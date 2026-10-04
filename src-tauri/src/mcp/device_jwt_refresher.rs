@@ -925,8 +925,10 @@ pub(crate) async fn try_refresh_once(
     device_id: &str,
     user_id: &str,
     machine_tenant: Option<uuid::Uuid>,
+    pair_base_arm: Option<crate::api_config::ApiBaseUrlArm>,
 ) -> RefreshOutcome {
     let base = pair_base.to_string();
+    let origin = pair_base_origin(pair_base_arm);
     let token = runner_token.to_string();
     let did = device_id.to_string();
     let uid = user_id.to_string();
@@ -975,7 +977,7 @@ pub(crate) async fn try_refresh_once(
     // spawn_blocking or it stalls the tokio runtime.
     let pair_join = spawn_blocking_tracked(move || {
         qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
-            &base, &token, &did, &uid, tenant_id,
+            &base, &token, &did, &uid, tenant_id, &origin,
         )
     })
     .await;
@@ -5253,39 +5255,49 @@ pub(crate) async fn refresh_cognito_bearer(
     (auth_manager.get_oauth_access_token().ok(), RefreshClass::Ok)
 }
 
-/// The qontinui-web backend base URL this refresher should talk to.
+/// The qontinui-web backend base URL this refresher should talk to, plus the
+/// ladder rung that chose it (`None` when nothing is configured).
 ///
-/// `api_config` refuses a LOOPBACK persisted `backend_url` on a RELEASE build
-/// (see `api_config::resolve_api_base_url`), so on such a runner the relay
-/// dials the release default. Reading the persisted field raw would leave the
-/// loop minting against `127.0.0.1:8000` while the relay talks to production —
-/// the prod/local device-JWT split the persisted rung was introduced to close
-/// (plan 2026-07-08), re-opened pointing the other way.
-///
-/// So a refused value defers to `get_api_base_url()` — the one authority —
-/// rather than to a second copy of rung 4 here. The two can then not disagree
-/// by construction. A runner whose persisted value is honoured (every debug
-/// build, and every release build pointed at a real remote backend) takes the
-/// same path it always did.
-///
-/// Blank is NOT refused (it is unset, not loopback), so callers still have to
-/// guard the unconfigured case — an empty return means "no web backend".
-///
-/// Extracted from the `Decision::Refresh` arm when Phase 2's per-tenant slot
-/// pass gained its own need for the same base (the device-machine-key
-/// exchange). Two hand-copied resolutions of this rule is exactly how the
-/// 2026-07-08 split reopened.
-fn resolve_pair_base(settings: &crate::settings::Settings) -> String {
-    let persisted = settings
-        .web_integration
-        .backend_url
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
-    if crate::api_config::persisted_backend_url_refused(&persisted, cfg!(debug_assertions)) {
-        crate::api_config::get_api_base_url()
-    } else {
-        persisted
+/// A configured value comes from [`crate::api_config::configured_api_base_from`],
+/// the one ladder, so this can not disagree with the relay by construction
+/// (a release build's refusal of a loopback persisted value included; plan
+/// 2026-07-08's prod/local device-JWT split). When the ladder yields nothing
+/// but a non-blank persisted value exists, the value was not honoured as
+/// configured: it was refused (release loopback), equal to the build default
+/// (debug), or web-integration is disabled. In each case the base is what the
+/// relay actually dials, with its arm. NOTE the disabled case is a deliberate
+/// behaviour change: the refresher used to ignore `web_integration.enabled`
+/// and now falls back to the relay's base instead. Otherwise `("", None)`:
+/// callers keep their empty-means-unconfigured guard.
+fn resolve_pair_base(
+    settings: &crate::settings::Settings,
+) -> (String, Option<crate::api_config::ApiBaseUrlArm>) {
+    if let Some((url, arm)) = crate::api_config::configured_api_base_from(settings) {
+        return (url, Some(arm));
+    }
+    if settings.web_integration.backend_url.trim().is_empty() {
+        return (String::new(), None);
+    }
+    let (url, arm) = crate::api_config::get_api_base_url_with_source();
+    (url, Some(arm))
+}
+
+/// The provenance a pair failure reports for a base resolved by
+/// [`resolve_pair_base`]: the arm's wire string and remedy, or `unconfigured`
+/// when no arm chose it.
+fn pair_base_origin(
+    arm: Option<crate::api_config::ApiBaseUrlArm>,
+) -> qontinui_runner_lib::pair::PairBaseOrigin {
+    match arm {
+        Some(arm) => qontinui_runner_lib::pair::PairBaseOrigin {
+            label: arm.as_str().to_string(),
+            remedy: arm.remedy().to_string(),
+        },
+        None => qontinui_runner_lib::pair::PairBaseOrigin {
+            label: "unconfigured".to_string(),
+            remedy: "Set `api_url` in the active profile in ~/.qontinui/profiles.json, or export QONTINUI_WEB_BACKEND_URL."
+                .to_string(),
+        },
     }
 }
 
@@ -5437,7 +5449,7 @@ async fn refresher_loop(
                     // pair path below resolves it — the device-machine-key
                     // exchange lives there, and Phase 2's re-derive needs it.
                     // Empty simply disables re-derivation for the pass.
-                    let slot_web_base = resolve_pair_base(&settings_snapshot);
+                    let (slot_web_base, _slot_web_arm) = resolve_pair_base(&settings_snapshot);
                     let outcomes = refresh_tenant_slots(
                         &auth_manager,
                         &coord_base,
@@ -5673,7 +5685,7 @@ async fn refresher_loop(
                 // persisted value is honoured (every debug build, and every
                 // release build pointed at a real remote backend) takes the
                 // same path it always did.
-                let pair_base = resolve_pair_base(&settings_snapshot);
+                let (pair_base, pair_base_arm) = resolve_pair_base(&settings_snapshot);
                 if pair_base.is_empty() {
                     warn!("device_jwt_refresher: backend_url empty — cannot pair");
                     if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
@@ -5750,6 +5762,7 @@ async fn refresher_loop(
                     &device_id,
                     &user_id,
                     machine_tenant,
+                    pair_base_arm,
                 )
                 .await;
                 let progress = match &outcome {
@@ -5968,6 +5981,58 @@ pub mod commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_base_origin_names_label_and_remedy_for_every_arm() {
+        use crate::api_config::ApiBaseUrlArm as A;
+        for (arm, label, needles) in [
+            (
+                A::EnvWebBackendUrl,
+                "env:QONTINUI_WEB_BACKEND_URL",
+                &["QONTINUI_WEB_BACKEND_URL"][..],
+            ),
+            (
+                A::EnvApiUrl,
+                "env:QONTINUI_API_URL",
+                &["QONTINUI_API_URL"][..],
+            ),
+            (A::ProfileApiUrl, "profile:api_url", &["profiles.json"][..]),
+            (
+                A::PersistedBackendUrl,
+                "persisted:web_integration.backend_url",
+                &["web_integration.backend_url"][..],
+            ),
+            (
+                A::BuildDefaultDebug,
+                "build_default:debug",
+                &["QONTINUI_WEB_BACKEND_URL", "profiles.json"][..],
+            ),
+            (
+                A::BuildDefaultRelease,
+                "build_default:release",
+                &["QONTINUI_WEB_BACKEND_URL", "profiles.json"][..],
+            ),
+            (
+                A::BuildDefaultReleaseLoopbackRejected,
+                "build_default:release:persisted_loopback_rejected",
+                &["web_integration.backend_url"][..],
+            ),
+        ] {
+            let o = pair_base_origin(Some(arm));
+            assert_eq!(o.label, label);
+            for n in needles {
+                assert!(
+                    o.remedy.contains(n),
+                    "{arm:?} remedy {:?} must mention {n}",
+                    o.remedy
+                );
+            }
+        }
+        let none = pair_base_origin(None);
+        assert_eq!(none.label, "unconfigured");
+        assert!(none.remedy.contains("profiles.json"));
+        assert!(none.remedy.contains("QONTINUI_WEB_BACKEND_URL"));
+    }
 
     #[test]
     fn decides_no_refresh_when_jwt_fresh() {
@@ -6498,7 +6563,7 @@ mod try_refresh_once_tests {
             r#"{"error":"token expired"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
         assert_eq!(
             outcome,
             RefreshOutcome::KeptExisting,
@@ -6531,7 +6596,7 @@ mod try_refresh_once_tests {
             r#"{"error":"coord overloaded"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
         assert_eq!(outcome, RefreshOutcome::KeptExisting);
 
         let still = mgr.get_access_token().expect("token still present");
@@ -6567,7 +6632,7 @@ mod try_refresh_once_tests {
 
         let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
                 assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
@@ -6611,7 +6676,7 @@ mod try_refresh_once_tests {
         let body = serde_json::json!({ "token": wrong_tenant_jwt, "user_id": UID }).to_string();
         let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
         match outcome {
             RefreshOutcome::TenantMismatch { expected, returned } => {
                 assert_eq!(
@@ -6694,7 +6759,7 @@ mod try_refresh_once_tests {
         .to_string();
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None, None).await;
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
                 assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
@@ -6741,7 +6806,7 @@ mod try_refresh_once_tests {
         let body = serde_json::json!({ "token": new_jwt }).to_string();
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None, None).await;
 
         assert_eq!(
             outcome,
@@ -6789,7 +6854,7 @@ mod try_refresh_once_tests {
 
         let machine = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
         let outcome =
-            try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, Some(machine)).await;
+            try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, Some(machine), None).await;
 
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {

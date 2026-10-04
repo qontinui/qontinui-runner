@@ -68,10 +68,11 @@ omitted-argument fallback above:
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
->   never a requirement — no tenant needs a git repo to author, vet or ship a
->   plan. Which directory THIS fleet writes new plans to is a local operating
->   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **A git repo holding the plans directory is an OPTIONAL export target as a
+>   product matter**, never a requirement — no tenant needs a git repo to
+>   author, vet or ship a plan. Which directory a deployment writes new plans
+>   to is that deployment's own operating rule (its `CLAUDE.md`, where it has
+>   one), not a product one.
 > * **Read the corpus through these doors, in this order** *(plan
 >   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
 >   1. **The runner door — no credential.**
@@ -81,13 +82,28 @@ omitted-argument fallback above:
 >      JWT; the caller presents nothing. A non-2xx names the host the runner
 >      dialled — that is the runner's configured web base, and the answer is an
 >      observation about that base, never about the corpus.
->   2. **The git doors — no credential, no service.**
->      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
->      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
->      enumerate. Authoring layer only (a plan authored through the web UI is
+>   2. **The git doors — no credential, no service; only where the plans
+>      directory is a git checkout.** Resolve the repo that holds it and the
+>      directory's path inside that repo:
+>      `REPO=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)` and
+>      `DIR=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-prefix)` (ends in
+>      `/`; empty when the plans directory is the repo root). When
+>      `$QONTINUI_PLANS_DIR` is unset or EMPTY, do not run them at all —
+>      `git -C ""` succeeds against whatever repo the shell stands in, so its
+>      answer is not the plans repo. Unset, empty, or either command exiting
+>      non-zero: there is no git door on this machine — that is an absent
+>      door, not a miss. So is a plans directory git does not TRACK in
+>      that repo (one sitting gitignored, or untracked, inside an unrelated
+>      work tree): after the fetch below, an EMPTY
+>      `ls-tree --name-only origin/main "${DIR:-.}"` is an absent door,
+>      never a miss.
+>      Otherwise `git -C "$REPO" show "origin/main:${DIR}<stem>.md"` for a
+>      body, `git -C "$REPO" ls-tree --name-only origin/main "${DIR:-.}"` to
+>      enumerate (substitute the remote's default branch throughout if it is
+>      not `main`). Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch —
 >      so fetch first:
->      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      `git -C "$REPO" fetch origin +refs/heads/main:refs/remotes/origin/main`,
 >      exit code read unpiped (a bare `fetch origin main` in a clone whose
 >      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
 >      When that fetch was skipped or exited non-zero, a git-door MISS is
@@ -97,8 +113,8 @@ omitted-argument fallback above:
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
 >      claim the route requires; the agent token `/agents/allocate` mints does
->      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
->      door; whatever it answers is an observation about that process.
+>      not. A per-box dev backend on loopback is not a discovery door;
+>      whatever it answers is an observation about that process.
 >
 >   On every list result **check that the returned `slug` equals the stem** — a
 >   backend predating the `slug` filter ignores the parameter and returns an
@@ -123,8 +139,9 @@ omitted-argument fallback above:
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
 >   runner door) has one roll-up per `source_repo` key: the
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
->   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
->   the key `<repo>/plans`.
+>   so a hit on `origin/main:${DIR}<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>${DIR:+/${DIR%/}}` — the bare `<repo>` when the plans
+>   directory is the repo root.
 >   - **No git door found the file:** the roll-up has nothing to add; the miss
 >     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
 >     and even then it speaks for the authoring layer only.
@@ -132,7 +149,7 @@ omitted-argument fallback above:
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
 >     then always `false`); (b) after a `git fetch`,
->     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     `git -C "$REPO" cat-file -e "<ref_sha>:${DIR}<stem>.md"` exits
 >     0 (any other exit, including an object this clone lacks, is UNKNOWN).
 >     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
 >     `least_behind_device_ids` (they share it); that row's own `state` may
@@ -167,10 +184,10 @@ omitted-argument fallback above:
 >     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
 >     the runner's write door, `qontinui-pr plan-library-backfill`, a
 >     secondary or temp runner instance, a runner build predating the report.
-> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
->   PowerShell interpreter (`pwsh` on Linux via
->   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
->   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+> * **The cache is one line.** A local plan cache exists only where your
+>   deployment provides one; where its renderer cannot run on this machine it
+>   is INOPERATIVE, not a degraded arm. When you read
+>   `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
 >   say so and quote its `Rendered:` stamp with the `api_base` beside it and
 >   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
 <!-- plan-corpus:end -->
@@ -253,7 +270,12 @@ fresh-branch path and open the new PR — **`coord_create_pr` first, then
 `gh pr create`** — with a line-anchored `Plan: <stem>` marker in the body,
 carrying the DELIVERY SCOPE for the phases this PR actually implements
 (`Plan: <stem> phases: 2,3` — `/implement-plan` Step 4.5 has the grammar and the
-reason). **Where this skill used to WITHHOLD a citation because the PRs deliver
+reason). Open it in `/implement-plan` Step 4.5b's served door order (the
+runner's loopback door sits between the coord door and the `gh` fallback), then
+READ it back — `gh pr list --repo <owner/repo> --head <branch> --state all
+--json number,url,state,headRefOid` — and take the PR number only from a row
+whose `headRefOid` is the head you pushed, never from the create call's exit
+status or output. **Where this skill used to WITHHOLD a citation because the PRs deliver
 only part of the plan, cite it with a scope instead.** Withholding never worked:
 the webhook auto-captures the `Plan:` marker from the PR body and those captures
 are not removable, so a withheld citation was recorded anyway — measured
@@ -630,6 +652,21 @@ chain on its own plan reserves a key the parent never took and gets `granted`
 (measured 2026-09-04). Plan
 `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
+⚠️ **`stop` — and a `remove` of the last row, which returns `stop`'s exit
+code — reports what it OBSERVED, and two more exits are not "stopped".**
+`9`: the loop is still alive after TERM and then KILL, or the signal was refused;
+the pidfile is kept. `10`: UNKNOWN — the pidfile names a live pid whose command
+line cannot be read; there is no usable pidfile and the process table is
+unreadable; or the pidfile's loop WAS stopped (a `stopped pid=…` line comes
+first) but the unreadable table cannot rule out a second loop. On either exit,
+quote the `stop-failed …` / `unknown=1 …` line in your report and never record
+the loop as stopped. Still run the release below, because the release is what
+coord reads. A loop that is still running with its rows gone (a refused signal,
+or an UNKNOWN) ends by itself at its next pass over the empty ledger. A loop
+that outlived KILL will NOT end by itself, so name its pid as left behind.
+`--force` changes neither answer. What each line means: `scripts/README.md` →
+"`stop` reports only what it observes".
+
 Then release:
 
 ```bash
@@ -736,7 +773,8 @@ Args: <resolved plan path>
 Let `/vet-plan` run to completion — it audits the claims, edits the plan in
 place, resolves open questions via its Decision policy, and stamps the plan
 `Status: VETTED <date>` (and, under this chain, registers the `time_elapsed`
-safety-net gate — **not** a `unit_ready` record gate; see the table below). Do
+safety-net gate — **not** a `unit_ready` record gate; see the table below —
+unless it took its §5.4 step 6 **hold-gate skip**, which registers neither). Do
 not short-circuit any of it.
 
 **Collect its report; do not emit it.** `/vet-plan` Step 6 produces a complete,
@@ -755,13 +793,15 @@ point, so do not reintroduce it as a "quick summary of the vet" either.
 about the MIDPOINT, not a cap on output.)
 
 **`/vet-plan` registers exactly ONE gate for a `/vet-imp` run — the net
-(changed 2026-09-04).** If this chain drops after vetting, coord dispatches a
+(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip**
+(the plan is held behind a live trigger gate that already dispatches back to
+it; see Step 3's VETTED-HELD arm). If this chain drops after vetting, coord dispatches a
 fresh visible session to implement the plan instead of leaving it stranded.
 
 | Gate | `phase_name` | Predicate | Continuation | Registered under `/vet-imp`? |
 |---|---|---|---|---|
 | **Record** | the plan title, or `"vet→implement handoff"` | `unit_ready` `{work_unit_id, ready_status}` | **NEVER** — unconditional | **NO — standalone `/vet-plan` only** |
-| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always** |
+| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4 step 6's hold-gate skip |
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
@@ -776,7 +816,7 @@ fresh visible session to implement the plan instead of leaving it stranded.
 > holds only while the unit is at its vetted status with no unmuted sibling
 > open. The net above is registered on the same `work_unit_id` seconds later
 > and pins it `Open`; `/implement-plan` Step 0.5 then transitions the unit to
-> `in_progress` **before** it mutes that net — so the window in which the record
+> `in_progress` **before** it withdraws that net — so the window in which the record
 > gate could clear is closed by this chain's own next step, and the gate fails
 > **OPEN** with no alert until the 7-day stale sweep. Measured 2026-09-04 over
 > 26 work units: **6 of 25 `unit_ready` gates (24%) ended unclearable**; the rest
@@ -795,7 +835,7 @@ fresh visible session to implement the plan instead of leaving it stranded.
 >
 > ⛔ **But `all_unit_gates_cleared` is `total > 0 && total == cleared`, and the
 > first conjunct matters.** The query now excludes archived, muted AND withdrawn
-> rows (`work_unit_derive_worker.rs:752` — the old `:337-353` citation had
+> rows (`work_unit_derive_worker.rs:1077` — the old `:337-353` citation had
 > drifted), so withdrawal REMOVES the row: withdraw the last counted gate and
 > `total = 0`, which is **vacuously false**. Coord's own regression test only
 > demonstrates the fix on a unit that keeps another cleared gate. So withdrawal
@@ -812,8 +852,8 @@ fresh visible session to implement the plan instead of leaving it stranded.
 
 > ⚠️ **Do not "simplify" this back into one gate with a continuation on
 > `unit_ready`. That configuration cannot work, and coord now refuses it at the
-> door.** `/vet-plan` §5.4 mandates transitioning the unit to its vetted status
-> *before* registering the record gate keyed on the status that landed, and
+> door.** `/vet-plan` §5.4 mandates transitioning the unit to `vetted`
+> *before* registering the record gate keyed on `vetted`, and
 > `ready_verdict` is a bare `status != ready_status` compare — so
 > `status == ready_status` **by construction** and a freshly-upserted unit has no
 > open siblings. `Cleared` is the only reachable verdict from the first
@@ -838,19 +878,33 @@ The net's window is genuinely unsatisfied for its whole 30 minutes, which is the
 property `unit_ready` could not provide: it is false the instant it is armed and
 becomes true only if nobody picks the plan up.
 
-`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS —
-**cancel, then mute**, on the `"vet→implement safety net"` gate specifically
-(`coord_cancel_continuation {gate_id, reason}`, or the REST twin
-`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel`; then
-mute, or the record gate stays pinned `Open` on it as a sibling —
-`coord_withdraw_gate` is the one-call equivalent and is LIVE). At that stamp the
+`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS — by
+**withdrawing** the `"vet→implement safety net"` gate specifically:
+`coord_withdraw_gate {gate_id, reason}`, or its HTTP twin, the bare device-authed
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}` (no `/agent/`
+infix exists for withdraw), with reason
+`safety net retired: implementation taken over by session <id>`. One call sets
+the terminal, non-clear, non-paging `withdrawn` verdict, cancels a
+dispatched-but-unconsumed continuation itself, and takes the row out of the open
+set (`withdraw_gate_core`, qontinui-coord `gates.rs:9131`). It replaced *cancel,
+then mute* on 2026-09-27: for `open_sibling_gates` and `all_unit_gates_cleared`
+the two are identical, but a muted gate stays `open` and the sweep skips it, so
+it never clears — **mute is for noise, not retirement** (plan
+`2026-09-27-gate-backlog-is-unretired-gates-not-slow-spawns`). The pre-dispatch
+cancel (`coord_cancel_continuation {gate_id, reason}`, or the REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel`) may
+precede the withdraw as a race optimisation; and when the withdraw answers
+`NotRegistrant` (not the registrant — MCP error or HTTP 403; causes: `_gate-registration` → "Continuation cancel + refresh", point 2) Step 0.5 falls back to that
+cancel plus `coord_mute_gate {gate_id}` (REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute`) and names the gate id in
+its closeout. At that stamp the
 **expected** row state is `continuation_spawn != null ∧ dispatched_at == null`
 — pre-dispatch and armed, which is precisely what a 30-minute window exists to
-produce, and `cancel_continuation` deliberately omits the
-`continuation_dispatched_at IS NOT NULL` guard (*"the pre-dispatch stamp is the
-whole point"*). A `409 already_consumed` now means the chain took **longer than
-the window** to reach Step 0.5, not that the race is unwinnable; the residual is
-then a **visible** redundant terminal that should stand down at
+produce; a withdrawn gate never clears, so it never dispatches. A consumed
+continuation (the optional cancel's `409 already_consumed`) now means the chain
+took **longer than the window** to reach Step 0.5, not that the race is
+unwinnable; the withdraw still follows, and the residual is then a **visible**
+redundant terminal that should stand down at
 `/implement-plan` Step 0.45 / Step 0.6 — never a silent strand.
 
 This is a **backstop, not a licence to stop here**: a stalled chain that gets
@@ -1138,13 +1192,26 @@ states that legitimately stop the lifecycle must stop it here too:
 
 - **The stamp is missing** for any other reason. Do not implement an unvetted
   plan; report what `/vet-plan` actually produced and stop.
+- **The plan is VETTED but HELD — `/vet-plan` took §5.4 step 6's hold-gate
+  skip.** The fresh stamp defers every remaining phase behind a named gate that
+  is open and armed to come back to this plan. There is nothing to implement,
+  and the plan's own text forbids implementing it. So do **not** invoke
+  `/implement-plan`: go to Step 5 and report the chain as **VETTED-HELD**,
+  quoting the hold `gate_id`, its verdict and `will_dispatch` as `/vet-plan`
+  read them. This is the one VETTED outcome that ends the chain here, and it is
+  a stand-down, not a stall. Only the hold-gate skip `/vet-plan` actually
+  reported qualifies — never your own reading that the work "looks deferred".
+  The Backstop hook below may block once because the stamp still reads
+  `VETTED`; answer it with this reason in one line.
 
-If the status block reads `VETTED`, proceed to Step 4. A defect count > 0 in the
+If the status block reads `VETTED` and the plan is not held (above), proceed to
+Step 4. A defect count > 0 in the
 VETTED summary is **not** a blocker — `/vet-plan` auto-fixes what it can and only
 surfaces genuine product/scope calls; those are reported, not gating.
 
 **Confirming VETTED and invoking `/implement-plan` happen in the SAME assistant
-turn, with the Skill call last.** Do not confirm the gate in one turn and plan to
+turn, with the Skill call last** — for every VETTED outcome except the
+VETTED-HELD arm above, which goes to Step 5 in that same turn instead. Do not confirm the gate in one turn and plan to
 invoke in the next — there is no next turn; the turn ends and the chain is dead.
 If you have just written the words that confirm the stamp, the very next thing
 you emit is the Step 4 Skill call, not a summary and not a hand-off sentence.
@@ -1165,6 +1232,14 @@ phase agents, manual testing, commit, and the SHIPPED stamp. Because
 Step 2 just stamped the plan VETTED in this same session, `/implement-plan`'s
 Step 0.5 will see a fresh VETTED block and start cleanly — it will NOT warn that
 the plan was never vetted.
+
+**Once `/implement-plan` returns with its PRs open and their branches pushed,
+declare each PR worktree's hand-off** — `/unattended` Step 4.9's declaration
+step, one call per worktree:
+`bash <workspace-root>/qontinui-claude-config/scripts/worktree-handoff.sh --path <worktree> --pr <owner/repo#n>`.
+It releases the worktree slot early (once coord's relief lands) and saves this
+session's transcript to coord for a later fixer. Report its three output lines
+in Step 5. In a subagent, declare only worktrees the subagent itself allocated.
 
 ### Step 5 — Final session name + report
 
@@ -1249,8 +1324,8 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   CONTRADICTION also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh pr edit <n> --body-file <file>`, `/implement-plan`
-  Step 4.5) as well as re-record.
+  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
   its `COORD_REVIVE_CALL_TIMEOUT` total bound; `unknown_budget_expired` — this
@@ -1274,6 +1349,30 @@ The rows the script appends (`corroboration[]`, `coverage`) are merged into the
 same artifact, so a later reader finds the implementer-written half and the
 coord-observed half in one document and can tell them apart by `source`.
 
+**Then read the arming record the same way — a presence check, not a proof.**
+*(Plan `2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for`
+Phase 3.)* `/implement-plan` Step 4.4b declared and proved, for each PR it
+opened, that the change is observed to reach the population it was written for,
+and wrote that to `~/.qontinui/arming/<session-id>.json` under the same
+`AGENT_SESSION_ID`. Read it — do not re-run it:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh show
+```
+
+**PRs opened and no arming record under that id ⇒ the chain is INCOMPLETE, and
+this command refuses to report it complete** — name the path looked for and the
+session id, exactly as for a missing review-arm artifact. The record holds the
+LAST head declared, so a multi-PR run reads each PR's own evidence from the
+`Coord-Arming-Head:` block in its body; a PR whose body carries none must say
+`arming UNKNOWN: <detail>` or `arming ABSENT` there, and the summary quotes it.
+Never report a PR as armed on the strength of a record whose head is not that
+PR's head. And never report the trailers as observed by coord: coord
+harvests `Coord-Arming-*` and serves `arming_coverage` only once the
+qontinui-coord Phase 1 change of plan `2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for` lands — until then they are inert
+text in the body. Declaring and proving belong to `/implement-plan` alone; a second
+copy of that step here is a second thing to diverge.
+
 **The refusal changes the REPORTED STATUS ONLY.** It is a verdict computed here,
 never an early return out of Step 5: everything below it still runs. It must not
 suppress the `/name` call above it — labeling is best-effort and non-gating by
@@ -1284,7 +1383,14 @@ it was reporting. **INCOMPLETE *and* released** is the correct end state.
 
 Then give one short summary tying the two halves together: what the plan was
 about, the vet outcome (defects found / auto-fixed / surfaced), and the
-implement outcome (phases shipped, commit SHAs, anything deferred to a gate).
+implement outcome (phases shipped, commit SHAs, anything deferred to a gate)
+— or, for a VETTED-HELD plan, the hold instead: each hold `gate_id`, its
+verdict and `will_dispatch` as `/vet-plan` read them, and that
+`/implement-plan` was deliberately not run. When `/implement-plan` itself
+stopped at its Step 0.45 held check (a cited hold gate still open but not
+usable as a trigger — unarmed, armed toward another target, or claim-anchored —
+so `/vet-plan` took no skip), say that instead, with the same gate
+fields — and name the unarmed gate as a missing trigger.
 **Fold in the vet report you collected at Step 2** — it was never emitted, so
 this is its only appearance; dropping it loses the vet outcome entirely. For the
 implement half, defer to `/implement-plan`'s own report rather than repeating it
@@ -1361,7 +1467,9 @@ the since-when read out of the ledger — not as a clean idempotent no-op.
   stamps VETTED, writes the sentence, and ends the turn without ever calling the
   Skill tool (diagnosed 2026-07-28, reproduced live in the diagnosing session).
   **The Step 3 VETTED confirmation and the Step 4 `Skill: implement-plan` call
-  MUST occur in the SAME assistant turn, with the Skill call LAST.** If you find
+  MUST occur in the SAME assistant turn, with the Skill call LAST** — except on
+  Step 3's VETTED-HELD arm, where there is no Step 4 and Step 5 follows in the
+  same turn. If you find
   yourself about to write that sentence — **call the tool instead.** The tool
   call IS the sentence.
 - **No finished-looking report before implementation completes.** `/vet-plan`'s
@@ -1373,11 +1481,13 @@ the since-when read out of the ledger — not as a clean idempotent no-op.
   the `Skill: implement-plan` call.
 - **The VETTED gate is mandatory.** Never run `/implement-plan` from this
   command unless Step 3 confirms a fresh `Status: VETTED` block. A vet abort
-  (closed plan, or wrong architectural direction) stops the chain.
+  (closed plan, or wrong architectural direction) stops the chain, and so
+  does a VETTED-HELD plan (Step 3), which ends at Step 5 with nothing to implement.
 - **One session, no stop between halves.** Like `/implement-plan` itself, the
   vet → implement chain runs end-to-end without handing back to the operator
   between the two — except for the escalations the underlying skills already
-  define (operator-resource needs, oversize-plan handoff, a vet abort).
+  define (operator-resource needs, oversize-plan handoff, a vet abort) and a
+  VETTED-HELD plan, which ends at Step 5 without handing back.
 
 ## Backstop
 
@@ -1393,5 +1503,7 @@ It fires **at most once per session** (latched by
 and **fails open on everything else**, so it can nag but never trap. Treat it as
 the last line of defence: the rules above are what should prevent the stall, and
 a hook block means they were ignored. If the block is genuinely wrong (the vet
-aborted, or the operator stopped the run), state that reason in one line and
+aborted, the operator stopped the run, Step 3's VETTED-HELD arm ended the
+chain because the plan is held behind a live trigger gate, or `/implement-plan`
+Step 0.45 stopped on a held plan), state that reason in one line and
 stop — it will not ask twice.

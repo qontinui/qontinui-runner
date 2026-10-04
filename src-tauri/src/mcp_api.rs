@@ -188,7 +188,7 @@ async fn embedding_service_health() -> serde_json::Value {
 /// sub-millisecond round-trip on a healthy DB, and when the DB is down the 2s
 /// ceiling bounds the cost — surfacing the outage on the very next `/health`
 /// poll is the whole point (the B-5 observability gap the plan calls out).
-async fn pg_liveness_probe() -> Option<bool> {
+pub(crate) async fn pg_liveness_probe() -> Option<bool> {
     let pg = crate::database::pg::PgDb::try_global()?;
     let probe = async move {
         let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
@@ -201,6 +201,91 @@ async fn pg_liveness_probe() -> Option<bool> {
         Ok(Ok(())) => Some(true),
         Ok(Err(_)) => Some(false),
         Err(_) => Some(false),
+    }
+}
+
+/// Fixed, minimal set of relations the runner cannot work without. `schema_ok`
+/// (plan `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`,
+/// Phase 1) checks exactly these via `to_regclass()` — never a migration
+/// check, never a table scan. `project.task_runs` is the concrete relation
+/// named by the originating finding (`get_running_task_runs`, one of the four
+/// `runner-lifecycle` idle signals); `public.alembic_version` is the marker
+/// that alembic's chain was ever applied at all, so an unmigrated-from-scratch
+/// database is caught even before any app table is queried.
+const SCHEMA_PROBE_REQUIRED_RELATIONS: &[&str] = &["project.task_runs", "public.alembic_version"];
+
+/// Bounded schema probe for `/health` (Phase 1 of the plan above), run ONLY
+/// when [`pg_liveness_probe`] already returned `Some(true)` — a connect
+/// failure must never be re-tried here, it is reported as `schema_ok: None`
+/// by [`derive_schema_health`] instead. Like `pg_liveness_probe` this is
+/// intentionally UNCACHED rather than kept in a background-refreshed slot:
+/// `to_regclass()` is a catalog lookup (sub-millisecond on a healthy DB), it
+/// only ever runs after a connect has already succeeded, and it is bounded by
+/// the same 2s ceiling so a wedged probe can never hang `/health`.
+///
+/// Returns `Ok(None)` when every relation in [`SCHEMA_PROBE_REQUIRED_RELATIONS`]
+/// resolves, `Ok(Some(name))` naming the FIRST one that does not (`to_regclass`
+/// returns SQL NULL for an absent relation — not an error), or `Err(reason)`
+/// when the probe itself could not complete (pool exhaustion on the second
+/// checkout, a query error distinct from "table absent", or the 2s ceiling).
+///
+/// `pub(crate)`: Phase 2 of the same plan (`crate::mcp::restart_readiness`)
+/// calls this directly rather than re-deriving the same check, so `/restart-
+/// readiness` can report its AI/task-run plane as unobtainable on the same
+/// evidence `/health`'s `schema_ok` uses.
+pub(crate) async fn pg_schema_probe() -> Result<Option<String>, String> {
+    let pg =
+        crate::database::pg::PgDb::try_global().ok_or_else(|| "no PG configured".to_string())?;
+    let probe = async move {
+        let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
+        for rel in SCHEMA_PROBE_REQUIRED_RELATIONS {
+            let row = conn
+                .query_one("SELECT to_regclass($1)::text", &[rel])
+                .await
+                .map_err(|e| e.to_string())?;
+            let resolved: Option<String> = row.try_get(0).map_err(|e| e.to_string())?;
+            if resolved.is_none() {
+                return Ok(Some((*rel).to_string()));
+            }
+        }
+        Ok(None)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(result) => result,
+        Err(_) => Err("probe timeout".to_string()),
+    }
+}
+
+/// Pure decision logic behind the `/health` `schema_ok` / `schema_detail`
+/// pair — split out of the async plumbing above so the three arms are
+/// unit-testable with no live Postgres connection. `reachable` is the SAME
+/// value already published as `database.reachable`; `schema_probe` is
+/// `None` when the caller skipped running [`pg_schema_probe`] at all (because
+/// `reachable != Some(true)`), and `Some(result)` otherwise.
+///
+/// `schema_ok: false` must NEVER be derived from a connect failure —
+/// `reachable != Some(true)` always yields `None`, never `Some(false)`, per
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default`.
+pub(crate) fn derive_schema_health(
+    reachable: Option<bool>,
+    schema_probe: Option<Result<Option<String>, String>>,
+) -> (Option<bool>, Option<String>) {
+    if reachable != Some(true) {
+        let label = match reachable {
+            Some(true) => unreachable!("handled by the branch condition above"),
+            Some(false) => "false",
+            None => "unknown",
+        };
+        return (None, Some(format!("not attempted: reachable={label}")));
+    }
+    match schema_probe {
+        None => (
+            None,
+            Some("not attempted: schema probe did not run".to_string()),
+        ),
+        Some(Ok(None)) => (Some(true), None),
+        Some(Ok(Some(missing))) => (Some(false), Some(format!("missing relation: {missing}"))),
+        Some(Err(reason)) => (None, Some(format!("probe error: {reason}"))),
     }
 }
 
@@ -1132,6 +1217,17 @@ async fn health(
     let pg_probe_started = std::time::Instant::now();
     let pg_reachable = pg_liveness_probe().await;
     let pg_probe_ms = pg_probe_started.elapsed().as_millis() as u64;
+    // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`:
+    // `reachable` only proves a connect+auth handshake, not that the schema
+    // the runner needs exists. Only attempt the schema probe once the connect
+    // already succeeded — a connect failure is reported as `schema_ok: None`
+    // below, never silently re-tried or turned into `false`.
+    let schema_probe_result = if pg_reachable == Some(true) {
+        Some(pg_schema_probe().await)
+    } else {
+        None
+    };
+    let (schema_ok, schema_detail) = derive_schema_health(pg_reachable, schema_probe_result);
 
     let main_window = {
         use tauri::Manager;
@@ -1451,6 +1547,17 @@ async fn health(
             // /health and has nothing to do with the UI thread — the 2026-08-19
             // confound, now reported instead of inferred.
             "probeMs": pg_probe_ms,
+            // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-
+            // probe-not-a-schema-probe`: does the SCHEMA the runner needs
+            // actually exist, not just "can we connect". `Some(true)` only
+            // when every relation in `SCHEMA_PROBE_REQUIRED_RELATIONS`
+            // resolves via `to_regclass()` — never a migration check, never a
+            // table scan. `None` means "could not determine" (the connect
+            // probe itself failed/is unknown, or the schema probe errored) —
+            // it must NEVER be read as `false`; `schema_detail` always
+            // explains whichever non-`Some(true)` state this is.
+            "schema_ok": schema_ok,
+            "schema_detail": schema_detail,
         },
         // Native message-loop liveness (plan
         // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 5).
@@ -1671,6 +1778,17 @@ async fn health(
         // check completes, and permanently null on a repo-less install.
         "mainSha": main_sha_json,
         "buildDrift": build_drift_json,
+        // The scheduler `ScheduleConditions` this binary actually ENFORCES,
+        // snake_case: the evaluator's list
+        // (`crate::scheduler_service::EVALUATED_CONDITIONS`) when the task store
+        // round-trips a task's conditions, and EMPTY when it does not — a
+        // condition that is evaluated but never persisted is dropped on create
+        // and the task runs ungated. A capability read, not a version guess:
+        // a client registering a gated schedule must see the condition here
+        // first; an absent field or entry means this build would run the task
+        // UNGATED (plan 2026-09-29-quiet-is-measured-by-session-existence-and-
+        // machine-wide-so-a-24x7-box-never-gets-one, Phase 5).
+        "schedulerConditions": crate::scheduler_service::enforced_conditions(),
         // This runner's DEFAULT tenant — what a session that names no tenant
         // is minted into (`machine.json::active_tenant_id`, read live per
         // request via `resolve_tenant_pin()`, so re-pointing the pin shows
@@ -3154,8 +3272,13 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
 /// low count is trustworthy, and a misattributed row corrupts two sessions'
 /// numbers at once while a dropped one only under-counts (visibly, via the
 /// `debug!` field set at the call site).
+///
+/// `app` is `None` when the caller has no Tauri handle to hand (the REST write
+/// forwarder reads the process-global one, which is unset in a headless test
+/// runner). That is not a separate arm: every probe below simply finds its
+/// state missing and reports the same miss a handle without that state would.
 fn resolve_event_lane_session_id(
-    state: &Arc<ApiState>,
+    app: Option<&tauri::AppHandle>,
     nonce: Option<&str>,
 ) -> Result<uuid::Uuid, EventLaneMiss> {
     let Some(nonce) = nonce else {
@@ -3166,9 +3289,7 @@ fn resolve_event_lane_session_id(
     // so does every miss.
     match event_lane_terminal_leg(
         crate::coord_mcp::terminal_id_for_nonce(nonce).as_deref(),
-        |terminal_id| match state
-            .app_handle
-            .try_state::<Arc<crate::terminal::TerminalManager>>()
+        |terminal_id| match app.and_then(|a| a.try_state::<Arc<crate::terminal::TerminalManager>>())
         {
             None => TerminalLaneProbe::NoManager,
             Some(tm) => match tm.get(terminal_id) {
@@ -3185,15 +3306,12 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let task_run_id = state
-        .app_handle
-        .try_state::<Arc<crate::claude_session::SessionManager>>()
+    let task_run_id = app
+        .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .task_run_id_for_workdir(&workdir)
         .ok_or(EventLaneMiss::NoTaskRun)?;
-    state
-        .app_handle
-        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+    app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
         .ok_or(EventLaneMiss::AiSessionUnregistered)
@@ -3353,7 +3471,7 @@ fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) 
             reason = %miss.as_str(),
             terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
             nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
-            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+            "coord door (proxy or write forwarder): no coord.sessions lane for this caller — transport-rung \
              observation not recorded; first-rung reachability under-counts \
              (GET /health transportRung.laneMiss carries the totals)"
         );
@@ -3365,7 +3483,7 @@ fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) 
             reason = %miss.as_str(),
             terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
             nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
-            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+            "coord door (proxy or write forwarder): no coord.sessions lane for this caller — transport-rung \
              observation not recorded"
         );
     }
@@ -3501,11 +3619,25 @@ fn nonce_log_prefix(nonce: &str) -> String {
 /// arrived at this door, under which session's nonce, for which JSON-RPC
 /// operation — is authoritative, and is what the row's lane and the
 /// runner-observed payload fields carry.
+///
+/// ## Two doors, one recorder
+///
+/// Both coord doors on this runner call it: the JSON-RPC `/coord-mcp` proxy
+/// (`operation` classified from the JSON-RPC body by
+/// [`crate::session::coord_transport_rung::operation_for_body`]) and the REST
+/// write forwarder ([`coord_write_proxy_handler`], `operation` always
+/// [`crate::session::coord_transport_rung::OPERATION_WRITE`] — its routes are
+/// an enumerated set of coord WRITES, and its REST body is not JSON-RPC, so the
+/// body classifier would call every one of them a read). The operation is
+/// therefore the CALLER's to supply, never re-derived here. Plan
+/// `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`,
+/// Phase 2: before the forwarder called this, every gate write a caller
+/// declared as `write_forwarder` produced no row at all.
 fn record_coord_transport_rung(
-    state: &Arc<ApiState>,
+    app: Option<&tauri::AppHandle>,
     headers: &axum::http::HeaderMap,
     nonce: Option<&str>,
-    body: &[u8],
+    operation: &'static str,
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
@@ -3516,7 +3648,7 @@ fn record_coord_transport_rung(
         // that never reached `main.rs`'s install). Nothing to record into.
         return;
     };
-    let lane = match resolve_event_lane_session_id(state, nonce) {
+    let lane = match resolve_event_lane_session_id(app, nonce) {
         Ok(lane) => lane,
         Err(miss) => {
             // A dropped observation has to be IDENTIFIABLE, or "the runner
@@ -3528,7 +3660,7 @@ fn record_coord_transport_rung(
             return;
         }
     };
-    hand_off_transport_rung(emitter, lane, headers, body, door, caller_session_id);
+    hand_off_transport_rung(emitter, lane, headers, operation, door, caller_session_id);
 }
 
 /// The lane-resolved half of [`record_coord_transport_rung`]: build the
@@ -3539,7 +3671,7 @@ fn hand_off_transport_rung(
     emitter: Arc<crate::session::coord_transport_rung::RungEmitter>,
     lane: uuid::Uuid,
     headers: &axum::http::HeaderMap,
-    body: &[u8],
+    operation: &'static str,
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
@@ -3558,7 +3690,7 @@ fn hand_off_transport_rung(
         // after the hop would be missing exactly when the hop is what failed.
         rung::OUTCOME_OK,
         door,
-        rung::operation_for_body(body),
+        operation,
         caller_session_id,
     );
     // The outbox append is group-committed and returns only once the line is
@@ -4097,6 +4229,50 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// run. coord's own grant (`mcp/agent_tool_access.rs`) is the authority on who
 /// may call it; this list only forwards.
 ///
+/// `coord_submit_escalate_evidence` is IN, and it is the reason this paragraph
+/// exists: it is the agent door of the operator ruling
+/// `decision_record/escalate-path-clearance-is-agent-work` — an
+/// `escalate-path-matched` block is cleared by an agent submitting a grounded
+/// evidence bundle for one head, and coord (not the agent) checks it, announces
+/// the clearance, and writes the head-pinned marker. The grant carries no scope
+/// and no glob; coord's refusals (`head_moved`, `disclosure_not_grounded`,
+/// `review_not_for_head`, `credential_not_holder_issued`, …) are the control.
+/// Withheld here it answered `METHOD_NOT_ALLOWED` from every runner-proxied
+/// session, so the blocker line coord prints on every such PR — which names this
+/// tool as the remedy — sent the session to a door this list shut (measured
+/// 2026-09-26 on claude-config#1198 and 2026-09-29 on coord#2638, where the
+/// bundle had to be carried over a hand-minted device JWT instead). Its operator
+/// twin `coord_attest_escalate_override` stays in
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`], unmoved.
+///
+/// The same diff of coord's `DEVICE_DEFAULT_TOOLS` / `TWIN_READ_TOOLS` against
+/// this list (coord `mcp/agent_tool_access.rs` on origin/main, 2026-09-29) found
+/// ten more names that were neither allowed nor deliberately excluded — the
+/// drift state `coord_mcp_filter_tools_list_response` warns about. Each is
+/// granted on coord's device floor with a recorded rationale. Eight of them
+/// also have a device-admitting HTTP twin (a `DoorAdmits::DeviceAgent` row that
+/// coord's `device_floor_matches_device_admitting_http_doors` pins), so
+/// withholding those here was a transport asymmetry rather than a boundary. The
+/// other two have no such twin and rest on coord's own grant alone:
+/// `coord_fleet_drain_status` is on coord's read-only observer floor, and
+/// `coord_land_provenance_backfill` is a deliberately bounded agent door onto a
+/// repair pass whose HTTP route is operator-only (coord plan
+/// `2026-09-15-two-admin-only-repair-passes-have-no-agent-door`). That is the
+/// same precedent as `coord_citations_reenrich` above: coord's grant is the
+/// authority on who may call it, and this list only forwards.
+///
+/// * reads — `coord_fleet_drain_status` (a session that cannot see a drain
+///   reads a quiesced machine as idle), `coord_next_step_settings_effective`
+///   (the dial governing the caller's OWN autonomy), `coord_pending_agent_questions`,
+///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`;
+/// * self-scoped or bounded writes — `coord_adopt_pr` (the PR adoption claim a
+///   fixer takes before acting on a PR it did not author),
+///   `coord_answer_agent_question` / `coord_withdraw_agent_question` (the
+///   agent-audience queue's only consumers; neither can write `audience` or
+///   erase an operator answer), `coord_operator_touch_classify` (append-only
+///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
+///   default, precedence-aware re-derive, reversible by re-running).
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4113,11 +4289,13 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
+    "coord_adopt_pr",
     "coord_agent_registry_effective",
     "coord_alert_claim",
     "coord_alert_queue",
     "coord_alert_release",
     "coord_am_i_clear",
+    "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
     "coord_bind_self_session",
@@ -4150,6 +4328,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_explain_worktree",
     "coord_find_references",
     "coord_fixer_arm_readiness",
+    "coord_fleet_drain_status",
     "coord_force_clear_gate",
     "coord_gate_doctor",
     "coord_gate_inspect",
@@ -4160,6 +4339,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_inbox",
     "coord_is_commit_live",
     "coord_is_merge_safe",
+    "coord_land_provenance_backfill",
     "coord_layering_triage",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
@@ -4174,9 +4354,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_merge_order",
     "coord_migration_queue",
     "coord_mute_gate",
+    "coord_next_step_settings_effective",
     "coord_notify_sensitive_action",
     "coord_operator_touch_classify",
     "coord_orient",
+    "coord_pending_agent_questions",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
     // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
@@ -4185,6 +4367,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_pr_label_unset",
     "coord_pr_status",
     "coord_predict_resource_collisions",
+    "coord_primary_tree_branch_status",
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
@@ -4206,17 +4389,29 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_signature",
     "coord_slo_metrics",
     "coord_snooze_gate",
+    "coord_submit_escalate_evidence",
     "coord_symbol_lookup",
     "coord_twin_catalog",
     "coord_typecheck_file",
     "coord_unmute_gate",
     "coord_who_is_working_on",
+    "coord_withdraw_agent_question",
     "coord_withdraw_gate",
     "coord_work_unit_add_citation",
+    // Plan 2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr
+    // Phase 4 (qontinui-coord#2616): attest a phase that ships no PR. It cannot
+    // forge `shipped` — coord's I1+I2 mean an attestation never creates delivery
+    // nor demotes; it only releases a phase-coverage pin on a unit that already
+    // has a real landed PR, disclosed as a `PHASE ATTESTED WITHOUT A PR` gap.
+    "coord_work_unit_attest_phase",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
+    "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
+    // Same plan/phase: the undo of `coord_work_unit_attest_phase`. It writes the
+    // attestation table, not citations, so it cannot erase a citation.
+    "coord_work_unit_retract_phase_attestation",
     "coord_work_unit_transition",
     "coord_work_unit_upsert",
     "coord_write_prompt_document",
@@ -6533,10 +6728,10 @@ async fn coord_mcp_proxy_handler(
     // and BEFORE the forward, so the row exists even when the hop that follows
     // dies. Best-effort telemetry: it cannot fail or slow the proxied call.
     record_coord_transport_rung(
-        &state,
+        Some(&state.app_handle),
         &headers,
         nonce.as_deref(),
-        &body,
+        crate::session::coord_transport_rung::operation_for_body(&body),
         &url,
         caller_session_id,
     );
@@ -8595,6 +8790,31 @@ async fn coord_write_proxy_handler(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
+
+    // Plan 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed,
+    // Phase 2 — the same per-call transport-rung row the JSON-RPC proxy writes
+    // ([`record_coord_transport_rung`]), for the same reasons and at the same
+    // point: after the door URL is known and BEFORE the forward, so the row
+    // exists even when the hop that follows dies. Without it, every write a
+    // caller declared as `write_forwarder` (`/gate` Part B's REST leg) was a
+    // silent hole in the first-rung instrument. Best-effort telemetry: it
+    // cannot fail or slow the forwarded write.
+    //
+    // The caller's declaration headers are read here and go no further:
+    // [`forward_coord_write`] takes no request headers at all and builds the
+    // upstream request from scratch, so none of them can reach coord.
+    // `caller_session` is `None` on targets coord does not attribute — the
+    // row's `agent_session_id` then says "not resolved", which is what
+    // happened.
+    record_coord_transport_rung(
+        crate::tauri_app_handle::current().as_ref(),
+        &headers,
+        nonce.as_deref(),
+        crate::session::coord_transport_rung::OPERATION_WRITE,
+        &url,
+        caller_session,
+    );
+
     forward_coord_write(
         target.method(),
         &url,
@@ -11915,6 +12135,7 @@ pub fn create_router(
         .merge(crate::mcp::step_type_metadata_api::routes())
         .merge(crate::mcp::task_run_inspection::routes())
         .merge(crate::mcp::task_runs::routes())
+        .merge(crate::mcp::tenant::routes())
         .merge(crate::mcp::terminals::routes())
         .merge(crate::mcp::steward::routes())
         .merge(crate::mcp::testing::routes())
@@ -12245,6 +12466,10 @@ const API_RUNTIME_WORKER_THREADS: usize = 4;
 /// It MUST outlive [`serve_on_dedicated_runtime`]'s stack frame: dropping a
 /// `Runtime` shuts its workers down, which would stop the server we just
 /// started — and dropping one from inside an async context panics outright.
+#[expect(
+    clippy::disallowed_types,
+    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 static API_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 /// Serve the local API (`:9876`) on a tokio runtime of its **own**.
@@ -12864,7 +13089,9 @@ mod transport_rung_counter_tests {
             emitter,
             lane,
             &headers,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            crate::session::coord_transport_rung::operation_for_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            ),
             "https://coord.qontinui.io/mcp",
             None,
         );
@@ -12942,7 +13169,9 @@ mod transport_rung_counter_tests {
             emitter,
             lane,
             &headers,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            crate::session::coord_transport_rung::operation_for_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            ),
             "https://coord.qontinui.io/mcp",
             None,
         );
@@ -12997,7 +13226,9 @@ mod transport_rung_counter_tests {
             emitter,
             uuid::Uuid::new_v4(),
             &headers,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            crate::session::coord_transport_rung::operation_for_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ),
             "https://coord.qontinui.io/mcp",
             None,
         );
@@ -13047,6 +13278,196 @@ mod transport_rung_counter_tests {
         assert_eq!(
             parse_failure_class(declared_failure_class(&headers)),
             Some("tool_masked")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed,
+    // Phase 2 — the REST write forwarder records a rung row too.
+    // -----------------------------------------------------------------------
+
+    /// Hand one observation off exactly as `coord_write_proxy_handler` does —
+    /// operation `write`, door = the upstream write URL — and return the single
+    /// outbox payload it lands, after a bounded wait. The caller holds
+    /// `series_lock`.
+    async fn forwarder_row(headers: &axum::http::HeaderMap) -> serde_json::Value {
+        use crate::session::coord_transport_rung::{RungEmitter, OPERATION_WRITE};
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let door = super::write_upstream_url(
+            "https://coord.qontinui.io",
+            &super::CoordWriteTarget::RegisterGate,
+        );
+
+        let before = transport_rung_emitted_counter().load(Ordering::Relaxed);
+        hand_off_transport_rung(
+            emitter,
+            uuid::Uuid::new_v4(),
+            headers,
+            OPERATION_WRITE,
+            &door,
+            None,
+        );
+        assert_eq!(
+            transport_rung_emitted_counter().load(Ordering::Relaxed),
+            before + 1,
+            "a forwarded write moves `emitted` by one, exactly as a proxied call does"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].event_kind, "coord-transport-rung");
+                assert_eq!(
+                    pending[0].payload["door"],
+                    serde_json::json!("https://coord.qontinui.io/coord/gates/register-agent")
+                );
+                return pending[0].payload.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the forwarded write's observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `/gate` Part B's REST leg declares `write_forwarder` / `gate`; the row
+    /// carries exactly that, and says `write`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn forwarded_write_declaring_write_forwarder_yields_a_write_forwarder_row() {
+        // Bumps the process-global `emitted` counter, which
+        // `successful_emit_increments_emitted` asserts EXACTLY.
+        let _serialised = series_lock();
+        use crate::session::coord_transport_rung::{
+            REPORTER_HEADER, REPORTER_STEP_HEADER, TRANSPORT_HEADER,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(TRANSPORT_HEADER, "write_forwarder".parse().unwrap());
+        headers.insert(REPORTER_HEADER, "gate".parse().unwrap());
+        headers.insert(REPORTER_STEP_HEADER, "2".parse().unwrap());
+
+        let p = forwarder_row(&headers).await;
+        assert_eq!(p["transport"], serde_json::json!("write_forwarder"));
+        assert_eq!(p["reporter"], serde_json::json!("gate"));
+        assert_eq!(p["reporter_step"], serde_json::json!("2"));
+        assert_eq!(p["operation"], serde_json::json!("write"));
+        assert_eq!(p["outcome"], serde_json::json!("ok"));
+        assert_eq!(p["off_cascade"], serde_json::json!(false));
+    }
+
+    /// A forwarded write nobody tagged is the VISIBLE untagged arm —
+    /// `unknown` / `untagged` — never a skipped emit, and still a `write`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn forwarded_undeclared_write_yields_an_untagged_unknown_row() {
+        let _serialised = series_lock();
+        let p = forwarder_row(&axum::http::HeaderMap::new()).await;
+        assert_eq!(p["transport"], serde_json::json!("unknown"));
+        assert_eq!(p["reporter"], serde_json::json!("untagged"));
+        assert_eq!(p["operation"], serde_json::json!("write"));
+        assert_eq!(p["failure_class"], serde_json::Value::Null);
+    }
+
+    /// Why the forwarder supplies `write` rather than letting the recorder
+    /// classify its body: a REST gate body is not JSON-RPC, and the JSON-RPC
+    /// classifier calls anything that is not a `tools/call` a READ. Re-deriving
+    /// the operation from the body would file every forwarded gate write as a
+    /// read.
+    #[test]
+    fn rest_write_bodies_would_misclassify_as_reads_under_the_jsonrpc_classifier() {
+        use crate::session::coord_transport_rung::{operation_for_body, OPERATION_READ};
+        assert_eq!(
+            operation_for_body(br#"{"predicate":{"kind":"unit_ready"},"phase_name":"Phase 3"}"#),
+            OPERATION_READ,
+        );
+    }
+
+    /// The body of one `async fn` / `fn` in this file, comments stripped.
+    fn fn_body(name_with_paren: &str) -> String {
+        let text = include_str!("mcp_api.rs");
+        let start = text
+            .find(name_with_paren)
+            .unwrap_or_else(|| panic!("{name_with_paren} exists"));
+        let end = text[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("its body ends");
+        text[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The write forwarder records a rung row — through the SAME recorder the
+    /// JSON-RPC proxy uses, as a `write`, and BEFORE the upstream hop (so the
+    /// row exists even when the hop dies). This is the pin that goes red on
+    /// the defect: before plan 2026-09-20 Phase 2 the handler never called the
+    /// recorder, and forwarded writes produced no row at all.
+    #[test]
+    fn write_forwarder_records_its_rung_before_forwarding() {
+        let code = fn_body("async fn coord_write_proxy_handler(");
+        let record = code
+            .find("record_coord_transport_rung(")
+            .expect("coord_write_proxy_handler must record a transport-rung row");
+        let forward = code
+            .find("forward_coord_write(")
+            .expect("coord_write_proxy_handler forwards");
+        assert!(
+            record < forward,
+            "the rung row must be written BEFORE the upstream forward"
+        );
+        let call = &code[record..forward];
+        assert!(
+            call.contains("OPERATION_WRITE"),
+            "the forwarder's row must say `write`, not a body-classified operation"
+        );
+        assert!(
+            !call.contains("operation_for_body"),
+            "a REST write body must not go through the JSON-RPC classifier"
+        );
+    }
+
+    /// The caller's declaration headers are CLAIMS and never reach coord. The
+    /// JSON-RPC proxy strips them explicitly; the write forwarder's upstream leg
+    /// takes no request headers at all and builds its request from scratch —
+    /// pinned here so a future "pass the caller's headers through" refactor
+    /// has to confront the strip.
+    #[test]
+    fn write_forwarder_upstream_leg_cannot_carry_declaration_headers() {
+        let code = fn_body("async fn forward_coord_write(");
+        let sig_end = code
+            .find(") -> axum::response::Response")
+            .expect("signature ends");
+        assert!(
+            !code[..sig_end].contains("HeaderMap"),
+            "forward_coord_write must not take the caller's request headers"
+        );
+        assert!(
+            !code.contains("headers.iter()"),
+            "forward_coord_write must not copy request headers upstream"
+        );
+        for h in crate::session::coord_transport_rung::DECLARATION_HEADERS {
+            assert!(
+                !code.contains(h),
+                "forward_coord_write must not set declaration header {h}"
+            );
+        }
+        // …and the handler hands the leg no header map either.
+        let handler = fn_body("async fn coord_write_proxy_handler(");
+        let call = &handler[handler.find("forward_coord_write(").unwrap()..];
+        assert!(
+            !call.contains("&headers") && !call.contains("headers,"),
+            "the handler must not pass request headers to the upstream leg"
         );
     }
 }
@@ -15116,6 +15537,30 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// Plan `2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr`
+    /// Phase 4: coord grants the phase-attestation pair to device principals, so
+    /// this door must forward both — and the source-text parser must read each
+    /// entry back exactly once despite the comments above them.
+    #[test]
+    fn phase_attestation_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_work_unit_attest_phase",
+            "coord_work_unit_retract_phase_attestation",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
     /// The MCP handshake + the legitimate coordination surface forwards.
     #[test]
     fn allows_handshake_and_coordination_tools() {
@@ -15661,6 +16106,53 @@ mod coord_mcp_body_gate_tests {
                  only pins that THIS door would not carry it."
             );
         }
+    }
+
+    /// The agent escalate-evidence door and the ten device-floor names found
+    /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
+    /// while the operator escape hatch for the same block stays withheld. A
+    /// literal enumeration, so dropping any one name — or moving the operator
+    /// attest onto the allowlist — reds this test by name.
+    #[test]
+    fn escalate_evidence_door_and_device_floor_drift_are_forwarded() {
+        for tool in [
+            "coord_submit_escalate_evidence",
+            "coord_adopt_pr",
+            "coord_answer_agent_question",
+            "coord_fleet_drain_status",
+            "coord_land_provenance_backfill",
+            "coord_next_step_settings_effective",
+            "coord_operator_touch_classify",
+            "coord_pending_agent_questions",
+            "coord_primary_tree_branch_status",
+            "coord_withdraw_agent_question",
+            "coord_work_unit_overview",
+        ] {
+            assert!(
+                coord_mcp_tool_is_allowed(tool),
+                "{tool} is granted on coord's device floor and must not be withheld here"
+            );
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be both allowed and listed as a deliberate exclusion"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+        }
+        assert!(
+            !coord_mcp_tool_is_allowed("coord_attest_escalate_override"),
+            "the operator escalate override must stay withheld; agents clear escalate \
+             blocks through coord_submit_escalate_evidence"
+        );
+        assert!(coord_mcp_withholding_is_deliberate(
+            "coord_attest_escalate_override"
+        ));
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
@@ -17770,6 +18262,53 @@ mod coord_provision_session_gate_tests {
         assert!(src.contains(".route(\"/health\", get(health))"));
     }
 
+    /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-
+    /// so-a-24x7-box-never-gets-one` Phase 4b: `/health` carries the scheduler
+    /// condition capability list, rendered from the evaluator's own const —
+    /// the field a schedule installer reads before registering a probe-gated
+    /// `Condition` task (same source-scan technique as the tests around it).
+    #[test]
+    fn the_health_handler_emits_the_scheduler_conditions_capability() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains(
+                "\"schedulerConditions\": crate::scheduler_service::enforced_conditions()"
+            ),
+            "{region}"
+        );
+        // And it renders as the JSON array a client reads: the evaluator's
+        // full list, now that the task store persists conditions (Phase 4c).
+        let rendered = serde_json::json!({
+            "schedulerConditions": crate::scheduler_service::enforced_conditions(),
+        });
+        assert!(crate::database::pg::scheduler::task_store_persists_conditions());
+        assert_eq!(
+            rendered["schedulerConditions"],
+            serde_json::json!([
+                "require_idle",
+                "require_repo_inactive",
+                "require_probe",
+                "timeout_minutes"
+            ])
+        );
+    }
+
     /// Plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
     /// tails-rotate-every-idle-thread` Phase 0: the by-name thread census and the
     /// transcript-tail gauge are rendered INSIDE `async fn health` — a snapshot
@@ -19501,6 +20040,74 @@ mod pr_credential_probe_tests {
             "{unbound}"
         );
         assert!(!unbound.contains("127.0.0.1"), "{unbound}");
+    }
+}
+
+#[cfg(test)]
+mod database_schema_health_tests {
+    use super::*;
+
+    /// The `false` arm: connect succeeded, but the probe found a missing
+    /// relation — `schema_ok` is `Some(false)` and `schema_detail` names it.
+    #[test]
+    fn missing_relation_yields_schema_ok_false_naming_it() {
+        let (schema_ok, schema_detail) =
+            derive_schema_health(Some(true), Some(Ok(Some("project.task_runs".to_string()))));
+        assert_eq!(schema_ok, Some(false));
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("missing relation: project.task_runs")
+        );
+    }
+
+    /// The all-present arm: connect succeeded and every required relation
+    /// resolved — `schema_ok` is `Some(true)` with no detail needed.
+    #[test]
+    fn all_relations_present_yields_schema_ok_true() {
+        let (schema_ok, schema_detail) = derive_schema_health(Some(true), Some(Ok(None)));
+        assert_eq!(schema_ok, Some(true));
+        assert_eq!(schema_detail, None);
+    }
+
+    /// The `null`/`None` arm via an unreachable connect: `reachable: false`
+    /// must NEVER be silently inherited as `schema_ok: false` — it stays
+    /// `None`, with a reason naming the connect state, not "probe error".
+    #[test]
+    fn unreachable_connect_yields_schema_ok_none_never_false() {
+        let (schema_ok, schema_detail) = derive_schema_health(Some(false), None);
+        assert_eq!(schema_ok, None, "a connect failure must not become `false`");
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("not attempted: reachable=false")
+        );
+    }
+
+    /// Same `None` arm, but for an UNPROBED/unconfigured PG (`reachable`
+    /// itself is `None`, not `Some(false)`) — still `schema_ok: None`, with a
+    /// distinct reason so the two unknown causes are not conflated.
+    #[test]
+    fn unknown_connect_state_yields_schema_ok_none() {
+        let (schema_ok, schema_detail) = derive_schema_health(None, None);
+        assert_eq!(schema_ok, None);
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("not attempted: reachable=unknown")
+        );
+    }
+
+    /// A schema probe that ran (because `reachable` was `Some(true)`) but hit
+    /// a genuine query-level error distinct from "table absent" must also
+    /// report `schema_ok: None`, never `Some(false)` — that would misreport an
+    /// infra hiccup as an unmigrated schema.
+    #[test]
+    fn probe_error_yields_schema_ok_none_not_false() {
+        let (schema_ok, schema_detail) =
+            derive_schema_health(Some(true), Some(Err("pool exhausted".to_string())));
+        assert_eq!(schema_ok, None);
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("probe error: pool exhausted")
+        );
     }
 }
 

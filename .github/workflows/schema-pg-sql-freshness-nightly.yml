@@ -78,23 +78,49 @@ name: schema.pg.sql.generated nightly freshness
 # only keeps this workflow observable and keeps the train clear. Adding a `push:`
 # arm silently un-watches this gate.
 #
-# NO `pull_request:` arm either: `schema-fresh` already verifies this exact
-# artifact at PR time, so a second PR-time check on the same fact adds no
-# information and would double-red the same PR. It also keeps this file out of
-# `src-tauri/tests/workflow_paths_self_inclusion.rs`'s scope, which only holds
-# workflows carrying a `paths:` filter on push/pull_request.
+# The `pull_request:` arm runs ONLY the cheap `selftest` job, never the
+# freshness check: `schema-fresh` already verifies this exact artifact at PR
+# time, so a second PR-time freshness check would add no information and would
+# double-red the same PR. Because that arm carries a `paths:` filter, this file
+# IS in `src-tauri/tests/workflow_paths_self_inclusion.rs`'s scope, and lists
+# its own path.
 #
 # ---------------------------------------------------------------------------
 # Behaviour on drift
 # ---------------------------------------------------------------------------
 # Detect -> push the regenerated dump to a long-lived branch -> open/update a
-# draft PR. The exit code reports DELIVERY, not merely drift:
+# PR that is born a DRAFT -> mark it ready for review once its head carries
+# Actions check runs (scripts/ci/ready-bot-draft-pr.sh). The branch is
+# force-pushed ONLY while its PR is a draft (or absent): once the PR is ready it
+# may be a live merge-train candidate, so later drift is delivered as a deduped
+# PR comment instead, and the run after it lands regenerates. The one exception
+# is a ready PR that CONFLICTS with main — it can never land, so it is
+# converted back to a draft and rebuilt. The exit code reports
+# DELIVERY, not merely drift:
 #
-#   * no drift                        -> green
-#   * drift, fully delivered as a PR  -> green (the PR is the signal; a human
-#                                        merges it, and the next night is green
-#                                        for real)
+#   * no drift                        -> green, `healed=false`
+#   * drift, fully delivered as a PR  -> green, `healed=true` (the PR is the
+#                                        signal; coord's merge train lands it
+#                                        once it is ready, and the next night
+#                                        is green for real)
 #   * drift, delivery FAILED          -> red, with the remediation printed
+#
+# A green night is therefore NOT evidence the dump is fresh — it may be green
+# because it HEALED. The `fresh_check` step's `healed` output and the step
+# summary say which, so a consumer need not parse prose.
+#
+# Why "born a draft, then readied": a GITHUB_TOKEN-authored PR fires no
+# `pull_request` workflows, so it would carry NO checks, and a no-checks PR
+# marked ready is a merge-train candidate with nothing to gate on. But coord
+# does not propose drafts either, so a draft nothing un-drafts is a fix that
+# never lands (#1505 sat 17 days with 23 green check runs). The script decides
+# by MEASUREMENT — >= 1 check run on the head => ready; 0 => stays a draft and,
+# past 48h, is paged once on the PR. The `Sweep the refresh PR` step re-decides
+# on every scheduled/dispatched main run, drift or not, so one bad night does
+# not park the PR forever — and on a night that finds NO drift it closes the
+# open refresh PR as obsolete (main already carries the dump; readying it
+# could land stale schema).
+# Plan: plans/2026-09-17-atlas-self-heal-files-its-own-fix-as-a-draft-and-nothing-lands-it.md
 #
 # So a red night means "I found drift and could NOT hand you the fix", which is
 # the actionable condition, and it is what the red-streak detector should fire
@@ -125,6 +151,11 @@ on:
       # that omits its own path does not run on the PR that edits it.
       - ".github/workflows/schema-pg-sql-freshness-nightly.yml"
       - "scripts/tests/test_schema_pr_step_guards.sh"
+      # The shared draft->ready script both self-heal nightlies call, and its
+      # own stubbed-gh test. Listed here because THIS workflow's selftest is
+      # the one that exercises them (sibling-pin-bump.yml has no step harness).
+      - "scripts/ci/ready-bot-draft-pr.sh"
+      - "scripts/tests/test_ready_bot_draft_pr.sh"
 
 # Least-privilege at workflow level; the one job that needs to write widens it
 # itself. Stated explicitly rather than inherited from the repo-level
@@ -151,6 +182,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: Test the refresh-PR step's guards (stubbed gh, no network)
         run: bash scripts/tests/test_schema_pr_step_guards.sh
+      - name: Test the draft->ready script (stubbed gh, no network)
+        run: bash scripts/tests/test_ready_bot_draft_pr.sh
 
   nightly:
     if: github.event_name != 'pull_request'
@@ -159,10 +192,14 @@ jobs:
 
     # A job-level block REPLACES the workflow-level one wholesale rather than
     # merging, so `contents` is restated here. `pull-requests: write` carries
-    # every `gh pr` verb except `create` (see pr_op_failed).
+    # every `gh pr` verb except `create` (see pr_op_failed), plus the
+    # ready/convert-to-draft mutations and the page comment. `checks: read` is
+    # what scripts/ci/ready-bot-draft-pr.sh reads the head's check runs with;
+    # without it that read is refused and the PR is never readied.
     permissions:
       contents: write
       pull-requests: write
+      checks: read
 
     services:
       postgres:
@@ -339,13 +376,27 @@ jobs:
           strip "$RUNNER_TEMP/schema.checked-in.sql" "$RUNNER_TEMP/a.sql"
           strip "$RUNNER_TEMP/schema.fresh.sql"      "$RUNNER_TEMP/b.sql"
 
+          # `healed` separates "green because fresh" from "green because
+          # healed": true EXACTLY when drift=true and self_heal=true. Both
+          # verdicts end this step exit 0, so without it the run conclusion
+          # cannot tell a consumer which one happened.
           if diff -q "$RUNNER_TEMP/a.sql" "$RUNNER_TEMP/b.sql" >/dev/null; then
-            echo "drift=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "drift=false"
+              echo "healed=false"
+            } >> "$GITHUB_OUTPUT"
             echo "schema.pg.sql.generated is up to date."
             exit 0
           fi
 
-          echo "drift=true" >> "$GITHUB_OUTPUT"
+          healed=false
+          if [ "$SELF_HEAL" = "true" ]; then
+            healed=true
+          fi
+          {
+            echo "drift=true"
+            echo "healed=$healed"
+          } >> "$GITHUB_OUTPUT"
           echo "schema.pg.sql.generated is STALE relative to a fresh alembic upgrade head + pg_dump."
           echo ""
           echo "Diff (first 80 lines):"
@@ -356,6 +407,28 @@ jobs:
           diff -u "$RUNNER_TEMP/schema.checked-in.sql" "$RUNNER_TEMP/schema.fresh.sql" | head -80 || true
 
           if [ "$SELF_HEAL" = "true" ]; then
+            # Name the drift in the summary: this run goes GREEN, and a green
+            # conclusion here means HEALED, not fresh. `awk` rather than
+            # `grep` so a dump with no CREATE TABLE line cannot exit 1.
+            awk '/^CREATE TABLE /' "$RUNNER_TEMP/a.sql" | LC_ALL=C sort > "$RUNNER_TEMP/tables.old"
+            awk '/^CREATE TABLE /' "$RUNNER_TEMP/b.sql" | LC_ALL=C sort > "$RUNNER_TEMP/tables.new"
+            LC_ALL=C comm -13 "$RUNNER_TEMP/tables.old" "$RUNNER_TEMP/tables.new" > "$RUNNER_TEMP/tables.added"
+            LC_ALL=C comm -23 "$RUNNER_TEMP/tables.old" "$RUNNER_TEMP/tables.new" > "$RUNNER_TEMP/tables.removed"
+            {
+              echo "### schema.pg.sql.generated: drift HEALED (green because healed, not because fresh)"
+              echo ""
+              echo "\`healed=true\` — the checked-in dump (${committed_n} lines) differs from a fresh"
+              echo "\`alembic upgrade head\` + \`pg_dump\` of qontinui-web@main (${fresh_n} lines)."
+              echo "Delivery follows in the PR step (see its summary block below); a red there means it was NOT delivered."
+              echo ""
+              echo "Tables added: $(wc -l < "$RUNNER_TEMP/tables.added" | tr -d ' '), removed: $(wc -l < "$RUNNER_TEMP/tables.removed" | tr -d ' ') (other changes are column/index/constraint level)."
+              echo ""
+              echo '```'
+              sed 's/^/+ /' "$RUNNER_TEMP/tables.added"
+              sed 's/^/- /' "$RUNNER_TEMP/tables.removed"
+              echo '```'
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "Drift on a scheduled/dispatched main run — the delivery step will push it."
             exit 0
           fi
@@ -387,6 +460,11 @@ jobs:
             local op="$1"
             echo "::error::The pull-request '$op' operation failed on $REPO (head branch '$BRANCH')."
             case "$op" in
+              ready*)
+                echo "::error::The refresh PR exists but its draft/ready state could not be decided (see scripts/ci/ready-bot-draft-pr.sh's ::error:: above). It runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal there means that permissions block has drifted."
+                echo "::error::Meanwhile, mark the PR ready for review by hand once its head carries checks — the regenerated dump is already committed on '$BRANCH'."
+                return 0
+                ;;
               create*)
                 echo "::error::Usually permissions/config, not schema drift (see gh's errors above). EITHER of these unblocks it:"
                 echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
@@ -409,7 +487,111 @@ jobs:
 
           # Resolve any existing PR BEFORE touching the branch. No `|| true`:
           # a gh failure here must not read as "no PR exists".
-          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          # Same-repository PRs only: a fork PR whose branch shares the name is
+          # never this workflow's to edit, comment on or force-push under.
+          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
+
+          # Identity of THIS run's regenerated dump, banner stripped (the
+          # banner is client noise, same rule as fresh_check's comparison).
+          # Carried as a hidden marker in the PR body and in any drift comment,
+          # so an unchanged dump is never re-announced. `awk`, not `grep -v`,
+          # so an empty file cannot exit 1.
+          dump_sha="$(awk '!/^-- Dumped by pg_dump version/' "$RUNNER_TEMP/schema.fresh.sql" | sha256sum | cut -c1-16)"
+          drift_marker="<!-- schema-pg-sql-refresh-dump:$dump_sha -->"
+
+          # NEVER FORCE-PUSH UNDER A READY PR. The PR is born a draft and then
+          # readied by scripts/ci/ready-bot-draft-pr.sh once it carries checks,
+          # after which it can be a live merge-train candidate — and moving the
+          # branch tip out from under an in-flight proposal is a known wedge
+          # class in this fleet. So a ready PR gets the new drift as a COMMENT
+          # instead, and this run goes green: the run after it lands
+          # regenerates against the new main. (Same guard as
+          # sibling-pin-bump.yml's PR step.) A draft is still force-pushed as
+          # before — nothing can be proposing it.
+          #
+          # isDraft is queried on its own rather than parsed out of a combined
+          # string, so a quoting change in gh's output cannot make every draft
+          # read as ready (or the reverse). No `|| true`: an unreadable state
+          # is a red, never a guess in either direction.
+          #
+          # EXCEPT a ready PR that CONFLICTS with main: it is not a train
+          # candidate (coord cannot land it), and commenting on it would park
+          # it forever. It is converted back to a draft (asserted from the
+          # mutation's own returned isDraft) and then takes the ordinary draft
+          # path below: rebuilt from the triggering sha, force-pushed, and
+          # re-readied once the new head's checks register. `UNKNOWN`
+          # mergeability is NOT a conflict — GitHub computes it lazily — so an
+          # unknown keeps the comment path: never force-push on an unknown.
+          if [ -n "$existing_num" ]; then
+            if ! existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"; then
+              pr_op_failed "view #$existing_num (isDraft)"; exit 1
+            fi
+            case "$existing_draft" in
+              true|false) : ;;
+              *) echo "::error::Could not read PR #$existing_num's draft state (got '$existing_draft'). Refusing to guess whether it may be force-pushed."; exit 1 ;;
+            esac
+            if [ "$existing_draft" = "false" ]; then
+              if ! merge_state="$(gh pr view "$existing_num" --repo "$REPO" --json mergeable,mergeStateStatus --jq '.mergeable + " " + .mergeStateStatus')"; then
+                pr_op_failed "view #$existing_num (mergeable)"; exit 1
+              fi
+              read -r mergeable merge_status <<< "$merge_state"
+              case "$mergeable" in
+                MERGEABLE|CONFLICTING|UNKNOWN) : ;;
+                *) echo "::error::Could not read PR #$existing_num's mergeability (got '$merge_state')."; exit 1 ;;
+              esac
+              if [ "$mergeable" = "CONFLICTING" ] || [ "${merge_status:-}" = "DIRTY" ]; then
+                echo "::warning::Refresh PR #$existing_num is ready but CONFLICTS with main ($mergeable/${merge_status:-}); it can never land. Converting it back to a draft and rebuilding '$BRANCH' from main."
+                if ! pr_node_id="$(gh pr view "$existing_num" --repo "$REPO" --json id --jq '.id')"; then
+                  pr_op_failed "view #$existing_num (id)"; exit 1
+                fi
+                if ! converted="$(gh api graphql -f query='mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{isDraft}}}' -f id="$pr_node_id" --jq '.data.convertPullRequestToDraft.pullRequest.isDraft')"; then
+                  pr_op_failed "convert #$existing_num to draft"; exit 1
+                fi
+                if [ "$converted" != "true" ]; then
+                  echo "::error::convertPullRequestToDraft on PR #$existing_num returned isDraft=[$converted], not true. Refusing to force-push under a PR that may still be ready."
+                  exit 1
+                fi
+                existing_draft=true
+              fi
+            fi
+            if [ "$existing_draft" != "true" ]; then
+              echo "::warning::Refresh PR #$existing_num is marked ready for review (possible merge-train candidate). Not force-pushing '$BRANCH' under it."
+              echo "::warning::The run after it lands regenerates against the new main. The new drift is delivered as a PR comment, and in this run's 'schema.pg.sql.generated-fresh' artifact."
+              # Dedup against the PR body (which carries the marker of the dump
+              # it was last pushed with) AND every comment. Materialized to a
+              # file before grepping, never `gh ... | grep -q`: grep exits on
+              # the first hit, SIGPIPEs gh, and under pipefail a dedup HIT
+              # becomes a failure. REST --paginate has no page cap, so the
+              # marker cannot scroll out of view on a PR that sits for days.
+              seen="$RUNNER_TEMP/refresh-pr-seen.txt"
+              if ! gh api "repos/$REPO/pulls/$existing_num" --jq '.body // ""' > "$seen"; then
+                pr_op_failed "read body of #$existing_num"; exit 1
+              fi
+              if ! gh api --paginate "repos/$REPO/issues/$existing_num/comments" --jq '.[].body' >> "$seen"; then
+                pr_op_failed "read comments of #$existing_num"; exit 1
+              fi
+              if grep -qF "$drift_marker" "$seen"; then
+                echo "PR #$existing_num already carries dump $dump_sha (body or comment); not commenting again."
+              else
+                comment="$RUNNER_TEMP/refresh-pr-comment.md"
+                {
+                  printf 'qontinui-web moved again after this PR was marked ready for review, so `%s` was **not** force-pushed — it may be a live merge-train candidate.\n\n' "$BRANCH"
+                  printf 'The newer regenerated dump (`%s`) is the `schema.pg.sql.generated-fresh` artifact on %s\n\n' "$dump_sha" "$RUN_URL"
+                  printf 'Once this PR lands, the next scheduled run regenerates against the new `main` and opens a fresh PR if anything is still stale.\n\n%s\n' "$drift_marker"
+                } > "$comment"
+                if ! gh pr comment "$existing_num" --repo "$REPO" --body-file "$comment"; then
+                  pr_op_failed "comment on #$existing_num"; exit 1
+                fi
+                echo "Commented the newer drift ($dump_sha) on ready PR #$existing_num."
+              fi
+              {
+                echo "### schema.pg.sql.generated refresh"
+                echo ""
+                echo "Drift detected; refresh PR #$existing_num is READY, so it was not force-pushed. New drift delivered as a comment (dump $dump_sha)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
 
           # Rebuild the branch from the TRIGGERING sha, not a bare HEAD.
           git checkout -B "$BRANCH" "$TRIGGER_SHA"
@@ -425,10 +607,14 @@ jobs:
 
           git commit -m "$TITLE"
           # Plain --force is justified: this is a bot-owned branch that is never
-          # fetched by a human, so there is no lease to lose.
+          # fetched by a human, so there is no lease to lose — and the guard
+          # above has established that no READY PR sits on it.
           git push --force origin "HEAD:refs/heads/$BRANCH"
           branch_pushed=1
-          echo "Pushed the regenerated dump to '$BRANCH'."
+          # The commit just pushed: the draft->ready call below must decide on
+          # THIS head, not on whatever head GitHub reports a second later.
+          pushed_sha="$(git rev-parse HEAD)"
+          echo "Pushed the regenerated dump to '$BRANCH' ($pushed_sha)."
 
           body="$RUNNER_TEMP/pr-body.md"
           {
@@ -450,15 +636,21 @@ jobs:
           web-authored drift: its `detect` job filters on two *runner* paths, while 100% of this
           dump is authored by qontinui-web's alembic chain.
 
-          **Opened as a draft on purpose**, so a PR that may carry no checks cannot sit in a
-          merge-train slot. Mark it ready for review once CI is satisfied.
+          **Born a draft on purpose**, so a PR that may carry no checks cannot sit in a
+          merge-train slot — and **auto-readied** by `scripts/ci/ready-bot-draft-pr.sh` as soon as
+          its head carries at least one check run, so coord's merge train can land it without a
+          human. The nightly re-decides this on every scheduled run.
 
           If this PR shows **no checks at all**, it was authored with `GITHUB_TOKEN`, which by
-          design does not fire `pull_request` workflows.
+          design does not fire `pull_request` workflows; it then stays a draft, and after 48 hours
+          the nightly pages on this PR once.
 
           Plan: plans/2026-08-07-runner-schema-freshness-cross-repo-blind-spot.md
           EOF
             printf '\nRun: %s\n' "$RUN_URL"
+            # Which dump this branch carries; the ready-PR guard above dedups
+            # its drift comment against it.
+            printf '\n%s\n' "$drift_marker"
           } > "$body"
 
           url=""
@@ -499,13 +691,109 @@ jobs:
             fi
           fi
 
-          # Draft on purpose: a PR that may carry no checks must not sit in a
-          # merge-train slot.
           echo "Refresh PR: $url"
+
+          # Born a draft (both create sites above pass --draft): a PR that may
+          # carry no checks must not sit in a merge-train slot. But coord does
+          # not propose drafts, so a draft nothing un-drafts never lands. The
+          # shared script decides by MEASUREMENT — >= 1 check run on the head
+          # => mark it ready; 0 => leave it a draft. The wait covers the
+          # seconds between this run's force-push and the check runs it fires
+          # registering; without it every night the branch moves would read 0.
+          # `tee` keeps the script's ::error:: lines in the log; under
+          # pipefail the `if !` sees the script's own exit status.
+          ready_log="$RUNNER_TEMP/ready-bot-draft-pr.pr-step.log"
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --wait-for-checks-seconds 180 --expect-head "$pushed_sha" | tee "$ready_log"; then
+            pr_op_failed "ready-for-review (scripts/ci/ready-bot-draft-pr.sh)"; exit 1
+          fi
+          pr_state="$(tail -n1 "$ready_log")"
+          case "$pr_state" in
+            "readied #"*|"already-ready #"*) pr_state_word="ready for review ($pr_state)" ;;
+            "head-mismatch #"*) pr_state_word="still a DRAFT: GitHub had not yet reported the pushed head $pushed_sha ($pr_state); the sweep step re-decides" ;;
+            "draft-conflicting #"*) pr_state_word="still a DRAFT: GitHub reports it conflicting with main ($pr_state); it is not readied, and the next run re-decides" ;;
+            "draft-no-checks #"*) pr_state_word="still a DRAFT: its head carries no Actions check runs yet ($pr_state); the sweep step re-decides every night" ;;
+            *)
+              echo "::warning::The PR was written moments ago but the draft->ready lookup reported '$pr_state'; the sweep step re-decides it."
+              pr_state_word="UNKNOWN ($pr_state)"
+              ;;
+          esac
           {
             echo "### schema.pg.sql.generated refresh"
             echo ""
             echo "Drift detected and delivered: $url"
+            echo ""
+            echo "Refresh PR state: $pr_state_word"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Re-decide the refresh PR's draft state on EVERY scheduled/dispatched
+      # main run — drift or not. The PR step above only runs on drift, and it
+      # decides at one instant; a PR created on the GITHUB_TOKEN arm, or before
+      # its checks registered, would otherwise stay a draft until the next
+      # drift. Keyed on `self_heal` (the same selector as the PR step, minus the
+      # drift term) under `!cancelled()` rather than the default success().
+      # Say exactly what that buys: `self_heal` is written as fresh_check's
+      # FIRST line, so the sweep still runs when fresh_check ITSELF fails after
+      # that line (a regeneration fault, a shape guard) or when the PR step
+      # fails. It does NOT run when poetry, the alembic chain or the Atlas
+      # apply fails: those steps come BEFORE fresh_check, so `self_heal` is ''
+      # and the condition reads false. Accepted — such a night reaches the
+      # parked PR again the next night. The sweep's own failure still reds.
+      # It is the LAST step that touches the PR, after every draft read.
+      #
+      # What it passes the script:
+      #   --max-age-hours 48  (two nightlies) page once on a draft parked past
+      #                       the budget (no Actions checks, or conflicting).
+      #   --expect-head       the branch's head per `git ls-remote`, so the
+      #                       decision is on the commit the branch carries now;
+      #                       an absent branch passes none.
+      #   --close-if-obsolete ONLY when fresh_check reported drift=false
+      #                       EXPLICITLY: main is already current, so the open
+      #                       refresh PR — conflicting or not — carries an
+      #                       obsolete dump, and readying it could land stale
+      #                       schema (e.g. re-add a table web has since
+      #                       dropped); it is closed. An empty `drift`
+      #                       (fresh_check failed before deciding) is UNKNOWN
+      #                       and never closes anything.
+      - name: Sweep the refresh PR (ready it once it carries checks; page if parked)
+        id: sweep
+        if: ${{ !cancelled() && steps.fresh_check.outputs.self_heal == 'true' }}
+        working-directory: qontinui-runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: chore/schema-pg-sql-refresh
+          HEALED: ${{ steps.fresh_check.outputs.healed }}
+          DRIFT: ${{ steps.fresh_check.outputs.drift }}
+        run: |
+          set -euo pipefail
+          sweep_log="$RUNNER_TEMP/ready-bot-draft-pr.sweep.log"
+          extra_args=()
+          # No `|| true`: an unanswered ls-remote is not "no branch".
+          if ! remote_line="$(git ls-remote origin "refs/heads/$BRANCH")"; then
+            echo "::error::git ls-remote for '$BRANCH' failed (see above); refusing to decide on an unpinned head."
+            exit 1
+          fi
+          remote_head="${remote_line%%$'\t'*}"
+          if [ -n "$remote_head" ]; then
+            extra_args+=(--expect-head "$remote_head")
+          fi
+          if [ "$DRIFT" = "false" ]; then
+            extra_args+=(--close-if-obsolete)
+          fi
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --max-age-hours 48 "${extra_args[@]}" | tee "$sweep_log"; then
+            echo "::error::The refresh-PR sweep could not decide the draft/ready state of '$BRANCH''s PR on $REPO (see the ::error:: above)."
+            echo "::error::It runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal means that permissions block has drifted."
+            exit 1
+          fi
+          {
+            echo "### schema.pg.sql.generated refresh-PR sweep"
+            echo ""
+            echo "healed=$HEALED; drift=${DRIFT:-unknown}; sweep outcome: \`$(tail -n1 "$sweep_log")\`"
+            echo ""
+            echo '```'
+            cat "$sweep_log"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Keyed on the `drift` output rather than `failure()`, because the

@@ -23,9 +23,12 @@
 //! `PathSettings::plans_dir` setting — the **Paths** section of the settings
 //! UI, or `paths.plans_dir` in `settings.json`. There is **no environment
 //! override**: the one that used to exist was a backward-compatibility shim
-//! that silently outranked the setting; the binary's `plans_dir_migration`
-//! persists its value into the setting once at boot, and the env read itself
-//! is gone. The markdown-plan carrier is the optional top coordination tier,
+//! that silently outranked the setting, and the resolver's env read is gone.
+//! The binary's `plans_dir_migration` seeds a BLANK setting at primary boot
+//! from that retired shim, else from `QONTINUI_PLANS_DIR` outside runner
+//! context — a write into the setting, never a resolver rung. So turning the
+//! tier off durably means removing that env export as well as clearing the
+//! setting. The markdown-plan carrier is the optional top coordination tier,
 //! so a runner with nothing configured no-ops (it never scans, never pushes) —
 //! claims/intent and coord-native work-units are unaffected.
 //!
@@ -1260,7 +1263,25 @@ impl ProcessGit {
         use crate::process_helpers::DegradeReason;
         let why = match reason {
             DegradeReason::Status => "it exited non-zero".to_string(),
-            DegradeReason::SpawnError => "it could not be spawned (SpawnError)".to_string(),
+            // The classification is part of the text on purpose: "out of
+            // commit" and "git is not installed" have different remedies. It
+            // is also stable per fault (a kind and an OS code, never a pid),
+            // so `is_same_reading` still sees one unchanging fault as one.
+            DegradeReason::SpawnError(f) => match (f.exhaustion, f.os_code) {
+                (Some(kind), code) => format!(
+                    "it could not be spawned (SpawnError: {} exhaustion, os error {})",
+                    kind.as_str(),
+                    code.map_or_else(|| "none".to_string(), |c| c.to_string())
+                ),
+                (None, Some(code)) => {
+                    format!("it could not be spawned (SpawnError, os error {code})")
+                }
+                (None, None) => "it could not be spawned (SpawnError)".to_string(),
+            },
+            DegradeReason::CommitExhaustionSuspected { os_code } => format!(
+                "it exited non-zero because its own child launch failed \
+                 (commit_exhaustion_suspected, os error {os_code})"
+            ),
             DegradeReason::TimedOut { reaped, .. } => format!(
                 "it overran its {}s budget and was killed (TimedOut{})",
                 budget.as_secs(),
@@ -4509,28 +4530,72 @@ pub fn body_sync_disabled_message(observed: Option<&str>) -> String {
 
 /// What [`BodySync::run_cycle`] says about the tenant's `plan_capture` dial
 /// this cycle, given the verdict it recorded last cycle: the dial is announced
-/// on the FIRST cycle unconditionally, on every later cycle only when it flips,
-/// and otherwise not at all.
+/// on the FIRST cycle unconditionally, on every later cycle only when it
+/// changes, and otherwise not at all.
 ///
 /// The first-cycle arm exists because a runner that boots with the dial OFF
 /// used to say nothing recognisable about it — the previous "changed" wording
 /// fired then too, but described a boot as a transition, and a reader grepping
 /// for the dial's boot state found no line that named it as such.
-pub fn capture_gate_message(previous: Option<bool>, gate_open: bool) -> Option<&'static str> {
-    match (previous, gate_open) {
-        (None, true) => Some(
+///
+/// [`CaptureVerdict::Unanswered`] has its own wording on purpose: a runner
+/// that has not heard from coord yet is WAITING, and saying "CLOSED" would
+/// claim the tenant turned capture off when nobody has said so.
+pub fn capture_gate_message(
+    previous: Option<CaptureVerdict>,
+    now: CaptureVerdict,
+) -> Option<&'static str> {
+    match (previous, now) {
+        (None, CaptureVerdict::Open) => Some(
             "plan library: tenant plan_capture dial is OPEN on the body sync's first cycle — \
              scanned plan bodies are pushed to agent.work_artifacts",
         ),
-        (None, false) => Some(
+        (None, CaptureVerdict::Closed) => Some(
             "plan library: tenant plan_capture dial is CLOSED on the body sync's first cycle — \
              plan bodies are NOT pushed to agent.work_artifacts until the dial opens (it is \
              re-read every cycle, no restart needed)",
+        ),
+        (None, CaptureVerdict::Unanswered) => Some(
+            "plan library: tenant plan_capture dial is UNANSWERED on the body sync's first \
+             cycle — coord has not yet answered this process's plan_capture poll, so plan \
+             bodies are held (not pushed) until it does; the default is record, but an \
+             explicit off must be able to win first",
+        ),
+        // Leaving UNANSWERED is coord's first answer, not a flip — name it.
+        (Some(CaptureVerdict::Unanswered), CaptureVerdict::Open) => Some(
+            "plan library: coord answered: tenant plan_capture is record — the body sync is \
+             authorized and scanned plan bodies are now pushed to agent.work_artifacts",
+        ),
+        (Some(CaptureVerdict::Unanswered), CaptureVerdict::Closed) => Some(
+            "plan library: coord answered: tenant plan_capture is off — plan bodies stay held \
+             (not pushed to agent.work_artifacts) until the dial opens",
         ),
         (Some(prev), now) if prev != now => {
             Some("plan library: tenant plan_capture level changed the body sync's authorization")
         }
         _ => None,
+    }
+}
+
+/// What the tenant's fleet dial says about plan capture right now, as the body
+/// sync sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureVerdict {
+    /// Coord has answered in this process and the level is `record`.
+    Open,
+    /// Coord has answered in this process and the level is not `record`.
+    Closed,
+    /// Coord has not answered yet in this process. The level's default is
+    /// `record`, but pushing on a guess would publish a tenant's plans before
+    /// an explicit `off` could arrive, so this holds like `Closed` — and is
+    /// logged as waiting, not as closed.
+    Unanswered,
+}
+
+impl CaptureVerdict {
+    /// Whether plan bodies may be pushed.
+    pub fn is_open(self) -> bool {
+        self == CaptureVerdict::Open
     }
 }
 
@@ -4540,7 +4605,7 @@ pub fn capture_gate_message(previous: Option<bool>, gate_open: bool) -> Option<&
 /// runner **binary** (`crate::mcp::fleet_policy_poller`) while this adapter
 /// lives in the lib crate, which cannot see it. The binary supplies the reader
 /// at spawn time; the lib stays free of the poller.
-pub type CaptureGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+pub type CaptureGate = std::sync::Arc<dyn Fn() -> CaptureVerdict + Send + Sync>;
 
 /// Whether THIS runner instance may publish the machine's scan-root reading.
 ///
@@ -4730,8 +4795,9 @@ pub fn scan_report_due(
 ///
 /// ## The fleet dial governs this, not just the briefing
 ///
-/// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` level —
-/// on every cycle, and does nothing at `off`. Without that the dial would be
+/// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` verdict —
+/// on every cycle, and does nothing unless it is [`CaptureVerdict::Open`]: at
+/// an explicit `off`, and until coord has answered this process at all. Without that the dial would be
 /// advisory for everything except the system-prompt clause: a runner with
 /// the body sync on would keep pushing the whole corpus at fleet level `off`.
 /// Capture is two independent switches in the same direction — a per-machine
@@ -4757,7 +4823,7 @@ pub struct BodySync {
     breaker: FailureBreaker,
     /// Last gate verdict observed, so a flip is logged ONCE rather than every
     /// tick. `None` until the first cycle.
-    last_gate_open: Option<bool>,
+    last_gate_open: Option<CaptureVerdict>,
     /// The scan-root reading last ACCEPTED by the web read side, and when —
     /// see [`scan_report_due`]. Reset with the rest of this struct when the
     /// path settings move, so a new plans dir is reported on its first cycle.
@@ -4900,7 +4966,7 @@ impl BodySync {
         metrics: &AdapterMetrics,
         censuses: ScanCensusInputs,
     ) {
-        if !(self.capture_gate)() {
+        if !(self.capture_gate)().is_open() {
             return;
         }
         self.report_scan_root_if_due(
@@ -5136,12 +5202,12 @@ impl BodySync {
         ref_census: Option<super::body_push::PlanSlugCensus>,
         pin: std::sync::Arc<CycleRefPin>,
     ) {
-        let gate_open = (self.capture_gate)();
-        if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
-            tracing::info!(capture_enabled = gate_open, "{message}");
+        let verdict = (self.capture_gate)();
+        if let Some(message) = capture_gate_message(self.last_gate_open, verdict) {
+            tracing::info!(capture_enabled = verdict.is_open(), capture_verdict = ?verdict, "{message}");
         }
-        self.last_gate_open = Some(gate_open);
-        if !gate_open {
+        self.last_gate_open = Some(verdict);
+        if !verdict.is_open() {
             return;
         }
         // The scan-root report goes AFTER the capture gate (a tenant at
@@ -5294,8 +5360,10 @@ fn tenant_override(by_tenant: &BTreeMap<String, String>, tenant: Option<&str>) -
 /// that used to sit above this setting was a backward-compatibility shim for a
 /// pre-settings deployment, and it silently outranked the setting — the
 /// settings UI could show a directory that was not the one in effect. It was
-/// migrated into the setting once at boot (the binary's `plans_dir_migration`)
-/// and then deleted: one precedence chain, one source of truth.
+/// deleted: one precedence chain, one source of truth. (The binary's
+/// `plans_dir_migration` still SEEDS a blank setting at primary boot from that
+/// retired shim or, outside runner context, `QONTINUI_PLANS_DIR` — a write
+/// into the setting, not a rung here.)
 ///
 /// Kept as its own name rather than having callers spell the filter
 /// themselves because it is the documented seam every surface that needs
@@ -8380,7 +8448,13 @@ Body.
         BodySync::new(
             Vec::new(),
             super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
-            std::sync::Arc::new(move || gate_open) as CaptureGate,
+            std::sync::Arc::new(move || {
+                if gate_open {
+                    CaptureVerdict::Open
+                } else {
+                    CaptureVerdict::Closed
+                }
+            }) as CaptureGate,
         )
         .with_reporter(reporter)
         .with_scan_report_gate(owns_the_machine())
@@ -8585,7 +8659,7 @@ Body.
                 super::super::body_push::PLANS_ROOT_LABEL,
             )],
             super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_reporter(reporter)
         .with_scan_report_gate(owns_the_machine())
@@ -8902,7 +8976,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
         .with_scan_reporter(reporter.clone())
@@ -8957,7 +9031,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_scan_report_gate(owns_the_machine())
         .with_scan_reporter(reporter.clone())
@@ -9034,7 +9108,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_scan_report_gate(owns_the_machine())
         .with_scan_reporter(reporter.clone())
@@ -9329,7 +9403,7 @@ Body.
         let mut unconfigured = BodySync::new(
             Vec::new(),
             super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_reporter(silent.clone());
         unconfigured
@@ -9352,7 +9426,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
         .with_scan_reporter(reporter.clone());
@@ -9426,6 +9500,26 @@ Body.
         assert!(reporter.states().is_empty());
     }
 
+    /// A runner coord has not answered yet (cold start) publishes nothing
+    /// either: the `record` default does not open the write path on a guess.
+    #[tokio::test]
+    async fn an_unanswered_capture_gate_reports_nothing() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = BodySync::new(
+            Vec::new(),
+            super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
+            std::sync::Arc::new(|| CaptureVerdict::Unanswered) as CaptureGate,
+        )
+        .with_reporter(reporter.clone())
+        .with_scan_report_gate(owns_the_machine());
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
+            .await;
+        bs.report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
+        assert!(reporter.states().is_empty());
+    }
+
     /// A device with NO plans dir still reports `not_scanning` when it has a
     /// body sync — through the idle tick, which never reaches `run_cycle` —
     /// and under the same posting policy: once, not every tick.
@@ -9440,7 +9534,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
         .with_scan_reporter(reporter.clone())
@@ -9685,7 +9779,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_scan_report_gate(owns_the_machine())
         .with_scan_reporter(std::sync::Arc::new(FakeReporter::default()))
@@ -9728,7 +9822,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_scan_report_gate(owns_the_machine())
         .with_scan_reporter(std::sync::Arc::new(FakeReporter::default()))
@@ -9819,19 +9913,34 @@ Body.
     /// flip afterwards, and never on a steady cycle.
     #[test]
     fn the_capture_dial_is_announced_on_the_first_cycle_and_on_flips_only() {
-        let first_closed = capture_gate_message(None, false).expect("first cycle, closed");
+        use CaptureVerdict::{Closed, Open, Unanswered};
+        let first_closed = capture_gate_message(None, Closed).expect("first cycle, closed");
         assert!(first_closed.contains("CLOSED"), "{first_closed}");
         assert!(first_closed.contains("first cycle"), "{first_closed}");
-        let first_open = capture_gate_message(None, true).expect("first cycle, open");
+        let first_open = capture_gate_message(None, Open).expect("first cycle, open");
         assert!(first_open.contains("OPEN"), "{first_open}");
         assert!(first_open.contains("first cycle"), "{first_open}");
+        // Not-yet-answered is WAITING, and must not claim the dial is closed.
+        let first_waiting =
+            capture_gate_message(None, Unanswered).expect("first cycle, unanswered");
+        assert!(first_waiting.contains("UNANSWERED"), "{first_waiting}");
+        assert!(!first_waiting.contains("CLOSED"), "{first_waiting}");
 
-        assert_eq!(capture_gate_message(Some(false), false), None);
-        assert_eq!(capture_gate_message(Some(true), true), None);
+        assert_eq!(capture_gate_message(Some(Closed), Closed), None);
+        assert_eq!(capture_gate_message(Some(Open), Open), None);
+        assert_eq!(capture_gate_message(Some(Unanswered), Unanswered), None);
 
-        let flipped = capture_gate_message(Some(false), true).expect("flip");
+        let flipped = capture_gate_message(Some(Closed), Open).expect("flip");
         assert!(flipped.contains("changed"), "{flipped}");
-        assert_eq!(capture_gate_message(Some(true), false), Some(flipped));
+        assert_eq!(capture_gate_message(Some(Open), Closed), Some(flipped));
+        // Leaving UNANSWERED names coord's answer rather than calling it a flip.
+        let answered_off = capture_gate_message(Some(Unanswered), Closed).expect("answered off");
+        assert!(answered_off.contains("coord answered"), "{answered_off}");
+        assert!(answered_off.contains("is off"), "{answered_off}");
+        let answered_on = capture_gate_message(Some(Unanswered), Open).expect("answered record");
+        assert!(answered_on.contains("coord answered"), "{answered_on}");
+        assert!(answered_on.contains("is record"), "{answered_on}");
+        assert_ne!(Some(answered_on), Some(flipped));
     }
 
     /// With the sync on by default, the thing that protects a release build is
@@ -10646,13 +10755,14 @@ Body.
                 .iter()
                 .rev()
                 .find(|b| b.slug == slug)
-                .and_then(|b| b.metadata.clone())
+                .and_then(|b| b.metadata.clone().or_else(|| b.metadata_patch.clone()))
                 .expect("the unit was pushed")
         };
-        assert!(!meta_for("2026-01-01-bad-area")
-            .as_object()
-            .unwrap()
-            .contains_key("area"));
+        // A phase-less plan goes out as a patch, where an undeclared area is
+        // an explicit `null` (RFC 7396 delete) rather than an absent key.
+        assert!(meta_for("2026-01-01-bad-area")
+            .get("area")
+            .is_none_or(|a| a.is_null()));
         assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
     }
 
@@ -11842,7 +11952,10 @@ Body.
             let last = upserts.last().expect("at least one upsert");
             assert_eq!(last.title.as_deref(), Some("Renamed twice"));
             assert_eq!(
-                last.metadata.as_ref().expect("metadata")["source_path"],
+                last.metadata
+                    .as_ref()
+                    .or(last.metadata_patch.as_ref())
+                    .expect("metadata")["source_path"],
                 "plans/archive-candidates/a.md",
                 "a moved plan's provenance must follow it"
             );
@@ -12468,14 +12581,14 @@ Body.
         // [policy: a-test-must-be-able-to-fail, shape 2].
         assert_eq!(
             by_slug["2026-01-01-shipped-plan"]
-                .metadata
+                .metadata_patch
                 .as_ref()
                 .unwrap()["archive_path"],
             serde_json::json!("myrepo/archive/2026-01-01-shipped-plan.md")
         );
         assert_eq!(
             by_slug["2026-01-02-archived-plan"]
-                .metadata
+                .metadata_patch
                 .as_ref()
                 .unwrap()["archive_path"],
             serde_json::json!("myrepo/archive/2026-01-02-archived-plan.md")
@@ -12927,12 +13040,15 @@ Body.
     /// returns early: a previously hermetic suite would start failing on a
     /// property of the host. Injecting the answer removes the host from it.
     fn tick_state(reader: PathReader) -> LoopState {
-        LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate).with_git(
-            std::sync::Arc::new(FakeGit {
-                root: Ok(None),
-                ..FakeGit::healthy(0, 0)
-            }),
+        LoopState::new(
+            reader,
+            None,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(None),
+            ..FakeGit::healthy(0, 0)
+        }))
     }
 
     /// The phase's headline acceptance criterion, pinned at the TICK — the
@@ -12951,8 +13067,12 @@ Body.
         let (_cell, reader) = switchable_paths();
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
-            .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
+        let mut state = LoopState::new(
+            reader,
+            None,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
 
         assert_eq!(
             metrics.snapshot().scan_divergence,
@@ -12984,8 +13104,12 @@ Body.
         *cell.lock().unwrap() = plans_dir_input(dir.path());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
-            .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
+        let mut state = LoopState::new(
+            reader,
+            None,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
 
         state.tick(&sink, &metrics).await;
 
@@ -13222,7 +13346,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_scan_report_gate(owns_the_machine())
         .with_scan_reporter(reporter.clone())
@@ -13588,7 +13712,7 @@ Body.
             Some(super::super::body_push::HttpArtifactSink::new(
                 "http://127.0.0.1:9",
             )),
-            std::sync::Arc::new(|| true) as CaptureGate,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
         )
         .with_scan_report_gate(std::sync::Arc::new(|| true) as ScanReportGate)
         .with_scan_reporter(reporter.clone())
@@ -13634,12 +13758,16 @@ Body.
         *cell.lock().unwrap() = plans_dir_input(dir.path());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
-            .with_git(std::sync::Arc::new(FakeGit {
-                root: Ok(Some(dir.path().to_path_buf())),
-                default_ref: Err("no `origin/HEAD` in this clone".to_string()),
-                ..FakeGit::healthy(0, 0)
-            }));
+        let mut state = LoopState::new(
+            reader,
+            None,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            default_ref: Err("no `origin/HEAD` in this clone".to_string()),
+            ..FakeGit::healthy(0, 0)
+        }));
 
         for _ in 0..3 {
             state.tick(&sink, &metrics).await;
@@ -14180,7 +14308,10 @@ Body.
         let last = sink.upserts.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.slug, "s");
         assert_eq!(last.status, None, "metadata-only: no status on the wire");
-        assert!(last.metadata.is_some(), "provenance keeps reaching coord");
+        assert!(
+            last.metadata.is_some() || last.metadata_patch.is_some(),
+            "provenance keeps reaching coord"
+        );
         assert_eq!(
             sink.statuses.lock().unwrap().get("s").map(String::as_str),
             Some(current),
@@ -14764,8 +14895,12 @@ Body.
         *cell.lock().unwrap() = plans_dir_input(dir.path());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
-            .with_git(git.clone());
+        let mut state = LoopState::new(
+            reader,
+            None,
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
+        )
+        .with_git(git.clone());
 
         state.tick(&sink, &metrics).await;
         assert_eq!(

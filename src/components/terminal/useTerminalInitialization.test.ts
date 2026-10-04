@@ -362,7 +362,42 @@ describe("runVerifiedResume", () => {
 
   beforeEach(() => {
     mockInvoke.mockReset();
-    mockInvoke.mockResolvedValue({ success: true, message: null, data: null });
+    // The pane probe reads a plain shell (no claude), so the typing paths run.
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "terminal_probe_claude"
+        ? { success: true, message: null, data: { state: "absent", sessionIds: [] } }
+        : { success: true, message: null, data: null },
+    );
+  });
+
+  it("a claude that is NOT provably this session → types nothing, parks resumeFailed, no re-assert, marker kept", async () => {
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      recordOpen: RECORD_OPEN,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 5,
+        intervalMs: 1,
+        readTail: async () => "",
+        probeClaude: async () => ({ state: "live", sessionIds: ["sess-other"] }),
+      },
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", {
+      isReconnecting: false,
+      resumeFailed: true,
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
   });
 
   it("verified handshake → clears isReconnecting AND the backend restore-pending marker", async () => {

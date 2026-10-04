@@ -65,6 +65,19 @@ Include PRs the session opened via stacked worktrees. Build a table:
 `coord:upstream-of=` labels as dependency edges (parents land before children).
 Skip drafts. If zero PRs found and none given, report and exit.
 
+**Then declare the hand-off of each PR's worktree** once its branch is pushed,
+so a session that waits days on the train stops holding a worktree slot. Run
+`/unattended` Step 4.9's declaration step once per worktree:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/worktree-handoff.sh --path <worktree> --pr '<owner/repo#n>'
+```
+
+Report its three output lines; that step says what each one means and what the
+declaration does and does not give up. Nothing here changes Step 3: a red PR is
+still fixed here, and editing the tree re-occupies it. In a subagent, declare
+only worktrees the subagent itself allocated.
+
 ## Step 2 — Watch loop
 
 ⚠️ **Do not hand-write the poll. Invoke `scripts/watch-until.sh`.** Two of the
@@ -286,6 +299,7 @@ Only once the classification says “real” do you read the failing run log
   |---|---|---|---|
   | **1 (primary)** | `conclusion == "failure"` ∧ `steps` non-empty ∧ **NO step has `conclusion == "failure"`** | infrastructure kill | **re-run it** |
   | **2** | `conclusion == "failure"` ∧ `steps` is **empty** | infra-unknown | re-run it |
+  | **T (declared step timeout)** | `conclusion == "failure"` ∧ the job's check-run annotations carry a title containing `TIMED OUT (not a verdict on this PR)` — read with `gh api "repos/OWNER/REPO/check-runs/<job_id>/annotations" --jq '.[].title'` (an Actions job id IS its check-run id) | step killed at its `timeout-minutes` bound: the suite did **not** complete, the run is **inconclusive** | **re-run it** (counts against the 2 reruns); fix in-session only if your diff touches the file of a test the log names `... FAILED` |
   | **3 (confirmatory only)** | log contains `The runner has received a shutdown signal` or `lost communication with the server` | corroborates Tier 1/2 | **never sufficient alone** |
   | **none — deliberately untiered** | `conclusion == "cancelled"` (the jq above selects it, so it *will* appear in this output) | **no verdict reached** — the tiers are all keyed on `conclusion == "failure"`, and a cancel must not fall through them into "otherwise → genuine" | **Scope-dependent — read the note below before acting.** On a **PR head**: do not count it as a red. On a **main baseline**: the infra-cancelled class — apply the *matching* row of the steward's red-main remedies table (two remedies, each conditioned) |
 
@@ -354,7 +368,17 @@ Only once the classification says “real” do you read the failing run log
   shape you cannot see that way.
 
   **ANY failed step means a genuine failure of that step** — Tier 1 requires
-  ZERO, so the count that separates the two causes is zero-vs-nonzero. The
+  ZERO, so the count that separates the two causes is zero-vs-nonzero. **The
+  one carve-out is Tier T**, and it is checked BEFORE this rule: a step-level
+  `timeout-minutes` expiry concludes as a plain `failure` (GitHub reports
+  `timed_out` only at JOB level), so a killed step has exactly the shape of a
+  genuine one and only the job's own annotation tells them apart. The job
+  measures elapsed time against the bound and emits the marker itself
+  (`qontinui-coord` `ci.yml`, `coord-db-tests`; coord's `ci_rework` nudge reads
+  the same title). Do **not** read a `... FAILED` line in such a run as an
+  artefact: the suite is serial, so it is a real recorded failure whose
+  message the kill destroyed — the re-run is how you get it back. Plan
+  `2026-09-23-a-coord-db-tests-step-timeout-reports-a-passing-test-as-failed`. The
   GitHub-hosted OOM is the nonzero case with exactly one (the build step, exit
   143), and it is **futile to re-run**: it needs a resource fix, not another
   attempt.
@@ -576,7 +600,7 @@ it — WAIT, do not race it).
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
 | **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red`, `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2 kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
 | **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
-| **Coord down** | no leader across 4–8 health samples, **and** `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — which for an agent ends in the operator hand-off, not a merge (#328). |
+| **Coord down** | no leader across 4–8 health samples, **and** `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — which for an agent ends in the operator hand-off, not a merge (#328). |
 
 **`escalate-path-matched` is a hold with a named pending gate — read it before
 deciding who acts.** `coord_pr_merge_verdict {repo, pr_number}` returns an
@@ -782,7 +806,7 @@ to the watch loop — coord lands it, no admin-merge.
 Preconditions — ALL must hold:
 - Diagnosis class is **coord defect** or **coord down** (never a legitimate
   hold, never transient) — and **coord down** is stated only as the
-  `FLOOR-CLAIM: verdict=FLOOR` block from `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim`, pasted verbatim.
+  `FLOOR-CLAIM: verdict=FLOOR` block from `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim`, pasted verbatim.
 - Step 5 levers tried and did not clear it (skip levers when coord is down).
 - `/merge/queue` shows no in-flight proposal for this PR (do not race coord).
 - CI is fully green on the CURRENT head, including the stale-green re-check
@@ -928,6 +952,12 @@ Then:
    `gh pr merge <n> --rebase`. Strict rulesets (qontinui-web) need
    the up-to-date head; non-strict ones (qontinui-coord) merge as soon as the
    required checks are green on the current head.
+   **A peer's coord PROPOSAL is not its branch.** A proposal holding a merge
+   slot past the repo's own `stall_window_secs` can be cancelled by any session,
+   but only through the class A/B/C table and the per-target probe in
+   `/merge-train-steward` (the `self_blocking` arm) — `unblock: true` only, a
+   Stop-mode cancel is class C, and a 409 from the door is a successful guard,
+   never something to retry.
    **Adopting a foreign branch (route-around) — the only shape it may take.**
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
@@ -937,7 +967,12 @@ Then:
    `Session-Id:` onto the author's commits, which is the corruption that PR
    closes, so check its state before trusting the trailers you produced),
    open a NEW PR from that branch, and leave the
-   original PR to be superseded. Every adoption discloses, in the new PR's
+   original PR to be superseded. Open it in `/implement-plan` Step 4.5b's
+   served door order and READ it back — `gh pr list --repo <owner/repo>
+   --head <new-branch> --state all --json number,url,state,headRefOid` must
+   return a row whose `headRefOid` is the head you pushed; the create call's
+   exit status and output are never evidence a PR exists. Every adoption
+   discloses, in the new PR's
    body, all four of these lines — they are what coord#2034 wrote in prose on
    2026-09-08 and what `scripts/adoption-disclosure-check.sh` checks:
 

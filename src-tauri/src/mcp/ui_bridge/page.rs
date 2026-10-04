@@ -268,9 +268,83 @@ impl RequestHints for SetTabRequest {
 pub struct SetTabResponse {
     pub success: bool,
     pub tab: String,
-    /// Value of `[data-page-id]` on the active page after the tab change
-    /// (null if no element with that attribute is present).
+    /// Value of the FIRST `[data-page-id]` in document order after the tab
+    /// change — always the outermost page wrapper, never a sub-view (null if
+    /// no element with that attribute is present). The selector predates
+    /// `activePageId` and is unchanged; the value used to be always null
+    /// because the read-back Promise was never awaited. Read `active_page_id`
+    /// when you need the innermost visible view.
     pub page_id: Option<String>,
+    /// `data-page-id` of the deepest VISIBLE `[data-page-id]` inside the page
+    /// wrapper (the wrapper itself included) — the sub-view a nested page
+    /// publishes. Visible means a non-zero bounding client rect, so unmounted
+    /// and `display:none` views are skipped; greatest ancestor depth wins and
+    /// ties go to the last in document order. Equals `page_id` when the page
+    /// publishes no nested id and the wrapper is visible (Settings sub-tabs,
+    /// for one, carry none). Null when no candidate inside the wrapper has a
+    /// non-zero rect.
+    pub active_page_id: Option<String>,
+    /// `data-page-id` values along the winning element's ancestor path, outer
+    /// to inner, consecutive duplicates collapsed (the last entry equals
+    /// `active_page_id`). Empty when `active_page_id` is null.
+    pub page_id_chain: Vec<String>,
+}
+
+/// The read-back walk evaluated in the webview after a set-tab dispatch. It
+/// defines `readSetTabPageIds(doc)`; its vitest lives in
+/// `src/components/app/__tests__/set-tab-readback.test.ts`.
+const SET_TAB_READBACK_JS: &str = include_str!("set_tab_readback.js");
+
+/// The set-tab eval expression: dispatch `ui-bridge-set-tab`, wait 100 ms,
+/// then return the [`SET_TAB_READBACK_JS`] read-back as a JSON string. Must be
+/// evaluated with `await_promise = true` — it is an async IIFE.
+fn set_tab_expression(tab: &str) -> String {
+    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
+            await new Promise(r => setTimeout(r, 100));
+            {}
+            try {{ return JSON.stringify(readSetTabPageIds(document)); }} catch (e) {{ return "{{}}"; }}
+        }})()"#,
+        escaped_tab, SET_TAB_READBACK_JS
+    )
+}
+
+/// The page-id fields read back from the webview after a set-tab dispatch.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SetTabReadback {
+    pub page_id: Option<String>,
+    pub active_page_id: Option<String>,
+    pub page_id_chain: Vec<String>,
+}
+
+/// Parse the set-tab eval result (`{"pageId", "activePageId", "pageIdChain"}`
+/// as a JSON string). Every field is optional: an unparseable result, a
+/// missing key, or a non-string value reads as absent (and non-string chain
+/// entries are dropped). The eval result is text produced inside the webview,
+/// where page script runs alongside the read-back, so it is parsed as
+/// untrusted input: a malformed read-back costs the verification signal, never
+/// the tab switch that already happened.
+pub(crate) fn parse_set_tab_readback(result_str: &str) -> SetTabReadback {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result_str) else {
+        return SetTabReadback::default();
+    };
+    let str_field = |key: &str| v.get(key).and_then(|p| p.as_str()).map(|s| s.to_string());
+    let page_id_chain = v
+        .get("pageIdChain")
+        .and_then(|c| c.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    SetTabReadback {
+        page_id: str_field("pageId"),
+        active_page_id: str_field("activePageId"),
+        page_id_chain,
+    }
 }
 
 /// Request body for `POST /ui-bridge/control/tab/activate` (F4).
@@ -2051,6 +2125,13 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 // ============================================================================
 
 /// POST /ui-bridge/control/page/set-tab
+///
+/// Dispatches `ui-bridge-set-tab`, waits 100 ms, then reads back three page-id
+/// signals via [`SET_TAB_READBACK_JS`]: `pageId` (the first `[data-page-id]`
+/// in document order — the outer wrapper), `activePageId` (the
+/// deepest visible `[data-page-id]` inside that wrapper, i.e. the sub-view) and
+/// `pageIdChain` (outer → inner along that element's ancestors). See
+/// [`SetTabResponse`].
 pub async fn ui_bridge_page_set_tab_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<SetTabRequest>,
@@ -2081,31 +2162,24 @@ pub async fn ui_bridge_page_set_tab_handler(
 
     info!("UI Bridge API: page/set-tab → {}", tab);
 
-    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
-    let expression = format!(
-        r#"(async () => {{
-            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
-            await new Promise(r => setTimeout(r, 100));
-            var el = document.querySelector("[data-page-id]");
-            var pageId = el && el.getAttribute ? el.getAttribute("data-page-id") : null;
-            return JSON.stringify({{ pageId: pageId }});
-        }})()"#,
-        escaped_tab
-    );
+    let expression = set_tab_expression(&tab);
 
-    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), false).await {
+    // `await_promise` must be true: the expression is an async IIFE, and with
+    // false the helper stringifies the pending Promise (`"{}"`), so every
+    // read-back field would come back absent. The read-back is wrapped in
+    // try/catch so a throwing walk (a DOM method throwing mid-read) costs only
+    // the signal, not a 500 for a tab switch that already happened. A page that
+    // breaks `JSON.stringify` itself still times out: the helper's own POST
+    // back needs it.
+    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), true).await {
         Ok(result_str) => {
-            let page_id = serde_json::from_str::<serde_json::Value>(&result_str)
-                .ok()
-                .and_then(|v| {
-                    v.get("pageId")
-                        .and_then(|p| p.as_str())
-                        .map(|s| s.to_string())
-                });
+            let readback = parse_set_tab_readback(&result_str);
             Ok(Json(ApiResponse::success(SetTabResponse {
                 success: true,
                 tab,
-                page_id,
+                page_id: readback.page_id,
+                active_page_id: readback.active_page_id,
+                page_id_chain: readback.page_id_chain,
             })))
         }
         Err(e) => {
@@ -3969,6 +4043,100 @@ mod refresh_response_honesty_tests {
         assert!(
             body.contains("Hard refresh triggered"),
             "hard-refresh's honest message must survive this change"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_tab_readback_tests {
+    use super::*;
+
+    #[test]
+    fn readback_js_defines_the_function_the_expression_calls() {
+        assert!(SET_TAB_READBACK_JS.contains("function readSetTabPageIds(doc)"));
+    }
+
+    #[test]
+    fn expression_embeds_the_walk_and_never_throws_on_readback() {
+        let expr = set_tab_expression("settings");
+        assert!(expr.starts_with("(async () => {"));
+        assert!(expr.contains(r#"detail: { tab: "settings" }"#));
+        assert!(expr.contains(SET_TAB_READBACK_JS));
+        assert!(expr.contains(
+            r#"try { return JSON.stringify(readSetTabPageIds(document)); } catch (e) { return "{}"; }"#
+        ));
+        assert!(expr.trim_end().ends_with("})()"));
+    }
+
+    #[test]
+    fn response_keeps_page_id_and_adds_active_fields() {
+        let resp = SetTabResponse {
+            success: true,
+            tab: "settings".to_string(),
+            page_id: Some("page-settings".to_string()),
+            active_page_id: Some("settings-general".to_string()),
+            page_id_chain: vec!["page-settings".to_string(), "settings-general".to_string()],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["pageId"], "page-settings");
+        assert_eq!(v["activePageId"], "settings-general");
+        assert_eq!(
+            v["pageIdChain"],
+            serde_json::json!(["page-settings", "settings-general"])
+        );
+        assert_eq!(v["success"], true);
+        assert_eq!(v["tab"], "settings");
+    }
+
+    #[test]
+    fn response_serializes_absent_active_fields_as_null_and_empty() {
+        let resp = SetTabResponse {
+            success: true,
+            tab: "tasks".to_string(),
+            page_id: None,
+            active_page_id: None,
+            page_id_chain: Vec::new(),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v["pageId"].is_null());
+        assert!(v["activePageId"].is_null());
+        assert_eq!(v["pageIdChain"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parses_full_readback() {
+        let r = parse_set_tab_readback(
+            r#"{"pageId":"page-settings","activePageId":"settings-ai","pageIdChain":["page-settings","settings-ai"]}"#,
+        );
+        assert_eq!(r.page_id.as_deref(), Some("page-settings"));
+        assert_eq!(r.active_page_id.as_deref(), Some("settings-ai"));
+        assert_eq!(r.page_id_chain, vec!["page-settings", "settings-ai"]);
+    }
+
+    #[test]
+    fn legacy_readback_with_only_page_id_degrades_cleanly() {
+        let r = parse_set_tab_readback(r#"{"pageId":"page-tasks"}"#);
+        assert_eq!(r.page_id.as_deref(), Some("page-tasks"));
+        assert_eq!(r.active_page_id, None);
+        assert!(r.page_id_chain.is_empty());
+    }
+
+    #[test]
+    fn nulls_non_strings_and_garbage_read_as_absent() {
+        let r = parse_set_tab_readback(
+            r#"{"pageId":null,"activePageId":7,"pageIdChain":["a",null,3,"b"]}"#,
+        );
+        assert_eq!(r.page_id, None);
+        assert_eq!(r.active_page_id, None);
+        assert_eq!(r.page_id_chain, vec!["a", "b"]);
+
+        assert_eq!(
+            parse_set_tab_readback("not json"),
+            SetTabReadback::default()
+        );
+        assert_eq!(
+            parse_set_tab_readback(r#"{"pageIdChain":"x"}"#),
+            SetTabReadback::default()
         );
     }
 }

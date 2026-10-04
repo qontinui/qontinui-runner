@@ -195,6 +195,24 @@ export function detachedRemoteTabs<T extends { isAlive: boolean; remote?: Remote
 }
 
 /**
+ * Whether the tab a fleet-picker attach (or create) opened is STILL open on
+ * this page — the predicate behind "Attached — tab open on this page."
+ *
+ * The picker records the opened tab's id once, when the attach succeeds; that
+ * is a fact about the past. Rendering the notice off the id alone kept it on
+ * screen after the operator closed the tab. The claim is about the present, so
+ * it is read against the page's live tab list: gone, or ended (`!isAlive`, the
+ * tab that offers "Reattach"), and the notice goes.
+ */
+export function openedTabStillOpen<T extends { id: string; isAlive: boolean }>(
+  openedId: string | null | undefined,
+  tabs: readonly T[],
+): boolean {
+  if (!openedId) return false;
+  return tabs.some((t) => t.id === openedId && t.isAlive);
+}
+
+/**
  * Split a remote tab's title back into its session half, for a reattach that
  * should keep the same title. Falls back to the whole title when it was
  * renamed away from the `"<device>: <label>"` shape.
@@ -325,4 +343,138 @@ export function applyAttachWaiting(
     return next;
   }
   return { ...prev, [w.sessionId]: w };
+}
+
+// ---------------------------------------------------------------------------
+// Remote interactivity footer (plan
+// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`, A1)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a keystroke may go unacknowledged before the footer says so. The
+ * wire contract's `INPUT_ACK_DEADLINE` (5 s).
+ */
+export const INPUT_ACK_DEADLINE_MS = 5_000;
+
+/**
+ * `terminal_remote_interactivity`'s payload (Rust `RemoteInteractivity`,
+ * camelCase). Every timestamp is epoch ms on THIS machine's clock.
+ */
+export interface RemoteInputAck {
+  seq: number | null;
+  atMs: number;
+  bytes: number;
+  accepted: boolean;
+  error: string | null;
+  via: string;
+  targetAcceptedAt: string | null;
+}
+
+export interface RemoteInteractivitySnapshot {
+  attachedAtMs: number;
+  lastInputSent: { seq: number; atMs: number; bytes: number } | null;
+  /** The last KEYSTROKE ack (`via: traffic`). Probe acks never land here. */
+  lastInputAcked: RemoteInputAck | null;
+  /** The last write-PROBE ack. Shown only when no keystroke has been sent. */
+  lastProbeAcked: RemoteInputAck | null;
+  /** Acks received over this pane's life, accepted or not. */
+  acksReceived: number;
+  /** Acks since the current attachment (reset on reattach). */
+  acksSinceAttach: number;
+  /** The last write probe queued — never a keystroke. */
+  lastProbeSent: { seq: number; atMs: number; bytes: number } | null;
+  lastFrameReceived: { atMs: number; throughOffset: number } | null;
+}
+
+export interface RemoteInteractivityFooter {
+  /** "last output received 3s ago · last keystroke accepted 1s ago". */
+  summary: string;
+  /** An inline note that needs the operator's eye, or null. */
+  note: string | null;
+  /** `warning`: input is not getting through. `info`: an honest unknown. */
+  noteKind: "warning" | "info" | null;
+}
+
+function agoLabel(atMs: number, nowMs: number): string {
+  const secs = Math.max(0, Math.floor((nowMs - atMs) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.floor(mins / 60)}h ago`;
+}
+
+/**
+ * Is the newest keystroke this pane sent still waiting for its ack? Compared by
+ * `seq` when the ack carries one; by arrival order when a relay dropped it.
+ * Reads the KEYSTROKE slot only — a probe ack acknowledges no keystroke.
+ */
+export function inputAwaitingAck(s: RemoteInteractivitySnapshot): boolean {
+  const sent = s.lastInputSent;
+  if (!sent) return false;
+  const ack = s.lastInputAcked;
+  if (!ack) return true;
+  if (ack.seq !== null) return ack.seq < sent.seq;
+  return ack.atMs < sent.atMs;
+}
+
+/**
+ * The footer for a remote tab, derived only from what the pane observed.
+ *
+ * - Before any input: "no input sent yet" — never an implied success.
+ * - A refused ack is shown with the target's code.
+ * - An unacked keystroke past {@link INPUT_ACK_DEADLINE_MS} is "input not
+ *   acknowledged by <device>" — UNLESS the CURRENT attachment has received no
+ *   ack at all (`acksSinceAttach`, the same count the runner's probe gate
+ *   reads), which is what a target predating acknowledgements looks like; that
+ *   is said as such, and is not rendered as a failure forever.
+ * - Probe acks are kept apart from keystroke acks, so an accepted probe never
+ *   hides a refused keystroke.
+ */
+export function remoteInteractivityFooter(
+  s: RemoteInteractivitySnapshot,
+  nowMs: number,
+  deviceLabel: string,
+): RemoteInteractivityFooter {
+  const read = s.lastFrameReceived
+    ? `last output received ${agoLabel(s.lastFrameReceived.atMs, nowMs)}`
+    : "no output yet";
+
+  const ack = s.lastInputAcked;
+  const probe = s.lastProbeAcked;
+  let write: string;
+  if (!s.lastInputSent && !ack) {
+    write =
+      probe && probe.accepted
+        ? `no input sent yet (input path probed ${agoLabel(probe.atMs, nowMs)})`
+        : "no input sent yet";
+  } else if (ack && ack.accepted) {
+    write = `last keystroke accepted ${agoLabel(ack.atMs, nowMs)}`;
+  } else if (ack) {
+    write = `last keystroke rejected ${agoLabel(ack.atMs, nowMs)}`;
+  } else {
+    write = "keystrokes sent, none acknowledged yet";
+  }
+
+  let note: string | null = null;
+  let noteKind: RemoteInteractivityFooter["noteKind"] = null;
+  const pending = inputAwaitingAck(s);
+  const overdue =
+    pending && s.lastInputSent !== null && nowMs - s.lastInputSent.atMs >= INPUT_ACK_DEADLINE_MS;
+  if (ack && !ack.accepted && !pending) {
+    note = `input rejected by ${deviceLabel}: ${ack.error ?? "unknown error"}`;
+    noteKind = "warning";
+  } else if (overdue && s.acksSinceAttach === 0) {
+    note =
+      s.acksReceived > 0
+        ? "target has not acknowledged input since reattach (possibly an older build)"
+        : "target does not acknowledge input (older build)";
+    noteKind = "info";
+  } else if (overdue) {
+    note = `input not acknowledged by ${deviceLabel}`;
+    noteKind = "warning";
+  } else if (ack && !ack.accepted) {
+    note = `input rejected by ${deviceLabel}: ${ack.error ?? "unknown error"}`;
+    noteKind = "warning";
+  }
+  return { summary: `${read} · ${write}`, note, noteKind };
 }

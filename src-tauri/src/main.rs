@@ -234,6 +234,7 @@ mod safe_lock;
 mod saved_api_requests;
 mod scenarios;
 mod scheduler;
+mod scheduler_probe;
 mod scheduler_remote_agent;
 mod scheduler_service;
 mod schema_registry;
@@ -761,6 +762,10 @@ const DEGRADED_PLACEHOLDER_DSN: &str = "postgresql://qontinui@127.0.0.1:1/qontin
 /// `QONTINUI_FORCE_EMBEDDED_PG` is set. The hardcoded `localhost:5432` default
 /// that used to stand behind the other arm stays deleted — an unconfigured box
 /// boots the bundled cluster rather than guessing at a port.
+#[expect(
+    clippy::disallowed_types,
+    reason = "borrows the process-lived APP_RUNTIME during synchronous boot, predates the disallowed_types gate — migrate to a tokio::runtime::Handle; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::PgDb> {
     // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
     // machine-shared default. A temp/test runner sets it and gets a cluster of
@@ -889,6 +894,10 @@ fn env_flag(name: &str) -> bool {
 /// Setting both is a contradiction and panics: silently picking a winner would
 /// leave the operator debugging the wrong database, which is the exact class of
 /// undiagnosable failure this module exists to stop.
+#[expect(
+    clippy::disallowed_types,
+    reason = "borrows the process-lived APP_RUNTIME during synchronous boot, predates the disallowed_types gate — migrate to a tokio::runtime::Handle; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 fn select_db_arm(
     rt: &tokio::runtime::Runtime,
     profile: &qontinui_runner_lib::profiles::ResolvedProfile,
@@ -1267,6 +1276,10 @@ mod headless_manifest_tests {
 /// `'static` transmute. It is filled ONLY after `set` has succeeded, so a
 /// runtime we could not install is dropped rather than left running
 /// [`app_runtime_worker_threads`] idle workers nobody can reach.
+#[expect(
+    clippy::disallowed_types,
+    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 /// The cap on the application runtime's worker count.
@@ -1567,6 +1580,23 @@ fn install_app_runtime() {
     }
 }
 
+/// The process allocator: `std::alloc::System`, observed. On a null return it
+/// writes an `alloc_failure` line to `wedge-incidents.log` — at most 8 per
+/// process, through a handle `crash_observability::install_live_crash_writer`
+/// opens — and returns the null unchanged. A fallible caller (`try_reserve`)
+/// then handles it and the process lives; anywhere else the default handler
+/// aborts exactly as before — but the next
+/// boot's harvest can now say the runner died of an allocation failure, with
+/// the last memory reading, instead of `unknown (WER harvest)`. The success
+/// path is one null check. Plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0; see `qontinui_runner_lib::alloc_breadcrumb` for the rules its
+/// failure arm lives by. Registered HERE, in the runner bin only: the lib's
+/// other binaries keep the plain system allocator.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
+    qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
+
 fn main() {
     // The capability manifest (`--capability-manifest[ --json]`,
     // `--capability-manifest-doc`). Same posture as the `env …` CLI below and
@@ -1587,6 +1617,17 @@ fn main() {
     // launch / `qontinui://` deep-link falls through to the GUI below.
     if let Some(code) = qontinui_runner_lib::profile_cli::try_run_cli() {
         std::process::exit(code as i32);
+    }
+
+    // PTY holder survival spike (plan
+    // `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    // Phase 0). `--pty-holder-spike` must run BEFORE the single-instance plugin
+    // for the same reason `try_headless_manifest` does — a holder launched
+    // while a GUI runner is open would otherwise be forwarded to that GUI and
+    // hold nothing — and before `install_app_runtime`, because a holder is a
+    // few threads, not a 16-worker runtime. Matches only an exact argv[1].
+    if let Some(code) = qontinui_runner_lib::pty_holder::try_run_spike() {
+        std::process::exit(code);
     }
 
     // Enable backtraces in crash dumps for better diagnostics
@@ -1866,8 +1907,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Same shape, same ordering argument: the plan adapter's loop below reads
     // `paths.plans_dir` (every tick, but its FIRST tick is what decides whether
-    // this boot scans at all), so the retired env shim's value must be in the
-    // setting before that thread spawns.
+    // this boot scans at all), so any env-seeded value (the retired shim, or an
+    // operator-exported `QONTINUI_PLANS_DIR` outside runner context) must be in
+    // the setting before that thread spawns.
     if let Err(e) = plans_dir_migration::persist_env_plans_dir() {
         warn!("plans dir migration failed (non-fatal): {}", e);
     }
@@ -2290,71 +2332,50 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // "return None rather than guess" guard and point a release
                     // runner's 1,100-artifact sync at production.
                     let settings = settings::load_settings();
-                    let persisted_backend_url = settings
-                        .web_integration
-                        .enabled
-                        .then(|| settings.web_integration.backend_url.clone());
-                    // ...and the release-build refusal of a MACHINE-LOCAL
-                    // persisted value applies here too. This is the third
-                    // reader of that field that never goes through the
-                    // `get_api_base_url` ladder, so without this it would keep
-                    // honouring exactly the value every other subsystem now
-                    // refuses — which is not a refusal, it is a divergence.
-                    //
-                    // Refused resolves to None (NOT to the release default)
-                    // because this call site's whole contract, stated above, is
-                    // "return None rather than guess": the operator's persisted
-                    // intent was a local backend, and silently redirecting a
+                    // The ladder's configured base (env, profile, persisted);
+                    // `None` when nothing is configured, and a release build's
+                    // refusal of a MACHINE-LOCAL persisted value is `None` too,
+                    // NOT the release default: this call site's contract is
+                    // "return None rather than guess", and redirecting a
                     // 1,100-artifact bulk upload to production on the strength
-                    // of a value we just rejected is precisely the guess that
-                    // guard exists to prevent. None makes the body sync no-op,
-                    // and `spawn_if_configured` already warns when it is
-                    // enabled with no backend — but that warning says "no
-                    // backend is configured", which is the wrong cause here, so
-                    // name the real one before it fires.
-                    //
-                    // The refusal is unconditional; only the WARNING is gated
-                    // on the sync actually being on — which, now that the sync
-                    // is on by default, means it fires on every release runner
-                    // whose persisted backend is machine-local. That is
-                    // correct: a refused target is a configuration the
-                    // operator must see. Only a runner killed with
-                    // QONTINUI_PLAN_LIBRARY_SYNC=0 stays quiet, because there
-                    // the decision changed nothing.
-                    let persisted_backend_url = match persisted_backend_url {
-                        Some(raw)
-                            if crate::api_config::persisted_backend_url_refused(
-                                &raw,
-                                cfg!(debug_assertions),
-                            ) =>
+                    // of a value we just rejected is that guess. Build-default
+                    // arms are never mapped to `Some(default)` for the same
+                    // reason.
+                    let persisted_backend_url =
+                        crate::api_config::configured_api_base_from(&settings).map(|(url, _)| url);
+                    // Name the real cause before `spawn_if_configured` warns
+                    // "no backend is configured", which would be wrong when a
+                    // persisted value was refused. Only gated on the sync being
+                    // on (it is by default; QONTINUI_PLAN_LIBRARY_SYNC=0 stays
+                    // quiet).
+                    if persisted_backend_url.is_none() {
+                        let (_, arm) = crate::api_config::resolve_api_base_url_from(&settings);
+                        if arm == crate::api_config::ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected
+                            && qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled()
                         {
-                            use qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled;
-                            if body_sync_enabled() {
-                                warn!(
-                                    rejected_backend_url = %raw,
-                                    "plan library: REFUSING persisted \
-                                     web_integration.backend_url '{raw}' as the body-sync \
-                                     target: it is a MACHINE-LOCAL address and this is a \
-                                     RELEASE build (same refusal as \
-                                     api_config::resolve_api_base_url). The body sync (on by \
-                                     default) will NOT run rather than guess a backend. FIX: set \
-                                     web_integration.backend_url in settings.json to the \
-                                     backend this runner actually paired with, then start a \
-                                     new runner."
-                                );
-                            }
-                            None
+                            let raw = &settings.web_integration.backend_url;
+                            warn!(
+                                rejected_backend_url = %raw,
+                                "plan library: REFUSING persisted \
+                                 web_integration.backend_url '{raw}' as the body-sync \
+                                 target: it is a MACHINE-LOCAL address and this is a \
+                                 RELEASE build (same refusal as \
+                                 api_config::resolve_api_base_url). The body sync (on by \
+                                 default) will NOT run rather than guess a backend. FIX: set \
+                                 web_integration.backend_url in settings.json to the \
+                                 backend this runner actually paired with, then start a \
+                                 new runner."
+                            );
                         }
-                        other => other,
-                    };
+                    }
                     // The tenant-wide `plan_capture` dial. Read per cycle (a
                     // closure, not a snapshot) so an operator flipping it takes
                     // effect on the next tick rather than needing a restart.
                     let capture_gate: qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureGate =
-                        std::sync::Arc::new(|| {
-                            mcp::fleet_policy_poller::effective_plan_capture_level()
-                                == mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
-                        });
+                        // Writes wait for an AUTHORITATIVE answer: the `record`
+                        // default alone must not push every plan on a cold
+                        // start before an explicit `off` can arrive.
+                        std::sync::Arc::new(mcp::fleet_policy_poller::plan_capture_verdict);
                     // The scan-root reading is machine-scoped (one row per
                     // device on the web), so only the instance that owns shared
                     // root state publishes it — the same predicate as every
@@ -2865,6 +2886,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_attach_remote,
             commands::remote_attach::terminal_remote_identities,
             commands::remote_attach::terminal_remote_history_load,
+            commands::remote_attach::terminal_remote_interactivity,
             commands::remote_create::remote_create_preference_get,
             commands::remote_create::remote_create_preference_set,
             commands::remote_create::remote_create_preference_reconcile,
@@ -3494,6 +3516,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_create,
             commands::terminal::terminal_flow_reset,
             commands::terminal::terminal_get_bracketed_paste,
+            commands::terminal::terminal_probe_claude,
             commands::terminal::terminal_get_grid,
             commands::terminal::terminal_get_saved_scrollback,
             commands::terminal::terminal_get_scrollback,

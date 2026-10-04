@@ -16,10 +16,12 @@
  * `useTerminalInitialization.ts`) instead of pretending the resume worked.
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
 import {
   CLAUDE_HANDSHAKE_REGEXES,
+  CLAUDE_TITLE_REGEXES,
   CLAUDE_RESUME_FAILURE_REGEXES,
   type HandshakePatterns,
 } from "./providerAdapter";
@@ -79,10 +81,68 @@ export function buildPickerAnswer(policy: ResumeSummaryPolicy): string {
   return policy === "summary" ? "1\r" : "2\r";
 }
 
-/** Strip ANSI escape sequences so patterns match rendered text. */
+/**
+ * Strip ANSI escape sequences so patterns match rendered text.
+ *
+ * Used for the FAILURE and PICKER phrases. Cursor motion is deleted, so text
+ * that Claude Code v2 draws with cursor moves collapses (`No\x1b[1Cconversation`
+ * becomes `Noconversation`). That is deliberate: those checks run over the
+ * whole tail, and a resumed conversation that merely MENTIONS "No conversation
+ * found" or "Resume full session as-is" must not fail the resume or trigger
+ * the picker answer. The success markers use {@link renderAnsi} instead.
+ */
 export function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
   return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "");
+}
+
+/**
+ * Render ANSI output to approximate screen text, for the SUCCESS markers only.
+ *
+ * Claude Code v2 paints its TUI with cursor addressing. The gaps between words
+ * are often cursor moves rather than spaces (`Claude\x1b[1CCode`), and the `❯`
+ * prompt sits one cursor-down below its `────` rule. Deleting those moves (as
+ * {@link stripAnsi} does) glues the words together, so a marker cannot match a
+ * pane that plainly shows it. Here, horizontal moves become spaces and
+ * vertical moves become newlines. Column positions are approximate, which is
+ * enough for a marker match.
+ */
+export function renderAnsi(text: string): string {
+  /* eslint-disable no-control-regex */
+  return (
+    text
+      // OSC and DCS strings: window titles, shell-integration marks, device
+      // control. Titles are read separately by `lastOscTitle`.
+      .replace(/\x1b\][^\x07]*?(?:\x07|\x1b\\)/g, "")
+      .replace(/\x1bP[^\x1b]*\x1b\\/g, "")
+      // Cursor forward (CUF) → that many spaces; column absolute (CHA) → one.
+      .replace(/\x1b\[(\d*)C/g, (_m, n: string) => " ".repeat(Math.min(Number(n || "1"), 256)))
+      .replace(/\x1b\[\d*G/g, " ")
+      // Vertical moves and absolute positioning (CUU, CUD, CNL, CPL, CUP, HVP,
+      // VPA) → a new line.
+      .replace(/\x1b\[[\d;]*[ABEFHfd]/g, "\n")
+      // Every other CSI, including private-parameter forms such as `ESC[>0q`.
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+      // Charset designation (`ESC(B`), two-byte escapes (`ESC7`, `ESC M`, …)
+      // and the shift-in/shift-out controls.
+      .replace(/\x1b[()][0-9A-Za-z]/g, "")
+      .replace(/\x1b[0-9=>MDEc]/g, "")
+      .replace(/[\x0e\x0f]/g, "")
+  );
+  /* eslint-enable no-control-regex */
+}
+
+/**
+ * The CURRENT window title: the last OSC 0 / OSC 2 title in `text`, or
+ * `undefined` when there is none. Claude Code titles its window
+ * `✳ Claude Code` at launch, before it paints anything else, and resets the
+ * title to empty on exit. Only the last title counts, so a pane that has fallen
+ * back to a shell is not verified by a title an earlier Claude set.
+ */
+export function lastOscTitle(text: string): string | undefined {
+  // eslint-disable-next-line no-control-regex
+  const titleOsc = /\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  return Array.from(text.matchAll(titleOsc), (m) => m[1]).at(-1);
 }
 
 /**
@@ -112,19 +172,27 @@ export function detectResumeFailure(text: string, patterns?: HandshakePatterns):
  * True when the pane's recent output shows the provider's resume handshake.
  * Same union rule as {@link detectResumeFailure}: descriptor substrings ∪
  * descriptor regexes, falling back to Claude's regex set when no descriptor is
- * supplied. The Claude descriptor's regexes carry the rounded input-box frame
- * marker, which no substring can express — a restored pane that has painted
- * only the frame verifies here.
+ * supplied. The Claude descriptor's regexes carry the input-box frame
+ * markers, which no substring can express — a restored pane that has painted
+ * only the frame verifies here. Body markers run over {@link renderAnsi}
+ * output; title markers run over the pane's current window title
+ * ({@link lastOscTitle}) alone.
  */
 export function detectClaudeHandshake(text: string, patterns?: HandshakePatterns): boolean {
-  const stripped = stripAnsi(text);
+  const rendered = renderAnsi(text);
+  // The current window title is matched only against title patterns: the shell
+  // titles the window too, so body markers must never see it.
+  const title = lastOscTitle(text);
+  const titleMatch = (titlePatterns?: RegExp[]) =>
+    title !== undefined && matchRegexes(title, titlePatterns);
   if (patterns) {
     return (
-      matchSubstrings(stripped, patterns.success) ||
-      matchRegexes(stripped, patterns.successPatterns)
+      matchSubstrings(rendered, patterns.success) ||
+      matchRegexes(rendered, patterns.successPatterns) ||
+      titleMatch(patterns.titlePatterns)
     );
   }
-  return matchRegexes(stripped, CLAUDE_HANDSHAKE_REGEXES);
+  return matchRegexes(rendered, CLAUDE_HANDSHAKE_REGEXES) || titleMatch(CLAUDE_TITLE_REGEXES);
 }
 
 /** Case-insensitive substring match of any pattern in `text`. */
@@ -220,6 +288,62 @@ export async function waitForClaudeHandshake(
 }
 
 /**
+ * What the pane's process subtree says about `claude` (`terminal_probe_claude`):
+ * - `live` / `absent` are readings of the process table; on `live`,
+ *   `sessionIds` holds the `--resume` / `--session-id` value of each claude
+ *   whose command line carried one.
+ * - `remote`: the pane has no local pid, so its subtree cannot be observed.
+ * - `unknown`: a local pane whose table could not be read, an IPC failure, or
+ *   an unparseable answer — says nothing either way.
+ */
+export interface PaneClaudeProbe {
+  state: "live" | "absent" | "remote" | "unknown";
+  sessionIds: string[];
+}
+
+/**
+ * Ask the runner whether a `claude` process is running in the pane's subtree.
+ * Never throws — any failure is `unknown`.
+ *
+ * This is the guard against typing the resume command INTO a live Claude
+ * session: the handshake scrape below can false-negative (a TUI redraw the
+ * patterns miss, a slow transcript load past the timeout), and then the
+ * retype — or the operator's "Retry resume" — lands
+ * `--permission-mode bypassPermissions --resume <id>` as a prompt in the
+ * running session. The process table does not depend on what the screen shows.
+ */
+export async function probeClaudeInPane(
+  tabId: string,
+  invoker: (cmd: string, args: Record<string, unknown>) => Promise<unknown> = invoke,
+): Promise<PaneClaudeProbe> {
+  try {
+    const resp = await invoker("terminal_probe_claude", { terminalId: tabId });
+    const data = (resp as { data?: { state?: unknown; sessionIds?: unknown } } | null)?.data;
+    const state = data?.state;
+    if (state !== "live" && state !== "absent" && state !== "remote") {
+      return { state: "unknown", sessionIds: [] };
+    }
+    const sessionIds = Array.isArray(data?.sessionIds)
+      ? data.sessionIds.filter((v): v is string => typeof v === "string")
+      : [];
+    return { state, sessionIds };
+  } catch {
+    return { state: "unknown", sessionIds: [] };
+  }
+}
+
+/**
+ * Outcome of {@link typeResumeAndVerify}:
+ * - `verified` — the requested session is up in the pane (handshake seen, or
+ *   a claude launched with that id is running there).
+ * - `failed` — the resume is not provably up, INCLUDING when nothing was typed
+ *   because the pane could not be checked or already runs a claude that is not
+ *   provably this session. `failed` keeps the record's restore-pending guard
+ *   and the Retry banner, and a retry re-probes before it types anything.
+ */
+export type ResumeOutcome = "verified" | "failed";
+
+/**
  * ESC clears any partially-typed line in PSReadLine / readline before a
  * retry retype, so a half-landed first attempt can't corrupt the second.
  */
@@ -260,6 +384,28 @@ export interface TypeAndVerifyOptions extends HandshakeWaitOptions {
    * opt-in "summary" policy. Omit to disable.
    */
   pickerAnswer?: string;
+  /**
+   * Injectable pane probe (tests); defaults to {@link probeClaudeInPane}.
+   * Consulted before every write of the resume command — and before the
+   * retry's clear-line ESC, which would interrupt a working Claude turn:
+   * - `live` → nothing is typed; `verified` when a running claude carries
+   *   `sessionId` (case-insensitive), else `failed`. A claude whose command
+   *   line could not be read carries no id, so it lands in `failed` too —
+   *   never in a state that drops the record's restore-pending guard.
+   * - `unknown` → nothing is typed; `failed`. Fail closed: an unreadable table
+   *   on a local pane is exactly when the scrape is also likeliest to miss.
+   * - `absent` / `remote` → typed as before (a remote pane cannot be probed).
+   */
+  probeClaude?: (tabId: string) => Promise<PaneClaudeProbe>;
+  /** The session being resumed — what a `live` probe is matched against. */
+  sessionId?: string;
+  /**
+   * Skip the probe before attempt 1 because the pane was just created as a
+   * plain shell (the boot restore), so no claude can be in it yet — true as
+   * long as `createTerminal` runs no startup command. Saves one process-table
+   * snapshot per restored tab; attempt 2 is still probed.
+   */
+  skipFirstProbe?: boolean;
 }
 
 /**
@@ -283,7 +429,7 @@ export async function typeResumeAndVerify(
   tabId: string,
   resumeCmd: string,
   options: TypeAndVerifyOptions = {},
-): Promise<"verified" | "failed"> {
+): Promise<ResumeOutcome> {
   const {
     attempts = 2,
     settleMs = 500,
@@ -291,6 +437,9 @@ export async function typeResumeAndVerify(
     pickerAnswer,
     onProbe,
     onWriteFailure,
+    probeClaude = probeClaudeInPane,
+    sessionId,
+    skipFirstProbe = false,
     ...waitOpts
   } = options;
   let pickerAnswered = false;
@@ -320,6 +469,31 @@ export async function typeResumeAndVerify(
     return null;
   };
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    // Don't type a shell command into a running Claude session. Checked
+    // first thing on every attempt: the boot-restore retype and the operator
+    // retry can both reach here with claude already up in the pane. This
+    // narrows the hazard, it does not close it — keystrokes still buffered
+    // behind a slow shell start can reach a claude that starts after the probe,
+    // and a claude the image-name match does not recognise reads as absent.
+    if (!(attempt === 1 && skipFirstProbe)) {
+      const pane = await probeClaude(tabId);
+      if (pane.state === "live") {
+        const wanted = sessionId?.toLowerCase();
+        const same =
+          wanted !== undefined && pane.sessionIds.some((id) => id.toLowerCase() === wanted);
+        console.warn(
+          `[resumeVerification] claude already running in ${tabId} (attempt ${attempt}/${attempts}, ` +
+            `${same ? "the requested session" : `not provably ${sessionId ?? "the requested session"}: [${pane.sessionIds.join(", ")}]`}) — not typing the resume command`,
+        );
+        return same ? "verified" : "failed";
+      }
+      if (pane.state === "unknown") {
+        console.warn(
+          `[resumeVerification] could not read ${tabId}'s process tree (attempt ${attempt}/${attempts}) — not typing the resume command`,
+        );
+        return "failed";
+      }
+    }
     if (attempt > 1) {
       // Clear any half-typed line from the failed attempt, then retype.
       void write(terminalRefs, tabId, CLEAR_LINE);

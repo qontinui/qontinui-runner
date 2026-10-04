@@ -952,6 +952,21 @@ elif [[ ! -r "$_lib_src" ]]; then ok   # inside the runner bundle: scripts/lib/ 
 elif cmp -s "$_lib_here" "$_lib_src"; then ok
 else fail "T16: lib/coord-tenant-credential.sh differs from scripts/lib/coord-tenant-credential.sh -- copy scripts/lib's forward"; fi
 
+# --- T17: a STALE library (readable, but predating ctc_prove_tenant) withholds
+# with exit 5 and says why -- the CTC_OK=0 arm, which nothing else reaches. The
+# load line is a `&&` chain under `set -e`; it survives a failing `declare -F`
+# only because that is not the chain's LAST command, so this pins that too.
+_t17="$(mktemp -d)"; mkdir -p "$_t17/lib"
+cp "$SCRIPT" "$_t17/set-label.sh"
+printf '%s\n' '# a library copy that predates ctc_prove_tenant' 'ctc_is_uuid() { return 0; }' > "$_t17/lib/coord-tenant-credential.sh"
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+: > "$STUBDIR3/calls"; : > "$STUBDIR3/bearers"
+OUT="$(HOME="$FAKEHOME" bash "$_t17/set-label.sh" --repo "$REPO" --pr 7 --label "coord:stacked-on=#6" 2>&1)"; RC=$?  # skill-self-path-ok: a copy under mktemp -d beside a deliberately stale lib/, not this skill's own files
+expect_rc 5 "T17 stale library withholds"
+expect_out "is not usable" "T17"
+expect_calls post 0 "T17"
+rm -rf "$_t17"
+
 # ----- report -----------------------------------------------------------------
 if [[ $FAILURES -ne 0 ]]; then
   echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2

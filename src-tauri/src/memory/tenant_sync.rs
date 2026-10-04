@@ -798,7 +798,8 @@ fn init_global() -> Option<TenantMemorySync> {
 /// Resolve the web backend base URL the memory API lives behind.
 ///
 /// Order: `QONTINUI_WEB_BASE` env (temp-runner / test override) → the
-/// operator-configured `web_integration.backend_url` from settings → the
+/// configured base from [`crate::api_config::configured_api_base_from`] (env,
+/// profile `api_url`, persisted `web_integration.backend_url`) → the
 /// coord-derived fallback. `None` only when all three are absent.
 ///
 /// The `web_integration.backend_url` step is load-bearing on the PRIMARY: it
@@ -826,35 +827,24 @@ pub(crate) fn resolve_web_base() -> Option<String> {
             return Some(t.trim_end_matches('/').to_string());
         }
     }
-    let wi = crate::settings::load_settings().web_integration;
-    if wi.enabled {
-        let b = wi.backend_url.trim();
-        if !b.is_empty() {
-            // A RELEASE build REFUSES a loopback persisted `backend_url`
-            // (`api_config::resolve_api_base_url`), so on such a runner the
-            // relay and every `/api/v1/*` caller dial the release default
-            // instead. Handing the refused value back here would break this
-            // function's own contract — stated directly above, that it yields
-            // the SAME base those callers use — and would upload the tenant's
-            // memory records to a backend only this machine can reach,
-            // silently, on a timer.
-            //
-            // A refused value defers to `get_api_base_url()`, the one
-            // authority, so this function keeps agreeing with the relay by
-            // construction. It deliberately does NOT fall through to the
-            // coord-derived step below: `enabled` is true and a value IS
-            // configured, so "unconfigured" is the wrong answer — and that
-            // step is the one this function's doc comment records as mangling
-            // a PORTLESS production coord URL into `"https"`, which is how the
-            // primary lost memory sync in the first place.
-            //
-            // Debug builds are untouched: the predicate is false for them, so
-            // local dev keeps resolving to `127.0.0.1:8000` from this rung.
-            if crate::api_config::persisted_backend_url_refused(b, cfg!(debug_assertions)) {
-                return Some(crate::api_config::get_api_base_url());
-            }
-            return Some(b.trim_end_matches('/').to_string());
-        }
+    let settings = crate::settings::load_settings();
+    // The configured base, resolved by the one ladder (env, profile, persisted)
+    // so this reader can not diverge from the relay's.
+    if let Some((base, _arm)) = crate::api_config::configured_api_base_from(&settings) {
+        return Some(base);
+    }
+    // A persisted value the ladder REFUSED (a loopback value on a release
+    // build): a value IS configured, so "unconfigured" is the wrong answer and
+    // the coord-derived step below is the one that once mangled a portless
+    // production coord URL. Defer to what the relay actually dials.
+    let wi = &settings.web_integration;
+    if wi.enabled
+        && crate::api_config::persisted_backend_url_refused(
+            wi.backend_url.trim(),
+            cfg!(debug_assertions),
+        )
+    {
+        return Some(crate::api_config::get_api_base_url());
     }
     qontinui_runner_lib::env_agent::enroll::resolve_backend_base(None).ok()
 }

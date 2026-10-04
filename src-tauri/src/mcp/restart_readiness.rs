@@ -95,6 +95,23 @@
 //! *"nothing is running"* — see [`BOUNDARY`], which says so on every response.
 //! Plan `2026-09-10-restart-readiness-counts-open-sessions-not-active-ones`.
 //!
+//! ## Working is not open (2026-09-29)
+//!
+//! `blocking` still counts every non-`finished` process, because a restart
+//! kills an idle session as surely as a working one. But "245 blocking" hides
+//! what an operator needs to decide what to finish first. Coord finding
+//! `0675c4e4` (merytshost, 2026-09-29) counted 245 live sessions of which
+//! Claude Code's own records called 220 `idle` and only 8 had exchanged a
+//! message in the last hour — a hand measurement cited here, not something
+//! this code measured. `live_claude.by_activity {working, idle, stale, unknown}` splits the
+//! same `total` on the ACTIVITY axis ([`crate::session::claude_activity`]):
+//! the runner's own pane observation (already taken by the wind-down
+//! observer) where it is decisive, else Claude Code's `sessions/<pid>.json`.
+//! **Report-only: the verdict does not read it** — an idle session still dies
+//! on a restart. Plan
+//! `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`,
+//! Phase 6.
+//!
 //! ## Fresh, not cached (D5)
 //!
 //! The verdict calls [`crate::session::tracking_health::compute`] on demand.
@@ -111,14 +128,44 @@
 //! `evaluate` body, over the same handles, keyed on the same
 //! `primary_boot_unix_millis`. Nothing here counts anything on its own.
 //!
+//! ## Database schema health gates the AI plane (2026-09-07)
+//!
+//! The AI/task-run plane is enriched with `age_s` from `project.task_runs`,
+//! and plan `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-
+//! schema-probe` names that exact relation as the concrete backing of one of
+//! the four independent idle signals `production-and-cost` `runner-lifecycle`
+//! requires before an operator-requested restart. `/health`'s
+//! `database.reachable` only proves a connect+auth handshake, not that
+//! `project.task_runs` (or the rest of the schema the runner needs) actually
+//! exists — so a reachable-but-unmigrated database answers every query
+//! against it with a continuous error while `reachable: true` gives no hint
+//! why, and a caller could misread that error as "zero active sessions"
+//! (exactly the `verification-and-evidence` `silent-empty-is-unknown` failure
+//! mode this plan exists to close).
+//!
+//! This endpoint reuses Phase 1's own probe rather than re-deriving it —
+//! `crate::mcp_api::{pg_liveness_probe, pg_schema_probe, derive_schema_health}`,
+//! widened to `pub(crate)` for exactly this call — fresh on every request, in
+//! keeping with D5 above. Whenever the resulting `schema_ok` is **not**
+//! `Some(true)` (i.e. `Some(false)` or `None`), the AI plane is reported as
+//! `ai_sessions: null` — UNOBTAINABLE, never a count, and never silently `0` —
+//! via the SAME `unknowns`/fail-closed path every other unresolved plane
+//! already uses, so `safe_to_restart` can never read `true` on an unknown
+//! schema. `schema_ok == Some(true)` changes nothing: the AI plane is built
+//! exactly as it was before this change.
+//!
 //! ## Fail closed
 //!
 //! `safe_to_restart` is `false` on every unknown — an unreadable process
 //! table, an unresolvable `SessionManager`/`TerminalManager`/lifecycle store,
-//! an uninitialized PID-reuse reference — with the cause named in `reason` and
-//! the affected plane serialized as `null` rather than `0`. This surface is
-//! consulted precisely when someone is about to do something destructive.
+//! an uninitialized PID-reuse reference, an unobtainable database schema
+//! health signal — with the cause named in `reason` and the affected plane
+//! serialized as `null` rather than `0`. This surface is consulted precisely
+//! when someone is about to do something destructive.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -127,15 +174,16 @@ use serde::Serialize;
 
 use crate::mcp::session_work_status::{self, SessionStatusSource};
 use crate::mcp::types::ApiState;
+use crate::session::claude_activity::{self, ActivityCounts, LivePid, RecordReading};
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthReport};
-use crate::session::wind_down_observer;
+use crate::session::wind_down_observer::{self, ObservedInputs, TerminalObservation};
 use qontinui_runner_lib::wind_down::{self, WindDownView};
 
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -274,6 +322,31 @@ pub struct LiveClaudeTotals {
     /// `total`, still named in `terminal_sessions.processes`, and a restart
     /// still kills them.
     pub finished_discounted: usize,
+    /// The ACTIVITY axis over the same `total` processes: how many are
+    /// `working` right now, sitting `idle` at a turn boundary or a prompt,
+    /// `stale` (Claude Code says `busy`/`shell` but nothing has moved for 30
+    /// min), or `unknown`. `working + idle + stale + unknown == total` always:
+    /// a process that cannot be classified is `unknown`, never `idle`.
+    ///
+    /// ⚠ **REPORT-ONLY — the verdict never reads it.** An idle session still
+    /// dies on a restart. This exists so an operator can see how many of the
+    /// open sessions are actually working and decide what to finish first; see
+    /// [`crate::session::claude_activity`] for the evidence and its precedence.
+    pub by_activity: ActivityCounts,
+}
+
+/// Everything `live_claude.by_activity` reads beyond the census pass itself.
+/// The default is "no evidence at all", which classifies every process
+/// `unknown` — the honest answer when nothing was observed.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityEvidence {
+    /// pid → the pane observation of the top-level terminal-hosted `claude`
+    /// the runner spawned in it. Built by [`pane_observations_by_pid`].
+    pub pane_by_pid: HashMap<u32, TerminalObservation>,
+    /// pid → Claude Code's own `sessions/<pid>.json` reading. A pid absent
+    /// from this map was not read, and classifies like a missing record.
+    pub records: HashMap<u32, RecordReading>,
+    pub now_ms: i64,
 }
 
 /// The AI / task-run plane — `SessionManager::active_claude_sessions()`.
@@ -478,6 +551,16 @@ pub fn headless_plane_from(report: &TrackingHealthReport) -> HeadlessPlane {
 /// carried before the split, and the number the verdict reads. Emitting it keeps
 /// the split a labelling change rather than a loss of information.
 pub fn live_claude_totals_from(report: &TrackingHealthReport) -> LiveClaudeTotals {
+    live_claude_totals_observed(report, &ActivityEvidence::default())
+}
+
+/// [`live_claude_totals_from`] with the activity axis classified from
+/// `evidence`. Every count except `by_activity` is independent of `evidence`,
+/// so the verdict — which reads `blocking` — cannot move with it.
+pub fn live_claude_totals_observed(
+    report: &TrackingHealthReport,
+    evidence: &ActivityEvidence,
+) -> LiveClaudeTotals {
     LiveClaudeTotals {
         total: report.live_claude_total,
         terminal_hosted: report.terminal_hosted.len(),
@@ -506,6 +589,176 @@ pub fn live_claude_totals_from(report: &TrackingHealthReport) -> LiveClaudeTotal
         .iter()
         .map(|l| TrackingHealthReport::finished_count(l))
         .sum(),
+        by_activity: activity_counts(report, evidence),
+    }
+}
+
+/// Classify every live process in all four census classes — the same
+/// population `total` counts, so the four cells always sum to it.
+pub fn activity_counts(
+    report: &TrackingHealthReport,
+    evidence: &ActivityEvidence,
+) -> ActivityCounts {
+    let mut counts = ActivityCounts::default();
+    for list in [
+        &report.terminal_hosted,
+        &report.ai_plane,
+        &report.headless_exempt,
+        &report.live_untracked,
+    ] {
+        for process in list {
+            counts.add(claude_activity::classify(
+                evidence.pane_by_pid.get(&process.pid),
+                process.has_live_children,
+                evidence
+                    .records
+                    .get(&process.pid)
+                    .unwrap_or(&RecordReading::Missing),
+                evidence.now_ms,
+            ));
+        }
+    }
+    counts
+}
+
+/// pid → pane observation, for the top-level terminal-hosted processes whose
+/// pane the wind-down observer actually looked at in this pass. A nested
+/// subagent is not its pane's top-level `claude`, so the pane says nothing
+/// about it; a process whose pane was not observed gets no entry (never
+/// [`TerminalObservation::UNOBSERVABLE`] standing in for one).
+pub fn pane_observations_by_pid(
+    report: &TrackingHealthReport,
+    observed: &ObservedInputs,
+) -> HashMap<u32, TerminalObservation> {
+    report
+        .terminal_hosted
+        .iter()
+        .filter(|p| !p.nested_under_claude)
+        .filter_map(|p| {
+            let terminal_id = observed.terminal_for(p.session_id.as_deref()?)?;
+            let observation = observed.by_terminal.get(terminal_id)?;
+            Some((p.pid, *observation))
+        })
+        .collect()
+}
+
+/// How long the Claude Code record read may take before every undecided
+/// process is reported `unknown`. `/restart-readiness` is polled on every Stop
+/// turn under a short client timeout; a slow disk must cost the activity
+/// split, never the verdict's availability.
+pub const RECORD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Set while a Claude Code record read is running. See
+/// [`gather_activity_evidence`].
+pub static RECORD_READ_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Clears the in-flight flag when dropped — i.e. when the blocking read
+/// finishes or unwinds.
+struct InFlightRead(&'static AtomicBool);
+
+impl Drop for InFlightRead {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The live processes whose activity the pane did NOT decide — the only ones
+/// whose Claude Code record is worth reading — with the census's process age
+/// for the record's identity check.
+fn pids_needing_a_record(
+    report: &TrackingHealthReport,
+    pane_by_pid: &HashMap<u32, TerminalObservation>,
+    now_ms: i64,
+) -> Vec<LivePid> {
+    [
+        &report.terminal_hosted,
+        &report.ai_plane,
+        &report.headless_exempt,
+        &report.live_untracked,
+    ]
+    .iter()
+    .flat_map(|l| l.iter())
+    .filter(|p| {
+        pane_by_pid
+            .get(&p.pid)
+            .and_then(|obs| claude_activity::classify_from_pane(obs, p.has_live_children, now_ms))
+            .is_none()
+    })
+    .map(|p| LivePid {
+        pid: p.pid,
+        // From the census's OWN snapshot time, not a later clock read: the
+        // age was measured at `checked_at_ms`.
+        process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
+    })
+    .collect()
+}
+
+/// Assemble the activity evidence for one pass: the pane observations the
+/// wind-down observer already took, plus Claude Code's records for every
+/// process the pane could not decide, read from `config_dirs` off the
+/// executor and bounded by `read_timeout`. A read that fails or times out
+/// costs the records — those processes read `unknown`, never `idle`.
+/// `proc_start` is [`claude_activity::proc_start_ticks`] in production.
+///
+/// `in_flight` admits ONE read at a time: while a read (even an abandoned,
+/// timed-out one) is still running, a new call skips the read and reports its
+/// undecided processes `unknown`. Production passes
+/// [`RECORD_READ_IN_FLIGHT`].
+pub async fn gather_activity_evidence(
+    report: &TrackingHealthReport,
+    observed: &ObservedInputs,
+    config_dirs: Vec<PathBuf>,
+    proc_start: fn(u32) -> Option<String>,
+    read_timeout: std::time::Duration,
+    in_flight: &'static AtomicBool,
+) -> ActivityEvidence {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let pane_by_pid = pane_observations_by_pid(report, observed);
+    let pids = pids_needing_a_record(report, &pane_by_pid, now_ms);
+    let records = if pids.is_empty() {
+        HashMap::new()
+    } else if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // An earlier read is still running — it timed out and was abandoned,
+        // but a blocking thread cannot be cancelled. Starting another would
+        // leak one more thread per poll on a hung filesystem.
+        tracing::warn!(
+            "restart-readiness: a previous Claude Code session-record read is still in \
+             flight — skipped; every undecided process reads activity `unknown`"
+        );
+        HashMap::new()
+    } else {
+        let guard = InFlightRead(in_flight);
+        let read = tokio::task::spawn_blocking(move || {
+            // Released when the read ENDS (or unwinds), not when the caller
+            // stops waiting for it.
+            let _guard = guard;
+            claude_activity::read_records(&config_dirs, &pids, &proc_start)
+        });
+        match tokio::time::timeout(read_timeout, read).await {
+            Ok(Ok(records)) => records,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "restart-readiness: Claude Code session-record read failed ({e}) — \
+                     every undecided process reads activity `unknown`"
+                );
+                HashMap::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "restart-readiness: Claude Code session-record read exceeded {read_timeout:?} — \
+                     every undecided process reads activity `unknown`"
+                );
+                HashMap::new()
+            }
+        }
+    };
+    ActivityEvidence {
+        pane_by_pid,
+        records,
+        now_ms,
     }
 }
 
@@ -798,6 +1051,30 @@ pub fn build_verdict(
     }
 }
 
+/// Whether the AI/task-run plane may be reported this request, given
+/// `/health`'s `schema_ok` derivation (plan `2026-09-07-health-database-
+/// reachable-is-a-connect-probe-not-a-schema-probe`, Phase 2) — pure and
+/// unit-testable apart from the handler's async plumbing.
+///
+/// `Ok(())` ONLY on `schema_ok == Some(true)`; every other value (`Some(false)`
+/// or `None`) is `Err` naming why, so the handler can push it straight into
+/// `unknowns` and report the plane as `None` — unobtainable, never a count,
+/// never a silent `0` — which forces `safe_to_restart: false` through the
+/// same fail-closed path every other unresolved plane already uses.
+pub fn ai_plane_schema_gate(
+    schema_ok: Option<bool>,
+    schema_detail: Option<&str>,
+) -> Result<(), String> {
+    if schema_ok == Some(true) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the AI/task-run plane could not be determined: database schema unavailable ({})",
+            schema_detail.unwrap_or("no detail reported")
+        ))
+    }
+}
+
 /// `windDownCandidates` for a resolved terminal plane: top-level processes
 /// whose wind-down verdict is `eligible`. Computed whether or not the runner is
 /// drained, and THIS endpoint closes none of them — but since Phase 4 the
@@ -832,6 +1109,22 @@ pub async fn restart_readiness_handler(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let app = &state.app_handle;
     let mut unknowns: Vec<String> = Vec::new();
+
+    // ── Database schema health (plan `2026-09-07-health-database-reachable-
+    //    is-a-connect-probe-not-a-schema-probe`, Phase 2) ───────────────────
+    //
+    // Computed fresh, every request (D5) — see the module docs under
+    // "Database schema health gates the AI plane". Reuses Phase 1's own
+    // probe/derivation (`mcp_api`, widened to `pub(crate)`) rather than
+    // re-deriving the same check.
+    let pg_reachable = crate::mcp_api::pg_liveness_probe().await;
+    let schema_probe_result = if pg_reachable == Some(true) {
+        Some(crate::mcp_api::pg_schema_probe().await)
+    } else {
+        None
+    };
+    let (schema_ok, schema_detail) =
+        crate::mcp_api::derive_schema_health(pg_reachable, schema_probe_result);
 
     // ── Drain state: reported, never performed ────────────────────────────
     let port = state
@@ -925,17 +1218,40 @@ pub async fn restart_readiness_handler(
     let wind_down_observer::FreshPass {
         pass,
         status_fetch,
-        observed: _,
+        observed,
         unknowns: pass_unknowns,
     } = fresh;
     unknowns.extend(pass_unknowns);
     let status_source = SessionStatusSource::from(&status_fetch);
 
+    // ── The ACTIVITY axis (report-only; the verdict never reads it) ───────
+    //
+    // The pane half is the observation `fresh_pass` already took for the
+    // wind-down verdicts — no second look at any pane. The record half reads
+    // Claude Code's `sessions/<pid>.json` only for processes the pane did not
+    // decide, off the executor and under `RECORD_READ_TIMEOUT`.
+    let activity_evidence = match pass.as_ref() {
+        Some(p) => {
+            gather_activity_evidence(
+                &p.report,
+                &observed,
+                crate::terminal::transcript::find_claude_config_dirs(),
+                claude_activity::proc_start_ticks,
+                RECORD_READ_TIMEOUT,
+                &RECORD_READ_IN_FLIGHT,
+            )
+            .await
+        }
+        None => ActivityEvidence::default(),
+    };
+
     let terminal = pass
         .as_ref()
         .map(|p| terminal_plane_from(&p.report, &p.open_records, now_ms));
     let headless = pass.as_ref().map(|p| headless_plane_from(&p.report));
-    let totals = pass.as_ref().map(|p| live_claude_totals_from(&p.report));
+    let totals = pass
+        .as_ref()
+        .map(|p| live_claude_totals_observed(&p.report, &activity_evidence));
     // The AI plane joins `SessionManager` rows with the census's own view of
     // that plane's processes. A census that did not resolve costs `processes:
     // []` — an empty DETAIL array beside an explicit unknown in `unknowns`,
@@ -944,7 +1260,23 @@ pub async fn restart_readiness_handler(
         .as_ref()
         .map(|p| p.report.ai_plane.clone())
         .unwrap_or_default();
-    let ai = ai_inputs.map(|inputs| ai_plane_from(&inputs, &ai_census, now_ms));
+    // `ai_plane_schema_gate` (plan `2026-09-07-health-database-reachable-is-a-
+    // connect-probe-not-a-schema-probe`, Phase 2): the AI plane's `age_s`
+    // enrichment and the broader `runner-lifecycle` idle signal it stands in
+    // for both depend on `project.task_runs` actually existing, not merely on
+    // a successful connect. On anything but `schema_ok == Some(true)`, report
+    // the plane as unobtainable (`None`) rather than a count that may be
+    // silently wrong or read as `0` — the SAME fail-closed path `build_verdict`
+    // already applies to every other unresolved plane. The `Ok(())` arm is a
+    // no-op, so `schema_ok == Some(true)` leaves this exactly as it was before
+    // this change.
+    let ai = match ai_plane_schema_gate(schema_ok, schema_detail.as_deref()) {
+        Ok(()) => ai_inputs.map(|inputs| ai_plane_from(&inputs, &ai_census, now_ms)),
+        Err(msg) => {
+            unknowns.push(msg);
+            None
+        }
+    };
 
     let drain = DrainInfo {
         already_drained,
@@ -2796,5 +3128,574 @@ mod tests {
         assert!(BOUNDARY.contains("a candidacy and never a prediction"));
         assert!(BOUNDARY.contains("windDownCandidates"));
         assert!(BOUNDARY.contains("whether or not the runner is drained"));
+    }
+
+    // ---- the ACTIVITY axis: `live_claude.by_activity` (report-only) -------
+    //
+    // Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`,
+    // Phase 6. The classification table itself is pinned in
+    // `session::claude_activity::tests`; these pin the AGGREGATION — every
+    // census class is classified, the cells sum to `total`, the pane is
+    // consulted only for the process it hosts, and the verdict never moves.
+
+    const ACT_NOW: i64 = 1_790_000_000_000;
+
+    fn act_record(status: &str, msg_age_min: Option<i64>) -> RecordReading {
+        RecordReading::Parsed(claude_activity::RecordEvidence {
+            status: status.to_string(),
+            status_updated_at_ms: None,
+            last_message_ms: msg_age_min.map(|m| ACT_NOW - m * 60_000),
+        })
+    }
+
+    /// One process per census class plus extras, so every class and every
+    /// record shape is represented.
+    fn activity_report() -> TrackingHealthReport {
+        TrackingHealthReport {
+            checked_at_ms: ACT_NOW,
+            live_claude_total: 9,
+            tracked_open_total: 3,
+            terminal_hosted: vec![
+                wind_down_proc(1, Some("s1"), Some("working"), false, false), // pane: working
+                wind_down_proc(2, Some("s2"), Some("finished"), false, false), // pane: idle
+                wind_down_proc(3, Some("s1"), None, true, false),             // nested: record
+                // An idle pane, but a live child (a days-old MCP shim) vetoes
+                // pane-idle WITHOUT counting as work: the record decides.
+                wind_down_proc(4, Some("s4"), Some("working"), false, true),
+            ],
+            ai_plane: vec![wind_down_proc(5, None, None, false, false)],
+            headless_exempt: vec![
+                wind_down_proc(6, None, None, false, false),
+                wind_down_proc(7, None, None, false, false),
+            ],
+            live_untracked: vec![
+                wind_down_proc(8, None, None, false, false),
+                wind_down_proc(9, None, None, false, false),
+            ],
+            tracked_dead: vec![],
+        }
+    }
+
+    fn activity_evidence() -> ActivityEvidence {
+        ActivityEvidence {
+            pane_by_pid: [
+                (
+                    1,
+                    TerminalObservation {
+                        sideband: Sideband::NeverReported,
+                        grid: GridIdle::Busy,
+                    },
+                ),
+                (
+                    2,
+                    TerminalObservation {
+                        sideband: Sideband::Reported {
+                            state: qontinui_runner_lib::wind_down::SidebandState::NotWorking,
+                            set_at_ms: 1,
+                        },
+                        grid: GridIdle::Idle { since_ms: 1 },
+                    },
+                ),
+                (
+                    4,
+                    TerminalObservation {
+                        sideband: Sideband::Reported {
+                            state: qontinui_runner_lib::wind_down::SidebandState::NotWorking,
+                            set_at_ms: 1,
+                        },
+                        grid: GridIdle::Idle { since_ms: 1 },
+                    },
+                ),
+            ]
+            .into(),
+            records: [
+                // pid 1 and 2: the pane decides, whatever the record says.
+                (1, act_record("idle", None)),
+                (2, act_record("busy", Some(1))),
+                (3, act_record("busy", Some(2))),       // working
+                (4, act_record("waiting", None)),       // idle
+                (5, act_record("shell", Some(600))),    // stale
+                (6, RecordReading::Unparseable),        // unknown
+                (7, act_record("compacting", Some(1))), // unknown status
+                (8, RecordReading::Ambiguous),          // unknown
+                                                        // pid 9: no record at all — unknown.
+            ]
+            .into(),
+            now_ms: ACT_NOW,
+        }
+    }
+
+    #[test]
+    fn by_activity_classifies_every_census_class_and_sums_to_total() {
+        let report = activity_report();
+        let totals = live_claude_totals_observed(&report, &activity_evidence());
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                working: 2, // pid 1 (pane grid busy), pid 3 (busy + recent message)
+                idle: 2, // pid 2 (pane idle beats a busy record), pid 4 (child-vetoed pane, waiting record)
+                stale: 1, // pid 5 (shell, silent 10 h)
+                unknown: 4, // pids 6-9: unparseable, unknown status, ambiguous, missing
+            }
+        );
+        assert_eq!(totals.by_activity.sum(), totals.total);
+        assert_eq!(totals.total, 9);
+    }
+
+    #[test]
+    fn by_activity_with_no_evidence_is_all_unknown_never_idle() {
+        let report = activity_report();
+        let totals = live_claude_totals_from(&report);
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                unknown: 9,
+                ..ActivityCounts::default()
+            }
+        );
+        assert_eq!(totals.by_activity.sum(), totals.total);
+        // And on an empty box every cell is zero, still summing to total.
+        let empty = live_claude_totals_from(&empty_report(ACT_NOW));
+        assert_eq!(empty.by_activity, ActivityCounts::default());
+        assert_eq!(empty.by_activity.sum(), empty.total);
+    }
+
+    #[test]
+    fn by_activity_does_not_move_any_other_count_or_the_verdict() {
+        let report = activity_report();
+        let plain = live_claude_totals_from(&report);
+        let observed = live_claude_totals_observed(&report, &activity_evidence());
+        assert_eq!(
+            LiveClaudeTotals {
+                by_activity: plain.by_activity,
+                ..observed.clone()
+            },
+            plain,
+            "only by_activity may differ"
+        );
+
+        // An all-idle box that is still blocking stays unsafe: the verdict
+        // reads `blocking`, never `by_activity`.
+        let one = TrackingHealthReport {
+            live_claude_total: 1,
+            terminal_hosted: vec![wind_down_proc(1, Some("s1"), Some("working"), false, false)],
+            ..empty_report(ACT_NOW)
+        };
+        let idle_everywhere = ActivityEvidence {
+            records: [(1, act_record("idle", None))].into(),
+            now_ms: ACT_NOW,
+            ..ActivityEvidence::default()
+        };
+        let totals = live_claude_totals_observed(&one, &idle_everywhere);
+        assert_eq!(totals.by_activity.idle, 1);
+        let v = build_verdict(
+            Some(terminal_plane_from(&one, &[], ACT_NOW)),
+            Some(headless_plane_from(&one)),
+            Some(ai_plane_from(&[], &[], ACT_NOW)),
+            Some(totals),
+            vec![],
+            idle_drain(),
+            fresh_census(ACT_NOW),
+            clean_status_source(),
+        );
+        assert!(!v.safe_to_restart, "an idle session still dies on restart");
+    }
+
+    #[test]
+    fn by_activity_serializes_under_live_claude_in_the_modules_snake_case() {
+        let report = activity_report();
+        let v = build_verdict(
+            Some(terminal_plane_from(&report, &[], ACT_NOW)),
+            Some(headless_plane_from(&report)),
+            Some(ai_plane_from(&[], &report.ai_plane, ACT_NOW)),
+            Some(live_claude_totals_observed(&report, &activity_evidence())),
+            vec![],
+            idle_drain(),
+            fresh_census(ACT_NOW),
+            clean_status_source(),
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(
+            json["live_claude"]["by_activity"],
+            serde_json::json!({"working": 2, "idle": 2, "stale": 1, "unknown": 4})
+        );
+        assert!(json["live_claude"].get("byActivity").is_none(), "{json}");
+    }
+
+    #[test]
+    fn pane_observations_cover_only_observed_top_level_terminal_processes() {
+        let report = activity_report();
+        let observed = ObservedInputs {
+            terminal_by_session: [
+                ("s1".to_string(), "t1".to_string()),
+                ("s2".to_string(), "t2".to_string()),
+                ("s4".to_string(), "t4".to_string()),
+            ]
+            .into(),
+            // t4 was not observed this pass.
+            by_terminal: [
+                ("t1".to_string(), IDLE_LONG_AGO),
+                ("t2".to_string(), TerminalObservation::UNOBSERVABLE),
+            ]
+            .into(),
+            ..ObservedInputs::default()
+        };
+        let by_pid = pane_observations_by_pid(&report, &observed);
+        // pid 3 shares s1's pane but is nested: the pane is not ITS
+        // observation. pid 4's pane was never observed: no stand-in entry.
+        assert_eq!(
+            by_pid,
+            [(1, IDLE_LONG_AGO), (2, TerminalObservation::UNOBSERVABLE)].into()
+        );
+    }
+
+    /// Only processes the pane did NOT decide get a record read (L2): pid 1
+    /// (busy grid) and pid 2 (idle pane) are decided; pid 4's idle pane is
+    /// vetoed by its child, so it still needs one.
+    #[test]
+    fn records_are_read_only_for_processes_the_pane_did_not_decide() {
+        let report = activity_report();
+        let evidence = activity_evidence();
+        let pids: Vec<u32> = pids_needing_a_record(&report, &evidence.pane_by_pid, ACT_NOW)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids, vec![3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    fn write_record(dir: &std::path::Path, pid: u32, status: &str) {
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(
+            dir.join(format!("sessions/{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"s{pid}","status":"{status}","procStart":"77"}}"#),
+        )
+        .unwrap();
+    }
+
+    fn kernel_agrees(_: u32) -> Option<String> {
+        Some("77".to_string())
+    }
+
+    /// L1: the handler's evidence assembly, end to end against a temp config
+    /// dir — pane-decided processes, record-decided ones, and a missing
+    /// record, summing to `total`.
+    #[tokio::test]
+    async fn gather_activity_evidence_reads_records_from_the_given_config_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-x");
+        for pid in [3, 4, 6, 7, 8] {
+            write_record(&dir, pid, "idle");
+        }
+        write_record(&dir, 5, "waiting");
+        // pid 9: no record at all.
+        let report = activity_report();
+        let observed = ObservedInputs {
+            terminal_by_session: [
+                ("s1".to_string(), "t1".to_string()),
+                ("s2".to_string(), "t2".to_string()),
+            ]
+            .into(),
+            by_terminal: [
+                (
+                    "t1".to_string(),
+                    TerminalObservation {
+                        sideband: Sideband::NeverReported,
+                        grid: GridIdle::Busy,
+                    },
+                ),
+                ("t2".to_string(), IDLE_LONG_AGO),
+            ]
+            .into(),
+            ..ObservedInputs::default()
+        };
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let evidence = gather_activity_evidence(
+            &report,
+            &observed,
+            vec![dir],
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+            &IN_FLIGHT,
+        )
+        .await;
+        assert!(
+            !evidence.records.contains_key(&1),
+            "a pane-decided process is never read"
+        );
+        let totals = live_claude_totals_observed(&report, &evidence);
+        // pid 1 working (busy grid); pid 2's pane never reported a sideband so
+        // it falls to the record — none written for it, so unknown; 3-8 idle
+        // from their records; 9 missing → unknown.
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                working: 1,
+                idle: 6,
+                stale: 0,
+                unknown: 2,
+            }
+        );
+        assert_eq!(totals.by_activity.sum(), totals.total);
+    }
+
+    /// L2: a record read that overruns its budget costs the records — every
+    /// undecided process reads `unknown`, never `idle` — and the sum holds.
+    /// The kernel read sleeps ONCE, so the abandoned thread ends promptly.
+    #[tokio::test]
+    async fn a_record_read_that_times_out_leaves_every_undecided_process_unknown() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static SLEPT: AtomicBool = AtomicBool::new(false);
+        fn slow_once(_: u32) -> Option<String> {
+            if !SLEPT.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Some("77".to_string())
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-x");
+        for pid in 1..=9 {
+            write_record(&dir, pid, "idle");
+        }
+        let report = activity_report();
+        let evidence = gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            vec![dir],
+            slow_once,
+            std::time::Duration::from_millis(20),
+            &IN_FLIGHT,
+        )
+        .await;
+        assert!(evidence.records.is_empty());
+        let totals = live_claude_totals_observed(&report, &evidence);
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                unknown: 9,
+                ..ActivityCounts::default()
+            }
+        );
+    }
+
+    /// N2: while an abandoned read is still running, a new call does NOT
+    /// start another (that would leak a blocking thread per poll on a hung
+    /// filesystem) — it reports `unknown` — and once the read ends, reads
+    /// resume.
+    #[tokio::test]
+    async fn only_one_record_read_is_in_flight_at_a_time() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static SLEPT: AtomicBool = AtomicBool::new(false);
+        fn slow_once(_: u32) -> Option<String> {
+            if !SLEPT.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Some("77".to_string())
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-x");
+        for pid in 1..=9 {
+            write_record(&dir, pid, "idle");
+        }
+        let report = activity_report();
+        let observed = ObservedInputs::default();
+        async fn gather(
+            report: &TrackingHealthReport,
+            observed: &ObservedInputs,
+            dir: &std::path::Path,
+            kernel: fn(u32) -> Option<String>,
+            timeout_ms: u64,
+        ) -> ActivityEvidence {
+            gather_activity_evidence(
+                report,
+                observed,
+                vec![dir.to_path_buf()],
+                kernel,
+                std::time::Duration::from_millis(timeout_ms),
+                &IN_FLIGHT,
+            )
+            .await
+        }
+
+        // 1. Times out; its blocking read is still running.
+        assert!(gather(&report, &observed, &dir, slow_once, 20)
+            .await
+            .records
+            .is_empty());
+        assert!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            "the abandoned read holds the slot"
+        );
+
+        // 2. Skipped outright, even with a fast kernel and a generous budget.
+        let skipped = gather(&report, &observed, &dir, kernel_agrees, 3_000).await;
+        assert!(skipped.records.is_empty());
+        assert_eq!(
+            live_claude_totals_observed(&report, &skipped)
+                .by_activity
+                .unknown,
+            9
+        );
+
+        // 3. Once the abandoned read finishes, the slot is free again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while IN_FLIGHT.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the read never ended");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let resumed = gather(&report, &observed, &dir, kernel_agrees, 3_000).await;
+        assert_eq!(resumed.records.len(), 9);
+        assert_eq!(
+            live_claude_totals_observed(&report, &resumed)
+                .by_activity
+                .idle,
+            9
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 of `2026-09-07-health-database-reachable-is-a-connect-probe-
+    // not-a-schema-probe`: the AI/task-run plane is reported as unobtainable
+    // — never a count, never a silent `0` — whenever `/health`'s `schema_ok`
+    // is anything but `Some(true)`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ai_plane_schema_gate_blocks_on_schema_ok_false() {
+        let err = ai_plane_schema_gate(Some(false), Some("missing relation: project.task_runs"))
+            .expect_err("schema_ok: false must gate the AI plane");
+        assert!(err.contains("database schema unavailable"));
+        assert!(err.contains("missing relation: project.task_runs"));
+    }
+
+    #[test]
+    fn ai_plane_schema_gate_blocks_on_schema_ok_none() {
+        // `schema_ok: null` must never be read as safe any more than
+        // `schema_ok: false` — both are "not `Some(true)`".
+        let err = ai_plane_schema_gate(None, Some("not attempted: reachable=false"))
+            .expect_err("schema_ok: null must gate the AI plane, never read as safe");
+        assert!(err.contains("database schema unavailable"));
+        assert!(err.contains("not attempted: reachable=false"));
+    }
+
+    #[test]
+    fn ai_plane_schema_gate_names_a_missing_detail_rather_than_panicking() {
+        let err = ai_plane_schema_gate(None, None).expect_err("still a gate with no detail string");
+        assert!(err.contains("no detail reported"));
+    }
+
+    #[test]
+    fn ai_plane_schema_gate_passes_only_on_schema_ok_true() {
+        assert_eq!(ai_plane_schema_gate(Some(true), None), Ok(()));
+    }
+
+    /// End-to-end through `build_verdict`, mirroring exactly what the handler
+    /// does with the gate's result: a `schema_ok: Some(false)` must make the
+    /// overall verdict unsafe via the SAME fail-closed `unknowns` path every
+    /// other unresolved plane uses — never `safe_to_restart: true` beside an
+    /// `ai_sessions: null`.
+    #[test]
+    fn schema_ok_false_forces_the_verdict_unsafe_with_ai_sessions_null() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = empty_report(now_ms);
+        let open: Vec<TerminalSessionRecord> = vec![];
+        let mut unknowns = Vec::new();
+        let ai =
+            match ai_plane_schema_gate(Some(false), Some("missing relation: project.task_runs")) {
+                Ok(()) => Some(ai_plane_from(&[], &[], now_ms)),
+                Err(msg) => {
+                    unknowns.push(msg);
+                    None
+                }
+            };
+        let v = verdict_from(
+            &report,
+            &open,
+            ai,
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+
+        assert!(
+            !v.safe_to_restart,
+            "an unobtainable AI plane must never read as safe: {v:?}"
+        );
+        assert!(
+            v.ai_sessions.is_none(),
+            "the AI plane must be reported null, never a count"
+        );
+        assert!(v.reason.contains("database schema unavailable"));
+        assert!(v.reason.contains("missing relation: project.task_runs"));
+        assert!(serde_json::to_value(&v).unwrap()["ai_sessions"].is_null());
+    }
+
+    /// Same end-to-end path, but for `schema_ok: None` (the probe itself could
+    /// not run, or `reachable` was not `Some(true)`) — equally unsafe, never
+    /// treated as "zero active sessions".
+    #[test]
+    fn schema_ok_none_forces_the_verdict_unsafe_with_ai_sessions_null() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = empty_report(now_ms);
+        let open: Vec<TerminalSessionRecord> = vec![];
+        let mut unknowns = Vec::new();
+        let ai = match ai_plane_schema_gate(None, Some("not attempted: reachable=unknown")) {
+            Ok(()) => Some(ai_plane_from(&[], &[], now_ms)),
+            Err(msg) => {
+                unknowns.push(msg);
+                None
+            }
+        };
+        let v = verdict_from(
+            &report,
+            &open,
+            ai,
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+
+        assert!(
+            !v.safe_to_restart,
+            "schema_ok: null must never read as safe: {v:?}"
+        );
+        assert!(v.ai_sessions.is_none());
+        assert!(v.reason.contains("database schema unavailable"));
+        assert!(v.reason.contains("not attempted: reachable=unknown"));
+    }
+
+    /// `schema_ok == Some(true)`: the gate is a no-op, so the AI plane is
+    /// built exactly as it was before this change. Smoke-level — the AI
+    /// plane's own shaping is already covered by the tests above.
+    #[test]
+    fn schema_ok_true_leaves_the_ai_plane_unaffected() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = empty_report(now_ms);
+        let open: Vec<TerminalSessionRecord> = vec![];
+        let mut unknowns = Vec::new();
+        let ai = match ai_plane_schema_gate(Some(true), None) {
+            Ok(()) => Some(ai_plane_from(&[], &[], now_ms)),
+            Err(msg) => {
+                unknowns.push(msg);
+                None
+            }
+        };
+        let v = verdict_from(
+            &report,
+            &open,
+            ai,
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+
+        assert!(v.safe_to_restart, "{}", v.reason);
+        assert!(
+            v.ai_sessions.is_some(),
+            "schema_ok: true must not gate the AI plane"
+        );
+        assert_eq!(v.ai_sessions.as_ref().unwrap().count, 0);
     }
 }

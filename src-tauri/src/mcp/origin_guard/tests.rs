@@ -1263,6 +1263,28 @@ fn grace_and_extension_only_lists_are_well_formed() {
     }
 }
 
+/// R7 tripwire: every active-selection route is a registered route and is on
+/// `TRUSTED_ROUTES` (qontinui-web and the supervisor UI keep them), so the
+/// Foreign/Extension refusal is the only thing this list changes.
+#[test]
+fn active_selection_routes_are_registered_and_trusted() {
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    assert!(!ACTIVE_SELECTION_ROUTES.is_empty());
+    for (m, p) in ACTIVE_SELECTION_ROUTES {
+        assert!(
+            registered
+                .iter()
+                .any(|(rm, rp)| rp == p && (rm == m || rm == "ANY")),
+            "active-selection entry not registered: {m} {p}"
+        );
+        assert!(
+            TRUSTED_ROUTES.contains(&(*m, *p)),
+            "active-selection entry not on TRUSTED_ROUTES: {m} {p}"
+        );
+        assert!(!is_credential_door(m, p));
+    }
+}
+
 /// S6 tripwire: nothing is routed after `origin_guard::apply` in
 /// `create_router` (it would bypass the guard). Proven on synthetic source.
 #[test]
@@ -1670,4 +1692,107 @@ fn origin_normalisation() {
     assert!(!fp("http://tauri.localhost.evil.example"));
     assert!(!fp("null"));
     assert!(NormOrigin::parse("null").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler requireProbe (plan 2026-09-29-quiet-is-measured-by-session-
+// existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 4b)
+// ---------------------------------------------------------------------------
+
+/// `POST /scheduler/tasks` and `PUT /scheduler/tasks/{id}` are TRUSTED_ROUTES,
+/// so under the default `enforce-doors` policy a Foreign origin is only
+/// shadowed — admitted. A `requireProbe` is command execution, so the
+/// handlers refuse it by the principal the guard attached. The stand-in
+/// handlers below run the REAL `refuse_untrusted_probe` on the principal this
+/// guard inserts (the real handlers need a database; a source-scan in
+/// `mcp::scheduler` pins that both call it before touching one).
+#[tokio::test]
+async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
+    use axum::routing::put;
+
+    async fn gate(
+        principal: Option<axum::Extension<RequesterPrincipal>>,
+        body: axum::Json<Value>,
+    ) -> StatusCode {
+        let probe: Option<crate::scheduler::ProbeCondition> = body
+            .0
+            .get("conditions")
+            .and_then(|c| c.get("requireProbe"))
+            .map(|p| serde_json::from_value(p.clone()).expect("a valid ProbeCondition"));
+        match crate::mcp::scheduler::refuse_untrusted_probe(
+            principal.as_ref().map(|p| &p.0),
+            probe.as_ref(),
+            None,
+        ) {
+            Ok(()) => StatusCode::OK,
+            // The real handlers answer a refusal with 403.
+            Err(_) => StatusCode::FORBIDDEN,
+        }
+    }
+
+    let h = harness("enforce-doors");
+    assert_eq!(h.guard.route_policy(), RoutePolicy::EnforceDoors);
+    let router = apply(
+        Router::new()
+            .route("/scheduler/tasks", post(gate))
+            .route("/scheduler/tasks/{id}", put(gate)),
+        h.guard.clone(),
+    );
+    let with_probe = json!({
+        "conditions": { "requireProbe": {
+            "enabled": true, "command": ["sh", "-c", "id > /tmp/pwned"],
+            "pollSeconds": 60, "timeoutSeconds": 10
+        }}
+    })
+    .to_string();
+    let without_probe = json!({ "conditions": { "timeoutMinutes": 30 } }).to_string();
+    let host = host(&h);
+
+    let status =
+        |method: &'static str, uri: &'static str, origin: Option<&'static str>, body: String| {
+            let router = router.clone();
+            let host = host.clone();
+            async move {
+                let mut headers = vec![
+                    ("host", host.as_str()),
+                    ("content-type", "application/json"),
+                ];
+                if let Some(o) = origin {
+                    headers.push(("origin", o));
+                }
+                router
+                    .oneshot(req(method, uri, &headers, &body))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+    // Foreign: admitted by the shadowed route policy, refused by the handler.
+    assert_eq!(
+        status("POST", "/scheduler/tasks", Some(EVIL), with_probe.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status("PUT", "/scheduler/tasks/t1", Some(EVIL), with_probe.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    // Trusted (the web dev frontend) may manage tasks but not set a probe.
+    assert_eq!(
+        status("POST", "/scheduler/tasks", Some(WEB), with_probe.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status("POST", "/scheduler/tasks", Some(WEB), without_probe.clone()).await,
+        StatusCode::OK
+    );
+    // NonBrowser (an agent, a script): allowed.
+    assert_eq!(
+        status("POST", "/scheduler/tasks", None, with_probe.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status("PUT", "/scheduler/tasks/t1", None, with_probe).await,
+        StatusCode::OK
+    );
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pinned-read.sh — the fleet's ONE pinned read: FOUND / MISSING_AT_REF / UNKNOWN.
 #
-# SOURCE this for the functions, or EXECUTE it for the four verbs. Both modes
+# SOURCE this for the functions, or EXECUTE it for the five verbs. Both modes
 # run the same code; there is deliberately no second implementation, and no
 # Python twin (see "ONE PRODUCER" below).
 #
@@ -148,13 +148,72 @@
 # ── READ-ONLY BY CONSTRUCTION ───────────────────────────────────────────────
 #
 # No `stash create`, no ref write, no fetch, no network. The helper must never
-# mutate the tree it is measuring, and must never make the network call that
+# mutate the tree it is measuring. The ONE write anywhere in this file is
+# `cat ... --save <file>`, and it writes exactly two files, both named by the
+# CALLER: `<file>` and `<file>.pin`. It never writes an object, a ref, the
+# index or the working tree of the repository it reads -- and it never writes
+# at all outside state FOUND, and must never make the network call that
 # would make it SLOWER than the unsafe read it replaces: the whole reason the
 # unsafe read wins today is that the wrong answer is the cheap one, so the right
 # answer must not cost a fetch. Every git call carries `--no-optional-locks`
 # (git-LEVEL, before the subcommand — the `status --no-optional-locks` spelling
 # is an `error: unknown option` that a `2>/dev/null` renders as a clean result)
 # and `-c core.quotePath=false`.
+#
+# ── A CACHED BODY CARRIES ITS SHA: `--save` AND `recheck` ───────────────────
+#
+# Plan 2026-09-20-a-probe-that-could-not-answer-is-published-as-a-measurement,
+# Phase 4 (sub-shape C). Finding b3d269a4: the freshness check was a diff of a
+# NEW worktree against `origin/main` -- new-vs-new, so it could not fail -- and
+# the phase detail was then read from a scratchpad copy saved 16 h earlier. The
+# check and the consumer read DIFFERENT sources. No re-diff closes that: the
+# copy is not in any tree a diff looks at. What closes it is the copy carrying
+# the sha it was read through, and a re-read that asks the REF again.
+#
+#   cat <ref> <path> --save <file>
+#     Resolves once, exactly as `cat`, and ONLY in state FOUND writes the blob's
+#     bytes to <file> and a sidecar <file>.pin:
+#
+#       pin: ref=... sha=<sha> path=... state=FOUND type=blob measured=...
+#       blob=<the blob id those bytes ARE>
+#       root=<the checkout, absolute>
+#       ref=<the ref as given, raw>
+#       path=<the path, raw>
+#
+#     Line 1 is the ordinary `pin:` line; the four `key=value` lines are what
+#     `recheck` needs raw (unencoded), one per line. Both files are written to a
+#     temporary name beside the target and renamed, content FIRST: a crash
+#     between the two renames leaves new bytes under the old sidecar, which
+#     `recheck` reports EDITED -- detected, never a silent CURRENT. A path, ref
+#     or file name containing a newline is refused (UNKNOWN), because it would
+#     split a sidecar line. Stdout is empty: the content went to the file.
+#     The `pin:` line on STDERR agrees with the exit code: `state=FOUND` is
+#     emitted only AFTER both renames succeeded, and a FOUND path whose blob
+#     id, checkout path or write then failed emits `state=UNKNOWN` instead --
+#     never a FOUND line followed by exit 2.
+#
+#   recheck <file>
+#     Reads <file>.pin, resolves `ref` AGAIN in `root` -- never reuses the saved
+#     sha, which would make the recheck as unable to fail as the diff it
+#     replaces -- and compares three blob ids: the saved one, the one at
+#     `<new sha>:<path>`, and `git hash-object --no-filters <file>` (raw bytes;
+#     without `--no-filters` a CRLF or clean-filter config would hash the bytes
+#     git WOULD store, not the bytes on disk). Local != saved is EDITED, whatever
+#     the ref says. Otherwise saved == current is CURRENT, and saved != current
+#     is STALE -- including a path now absent from the ref (`missing_at_ref`)
+#     or a tree there (`not_a_blob_at_ref`): the ref resolved and the path was
+#     MEASURED, so that is a stale copy, not "could not tell"; folding it into
+#     UNKNOWN would collapse a measured absence into an unmeasured one.
+#
+#     NO FETCH. `as_of=<sha>` on its line is what the ref resolved to in that
+#     checkout NOW, so CURRENT claims "current as of this checkout's last fetch"
+#     and says which sha that was. A ref given as a raw sha re-resolves to
+#     itself, so such a copy can only ever be CURRENT or EDITED -- which is the
+#     truth about a copy pinned to an immutable commit.
+#
+#     It prints ONE `pin-recheck:` line to stderr (registered beside the `pin:`
+#     grammar as `PIN_RECHECK_LINE_RE`; see the comment there for why it is a
+#     second line rather than more `pin:` states) and nothing on stdout.
 #
 # ── EXIT CODES (executed mode) ──────────────────────────────────────────────
 #
@@ -163,6 +222,16 @@
 #   grep   <ref> <pathspec> <pat>    0 match | 1 no match, pathspec VERIFIED
 #                                    non-empty | 2 UNKNOWN | 3 PATHSPEC_EMPTY
 #   sha    <ref>                     0 resolved, sha on stdout | 2 UNKNOWN
+#   cat    <ref> <path> --save <file>
+#                                    0 FOUND, content written to <file> and its
+#                                    provenance to <file>.pin; NOTHING on stdout
+#                                    | 1 MISSING_AT_REF | 2 UNKNOWN -- and in
+#                                    every non-zero state NEITHER file is written
+#   recheck <file>                   0 CURRENT | 1 STALE (the ref moved the blob,
+#                                    or the path is gone from it) | 1 EDITED (the
+#                                    local bytes are not the saved blob)
+#                                    | 2 UNKNOWN (no sidecar, the checkout gone,
+#                                    the ref unresolvable, the copy missing)
 #
 # 2 is UNKNOWN throughout, matching scripts/reach-grep.sh's rule ("Either exits
 # 2, never 0"). 3 is never folded into 1: collapsing MISSING_AT_REF or
@@ -251,14 +320,21 @@ _pin_encode() {
   printf '%s' "$s"
 }
 
+# _pin_line <ref> <sha> <path> <state> <type>
+#   ONE pin: line, on stdout -- the text only. `_pin_emit` sends it to stderr;
+#   `--save` also writes it as the sidecar's first line.
+_pin_line() {
+  printf 'pin: ref=%s sha=%s path=%s state=%s type=%s measured=%s\n' \
+    "$(_pin_encode "${1-}")" "${2-$PIN_UNKNOWN}" "$(_pin_encode "${3-}")" \
+    "${4-$PIN_UNKNOWN}" "${5-$PIN_UNKNOWN}" "$(_pin_now)"
+}
+
 # _pin_emit <ref> <sha> <path> <state> <type>
 #   ONE pin: line, to STDERR, BEFORE any stdout — the reach-grep.sh discipline,
 #   so a `| head` cannot hide it and a caller that reads only stdout still gets
 #   the provenance on the channel it did not filter.
 _pin_emit() {
-  printf 'pin: ref=%s sha=%s path=%s state=%s type=%s measured=%s\n' \
-    "$(_pin_encode "${1-}")" "${2-$PIN_UNKNOWN}" "$(_pin_encode "${3-}")" \
-    "${4-$PIN_UNKNOWN}" "${5-$PIN_UNKNOWN}" "$(_pin_now)" >&2
+  _pin_line "$@" >&2
 }
 
 # _pin_reject_relative <path> — `<rev>:./x` and `<rev>:../x` are git's
@@ -421,6 +497,194 @@ pin_grep() {
   return "$rc"
 }
 
+# _pin_abs <path> — the path made absolute against $PWD, lexically (no
+# symlink resolution, no spawn). A relative sidecar `root=` or a relative copy
+# name would mean something different from the next caller's directory.
+_pin_abs() {
+  case "${1-}" in
+    /*|[A-Za-z]:/*) printf '%s' "$1" ;;
+    *)              printf '%s/%s' "$PWD" "$1" ;;
+  esac
+}
+
+# pin_cat_save <root> <ref> <path> <file>
+#   0 FOUND, bytes written to <file> and provenance to <file>.pin (nothing on
+#   stdout) | 1 MISSING_AT_REF | 2 UNKNOWN. In EVERY non-zero state neither
+#   file is written -- the same "content only in state 0" rule as `pin_cat`,
+#   applied to a file instead of a stream. See "A CACHED BODY CARRIES ITS SHA".
+pin_cat_save() {
+  local root="${1-}" ref="${2-}" path="${3-}" file="${4-}" sha rc oid abs_root line tmpc tmps typ
+  if ! _pin_reject_relative "$path"; then
+    _pin_emit "$ref" "$PIN_UNKNOWN" "$path" "$PIN_STATE_UNKNOWN" "$PIN_UNKNOWN"
+    echo "pinned-read: refusing '$path' -- a path that is empty, absolute, or CWD-relative ('./', '../') does not name repo content at a ref; git would resolve it against the current directory instead" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  case "$ref$path$file" in
+    *$'\n'*)
+      _pin_emit "$ref" "$PIN_UNKNOWN" "$path" "$PIN_STATE_UNKNOWN" "$PIN_UNKNOWN"
+      echo "pinned-read: refusing --save -- a newline in the ref, path or file name would split a line of the <file>.pin sidecar" >&2
+      return "$PIN_RC_UNKNOWN" ;;
+  esac
+  if [ -z "$file" ]; then
+    _pin_emit "$ref" "$PIN_UNKNOWN" "$path" "$PIN_STATE_UNKNOWN" "$PIN_UNKNOWN"
+    echo "pinned-read: --save needs a file name" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  file="$(_pin_abs "$file")"
+  if [ ! -d "${file%/*}" ] || [ -d "$file" ]; then
+    _pin_emit "$ref" "$PIN_UNKNOWN" "$path" "$PIN_STATE_UNKNOWN" "$PIN_UNKNOWN"
+    echo "pinned-read: --save target '$file' is a directory or sits in a directory that does not exist -- nothing written" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  sha="$(pin_sha "$root" "$ref")" || {
+    _pin_emit "$ref" "$PIN_UNKNOWN" "$path" "$PIN_STATE_UNKNOWN" "$PIN_UNKNOWN"
+    echo "pinned-read: could not resolve ref '$ref' in '$root' -- UNKNOWN, not MISSING; nothing written" >&2
+    return "$PIN_RC_UNKNOWN"
+  }
+  # NOT `_pin_exists_at_sha` on the FOUND path: it would emit `state=FOUND`
+  # before the save below could still fail, and the caller would read a FOUND
+  # line and an exit 2 for one call. The line is emitted once the outcome is
+  # known. A non-blob delegates to it, for the MISSING line it already owns.
+  typ="$(_pin_git "$root" cat-file -t "${sha}:${path}" 2>/dev/null)" || typ=""
+  if [ "$typ" != blob ]; then
+    _pin_exists_at_sha "$root" "$ref" "$sha" "$path"; rc=$?
+    # The object store is immutable per sha, so a second look answering FOUND
+    # is a flaking read, not a blob: UNKNOWN, with its own line.
+    if [ "$rc" -eq "$PIN_RC_FOUND" ]; then
+      _pin_emit "$ref" "$sha" "$path" "$PIN_STATE_UNKNOWN" "$PIN_UNKNOWN"
+      echo "pinned-read: '${sha}:${path}' answered two different object types -- UNKNOWN; nothing written" >&2
+      return "$PIN_RC_UNKNOWN"
+    fi
+    return "$rc"
+  fi
+  # The blob id, from the SAME resolved sha. The bytes are then read BY that id,
+  # so what lands in <file> is by construction the blob the sidecar names.
+  oid="$(_pin_git "$root" rev-parse --verify -q "${sha}:${path}" 2>/dev/null)" || oid=""
+  abs_root="$(cd "$root" 2>/dev/null && pwd)" || abs_root=""
+  if ! _pin_is_oid "$oid" || [ -z "$abs_root" ]; then
+    _pin_emit "$ref" "$sha" "$path" "$PIN_STATE_UNKNOWN" "blob"
+    echo "pinned-read: FOUND at $sha but the blob id or the checkout's absolute path did not resolve -- UNKNOWN; nothing written" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  tmpc="$file.pin-save.$$"
+  tmps="$file.pin.pin-save.$$"
+  line="$(_pin_line "$ref" "$sha" "$path" "$PIN_STATE_FOUND" "blob")"
+  if _pin_git "$root" cat-file blob "$oid" >"$tmpc" 2>/dev/null \
+     && printf '%s\nblob=%s\nroot=%s\nref=%s\npath=%s\n' "$line" "$oid" "$abs_root" "$ref" "$path" >"$tmps" 2>/dev/null \
+     && mv -f "$tmpc" "$file" 2>/dev/null \
+     && mv -f "$tmps" "$file.pin" 2>/dev/null; then
+    printf '%s\n' "$line" >&2
+    return "$PIN_RC_FOUND"
+  fi
+  rm -f "$tmpc" "$tmps" 2>/dev/null
+  _pin_emit "$ref" "$sha" "$path" "$PIN_STATE_UNKNOWN" "blob"
+  echo "pinned-read: writing '$file' or its .pin sidecar failed -- UNKNOWN" >&2
+  return "$PIN_RC_UNKNOWN"
+}
+
+# _pin_recheck_emit <file> <state> <ref> <path> <root> <saved_sha> <as_of>
+#                   <saved_blob> <current_blob> <local_blob> <reason>
+#   ONE pin-recheck: line to stderr. Empty fields render as the sentinel.
+_pin_recheck_emit() {
+  local u="$PIN_UNKNOWN"
+  printf 'pin-recheck: file=%s state=%s ref=%s path=%s root=%s saved_sha=%s as_of=%s saved_blob=%s current_blob=%s local_blob=%s reason=%s measured=%s\n' \
+    "$(_pin_encode "${1:-$u}")" "${2:-$u}" "$(_pin_encode "${3:-$u}")" \
+    "$(_pin_encode "${4:-$u}")" "$(_pin_encode "${5:-$u}")" "${6:-$u}" \
+    "${7:-$u}" "${8:-$u}" "${9:-$u}" "${10:-$u}" "${11:-$u}" "$(_pin_now)" >&2
+}
+
+# _pin_is_oid <s> — a 40- or 64-hex object id (SHA-1 or SHA-256 repository).
+_pin_is_oid() {
+  [[ "${1-}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
+}
+
+# pin_recheck <file>
+#   0 CURRENT | 1 STALE | 1 EDITED | 2 UNKNOWN. See "A CACHED BODY CARRIES ITS
+#   SHA" for what each state compares, and why the ref is resolved AGAIN.
+pin_recheck() {
+  local file="${1-}" side l pinline="" s_blob="" s_root="" s_ref="" s_path="" saved_sha=""
+  local new_sha local_blob typ cur reason
+  if [ -z "$file" ]; then
+    _pin_recheck_emit "" "$PIN_STATE_UNKNOWN" "" "" "" "" "" "" "" "" no_sidecar
+    echo "pinned-read: recheck needs <file>" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  file="$(_pin_abs "$file")"
+  side="$file.pin"
+  if [ ! -r "$side" ]; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "" "" "" "" "" "" "" "" no_sidecar
+    echo "pinned-read: '$side' is absent or unreadable -- this copy carries no provenance, so whether it is still the ref's is UNKNOWN" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  # First occurrence of each key wins; the `pin:` line is line 1 by contract.
+  while IFS= read -r l || [ -n "$l" ]; do
+    case "$l" in
+      "pin: "*) [ -n "$pinline" ] || pinline="$l" ;;
+      blob=*)   [ -n "$s_blob" ]  || s_blob="${l#blob=}" ;;
+      root=*)   [ -n "$s_root" ]  || s_root="${l#root=}" ;;
+      ref=*)    [ -n "$s_ref" ]   || s_ref="${l#ref=}" ;;
+      path=*)   [ -n "$s_path" ]  || s_path="${l#path=}" ;;
+    esac
+  done <"$side"
+  # 40 OR 64 hex -- a SHA-256 repository's commit ids are 64, and `_pin_is_oid`
+  # accepts both for the blob; a 40-only match here would call every such
+  # sidecar malformed.
+  [[ "$pinline" =~ \ sha=([0-9a-f]{40}([0-9a-f]{24})?)\  ]] && saved_sha="${BASH_REMATCH[1]}"
+  if [ -z "$saved_sha" ] || ! _pin_is_oid "$s_blob" || [ -z "$s_root" ] \
+     || [ -z "$s_ref" ] || ! _pin_reject_relative "$s_path"; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "" "" "" "" sidecar_malformed
+    echo "pinned-read: '$side' does not carry a pin: line with a resolved sha plus blob=/root=/ref=/path= -- UNKNOWN" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  if [ ! -f "$file" ]; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "" "$s_blob" "" "" copy_missing
+    echo "pinned-read: the copy '$file' is gone but its sidecar remains -- UNKNOWN" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  if [ ! -d "$s_root" ]; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "" "$s_blob" "" "" root_gone
+    echo "pinned-read: the checkout '$s_root' this copy was read through no longer exists -- UNKNOWN, not current and not stale" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  # ⚠️ THE RE-RESOLUTION. `saved_sha` is what the ref WAS; comparing against it
+  # would pass every copy forever -- the new-vs-new diff of b3d269a4 again.
+  new_sha="$(pin_sha "$s_root" "$s_ref")" || new_sha=""
+  if [ -z "$new_sha" ]; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "" "$s_blob" "" "" ref_unresolvable
+    echo "pinned-read: ref '$s_ref' no longer resolves in '$s_root' -- UNKNOWN" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  local_blob="$(_pin_git "$s_root" hash-object --no-filters -- "$file" 2>/dev/null)" || local_blob=""
+  if ! _pin_is_oid "$local_blob"; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "$new_sha" "$s_blob" "" "" hash_failed
+    echo "pinned-read: could not hash '$file' -- UNKNOWN" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  typ="$(_pin_git "$s_root" cat-file -t "${new_sha}:${s_path}" 2>/dev/null)" || typ=""
+  case "$typ" in
+    blob) cur="$(_pin_git "$s_root" rev-parse --verify -q "${new_sha}:${s_path}" 2>/dev/null)" || cur=""
+          _pin_is_oid "$cur" || cur="$PIN_UNKNOWN"
+          reason=ref_moved_blob ;;
+    "")   cur="none"; reason=missing_at_ref ;;
+    *)    cur="none"; reason=not_a_blob_at_ref ;;
+  esac
+  if [ "$local_blob" != "$s_blob" ]; then
+    _pin_recheck_emit "$file" EDITED "$s_ref" "$s_path" "$s_root" "$saved_sha" "$new_sha" "$s_blob" "$cur" "$local_blob" local_bytes_differ
+    return 1
+  fi
+  if [ "$cur" = "$PIN_UNKNOWN" ]; then
+    _pin_recheck_emit "$file" "$PIN_STATE_UNKNOWN" "$s_ref" "$s_path" "$s_root" "$saved_sha" "$new_sha" "$s_blob" "" "$local_blob" hash_failed
+    echo "pinned-read: '${new_sha}:${s_path}' is a blob but its id did not resolve -- UNKNOWN" >&2
+    return "$PIN_RC_UNKNOWN"
+  fi
+  if [ "$cur" = "$s_blob" ]; then
+    _pin_recheck_emit "$file" CURRENT "$s_ref" "$s_path" "$s_root" "$saved_sha" "$new_sha" "$s_blob" "$cur" "$local_blob" blob_unchanged
+    return 0
+  fi
+  _pin_recheck_emit "$file" STALE "$s_ref" "$s_path" "$s_root" "$saved_sha" "$new_sha" "$s_blob" "$cur" "$local_blob" "$reason"
+  return 1
+}
+
 # ── Executed mode ───────────────────────────────────────────────────────────
 
 _pin_usage() {
@@ -434,6 +698,19 @@ pinned-read.sh — read a ref, and never confuse "absent from the ref" with "no 
       Content on stdout, ONLY in state 0.
       0 FOUND | 1 MISSING_AT_REF | 2 UNKNOWN
 
+  pinned-read.sh [--root <dir>] cat <ref> <path> --save <file>
+      Content to <file> and its provenance (the pin: line, blob=, root=, ref=,
+      path=) to <file>.pin, ONLY in state 0; nothing on stdout, and neither
+      file is written in any other state.
+      0 FOUND | 1 MISSING_AT_REF | 2 UNKNOWN
+
+  pinned-read.sh recheck <file>
+      Is a --save'd copy still the ref's? Re-resolves the sidecar's ref in its
+      checkout (no fetch; the line says as_of=<sha>) and compares blob ids.
+      0 CURRENT | 1 STALE (the ref moved the blob) | 1 EDITED (the local bytes
+      differ from the saved blob) | 2 UNKNOWN (no sidecar, checkout gone, ref
+      unresolvable, copy missing)
+
   pinned-read.sh [--root <dir>] grep <ref> <pathspec> <pattern> [git-grep args...]
       0 match | 1 no match (pathspec verified non-empty)
       | 2 UNKNOWN | 3 PATHSPEC_EMPTY
@@ -445,7 +722,8 @@ pinned-read.sh — read a ref, and never confuse "absent from the ref" with "no 
   --root <dir>   the checkout to read through (default: the current directory)
   -h, --help     this text
 
-Every verb prints ONE `pin:` line to stderr, before any stdout, naming the ref
+Every read verb prints ONE `pin:` line to stderr (`recheck` prints one
+`pin-recheck:` line instead), before any stdout, naming the ref
 AS GIVEN and the sha it was RESOLVED TO — so "names a ref" and "was read through
 that ref" cannot diverge.
 
@@ -455,6 +733,10 @@ there" are different answers, and 3 is never folded into 1.
   # instead of:  git show origin/main:path/to/f.md | grep -c PATTERN
   bash scripts/lib/pinned-read.sh cat origin/main path/to/f.md | grep -c PATTERN
   # ... and check the exit code, which now survives the pipe on stderr.
+
+  # instead of:  git show origin/main:path/to/f.md > /tmp/f.md   (no sha kept)
+  bash pinned-read.sh cat origin/main path/to/f.md --save /tmp/f.md
+  bash pinned-read.sh recheck /tmp/f.md    # before trusting the copy later
 USAGE
 }
 
@@ -476,8 +758,15 @@ _pin_main() {
   case "$verb" in
     exists) [ $# -eq 2 ] || { echo "pinned-read: exists needs <ref> <path>" >&2; return 2; }
             pin_exists "$root" "$1" "$2" ;;
-    cat)    [ $# -eq 2 ] || { echo "pinned-read: cat needs <ref> <path>" >&2; return 2; }
-            pin_cat "$root" "$1" "$2" ;;
+    cat)    if [ $# -eq 2 ]; then
+              pin_cat "$root" "$1" "$2"
+            elif [ $# -eq 4 ] && [ "$3" = "--save" ]; then
+              pin_cat_save "$root" "$1" "$2" "$4"
+            else
+              echo "pinned-read: cat needs <ref> <path> [--save <file>]" >&2; return 2
+            fi ;;
+    recheck) [ $# -eq 1 ] || { echo "pinned-read: recheck needs <file>" >&2; return 2; }
+            pin_recheck "$1" ;;
     grep)   [ $# -ge 3 ] || { echo "pinned-read: grep needs <ref> <pathspec> <pattern>" >&2; return 2; }
             pin_grep "$root" "$@" ;;
     sha)    [ $# -eq 1 ] || { echo "pinned-read: sha needs <ref>" >&2; return 2; }

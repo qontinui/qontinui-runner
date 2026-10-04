@@ -379,7 +379,12 @@ pub async fn terminal_create(
                 // `terminal_close` command, so a double-close (exit +
                 // explicit close) is a no-op.
                 let close_registry = registry.clone();
-                session.set_on_exit(Box::new(move |coord_id| {
+                // Fixed at spawn (`TerminalSession::pinned_session_id` doc) —
+                // safe to capture as an owned String for the on-exit hook,
+                // which fires once the session's identity is long past
+                // changing.
+                let exit_pinned_session_id = session.pinned_session_id().to_string();
+                session.set_on_exit(Box::new(move |coord_id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -387,6 +392,15 @@ pub async fn terminal_create(
                             "terminal exit hook: coord session close failed"
                         );
                     }
+                    // Trigger 4 (session_exit) — plan
+                    // 2026-08-27-operator-touch-observation-runner-emitter,
+                    // Phase B2 §2b/§2c.
+                    crate::session::operator_touch::emit_session_exit_if_nonzero(
+                        &close_registry,
+                        coord_id,
+                        Some(&exit_pinned_session_id),
+                        exit_code,
+                    );
                 }));
 
                 // Attach the output pipe so PTY output streams to coord.
@@ -689,6 +703,82 @@ pub fn terminal_get_bracketed_paste(
         success: true,
         message: None,
         data: Some(serde_json::json!({ "bracketedPaste": bracketed })),
+    })
+}
+
+/// Is a `claude` process running in this pane's process subtree right now,
+/// and which session id was it launched with?
+///
+/// WHY. The resume path (boot-restore retype and the "Retry resume" banner)
+/// types `claude --permission-mode bypassPermissions --resume <id>` into the
+/// pane on the assumption it is sitting at a shell prompt. When the handshake
+/// scrape false-negatives, claude IS already running there, and the command
+/// lands as a prompt in the live session. The process table answers "is there
+/// a claude in this pane" without scraping the screen, so the frontend asks
+/// here before every resume write.
+///
+/// `state`:
+/// - `live` / `absent` — readings of the process table. On `live`,
+///   `sessionIds` carries the `--resume` / `--session-id` value parsed from
+///   each claude's command line (one targeted query, only the claude pids);
+///   a claude started with neither, or whose command line was unreadable,
+///   contributes nothing, so a requested id missing from the list is NOT
+///   evidence that a different session runs.
+/// - `remote` — the pane has no local pid; the subtree cannot be observed.
+/// - `unknown` — a LOCAL pane whose process table could not be read. Says
+///   nothing either way, and the caller must not treat it as `absent`.
+#[tauri::command]
+pub async fn terminal_probe_claude(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    use crate::terminal::graceful_exit::{probe_claude_under, ClaudeProbe};
+
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+    let Some(root_pid) = session.child_pid() else {
+        return Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::json!({
+                "state": "remote",
+                "claudePids": [],
+                "sessionIds": [],
+            })),
+        });
+    };
+    let data = match probe_claude_under(Some(root_pid), Vec::new()).await {
+        ClaudeProbe::Readable(p) => {
+            let pids: Vec<u32> = p.subtree_claude.iter().map(|id| id.pid).collect();
+            let session_ids: Vec<String> = if pids.is_empty() {
+                Vec::new()
+            } else {
+                crate::process_capture::process_tree::command_lines_for_pids(&pids)
+                    .await
+                    .values()
+                    .filter_map(|cl| {
+                        crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
+                    })
+                    .collect()
+            };
+            serde_json::json!({
+                "state": if pids.is_empty() { "absent" } else { "live" },
+                "claudePids": pids,
+                "sessionIds": session_ids,
+            })
+        }
+        ClaudeProbe::Unreadable(detail) => serde_json::json!({
+            "state": "unknown",
+            "claudePids": [],
+            "sessionIds": [],
+            "detail": detail,
+        }),
+    };
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(data),
     })
 }
 
@@ -1327,7 +1417,7 @@ fn record_open_confirmation_report(
 /// Re-point an open session record at the terminal that now hosts it.
 ///
 /// Called by the cold-restore path for every recreated tab whose record is NOT
-/// on the verified-resume track (`terminal-only` / `quarantine`). Those records
+/// on the verified-resume track (`terminal-only`). Those records
 /// otherwise keep pointing at the dead pre-restart terminal id forever, so each
 /// restore pass fails to recognise the tab it already made and cold-creates a
 /// duplicate — an unbounded PTY leak proportional to (stale records × restarts).
@@ -1543,76 +1633,7 @@ pub fn terminal_session_list_open(
     // 2026-07-19 anchor ~1h46m past the crash band and stranded 81 sessions).
     // Only a CLEAN shutdown marker is an honest last-moment-of-life signal.
     let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
-    let mut sessions = store.restorable_records(now, prior_marker_at, boot_was_clean);
-
-    // G3 (session-restore-redesign Phase 3): UNION the registry restorable set
-    // with the TRANSCRIPT-DERIVED disk-only recovery net. A session that was
-    // live at crash but that the registry never captured — the spawn-record AND
-    // the provider hook both missed, AND the crash beat the next reconcile poll
-    // (which needs a live PTY it no longer has) — has no restorable row today
-    // and is silently lost. `disk_only_restore_candidates` scans every Claude
-    // config dir (dynamic account enumeration via `find_claude_config_dirs` —
-    // NOT a hardcoded account list) for recently-active transcripts and offers
-    // the registry-ABSENT ones under the account that holds each transcript.
-    //
-    // PRIMARY-ONLY since 2026-08-10 (plan
-    // `2026-08-10-temp-runner-session-restore-isolation`, Phase 2). On any
-    // SECONDARY — temp or named — `disk_only_restore_candidates` returns empty
-    // WITHOUT scanning, so everything below about the machine-global scan and
-    // the exclusion set describes the primary's behaviour only. If you are
-    // asking "why is the restore set empty on my temp runner?", that is why,
-    // and it is deliberate: a secondary's candidates are overwhelmingly other
-    // instances', and offering them materialized a PTY apiece (measured: 283
-    // live PTYs on one temp runner). The registry-backed restorable set above
-    // is unaffected on every instance.
-    //
-    // Exclusion set (P3 fix): the restorable-set ids UNION every CLOSED row's
-    // id — deliberately NOT `all_ids()`. `all_ids()` also excluded registry
-    // rows that are `open` yet DROPPED by the restorable grace gate (the
-    // Phase-1 cohort-anchor victims: an open row a crash-restart couldn't
-    // admit), making them invisible to BOTH paths — not restorable AND not
-    // disk-recoverable. By excluding only restorable + closed ids, exactly
-    // those open grace-gate victims can now LEAK into the quarantined
-    // disk-only net (if a fresh transcript exists). Closed rows never leak:
-    // whether user-closed (`no-terminal`/explicit) or a grace-EXPIRED
-    // `pty-exit`/`poll-dead`, their close encodes a "do not restore" decision,
-    // so a fresh mtime must not resurrect them (the don't-resurrect-a-closed-
-    // tab property the old `all_ids` exclusion was buying). In-grace
-    // `pty-exit`/`poll-dead` closes are already in the restorable set, so they
-    // stay excluded too — the union just additionally covers grace-expired and
-    // user closes.
-    //
-    // These candidates are `origin=reconciled`+unconfirmed, so the frontend
-    // classifier quarantines them behind the one-click verified-resume
-    // handshake — never a blind `--resume`. Fail-open by construction: a scan
-    // failure yields zero extra candidates, degrading to today's registry-only
-    // set.
-    let mut excluded = store.closed_ids();
-    excluded.extend(sessions.iter().map(|r| r.claude_session_id.clone()));
-    let disk_only = crate::session::reconcile::disk_only_restore_candidates(now, &excluded);
-    if !disk_only.is_empty() {
-        tracing::info!(
-            count = disk_only.len(),
-            "terminal_session_list_open: added transcript-derived disk-only restore candidates (registry capture-miss recovery)"
-        );
-    }
-    sessions.extend(disk_only);
-
-    // Stamp the derived `transcriptExists` bit onto every candidate so the
-    // frontend classifier can avoid typing `--resume` against an id with no
-    // conversation on disk. See `probe_transcript_exists` for why `confirmed_at`
-    // is not sufficient proof and which cases read UNKNOWN.
-    let rows: Vec<RestoreCandidate> = sessions
-        .into_iter()
-        .map(|rec| {
-            let transcript_exists =
-                store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
-            RestoreCandidate {
-                record: rec,
-                transcript_exists,
-            }
-        })
-        .collect();
+    let rows = restore_candidates(&store, now, prior_marker_at, boot_was_clean);
 
     Ok(CommandResponse {
         success: true,
@@ -1633,6 +1654,43 @@ struct RestoreCandidate {
     /// rather than "no transcript".
     #[serde(rename = "transcriptExists", skip_serializing_if = "Option::is_none")]
     transcript_exists: Option<bool>,
+}
+
+/// The boot-restore set [`terminal_session_list_open`] returns: exactly the
+/// registry's [`SessionLifecycleStore::restorable_records`], each stamped with
+/// its derived `transcriptExists` bit, and NOTHING else.
+///
+/// Every row here is one the registry owns. The restore loop creates a pane for
+/// every row it is handed, so a source that is not the registry — the former
+/// disk-only transcript net, which offered every registry-absent transcript on
+/// the box modified in the last 6h — becomes one bare shell pane per candidate
+/// on every restore. That net was deleted (plan
+/// `2026-09-30-disk-only-restore-net-spawns-orphan-shell-panes`); a session
+/// missing from this set is resumable by hand from Past Sessions when its row
+/// or snapshot history exists.
+///
+/// The `transcriptExists` bit lets the frontend classifier avoid typing
+/// `--resume` against an id with no conversation on disk. See
+/// `probe_transcript_exists` for why `confirmed_at` is not sufficient proof and
+/// which cases read UNKNOWN.
+fn restore_candidates(
+    store: &SessionLifecycleStore,
+    now_ms: i64,
+    prior_marker_at: Option<i64>,
+    boot_was_clean: bool,
+) -> Vec<RestoreCandidate> {
+    store
+        .restorable_records(now_ms, prior_marker_at, boot_was_clean)
+        .into_iter()
+        .map(|rec| {
+            let transcript_exists =
+                store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+            RestoreCandidate {
+                record: rec,
+                transcript_exists,
+            }
+        })
+        .collect()
 }
 
 /// List EVERY previous Claude terminal session for display — the "previous
@@ -2295,7 +2353,8 @@ pub(crate) fn create_terminal_session_backend(
                 // spawn on.
                 let exited_terminal_id = info.id.clone();
                 let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
-                session.set_on_exit(Box::new(move |coord_id| {
+                let exit_pinned_session_id = session.pinned_session_id().to_string();
+                session.set_on_exit(Box::new(move |coord_id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -2306,6 +2365,15 @@ pub(crate) fn create_terminal_session_backend(
                     crate::agent_runtime::notify_continuation_terminal_exit(
                         &exited_terminal_id,
                         exit_rt_handle.as_ref(),
+                    );
+                    // Trigger 4 (session_exit) — plan
+                    // 2026-08-27-operator-touch-observation-runner-emitter,
+                    // Phase B2 §2b/§2c.
+                    crate::session::operator_touch::emit_session_exit_if_nonzero(
+                        &close_registry,
+                        coord_id,
+                        Some(&exit_pinned_session_id),
+                        exit_code,
                     );
                 }));
                 let rx = session.subscribe_output();
@@ -2464,8 +2532,8 @@ fn resolve_latest_claude_session_id(
 /// backend-spawned session whose id was NOT pre-pinned (no `--session-id` in the
 /// hint) — there the id only appears once the child writes its first transcript,
 /// so this poll is the only recourse. It records with origin `"reconciled"` (a
-/// freshest-mtime guess that may be foreign — quarantined on restore, never
-/// auto-resumed). Do NOT add new callers; pin the id at spawn instead.
+/// freshest-mtime guess that may be foreign — restored as a plain terminal
+/// (terminal-only), never auto-resumed). Do NOT add new callers; pin the id at spawn instead.
 ///
 /// The resolver is injected so this loop is unit-testable without a real
 /// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
@@ -2862,6 +2930,76 @@ mod tests {
         assert!(
             unprobed.get("transcriptExists").is_none(),
             "no probe attached must OMIT the field, never emit false: {unprobed}"
+        );
+    }
+
+    /// The boot-restore set is the REGISTRY and nothing else: a fresh,
+    /// registry-absent transcript sitting on disk under a discoverable Claude
+    /// config dir is NOT offered for restore (plan
+    /// `2026-09-30-disk-only-restore-net-spawns-orphan-shell-panes`). The
+    /// removed disk-only net offered exactly such a transcript, and the restore
+    /// loop turned each one into a bare shell pane on every restore.
+    ///
+    /// Non-vacuous by construction: the transcript lives under
+    /// `CLAUDE_CONFIG_DIR`, which `find_claude_config_dirs` returns (asserted
+    /// below), the file is seconds old, and the instance-identity env is
+    /// cleared so this process reads as the PRIMARY. A re-added net that scans
+    /// the config dirs from [`restore_candidates`] would therefore offer
+    /// `disk-only-sess` and fail the exact-set assertion.
+    #[test]
+    fn restore_candidates_never_offers_a_registry_absent_disk_transcript() {
+        let amb = crate::test_env::isolated_ambient();
+        for key in [
+            "QONTINUI_INSTANCE_NAME",
+            "QONTINUI_PRIMARY_PORT",
+            "QONTINUI_PORT",
+        ] {
+            std::env::remove_var(key);
+        }
+
+        // A fresh, real-looking interactive transcript the registry never saw.
+        let cfg = amb.dir().join("claude-cfg");
+        let proj = cfg.join("projects").join("C--repo");
+        std::fs::create_dir_all(&proj).expect("project dir");
+        std::fs::write(
+            proj.join("disk-only-sess.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"C:/repo\",\"timestamp\":\"2026-09-30T11:23:00.000Z\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .expect("transcript");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+        assert!(
+            crate::terminal::transcript::find_claude_config_dirs().contains(&cfg),
+            "fixture must be discoverable, or this test proves nothing about a disk scan"
+        );
+
+        // One registry row, recorded now — the only thing restore may offer.
+        let store = SessionLifecycleStore::open(amb.dir().join("terminal-sessions.json"))
+            .expect("store opens");
+        store.record_open(restore_candidate_record("registry-sess"));
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let offered: Vec<String> = restore_candidates(&store, now, None, false)
+            .into_iter()
+            .map(|c| c.record.claude_session_id)
+            .collect();
+        let registry: Vec<String> = store
+            .restorable_records(now, None, false)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+
+        assert_eq!(
+            offered,
+            vec!["registry-sess".to_string()],
+            "restore must offer exactly the registry row"
+        );
+        assert_eq!(
+            offered, registry,
+            "restore is the registry's restorable set, no union"
+        );
+        assert!(
+            !offered.iter().any(|id| id == "disk-only-sess"),
+            "a registry-absent transcript on disk must never become a restore candidate"
         );
     }
 

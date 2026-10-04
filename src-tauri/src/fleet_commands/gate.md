@@ -120,11 +120,15 @@ Do this first, regardless of which transport ends up carrying it.
 | A claim going terminal | `claim_terminal` | claim-anchored (`claim_kind`+`resource_key`) |
 | A human decision / judgment | `operator_approval` | `{prompt}` — notify-only; the human escape hatch |
 | CI going green | `ci_green` | `{repo, head_sha}` — a FIXED head SHA, not a branch name: the evaluator matches `coord.pr_check_runs_latest` rows BY head SHA, so a branch name matches nothing and the gate stays open forever |
+| A **PR's** CI going green across pushes | `pr_ci_green` | `{repo, pr_number}` — the HEAD-FOLLOWING sibling of `ci_green`: it re-resolves the PR's head from `coord.repo_branches` on every sweep, so ONE `gate_id` (and any continuation on it) survives a rebase, a fix commit or a regenerated artifact, clearing when CI is green on whatever the head then is. **A red head is `Open` with a loud reason, never `Failed`** — the only terminal arms come from the PR lifecycle: merged/ff-landed clears it, closed without a land record fails it. Choose it over `ci_green` whenever the PR may need a NEW head before it goes green — `ci_green` pins one `head_sha` and goes terminally `Failed` on a red check, so a `ci_green` gate on a head that gets replaced can never clear and wakes nobody. The field is `pr_number`, not `pr` (one spelling with `pr_merged`). Declared by qontinui-coord `GatePredicate`; missing from this table until 2026-09-25. |
+| A published GitHub Release catching up with its `v*` tag | `release_in_sync` | `{repo?}` — a repo's published GitHub Release is in sync with its latest `v*` tag; `repo` defaults to `qontinui/qontinui-runner`, so a bare `{}` gates the runner installer, and when present it must be `owner/name` (a bare slug is refused). It reads the release observer's PERSISTED observation, not a live probe: `in_sync` clears; `in_flight` (building / inside grace) and `unknown` stay `Open` quietly; `stale` (tag pushed, nothing published past grace) and `failed_deploy` (a stuck DRAFT) stay `Open` with a LOUD reason and self-heal when the release is fixed; only `rolled_back` (a published release un-published or deleted) is `Failed`. Declared by qontinui-coord `GatePredicate`; missing from this table until 2026-09-25. |
+| A branch becoming safe to delete | `branch_reapable` | `{repo, branch, pr_number?, merged_at?, grace_secs}` — clears once the grace window since `merged_at` (default: registration time) has elapsed AND no live `branch_name` claim, no non-terminal `coord.agent_worktrees` row, and no open/draft PR basing on it remain; coord's reap worker then DELETES the ref. `grace_secs` has NO default at this door — pass the reap-on-merge hook's window (2100s today) unless you mean otherwise. You rarely register one: the reap-on-merge hook registers it on PR close/merge for a branch with session coverage (a claims-audit row, an `agent_worktrees` row or a `Session-Id:` trailer); an uncovered branch gets an `operator_approval` gate instead, so do not assume every closed PR's branch is being watched. **Every guard is a LIVENESS check, none a landedness proof** — a hand-registered PR-less one (`pr_number` omitted) is YOUR assertion that the branch's content already landed (e.g. by `land-evidence.sh`), which coord does not verify before deleting. The door refuses `main` / `master` LITERALLY (it has no webhook payload to learn the real default branch, so a repo whose default branch has another name is NOT protected there) and coord's scratch prefixes `merge-candidate/`, `merge-candidate-spec/`, `speculative/`, as well as a non-`owner/name` or padded `repo`, a blank `branch` and a non-positive `pr_number`. Declared by qontinui-coord `GatePredicate`; missing from this table until 2026-09-25. |
 | A git ref/tag appearing | `ref_exists` | the ref (refs, **not** file contents) |
 | A metric crossing a threshold | `metric_threshold` | `{metric, labels, op, value, window_secs?}` — name `labels` explicitly |
 | A time window / burn-in elapsing | `time_elapsed` | `{since (default now), duration_secs}` |
 | **A vetted plan that is ready, dispatchable work** | `unit_ready` | `{work_unit_id, ready_status}` — auto-clears when the unit reaches `ready_status` + sibling gates cleared; **NOT** `operator_approval` |
 | A schema/alembic reaching head | `migration_at_head` | `{schema}` — live schema observer |
+| A specific **schema object** (table or column) existing on the database coord itself is connected to | `schema_object_exists` | `{schema, object, column?}` — `information_schema` tables/columns only; no `constraint`/`index` arity (a name there silently probes a nonexistent table and sits `Open` forever), a **view** reachable via the table arm. found → `Cleared`; definitive empty → `Open`; failed read → `Indeterminate{reason}`, stored as the `open` tag — read `verdict_reason`, not the tag. `schema` is not pinned to one value; name it. |
 | Infra drift / active-negation clearing | `infra_drift_clear` | `{}` — live infra observer |
 | A repo file / workflow / migration file existing | `file_exists` — **usable again.** The 2026-08-05 fleet-wide 403 was root-caused and FIXED by coord `e6f486b8` (2026-08-15), which is deployed; a live re-probe on 2026-08-31 registered `201` and cleared. Residual: that probe was one PUBLIC repo — re-probe before relying on it against a private one. | `{repo, path, on_ref?}` — file contents/presence |
 | A coord data count crossing a bound | `sql_count` | `{query_id, op, n}` — whitelisted `query_id` only (`devices_null_tenant`\|`open_gates`\|`draft_plans`), never raw SQL |
@@ -134,13 +138,18 @@ Do this first, regardless of which transport ends up carrying it.
 
 **`unit_ready` vs `operator_approval` — do not mismodel a work queue as a human
 decision.** Ready, dispatchable, vetted work is `unit_ready`
-(`{"kind":"unit_ready","work_unit_id":"<uuid from upsert>","ready_status":"<what landed>"}`).
+(`{"kind":"unit_ready","work_unit_id":"<uuid from upsert>","ready_status":"vetted"}`).
 `operator_approval` is for genuine human decisions only.
-⚠️ Transition the unit FIRST, then set `ready_status` to the status that actually
-landed. Do not hardcode an **Attested** value (`vetted`/`superseded`/`obsolete`) on
-a unit you own: the upsert that created it made you its owner, an owner may not
-attest, and the gate would pin open forever. `/vet-plan` §5.4 attempts `vetted` and
-falls back to the Free status `vetted_unattested`. (Canonical: `_gate-registration`
+⚠️ Transition the unit FIRST, then key `ready_status` on `vetted`. The upsert that
+created the unit made you its owner, and an owner may not attest an **Attested**
+value (`vetted`/`superseded`/`obsolete`) without an `independence` declaration, so
+a `vetted` key is satisfiable only by a transition that carries one.
+`/vet-plan` §5.4 sends ONE `→ vetted` call carrying that declaration. On a refusal
+it leaves the status unchanged and reports the attestation owed — there is no
+fallback status — and registers NO `unit_ready` record gate: a `vetted` key over a
+unit that never reaches `vetted` pins open forever. The debt's record is coord's
+own auto-registered `attestation:vetted` gate.
+(Canonical: `_gate-registration`
 → "`unit_ready` vs `operator_approval`".) **No kind fits?** Either it is a real human
 decision → `operator_approval{prompt}`, or it has **no observable trigger** → it
 is *not a gate*; leave it in your report. Never register prose as a predicate.
@@ -736,7 +745,7 @@ bare file another runner start has since rewritten), `..._INVALID_BODY` /
 > doors. Name both probes you ran.
 >
 > **The stamped form of both probes is one command:**
-> `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` runs this same
+> `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` runs this same
 > unauthenticated probe as one door of its cascade and prints a `FLOOR-CLAIM:`
 > block carrying the probe time, the runner build, this box's load and a
 > per-door table — the block Step 5's report pastes. The bare `curl` stays
@@ -1277,7 +1286,7 @@ and point at the self-check:
 > PASS that refutes a fleet-wide claim).
 > Run **`coord doctor`** (runner self-check — names the one failing link + its
 > fix) to diagnose the missing credential, then re-run `/gate`.
-> `FLOOR-CLAIM:` <the block `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` printed,
+> `FLOOR-CLAIM:` <the block `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed,
 > pasted verbatim — probe time, runner build, this box's load, one line per
 > door>.
 
@@ -1322,10 +1331,14 @@ a gate here — a seven-line probe report is still a sample, not a search:
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of

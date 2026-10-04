@@ -12,8 +12,8 @@
 #   builtin: 15
 #   fixture: 33
 
-src/App.tsx:217	literal	component	complete	schema=no	arity=0	effect=write
-src/App.tsx:233	guarded	component	go-to-step	schema=yes	arity=-	effect=read
+src/App.tsx:218	literal	component	complete	schema=no	arity=0	effect=write
+src/App.tsx:234	guarded	component	go-to-step	schema=yes	arity=-	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:89	literal	component	start-run	schema=no	arity=0	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:109	literal	component	stop-run	schema=no	arity=0	effect=destructive
 src/components/active-dashboard/ActiveDashboardPage.tsx:120	literal	component	refresh	schema=no	arity=0	effect=read
@@ -170,7 +170,7 @@ src/components/terminal/terminalLaunchMenuActions.ts:119	guarded	free	create-pla
 src/components/terminal/terminalLaunchMenuActions.ts:136	guarded	free	create-ai-session	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts:171	guarded	free	create-best-account	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts:205	guarded	free	create-with-command	schema=yes	arity=-	effect=destructive
-src/hooks/changeTrackingHandler.test.ts:50	builtin	element	click	schema=no	arity=-	effect=-
+src/hooks/changeTrackingHandler.test.ts:52	builtin	element	click	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/usePageEvents.ts:1359	delegated	component	map	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/utils.ts:192	delegated	component	map	schema=no	arity=-	effect=-
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:17	literal	component	open-advanced-controls	schema=no	arity=0	effect=read

@@ -921,10 +921,40 @@ pub async fn transcript_session_digests(
     })
 }
 
+/// The last COMPLETED external-process enumeration, kept so a shed call can
+/// answer with it instead of with nothing.
+#[derive(Debug, Clone)]
+struct ExternalScanCache {
+    processes: Vec<transcript::ExternalClaudeProcess>,
+    /// Wall-clock time the enumeration completed, epoch milliseconds.
+    observed_at_ms: i64,
+}
+
+/// See [`ExternalScanCache`]. Written only by a `Complete` scan — a degraded
+/// one knows nothing and must not overwrite something that was known.
+static EXTERNAL_SCAN_CACHE: StdMutex<Option<ExternalScanCache>> = StdMutex::new(None);
+
+/// Oldest cached enumeration a shed call may still serve.
+///
+/// Past this, a cached list says more about the box as it WAS than as it is —
+/// ten minutes is twenty of the frontend's 30 s polls, enough for sessions to
+/// have started and finished — so a shed call older than this answers UNKNOWN
+/// (`success: false`) rather than a stale count that reads as current.
+const EXTERNAL_SCAN_CACHE_MAX_AGE_MS: i64 = 10 * 60 * 1000;
+
+/// Edge-triggered shed logger for the enumeration — see
+/// [`crate::resource_guard::ShedLog`]. A `static` because the spender is a Tauri
+/// command, not a loop with a frame to own it.
+static EXTERNAL_SCAN_SHED_LOG: StdMutex<crate::resource_guard::ShedLog> = StdMutex::new(
+    crate::resource_guard::ShedLog::new("transcript_wmi_enumeration"),
+);
+
 /// Detect Claude Code processes running outside this Runner instance.
 ///
 /// Returns a list of PIDs and optional working directories for Claude processes
-/// that are NOT managed by this Runner's PTY or session system.
+/// that are NOT managed by this Runner's PTY or session system, as
+/// `{ processes, stale, observed_at_ms }` — see
+/// [`external_processes_response`] for when `stale` is true.
 #[tauri::command]
 pub async fn transcript_find_external_processes(
     execution: tauri::State<'_, ExecutionCompartment>,
@@ -936,28 +966,139 @@ pub async fn transcript_find_external_processes(
         .map_err(|e| format!("Failed to lock ai_pid_tracker: {e}"))?
         .clone();
 
+    Ok(external_processes_response(
+        &crate::resource_guard::background_work_verdict(),
+        &managed_pids,
+        &EXTERNAL_SCAN_CACHE,
+        &EXTERNAL_SCAN_SHED_LOG,
+        transcript::scan_external_claude_processes,
+    ))
+}
+
+/// The decision behind [`transcript_find_external_processes`], over an
+/// injected verdict, cache, logger and scan — so the shed arm is testable
+/// without a WMI provider.
+///
+/// ## Shedding (plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`, Phase 3)
+///
+/// The enumeration is a `powershell` → `Get-CimInstance Win32_Process` spawn,
+/// polled every 30 s by the frontend (`useSessionManager.ts`) — not a runner
+/// timer, so it is gated here, at the command. It is also the call whose
+/// failure produced the fabricated missing-assembly line in the runner log while
+/// the box was out of commit. At a THROTTLE or SKIP verdict it is not run:
+///
+/// - With a previous COMPLETE result cached, that result is returned with
+///   `stale: true` and the time it was observed. The previous answer, labelled,
+///   is the honest one; the frontend treats it exactly as it treats "keep the
+///   last count".
+/// - With nothing cached (a runner that has never finished one), or only a
+///   result older than [`EXTERNAL_SCAN_CACHE_MAX_AGE_MS`], the answer is
+///   `success: false` — UNKNOWN, the same shape a degraded scan produces.
+///
+/// **Never an empty list.** An empty `processes` reads as "no external Claude
+/// sessions", and that is the UNKNOWN-as-default failure this command already
+/// refuses for a degraded scan; shedding must not reintroduce it.
+///
+/// UNKNOWN reading / guard disabled ⇒ `Run` ⇒ exactly as before.
+fn external_processes_response(
+    verdict: &crate::resource_guard::BackgroundWork,
+    managed_pids: &[u32],
+    cache: &StdMutex<Option<ExternalScanCache>>,
+    shed_log: &StdMutex<crate::resource_guard::ShedLog>,
+    scan: impl FnOnce(&[u32]) -> transcript::ExternalClaudeScan,
+) -> CommandResponse {
+    use crate::resource_guard::{BackgroundWork, ShedState};
+
+    let shed = !matches!(verdict, BackgroundWork::Run);
+    shed_log.lock().unwrap_or_else(|e| e.into_inner()).note(
+        if shed {
+            ShedState::Skipped
+        } else {
+            ShedState::Running
+        },
+        verdict,
+    );
+
+    if shed {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cached = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|c| now_ms - c.observed_at_ms <= EXTERNAL_SCAN_CACHE_MAX_AGE_MS);
+        return match cached {
+            Some(ExternalScanCache {
+                processes,
+                observed_at_ms,
+            }) => {
+                // Re-filter against the CURRENT managed set: a process the runner
+                // has adopted since the cached scan is no longer external.
+                let processes: Vec<_> = processes
+                    .into_iter()
+                    .filter(|p| !managed_pids.contains(&p.pid))
+                    .collect();
+                let age_s = (now_ms - observed_at_ms).max(0) / 1000;
+                CommandResponse {
+                    success: true,
+                    message: Some(format!(
+                        "Returning the external-process list from {age_s}s ago ({} processes) — \
+                         the enumeration was skipped under memory pressure. This is the last \
+                         known answer, not a fresh one.",
+                        processes.len()
+                    )),
+                    data: Some(serde_json::json!({
+                        "processes": processes,
+                        "stale": true,
+                        "observed_at_ms": observed_at_ms,
+                    })),
+                }
+            }
+            None => CommandResponse {
+                success: false,
+                message: Some(
+                    "External Claude processes were not enumerated: the scan was skipped under \
+                     memory pressure and no result from the last 10 minutes exists. This is \
+                     UNKNOWN, not zero."
+                        .to_string(),
+                ),
+                data: None,
+            },
+        };
+    }
+
     // A degraded enumeration must NOT render as "found 0". The underlying
     // scan is the same `Get-CimInstance Win32_Process` call that wedged the
     // runner, so a hang here is expected rather than exotic — and an empty
     // list reported as `success: true` is indistinguishable from a genuine
     // "no external processes", which is the one answer a caller acts on.
-    match transcript::scan_external_claude_processes(&managed_pids) {
-        transcript::ExternalClaudeScan::Complete(external) => Ok(CommandResponse {
-            success: true,
-            message: Some(format!(
-                "Found {} external Claude processes",
-                external.len()
-            )),
-            data: Some(serde_json::to_value(&external).unwrap_or_default()),
-        }),
-        transcript::ExternalClaudeScan::Degraded { reason } => Ok(CommandResponse {
+    match scan(managed_pids) {
+        transcript::ExternalClaudeScan::Complete(external) => {
+            let observed_at_ms = chrono::Utc::now().timestamp_millis();
+            *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(ExternalScanCache {
+                processes: external.clone(),
+                observed_at_ms,
+            });
+            CommandResponse {
+                success: true,
+                message: Some(format!(
+                    "Found {} external Claude processes",
+                    external.len()
+                )),
+                data: Some(serde_json::json!({
+                    "processes": external,
+                    "stale": false,
+                    "observed_at_ms": observed_at_ms,
+                })),
+            }
+        }
+        transcript::ExternalClaudeScan::Degraded { reason } => CommandResponse {
             success: false,
             message: Some(format!(
                 "Could not enumerate external Claude processes: {reason}. This is UNKNOWN, \
                  not zero — no conclusion can be drawn about external processes."
             )),
             data: None,
-        }),
+        },
     }
 }
 
@@ -1254,6 +1395,136 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 3 (plan 2026-09-23-…-ungated), verification (a2): at CRITICAL the
+    /// WMI enumeration is not run, and the command answers with the previous
+    /// COMPLETE result marked stale — never an empty list, which would read as
+    /// "no external sessions". A process the runner has since adopted is
+    /// filtered out of the cached answer. The skip is logged once.
+    #[test]
+    fn external_processes_at_skip_return_the_cached_result_marked_stale() {
+        use crate::resource_guard::{capture_logs, test_skip_verdict, BackgroundWork, ShedLog};
+
+        let cache = StdMutex::new(None);
+        let log = StdMutex::new(ShedLog::new("transcript_wmi_enumeration"));
+        let found = vec![
+            transcript::ExternalClaudeProcess {
+                pid: 11,
+                working_directory: Some("/w/a".into()),
+            },
+            transcript::ExternalClaudeProcess {
+                pid: 22,
+                working_directory: None,
+            },
+        ];
+
+        // A healthy call scans and fills the cache.
+        let first = external_processes_response(&BackgroundWork::Run, &[], &cache, &log, |_| {
+            transcript::ExternalClaudeScan::Complete(found.clone())
+        });
+        assert!(first.success);
+        let data = first.data.expect("data");
+        assert_eq!(data["stale"], false);
+        assert_eq!(data["processes"].as_array().unwrap().len(), 2);
+
+        // Under pressure: no scan, the cached list (minus the now-managed pid 22),
+        // labelled stale.
+        let skip = test_skip_verdict();
+        let (responses, logs) = capture_logs(|| {
+            (0..5)
+                .map(|_| {
+                    external_processes_response(&skip, &[22], &cache, &log, |_| {
+                        panic!("a shed call must not enumerate")
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        for shed in responses {
+            assert!(shed.success, "a cached answer is an answer");
+            let data = shed.data.expect("a shed call must not return nothing");
+            assert_eq!(data["stale"], true);
+            let pids: Vec<u64> = data["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["pid"].as_u64().unwrap())
+                .collect();
+            assert_eq!(pids, vec![11]);
+            assert!(data["observed_at_ms"].as_i64().unwrap() > 0);
+        }
+        assert_eq!(
+            logs.matches("skipping transcript_wmi_enumeration's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// With nothing cached, a shed call is UNKNOWN (`success: false`, no data)
+    /// — the shape a degraded scan already has — never a successful empty list.
+    /// And a throttled call sheds exactly like a skipped one.
+    #[test]
+    fn external_processes_shed_with_no_cache_is_unknown_not_empty() {
+        use crate::resource_guard::{test_throttle_verdict, ShedLog};
+
+        let cache = StdMutex::new(None);
+        let log = StdMutex::new(ShedLog::new("transcript_wmi_enumeration"));
+        let resp = external_processes_response(&test_throttle_verdict(), &[], &cache, &log, |_| {
+            panic!("a shed call must not enumerate")
+        });
+        assert!(!resp.success);
+        assert!(resp.data.is_none());
+        assert!(resp.message.unwrap().contains("UNKNOWN"));
+    }
+
+    /// A cached answer past its maximum age is UNKNOWN, not a stale count.
+    #[test]
+    fn a_cached_answer_older_than_ten_minutes_is_unknown() {
+        use crate::resource_guard::{test_skip_verdict, ShedLog};
+
+        let old = chrono::Utc::now().timestamp_millis() - EXTERNAL_SCAN_CACHE_MAX_AGE_MS - 1_000;
+        let cache = StdMutex::new(Some(ExternalScanCache {
+            processes: vec![transcript::ExternalClaudeProcess {
+                pid: 5,
+                working_directory: None,
+            }],
+            observed_at_ms: old,
+        }));
+        let log = StdMutex::new(ShedLog::new("transcript_wmi_enumeration"));
+        let resp = external_processes_response(&test_skip_verdict(), &[], &cache, &log, |_| {
+            panic!("a shed call must not enumerate")
+        });
+        assert!(!resp.success);
+        assert!(resp.data.is_none());
+        assert!(resp.message.unwrap().contains("UNKNOWN"));
+    }
+
+    /// A degraded scan never overwrites a cached COMPLETE result: it knew
+    /// nothing, so it cannot replace something that was known.
+    #[test]
+    fn a_degraded_scan_does_not_clobber_the_cache() {
+        use crate::resource_guard::{test_skip_verdict, BackgroundWork, ShedLog};
+
+        let cache = StdMutex::new(None);
+        let log = StdMutex::new(ShedLog::new("transcript_wmi_enumeration"));
+        let found = vec![transcript::ExternalClaudeProcess {
+            pid: 7,
+            working_directory: None,
+        }];
+        external_processes_response(&BackgroundWork::Run, &[], &cache, &log, |_| {
+            transcript::ExternalClaudeScan::Complete(found.clone())
+        });
+        let degraded = external_processes_response(&BackgroundWork::Run, &[], &cache, &log, |_| {
+            transcript::ExternalClaudeScan::Degraded {
+                reason: "timed out".into(),
+            }
+        });
+        assert!(!degraded.success);
+        let shed = external_processes_response(&test_skip_verdict(), &[], &cache, &log, |_| {
+            panic!("a shed call must not enumerate")
+        });
+        assert_eq!(shed.data.unwrap()["processes"][0]["pid"], 7);
+    }
 
     fn dirs(names: &[&str]) -> Vec<std::path::PathBuf> {
         names.iter().map(std::path::PathBuf::from).collect()

@@ -47,10 +47,11 @@ the runner will not have it.
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
->   never a requirement — no tenant needs a git repo to author, vet or ship a
->   plan. Which directory THIS fleet writes new plans to is a local operating
->   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **A git repo holding the plans directory is an OPTIONAL export target as a
+>   product matter**, never a requirement — no tenant needs a git repo to
+>   author, vet or ship a plan. Which directory a deployment writes new plans
+>   to is that deployment's own operating rule (its `CLAUDE.md`, where it has
+>   one), not a product one.
 > * **Read the corpus through these doors, in this order** *(plan
 >   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
 >   1. **The runner door — no credential.**
@@ -60,13 +61,28 @@ the runner will not have it.
 >      JWT; the caller presents nothing. A non-2xx names the host the runner
 >      dialled — that is the runner's configured web base, and the answer is an
 >      observation about that base, never about the corpus.
->   2. **The git doors — no credential, no service.**
->      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
->      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
->      enumerate. Authoring layer only (a plan authored through the web UI is
+>   2. **The git doors — no credential, no service; only where the plans
+>      directory is a git checkout.** Resolve the repo that holds it and the
+>      directory's path inside that repo:
+>      `REPO=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)` and
+>      `DIR=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-prefix)` (ends in
+>      `/`; empty when the plans directory is the repo root). When
+>      `$QONTINUI_PLANS_DIR` is unset or EMPTY, do not run them at all —
+>      `git -C ""` succeeds against whatever repo the shell stands in, so its
+>      answer is not the plans repo. Unset, empty, or either command exiting
+>      non-zero: there is no git door on this machine — that is an absent
+>      door, not a miss. So is a plans directory git does not TRACK in
+>      that repo (one sitting gitignored, or untracked, inside an unrelated
+>      work tree): after the fetch below, an EMPTY
+>      `ls-tree --name-only origin/main "${DIR:-.}"` is an absent door,
+>      never a miss.
+>      Otherwise `git -C "$REPO" show "origin/main:${DIR}<stem>.md"` for a
+>      body, `git -C "$REPO" ls-tree --name-only origin/main "${DIR:-.}"` to
+>      enumerate (substitute the remote's default branch throughout if it is
+>      not `main`). Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch —
 >      so fetch first:
->      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      `git -C "$REPO" fetch origin +refs/heads/main:refs/remotes/origin/main`,
 >      exit code read unpiped (a bare `fetch origin main` in a clone whose
 >      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
 >      When that fetch was skipped or exited non-zero, a git-door MISS is
@@ -76,8 +92,8 @@ the runner will not have it.
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
 >      claim the route requires; the agent token `/agents/allocate` mints does
->      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
->      door; whatever it answers is an observation about that process.
+>      not. A per-box dev backend on loopback is not a discovery door;
+>      whatever it answers is an observation about that process.
 >
 >   On every list result **check that the returned `slug` equals the stem** — a
 >   backend predating the `slug` filter ignores the parameter and returns an
@@ -102,8 +118,9 @@ the runner will not have it.
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
 >   runner door) has one roll-up per `source_repo` key: the
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
->   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
->   the key `<repo>/plans`.
+>   so a hit on `origin/main:${DIR}<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>${DIR:+/${DIR%/}}` — the bare `<repo>` when the plans
+>   directory is the repo root.
 >   - **No git door found the file:** the roll-up has nothing to add; the miss
 >     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
 >     and even then it speaks for the authoring layer only.
@@ -111,7 +128,7 @@ the runner will not have it.
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
 >     then always `false`); (b) after a `git fetch`,
->     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     `git -C "$REPO" cat-file -e "<ref_sha>:${DIR}<stem>.md"` exits
 >     0 (any other exit, including an object this clone lacks, is UNKNOWN).
 >     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
 >     `least_behind_device_ids` (they share it); that row's own `state` may
@@ -146,10 +163,10 @@ the runner will not have it.
 >     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
 >     the runner's write door, `qontinui-pr plan-library-backfill`, a
 >     secondary or temp runner instance, a runner build predating the report.
-> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
->   PowerShell interpreter (`pwsh` on Linux via
->   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
->   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+> * **The cache is one line.** A local plan cache exists only where your
+>   deployment provides one; where its renderer cannot run on this machine it
+>   is INOPERATIVE, not a degraded arm. When you read
+>   `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
 >   say so and quote its `Rendered:` stamp with the `api_base` beside it and
 >   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
 <!-- plan-corpus:end -->
@@ -276,6 +293,25 @@ decision inline with one sentence naming the deciding priority (mirrors
 the fact). Leave a question genuinely **open** only when it's a
 product/scope/stakeholder call nobody but the operator can make.
 
+**Difficulty — decide whether to stamp, and default to NOT stamping.** Every
+captured plan is rated by a lexical rubric (qontinui-web
+`backend/app/services/plan_difficulty.py`) that routes it to a model tier. A
+`**Difficulty:** <level>` line in the plan's header overrides that rating — and
+it is a pin that is re-derived from the body on every re-rate, so it also stops
+the plan's level moving with any future rubric improvement. At authoring time
+the plan is not in the library yet, so you cannot see what the rubric will say.
+Write the line **only** when you have positive reason to expect the rubric to be
+wrong, under one of two named triggers:
+
+- **deceptively small** → `high`: little prose, subtle design — concurrency and
+  ordering, a migration's consistency window, a security or tenancy boundary.
+- **large but mechanical** → `low`: many phases and files, no design risk. The
+  rubric tops a mechanical plan out at `medium`, so this trigger is mainly what
+  buys `low`.
+
+Name which trigger applies in one clause on the same line. Neither applies →
+**write no Difficulty line at all**; the rubric rates the plan on capture.
+
 ### 5. Write the plan file
 
 **Filename:** `$QONTINUI_PLANS_DIR/<YYYY-MM-DD>-<slug>.md`. Get today's
@@ -301,6 +337,9 @@ the existing corpus in `plans/*.md`).
 
 > **Repo(s):** <repo1>[, <repo2>...]
 
+<!-- OPTIONAL: write the Difficulty line only on a Step 4 difficulty trigger; otherwise omit it and this comment. -->
+**Difficulty:** <high|medium|low> — <deceptively small | large but mechanical>: <one clause>
+
 ## Why
 <the motivating problem, pulled from the prompt + your own research —
 not a copy-paste of the prompt>
@@ -321,6 +360,8 @@ deciding priority>
 **Phase 1 — <name>**
 - Concrete steps, each citing `file:line` where it applies.
 - Gate: <the repo's actual test/CI command, e.g. `cargo test -p qontinui-coord`>
+- Arming: <seam_class> | <what is observed to change> | <entry point the population uses>
+  (or `Arming: none — <reason>`)
 
 **Phase 2 — <name>**
 - ...
@@ -335,6 +376,32 @@ deciding priority>
 ## Related
 - `[[other-plan-stem]]` / memory names this plan builds on or supersedes.
 ```
+
+**Where the `**Difficulty:**` line goes, when Step 4 says to write one.** On
+its own line, below `> **Repo(s):**`, and **above the first `##`–`######`
+heading** — never inside a blockquote's body text and never under a section.
+The rubric reads a declared stamp only from the header region, which is
+everything before the first sub-H1 heading (`_declared`, qontinui-web
+`backend/app/services/plan_difficulty.py`); a stamp below `## Why` is dead text
+that silently loses to the computed rating. Put the level token
+directly after the colon — `**Difficulty:** high — deceptively small: …` — and
+delete the template's `<!-- OPTIONAL … -->` comment either way.
+
+**Every phase carries an `Arming:` line beside `Gate:`.** *(Plan
+`2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for`
+Phase 4.)* `Gate:` says the code is correct; `Arming:` says what will be
+OBSERVED to change when it runs on the population it was written for, and
+through which entry point — the proposition `/implement-plan` Step 4.4b later
+proves. The value is three `|`-separated fields,
+`<seam_class> | <what is observed to change> | <entry point>`, where
+`seam_class` is one of `gate`, `sentinel`, `sweep_narrowing`, `convention`,
+`detect_deliver`, `counter` — or the whole value is `none — <reason>` for a
+phase that changes no behaviour (docs, a plan edit). Name the entry point the
+population actually calls, not the function the phase changes: a test that
+enters through the changed function is the dossier
+`shipped-fix-inert-on-its-population`. `/vet-plan` treats a phase without a
+parseable `Arming:` line as a **Missing** defect and writes one; a corpus
+measurement (check #75, report-only) counts how many new plans carry it.
 
 **Do not add a `## Gates` section.** That block (`<!-- GATE-SWEEP:BEGIN -->`)
 is machine-managed by `/gate-sweep`, and the `unit_ready` coord gate itself
@@ -375,11 +442,14 @@ the probe cannot tell, it cuts a fresh branch, opens a new PR with
 `Plan: <stem>` marker in the body, and prints `PROPOSED <pr-url|branch> <branch>`.
 To open it with `coord_create_pr` instead, set `LAND_PLAN_STAMP_NO_PR=1`: the
 helper pushes and reads back the branch, prints it, and opens nothing; then open
-the PR with `coord_create_pr`, falling back to `gh pr create`.
+the PR in `/implement-plan` Step 4.5b's served door order (the runner's loopback
+door sits between the coord door and the `gh` fallback).
 It never pushes to an existing branch. A non-zero exit means the plan is NOT
-published; report it. On `PROPOSED`, read the PR back with
+published; report it. On `PROPOSED`, READ the PR back with
 `gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid,url`
-— `--state all`, not `--state open`: an empty open-only answer cannot tell
+and take the PR number only from a row whose `headRefOid` is the head the
+helper pushed (read it with `git -C <plans-repo-root> rev-parse origin/<branch>`, the ref the helper's own fetch leaves; its `PROPOSED` line names the branch, not the sha), never from the create call's exit status or output —
+`--state all`, not `--state open`: an empty open-only answer cannot tell
 "never proposed" from "closed under you". **Never `gh pr merge`, never
 `--admin`** — coord is the sole merge authority. Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
@@ -423,10 +493,8 @@ your session advertises, and verify by read — a zero exit is not evidence the
 write landed. The declaration is STORED on the unit, so one you did not earn is
 a false witness statement with your actor key beside it.
 
-⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a fresh
-allocate issues a NEW agent id the legacy compare would admit, which that
-refusal itself names *"a known defect being tracked, not a sanctioned route"*.
-That prohibition is that refusal's alone: `attester_unresolved` wants a device-
+⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`.
+The re-allocate prohibition is that refusal's alone: `attester_unresolved` wants a device-
 or agent-identified caller, which is a credential remedy rather than a route
 around a control.
 

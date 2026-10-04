@@ -60,6 +60,10 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The message a failed task-list read put in `error`, so the next
+  // successful read (the 30 s auto-refresh) can clear it without also
+  // clearing an unrelated action's error.
+  const tasksReadErrorRef = useRef<string | null>(null);
 
   /**
    * Make an API request
@@ -103,8 +107,13 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
     try {
       const result = await apiRequest<ScheduledTask[]>("GET", "/scheduler/tasks");
       setTasks(result || []);
+      const stale = tasksReadErrorRef.current;
+      tasksReadErrorRef.current = null;
+      if (stale !== null) setError((prev) => (prev === stale ? null : prev));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load tasks");
+      const message = err instanceof Error ? err.message : "Failed to load tasks";
+      tasksReadErrorRef.current = message;
+      setError(message);
     }
   }, []);
 
@@ -244,8 +253,10 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       );
       setTaskHistory(result || []);
     } catch (err) {
+      // A failed read is not "no executions": say so, not only in the console.
       console.warn("[SCHEDULER] Failed to load task history:", err);
       setTaskHistory([]);
+      setError(err instanceof Error ? err.message : "Failed to load task history");
     }
   }, []);
 

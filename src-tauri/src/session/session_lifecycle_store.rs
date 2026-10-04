@@ -1098,10 +1098,10 @@ impl SessionLifecycleStore {
     /// Both degrade a restore to terminal-only (right cwd, fresh conversation)
     /// and neither loses data — the session stays resumable by hand from the
     /// Past Sessions surface, which uses the better resolver. Answering by
-    /// SESSION ID across all project dirs (the walk exists:
-    /// `transcript::list_recent_sessions_all_projects`) would remove the class
-    /// outright and is the follow-up worth doing before anything DESTRUCTIVE
-    /// (e.g. pruning transcript-less rows) is gated on this.
+    /// SESSION ID across all project dirs (a walk of every project dir under
+    /// every config dir) would remove the class outright and is the follow-up
+    /// worth doing before anything DESTRUCTIVE (e.g. pruning transcript-less
+    /// rows) is gated on this.
     pub fn probe_transcript_exists(
         &self,
         session_id: &str,
@@ -1286,8 +1286,8 @@ impl SessionLifecycleStore {
             entry.title = rec.title;
             // terminal_id is STICKY against an empty/placeholder incoming (like
             // the `config_dir` guard above): a write that omits the terminal —
-            // an empty/whitespace-only id (a disk-only record, a provider that
-            // didn't report it) — must NOT clobber a real binding. Clobbering it
+            // an empty/whitespace-only id (a provider that didn't report it)
+            // — must NOT clobber a real binding. Clobbering it
             // would orphan the row AND dodge the single-tenant-terminal invariant
             // below (which is gated on a non-empty terminal_id). Take the incoming
             // value only when it names a terminal.
@@ -2569,50 +2569,6 @@ impl SessionLifecycleStore {
         }
     }
 
-    /// Every session id the registry knows, OPEN or CLOSED. Used by the
-    /// disk-only transcript-derived restore net (session-restore-redesign
-    /// Phase 3 / G3) to exclude ANY id the registry already tracks: a
-    /// restorable row wins on layout (real page/zone), and a NON-restorable row
-    /// (user-closed, `no-terminal` orphan, stale ghost) already encodes a
-    /// deliberate "do not restore" decision that the disk-only net must honor —
-    /// a fresh transcript mtime must never resurrect a session the user closed.
-    /// Only genuinely registry-ABSENT on-disk sessions (the true capture-miss)
-    /// survive this exclusion.
-    pub fn all_ids(&self) -> HashSet<String> {
-        match self.map.lock() {
-            Ok(m) => m.keys().cloned().collect(),
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_ids");
-                HashSet::new()
-            }
-        }
-    }
-
-    /// Ids of every record whose `state == "closed"`.
-    ///
-    /// Used to build the disk-only-net exclusion set in
-    /// `terminal_session_list_open`: the net excludes the restorable-set ids
-    /// UNION these closed ids, so the ONLY registry rows that can leak into the
-    /// quarantined disk-only candidate set are `open` rows dropped by the
-    /// restorable grace gate (the crash-restart / Phase-1 victims). A closed
-    /// row — user-closed (`no-terminal`/explicit), or a grace-EXPIRED
-    /// `pty-exit`/`poll-dead` — always stays excluded so its transcript is
-    /// never resurrected (the don't-resurrect-a-closed-tab property the old
-    /// `all_ids` exclusion was buying).
-    pub fn closed_ids(&self) -> HashSet<String> {
-        match self.map.lock() {
-            Ok(m) => m
-                .values()
-                .filter(|r| r.state == "closed")
-                .map(|r| r.claude_session_id.clone())
-                .collect(),
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on closed_ids");
-                HashSet::new()
-            }
-        }
-    }
-
     /// Clone of every record whose `state == "open"`.
     pub fn open_records(&self) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
@@ -2688,9 +2644,11 @@ impl SessionLifecycleStore {
     /// an unclean (crash) boot it is dropped and the crash rows supply the
     /// anchor themselves. A genuinely-newer session row (one that really was
     /// alive later) legitimately advances the anchor; a crash cohort more than
-    /// `grace` older than that is stale and excluded — but is still offered,
-    /// quarantined, through the disk-only transcript net (see
-    /// `commands::terminal::terminal_session_list_open`), so it is never lost.
+    /// `grace` older than that is stale and excluded from boot restore. Nothing
+    /// else re-offers it on restore: `terminal_session_list_open` returns this
+    /// set and nothing more. Its row stays in the registry, so it remains
+    /// resumable by hand from the Past Sessions surface
+    /// (`session::past_sessions`).
     ///
     /// ## One-live-session-per-terminal (open rows)
     ///
@@ -2957,9 +2915,8 @@ impl SessionLifecycleStore {
                 // a confirmed one, and a naive newest-`last_seen` sort would
                 // violate it (a later zone-move / boot re-assert can give an
                 // unconfirmed phantom a marginally newer `last_seen_at` than the
-                // real confirmed session, so we'd keep the phantom and close —
-                // and thereby exclude from the disk-only rescue net — the real
-                // one). Same key as the read-time dedupe in `restorable_records`.
+                // real confirmed session, so we'd keep the phantom and close
+                // the real one). Same key as the read-time dedupe in `restorable_records`.
                 let mut ranked = ids;
                 ranked.sort_by(|a, b| {
                     let ka = m.get(a.as_str()).map(open_authority_key).unwrap_or((
@@ -5368,9 +5325,8 @@ mod tests {
     /// The boot repair must be CONFIRMED-aware: a CONFIRMED real session on a
     /// reused terminal must survive even when an UNCONFIRMED phantom (a later
     /// zone-move / boot re-assert) carries a marginally NEWER `last_seen_at`.
-    /// A naive newest-only rank would close the real session — and, since it is
-    /// then `closed`, exclude it from the disk-only rescue net too — keeping a
-    /// placeholder phantom instead. Mirrors `open_authority_key`.
+    /// A naive newest-only rank would close the real session — so it would never
+    /// restore — keeping a placeholder phantom instead. Mirrors `open_authority_key`.
     #[test]
     fn repair_terminal_id_collisions_keeps_confirmed_over_newer_unconfirmed() {
         let dir = tempdir().unwrap();
@@ -7800,139 +7756,6 @@ mod tests {
         ids
     }
 
-    /// `closed_ids()` returns exactly the ids of `state == "closed"` rows —
-    /// `open` rows (restorable or grace-gate-dropped ghost alike) never appear.
-    #[test]
-    fn closed_ids_returns_only_closed_rows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let t = 1_700_000_000_000_i64;
-        write_fixture(
-            &path,
-            vec![
-                fixture_rec("open-fresh", "open", t, None, None),
-                fixture_rec("open-ghost", "open", t - 72 * 3_600_000, None, None),
-                fixture_rec("closed-user", "closed", t, Some(t), Some("no-terminal")),
-                fixture_rec("closed-pty", "closed", t, Some(t), Some("pty-exit")),
-            ],
-        );
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        let closed = store.closed_ids();
-        assert_eq!(
-            closed,
-            ["closed-user".to_string(), "closed-pty".to_string()]
-                .into_iter()
-                .collect::<HashSet<String>>(),
-            "closed_ids returns only the two closed rows"
-        );
-    }
-
-    /// P3 end-to-end (store side): the disk-only-net exclusion set is
-    /// `restorable ids ∪ closed_ids`. An `open` row DROPPED by the restorable
-    /// grace gate (Phase-1 cohort-anchor victim) is absent from that set, so it
-    /// can LEAK into the quarantined disk-only candidates; a user-closed row
-    /// and an already-restorable row are both excluded (never resurrected /
-    /// never double-offered).
-    #[test]
-    fn disk_only_exclusion_leaks_open_victim_not_closed_or_restorable() {
-        use crate::session::reconcile::select_disk_only_candidates;
-        use crate::terminal::transcript::RecentTranscript;
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let crash = 1_700_000_000_000_i64;
-        let now = crash + 60_000; // restart one minute later
-        write_fixture(
-            &path,
-            vec![
-                // Fresh-at-crash open row → admitted to the restorable set.
-                fixture_rec("open-restorable", "open", crash, None, None),
-                // Open row that died 72h before the crash cohort → EXCLUDED
-                // from the restorable set (the grace-gate victim P3 rescues).
-                fixture_rec("open-victim", "open", crash - 72 * 3_600_000, None, None),
-                // User-closed row with an intentional close reason.
-                fixture_rec(
-                    "user-closed",
-                    "closed",
-                    crash,
-                    Some(crash),
-                    Some("no-terminal"),
-                ),
-            ],
-        );
-        let store = SessionLifecycleStore::open(&path).unwrap();
-
-        // Build the exclusion set exactly as `terminal_session_list_open` does:
-        // restorable ids ∪ closed ids.
-        let restorable = store.restorable_records(now, None, false);
-        assert_eq!(
-            restorable
-                .iter()
-                .map(|r| r.claude_session_id.as_str())
-                .collect::<HashSet<&str>>(),
-            ["open-restorable"].into_iter().collect::<HashSet<&str>>(),
-            "only the fresh open row is restorable; the stale open row is dropped"
-        );
-        let mut excluded = store.closed_ids();
-        excluded.extend(restorable.iter().map(|r| r.claude_session_id.clone()));
-
-        // All three sessions have an equally-fresh transcript on disk.
-        let recents = vec![
-            RecentTranscript {
-                session_id: "open-restorable".to_string(),
-                config_dir: "C:/cfg".to_string(),
-                working_dir: "C:/repo".to_string(),
-                last_activity_ms: now - 1_000,
-            },
-            RecentTranscript {
-                session_id: "open-victim".to_string(),
-                config_dir: "C:/cfg".to_string(),
-                working_dir: "C:/repo".to_string(),
-                last_activity_ms: now - 1_000,
-            },
-            RecentTranscript {
-                session_id: "user-closed".to_string(),
-                config_dir: "C:/cfg".to_string(),
-                working_dir: "C:/repo".to_string(),
-                last_activity_ms: now - 1_000,
-            },
-        ];
-        let offered = select_disk_only_candidates(&recents, &excluded, now);
-        let ids: HashSet<&str> = offered
-            .iter()
-            .map(|r| r.claude_session_id.as_str())
-            .collect();
-
-        // (a) the grace-gate open victim leaks through, quarantined.
-        assert!(
-            ids.contains("open-victim"),
-            "grace-gate-dropped open row is offered as a disk-only candidate"
-        );
-        let victim = offered
-            .iter()
-            .find(|r| r.claude_session_id == "open-victim")
-            .unwrap();
-        assert_eq!(
-            victim.origin.as_deref(),
-            Some(ORIGIN_RECONCILED),
-            "leaked candidate is quarantine-tier (reconciled)"
-        );
-        assert!(
-            victim.confirmed_at.is_none(),
-            "leaked candidate is unconfirmed (one-click verified resume gated)"
-        );
-        // (b) a user-closed row is NOT resurrected by a fresh transcript.
-        assert!(
-            !ids.contains("user-closed"),
-            "user-closed row is never re-offered"
-        );
-        // (c) an already-restorable row is NOT double-offered by the net.
-        assert!(
-            !ids.contains("open-restorable"),
-            "restorable row is not double-offered by the disk-only net"
-        );
-    }
-
     /// Item-1 verification fixture (the on-page repro): two in-grace
     /// pty-exit rows (exactly what a graceful shutdown writes for on-screen
     /// panes), one explicit close, and one stale `open` ghost whose terminal
@@ -8214,9 +8037,8 @@ mod tests {
     /// A genuinely-newer band advances the anchor and a crash band more than
     /// `grace` OLDER is EXCLUDED from the (full-restore) set — it is stale
     /// relative to the last moment of life, exactly as an old lone ghost is.
-    /// (It is not lost: `terminal_session_list_open` still offers such a
-    /// grace-gated open row through the QUARANTINED disk-only transcript net —
-    /// see the P3 tests.) This pins the fix for the densest-cohort
+    /// (Its row stays in the registry, so it remains resumable by hand from
+    /// Past Sessions; boot restore does not re-offer it.) This pins the fix for the densest-cohort
     /// over-admission regression: an older-but-larger band must NOT re-admit
     /// stale sessions by pinning the anchor into the past.
     #[test]

@@ -9,8 +9,11 @@ continue the work.
 ## Arguments
 
 - `$ARGUMENTS` — `<account> [N] [selector]`, all optional:
-  - **account** — `hotmail` (default), `gmail`, or any suffix of
-    `C:\claude\.claude-<suffix>\`. Pass without the leading `.claude-`.
+  - **account** — the suffix of an `<accounts-root>/.claude-<suffix>/` dir
+    (see [Layout assumption](#layout-assumption)), passed without the leading
+    `.claude-`; or `default` for the bare `~/.claude` (Claude Code's default
+    config dir, which carries no suffix). **No default account:** with no
+    argument at all, list the accounts found and ask which one (Step 0).
   - **N** — number of recent turns to extract (default `25`). Decrease
     to save tokens; increase for deeper context.
   - **selector** — one of:
@@ -36,18 +39,20 @@ continue the work.
   matching candidates by mtime** since the search is already filtered.
 
 Examples:
-- `/resume-foreign` — top 5 by mtime from hotmail's qontinui-root sessions
-- `/resume-foreign hotmail 30` — top 5 by mtime, will pull 30 turns
-- `/resume-foreign hotmail 25 6f29a17e` — direct UUID prefix
-- `/resume-foreign hotmail 25 name:traffic-light` — sessions whose
+- `/resume-foreign` — list the accounts on this machine and ask which one
+- `/resume-foreign work` — top 5 by mtime from the `work` account's sessions for this cwd
+- `/resume-foreign work 30` — top 5 by mtime, will pull 30 turns
+- `/resume-foreign work 25 6f29a17e` — direct UUID prefix
+- `/resume-foreign default 25` — the account in the bare `~/.claude`
+- `/resume-foreign work 25 name:traffic-light` — sessions whose
   user-set or auto-generated **title** contains "traffic-light".
   **Best option** when you used `/rename` to name the session.
-- `/resume-foreign hotmail 25 traffic-light` — full-content grep
-  across all hotmail sessions for "traffic-light". Slower but
+- `/resume-foreign work 25 traffic-light` — full-content grep
+  across all `work` sessions for "traffic-light". Slower but
   catches sessions that didn't get a custom name.
-- `/resume-foreign hotmail 25 "auto_register_file PTY"` — sessions
+- `/resume-foreign work 25 "auto_register_file PTY"` — sessions
   that mention BOTH terms in their content (multi-word selector — quote it)
-- `/resume-foreign gmail 25 C:\path\to\transcript.jsonl` — explicit path
+- `/resume-foreign personal 25 C:\path\to\transcript.jsonl` — explicit path
 
 **Picking a search strategy.**
 
@@ -65,19 +70,57 @@ named the session.
 ## Layout assumption
 
 Each Claude Code account on this machine writes transcripts to
-`C:\claude\.claude-<account>\projects\<cwd-slug>\<session-uuid>.jsonl`,
-where `<cwd-slug>` is the current cwd with `:\` replaced by `--` and `\`
-replaced by `-` (e.g. a cwd of `D:\my-workspace` → `D--my-workspace`).
+`<account-dir>/projects/<cwd-slug>/<session-uuid>.jsonl`, where
+`<account-dir>` is `<accounts-root>/.claude-<account>`, or the bare `~/.claude`
+for the account that predates any suffix (named `default` here).
+`<accounts-root>` is the directory holding the per-account config dirs: the
+parent of this session's own `$CLAUDE_CONFIG_DIR`, or of `~/.claude` when that
+variable is unset. Resolve it; never assume a path. `<cwd-slug>` is the
+current cwd in its NATIVE spelling with **every character outside
+`[A-Za-z0-9]` replaced by `-`** — so `:`, `\`, `/`, `.` and `_` all become `-`
+(e.g. `D:\my-workspace` → `D--my-workspace`, `/srv/my.work` →
+`-srv-my-work`).
 
 If the foreign account dir or project subdir doesn't exist, report and
 stop — there's nothing to resume.
 
 ## Instructions
 
+### 0. Resolve the accounts root, the slug and the account
+
+Read-only. Run this first; with no account argument it is also the account
+list you show the user (this session's own account is left out, since
+resuming from it is not "foreign"):
+
+```bash
+CCD="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CCD="${CCD//\\//}"                  # a Windows value may be spelled with backslashes
+ACCOUNTS_ROOT=$(dirname "$CCD")
+# The slug is taken from the NATIVE cwd: on Windows (Git Bash) Claude Code
+# sees `D:\x`, not `/d/x`.
+NATIVE_CWD="$PWD"; command -v cygpath >/dev/null 2>&1 && NATIVE_CWD=$(cygpath -w "$PWD")
+SLUG=$(printf '%s' "$NATIVE_CWD" | sed 's/[^A-Za-z0-9]/-/g')
+printf 'accounts-root %s\ncwd-slug      %s\n' "$ACCOUNTS_ROOT" "$SLUG"
+for d in "$ACCOUNTS_ROOT"/.claude-* "$HOME/.claude"; do
+  [ -d "$d" ] || continue
+  [ "$d" -ef "$CCD" ] && continue       # this session's own account
+  case "$d" in "$HOME/.claude") name=default ;; *) name="${d##*/.claude-}" ;; esac
+  n=$(ls "$d/projects/$SLUG"/*.jsonl 2>/dev/null | wc -l)
+  printf '%-16s %4s transcript(s) for this cwd  %s\n' "$name" "$n" "$d"
+done
+```
+
+With no account argument, show that list numbered and ask which account (in
+plain text), then wait. An account whose count is 0 has nothing to resume for
+this cwd. `<account-dir>` for the chosen name is
+`$ACCOUNTS_ROOT/.claude-<account>`, except that `default` (when no
+`.claude-default` dir exists) is `$HOME/.claude`.
+
 ### 1. Locate candidates
 
-Compute `<cwd-slug>` from `$PWD`. Build the foreign project dir:
-`C:\claude\.claude-<account>\projects\<cwd-slug>\`.
+The foreign project dir is `<account-dir>/projects/<cwd-slug>/`. Substitute
+its resolved absolute path for `<foreign-dir>` in the blocks below (shell
+state does not persist between Bash calls).
 
 Classify the third argument (`selector`) into one of five cases:
 
@@ -97,10 +140,11 @@ files. Multi-word: AND-join across the title text.
 
 ```bash
 # One-shot extractor — emits "<file>\t<latest-title>" for matches
-python - <<'PY'
+PYTHON=$(command -v python3 || command -v python) || { echo "no python3 or python on PATH" >&2; exit 1; }
+"$PYTHON" - <<'PY'
 import json, glob, os, sys
 KW = "<keyword(s) lowercased, space-separated>".split()
-DIR = r"C:/claude/.claude-<account>/projects/<cwd-slug>"
+DIR = r"<foreign-dir>"
 results = []
 for path in glob.glob(os.path.join(DIR, "*.jsonl")):
     latest_title = None
@@ -132,7 +176,7 @@ contain ALL words.
 
 ```bash
 # Bash equivalent if Grep tool can't traverse jsonl content cleanly:
-cd "C:/claude/.claude-<account>/projects/<cwd-slug>"
+cd "<foreign-dir>" || exit 1
 match_files=()
 for f in *.jsonl; do
     hit=1
@@ -190,7 +234,8 @@ The JSONL is one record per line. Schema (verified):
 Use Bash + Python (one-shot, no temp file) to extract:
 
 ```bash
-python - <<'PY'
+PYTHON=$(command -v python3 || command -v python) || { echo "no python3 or python on PATH" >&2; exit 1; }
+"$PYTHON" - <<'PY'
 import json, sys
 N = <N>
 path = r"<full-path>"
@@ -292,7 +337,7 @@ action.
 ## Rules
 
 - **Read-only on the foreign transcript.** Never write to, move, or
-  truncate files in `C:\claude\.claude-<account>\`. Treat the foreign
+  truncate files in `<account-dir>/`. Treat the foreign
   account's data as untouchable.
 - **Token-bound.** Cap the context block at ~15K tokens. If N=25 turns
   produces more, truncate aggressively (drop large tool results, keep

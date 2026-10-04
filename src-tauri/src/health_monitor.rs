@@ -1042,14 +1042,30 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 
 /// Append one line to `wedge-incidents.log`.
 ///
-/// **The single writer for that file.** Every rung with an incident worth
-/// surviving the process goes through here: the backend and UI-thread wedge
-/// detectors in this module, `webview_recovery`'s latched-recovery report
-/// (`recovery_wedged`), and `coord_outside_observer`'s four coord-liveness
-/// classes (`coord_unreachable`, `coord_worker_dead`, `coord_no_leader`,
-/// `coord_liveness_unknown` — plan
+/// **The single writer for that file — with one deliberate exception.** Every
+/// rung with an incident worth surviving the process goes through here: the
+/// backend and UI-thread wedge detectors in this module, `webview_recovery`'s
+/// latched-recovery report (`recovery_wedged`), and `coord_outside_observer`'s
+/// four coord-liveness classes (`coord_unreachable`, `coord_worker_dead`,
+/// `coord_no_leader`, `coord_liveness_unknown` — plan
 /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
-/// Phase 3b). A second incident file would be one more observability
+/// Phase 3b).
+///
+/// Two writers bypass this function. `append_watchdog_incident` (the
+/// runtime-independent watchdog) writes its own `WATCHDOG` lines; and
+/// `qontinui_runner_lib::alloc_breadcrumb` writes through a handle it opened at
+/// startup — tokens
+/// `alloc_failure`, `commit_exhaustion`, `commit_exhaustion_suspected`,
+/// `resource_exhaustion`, `resource_exhaustion_suspected`, and each episode
+/// token's `_closed` twin (`commit_exhaustion_closed`, …). It cannot come
+/// through here: its `alloc_failure` line is written from inside a failing
+/// allocator, and this function allocates (`format!`, `chrono`). EVERY writer
+/// keeps the `<RFC 3339> <TOKEN> … (pid N)` shape — the timestamp first and
+/// the pid LAST — because the next boot's crash harvest
+/// (`crash_observability::find_prior_exhaustion`) attributes lines to a run by
+/// that trailing pid; a line without it cannot be attributed to any run. Plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0. A second incident file would be one more observability
 /// channel nobody greps — and this one is already the first thing to read after
 /// an unexplained outage, because `runner-lifecycle.log` is truncated at every
 /// startup.
@@ -1065,7 +1081,9 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 ///
 /// `reason` is the stable, greppable token (`backend_wedged`,
 /// `ui_thread_wedged`, `recovery_wedged`, `coord_unreachable`,
-/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`);
+/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`; plus,
+/// through `alloc_breadcrumb`'s own handle, the exhaustion tokens listed
+/// above);
 /// `detail` is the prose after it.
 ///
 /// Best-effort by contract: the process is already sick, so a failure to write
@@ -1223,8 +1241,10 @@ fn watchdog_heartbeat_path(dir: &Path) -> PathBuf {
 }
 
 /// Path of the append-only incident log (shared with the monitor's own
-/// breadcrumb, so one file answers "what happened to this runner").
-fn wedge_incidents_path(dir: &Path) -> PathBuf {
+/// breadcrumb, so one file answers "what happened to this runner"). Also
+/// handed to `alloc_breadcrumb::install` at startup and read back by the
+/// next boot's crash harvest (`crash_observability`).
+pub(crate) fn wedge_incidents_path(dir: &Path) -> PathBuf {
     dir.join("wedge-incidents.log")
 }
 
@@ -1273,13 +1293,14 @@ fn append_watchdog_incident(dir: &Path, reason: WatchdogReason, s: WatchdogSampl
     let line = format!(
         "{} WATCHDOG {} — pid {}, probe heartbeat {}s old, metrics heartbeat {}s old, \
          consecutive /livez failures {}. Written by the runtime-independent watchdog \
-         thread, so this line survives a fully parked runtime.\n",
+         thread, so this line survives a fully parked runtime. (pid {})\n",
         chrono::Utc::now().to_rfc3339(),
         reason.as_str(),
         std::process::id(),
         monitor_age,
         metrics_age,
-        s.consecutive_failures
+        s.consecutive_failures,
+        std::process::id()
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

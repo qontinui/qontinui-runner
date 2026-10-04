@@ -597,7 +597,7 @@
       "class": "os_bound_tooling",
       "file": "src/crash_observability.rs",
       "symbol": "format_harvest_breadcrumb",
-      "excerpt": "flipping its shutdown marker to clean:true (crash, OOM kill, taskkill /F,\\n\\",
+      "excerpt": "abort, OOM kill, taskkill /F, or power loss). This artifact was\\n\\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1492,8 +1492,24 @@
     {
       "class": "plans_dir",
       "file": "src/plans_dir_migration.rs",
-      "symbol": "persist_env_plans_dir",
-      "excerpt": "\"plans_dir_migration: recorded paths.plans_dir = {value:?} from the retired env \\",
+      "symbol": "outcome_message",
+      "excerpt": "\"plans_dir_migration: kept existing setting: paths.plans_dir is already set, \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "plans_dir",
+      "file": "src/plans_dir_migration.rs",
+      "symbol": "outcome_message",
+      "excerpt": "\"plans_dir_migration: seeded from {var}: recorded paths.plans_dir = {value:?}. \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "plans_dir",
+      "file": "src/plans_dir_migration.rs",
+      "symbol": "outcome_message",
+      "excerpt": "{PLANS_DIR_ENV}{ignored}). paths.plans_dir stays unset, so the \\",
       "count": 1,
       "disposition": "unreviewed"
     },

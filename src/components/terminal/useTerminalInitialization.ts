@@ -9,6 +9,7 @@ import {
   getResumeSummaryPolicy,
   buildPickerAnswer,
   type ResumeSummaryPolicy,
+  type ResumeOutcome,
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
 import { providerDescriptorFor } from "./providerAdapter";
@@ -20,6 +21,7 @@ import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from ".
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds } from "./useTerminalPages";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import type { ResourceGuardSource } from "@/lib/resourceGuard";
 
 /**
  * Fetch the durable RESTORABLE session records for `pageId` from the backend
@@ -228,7 +230,7 @@ export async function runVerifiedResume(params: {
    */
   recordOpen?: SessionOpenArgs;
   verifyOptions?: TypeAndVerifyOptions;
-}): Promise<"verified" | "failed"> {
+}): Promise<ResumeOutcome> {
   const {
     terminalRefs,
     tabId,
@@ -252,6 +254,7 @@ export async function runVerifiedResume(params: {
     // this catches CLI version drift and the opt-in "summary" policy.
     pickerAnswer: buildPickerAnswer(policy),
     handshakePatterns,
+    sessionId: claudeSessionId,
     ...verifyOptions,
   });
   if (outcome === "verified") {
@@ -289,7 +292,9 @@ export async function runVerifiedResume(params: {
       console.warn(`[TerminalPage] clear restore-pending failed for ${claudeSessionId}:`, err);
     });
   } else {
-    // Resume never landed. Surface an explicit retry affordance and KEEP the
+    // Resume never landed — or was not typed because the pane could not be
+    // checked or already runs a claude not provably this session (see
+    // `ResumeOutcome`). Surface an explicit retry affordance and KEEP the
     // restore-pending marker — the open record must survive for the retry.
     console.warn(
       `[TerminalPage] resume verification failed for ${tabId} (session ${claudeSessionId})`,
@@ -748,7 +753,17 @@ interface UseTerminalInitializationParams {
   tabs: TerminalTab[];
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   reconnectToExistingSessions: () => Promise<string[] | null>;
-  createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
+  /**
+   * The cold-restore loop passes a `ResourceGuardSource` ("session restore",
+   * with the records still ahead of it), so a resource-guard refusal mid-restore
+   * says what is asking and how many more may follow.
+   */
+  createTerminal: (
+    title?: string,
+    workingDir?: string,
+    tenantId?: string,
+    spawnSource?: ResourceGuardSource,
+  ) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
   /**
    * Add the grid tab for a Conductor worker's durable record (`taskRunId`
@@ -1102,7 +1117,7 @@ export function useTerminalInitialization({
         //    are claimed from records FIRST so the creation-order auto-fill in
         //    `useZoneLayout` can never steal a zone a record owns (it only fills
         //    zones still empty after this loop runs).
-        for (const rec of openRecords) {
+        for (const [recIndex, rec] of openRecords.entries()) {
           // A Conductor worker (Phase 2b): no PTY exists or should exist for
           // it. Adopt the record as a `sessionBacked` tab and let
           // `reconcileAssignments` place it — every worker record is written
@@ -1173,7 +1188,13 @@ export function useTerminalInitialization({
           //    is re-asserted under the new ephemeral terminal id ONLY after
           //    the resume handshake VERIFIES (item 3 — re-asserting here
           //    refreshed `lastSeenAt` on ghost rows, making them immortal).
-          const tabId = await createTerminal(rec.title, rec.workingDir);
+          // The source names this restore in the resource-guard dialog. `queued`
+          // counts the records still ahead, this one included — an upper bound,
+          // since reconnected and live records ahead will be skipped.
+          const tabId = await createTerminal(rec.title, rec.workingDir, undefined, {
+            label: "session restore",
+            queued: openRecords.length - recIndex,
+          });
           if (!tabId) continue;
           // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
           // here, and is deliberately not clamped to zone 0: zone 0 belongs to
@@ -1418,6 +1439,9 @@ export function useTerminalInitialization({
                     provider: restore.provider,
                     updateTab,
                     recordOpen: restore.recordOpen,
+                    // The pane was created as a plain shell just above, so no
+                    // claude can be in it before the first type.
+                    verifyOptions: { skipFirstProbe: true },
                   });
                 }
               }

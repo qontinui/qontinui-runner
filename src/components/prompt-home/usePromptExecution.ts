@@ -236,7 +236,19 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             // exposes `checked` (checkbox) or `ariaExpanded` (disclosure),
             // it MUST flip after a click/check action. Buttons that expose
             // neither field fall through to P18B (pipeline-phase poll) when
-            // applicable, or just rely on the success flag otherwise.
+            // applicable, or otherwise rely on `directResult.success` alone.
+            // That flag comes from the in-process SDK `bridge.executeAction`
+            // (or `NLActionExecutor`). It is read strictly (`!success` fails,
+            // so an absent flag is NOT a pass), but the SDK sets it `true` for
+            // any action it dispatched without error. A click whose handler
+            // no-ops still reports success, and so does a custom action that
+            // RESOLVED a failure envelope instead of throwing. So the residual
+            // window stays open for those buttons. Plan
+            // 2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen
+            // hardened the relay/IPC readers (`actionOutcome`) and the
+            // execute-with-diff verdict. It did not touch this in-process
+            // path, and no reader can close this window: the SDK reports that
+            // the dispatch happened, not that it had an effect.
             if (targetId && preState) {
               const postState = bridge.getElementState(targetId);
               const checkedToggled =

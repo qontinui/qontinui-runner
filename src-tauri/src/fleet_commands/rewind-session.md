@@ -165,7 +165,7 @@ tests. A `cwd` that is not an existing directory is a 400, not a fallback.
 > runner's allow-list opens a spawn-into-nothing window.
 >
 > **Order it with a coord dep edge at PR time rather than by hand:** the
-> qontinui-claude-config PR that deletes a command file carries
+> command-corpus PR that deletes a command file carries
 > `coord:downstream-of=qontinui/qontinui-runner#<n>` — the waiting side of the
 > edge — so the runner PR that drops the allow-list arm lands FIRST and the
 > window never opens. Deleting a command file whose role is still on the

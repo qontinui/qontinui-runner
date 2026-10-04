@@ -307,6 +307,7 @@ fn cmd_show() -> ExitCode {
                 "redis_url":    p.redis_url,
                 "blob":         blob_view,
                 "coord_url":    p.coord_url,
+                "api_url":      p.api_url,
                 "auth":         auth_view,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -455,6 +456,7 @@ fn cmd_init(host: &str) -> ExitCode {
             secret_key: Some("qontinui-dev-secret".to_string()),
         }),
         coord_url: Some(format!("ws://{host}:9870/ws")),
+        api_url: None,
         auth: Some(AuthConfig {
             kind: "issuer".to_string(),
             issuer: Some(format!("http://{host}:8000")),
@@ -1170,7 +1172,17 @@ fn cmd_device_pair(
             pair_with_pair_code(&web_base, code, &device_id)
         }
         PairMode::AuthToken(token) => {
-            pair_with_auth_token(&base, token, preflight_tenant_id.expect("set above"))
+            let origin = qontinui_runner_lib::pair::PairBaseOrigin {
+                label: "coord_url (profiles.json / COORD_HTTP_URL)".to_string(),
+                remedy: "Set coord_url in ~/.qontinui/profiles.json or export COORD_HTTP_URL."
+                    .to_string(),
+            };
+            pair_with_auth_token(
+                &base,
+                token,
+                preflight_tenant_id.expect("set above"),
+                &origin,
+            )
         }
         PairMode::Browser => pair_via_browser(&base, preflight_tenant_id.expect("set above")),
     };

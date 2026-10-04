@@ -599,7 +599,6 @@ async fn hijack_live_ws_connection_refused() {
 
 /// Vector 2 (R6, enforce).
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn new_app_id_does_not_steal_active_connection() {
     let s = spawn(enforce_all()).await;
     let (_good, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -617,7 +616,6 @@ async fn new_app_id_does_not_steal_active_connection() {
 
 /// Vector 3.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn tab_stream_takeover_refused() {
     let s = spawn(BindingConfig::default()).await;
     let mut victim = s
@@ -664,7 +662,6 @@ mod forged_command_completion_refused {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
     async fn http_foreign_origin() {
         let s = spawn(BindingConfig::default()).await;
         let mut tab = s.attach("t1", browser(INJECT)).await.expect("attach");
@@ -698,7 +695,6 @@ mod forged_command_completion_refused {
     }
 
     #[tokio::test]
-    #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
     async fn http_same_origin_wrong_tab() {
         let s = spawn(BindingConfig::default()).await;
         let mut t1 = s.attach("t1", browser(INJECT)).await.expect("attach t1");
@@ -1651,7 +1647,6 @@ async fn an_oversized_app_id_is_refused_at_the_register_door() {
 
 /// R7.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn sdk_switch_refused_to_foreign() {
     // R7 holds in EVERY route policy, so exercise the default
     // (`enforce-doors`, which only shadows this route today) and `off`, where
@@ -1764,7 +1759,6 @@ async fn browser_http_register_cannot_declare_websocket() {
 
 /// R3: no operator-trust exemption (the supervisor-laundered shape).
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn operator_trust_cannot_post_tab_result() {
     let s = spawn(BindingConfig::default()).await;
     let mut tab = s.attach("t1", browser(INJECT)).await.expect("attach");
@@ -1795,7 +1789,6 @@ async fn operator_trust_cannot_post_tab_result() {
 
 /// Vector 6 (R8, enforce).
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn untargeted_dispatch_not_captured_during_reconnect() {
     let s = spawn(enforce_all()).await;
     let t1 = s.attach("t1", browser(INJECT)).await.expect("attach t1");
@@ -1831,7 +1824,6 @@ async fn untargeted_dispatch_not_captured_during_reconnect() {
 
 /// R9.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn pinned_tab_key_binds_across_origins() {
     const K: &str = "k-0123456789abcdef0123456789abcdef";
     let s = spawn(BindingConfig::default()).await;
@@ -1903,7 +1895,6 @@ mod pinned_tab_opaque_first_attach_then_real_origin {
     }
 
     #[tokio::test]
-    #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
     async fn null_origin_refused() {
         let s = spawn(BindingConfig::default()).await;
         match s.attach("t1", opaque()).await {
@@ -1919,7 +1910,6 @@ mod pinned_tab_opaque_first_attach_then_real_origin {
     }
 
     #[tokio::test]
-    #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
     async fn keyed_null_origin_admitted_and_bound_to_key() {
         const K: &str = "k-fedcba9876543210fedcba9876543210";
         let s = spawn(BindingConfig::default()).await;
@@ -2181,8 +2171,8 @@ async fn phone_home_loopback_alias_same_principal() {
     }
 }
 
-/// Admission is asserted in every phase; Phase 2 adds
-/// `R9-unkeyed.wouldRefuse == 1`.
+/// Admission is asserted in every phase, plus the `R9-unkeyed.wouldRefuse == 1`
+/// counter Phase 2 added.
 #[tokio::test]
 async fn unkeyed_pinned_tab_origin_hop_shadow() {
     let s = spawn(BindingConfig::default()).await;
@@ -2207,6 +2197,11 @@ async fn unkeyed_pinned_tab_origin_hop_shadow() {
     s.post_result(browser(ACCOUNTS), "t1", &command_id, json!({ "ok": true }))
         .await;
     assert_eq!(dispatch.await.unwrap().0, 200);
+    // The hop is admitted only because the routing-changing arm is in shadow,
+    // and it is counted so Phase 4 can decide its graduation from /health.
+    let r = s.rule("R9-unkeyed").await;
+    assert_eq!(r["wouldRefuse"], 1, "{r}");
+    assert_eq!(r["refused"], 0, "{r}");
 }
 
 /// Pins what the kill switches do: with both off, every attack succeeds again.

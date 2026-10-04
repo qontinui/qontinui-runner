@@ -1050,6 +1050,10 @@ mod timestamptz_parameter_binding_pg_tests {
     /// One runtime per test, owning the pool it builds. `new_blocking_for_test`
     /// makes and drops its own runtime, which would leave the connection tasks
     /// orphaned for the rest of the test.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "owned tokio Runtime predates the disallowed_types gate — dropping one from an async context panics; hold a Handle or use tauri::async_runtime; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+    )]
     fn run<F, T>(f: F) -> T
     where
         F: for<'a> FnOnce(

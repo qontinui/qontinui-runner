@@ -256,9 +256,9 @@ pub struct ReclaimPull {
 }
 
 /// One coord-deferred worktree: the path plus the gate reason that held it
-/// back. `reason` carries coord's `DeferReason` snake_case token
-/// (`dirty` | `not_landed` | `other_live_reference` | `serialize_claim_active`
-/// | `grace_pending` | `not_a_candidate`), or `pinned` once Phase 2 lands.
+/// back. `reason` carries coord's `DeferReason` snake_case token — the reason
+/// removal was refused; the full list the runner names is
+/// [`super::on_demand::KNOWN_COORD_DEFER_TOKENS`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockedWorktree {
     pub worktree_path: String,

@@ -38,6 +38,33 @@ function getStateMachine(): StateMachineAPI | undefined {
 }
 
 /**
+ * The `get_modal_context` IPC answer: the bridge registry's modal stack, or
+ * `null` when no modal detector answered.
+ *
+ * `null` means "could not classify", NEVER "no modals open": the Rust
+ * `/control/visibility` twin (`screenshots.rs::modal_ids_from_context`) reads
+ * it as `expectedOverlayDetection: "unavailable"`, while a real answer with an
+ * empty `modals` array reads as `"modal-stack"`. So every failure shape (no
+ * bridge, no registry, no `getModalContext` accessor, an accessor answering
+ * `undefined`, a tracker that throws) collapses to `null`, and a real answer,
+ * an empty stack included, passes through untouched. A throwing tracker
+ * degrades the field, never the request, per the SDK's rule that a
+ * misbehaving tracker degrades the field, never the caller (ui-bridge
+ * `core/registry.ts`).
+ */
+export function readModalContext(bridge: unknown): unknown {
+  try {
+    const registry = (
+      bridge as { registry?: { getModalContext?: () => unknown } } | null | undefined
+    )?.registry;
+    return registry?.getModalContext?.() ?? null;
+  } catch (err) {
+    logger.warn("get_modal_context: modal tracker threw; reporting null", err);
+    return null;
+  }
+}
+
+/**
  * Handles: discover, find, get_snapshot, get_modal_context, get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
@@ -192,28 +219,13 @@ export function useDiscoveryEvents(
           // occluders against `modals[].id` to honour `includeExpected`. This is
           // the same accessor the SDK's own visibility handler reads
           // (`registry.getModalContext()`), and it exists so the sweep need not
-          // rebuild a full `get_snapshot` a second time.
-          //
-          // `null` means "no modal detector answered" — NEVER "no modals": the
-          // Rust side reports `expectedOverlayDetection: "unavailable"` for it.
-          // A throwing tracker degrades to the same `null` rather than failing
-          // the request, per the SDK's rule that a misbehaving tracker degrades
-          // the field, never the caller (ui-bridge `core/registry.ts`).
-          let modalContext: unknown;
-          try {
-            const registry = (
-              currentBridge as { registry?: { getModalContext?: () => unknown } }
-            ).registry;
-            modalContext = registry?.getModalContext?.() ?? null;
-          } catch (err) {
-            logger.warn("get_modal_context: modal tracker threw; reporting null", err);
-            modalContext = null;
-          }
+          // rebuild a full `get_snapshot` a second time. The null contract is
+          // on `readModalContext`.
           await sendResponse({
             requestId,
             type,
             success: true,
-            data: modalContext,
+            data: readModalContext(currentBridge),
             timestamp: Date.now(),
           });
           return true;

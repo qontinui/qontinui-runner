@@ -125,9 +125,31 @@ pub enum SkipReason {
     /// coord has no trigger signal for this worktree — it is simply still in
     /// use / not a reclaim candidate.
     NotACandidate,
-    /// coord did not clear this worktree and gave no typed reason (the
-    /// pre-Phase-1 coord ships only its cleared set). Honest UNKNOWN, not a
-    /// claim that it is safe.
+    /// coord's latest census row for this path is older than its per-row
+    /// freshness bound (`DeferReason::StaleCensus`), so every census-derived
+    /// gate fact is untrustworthy and coord defers BOTH actions until a fresh
+    /// census tick re-observes the path. Resolves on its own with the next
+    /// census publish — a statement about coord's data, not about the tree.
+    StaleCensus,
+    /// coord's trigger for this path is `undeclared`
+    /// (`DeferReason::UndeclaredNotRemovable`): no `coord.agent_worktrees`
+    /// row, so removal authority is WITHDRAWN outright — not a gate that has
+    /// yet to clear. Unlike [`SkipReason::NotLanded`]/[`SkipReason::Grace`]
+    /// this never resolves with time; only allocating the tree through
+    /// coord makes it drainable by policy.
+    UndeclaredNotRemovable,
+    /// coord's trigger for this path is `landed_idle`
+    /// (`DeferReason::LandedIdleNotRemovable`, plan
+    /// `2026-09-17-coord-worktree-nomination-is-event-only-so-landed-clean-unowned-trees-hold-slots-forever`
+    /// Phase 3): landed, clean and idle past the retention clock, which earns
+    /// at most a non-destructive rejunction. Removal is deliberately NOT
+    /// authorized for that signal, so this does not resolve with time either.
+    LandedIdleNotRemovable,
+    /// coord did not clear this worktree and gave no typed reason — a coord
+    /// that serves no `blocked` list (every coord before plan
+    /// `2026-09-17-coord-worktree-nomination-is-event-only-so-landed-clean-unowned-trees-hold-slots-forever`
+    /// Phase 4), a path coord never evaluated, or a token this build does not
+    /// know. Honest UNKNOWN, not a claim that it is safe.
     NotCleared,
     /// coord is unreachable — with no decision there is no eligibility.
     /// Fail-safe: nothing is reclaimable while this holds.
@@ -150,6 +172,9 @@ impl SkipReason {
             SkipReason::MainMerge => "main-merge",
             SkipReason::Grace => "grace",
             SkipReason::NotACandidate => "not-a-candidate",
+            SkipReason::StaleCensus => "stale-census",
+            SkipReason::UndeclaredNotRemovable => "undeclared-not-removable",
+            SkipReason::LandedIdleNotRemovable => "landed-idle-not-removable",
             SkipReason::NotCleared => "not-cleared",
             SkipReason::CoordUnreachable => "coord-unreachable",
             SkipReason::Absent => "absent",
@@ -183,7 +208,22 @@ impl SkipReason {
             SkipReason::NotACandidate => {
                 "Not a reclaim candidate — coord has no trigger signal for it."
             }
-            SkipReason::NotCleared => "coord has not cleared this worktree for removal.",
+            SkipReason::StaleCensus => {
+                "coord's census of this path is out of date, so it will not judge it — \
+                 wait for the next census publish to re-observe it."
+            }
+            SkipReason::UndeclaredNotRemovable => {
+                "coord has no allocation record for this worktree, so it can never \
+                 authorize removing it — this does not clear with time. Allocate it \
+                 through coord to make it drainable by policy."
+            }
+            SkipReason::LandedIdleNotRemovable => {
+                "Landed, clean and idle — coord offers only a non-destructive rejunction \
+                 for that and never authorizes removing it on that signal alone."
+            }
+            SkipReason::NotCleared => {
+                "coord has not cleared this worktree for removal and gave no reason for it."
+            }
             SkipReason::CoordUnreachable => {
                 "coord is unreachable — nothing can be reclaimed without its decision."
             }
@@ -192,22 +232,64 @@ impl SkipReason {
         }
     }
 
-    /// Map coord's `DeferReason` snake_case token onto our vocabulary.
-    /// An unrecognized token degrades to [`SkipReason::NotCleared`] (honest
-    /// unknown) rather than being dropped.
+    /// Map coord's per-path defer token onto our vocabulary, through
+    /// [`KNOWN_COORD_DEFER_TOKENS`] — the one table, so the mapping and the
+    /// list coord's pairing test mirrors cannot drift apart.
+    ///
+    /// Only a token outside that table degrades to [`SkipReason::NotCleared`]
+    /// (honest unknown) rather than being dropped. That fallback exists for
+    /// version skew — a coord newer than this build — never for a token coord
+    /// is known to emit.
     fn from_coord_token(token: &str) -> SkipReason {
-        match token {
-            "dirty" => SkipReason::Dirty,
-            "not_landed" => SkipReason::NotLanded,
-            "other_live_reference" => SkipReason::SessionLive,
-            "serialize_claim_active" => SkipReason::MainMerge,
-            "grace_pending" => SkipReason::Grace,
-            "not_a_candidate" => SkipReason::NotACandidate,
-            "pinned" => SkipReason::Pinned,
-            _ => SkipReason::NotCleared,
-        }
+        KNOWN_COORD_DEFER_TOKENS
+            .iter()
+            .find(|(t, _)| *t == token)
+            .map_or(SkipReason::NotCleared, |&(_, reason)| reason)
     }
 }
+
+/// Every per-path defer token coord can put in the reclaim pull's `blocked`
+/// list. coord serves that list from plan
+/// `2026-09-17-coord-worktree-nomination-is-event-only-so-landed-clean-unowned-trees-hold-slots-forever`
+/// Phase 4 onward (a coord before it sends none, and every deferred path
+/// renders [`SkipReason::NotCleared`]); that phase's coord half adds the
+/// pairing test `every_defer_reason_maps_to_a_named_skip_reason`, which
+/// mirrors this table. `blocked.reason` is always a `DeferReason::as_str`
+/// token — the reason REMOVAL was refused. Rows, in order:
+///
+/// - the nine `DeferReason::as_str` tokens of coord's `DeferReason::ALL` as of
+///   2026-09-30 (`dirty` … `undeclared_not_removable`);
+/// - `landed_idle_not_removable` — `DeferReason::LandedIdleNotRemovable`, added
+///   by Phase 3 of plan
+///   `2026-09-17-coord-worktree-nomination-is-event-only-so-landed-clean-unowned-trees-hold-slots-forever`;
+///
+/// coord's `sinkless_rejunction` metrics label is deliberately absent: it
+/// describes a withheld REJUNCTION, not why removal was refused, so it can
+/// never be the reason a `blocked` entry carries.
+///
+/// Device-grain labels (`census_load_failed`, …) are deliberately absent: they
+/// are not about a path, so they can never key a `blocked` entry. A new coord
+/// token needs a row here with its own NAMED [`SkipReason`] — mapping it to
+/// [`SkipReason::NotCleared`] is refused by
+/// `every_known_coord_defer_token_maps_to_a_named_arm`.
+pub const KNOWN_COORD_DEFER_TOKENS: &[(&str, SkipReason)] = &[
+    ("dirty", SkipReason::Dirty),
+    ("not_landed", SkipReason::NotLanded),
+    ("other_live_reference", SkipReason::SessionLive),
+    ("serialize_claim_active", SkipReason::MainMerge),
+    ("grace_pending", SkipReason::Grace),
+    ("not_a_candidate", SkipReason::NotACandidate),
+    ("pinned", SkipReason::Pinned),
+    ("stale_census", SkipReason::StaleCensus),
+    (
+        "undeclared_not_removable",
+        SkipReason::UndeclaredNotRemovable,
+    ),
+    (
+        "landed_idle_not_removable",
+        SkipReason::LandedIdleNotRemovable,
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // The pure guard — the load-bearing decision.
@@ -2164,6 +2246,15 @@ mod tests {
             ("not_a_candidate", SkipReason::NotACandidate),
             ("dirty", SkipReason::Dirty),
             ("pinned", SkipReason::Pinned),
+            ("stale_census", SkipReason::StaleCensus),
+            (
+                "undeclared_not_removable",
+                SkipReason::UndeclaredNotRemovable,
+            ),
+            (
+                "landed_idle_not_removable",
+                SkipReason::LandedIdleNotRemovable,
+            ),
             ("something-new", SkipReason::NotCleared),
         ] {
             assert_eq!(SkipReason::from_coord_token(token), expected, "{token}");
@@ -3630,22 +3721,114 @@ mod tests {
         assert_eq!(humanize_secs(7_860), "2h 11m");
     }
 
+    /// The coord token list, pinned as a literal. coord's
+    /// `every_defer_reason_maps_to_a_named_skip_reason` mirrors this exact
+    /// list, so a token added on either side without the other breaks the
+    /// pair. Every entry must land on a NAMED arm — `NotCleared` is the
+    /// "coord never saw this path" answer and may not stand in for a known
+    /// verdict — and no two tokens may collapse onto one arm.
+    #[test]
+    fn every_known_coord_defer_token_maps_to_a_named_arm() {
+        let expected: &[&str] = &[
+            "dirty",
+            "not_landed",
+            "other_live_reference",
+            "serialize_claim_active",
+            "grace_pending",
+            "not_a_candidate",
+            "pinned",
+            "stale_census",
+            "undeclared_not_removable",
+            "landed_idle_not_removable",
+        ];
+        let tokens: Vec<&str> = KNOWN_COORD_DEFER_TOKENS.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            tokens, expected,
+            "the coord token table changed — update coord's pair"
+        );
+
+        let mut arms: Vec<&str> = Vec::new();
+        for &(token, reason) in KNOWN_COORD_DEFER_TOKENS {
+            assert_ne!(
+                reason,
+                SkipReason::NotCleared,
+                "{token} must map to a named arm"
+            );
+            assert_eq!(SkipReason::from_coord_token(token), reason, "{token}");
+            arms.push(reason.as_str());
+        }
+        let n = arms.len();
+        arms.sort_unstable();
+        arms.dedup();
+        assert_eq!(
+            arms.len(),
+            n,
+            "two coord tokens collapsed onto one SkipReason"
+        );
+    }
+
+    #[test]
+    fn a_blocked_entry_with_a_newer_coord_token_renders_its_named_reason() {
+        // End to end through the survey: coord's `blocked` entry carrying a
+        // token this build knows must surface as that reason, never as
+        // `not-cleared`.
+        let _amb = crate::test_env::isolated_ambient();
+        let path = "D:/qontinui-root/agent-worktrees/aaa/qontinui-runner";
+        let pull: ReclaimPull = serde_json::from_value(serde_json::json!({
+            "instructions": [],
+            "blocked": [{
+                "worktree_path": path,
+                "repo": "qontinui-runner",
+                "reason": "landed_idle_not_removable",
+            }],
+        }))
+        .unwrap();
+        let (items, _) = build_survey_items(
+            &[census_row(path, false, Some(false))],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "blocked");
+        assert_eq!(items[0].reason, Some("landed-idle-not-removable"));
+    }
+
+    /// Every `SkipReason` variant — the list the per-variant tests iterate.
+    const ALL_SKIP_REASONS: [SkipReason; 16] = [
+        SkipReason::Dirty,
+        SkipReason::DirtinessUnknown,
+        SkipReason::Pinned,
+        SkipReason::SessionLive,
+        SkipReason::Building,
+        SkipReason::NotLanded,
+        SkipReason::MainMerge,
+        SkipReason::Grace,
+        SkipReason::NotACandidate,
+        SkipReason::StaleCensus,
+        SkipReason::UndeclaredNotRemovable,
+        SkipReason::LandedIdleNotRemovable,
+        SkipReason::NotCleared,
+        SkipReason::CoordUnreachable,
+        SkipReason::Absent,
+        SkipReason::NotReapable,
+    ];
+
+    #[test]
+    fn skip_reason_serde_label_equals_as_str() {
+        for reason in ALL_SKIP_REASONS {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::Value::String(reason.as_str().to_string()),
+                "{reason:?}"
+            );
+        }
+    }
+
     #[test]
     fn skip_reasons_all_have_distinct_tokens_and_details() {
-        let all = [
-            SkipReason::Dirty,
-            SkipReason::Pinned,
-            SkipReason::SessionLive,
-            SkipReason::Building,
-            SkipReason::NotLanded,
-            SkipReason::MainMerge,
-            SkipReason::Grace,
-            SkipReason::NotACandidate,
-            SkipReason::NotCleared,
-            SkipReason::CoordUnreachable,
-            SkipReason::Absent,
-            SkipReason::NotReapable,
-        ];
+        let all = ALL_SKIP_REASONS;
         let mut tokens: Vec<&str> = all.iter().map(|r| r.as_str()).collect();
         tokens.sort_unstable();
         let unique = {
