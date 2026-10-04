@@ -103,7 +103,7 @@ thread_local! {
 /// D4: a tenant slot vanished from the shared `auth_tokens.enc` with no log line
 /// naming the writer. Every slot write and clear now carries this, so the next
 /// foreign writer (CLI, instance runner, test binary) is named by the log.
-pub(crate) fn process_attribution() -> String {
+pub fn process_attribution() -> String {
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let exe = EXE.get_or_init(|| match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
@@ -721,7 +721,13 @@ impl SecureStorage {
     /// Creates a SecureStorage instance with a custom storage path.
     ///
     /// This is primarily used for testing to ensure test isolation.
-    #[cfg(test)]
+    ///
+    /// Gated on `any(test, debug_assertions)` rather than `cfg(test)` because
+    /// the runner BIN's tests call it and this module is a lib module: `cargo
+    /// test` builds the bin's dependencies (this rlib included) without
+    /// `cfg(test)` but WITH `debug_assertions` — the same boundary as
+    /// `ambient::test_support`. A release build compiles none of it.
+    #[cfg(any(test, debug_assertions))]
     pub fn with_path(storage_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = storage_path.parent() {

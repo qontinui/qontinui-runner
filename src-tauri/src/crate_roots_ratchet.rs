@@ -25,21 +25,12 @@
 ///   `util` holds lib-only children and the bin's `util/` tree holds bin-only
 ///   ones. Duplicated children are policed by
 ///   [`ALLOWED_IN_BOTH_UTIL_TREES`].
-const ALLOWED_IN_BOTH_ROOTS: &[&str] = &[
-    "auth",
-    "coord_mcp_config",
-    "fs_atomic",
-    "fs_perms",
-    "machine_identity",
-    "process_helpers",
-    "secure_storage",
-    "test_env",
-    "util",
-];
+const ALLOWED_IN_BOTH_ROOTS: &[&str] = &["auth", "test_env", "util"];
 
 /// Children of `util` allowed in both the lib's inline `pub mod util { … }`
-/// and the bin's `util/mod.rs`.
-const ALLOWED_IN_BOTH_UTIL_TREES: &[&str] = &["error_chain"];
+/// and the bin's `util/mod.rs`. Empty: the bin re-exports the lib's
+/// `error_chain` instead of declaring it.
+const ALLOWED_IN_BOTH_UTIL_TREES: &[&str] = &[];
 
 const LIB_RS: &str = include_str!("lib.rs");
 const MAIN_RS: &str = include_str!("main.rs");
