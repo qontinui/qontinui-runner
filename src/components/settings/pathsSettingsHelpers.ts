@@ -677,7 +677,7 @@ export function scanSourceStatus(
       age === null
         ? `Nothing proves when ${ref} was last refreshed${view.detail ? ` (${view.detail})` : ""}`
         : `${age}, outside the adapter's freshness window`;
-    const detail = `${why}, so the true distance behind can only be larger and an ahead count may overstate. The adapter never fetches.`;
+    const detail = `${why}, so the true distance behind can only be larger and an ahead count may overstate. A cycle that cannot fetch (a withheld cycle, or a failed fetch) measures against the ref as this clone last fetched it.`;
     if (behind === 0) {
       return ahead > 0
         ? {
