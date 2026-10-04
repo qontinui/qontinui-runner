@@ -1392,14 +1392,27 @@ fn slow_host_probes() -> SlowHostProbes {
 }
 
 /// The probed host-fact capability set for the heartbeat.
+///
+/// Plus `gpu:cuda` / `gpu:vram:<GiB>` when a CUDA-capable NVIDIA GPU is
+/// measured (plan `2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity-and-coord-has-no-resource-model`,
+/// amendment 2026-10-01 item 4), from the same cached reading the computer
+/// reporter publishes as `coord.computers.gpus`. While that reading is
+/// UNKNOWN the tokens keep the last known one for one more reading period
+/// (so a single slow `nvidia-smi` does not withdraw `gpu:cuda`), but never
+/// while an `nvidia-smi` is wedged; with nothing known, nothing is
+/// advertised.
 fn host_capabilities() -> Vec<String> {
     let slow = slow_host_probes();
-    build_host_capabilities(
+    let mut caps = build_host_capabilities(
         current_os_label(),
         slow.powershell,
         slow.docker,
         webview_runtime_available(),
-    )
+    );
+    caps.extend(computer::gpu::capability_tokens(
+        computer::gpu::host_gpus_for_capabilities().as_deref(),
+    ));
+    caps
 }
 
 /// The capability token asserting this device has a usable webview runtime and
@@ -1924,8 +1937,14 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     itself retractable, so a stale label set left behind by a device that
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
-    let capabilities =
-        build_device_capabilities(ci.enabled, &ci.repo_allowlist, &host_capabilities());
+    // The host probes block (a `docker version` fork, and on a cache miss a
+    // bounded `nvidia-smi` run), so they run on the blocking pool rather than
+    // on this async task's worker. A join failure (a panicking probe) still
+    // advertises the OS fact, the one token that needs no probe.
+    let host = spawn_blocking_tracked(host_capabilities)
+        .await
+        .unwrap_or_else(|_| vec![format!("os:{}", current_os_label())]);
+    let capabilities = build_device_capabilities(ci.enabled, &ci.repo_allowlist, &host);
     let ci_runner_labels = if ci.enabled {
         ci_node_labels()
     } else {
@@ -7512,8 +7531,14 @@ mod tests {",
         if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
             *g = None;
         }
-        let first = host_capabilities();
-        let second = host_capabilities();
+        // `gpu:*` tokens are excluded: the GPU reading is a shared,
+        // single-flight cache another test may be filling concurrently, so
+        // two calls can legitimately straddle its first measurement.
+        let non_gpu = |v: Vec<String>| -> Vec<String> {
+            v.into_iter().filter(|c| !c.starts_with("gpu:")).collect()
+        };
+        let first = non_gpu(host_capabilities());
+        let second = non_gpu(host_capabilities());
         assert_eq!(
             first, second,
             "host_capabilities must be cache-stable across consecutive calls"
