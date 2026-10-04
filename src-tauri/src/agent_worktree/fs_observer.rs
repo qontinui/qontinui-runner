@@ -412,10 +412,9 @@ async fn post_observations(
     // unpaired / empty keychain collapses to the anonymous send coord accepts
     // today). Same write-path attach the credential-helper uses, and it feeds
     // the data-plane auth-coverage metric ahead of multiuser Phase-2
-    // enforcement on `/coord/fs/observations`. Must be `crate::auth`, not
-    // `qontinui_runner_lib::auth` — this module compiles into the bin target,
-    // and the lib path would bump the lib crate's separate counter statics,
-    // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
+    // enforcement on `/coord/fs/observations`. `crate::auth` is the lib's
+    // `auth` (the bin imports it), so this attach counts in the runner's one
+    // `DATA_PLANE_TOTAL/AUTHED` coverage readout.
     // Phase 5 — `body.tenant_id` above is the route's tenancy and the bearer is
     // matched to it. The producer used to pass a literal `None` into that slot
     // with an in-source note that it was "not resolved in this context"; it now

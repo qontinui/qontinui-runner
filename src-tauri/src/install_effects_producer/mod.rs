@@ -1508,7 +1508,7 @@ async fn observe_verify_with_base<L: RegistryTokenLookup + ?Sized>(
     // Phase 6 — the install's own checkout names the tenant. `repo_path` is
     // empty only on the degraded no-PreContext path, where the scope is
     // honestly unresolved rather than the machine default.
-    let scope = crate::repo_detection::tenant_scope_for_path(&repo_path).await;
+    let scope = qontinui_runner_lib::repo_tenant::tenant_scope_for_path(&repo_path).await;
     let client = CoordInstallClient::new(coord_base.to_string(), scope)?;
     // No registry creds are injected for the observe probes here — interception
     // observes the agent's already-authed install; the agent's shell owns its
@@ -1714,7 +1714,8 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
                 // the request the agent's shell is blocked on: it costs a `git`
                 // probe and, on a cold cache, a coord read, and "observe never
                 // blocks" is this path's whole contract.
-                let scope = crate::repo_detection::tenant_scope_for_path(&repo_path_buf).await;
+                let scope =
+                    qontinui_runner_lib::repo_tenant::tenant_scope_for_path(&repo_path_buf).await;
                 let ground_truth = {
                     let rp = repo_path_buf.clone();
                     let pkgs = packages.clone();
@@ -1841,7 +1842,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     // observe fast path (which resolves it inside its own deferred task), so
     // neither of those pays a `git` probe or a cold coord read, and
     // `effective_mode` above is read before this function's first await.
-    let scope = crate::repo_detection::tenant_scope_for_path(repo_path).await;
+    let scope = qontinui_runner_lib::repo_tenant::tenant_scope_for_path(repo_path).await;
 
     // ---- Phase 2: read-only dry-run + native-audit probes --------------------
     // Shell out the package manager's own `--dry-run` (+ `audit`) on a blocking

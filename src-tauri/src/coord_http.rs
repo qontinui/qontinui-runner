@@ -160,40 +160,24 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// the `/tenant-policy` poll, whose query names a tenant that coord requires
 /// to EQUAL the presented token's claim.
 ///
-/// **Takes `crate::auth::TenantScope`, not `qontinui_runner_lib::auth`'s**,
-/// unlike the three unparameterized helpers above — and the reason is NOT a
-/// naming convenience. This module is declared in `main.rs` alone, so it
-/// compiles into the bin only and a bin caller could perfectly well name
-/// `qontinui_runner_lib::auth::TenantScope`; no conversion was ever required.
+/// **One `auth` module instance, one set of statics.** `auth` is owned by the
+/// lib and the bin imports it (`main.rs`: `pub(crate) use
+/// qontinui_runner_lib::auth;`), so `crate::auth` here and
+/// `qontinui_runner_lib::auth` anywhere else name the SAME module:
+/// `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED` (the coverage counters),
+/// `MISSING_TOKEN_WARNED`, `DEAD_LEGACY_SLOT_WARNED` and the
+/// `warn_once_per_tenant_*` sets exist once per process, whichever spelling a
+/// caller uses. Every `attach_device_auth*` call — these helpers, the lib's
+/// own sites, and the `crate::auth::presented_tenant` call that diagnoses
+/// their refusals — counts into one `"coord data-plane device-JWT coverage:
+/// X/Y (Z%)"` series and shares one "already warned" latch.
 ///
-/// What forces the choice is that `auth` IS compiled twice — `lib.rs`'s
-/// `pub mod auth` and `main.rs`'s `mod auth` are two separate copies with
-/// SEPARATE STATICS. `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED` (the
-/// coverage counters), `MISSING_TOKEN_WARNED`, `DEAD_LEGACY_SLOT_WARNED` and
-/// the `warn_once_per_tenant_*` sets each exist once per copy. Routing this
-/// helper through `crate::auth` puts the attach in the SAME copy as the
-/// `crate::auth::presented_tenant` call that diagnoses its refusals and as
-/// the rest of this copy's `attach_device_auth*` call sites — the large
-/// majority of them, spread across three dozen modules — so the latch that
-/// says "already warned" and the counter that says "N of M authed" are the
-/// ones those sites read.
-/// Split across copies, a warning suppressed in one copy fires again from the
-/// other and neither counter is the whole story.
-///
-/// No count is pinned here on purpose. It moves with every call site added,
-/// and a grep wide enough to be worth quoting (`attach_device_auth`) also
-/// matches the LIB copy's own sites, this module's `use` lines and the doc
-/// comments referring to it — so any single number invites a reader to
-/// reproduce a different one and conclude the comment is wrong. The property
-/// that matters is "one copy of the statics", not "N".
-///
-/// Residual, named rather than fixed here: [`coord_get`], [`coord_post`] and
-/// [`coord_put`] above still call the LIB copy's `attach_device_auth`, so the
-/// runner emits the identically-worded
-/// `"coord data-plane device-JWT coverage: X/Y (Z%)"` line from two
-/// independent counters and an operator sees two indistinguishable series.
-/// That split PRE-EXISTS this change and outlives it; converging the two
-/// copies is a census item, not a line to slip into this one.
+/// History: until plan
+/// `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`
+/// Phase 2 the bin declared its own `mod auth`, the module compiled twice,
+/// and the runner logged that coverage line from two independent counters.
+/// `crate_roots_ratchet` now fails if any module is declared in both roots
+/// again.
 pub fn coord_get_for(
     client: &reqwest::Client,
     url: impl reqwest::IntoUrl,

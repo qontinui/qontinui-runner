@@ -20,15 +20,13 @@
 
 /// Top-level module names allowed in both crate roots.
 ///
-/// - `auth` — owed by Phase 2 of the plan above; remove it when the bin
-///   imports the lib's copy.
 /// - `test_env` — per-crate BY DESIGN: both copies only re-export the one
 ///   `ambient::test_support`, so no state is duplicated.
 /// - `util` — the NAME is shared, the contents are not: the lib's inline
 ///   `util` holds lib-only children and the bin's `util/` tree holds bin-only
 ///   ones. Duplicated children are policed by
 ///   [`ALLOWED_IN_BOTH_UTIL_TREES`].
-const ALLOWED_IN_BOTH_ROOTS: &[&str] = &["auth", "test_env", "util"];
+const ALLOWED_IN_BOTH_ROOTS: &[&str] = &["test_env", "util"];
 
 /// Children of `util` allowed in both the lib's inline `pub mod util { … }`
 /// and the bin's `util/mod.rs`. Empty: the bin re-exports the lib's
@@ -414,6 +412,27 @@ fn no_util_child_is_declared_in_both_util_trees() {
         "util child module(s) declared in BOTH lib.rs's inline `pub mod util` and \
          util/mod.rs: {offenders:?}. Each compiles twice. Keep the lib's declaration and \
          re-export it from util/mod.rs with `pub use qontinui_runner_lib::util::<name>;`."
+    );
+}
+
+/// `auth` is ONE module instance: the bin's `crate::auth` IS the lib's
+/// `qontinui_runner_lib::auth`, so its statics (`DATA_PLANE_TOTAL` /
+/// `DATA_PLANE_AUTHED`, the keychain circuit breaker, the one-shot warning
+/// latches) exist once per process.
+///
+/// A compile-level assertion: while the bin declared its own `mod auth`, the
+/// two `TenantScope`s were nominally distinct types and this binding did not
+/// type-check (E0308) — `repo_detection` needed a hand-written `rebadge` to
+/// cross between them. The runtime assert only keeps the test from being
+/// empty.
+#[test]
+fn auth_is_one_module_instance() {
+    let scope: qontinui_runner_lib::auth::TenantScope = crate::auth::TenantScope::Device;
+    let back: crate::auth::TenantScope = scope;
+    assert_eq!(
+        back,
+        qontinui_runner_lib::auth::TenantScope::Device,
+        "the bin's and the lib's TenantScope must be one type"
     );
 }
 

@@ -34,7 +34,7 @@ const SERVICE_NAME: &str = "com.qontinui.runner";
 /// through so a mint path added later cannot forget the check.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("minted device JWT is for tenant {returned:?}, not the requested tenant {expected}")]
-pub(crate) struct TenantMismatch {
+pub struct TenantMismatch {
     pub expected: Uuid,
     pub returned: Option<Uuid>,
 }
@@ -96,7 +96,7 @@ const EXPIRY_LEEWAY_SECS: i64 = 30;
 /// intentionally out of scope — coord re-verifies the JWT on every WS
 /// handshake; the only thing read here is the unverified `exp` for staleness
 /// decisions and operator introspection.
-pub(crate) fn decode_jwt_exp(token: &str) -> Option<i64> {
+pub fn decode_jwt_exp(token: &str) -> Option<i64> {
     let token = token.trim();
     if token.is_empty() {
         return None;
@@ -125,7 +125,7 @@ pub(crate) fn decode_jwt_exp(token: &str) -> Option<i64> {
 ///
 /// Coord is the authority on the value; it is read here only to decide which
 /// LOCAL slot a credential belongs in, never as an authorization decision.
-pub(crate) fn jwt_tenant_claim(token: &str) -> Option<Uuid> {
+pub fn jwt_tenant_claim(token: &str) -> Option<Uuid> {
     let mut parts = token.trim().splitn(3, '.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;
@@ -144,7 +144,7 @@ pub(crate) fn jwt_tenant_claim(token: &str) -> Option<Uuid> {
 /// returns `false` — callers that want a shape check should use
 /// [`looks_like_jwt`] first; this helper answers only "is this decodable
 /// JWT past its expiry?" and never claims an opaque token is expired.
-pub(crate) fn jwt_is_expired(token: &str) -> bool {
+pub fn jwt_is_expired(token: &str) -> bool {
     match decode_jwt_exp(token) {
         Some(exp) => {
             let now = chrono::Utc::now().timestamp();
@@ -178,7 +178,7 @@ pub(crate) fn jwt_is_expired(token: &str) -> bool {
 /// key, and this decides which LOCAL slot to present, never an authorization.
 /// `exp` + parseability is the whole contract — the same one
 /// [`decode_jwt_exp`] already serves the refresher.
-pub(crate) fn slot_jwt_is_usable(token: &str) -> bool {
+pub fn slot_jwt_is_usable(token: &str) -> bool {
     let token = token.trim();
     !token.is_empty() && decode_jwt_exp(token).is_some() && !jwt_is_expired(token)
 }
@@ -214,7 +214,7 @@ pub(crate) fn decode_jwt_kid(token: &str) -> Option<String> {
 /// *without printing the token*. A struct that cannot hold the secret cannot
 /// leak it into a log, a `/health` payload or a bug report.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub(crate) struct SlotDescriptor {
+pub struct SlotDescriptor {
     /// `true` iff [`slot_jwt_is_usable`] — the SAME predicate selection uses,
     /// called rather than re-implemented, so the doctor can never report a
     /// slot as healthy that selection would skip (or vice versa).
@@ -240,7 +240,7 @@ impl SlotDescriptor {
     /// `absent` — distinct from `opaque`, because "nothing stored" and
     /// "something stored that we cannot parse" have different repairs and the
     /// old code collapsed both into a single falsy bit.
-    pub(crate) fn describe(token: Option<&str>) -> Self {
+    pub fn describe(token: Option<&str>) -> Self {
         let token = token.map(str::trim).unwrap_or("");
         if token.is_empty() {
             return Self {
@@ -414,9 +414,17 @@ pub struct AuthManager {
     machine_file: Option<std::path::PathBuf>,
     /// Test-only override that forces [`Self::keychain_enabled`] to `true`
     /// regardless of `QONTINUI_DISABLE_KEYCHAIN`. Compiled only under
-    /// `#[cfg(test)]` so it cannot affect a release binary. See
+    /// `#[cfg(any(test, debug_assertions))]` so it cannot affect a release
+    /// binary, and only the test constructors ever set it. See
     /// [`Self::with_storage_force_keychain`] for why this exists.
-    #[cfg(test)]
+    ///
+    /// `any(test, debug_assertions)` rather than `cfg(test)` because the runner
+    /// BIN's tests call the test constructors and this is a lib module: `cargo
+    /// test` builds the bin's dependencies (this rlib included) without
+    /// `cfg(test)` but WITH `debug_assertions` — the same boundary as
+    /// `ambient::test_support`. The constructors below and the two branches
+    /// that read this field share the gate.
+    #[cfg(any(test, debug_assertions))]
     force_keychain_enabled: bool,
 }
 
@@ -432,7 +440,7 @@ impl AuthManager {
             secure_storage,
             service_name: SERVICE_NAME.to_string(),
             machine_file: crate::machine_identity::machine_file_path(),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             force_keychain_enabled: false,
         }
     }
@@ -443,7 +451,7 @@ impl AuthManager {
     /// [`Self::force_keychain_enabled`] can override it — see
     /// [`Self::with_storage_force_keychain`].
     fn keychain_enabled(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         if self.force_keychain_enabled {
             return true;
         }
@@ -468,7 +476,7 @@ impl AuthManager {
     /// must never read (let alone write) the real `~/.qontinui/machine.json`.
     /// Use [`Self::with_storage_and_machine_file`] to exercise the canonical
     /// identity path against a tempdir.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn with_storage(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
@@ -493,7 +501,7 @@ impl AuthManager {
     /// override sidesteps this without mutating process-global env (which
     /// would race every other test reading `QONTINUI_DISABLE_KEYCHAIN` in
     /// parallel) and without touching any non-test code path.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn with_storage_force_keychain(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
@@ -506,7 +514,7 @@ impl AuthManager {
     /// [`Self::with_storage`] with an explicit `machine.json` path, so the
     /// canonical-identity branch of [`Self::get_device_id`] is testable
     /// against a tempdir.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn with_storage_and_machine_file(
         secure_storage: SecureStorage,
         machine_file: std::path::PathBuf,
@@ -1579,7 +1587,7 @@ pub fn device_bearer_for(tenant: Option<&Uuid>) -> Option<String> {
 /// no longer selected (validity, above), a tenant-less binding no longer
 /// selects a slot FAMILY ([`crate::coord_mcp::session_tenant_or_refuse`]), and
 /// the two slots no longer diverge (the mirror). What remains is consolidation.
-pub(crate) fn select_device_bearer(
+pub fn select_device_bearer(
     am: &AuthManager,
     tenant: Option<&Uuid>,
     default_tenant: Option<Uuid>,
@@ -1608,7 +1616,7 @@ pub(crate) fn select_device_bearer(
 /// [`MeasuredBindingCount::Unknown`] here and the claimless token is refused.
 /// Presenting a token of unknown ownership as `t`'s is the cross-tenant write
 /// this plan exists to close; a re-pair (which writes a claim) is the recovery.
-pub(crate) fn legacy_token_serves_tenant(
+pub fn legacy_token_serves_tenant(
     am: &AuthManager,
     token: &str,
     t: &Uuid,
@@ -2133,7 +2141,7 @@ fn warn_once_per_tenant_slot_miss(tenant: &Uuid) {
 /// posture branch avoids by probing `probe_access_token()` instead of
 /// `get_access_token()`: an unreadable store is UNKNOWN, never absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BindingTenantRead {
+pub enum BindingTenantRead {
     /// `paired_user.json` was read, parsed, and names this default tenant.
     Bound(Uuid),
     /// MEASURED absence: the file is not there (an unpaired device), or it is
@@ -2159,24 +2167,24 @@ pub(crate) enum BindingTenantRead {
 /// read as single-tenant, and a tenant-less door call silently answered the
 /// default tenant's token.
 #[derive(Debug, Clone)]
-pub(crate) struct HeldDeviceTenants {
+pub struct HeldDeviceTenants {
     /// The per-tenant slot enumeration; `Err` = the store could not be read.
-    pub(crate) slots: std::result::Result<Vec<Uuid>, String>,
+    pub slots: std::result::Result<Vec<Uuid>, String>,
     /// The default binding (`paired_user.json`).
-    pub(crate) default_binding: BindingTenantRead,
+    pub default_binding: BindingTenantRead,
     /// Whether the legacy slot holds a JWT that is the DEFAULT binding's
     /// credential by [`legacy_token_serves_tenant`] — its claim names the
     /// binding, or it carries no claim on a device MEASURED to hold one binding
     /// and no slot for that tenant — not merely a JWT (re-review F2: a B token in the slot
     /// beside an A binding is NOT A's credential). `Ok(false)` when there is no bound default to name. `Err` =
     /// the slot could not be read.
-    pub(crate) legacy_slot: std::result::Result<bool, String>,
+    pub legacy_slot: std::result::Result<bool, String>,
 }
 
 /// Why [`HeldDeviceTenants`] could not establish an answer. Each is UNKNOWN,
 /// never an empty set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HeldTenantsUnknown {
+pub enum HeldTenantsUnknown {
     /// The per-tenant slot store could not be read.
     SlotStore(String),
     /// `paired_user.json` could not be read, so whose the legacy slot is — and
@@ -2207,12 +2215,12 @@ impl std::fmt::Display for HeldTenantsUnknown {
 
 impl HeldDeviceTenants {
     /// Read all three inputs from `am` and the live default-binding probe.
-    pub(crate) fn read(am: &AuthManager) -> Self {
+    pub fn read(am: &AuthManager) -> Self {
         Self::read_with(am, default_binding_tenant_probe())
     }
 
     /// [`Self::read`] with the default binding injected (tests).
-    pub(crate) fn read_with(am: &AuthManager, default_binding: BindingTenantRead) -> Self {
+    pub fn read_with(am: &AuthManager, default_binding: BindingTenantRead) -> Self {
         Self::read_with_count(am, default_binding, measured_device_binding_count())
     }
 
@@ -2246,9 +2254,7 @@ impl HeldDeviceTenants {
     /// The held set: the slot tenants ∪ {the default binding, when the legacy
     /// slot holds a credential}. Any input that could not be read is `Err` —
     /// an Unknown default binding included, because it is not a count.
-    pub(crate) fn set(
-        &self,
-    ) -> std::result::Result<std::collections::BTreeSet<Uuid>, HeldTenantsUnknown> {
+    pub fn set(&self) -> std::result::Result<std::collections::BTreeSet<Uuid>, HeldTenantsUnknown> {
         let mut held: std::collections::BTreeSet<Uuid> = self
             .slots
             .clone()
@@ -2274,7 +2280,7 @@ impl HeldDeviceTenants {
     /// Does this runner hold a credential for `tenant`? A positive read on
     /// either route answers `true` even when the other route is unreadable;
     /// `false` requires every route that could hold it to have been read.
-    pub(crate) fn holds(&self, tenant: Uuid) -> std::result::Result<bool, HeldTenantsUnknown> {
+    pub fn holds(&self, tenant: Uuid) -> std::result::Result<bool, HeldTenantsUnknown> {
         if matches!(&self.slots, Ok(slots) if slots.contains(&tenant)) {
             return Ok(true);
         }
@@ -2304,7 +2310,7 @@ impl HeldDeviceTenants {
 ///
 /// Callers that DESTROY something on the strength of this answer must use
 /// [`default_binding_tenant_probe`] instead — `None` here is ambiguous.
-pub(crate) fn default_binding_tenant() -> Option<Uuid> {
+pub fn default_binding_tenant() -> Option<Uuid> {
     match default_binding_tenant_probe() {
         BindingTenantRead::Bound(t) => Some(t),
         BindingTenantRead::Unbound | BindingTenantRead::Unknown => None,
@@ -2312,7 +2318,7 @@ pub(crate) fn default_binding_tenant() -> Option<Uuid> {
 }
 
 /// [`default_binding_tenant`] without the collapse.
-pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
+pub fn default_binding_tenant_probe() -> BindingTenantRead {
     let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -2329,7 +2335,7 @@ pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
 /// Pure-over-a-path core of [`default_binding_tenant_probe`], so the
 /// absent-vs-unreadable distinction is testable against a real tempdir with no
 /// process-global env mutation.
-pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenantRead {
+pub fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenantRead {
     let bytes = match std::fs::read(base.join("paired_user.json")) {
         Ok(b) => b,
         // MEASURED absence: there is no pairing file, so this device has no
@@ -2371,9 +2377,11 @@ pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenant
 ///
 /// Counts the v2 `bindings` array when present, else the legacy single
 /// `tenant_id` entry (mirroring `pair::PairedUserFile::effective_bindings`).
-/// Kept as a local minimal reader for the same reason [`default_binding_tenant`]
-/// is: `auth` compiles into BOTH the lib and bin crates while `pair` is
-/// lib-only.
+/// A local reader rather than a call into `pair`, because the two disagree on
+/// exactly the states this count exists to read safely: `pair` parses into a
+/// typed struct (a file missing `user_id` reads as no file at all) and a legacy
+/// file with no `tenant_id` yields ZERO bindings there, where this rule must
+/// count ONE.
 ///
 /// It reads [`binding_count_from_value`], NOT the stricter
 /// [`measured_binding_count_from_value`]: the two parsers diverge on a
@@ -2383,7 +2391,7 @@ pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenant
 /// present the DEFAULT binding's credential where it used to send nothing, the
 /// silent wrong-tenant write this module refuses. The strict parser is the
 /// claimless-legacy-token input and nothing else.
-pub(crate) fn device_binding_count() -> usize {
+pub fn device_binding_count() -> usize {
     match read_paired_user_value() {
         Some(value) => binding_count_from_value(&value),
         None => 1,
@@ -2412,7 +2420,7 @@ fn read_paired_user_value() -> Option<serde_json::Value> {
 /// reads every unreadable state as one. That rule may not treat Unknown as one,
 /// because there "one" is permission to present a token of unstated ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MeasuredBindingCount {
+pub enum MeasuredBindingCount {
     /// A well-formed file stated this many bindings.
     Measured(usize),
     /// No storage dir, no file, an unparseable file, or a shape that states no
@@ -2427,7 +2435,7 @@ pub(crate) enum MeasuredBindingCount {
 /// ([`legacy_token_serves_tenant`], through [`select_device_bearer`] and
 /// [`HeldDeviceTenants`]). The D2 degrade rule and the plan adapter's gate read
 /// [`device_binding_count`] instead.
-pub(crate) fn measured_device_binding_count() -> MeasuredBindingCount {
+pub fn measured_device_binding_count() -> MeasuredBindingCount {
     match read_paired_user_value() {
         Some(value) => measured_binding_count_from_value(&value),
         None => MeasuredBindingCount::Unknown,
@@ -2670,7 +2678,7 @@ impl TenantScope {
 /// where the default binding simply IS the owning tenant and today's write is
 /// right; conditioning on the binding count collapses the rule to exactly that
 /// blanket form on precisely the machines where the hazard is real.
-pub(crate) fn select_scoped_bearer(
+pub fn select_scoped_bearer(
     am: &AuthManager,
     scope: TenantScope,
     default_tenant: Option<Uuid>,
@@ -3106,7 +3114,7 @@ fn coverage_log_due() -> bool {
 /// Does NOT verify the signature or parse claims — that's
 /// `device_jwt_needs_refresh`'s job. This is the shallow shape check
 /// used at boot to decide whether a refresher kick is warranted.
-pub(crate) fn looks_like_jwt(s: &str) -> bool {
+pub fn looks_like_jwt(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
         return false;

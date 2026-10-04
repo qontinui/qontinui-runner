@@ -4,8 +4,9 @@
 //! because its principal consumer — the plan → work-unit adapter — is a lib
 //! module and cannot reach the binary's tree. This file keeps the parts that
 //! genuinely belong to the binary: the two `#[tauri::command]`s the frontend
-//! calls, the unregistered-repo event emit, and the binary-side scope
-//! conversion below.
+//! calls and the unregistered-repo event emit. The bin imports the lib's `auth`
+//! (one module instance), so a lib-resolved [`crate::auth::TenantScope`] needs
+//! no conversion: callers use [`repo_tenant::tenant_scope_for_path`] directly.
 
 use std::path::Path;
 
@@ -17,33 +18,6 @@ use tracing::warn;
 use qontinui_runner_lib::repo_tenant;
 
 pub use qontinui_runner_lib::repo_tenant::is_repo_registered;
-
-/// Re-badge the LIB crate's [`TenantScope`] as the BINARY's.
-///
-/// `src/auth.rs` is compiled into both crates (`lib.rs` `pub mod auth`,
-/// `main.rs` `mod auth`), so the two `TenantScope`s are structurally identical
-/// and nominally distinct — the same documented duplication that makes
-/// `auth`'s data-plane counters per-crate. The binary's coord writers attach
-/// through `crate::auth`, so a lib-resolved scope has to cross the boundary
-/// exactly once, here, rather than at every call site.
-///
-/// Exhaustive on purpose: a new variant must be considered here, not silently
-/// folded into an existing one — collapsing variants is the defect
-/// `TenantScope` exists to prevent.
-fn rebadge(scope: qontinui_runner_lib::auth::TenantScope) -> crate::auth::TenantScope {
-    match scope {
-        qontinui_runner_lib::auth::TenantScope::Owned(t) => crate::auth::TenantScope::Owned(t),
-        qontinui_runner_lib::auth::TenantScope::Device => crate::auth::TenantScope::Device,
-        qontinui_runner_lib::auth::TenantScope::Unresolved => crate::auth::TenantScope::Unresolved,
-    }
-}
-
-/// Binary-side [`repo_tenant::tenant_scope_for_path`]: the tenant that owns
-/// whatever repo `path` lives in, as a scope the binary's `crate::auth` seam
-/// accepts.
-pub async fn tenant_scope_for_path(path: &Path) -> crate::auth::TenantScope {
-    rebadge(repo_tenant::tenant_scope_for_path(path).await)
-}
 
 /// F2 — repo→tenant inference for the spawn picker's DEFAULT selection.
 ///

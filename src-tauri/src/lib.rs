@@ -10,15 +10,10 @@ use tauri::Manager;
 // (`pub(crate) use qontinui_runner_lib::X;` in `main.rs`), so each compiles
 // once and has one set of statics; `crate_roots_ratchet` (a bin test) fails
 // on any module declared in both roots outside its shrinking allowlist.
-// Lib code spells some lib paths `qontinui_runner_lib::…` rather than
-// `crate::…` — `auth`, `process_helpers`, `machine_identity`,
-// `secure_storage`, `env_agent`, `accessibility` and `plan_workunit_adapter`
-// all do — and this alias is what makes that spelling resolve here. For
-// `auth`, which is still declared in both roots (plan
+// Lib modules that still spell their own crate `qontinui_runner_lib::…` need
+// this alias to resolve; plan
 // `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`
-// Phase 2), it is also what gives its call sites one spelling whichever crate
-// compiles it: `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked`
-// works in both.
+// Phase 3 rewrites those spellings to `crate::` and settles the alias.
 extern crate self as qontinui_runner_lib;
 
 pub mod accessibility;

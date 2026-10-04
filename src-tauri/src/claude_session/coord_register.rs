@@ -1770,8 +1770,8 @@ impl AgentLogEmitter {
 /// Reuses the canonical disk reader in [`crate::pair`]. Any failure (missing
 /// file, unparseable, non-UUID) yields `None` — the handle then skips.
 fn read_device_id_uuid() -> Option<Uuid> {
-    // `pair` lives in the `qontinui_runner_lib` crate (this module compiles into
-    // both the lib and the bin target, so the bin can't reach it via `crate::`).
+    // `pair` is a lib-only module and this one is bin-only, so it is reached by
+    // its external path rather than `crate::`.
     let raw = qontinui_runner_lib::pair::read_device_id_from_disk().ok()?;
     Uuid::parse_str(raw.trim()).ok()
 }
