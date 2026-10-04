@@ -4224,7 +4224,7 @@ async fn renew_ahead_of_expiry(
         let left = wall_until(at, clock());
         if left.is_zero() {
             if pane.try_begin_reattach() {
-                give_up_to_a_supervisor(client, pane, jti, policy);
+                hand_off_to_a_reattach_task(client, pane, jti, policy);
             }
             return;
         }
@@ -4258,7 +4258,7 @@ async fn renew_ahead_of_expiry(
                         "remote attach: renewing the grant ahead of expiry was refused across a \
                          relay reconnect — reattaching under the current grant, then retrying"
                     );
-                    spawn_supervisor(client, pane, None, policy);
+                    spawn_reattach_task(client, pane, None, policy);
                 }
                 Err(e) if wall_until(at, clock()).is_zero() => {
                     warn!(
@@ -4266,7 +4266,7 @@ async fn renew_ahead_of_expiry(
                         error = %e,
                         "remote attach: renewing the grant ahead of expiry was refused"
                     );
-                    give_up_to_a_supervisor(client, pane, jti, policy);
+                    hand_off_to_a_reattach_task(client, pane, jti, policy);
                     return;
                 }
                 Err(e) => {
@@ -4295,7 +4295,7 @@ async fn renew_ahead_of_expiry(
 /// while the mint held the claim was consumed as "left to the owner", so
 /// nothing else would ever recover this pane; the supervisor presents the
 /// grant, is refused `attach_grant_expired`, and renews on its own path.
-fn give_up_to_a_supervisor(
+fn hand_off_to_a_reattach_task(
     client: &'static RemoteAttachClient,
     pane: &Arc<RemotePaneIo>,
     jti: &str,
@@ -4306,12 +4306,12 @@ fn give_up_to_a_supervisor(
         "remote attach: the grant expired before it could be renewed ahead of time — a \
          reattach supervisor renews it"
     );
-    spawn_supervisor(client, pane, None, policy);
+    spawn_reattach_task(client, pane, None, policy);
 }
 
 /// Hand `pane` (whose reattach claim the caller holds) to a reattach
 /// supervisor, which releases the claim when it is done.
-fn spawn_supervisor(
+fn spawn_reattach_task(
     client: &'static RemoteAttachClient,
     pane: &Arc<RemotePaneIo>,
     renewed_at: Option<tokio::time::Instant>,
@@ -4390,7 +4390,7 @@ async fn hand_over_renewed_grant(
              holds its binding until it expires, and the reattach retries until then"
         );
     }
-    spawn_supervisor(client, pane, Some(tokio::time::Instant::now()), policy);
+    spawn_reattach_task(client, pane, Some(tokio::time::Instant::now()), policy);
 }
 
 /// What the relay calls on every `connected`: re-present every live pane and
