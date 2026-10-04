@@ -18,7 +18,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mcp::types::{ApiResponse, ApiState};
 
@@ -112,32 +112,44 @@ fn record_diff_result(
     request_body: &serde_json::Value,
     result: &Result<Json<ApiResponse<serde_json::Value>>, DiffFailure>,
 ) {
-    let Some((response, failed)) = diff_verdict(result) else {
-        return;
-    };
+    if let Some((response, failed)) = diff_verdict(result) {
+        record_attempt(state, request_body, &response, failed);
+    }
+}
+
+fn record_attempt(
+    state: &Arc<ApiState>,
+    request_body: &serde_json::Value,
+    response: &serde_json::Value,
+    failed: bool,
+) {
     crate::journey::capture::record_diff(
         state.app_state.pg_db.clone(),
         crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
         request_body,
-        &response,
+        response,
         crate::journey::cursor::Provenance::default(),
         failed,
     );
 }
 
-/// Was this error an ATTEMPTED action that failed? Since main `cbe9ab60b` the
-/// frontend answers a failed execute-with-diff with `success:false,
-/// error:"ACTION_FAILED: ..."` and the diff kept as `data`, which
-/// `wrap_ipc_result_keeping_failure_data` turns into a 4xx carrying that diff.
-/// That 4xx is NOT a runner refusal: the action ran and failed.
+/// Was this error an ATTEMPTED action that failed? Both execute-with-diff
+/// producers — the frontend's `changeTrackingHandler.ts` (since main
+/// `cbe9ab60b`) and the relay's `sdk_client.rs::guard_execute_with_diff` —
+/// answer a failed action with `success:false, error:"ACTION_FAILED: ..."` and
+/// the diff kept as `data`, which `wrap_ipc_result_keeping_failure_data` turns
+/// into a 4xx carrying that diff. That 4xx is NOT a runner refusal: the action
+/// ran and failed.
+///
+/// The message PREFIX is the contract, deliberately not `error_detail.code`:
+/// `ACTION_FAILED` is not a typed frontend code, so the code on a genuine
+/// failure is a prose guess (`classify_transport_error`) that usually reads
+/// `InternalError` — and reads `ActionFailed` for any refusal whose prose
+/// merely contains "action failed", which would record a spurious edge.
 fn is_attempted_failure(body: &ApiResponse<serde_json::Value>) -> bool {
-    body.error_detail
-        .as_ref()
-        .is_some_and(|d| d.code == super::types::UiBridgeErrorCode::ActionFailed)
-        || body
-            .error
-            .as_deref()
-            .is_some_and(|e| e.starts_with("ACTION_FAILED:"))
+    body.error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("ACTION_FAILED:"))
 }
 
 /// The journey verdict for one execute-with-diff result: `Some((diff, failed))`
@@ -166,25 +178,64 @@ fn diff_verdict(
     }
 }
 
-/// The per-operation results a batch-with-diff answer carries — on success in
-/// `data.results`, and on an attempted failure in the error body's
-/// `data.results` (the diff `wrap_ipc_result_keeping_failure_data` keeps).
-fn batch_op_results(
+/// How a batch-with-diff answer is recorded on the journey ledger.
+#[derive(Debug, PartialEq)]
+enum BatchVerdict {
+    /// One `(diff, failed)` per operation, aligned with `operations` by index
+    /// (the producer runs every operation, in order, with no early stop).
+    PerOp(Vec<(serde_json::Value, bool)>),
+    /// The operations were attempted but no per-operation result came back
+    /// (a 5xx, or an ACTION_FAILED with no `results`): every operation is an
+    /// `error` edge with no diff.
+    AllFailed,
+    /// The runner refused the request itself; nothing acted.
+    Refused,
+}
+
+fn batch_verdict(
     result: &Result<Json<ApiResponse<serde_json::Value>>, DiffFailure>,
-) -> Option<Vec<serde_json::Value>> {
-    let body = match result {
-        Ok(Json(body)) => body,
-        Err((status, Json(body))) if status.is_client_error() && is_attempted_failure(body) => body,
-        _ => return None,
-    };
-    Some(
+) -> BatchVerdict {
+    let results = |body: &ApiResponse<serde_json::Value>| {
         body.data
             .as_ref()
             .and_then(|d| d.get("results"))
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default(),
-    )
+    };
+    match result {
+        // A 2xx batch: every op succeeded by the producer's own rule, so each
+        // op keeps the single-op reading of its result.
+        Ok(Json(body)) => BatchVerdict::PerOp(
+            results(body)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    let failed = r
+                        .get("actionSuccess")
+                        .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(true));
+                    (r, !body.success || failed)
+                })
+                .collect(),
+        ),
+        // An ACTION_FAILED batch: the producer counts an op as failed unless
+        // `actionSuccess === true` (`opActionSucceeded`), so an absent or null
+        // `actionSuccess` is a failure here, not the lenient single-op default.
+        Err((status, Json(body))) if status.is_client_error() && is_attempted_failure(body) => {
+            match results(body) {
+                Some(rs) => BatchVerdict::PerOp(
+                    rs.into_iter()
+                        .map(|r| {
+                            let ok = r.get("actionSuccess") == Some(&serde_json::Value::Bool(true));
+                            (r, !ok)
+                        })
+                        .collect(),
+                ),
+                None => BatchVerdict::AllFailed,
+            }
+        }
+        Err((status, _)) if status.is_client_error() => BatchVerdict::Refused,
+        Err(_) => BatchVerdict::AllFailed,
+    }
 }
 
 /// Composite endpoint: execute one or more actions with atomic change-buffer tracking.
@@ -213,22 +264,37 @@ pub async fn ui_bridge_with_diff_handler(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        match (&result, batch_op_results(&result)) {
-            (_, Some(results)) => {
-                for (op, op_result) in operations.iter().zip(results.iter()) {
-                    let op_ok: Result<
-                        Json<ApiResponse<serde_json::Value>>,
-                        (StatusCode, Json<ApiResponse<serde_json::Value>>),
-                    > = Ok(Json(ApiResponse::success(op_result.clone())));
-                    record_diff_result(&state, &with_diff_single_payload(op.clone()), &op_ok);
+        match batch_verdict(&result) {
+            BatchVerdict::PerOp(per_op) => {
+                if per_op.len() != operations.len() {
+                    warn!(
+                        "UI Bridge API: batch-with-diff returned {} results for {} operations; \
+                         journey edges recorded for the first {}",
+                        per_op.len(),
+                        operations.len(),
+                        per_op.len().min(operations.len())
+                    );
+                }
+                for (op, (response, failed)) in operations.iter().zip(per_op.iter()) {
+                    record_attempt(
+                        &state,
+                        &with_diff_single_payload(op.clone()),
+                        response,
+                        *failed,
+                    );
                 }
             }
-            (Err((status, _)), None) if status.is_server_error() => {
+            BatchVerdict::AllFailed => {
                 for op in &operations {
-                    record_diff_result(&state, &with_diff_single_payload(op.clone()), &result);
+                    record_attempt(
+                        &state,
+                        &with_diff_single_payload(op.clone()),
+                        &serde_json::Value::Null,
+                        true,
+                    );
                 }
             }
-            _ => {}
+            BatchVerdict::Refused => {}
         }
         result
     } else {
@@ -361,20 +427,70 @@ mod with_diff_single_payload_tests {
     }
 
     #[test]
-    fn a_batch_action_failed_still_yields_every_op_result() {
-        let r = action_failed_400(
-            serde_json::json!({ "results": [{ "actionSuccess": true }, { "actionSuccess": false }] }),
-        );
-        assert_eq!(batch_op_results(&r).map(|v| v.len()), Some(2));
+    fn a_batch_action_failed_fails_every_op_not_explicitly_successful() {
+        let r = action_failed_400(serde_json::json!({ "results": [
+            { "actionSuccess": true },
+            { "actionSuccess": false },
+            {},
+            { "actionSuccess": null },
+        ] }));
+        let BatchVerdict::PerOp(per_op) = batch_verdict(&r) else {
+            panic!("expected per-op verdicts");
+        };
+        let flags: Vec<bool> = per_op.iter().map(|(_, f)| *f).collect();
+        assert_eq!(flags, vec![false, true, true, true]);
+    }
+
+    #[test]
+    fn a_batch_action_failed_without_results_fails_every_op() {
+        let r = action_failed_400(serde_json::json!({}));
+        assert_eq!(batch_verdict(&r), BatchVerdict::AllFailed);
+    }
+
+    #[test]
+    fn a_batch_refusal_records_nothing_and_a_5xx_fails_every_op() {
         let refusal = Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::<serde_json::Value>::error("bad".to_string())),
         ));
-        assert!(batch_op_results(&refusal).is_none());
+        assert_eq!(batch_verdict(&refusal), BatchVerdict::Refused);
+        let five = Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<serde_json::Value>::error("boom".to_string())),
+        ));
+        assert_eq!(batch_verdict(&five), BatchVerdict::AllFailed);
     }
 
+    /// End to end through the real wrapper: the shape production produces.
+    #[test]
+    fn a_wrapped_inner_action_failed_is_an_attempted_failure() {
+        let diff = serde_json::json!({ "actionSuccess": false, "changes": [] });
+        let wrapped = wrap_ipc_result_keeping_failure_data(Ok(serde_json::json!({
+            "success": false,
+            "error": "ACTION_FAILED: Element btn not found",
+            "data": diff,
+        })));
+        let (_, failed) = diff_verdict(&wrapped).expect("attempted");
+        assert!(failed);
+    }
+
+    /// A refusal whose prose merely says "action failed" (and which
+    /// `classify_transport_error` may therefore code as `ActionFailed`) acted
+    /// on nothing and must record no edge.
+    #[test]
+    fn a_refusal_mentioning_action_failed_records_nothing() {
+        let wrapped = wrap_ipc_result_keeping_failure_data(Ok(serde_json::json!({
+            "success": false,
+            "error": "Validation: action failed precondition — no elementId",
+        })));
+        assert!(wrapped.as_ref().is_err_and(|(s, _)| s.is_client_error()));
+        assert!(diff_verdict(&wrapped).is_none());
+        assert_eq!(batch_verdict(&wrapped), BatchVerdict::Refused);
+    }
+
+    use super::super::request::wrap_ipc_result_keeping_failure_data;
     use super::with_diff_single_payload;
-    use super::{batch_op_results, diff_verdict, ApiResponse, DiffFailure};
+    use super::{batch_verdict, diff_verdict, ApiResponse, BatchVerdict, DiffFailure};
     use axum::{http::StatusCode, Json};
     use serde_json::json;
 
