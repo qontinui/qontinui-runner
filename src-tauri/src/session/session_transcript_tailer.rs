@@ -2552,10 +2552,16 @@ mod tests {
 
         t.lock_coverage().transcript_holes += 1;
         assert!(t.report_coverage_once(), "a new hole must be reported");
-        assert!(!t.report_coverage_once(), "an unchanged hole count is quiet");
+        assert!(
+            !t.report_coverage_once(),
+            "an unchanged hole count is quiet"
+        );
 
         t.lock_coverage().held_batches += 1;
-        assert!(t.report_coverage_once(), "a new held batch must be reported");
+        assert!(
+            t.report_coverage_once(),
+            "a new held batch must be reported"
+        );
         assert!(!t.report_coverage_once());
 
         // An append counted at `admit` and then held moves one count from
