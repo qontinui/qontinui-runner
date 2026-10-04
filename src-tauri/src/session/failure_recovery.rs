@@ -1015,7 +1015,8 @@ pub(crate) fn pty_exit_signal(
 ) -> FailureSignal {
     if exit.resumed && exit.code != Some(0) {
         if let (Some(profile), Some(provider)) = (profile, exit.provider) {
-            if let Some(line) = super::failure::resume_failure_line(profile, exit.screen) {
+            let tail = screen_tail(exit.screen, RESUME_MARKER_ROWS);
+            if let Some(line) = super::failure::resume_failure_line(profile, &tail) {
                 return FailureSignal::GridPhrase {
                     provider: provider.to_string(),
                     phrase: line,
@@ -1027,6 +1028,24 @@ pub(crate) fn pty_exit_signal(
         }
     }
     FailureSignal::Exit { code: exit.code }
+}
+
+/// How many of the exit screen's last non-blank rows a resume-failure marker
+/// is looked for in.
+///
+/// Rows, not time: a failed resume's marker is the CLI's LAST output — it
+/// prints it and exits — so it is always at the bottom of the screen, however
+/// long the resume took to fail (a slow start can run past
+/// [`RESUME_EXIT_GRACE`], and a time bound would then miss a real marker).
+/// What a row bound excludes is the scrollback above: a resumed session that
+/// ran for an hour, discussing or quoting the marker phrase, and then crashed,
+/// is a crash — not a failed resume that is never retried.
+pub const RESUME_MARKER_ROWS: usize = 6;
+
+/// The last `rows` non-blank lines of `screen`, in order.
+fn screen_tail(screen: &str, rows: usize) -> String {
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(rows)..].join("\n")
 }
 
 /// Steps 1 and 3–4 of [`report`], without deciding or executing anything. The
@@ -2230,6 +2249,23 @@ mod tests {
         );
         // A clean exit (an operator's own `/exit`) is no failure at all.
         assert_eq!(kind_of(&exit(true, 2, marker, 0)), None);
+        // The marker in the scrollback ABOVE the last rows — a long resumed
+        // session that quoted it, then crashed — is a crash, not a failed
+        // resume that is never retried.
+        let quoted: &'static str = Box::leak(
+            format!(
+                "{marker}\n{}",
+                (0..RESUME_MARKER_ROWS)
+                    .map(|i| format!("later output {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+            .into_boxed_str(),
+        );
+        assert_eq!(
+            kind_of(&exit(true, 300, quoted, 1)),
+            Some((FailureKind::ProcessExited, RecoveryPolicy::ResumeSameId))
+        );
     }
 
     /// C2: the PTY resume relaunches the Claude CLI, so it refuses any other
