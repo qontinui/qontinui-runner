@@ -542,6 +542,27 @@ pub struct ThreadNameCensus {
     pub total: usize,
     /// Top rows by count, then by name — capped, so the sum is ≤ `total`.
     pub by_name: Vec<ThreadNameCount>,
+    /// Threads belonging to a PER-SESSION family ([`SESSION_THREAD_FAMILIES`]),
+    /// tallied over the RAW names before any collapsing or truncation.
+    ///
+    /// **Read this, never `by_name`, to attribute threads to sessions.**
+    /// `by_name` is a human-facing projection: capped at
+    /// [`MAX_THREAD_NAME_ROWS`] rows and prefix-collapsed, so a family can fall
+    /// off it entirely, and before the UUID-suffix rule in
+    /// [`collapse_thread_name`] every Windows terminal thread was its own row
+    /// and did exactly that. A count derived from a truncated projection is a
+    /// count of whatever happened to survive the cut. This field is the
+    /// uncapped tally `resource_guard` subtracts from the graded reading to
+    /// estimate the runner's at-rest thread floor (plan
+    /// `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
+    /// dialog-says-low-memory`, Phase 1).
+    ///
+    /// A `0` here is a READING of this walk, not a verdict about the sessions:
+    /// whether zero session threads alongside N live terminals is plausible is
+    /// the consumer's question, because only the consumer holds the session
+    /// count (`resource_guard::session_thread_attribution` treats that shape as
+    /// a mis-read, i.e. UNKNOWN).
+    pub session_threads: usize,
     /// When the walk ran. Wall-clock, because the consumer is a `/health`
     /// reader comparing it against its own clock.
     pub sampled_at: std::time::SystemTime,
@@ -562,6 +583,26 @@ pub const MAX_THREAD_NAME_ROWS: usize = 12;
 
 /// The bucket a thread with no description lands in.
 pub const UNNAMED_THREAD: &str = "<unnamed>";
+
+/// The thread-name prefixes of the PER-SESSION families: the two threads every
+/// live terminal holds for its whole life (`terminal/session.rs` names them
+/// `terminal-reader-<id>` and `terminal-waiter-<id>`, the id a
+/// `uuid::Uuid::new_v4()` from `terminal/manager.rs`).
+///
+/// Exactly these two and nothing else, deliberately. `pipe-drain` is one
+/// TRANSIENT thread per piped child process and `transcript-scan` is a
+/// dispatcher singleton — neither scales with the number of terminals.
+/// Counting them as session load would inflate the measured threads-per-session
+/// and the live session-thread tally, and both of those RAISE
+/// `resource_guard`'s scaled ceiling: misattribution here loosens the guard.
+/// They stay in the non-session remainder, which `resource_guard`'s
+/// blocking-pool headroom arm covers.
+///
+/// Matched with `starts_with` over the raw names, which holds on both
+/// platforms: on Linux `comm`'s 15-byte truncation yields exactly
+/// `terminal-reader` / `terminal-waiter`, and on Windows the full
+/// `terminal-reader-<uuid>` description survives.
+pub const SESSION_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
 
 /// One direct child process.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1046,16 +1087,36 @@ pub fn capture_thread_name_census() -> Option<ThreadNameCensus> {
 
 /// The platform-independent tail of [`capture_thread_name_census`]: an empty
 /// walk is a failed enumeration (a live process has at least the calling
-/// thread), everything else is collapsed and stamped.
-fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus> {
+/// thread), everything else is tallied, collapsed and stamped. PURE apart from
+/// the timestamp.
+///
+/// The per-session tally is taken over the RAW names before
+/// [`collapse_thread_names`] caps and folds them — see
+/// [`ThreadNameCensus::session_threads`] for why the order matters. Public so
+/// a consumer's tests can build a census from the exact name shapes each
+/// platform produces (`terminal-reader` on Linux, `terminal-reader-<uuid>` on
+/// Windows) rather than from a hand-written projection that could not catch a
+/// collapsing bug.
+pub fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus> {
     if names.is_empty() {
         return None;
     }
+    let session_threads = names.iter().filter(|name| is_session_thread(name)).count();
     Some(ThreadNameCensus {
         total: names.len(),
         by_name: collapse_thread_names(names.iter().map(String::as_str)),
+        session_threads,
         sampled_at: std::time::SystemTime::now(),
     })
+}
+
+/// `true` when a raw thread name belongs to one of the
+/// [`SESSION_THREAD_FAMILIES`].
+fn is_session_thread(name: &str) -> bool {
+    let name = name.trim();
+    SESSION_THREAD_FAMILIES
+        .iter()
+        .any(|family| name.starts_with(family))
 }
 
 /// Collapse a list of thread names into the top [`MAX_THREAD_NAME_ROWS`] rows.
@@ -1086,10 +1147,23 @@ pub fn collapse_thread_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Th
 }
 
 /// One name's collapsed form — the per-element rule of [`collapse_thread_names`].
+///
+/// A trailing hyphenated UUID (`terminal-reader-3f2a1b4c-9d8e-4f00-a1b2-
+/// 0123456789ab`) is folded onto `<prefix>-*` FIRST, before the single-segment
+/// id rule. Without it the last-`-` split saw only the UUID's final group, kept
+/// the other four in the "prefix", and so left every Windows terminal thread as
+/// a row of its own — 164 terminals were 328 one-count rows, all of which then
+/// fell off the [`MAX_THREAD_NAME_ROWS`] cap, and `/health`'s `byName` stopped
+/// showing the families that were most of the process. (Linux never hit this
+/// only because `comm` truncates the name to 15 bytes, which happens to cut
+/// exactly at `terminal-reader`.)
 fn collapse_thread_name(name: &str) -> String {
     let name = name.trim();
     if name.is_empty() {
         return UNNAMED_THREAD.to_string();
+    }
+    if let Some(prefix) = strip_uuid_suffix(name) {
+        return format!("{prefix}-*");
     }
     match name.rsplit_once('-') {
         Some((prefix, suffix)) if !prefix.is_empty() && looks_like_thread_id(suffix) => {
@@ -1097,6 +1171,29 @@ fn collapse_thread_name(name: &str) -> String {
         }
         _ => name.to_string(),
     }
+}
+
+/// The prefix before a trailing `-<hyphenated uuid>`, or `None` when the name
+/// does not end in one. The UUID must be the canonical 8-4-4-4-12 hex form
+/// (the `uuid::Uuid` `Display` shape `terminal/manager.rs` produces) and the
+/// prefix must be non-empty, so a bare UUID stays whole.
+fn strip_uuid_suffix(name: &str) -> Option<&str> {
+    const UUID_LEN: usize = 36;
+    // `prefix` + `-` + uuid; byte-indexed, so bail on anything non-ASCII at
+    // the cut rather than slicing through a code point.
+    let cut = name.len().checked_sub(UUID_LEN + 1)?;
+    if cut == 0 || !name.is_char_boundary(cut) {
+        return None;
+    }
+    let (prefix, rest) = name.split_at(cut);
+    let uuid = rest.strip_prefix('-')?;
+    let groups: Vec<&str> = uuid.split('-').collect();
+    let canonical = groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(g, len)| g.len() == len && g.chars().all(|c| c.is_ascii_hexdigit()));
+    canonical.then_some(prefix)
 }
 
 /// `3f2a`, `17`, `0` — yes. `rt`, `worker`, `cafe`, `` — no.
@@ -3061,6 +3158,79 @@ mod tests {
             .expect("two names make a census");
         assert_eq!(c.total, 2);
         assert_eq!(c.by_name.len(), 2);
+        assert_eq!(c.session_threads, 0);
+    }
+
+    /// A Windows terminal thread keeps its full `terminal-reader-<uuid>`
+    /// description, and the collapse must fold the WHOLE uuid, not just its
+    /// last group — or every terminal is its own row.
+    #[test]
+    fn collapse_folds_a_trailing_uuid() {
+        assert_eq!(
+            collapse_thread_name("terminal-reader-3f2a1b4c-9d8e-4f00-a1b2-0123456789ab"),
+            "terminal-reader-*"
+        );
+        assert_eq!(
+            collapse_thread_name("terminal-waiter-FFFFFFFF-0000-4000-8000-ABCDEFabcdef"),
+            "terminal-waiter-*"
+        );
+        // A bare uuid has no prefix and stays whole; a malformed one falls
+        // through to the single-segment rule.
+        let bare = "3f2a1b4c-9d8e-4f00-a1b2-0123456789ab";
+        assert_eq!(collapse_thread_name(bare), "3f2a1b4c-9d8e-4f00-a1b2-*");
+        assert_eq!(
+            collapse_thread_name("x-3f2a1b4c-9d8e-4f00-a1b2-0123456789a"),
+            "x-3f2a1b4c-9d8e-4f00-a1b2-*"
+        );
+        assert_eq!(
+            strip_uuid_suffix("x-3f2a1b4c-9d8e-4f00-a1b2-0123456789az"),
+            None
+        );
+    }
+
+    /// The per-session tally is taken over the RAW names, so it survives both
+    /// the 12-row cap and either platform's spelling. 164 Windows terminals
+    /// (328 distinct uuid-suffixed names) used to be 328 one-count rows that
+    /// all fell off `by_name`; the tally counts all of them, and `by_name` now
+    /// shows the two families as two rows.
+    #[test]
+    fn the_session_tally_is_uncapped_and_platform_independent() {
+        let mut windows: Vec<String> = Vec::new();
+        for i in 0..164u32 {
+            let id = format!("{i:08x}-0000-4000-8000-000000000000");
+            windows.push(format!("terminal-reader-{id}"));
+            windows.push(format!("terminal-waiter-{id}"));
+        }
+        for i in 0..171 {
+            windows.push(format!("family{}-worker", i % 20));
+        }
+        let c = finish_thread_name_census(windows).expect("census");
+        assert_eq!(c.total, 499);
+        assert_eq!(c.session_threads, 328);
+        assert!(c
+            .by_name
+            .iter()
+            .any(|r| r.name == "terminal-reader-*" && r.count == 164));
+        assert!(c
+            .by_name
+            .iter()
+            .any(|r| r.name == "terminal-waiter-*" && r.count == 164));
+
+        // Linux: `comm` truncation leaves the bare family name.
+        let mut linux: Vec<String> = vec!["terminal-reader".to_string(); 164];
+        linux.extend(vec!["terminal-waiter".to_string(); 164]);
+        linux.extend(vec!["tokio-rt-worker".to_string(); 171]);
+        let c = finish_thread_name_census(linux).expect("census");
+        assert_eq!(c.session_threads, 328);
+
+        // Not per-session: transient and singleton families stay out.
+        let c = finish_thread_name_census(vec![
+            "pipe-drain".to_string(),
+            "transcript-scan".to_string(),
+            "terminal".to_string(),
+        ])
+        .expect("census");
+        assert_eq!(c.session_threads, 0);
     }
 
     /// The live census sees this test process and, on it, the thread this

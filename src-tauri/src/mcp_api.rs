@@ -1707,6 +1707,17 @@ async fn health(
         // `silent-empty-is-unknown`. It is what separates "441 threads of
         // load" from "441 threads, 325 of them an idle tokio blocking pool".
         "threadCensus": crate::health_monitor::thread_name_census_json(),
+        // Plan 2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-
+        // guard-dialog-says-low-memory, Phase 2: the thread ceilings the spawn
+        // guard ENFORCES right now, every machine input they were derived from
+        // (cores, MemTotal, at-rest baseline, threads per session, session
+        // threads now, each arm of the scaled term) and the term that decided
+        // each number (`local | scaled | floor | fleet | clamp_min | clamp_max
+        // | ladder`). A ceiling the operator cannot read is the confusion that
+        // plan's D3 records. Read `inputs.baseline` before the ceilings: it
+        // only populates where the fleet resource sample publishes, and `null`
+        // there means the 256/400 floor by design, not a fault.
+        "threadCeilings": crate::resource_guard::thread_ceilings_health_json(),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was
@@ -18299,6 +18310,12 @@ mod coord_provision_session_gate_tests {
         assert!(
             region.contains(
                 "\"transcriptWatcher\": crate::terminal::transcript_watcher::health_snapshot()"
+            ),
+            "{region}"
+        );
+        assert!(
+            region.contains(
+                "\"threadCeilings\": crate::resource_guard::thread_ceilings_health_json()"
             ),
             "{region}"
         );
