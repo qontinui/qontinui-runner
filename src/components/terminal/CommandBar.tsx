@@ -20,7 +20,8 @@
  *     position.
  *   - **Enter** parses args from the input and executes the selected
  *     action. Result feedback goes into a status line just above the bar
- *     which HOLDS until the next execute; recents are updated on success.
+ *     — a success clears itself after a few seconds, an error holds until
+ *     the next execute, Escape or its ×; recents are updated on success.
  *   - **ArrowUp on an empty input** walks the executed-input history
  *     (ArrowDown walks back out of it); with content in the input the
  *     arrows navigate the suggestion list as before.
@@ -55,6 +56,7 @@ import {
   type StatusKind,
   type Resolution,
   renderCommandStatus,
+  statusTtlMs,
   resolvedAction,
   getAll,
   interpretCommand,
@@ -111,7 +113,6 @@ function optionId(actionId: string): string {
 function suggestionElementId(slash: string): string {
   return `command-bar-suggestion-${slash.replace(/^\//, "")}`;
 }
-
 
 /**
  * Author-controlled control id for the command bar's text input. Exported so
@@ -277,6 +278,8 @@ export function CommandBar() {
     actions: COMMAND_BAR_INPUT_ACTIONS,
   });
   const blurTimerRef = useRef<number | null>(null);
+  /** Monotonic id of the latest `execute` — see `paint` inside it. */
+  const runIdRef = useRef(0);
 
   // Tier-3 state — async AI resolution result + in-flight indicator.
   // Lives outside the synchronous `matches` useMemo because the
@@ -323,11 +326,21 @@ export function CommandBar() {
     };
   }, []);
 
-  // The status line has NO auto-expiry: it holds the last verdict until
-  // the next execute replaces it. A 3s timer (which the focus gate cut to
-  // under 2s of visible time) meant a slow command's verdict — the
-  // /orchestrate case — landed and vanished while the operator was still
-  // watching the grid.
+  // Status line lifetime — `verdict.ts::statusTtlMs` decides it: successes
+  // expire, errors hold until the next execute, Escape, or the ×. The timer
+  // is armed when the verdict LANDS, so a slow command (the /orchestrate case
+  // that killed the old 3s timer) still gets the full window.
+  useEffect(() => {
+    if (!status) return;
+    const ttl = statusTtlMs(status.kind);
+    if (ttl === null) return;
+    const landed = status;
+    const timer = window.setTimeout(() => {
+      // Only retire the verdict this timer was armed for.
+      setStatus((cur) => (cur === landed ? null : cur));
+    }, ttl);
+    return () => window.clearTimeout(timer);
+  }, [status]);
 
   // Match list. WHICH TIER OWNS THE INPUT is decided by
   // `commands/rank.ts::chooseTier`, and "a literal slash beats everything"
@@ -514,9 +527,15 @@ export function CommandBar() {
       // preset-args branch, i.e. on the slash route only, on a justification
       // that held for Tier 2 and not for Tier 3 — see `commands/bind.ts`.
       const bound = bindCommand(resolution, rawInput);
-      // The previous verdict is retired the moment a new command runs —
-      // that, not a timer, is what bounds the status line's lifetime.
+      // The previous verdict is retired the moment a new command runs; a
+      // success is also retired by the lifetime timer (`statusTtlMs`).
       setStatus(null);
+      // Only the LATEST run may paint. Without this a slow command still in
+      // flight lands after a newer one and overwrites its verdict.
+      const runId = ++runIdRef.current;
+      const paint = (next: StatusLine): void => {
+        if (runIdRef.current === runId) setStatus(next);
+      };
       // BEFORE the `none` bail-out, not after. Recording only what resolved is
       // what made `persistHistory`'s "a typo is exactly what you want back"
       // false for the typo class; the Enter path above closes the same gap on
@@ -536,7 +555,7 @@ export function CommandBar() {
       // or a value that is not text or a number. Refused BEFORE the handler,
       // which is the last point at which it is still cheap.
       if (bound.refusal !== null) {
-        setStatus({ kind: "error", text: withHint(bound.refusal) });
+        paint({ kind: "error", text: withHint(bound.refusal) });
         return;
       }
       let result: CommandResult;
@@ -546,11 +565,14 @@ export function CommandBar() {
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        setStatus({ kind: "error", text: withHint(`${action.slash}: ${message}`) });
+        paint({ kind: "error", text: withHint(`${action.slash}: ${message}`) });
         return;
       }
       if (result.ok) {
         persistRecent(action.id);
+        // Superseded by a newer run: its verdict owns the line, and clearing
+        // the input here would wipe what the operator is typing now.
+        if (runIdRef.current !== runId) return;
         // CONSULT `result.value`. The renderer used to compose
         // `${action.slash} ✓` and throw the value away, which made the
         // status line structurally incapable of telling a no-op from an
@@ -567,7 +589,7 @@ export function CommandBar() {
         // of reach of the headless corpus harness, which can only see a
         // `CommandResult` and for which a no-op is `ok`. The harness now calls
         // the same function this line does.
-        setStatus(renderCommandStatus(action.slash, result.value));
+        paint(renderCommandStatus(action.slash, result.value));
         setQuery("");
         // Explicit even though the derived reset covers a query CHANGE:
         // running off an already-empty input (the recents palette) leaves
@@ -575,7 +597,7 @@ export function CommandBar() {
         setSelectedIdx(0);
         inputRef.current?.blur();
       } else {
-        setStatus({
+        paint({
           kind: "error",
           text: withHint(`${action.slash}: ${result.message ?? result.code}`),
         });
@@ -672,6 +694,7 @@ export function CommandBar() {
       if (e.key === "Escape") {
         e.preventDefault();
         setQuery("");
+        setStatus(null);
         // Same reason as in `execute`: Escape on an already-empty input
         // is not a query change, so the derived reset does not fire.
         setSelectedIdx(0);
@@ -807,33 +830,47 @@ export function CommandBar() {
       {(status || dropdownVisible) && (
         <div className="absolute bottom-full inset-x-0 z-40 flex justify-center px-3 pb-1 pointer-events-none">
           <div className="w-[520px] max-w-full">
-            {/* Status line — the last command's verdict, held until the next
-                execute. It is NOT gated on blur any more: an error leaves
-                the input focused, so the `!focused` gate hid exactly the
-                verdicts worth reading. */}
+            {/* Status line — the last command's verdict. Successes expire
+                on a timer; errors hold until the next execute, Escape or
+                the ×. It is NOT gated on blur: an error leaves the input
+                focused, so the `!focused` gate hid exactly the verdicts
+                worth reading. */}
             {status && (
               <div
                 data-page-element="command-bar-status"
                 data-status-kind={status.kind}
-                role="status"
-                aria-live="polite"
-                className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto"
+                className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto flex items-center gap-2"
               >
+                {/* The live region is the TEXT alone, so the × label is not
+                    read out as part of every verdict. */}
                 <span
+                  role="status"
+                  aria-live="polite"
                   className={
                     // Three verdicts, three colours — green for an effect,
                     // muted grey for a no-op, red for a failure. The grey is
                     // load-bearing: an operator scanning this line has to be
                     // able to see "nothing happened" without reading it.
                     status.kind === "ok"
-                      ? "text-[#9ece6a] font-mono"
+                      ? "min-w-0 break-words text-[#9ece6a] font-mono"
                       : status.kind === "noop"
-                        ? "text-[#a9b1d6] font-mono"
-                        : "text-[#f7768e] font-mono"
+                        ? "min-w-0 break-words text-[#a9b1d6] font-mono"
+                        : "min-w-0 break-words text-[#f7768e] font-mono"
                   }
                 >
                   {status.text}
                 </span>
+                <button
+                  type="button"
+                  data-page-element="command-bar-status-dismiss"
+                  aria-label="Dismiss status"
+                  title="Dismiss (Esc)"
+                  onMouseDown={(e) => e.preventDefault() /* keep input focus */}
+                  onClick={() => setStatus(null)}
+                  className="ml-auto shrink-0 px-1 text-[12px] leading-none text-[#565f89] hover:text-[#c0caf5]"
+                >
+                  ×
+                </button>
               </div>
             )}
 
