@@ -16,9 +16,10 @@ self-hosted-runner:
 paths:
   .github/workflows/**/*.{yml,yaml}:
     ignore:
-      # Info-level shellcheck style notes, inert while the job passes
-      # `-shellcheck=`; kept so a local run with shellcheck enabled reports
-      # only what the job would act on.
+      # SC ignores apply to local runs only: the workflow-lint job passes
+      # `-shellcheck=`, so CI never runs shellcheck and these are inert there.
+      # They mute info/style noise when a developer runs actionlint locally
+      # with shellcheck enabled.
       - 'SC2086:info'
       - 'SC2016:info'
       - 'SC2129:style'
