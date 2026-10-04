@@ -229,10 +229,11 @@ jobs:
       # `filter: blob:none` keeps the fetch to commits and trees; the one roster
       # blob it reads at the merge base is fetched lazily. Plan
       # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, A6.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           filter: blob:none
+          persist-credentials: false
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -292,12 +293,12 @@ jobs:
           repo: qontinui/ui-bridge
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"
@@ -324,7 +325,7 @@ jobs:
       # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
       # 1.95.0 and fail with "'cargo-fmt' is not installed".
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
@@ -406,7 +407,7 @@ jobs:
       # without touching the apt libs installed above.
       - name: Free disk space (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main
         with:
           tool-cache: false
           android: true
@@ -455,7 +456,7 @@ jobs:
       # revert the test step to JOBS=1 and keep this pagefile.
       - name: Configure pagefile (Windows — guard against link-time OOM)
         if: matrix.platform == 'windows-latest'
-        uses: al-cheb/configure-pagefile-action@v1.4
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708 # v1.4
         with:
           minimum-size: 32GB
           maximum-size: 32GB
@@ -489,7 +490,7 @@ jobs:
       # candidates. The cache that matters is the one saved by `main` runs
       # (every land), which all candidates and PRs can restore.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
           workspaces: ". -> target"
@@ -1461,7 +1462,9 @@ jobs:
     # Previously unbounded, i.e. GitHub's 360-minute default.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
       # diff test read; same rationale as the `test` job's sibling checkout,
@@ -1484,32 +1487,32 @@ jobs:
           repo: qontinui/ui-bridge
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
       - name: Configure pagefile (Windows — guard against link-time OOM)
-        uses: al-cheb/configure-pagefile-action@v1.4
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708 # v1.4
         with:
           minimum-size: 32GB
           maximum-size: 32GB
           disk-root: "D:"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
@@ -1577,7 +1580,9 @@ jobs:
     # tighten it once there are runs to measure.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
       # load the workspace; same action (and declared-adaptation resolution)
@@ -1586,13 +1591,13 @@ jobs:
         uses: ./.github/actions/checkout-sibling
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           components: clippy
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
@@ -1626,17 +1631,19 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Mirror the matrix job's frontend setup EXACTLY: pnpm 10.33.2, node 20,
       # pnpm cache keyed on the root lockfile, frozen-lockfile install.
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"
@@ -1674,7 +1681,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Assert test-fixtures seam stays cfg-gated out of release builds
         shell: bash
@@ -1726,7 +1735,9 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # cargo audit walks the workspace and resolves path: deps. The runner's
       # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
@@ -1838,7 +1849,7 @@ jobs:
           cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 

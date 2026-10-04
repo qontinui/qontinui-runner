@@ -72,7 +72,9 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Same sibling-repo dance as ci.yml — src-tauri/Cargo.toml has a
       # path = "../../qontinui-schemas/rust" dep that won't resolve
@@ -81,7 +83,7 @@ jobs:
         uses: ./.github/actions/checkout-sibling
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       # Bounded against a job-time apt hang — see the rationale on the same
       # step in .github/workflows/ci.yml. Sizing: 19 successful runs, p50 29s,
@@ -104,7 +106,7 @@ jobs:
 
       - name: Configure pagefile (Windows — guard against link-time OOM)
         if: matrix.platform == 'windows-latest'
-        uses: al-cheb/configure-pagefile-action@v1.4
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708 # v1.4
         with:
           minimum-size: 16GB
           maximum-size: 16GB
@@ -126,12 +128,12 @@ jobs:
       # compile path. Build the frontend first so dist/ exists. Same
       # pattern as ci.yml's "Build frontend" step.
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: '20'
           cache: 'pnpm'
@@ -165,7 +167,7 @@ jobs:
       # `cache-targets: false` therefore keeps the dependency/registry
       # restore this job genuinely benefits from and drops the payload.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
           workspaces: ". -> target"
@@ -231,6 +233,10 @@ jobs:
         shell: bash
 
       - name: Hash build #2 artifact and compare
+        # Step output via env, not spliced into the script (zizmor
+        # template-injection).
+        env:
+          BUILD1_HASH: ${{ steps.hash1.outputs.hash1 }}
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             EXE="$GITHUB_WORKSPACE/target/release/mock_claude_cli.exe"
@@ -238,7 +244,7 @@ jobs:
             EXE="$GITHUB_WORKSPACE/target/release/mock_claude_cli"
           fi
           HASH2=$(sha256sum "$EXE" | awk '{print $1}')
-          HASH1='${{ steps.hash1.outputs.hash1 }}'
+          HASH1="${BUILD1_HASH}"
           echo "Build #1 sha256: $HASH1"
           echo "Build #2 sha256: $HASH2"
           if [ "$HASH1" = "$HASH2" ]; then

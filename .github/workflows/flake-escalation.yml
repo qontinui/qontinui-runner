@@ -135,7 +135,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       # No setup-node and no `pnpm install`: the script and its tests import
       # only Node built-ins, and ubuntu-latest ships a Node new enough for
       # them (>= 18: global fetch, node:test). setup-node@v5 is deliberately
@@ -176,7 +178,9 @@ jobs:
       actions: read
       issues: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       # Runner-provided Node, for the same reason as the unit-tests job above.
       - name: Read coord's flake history and upsert escalation issues
         # Step-level, never job-level: a job-level `if:` publishes a

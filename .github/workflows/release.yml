@@ -24,8 +24,10 @@ on:
         type: boolean
         default: false
 
+# Read-only by default; only the jobs that create, upload to, or publish the
+# release are granted `contents: write` (zizmor excessive-permissions).
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,17 +51,25 @@ jobs:
     with:
       include_cuda: ${{ github.event.inputs.include_cuda == 'true' }}
       include_sam3: true
-    secrets: inherit
+    # No `secrets: inherit`: the called workflow reads only GITHUB_TOKEN, which
+    # a reusable workflow receives without being passed any secret, so
+    # inheriting every repository secret into it bought nothing.
+    permissions:
+      contents: read
 
   create-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       release_id: ${{ steps.create-release.outputs.id }}
       release_upload_url: ${{ steps.create-release.outputs.upload_url }}
       release_version: ${{ steps.get_version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Resolve ONE version and derive the tag from it, so the two can never
       # disagree.
@@ -119,9 +129,14 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
+      # actions/create-release is ARCHIVED (zizmor archived-uses) and runs on a
+      # retired Node runtime. softprops/action-gh-release — already used below
+      # for the asset uploads — creates the same draft release from the same
+      # inputs (`release_name` is spelled `name`) and exposes the same `id` /
+      # `upload_url` outputs.
       - name: Create Release
         id: create-release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -135,8 +150,8 @@ jobs:
           # from any other branch would tag main's HEAD while the build job
           # builds the dispatched ref — tag and shipped code silently diverge.
           # Pin it to the ref this run is actually building.
-          commitish: ${{ github.sha }}
-          release_name: Qontinui Runner v${{ steps.get_version.outputs.version }} (Beta)
+          target_commitish: ${{ github.sha }}
+          name: Qontinui Runner v${{ steps.get_version.outputs.version }} (Beta)
           draft: true
           prerelease: true
           body: |
@@ -171,6 +186,8 @@ jobs:
 
   build:
     needs: [create-release, build-python-executor]
+    permissions:
+      contents: write
     # Run even if build-python-executor was skipped (when include_bundled_python is false)
     if: ${{ always() && needs.create-release.result == 'success' }}
     strategy:
@@ -274,7 +291,9 @@ jobs:
     continue-on-error: ${{ matrix.name != 'windows-x64' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # qontinui-schemas is a workspace path-dep
       # (`qontinui-types = { path = "../../qontinui-schemas/rust" }`
@@ -327,16 +346,20 @@ jobs:
         shell: bash
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
-          cache: "pnpm"
-          cache-dependency-path: pnpm-lock.yaml
+          # No dependency cache in the job that builds and SIGNS the shipped
+          # installers: a cache entry written by any other workflow run on the
+          # default branch would be restored into the release build (zizmor
+          # cache-poisoning). `pnpm install --frozen-lockfile` still verifies
+          # every package against the lockfile; this only costs a cold install.
+          package-manager-cache: false
 
       # The repo pins the toolchain via `rust-toolchain.toml` (channel = "1.95.0").
       # dtolnay/rust-toolchain@stable installs *stable* and adds `targets:` to
@@ -347,7 +370,7 @@ jobs:
       # leg: the target was added to the wrong toolchain. Install the toolchain
       # that the override actually selects, and add the matrix target to IT.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
@@ -400,7 +423,7 @@ jobs:
       # ci.yml — if one is retuned there, retune it here.
       - name: Free disk space (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main
         with:
           # tool-cache stays: setup-node / setup-rust read from it.
           tool-cache: false
@@ -456,7 +479,7 @@ jobs:
       # Download bundled Python executor if it was built
       - name: Download Python executor
         if: ${{ needs.build-python-executor.result == 'success' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: python-executors
           path: src-tauri/binaries/
@@ -506,17 +529,15 @@ jobs:
       #     Remove-Item certificate/tempCert.txt
 
       # Tauri's NSIS bundler auto-downloads its toolset (makensis + plugins) and
-      # the WebView2 bootstrapper into %LOCALAPPDATA%\tauri on first use. On a
-      # fresh windows-latest runner that download happens every run; caching the
-      # dir skips it on cache-hit. (Note: the recurring "os error 2" at bundle
-      # start, once suspected to be this download — issue #654 — was actually
-      # the --target flag being hidden from tauri behind `--`; see the Build
-      # step below.) Keyed on the OS so each platform gets its own cache slot.
-      - name: Cache Tauri bundler toolchain
-        uses: actions/cache@v4
-        with:
-          path: ~/AppData/Local/tauri
-          key: tauri-toolchain-${{ runner.os }}-v1
+      # the WebView2 bootstrapper into %LOCALAPPDATA%\tauri on first use. That
+      # dir used to be restored from an actions/cache entry; it no longer is,
+      # because those binaries are run while bundling and signing the shipped
+      # installer, and a cache entry is writable by any workflow run on the
+      # default branch (zizmor cache-poisoning). The download now happens every
+      # run, and the system-NSIS step below covers a failed or rate-limited
+      # download. (The recurring "os error 2" at bundle start, once suspected
+      # to be this download — issue #654 — was actually the --target flag being
+      # hidden from tauri behind `--`; see the Build step below.)
 
       # Belt-and-braces for the os-error-2 failure: pre-install a system NSIS so
       # `makensis` is guaranteed on PATH even if Tauri's own download of its NSIS
@@ -610,8 +631,12 @@ jobs:
 
       - name: Upload release assets (Linux)
         if: matrix.platform == 'ubuntu-22.04'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          # Explicit, not derived from github.ref: on workflow_dispatch the ref
+          # is a branch, and the release create-release made is tagged
+          # v<release_version> either way.
+          tag_name: v${{ needs.create-release.outputs.release_version }}
           draft: true
           prerelease: true
           files: |
@@ -623,8 +648,12 @@ jobs:
 
       - name: Upload release assets (macOS)
         if: runner.os == 'macOS'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          # Explicit, not derived from github.ref: on workflow_dispatch the ref
+          # is a branch, and the release create-release made is tagged
+          # v<release_version> either way.
+          tag_name: v${{ needs.create-release.outputs.release_version }}
           draft: true
           prerelease: true
           files: |
@@ -643,6 +672,10 @@ jobs:
         # tauri.conf.json. Windows is the sole shipped platform, so a
         # Windows-only manifest is correct. Fails loudly if the .sig is absent
         # (signing key not set) — never ship an unverifiable "auto-update".
+        env:
+          # Bound through env, not spliced into the script (zizmor
+          # template-injection): a job output is text, not shell.
+          RELEASE_VERSION: ${{ needs.create-release.outputs.release_version }}
         run: |
           cd target/${{ matrix.target }}/release/bundle/nsis
           sig_file=$(ls *-setup.exe.sig 2>/dev/null | head -1)
@@ -651,7 +684,7 @@ jobs:
             exit 1;
           fi
           sig=$(cat "$sig_file")
-          ver="${{ needs.create-release.outputs.release_version }}"
+          ver="${RELEASE_VERSION}"
           cat > latest.json << EOF
           {
             "version": "v${ver}",
@@ -669,8 +702,12 @@ jobs:
 
       - name: Upload release assets (Windows)
         if: runner.os == 'Windows'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          # Explicit, not derived from github.ref: on workflow_dispatch the ref
+          # is a branch, and the release create-release made is tagged
+          # v<release_version> either way.
+          tag_name: v${{ needs.create-release.outputs.release_version }}
           draft: true
           prerelease: true
           files: |
@@ -684,6 +721,8 @@ jobs:
   publish-update-json:
     needs: [create-release, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     # Run even when the non-blocking (continue-on-error) macOS/Linux legs fail.
     # A failed leg makes `needs.build` non-success, which was SILENTLY SKIPPING
     # this whole job — so releases never actually auto-published (v1.0.0 and
@@ -693,7 +732,9 @@ jobs:
     if: ${{ always() && needs.create-release.result == 'success' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # VISIBILITY, not a gate. Every release from v1.0.0 through v1.0.7
       # published green while the macOS x86_64 and Linux legs were failing —
@@ -767,8 +808,9 @@ jobs:
       - name: Verify Windows installer uploaded
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.create-release.outputs.release_version }}
         run: |
-          names=$(gh release view "v${{ needs.create-release.outputs.release_version }}" \
+          names=$(gh release view "v${RELEASE_VERSION}" \
             --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
           echo "Release assets:"; echo "$names"
           echo "$names" | grep -qi 'setup\.exe' || {
@@ -793,8 +835,9 @@ jobs:
       - name: Publish release (un-draft, mark as latest)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.create-release.outputs.release_version }}
         run: |
-          gh release edit "v${{ needs.create-release.outputs.release_version }}" \
+          gh release edit "v${RELEASE_VERSION}" \
             --repo "${{ github.repository }}" \
             --draft=false \
             --prerelease=false \
