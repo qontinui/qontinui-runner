@@ -152,6 +152,13 @@
 #   powershell -File scripts/published-parity.ps1 -InstallRoot 'C:\...\Qontinui Runner'
 #   powershell -File scripts/published-parity.ps1 -JsonOut parity.json -Annotate
 #   powershell -File scripts/published-parity.ps1 -Door cli    # cold door; observes ~1 row
+#   powershell -File scripts/published-parity.ps1 -PublishedTag v1.0.12 -JsonOut parity.json
+#
+# PROVENANCE (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 2): the JSON artifact and the summary state WHICH two artifacts were
+# compared -- dev_sha, published_tag/published_sha, and skew_commits, the number
+# of commits between them. Without it a nightly's row difference cannot be told
+# apart from version skew. See "PROVENANCE" in lib/parity-diff.ps1.
 
 param(
     # The development build. Default: probe target/debug then target/release.
@@ -189,7 +196,13 @@ param(
     # see a missing-checkout difference and every 0 it has ever printed was
     # worthless. Needs no release and no installed exe, so it runs on a PR.
     # Exit 1 means BLIND; exit 0 means the instrument demonstrably sees the class.
-    [switch]$NegativeControl
+    [switch]$NegativeControl,
+    # The release tag the installed build came from. Recorded in the provenance
+    # block and used to compute skew_commits against this checkout's HEAD. The
+    # workflow binds it through the environment (PARITY_RELEASE_TAG) rather than
+    # the command line, the same hygiene it applies to every tag value. Empty
+    # leaves published_sha and skew_commits unknown(no_published_tag) -- never 0.
+    [string]$PublishedTag = $env:PARITY_RELEASE_TAG
 )
 
 $ErrorActionPreference = "Stop"
@@ -815,11 +828,70 @@ Write-Host ""
 Write-Host "published-parity: capability-manifest parity, development build vs installed published build"
 Write-Host ""
 
+# ---------------------------------------------------------------------------
+# Provenance inputs, read once before either leg boots: they describe the
+# checkout and the run, not anything a leg answers. The block itself is
+# assembled at emission time, when the manifest axis has an answer.
+# ---------------------------------------------------------------------------
+$skewProvenance = Get-ParitySkewProvenance -RepoDir $RepoRoot -Tag $PublishedTag
+$siblingProvenance = @(Get-ParitySiblingProvenance -RepoRoot $RepoRoot)
+Write-Host "  provenance        : dev $($skewProvenance.dev_sha) vs published '$PublishedTag' ($($skewProvenance.published_sha))"
+Write-Host "  skew_commits      : $($skewProvenance.skew_commits)"
+foreach ($sib in $siblingProvenance) { Write-Host "  sibling           : $($sib.repo) @ $($sib.sha) (recorded, not same-SHA)" }
+Write-Host ""
+
+function New-ParityRunProvenance {
+    param([string]$GeneratedAt, [string]$ManifestAxis)
+    return (New-ParityProvenance -DevSha $skewProvenance.dev_sha -PublishedTag $PublishedTag `
+        -PublishedSha $skewProvenance.published_sha -SkewCommits $skewProvenance.skew_commits -Divergence $skewProvenance.divergence `
+        -RunId $env:GITHUB_RUN_ID -RunEvent $env:GITHUB_EVENT_NAME -GeneratedAt $GeneratedAt `
+        -ManifestAxis $ManifestAxis `
+        -BehaviouralAxis (Format-ParityUnknown 'not_yet_measured: the contract-smoke legs run after this step') `
+        -Siblings $siblingProvenance)
+}
+
+# A comparison that could not happen still reports. Before this, exit 2 left
+# NO artifact, NO summary line and NO skew-commits output, so "the manifest axis
+# failed" and "the step never ran" were the same absence, and the workflow's
+# report step printed ''. Now each exit-2 path writes a provenance-only
+# artifact (counts null, never 0), one summary line stating that every row is
+# UNOBSERVED, and the skew-commits output (its unknown value included).
+# Never on -NegativeControl: that mode makes no parity claim at all.
+function Write-ParityUnavailableReport {
+    param([string]$Reason)
+    if ($NegativeControl) { return }
+    $at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $prov = New-ParityRunProvenance -GeneratedAt $at -ManifestAxis (Format-ParityUnknown $Reason)
+    if ($JsonOut) {
+        $obj = [PSCustomObject]@{
+            report_kind    = 'published-build-capability-parity'
+            report_version = $script:ParityReportVersion
+            generated_at   = $at
+            provenance     = $prov
+            unavailable    = $Reason
+            counts         = $null
+            rows           = @()
+        }
+        $dir = Split-Path -Parent $JsonOut
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        [System.IO.File]::WriteAllText($JsonOut, ($obj | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "Wrote provenance-only artifact (comparison unavailable): $JsonOut"
+    }
+    if ($SummaryOut) {
+        $line = Format-ParityUnavailableSummaryLine -Reason $Reason -Provenance $prov
+        [System.IO.File]::AppendAllText($SummaryOut, ($line + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($env:GITHUB_OUTPUT) {
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "skew-commits=$($prov.skew_commits)"
+    }
+}
+
 try {
     $devPath = Find-DevRunnerExe -Explicit $DevExe
 } catch {
     Write-Host "PARITY-UNAVAILABLE dev_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
+    Write-ParityUnavailableReport -Reason 'dev_leg_not_located'
     exit 2
 }
 
@@ -983,6 +1055,7 @@ try {
 } catch {
     Write-Host "PARITY-UNAVAILABLE published_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
+    Write-ParityUnavailableReport -Reason 'published_leg_not_located'
     exit 2
 }
 
@@ -1009,6 +1082,7 @@ if ($failed.Count -gt 0) {
     foreach ($f in $failed) { Write-Host "  $f" }
     Write-Host ""
     Write-Host "  No defect count is reported. A leg that could not be read is UNKNOWN, never 0."
+    Write-ParityUnavailableReport -Reason 'manifest_read_failed'
     exit 2
 }
 
@@ -1108,7 +1182,8 @@ Write-Host ""
 # Emission 1 of 3 -- the machine artifact.
 # ---------------------------------------------------------------------------
 $generatedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$reportObj = ConvertTo-ParityReportObject -Result $result -GeneratedAt $generatedAt -Observability $observability
+$provenance = New-ParityRunProvenance -GeneratedAt $generatedAt -ManifestAxis (Get-ParityManifestAxis -Result $result)
+$reportObj = ConvertTo-ParityReportObject -Result $result -GeneratedAt $generatedAt -Observability $observability -Provenance $provenance
 if ($JsonOut) {
     $dir = Split-Path -Parent $JsonOut
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
@@ -1123,57 +1198,12 @@ if ($JsonOut) {
 # Emission 2 of 3 -- the job-summary table.
 # ---------------------------------------------------------------------------
 if ($SummaryOut) {
-    $md = New-Object System.Collections.Generic.List[string]
-    $md.Add("### Published-build capability parity")
-    $md.Add("")
-    if ($result.SchemaRefusal) {
-        $md.Add("**Refused -- schema version mismatch.** $($result.SchemaRefusalReason)")
-        $md.Add("")
-        $md.Add("No defect count is reported. A row diff across two manifest formats is meaningless, and ``0`` would be a claim this run did not earn.")
-    } else {
-        $md.Add("**parity_defects = $($result.ParityDefectCount)** (rung_differs $($result.RungDifferCount) + only_in_dev $($result.OnlyInDevCount)) -- out of **$($result.ComparableCount) comparable** rows.")
-        $md.Add("")
-        $md.Add("**$($result.UnobservedCount) rows were unobserved** on at least one leg, so no comparison was possible for them. ``unknown`` is the absence of a reading, never agreement -- read ``parity_defects`` as a floor over the comparable set, not a verdict on the roster.")
-        $md.Add("")
-        $md.Add("| Capability | Development build | Published build | Disposition |")
-        $md.Add("|---|---|---|---|")
-        foreach ($r in @($result.Rows)) {
-            $devCell = $(if ($null -eq $r.DevRung) { "_(no row)_" } else { "``$($r.DevRung)``" })
-            $pubCell = $(if ($null -eq $r.PublishedRung) { "_(no row)_" } else { "``$($r.PublishedRung)``" })
-            $disp = switch ($r.Disposition) {
-                'defect'                { "**DEFECT**" }
-                'only_in_dev'           { "**DEFECT** (absent from published roster)" }
-                'only_in_dev_unobserved' { "roster difference, unobserved" }
-                'only_in_published'     { "only in published roster" }
-                'expected_difference'   { "expected (allowlisted)" }
-                'unobserved'            { "unobserved" }
-                default                 { "in parity" }
-            }
-            $md.Add("| ``$($r.Id)`` | $devCell | $pubCell | $disp |")
-        }
-        $md.Add("")
-        $md.Add("Allowlisted expected differences: **$(@($result.Allowlist).Count)** entries" + $(if (@($result.Allowlist).Count -eq 0) { " -- the allowlist is empty; nothing was excused." } else { ":" }))
-        foreach ($e in @($result.Allowlist)) {
-            $md.Add("- ``$($e.Id)`` (dev ``$($e.DevRung)`` / published ``$($e.PublishedRung)``): $($e.Reason)")
-        }
-        $md.Add("")
-        $md.Add("**slash_commands_status = ``" + $slashCommandsStatus + "``** (from the filesystem witness, not the manifest's self-report).")
-        $md.Add("")
-        if (@($selfReportDisagreements).Count -gt 0) {
-            $md.Add("**Self-report disagrees with the filesystem on " + @($selfReportDisagreements).Count + " row(s).** A finding about the INSTRUMENT, counted separately from both numbers:")
-            foreach ($d in @($selfReportDisagreements)) {
-                $md.Add("- ``" + $d.id + "`` (" + $d.leg + "): " + $d.kind + " -- " + $d.note)
-            }
-            $md.Add("")
-        }
-        $md.Add("Provisioning rows, driven through the artifact's own doors before the manifest read: " +
-                (($sessionLedgerRows | ForEach-Object { "``$_``" }) -join ", ") + ". A row still reading ``unknown`` means the door it needed refused -- see ``provisioning_drive`` in the JSON artifact for which one and why. Nothing here fabricates a spawn.")
-    }
-    $md.Add("")
-    $md.Add("Development build: ``$($result.Identity.DevAppVersion)`` / ``$($result.Identity.DevGitSha)`` via ``$($result.Identity.DevDoor)``  ")
-    $md.Add("Published build: ``$($result.Identity.PublishedAppVersion)`` / ``$($result.Identity.PublishedGitSha)`` via ``$($result.Identity.PublishedDoor)``")
-    $md.Add("")
-    $md.Add("_This report gates nothing._")
+    # Built in lib/parity-diff.ps1 (Format-ParitySummaryMarkdown) so the unit
+    # tests pin what a human reads first: the headline carries the unobserved
+    # count, and skew_commits is stated beside the numbers.
+    $md = Format-ParitySummaryMarkdown -Result $result -Provenance $provenance `
+        -SlashCommandsStatus $slashCommandsStatus -SelfReportDisagreements $selfReportDisagreements `
+        -SessionLedgerRows $sessionLedgerRows
     # UTF8 WITHOUT a BOM, via .NET: PS 5.1's `Add-Content -Encoding UTF8` writes a
     # BOM, and $GITHUB_STEP_SUMMARY is appended to -- a BOM landing mid-file renders
     # as literal garbage in the rendered summary.
@@ -1215,6 +1245,8 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "schema-refused=$($result.SchemaRefusal.ToString().ToLower())"
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "slash-commands-status=$slashCommandsStatus"
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "self-report-disagreements=$(@($selfReportDisagreements).Count)"
+    # Verbatim from the provenance block: an integer, or unknown(<reason>).
+    Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "skew-commits=$($provenance.skew_commits)"
 }
 
 # Report mode: a parity outcome NEVER sets the exit code.
