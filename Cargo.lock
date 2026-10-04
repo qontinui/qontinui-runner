@@ -6675,6 +6675,7 @@ dependencies = [
  "bytes",
  "flate2",
  "hex",
+ "libc",
  "rand 0.9.4",
  "reqwest 0.13.2",
  "serde",
