@@ -103,6 +103,9 @@ mod coord_questions;
 mod cost_management;
 mod crash_dumps;
 mod crash_observability;
+// Ratchet: no module may be declared in both this root and `lib.rs`.
+#[cfg(test)]
+mod crate_roots_ratchet;
 mod credential_helper;
 mod database;
 mod debug_lifecycle;
