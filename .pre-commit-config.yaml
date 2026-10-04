@@ -9,6 +9,16 @@ repos:
         args: ['--maxkb=1000']
       - id: check-merge-conflict
 
+  # Workflow security lint, offline (no API calls at commit time). The same
+  # pinned zizmor runs with online audits in the `workflow-lint` CI job;
+  # .github/zizmor.yml carries every reasoned suppression for both. Plan
+  # 2026-10-04-adopt-self-hosted-ci-scout-improvements, Phase 1.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
+        args: [--offline, --no-progress, --config, .github/zizmor.yml]
+
   # ESLint and cargo clippy are intentionally omitted here — they run too
   # slowly to gate every commit in the shared multi-agent tree. CI and
   # cargo-guard.sh already enforce them.
