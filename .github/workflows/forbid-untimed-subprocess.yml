@@ -483,6 +483,13 @@ jobs:
           # under the name "Forbid untimed std::process::Command waits" and
           # reads as a gate violation — the exact "cost a day instead of a
           # minute" confusion the provenance block below exists to prevent.
+          #
+          # ANONYMOUS FETCH. This job's checkout sets persist-credentials: false
+          # (zizmor artipacked), so this fetch carries no token and works only
+          # because qontinui-runner is PUBLIC. If the repo is ever made private,
+          # this fails with the ::error below: set persist-credentials: true on
+          # the checkout then, with a reasoned artipacked entry in
+          # .github/zizmor.yml.
           if ! git fetch --no-tags origin \
                  "+refs/pull/${PR_NUMBER}/head:refs/qontinui/pr-head" \
                  "+refs/heads/${BASE_REF}:refs/qontinui/base"; then

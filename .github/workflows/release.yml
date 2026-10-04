@@ -129,11 +129,47 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
+      # softprops/action-gh-release (below) does NOT fail on an existing
+      # release the way actions/create-release@v1 did (422): it finds the
+      # release by tag and UPDATES it — prerelease back to true, new name/body —
+      # and the upload steps overwrite same-named assets. A re-run, or a
+      # dispatch of an already-shipped version, would therefore flip the LIVE
+      # release to prerelease and replace the installer / .sig / latest.json
+      # that auto-updating clients read. Refuse that here. Reusing an existing
+      # DRAFT (a re-run of a release that never published) stays allowed.
+      # A lookup that fails for any reason other than "not found" is UNKNOWN
+      # and refuses too.
+      - name: Refuse to touch an already-published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.get_version.outputs.tag }}
+        run: |
+          set -uo pipefail
+          out="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>&1)"
+          rc=$?
+          if [[ $rc -ne 0 ]]; then
+            if grep -qi 'release not found' <<<"${out}"; then
+              echo "No release exists for ${TAG}; a new draft will be created."
+              exit 0
+            fi
+            echo "::error::Could not read the release for ${TAG} (gh exit ${rc}): ${out}. Whether a published release would be overwritten is UNKNOWN; refusing."
+            exit 1
+          fi
+          case "${out}" in
+            true)  echo "An existing DRAFT release for ${TAG} will be reused." ;;
+            false) echo "::error::Release ${TAG} is already PUBLISHED. Re-running would flip it back to prerelease and overwrite the assets auto-updating clients download. Bump the version instead."
+                   exit 1 ;;
+            *)     echo "::error::Unexpected isDraft value '${out}' for ${TAG}; refusing."
+                   exit 1 ;;
+          esac
+
       # actions/create-release is ARCHIVED (zizmor archived-uses) and runs on a
       # retired Node runtime. softprops/action-gh-release — already used below
-      # for the asset uploads — creates the same draft release from the same
-      # inputs (`release_name` is spelled `name`) and exposes the same `id` /
-      # `upload_url` outputs.
+      # for the asset uploads — creates a draft release from the same inputs
+      # (`release_name` is spelled `name`) and exposes the same `id` /
+      # `upload_url` outputs. Unlike create-release it reuses (updates) an
+      # existing release for the tag instead of failing; the step above limits
+      # that to an unpublished draft.
       - name: Create Release
         id: create-release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
