@@ -799,3 +799,91 @@ jobs:
             --draft=false \
             --prerelease=false \
             --latest
+
+  # ===========================================================================
+  # THE SAME-SHA PARITY LEG (plan
+  # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+  # Phase 2).
+  # ===========================================================================
+  #
+  # published-parity.yml carries a `release: published` trigger that never
+  # fires for a release made HERE: publish-update-json un-drafts with
+  # GITHUB_TOKEN, and GitHub's own docs say so in terms -- "events triggered by
+  # the GITHUB_TOKEN will not create a new workflow run, with the following
+  # exceptions: workflow_dispatch and repository_dispatch events always create
+  # workflow runs" (docs.github.com/en/actions/concepts/security/github_token,
+  # "When GITHUB_TOKEN triggers workflow runs"). So dispatch it explicitly, at
+  # the tag: the dev leg then builds the tag and installs the release made from
+  # it -- one SHA, two build shapes, skew_commits 0 -- on every release, with no
+  # human step.
+  #
+  # Its OWN job so `actions: write` is held by nothing else: no checkout, no
+  # build, one gh call. `needs: publish-update-json` with the default success()
+  # condition means it runs only once the release is public -- which is also
+  # when the tag exists at all, since a DRAFT release's tag is not a git ref
+  # until it is published, and the parity job downloads the published
+  # installer.
+  #
+  # VISIBLE BUT NOT FATAL, in publish-update-json's own idiom (its
+  # asset-completeness step): `continue-on-error` plus a ::warning:: and a
+  # summary line. A refused dispatch exits 1 -- under continue-on-error that
+  # marks the STEP failed on the run page while the job and the release stay
+  # green. A green step here would read exactly like "the parity run was
+  # started", which is the one thing a refusal means did not happen. The
+  # release is already public; failing the run would change nothing about it.
+  dispatch-parity:
+    needs: [create-release, publish-update-json]
+    # always() + an explicit result check, for the reason publish-update-json
+    # states above its own `if:`: a failed continue-on-error macOS/Linux leg
+    # makes `needs.build` non-success, which was "SILENTLY SKIPPING this whole
+    # job". The skip is transitive -- a job is skipped when ANY job upstream of
+    # it did not succeed, and build-python-executor is skipped on every tag
+    # push -- so without this the same-SHA dispatch would never run on a normal
+    # release. What matters is only that the release was published.
+    if: ${{ always() && needs.publish-update-json.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the same-SHA published-parity run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bound through env, not spliced in with ${{ }}: same reasoning as
+          # the asset-completeness step's RELEASE_VERSION binding.
+          RELEASE_VERSION: ${{ needs.create-release.outputs.release_version }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="v${RELEASE_VERSION}"
+          {
+            echo "### Same-SHA published-parity run"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The ref, FULLY QUALIFIED first: `refs/tags/<tag>` cannot resolve to
+          # a branch that happens to share the tag's name. The documented
+          # contract is narrower than that, so it is not relied on alone: the
+          # REST endpoint gh calls (POST .../actions/workflows/{id}/dispatches)
+          # documents `ref` as "The git reference for the workflow. The
+          # reference can be a branch or tag name." and `gh workflow run --ref`
+          # as "Branch or tag name which contains the version of the workflow
+          # file you'd like to run" (docs.github.com/en/rest/actions/workflows
+          # #create-a-workflow-dispatch-event; cli.github.com/manual/
+          # gh_workflow_run). Neither page states that a fully-qualified ref is
+          # accepted. So a refusal of the full ref falls back to the bare tag
+          # name -- the documented form -- and the summary says which carried.
+          dispatched=""
+          for ref in "refs/tags/${tag}" "${tag}"; do
+            if gh workflow run published-parity.yml --repo "$REPO" --ref "$ref" -f release_tag="$tag"; then
+              dispatched="$ref"
+              break
+            fi
+            echo "::warning::gh workflow run --ref ${ref} was refused."
+          done
+          if [ -n "$dispatched" ]; then
+            echo "Dispatched published-parity.yml at ${dispatched} (release_tag=${tag})."
+            echo "Dispatched \`published-parity.yml\` at \`${dispatched}\` against release \`${tag}\` -- expect \`skew_commits: 0\` in its summary." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not dispatch published-parity.yml at ${tag}. The release is published and unaffected, but NO same-SHA parity reading was started for it. Re-run by hand: gh workflow run published-parity.yml --ref refs/tags/${tag} -f release_tag=${tag}"
+            echo "**NOT dispatched** -- \`gh workflow run published-parity.yml\` was refused at both \`refs/tags/${tag}\` and \`${tag}\`. No same-SHA parity reading exists for this release until it is run by hand." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
