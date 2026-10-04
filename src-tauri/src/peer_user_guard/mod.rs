@@ -411,6 +411,9 @@ struct Guarded {
     own: Arc<Option<LocalUser>>,
     mode: Mode,
     pending: JoinSet<Option<Admitted>>,
+    /// Set after a non-connection accept error (EMFILE / ENFILE …): the accept
+    /// side pauses until then while finished resolutions keep draining.
+    backoff_until: Option<tokio::time::Instant>,
 }
 
 /// A [`TcpListener`] that only yields connections whose peer runs as the
@@ -515,6 +518,7 @@ impl GuardedListener {
                 own: Arc::new(own),
                 mode,
                 pending: JoinSet::new(),
+                backoff_until: None,
             })),
             local,
         })
@@ -570,7 +574,10 @@ impl Guarded {
                         return admitted;
                     }
                 }
-                accepted = self.listener.accept(), if self.pending.len() < MAX_INFLIGHT_RESOLUTIONS => {
+                () = tokio::time::sleep_until(self.backoff_until.unwrap_or_else(tokio::time::Instant::now)), if self.backoff_until.is_some() => {
+                    self.backoff_until = None;
+                }
+                accepted = self.listener.accept(), if self.backoff_until.is_none() && self.pending.len() < MAX_INFLIGHT_RESOLUTIONS => {
                     match accepted {
                         Ok((stream, peer)) => {
                             // Stamp the accept instant now, so the PID-recycle
@@ -591,7 +598,7 @@ impl Guarded {
                         Err(e) if is_connection_error(&e) => {}
                         Err(e) => {
                             warn!(listener = self.label, error = %e, "peer user guard: accept error");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            self.backoff_until = Some(tokio::time::Instant::now() + Duration::from_secs(1));
                         }
                     }
                 }

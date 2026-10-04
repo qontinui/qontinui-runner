@@ -56,12 +56,12 @@ impl Drop for Owned {
     }
 }
 
-/// Read one family's owner-PID connection table into raw bytes.
 /// Last observed table size per family, so a steady stream of connections
 /// starts at the right buffer size instead of paying a size probe each time.
 static V4_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
 static V6_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
 
+/// Read one family's owner-PID connection table into raw bytes.
 fn read_table(family: u32) -> Result<Vec<u64>, Unresolved> {
     let hint = if family == AF_INET {
         &V4_SIZE_HINT
@@ -268,9 +268,11 @@ impl OwnerResolver for TcpTableResolver {
         }
         match creation_time(process.0) {
             // A couple of seconds of slack absorbs a small backwards wall-clock
-            // step between the two readings; a recycled PID still has to be
-            // born after the connection existed, and its table row vanishes
-            // when the real owner dies, so the window this opens is nil.
+            // step between the two readings. What this catches: a PID reused
+            // AFTER the accept. Residual (plan residuals): a socket inherited by
+            // a child after its creator exits names a dead PID, and reuse of
+            // that PID BEFORE the accept is not detected — an attacker cannot
+            // choose which process receives a reused PID.
             Some(created) if created <= accepted_at + CLOCK_SLACK => {}
             // Born after the connection existed, or unreadable: not provably
             // the owner.
