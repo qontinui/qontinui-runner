@@ -105,36 +105,86 @@ pub async fn ui_bridge_execute_with_diff_handler(
 
 /// Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-users-
 /// path-and-the-passage-of-time, D3) for the runner's execute-with-diff
-/// routes: the response's `beforeSnapshot` / `afterSnapshot` resolve both
-/// nodes, so the edge is written immediately. These routes drive the runner's
-/// OWN webview, so the app is the runner's.
-///
-/// A 4xx the runner answered itself acted on nothing and records nothing. An
-/// action counts as failed when the route failed OR the diff result's
-/// `actionSuccess` is present and not `true`.
-fn record_diff_result<E: serde::Serialize>(
+/// routes. These routes drive the runner's OWN webview, so the app is the
+/// runner's.
+fn record_diff_result(
     state: &Arc<ApiState>,
     request_body: &serde_json::Value,
-    result: &Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<E>>)>,
+    result: &Result<Json<ApiResponse<serde_json::Value>>, DiffFailure>,
 ) {
-    let Some(route_failed) = crate::journey::capture::control_action_verdict(result) else {
+    let Some((response, failed)) = diff_verdict(result) else {
         return;
     };
-    let response = match result {
-        Ok(Json(body)) => body.data.clone().unwrap_or(serde_json::Value::Null),
-        Err(_) => serde_json::Value::Null,
-    };
-    let action_failed = response
-        .get("actionSuccess")
-        .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(true));
     crate::journey::capture::record_diff(
         state.app_state.pg_db.clone(),
         crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
         request_body,
         &response,
         crate::journey::cursor::Provenance::default(),
-        route_failed || action_failed,
+        failed,
     );
+}
+
+/// Was this error an ATTEMPTED action that failed? Since main `cbe9ab60b` the
+/// frontend answers a failed execute-with-diff with `success:false,
+/// error:"ACTION_FAILED: ..."` and the diff kept as `data`, which
+/// `wrap_ipc_result_keeping_failure_data` turns into a 4xx carrying that diff.
+/// That 4xx is NOT a runner refusal: the action ran and failed.
+fn is_attempted_failure(body: &ApiResponse<serde_json::Value>) -> bool {
+    body.error_detail
+        .as_ref()
+        .is_some_and(|d| d.code == super::types::UiBridgeErrorCode::ActionFailed)
+        || body
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("ACTION_FAILED:"))
+}
+
+/// The journey verdict for one execute-with-diff result: `Some((diff, failed))`
+/// when an action was attempted, `None` when nothing acted.
+///
+/// - `Ok` — the diff is `data`; failed when `success` is false or the diff's
+///   `actionSuccess` is present and not `true`;
+/// - a 4xx [`is_attempted_failure`] — the diff rides on the error body's
+///   `data`; failed;
+/// - a 5xx — attempted, outcome unknown to the runner; failed, no diff;
+/// - any other 4xx — the runner refused the request itself; nothing acted.
+fn diff_verdict(
+    result: &Result<Json<ApiResponse<serde_json::Value>>, DiffFailure>,
+) -> Option<(serde_json::Value, bool)> {
+    match result {
+        Ok(Json(body)) => {
+            let response = body.data.clone().unwrap_or(serde_json::Value::Null);
+            let action_failed = response
+                .get("actionSuccess")
+                .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(true));
+            Some((response, !body.success || action_failed))
+        }
+        Err((status, Json(body))) if status.is_client_error() => is_attempted_failure(body)
+            .then(|| (body.data.clone().unwrap_or(serde_json::Value::Null), true)),
+        Err(_) => Some((serde_json::Value::Null, true)),
+    }
+}
+
+/// The per-operation results a batch-with-diff answer carries — on success in
+/// `data.results`, and on an attempted failure in the error body's
+/// `data.results` (the diff `wrap_ipc_result_keeping_failure_data` keeps).
+fn batch_op_results(
+    result: &Result<Json<ApiResponse<serde_json::Value>>, DiffFailure>,
+) -> Option<Vec<serde_json::Value>> {
+    let body = match result {
+        Ok(Json(body)) => body,
+        Err((status, Json(body))) if status.is_client_error() && is_attempted_failure(body) => body,
+        _ => return None,
+    };
+    Some(
+        body.data
+            .as_ref()
+            .and_then(|d| d.get("results"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    )
 }
 
 /// Composite endpoint: execute one or more actions with atomic change-buffer tracking.
@@ -153,24 +203,18 @@ pub async fn ui_bridge_with_diff_handler(
             ui_bridge_request_sync(&state, "execute_batch_with_diff", body.clone()).await,
         );
         // Each operation is its own action (its own pending edge), unlike
-        // `/control/batch-actions`, which is one trigger. A 2xx records each
-        // operation with its own result's outcome hint; a 5xx records every
-        // operation as an `error` edge like every other route (m4); a 4xx the
-        // runner answered itself acted on nothing.
+        // `/control/batch-actions`, which is one trigger. A 2xx — or a 4xx
+        // carrying an attempted failure (ACTION_FAILED, the diff kept as
+        // `data`) — records each operation with its own result's outcome hint;
+        // a 5xx records every operation as an `error` edge like every other
+        // route (m4); any other 4xx the runner answered itself acted on nothing.
         let operations = body
             .get("operations")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        match &result {
-            Ok(Json(resp)) => {
-                let results = resp
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.get("results"))
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
+        match (&result, batch_op_results(&result)) {
+            (_, Some(results)) => {
                 for (op, op_result) in operations.iter().zip(results.iter()) {
                     let op_ok: Result<
                         Json<ApiResponse<serde_json::Value>>,
@@ -179,12 +223,12 @@ pub async fn ui_bridge_with_diff_handler(
                     record_diff_result(&state, &with_diff_single_payload(op.clone()), &op_ok);
                 }
             }
-            Err((status, _)) if status.is_server_error() => {
+            (Err((status, _)), None) if status.is_server_error() => {
                 for op in &operations {
                     record_diff_result(&state, &with_diff_single_payload(op.clone()), &result);
                 }
             }
-            Err(_) => {}
+            _ => {}
         }
         result
     } else {
@@ -268,7 +312,70 @@ fn with_diff_single_payload(body: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod with_diff_single_payload_tests {
+
+    // ── journey: execute-with-diff verdicts (F1, review of the rebase onto main
+    // cbe9ab60b, which turned a failed action into a 400 ACTION_FAILED) ──
+    fn action_failed_400(
+        data: serde_json::Value,
+    ) -> Result<Json<ApiResponse<serde_json::Value>>, DiffFailure> {
+        let mut body = ApiResponse::<serde_json::Value>::error(
+            "ACTION_FAILED: Element btn not found".to_string(),
+        );
+        body.data = Some(data);
+        Err((StatusCode::BAD_REQUEST, Json(body)))
+    }
+
+    #[test]
+    fn a_400_action_failed_is_an_attempted_failure_carrying_its_diff() {
+        let diff = serde_json::json!({ "actionSuccess": false, "afterSnapshot": {} });
+        let (resp, failed) = diff_verdict(&action_failed_400(diff.clone())).expect("attempted");
+        assert!(failed);
+        assert_eq!(resp, diff);
+    }
+
+    #[test]
+    fn a_runner_refusal_4xx_records_nothing() {
+        let body = ApiResponse::<serde_json::Value>::error("invalid body".to_string());
+        assert!(diff_verdict(&Err((StatusCode::BAD_REQUEST, Json(body)))).is_none());
+    }
+
+    #[test]
+    fn a_5xx_is_a_failure_with_no_diff() {
+        let body = ApiResponse::<serde_json::Value>::error("boom".to_string());
+        let (resp, failed) =
+            diff_verdict(&Err((StatusCode::INTERNAL_SERVER_ERROR, Json(body)))).expect("attempted");
+        assert!(failed);
+        assert!(resp.is_null());
+    }
+
+    #[test]
+    fn a_200_with_action_success_false_is_a_failure() {
+        let ok: Result<Json<ApiResponse<serde_json::Value>>, DiffFailure> = Ok(Json(
+            ApiResponse::success(serde_json::json!({ "actionSuccess": false })),
+        ));
+        assert_eq!(diff_verdict(&ok).map(|(_, f)| f), Some(true));
+        let ok2: Result<Json<ApiResponse<serde_json::Value>>, DiffFailure> = Ok(Json(
+            ApiResponse::success(serde_json::json!({ "actionSuccess": true })),
+        ));
+        assert_eq!(diff_verdict(&ok2).map(|(_, f)| f), Some(false));
+    }
+
+    #[test]
+    fn a_batch_action_failed_still_yields_every_op_result() {
+        let r = action_failed_400(
+            serde_json::json!({ "results": [{ "actionSuccess": true }, { "actionSuccess": false }] }),
+        );
+        assert_eq!(batch_op_results(&r).map(|v| v.len()), Some(2));
+        let refusal = Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error("bad".to_string())),
+        ));
+        assert!(batch_op_results(&refusal).is_none());
+    }
+
     use super::with_diff_single_payload;
+    use super::{batch_op_results, diff_verdict, ApiResponse, DiffFailure};
+    use axum::{http::StatusCode, Json};
     use serde_json::json;
 
     #[test]
