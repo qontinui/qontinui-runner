@@ -159,16 +159,13 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: Strin
         return HintOutcome::NotApplicable("session account unknown");
     };
 
-    let ai_settings = crate::settings::get_ai_settings();
-    if !ai_settings.claude_cli.auto_migrate_on_token_exhaustion {
+    if let Err(why) = migration_unavailable() {
         info!(
             session = %record.claude_session_id,
-            "usage-limit confirmed-candidate but auto-migration is disabled in settings"
+            why,
+            "usage-limit confirmed-candidate but no migration is possible"
         );
-        return HintOutcome::NotApplicable("auto-migration disabled");
-    }
-    if crate::settings::get_claude_config_dirs().len() < 2 {
-        return HintOutcome::NotApplicable("fewer than two accounts"); // nothing to migrate to
+        return HintOutcome::NotApplicable(why);
     }
 
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
@@ -559,6 +556,32 @@ pub(crate) struct ResumeSpawn<'a> {
 /// session under a different account than it ran on. It is never a
 /// `switch_claude_account` mutation, which would leak this one spawn's account
 /// choice into every later spawn on the box.
+/// Why no account migration can happen at all, from settings alone — known
+/// synchronously, so a failure can be announced as manual up front instead of
+/// after an asynchronous confirm. `Ok` when one may be possible.
+pub(crate) fn migration_unavailable() -> Result<(), &'static str> {
+    migration_precondition(
+        crate::settings::get_ai_settings()
+            .claude_cli
+            .auto_migrate_on_token_exhaustion,
+        crate::settings::get_claude_config_dirs().len(),
+    )
+}
+
+/// [`migration_unavailable`]'s decision. Pure.
+pub(crate) fn migration_precondition(
+    auto_migrate: bool,
+    accounts: usize,
+) -> Result<(), &'static str> {
+    if !auto_migrate {
+        return Err("auto-migration disabled");
+    }
+    if accounts < 2 {
+        return Err("fewer than two accounts"); // nothing to migrate to
+    }
+    Ok(())
+}
+
 pub(crate) fn spawn_resumed_pane(
     app: &tauri::AppHandle,
     terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
