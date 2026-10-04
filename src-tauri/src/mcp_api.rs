@@ -2125,6 +2125,11 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // Per-local-user connection guard (plan 2026-10-04-runner-loopback-
+        // api-refuses-other-local-users): installed/enabled/supported, the kill
+        // switch's name, and admit/refusal counters. No uid or SID is served —
+        // `/health` is reachable from browser origins; identities are logged.
+        "peerUserGuard": qontinui_runner_lib::peer_user_guard::health_json(),
         // UI Bridge relay principal binding (plan 2026-09-17-ui-bridge-relay-
         // registration-is-unauthenticated): both kill-switch modes, the
         // per-rule wouldRefuse/refused counts and the last 20 (rule, class,
@@ -13175,6 +13180,10 @@ async fn serve_on_dedicated_runtime(
                  any other subsystem blocks the app runtime's workers."
             );
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
+            let listener = qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(
+                listener,
+                "local-api",
+            )?;
             return axum::serve(listener, router).await.map_err(Into::into);
         }
     };
@@ -13184,6 +13193,12 @@ async fn serve_on_dedicated_runtime(
     // which the listener is owned by a thread that failed to start.
     let served = rt.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        // Refuse every connection whose peer process runs as a different OS
+        // user (plan 2026-10-04-runner-loopback-api-refuses-other-local-users).
+        // Wrapped HERE, on the dedicated runtime, because the guard's accept
+        // task is spawned on the runtime that wraps it.
+        let listener =
+            qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
         axum::serve(listener, router).await
     });
 

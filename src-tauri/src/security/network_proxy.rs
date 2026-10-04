@@ -35,7 +35,6 @@ pub struct NetworkMediator {
 struct ProxyState {
     policy: SecurityPolicy,
     audit_logger: AuditLogger,
-    #[allow(dead_code)]
     credential_proxy: Option<CredentialProxy>,
 }
 
@@ -43,6 +42,19 @@ impl NetworkMediator {
     /// Start the network mediation proxy.
     ///
     /// Binds to `127.0.0.1:0` (ephemeral port) and starts serving.
+    ///
+    /// NOT wrapped in `peer_user_guard::GuardedListener`, unlike every other
+    /// serving runner listener (plan `2026-10-04-runner-loopback-api-refuses-
+    /// other-local-users`). Its peers are step containers arriving through a
+    /// host forwarder (Docker Desktop's backend, `host.docker.internal`) whose
+    /// owning OS account is unmeasured, so a fail-closed owner check would break
+    /// every sandboxed step. The credential it can inject
+    /// (`handle_http_forward`, when `credential_proxy_enabled` and the step runs
+    /// in `Proxy` mode) is released only against the random per-step
+    /// placeholder that step's own container environment carries; a process
+    /// that can read that environment (e.g. `docker inspect`) already holds
+    /// root-equivalent access to the host's Docker, so an owner check here
+    /// would add nothing. Recorded as a residual in that plan.
     pub async fn start(
         policy: SecurityPolicy,
         audit_logger: AuditLogger,

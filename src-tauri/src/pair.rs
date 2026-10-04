@@ -2321,6 +2321,11 @@ pub fn pair_via_browser(
             );
             let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
                 .map_err(|e| format!("tokio listener wrap failed: {e}"))?;
+            // Only this runner's own OS user may deliver the callback (plan
+            // 2026-10-04-runner-loopback-api-refuses-other-local-users).
+            let tokio_listener =
+                crate::peer_user_guard::GuardedListener::wrap(tokio_listener, "pair-callback")
+                    .map_err(|e| format!("peer user guard wrap failed: {e}"))?;
             // Run until our flag flips, with a 5-minute hard timeout.
             let serve = axum::serve(tokio_listener, app);
             let timeout = tokio::time::sleep(Duration::from_secs(300));
