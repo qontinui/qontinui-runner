@@ -44,7 +44,7 @@
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use super::{CiCancelPayload, CiDispatchPayload};
+use qontinui_ci_exec::dispatch::{route, DispatchEvent};
 
 /// Base (and reset) reconnect back-off, ms — same posture as
 /// `agent_runtime::BACKOFF_BASE_MS`.
@@ -249,14 +249,16 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
         return Ok(());
     };
     match kind {
-        CiChannel::BuildRequested => match serde_json::from_value::<CiDispatchPayload>(inner) {
-            Ok(payload) => super::admission::submit(payload),
-            Err(e) => warn!("ci_node: build_requested payload did not parse: {e}"),
-        },
-        CiChannel::BuildCancelled => match serde_json::from_value::<CiCancelPayload>(inner) {
-            Ok(cancel) => super::admission::cancel(&cancel.dispatch_id),
-            Err(e) => warn!("ci_node: build_cancelled payload did not parse: {e}"),
-        },
+        CiChannel::BuildRequested => route(
+            &super::admission::NodeAdmission,
+            DispatchEvent::BuildRequested,
+            inner,
+        ),
+        CiChannel::BuildCancelled => route(
+            &super::admission::NodeAdmission,
+            DispatchEvent::BuildCancelled,
+            inner,
+        ),
         CiChannel::SettingsRequested => {
             match serde_json::from_value::<super::settings_directive::CiSettingsDirective>(inner) {
                 Ok(directive) => super::settings_directive::apply(directive),

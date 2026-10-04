@@ -27,7 +27,15 @@
 //! customers' machines. The result route proves WHICH device is reporting for
 //! WHICH dispatch, and coord already knows that dispatch's repo, sha and
 //! tenant — so the artifact carries no attribution at all and a runner cannot
-//! spoof another tenant's merge-gate inputs. See [`junit`].
+//! spoof another tenant's merge-gate inputs. See `qontinui_ci_exec::junit`.
+//!
+//! The executor itself — checkout, the `.qontinui/ci.toml` manifest, tool,
+//! sibling and service provisioning, the steps, the JUnit capture — is the
+//! shared `qontinui-ci-exec` crate (qontinui-schemas `ci-exec`), the same one
+//! the CI host agent and the standalone `qontinui-ci` CLI run. This module is
+//! the runner as a HOST of it: the coord subscription, admission, reporting,
+//! the owner's settings directive, and the runner's implementations of the
+//! crate's host traits ([`host`]).
 //!
 //! The executed commands come EXCLUSIVELY from the repo's own
 //! `.qontinui/ci.toml` at the dispatched SHA (coord supplies no commands —
@@ -41,99 +49,12 @@
 //! surface).
 
 pub(crate) mod admission;
-pub(crate) mod canonical;
-pub(crate) mod checkout;
-pub(crate) mod executor;
-pub(crate) mod host_sizing;
-pub(crate) mod junit;
-pub(crate) mod manifest;
+pub(crate) mod host;
 pub(crate) mod reporting;
-pub(crate) mod services;
 pub(crate) mod settings_directive;
-pub(crate) mod sibling;
 pub(crate) mod subscription;
-pub(crate) mod tools;
 
-use serde::Deserialize;
 use tracing::info;
-
-/// Default manifest path when the dispatch omits it.
-fn default_manifest_path() -> String {
-    ".qontinui/ci.toml".to_string()
-}
-
-/// A `events.ci.build_requested.<device_id>` dispatch payload. Unknown
-/// fields are tolerated (coord may grow the shape); `manifest_path` and
-/// `coord_http_url` degrade to sane defaults so a slightly-lean payload is
-/// still runnable/reportable.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct CiDispatchPayload {
-    pub dispatch_id: String,
-    /// Coord repo slug (`owner/name`) or bare repo name.
-    pub repo: String,
-    pub head_sha: String,
-    /// Resolved fetch URL (for coord-origin repos this is the git door /
-    /// mirror — a branch pushed only to GitHub is invisible there, memory
-    /// `reference_coord_origin_branch_push_must_use_git_door`).
-    pub fetch_url: String,
-    /// `refs/heads/merge-candidate/<proposal_id>`.
-    pub candidate_ref: String,
-    /// Pull request this dispatch is validating, when there is one.
-    ///
-    /// This is the ONLY key the sibling declaration rule turns on
-    /// ([`sibling::resolve_declaration`]), and its absence is a real answer,
-    /// not a gap to paper over: coord pushes the SAME
-    /// `refs/heads/merge-candidate/<proposal_id>` into every repo of a
-    /// multi-repo proposal, so a dispatch with no pull request resolves
-    /// siblings to their branch WITHOUT a declaration probe — exactly what
-    /// the Actions composite action does off a `pull_request` event, and for
-    /// the same reason (the candidate ref is force-pushed and deleted as the
-    /// proposal resolves).
-    ///
-    /// Coord does not populate this today; until it does, every dispatch
-    /// takes the branch path. Wiring it is a coord-side change to the
-    /// `events.ci.build_requested.<device_id>` payload.
-    #[serde(default)]
-    pub pr_number: Option<u64>,
-    #[serde(default = "default_manifest_path")]
-    pub manifest_path: String,
-    /// Check-run context coord will publish the verdict under. The runner
-    /// only logs it (the verdict write is coord-side, keyed by dispatch_id).
-    #[serde(default)]
-    pub check_name: String,
-    /// Coord HTTP base for the progress/result POSTs. Empty ⇒ fall back to
-    /// the active profile's coord base.
-    #[serde(default)]
-    pub coord_http_url: String,
-}
-
-/// A `events.ci.build_cancelled.<device_id>` payload.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct CiCancelPayload {
-    pub dispatch_id: String,
-}
-
-/// A dispatch_id is used in filesystem paths (`.ci-worktrees/<id>`) and in
-/// the progress/result URL path, so it must be a plain token. Coord mints
-/// UUIDs; anything else is dropped before it can touch disk or a URL.
-pub(crate) fn dispatch_id_is_safe(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// The repo slug is joined into local paths via its basename; require plain
-/// `owner/name`-style tokens so a hostile slug can't traverse.
-pub(crate) fn repo_slug_is_safe(repo: &str) -> bool {
-    !repo.is_empty()
-        && repo.len() <= 200
-        && !repo.contains("..")
-        && repo
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-}
 
 /// Spawn the CI-node runtime. Mirrors `agent_runtime::spawn_runtime`:
 /// no device identity or coord base ⇒ inert.
@@ -171,71 +92,114 @@ pub fn shutdown_all() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use qontinui_ci_exec::manifest::{parse_and_validate, SiblingPin, CANONICAL_TOOLCHAINS};
+    use qontinui_ci_exec::sibling::{lookup_pin, SIBLING_PIN_FILE};
 
+    /// The executor's closed set of `[canonical]` toolchains is exactly the set
+    /// `env_agent` has a version-manager cascade for — the runner is the host
+    /// that converges them, so a key on one side only would validate and then
+    /// be unsatisfiable (or be convergeable and never declarable).
     #[test]
-    fn dispatch_id_safety_gate() {
-        assert!(dispatch_id_is_safe("0198f2b4-1111-7aaa-bbbb-cccccccccccc"));
-        assert!(dispatch_id_is_safe("abc_DEF-123"));
-        assert!(!dispatch_id_is_safe(""));
-        assert!(!dispatch_id_is_safe("../../etc"));
-        assert!(!dispatch_id_is_safe("a/b"));
-        assert!(!dispatch_id_is_safe("a b"));
-        assert!(!dispatch_id_is_safe(&"x".repeat(65)));
+    fn canonical_toolchains_are_exactly_what_env_agent_converges() {
+        let appliable: Vec<&str> = qontinui_runner_lib::env_agent::apply_versions::APPLIABLE_TOOLS
+            .iter()
+            .map(|t| t.key())
+            .collect();
+        assert_eq!(CANONICAL_TOOLCHAINS, appliable.as_slice());
     }
 
+    /// Lane parity on this repo's REAL files, so the audit the manifests ask
+    /// for in prose ("when ci.yml's clone list changes, change this list in
+    /// the same PR") fails `cargo test` instead of waiting for an incident:
+    ///
+    /// * `.qontinui/ci.toml` parses and validates as shipped;
+    /// * every `[[siblings]]` entry that says `pin-file` is listed in
+    ///   `.github/sibling-pins.conf` with a usable SHA, and no entry of any
+    ///   kind is listed there UNUSABLY (a half-finished bump on `main` would
+    ///   red the Actions lane too, so it is caught here first);
+    /// * every repo the pin file lists is a declared sibling here — a pin for
+    ///   a repo this lane never checks out is a pin nothing reads, i.e. the
+    ///   two lanes' sibling lists have drifted;
+    /// * every repo the pin file lists that this lane does NOT read the pin
+    ///   for (a listed sibling on `declared-adaptation` / `default-branch`)
+    ///   is named in [`KNOWN_DIVERGENT`] — the ci.toml block that records
+    ///   the divergence is prose, and this is what makes an UNRECORDED one
+    ///   red: a sibling the Actions lane pins and this lane floats, with no
+    ///   line here admitting it. When the two entries flip to `pin-file`
+    ///   the list empties, and it must, because an entry left in it that
+    ///   is no longer divergent is refused too.
+    ///
+    /// Read against the checked-in bytes (`include_str!`), never a copy:
+    /// a copy is the second source of truth this whole mechanism exists to
+    /// avoid.
     #[test]
-    fn repo_slug_safety_gate() {
-        assert!(repo_slug_is_safe("qontinui/qontinui-runner"));
-        assert!(repo_slug_is_safe("qontinui-runner"));
-        assert!(repo_slug_is_safe("owner/repo.name"));
-        assert!(!repo_slug_is_safe(""));
-        assert!(!repo_slug_is_safe("owner/../secret"));
-        assert!(!repo_slug_is_safe("repo name"));
-        assert!(!repo_slug_is_safe("repo\\name"));
-    }
+    fn this_repo_manifests_agree_on_which_siblings_are_pinned() {
+        /// Siblings the pin file lists that `.qontinui/ci.toml` deliberately
+        /// does NOT read the pin for yet — its DECLARED DIVERGENCE block says
+        /// why (coord's allocate-lane reader must accept `pin-file` first).
+        /// Deleting the divergence deletes the entry here, in the same PR.
+        const KNOWN_DIVERGENT: &[&str] = &[
+            "qontinui/qontinui-schemas",
+            "qontinui/qontinui-web",
+            "qontinui/ui-bridge",
+        ];
 
-    /// The dispatch payload parses from the pinned wire contract, and the
-    /// two optional fields default when omitted.
-    #[test]
-    fn dispatch_payload_parses_pinned_contract() {
-        let full: CiDispatchPayload = serde_json::from_value(serde_json::json!({
-            "dispatch_id": "0198f2b4-1111-7aaa-bbbb-cccccccccccc",
-            "repo": "qontinui/qontinui-runner",
-            "head_sha": "deadbeef",
-            "fetch_url": "https://github.com/qontinui/qontinui-runner.git",
-            "candidate_ref": "refs/heads/merge-candidate/42",
-            "manifest_path": ".qontinui/ci.toml",
-            "check_name": "qontinui-ci-node",
-            "coord_http_url": "https://coord.qontinui.io",
-        }))
-        .expect("pinned contract must parse");
-        assert_eq!(full.manifest_path, ".qontinui/ci.toml");
-        assert_eq!(full.check_name, "qontinui-ci-node");
-        assert_eq!(full.pr_number, None);
-
-        // The sibling declaration key, when coord grows it.
-        let with_pr: CiDispatchPayload = serde_json::from_value(serde_json::json!({
-            "dispatch_id": "d1",
-            "repo": "r",
-            "head_sha": "s",
-            "fetch_url": "u",
-            "candidate_ref": "refs/heads/merge-candidate/1",
-            "pr_number": 1008,
-        }))
-        .expect("pr_number must parse");
-        assert_eq!(with_pr.pr_number, Some(1008));
-
-        let lean: CiDispatchPayload = serde_json::from_value(serde_json::json!({
-            "dispatch_id": "d1",
-            "repo": "r",
-            "head_sha": "s",
-            "fetch_url": "u",
-            "candidate_ref": "refs/heads/merge-candidate/1",
-        }))
-        .expect("lean payload must parse with defaults");
-        assert_eq!(lean.manifest_path, ".qontinui/ci.toml");
-        assert!(lean.check_name.is_empty());
-        assert!(lean.coord_http_url.is_empty());
+        let ci_toml = include_str!("../../../.qontinui/ci.toml");
+        let pin_file = include_str!("../../../.github/sibling-pins.conf");
+        let manifest = parse_and_validate(ci_toml)
+            .expect("this repo's own .qontinui/ci.toml must parse and validate");
+        assert!(
+            !manifest.siblings.is_empty(),
+            "this repo declares siblings; an empty list means the wrong file was read"
+        );
+        for s in &manifest.siblings {
+            let pinned = lookup_pin(pin_file, &s.repo).unwrap_or_else(|e| {
+                panic!("{SIBLING_PIN_FILE} entry for {} is unusable: {e}", s.repo)
+            });
+            let reads_pin = s.pin == SiblingPin::PinFile;
+            let admitted = KNOWN_DIVERGENT.contains(&s.repo.as_str());
+            match (reads_pin, pinned.is_some(), admitted) {
+                (true, false, _) => panic!(
+                    "{} says pin = \"pin-file\" in .qontinui/ci.toml but {SIBLING_PIN_FILE} does \
+                     not list it — every dispatch would hard-fail on this sibling",
+                    s.repo
+                ),
+                (true, true, true) => panic!(
+                    "{} reads its pin now; drop it from KNOWN_DIVERGENT — the divergence it \
+                     admits no longer exists",
+                    s.repo
+                ),
+                (false, true, false) => panic!(
+                    "{SIBLING_PIN_FILE} pins {} but .qontinui/ci.toml resolves it by {:?}, and \
+                     nothing admits the divergence: the Actions lane compiles against the pinned \
+                     commit while this lane floats. Either set pin = \"pin-file\" or record why \
+                     not in ci.toml's DECLARED DIVERGENCE block AND in KNOWN_DIVERGENT here",
+                    s.repo, s.pin
+                ),
+                (false, false, true) => panic!(
+                    "{} is in KNOWN_DIVERGENT but {SIBLING_PIN_FILE} does not list it — there is \
+                     no pin to diverge from; drop the entry",
+                    s.repo
+                ),
+                (true, true, false) | (false, true, true) | (false, false, false) => {}
+            }
+        }
+        let declared: Vec<&str> = manifest.siblings.iter().map(|s| s.repo.as_str()).collect();
+        let listed: Vec<&str> = pin_file
+            .lines()
+            .map(|l| l.split_once('#').map_or(l, |(code, _)| code))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert!(
+            !listed.is_empty(),
+            "{SIBLING_PIN_FILE} lists no repos; an empty list means the wrong file was read"
+        );
+        for repo in listed {
+            assert!(
+                declared.contains(&repo),
+                "{SIBLING_PIN_FILE} pins {repo}, which .qontinui/ci.toml does not declare as a \
+                 sibling — the two lanes' sibling lists have drifted"
+            );
+        }
     }
 }

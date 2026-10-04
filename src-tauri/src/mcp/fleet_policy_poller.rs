@@ -4031,7 +4031,7 @@ mod tests {
     /// the two resolvers return the same `PathBuf` and differ only in a side
     /// effect, which no equality assertion over the RETURN VALUE can
     /// distinguish. So part (1) asserts on the source of the resolution, the way
-    /// `agent_worktree::census` and `ci_node::services` already assert source
+    /// `agent_worktree::census` and `qontinui_ci_exec::services` already assert source
     /// invariants in this crate. Restore the ensuring call and it fails.
     ///
     /// But a source invariant bans a SPELLING, not a behaviour, and this body

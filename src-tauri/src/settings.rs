@@ -2429,7 +2429,7 @@ mod ci_node_tests {
     /// admission); None resolves to the host suggestion.
     #[test]
     fn ci_node_effective_capacity_prefers_explicit_then_suggestion() {
-        use crate::ci_node::host_sizing::HostCapacity;
+        use qontinui_ci_exec::host_sizing::HostCapacity;
         const GIB: u64 = 1024 * 1024 * 1024;
         let big = HostCapacity {
             mem_bytes: Some(368 * GIB),
@@ -2823,7 +2823,7 @@ pub struct CiNodeSettings {
     ///
     /// `None` (the default, and what a missing key loads as) means "never
     /// configured — use the host's suggestion"
-    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds`]).
+    /// ([`qontinui_ci_exec::host_sizing::suggested_concurrent_builds`]).
     /// `Some(n)` is an explicit operator value and always wins; an existing
     /// settings.json carrying a number stays explicit. Read it through
     /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
@@ -2856,7 +2856,7 @@ pub struct CiNodeSettings {
     /// all.
     ///
     /// With this false a drifted box does not silently build anyway: the
-    /// dispatch is REFUSED with the drift named (`ci_node::canonical`). Off
+    /// dispatch is REFUSED with the drift named (`qontinui_ci_exec::canonical`). Off
     /// means "do not touch my toolchains", not "ignore the declaration".
     #[serde(default)]
     pub canonical_converge: bool,
@@ -2873,11 +2873,11 @@ impl CiNodeSettings {
     /// reads this.
     pub(crate) fn configured_or_suggested_builds(
         &self,
-        host: crate::ci_node::host_sizing::HostCapacity,
+        host: qontinui_ci_exec::host_sizing::HostCapacity,
     ) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n,
-            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host),
+            None => qontinui_ci_exec::host_sizing::suggested_concurrent_builds(host),
         }
     }
 
@@ -2887,7 +2887,7 @@ impl CiNodeSettings {
     /// Pure.
     pub(crate) fn effective_max_concurrent_builds_for(
         &self,
-        host: crate::ci_node::host_sizing::HostCapacity,
+        host: qontinui_ci_exec::host_sizing::HostCapacity,
     ) -> u32 {
         self.configured_or_suggested_builds(host).max(1)
     }
@@ -2897,7 +2897,9 @@ impl CiNodeSettings {
     pub fn effective_max_concurrent_builds(&self) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n.max(1),
-            None => self.effective_max_concurrent_builds_for(crate::ci_node::host_sizing::probe()),
+            None => {
+                self.effective_max_concurrent_builds_for(qontinui_ci_exec::host_sizing::probe())
+            }
         }
     }
 }

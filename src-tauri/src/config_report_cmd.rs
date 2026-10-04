@@ -4518,8 +4518,8 @@ mod tests {
     ///
     /// - an **empty username** — `redis://:password@host` is the canonical
     ///   pre-ACL Redis form, and this crate builds `redis://` URLs and exports
-    ///   `REDIS_URL` itself (`ci_node::services`, `ci_node::executor`,
-    ///   `bin/qontinui_profile`; `ci_node::manifest` names it alongside
+    ///   `REDIS_URL` itself (`qontinui_ci_exec::services`, `qontinui_ci_exec::executor`,
+    ///   `bin/qontinui_profile`; `qontinui_ci_exec::manifest` names it alongside
     ///   `DATABASE_URL` as a credential-bearing family);
     /// - an **`@` inside the username** — mandated by Azure Database for
     ///   PostgreSQL/MySQL Single Server (`user@servername`), and normal
