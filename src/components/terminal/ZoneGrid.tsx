@@ -13,7 +13,15 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
-import { Terminal, Filter, RefreshCw, MessageSquare } from "lucide-react";
+import {
+  Terminal,
+  Filter,
+  RefreshCw,
+  MessageSquare,
+  ChevronLeft,
+  ChevronRight,
+  Trash2,
+} from "lucide-react";
 import {
   TerminalInstance,
   type TerminalInstanceHandle,
@@ -25,7 +33,7 @@ import { WorkerSessionCell } from "./WorkerSessionCell";
 import { SuggestionChip } from "./suggestions";
 import { ZoneHoverActions } from "./ZoneHoverActions";
 import type { LayoutPreset } from "./useZoneLayout";
-import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX } from "./useZoneLayout";
+import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX, findNextZone } from "./useZoneLayout";
 import {
   STATE_BORDER_COLORS,
   STATE_COLORS,
@@ -191,6 +199,7 @@ function ZoneGridInner({
     pageId,
     markReconnected,
     renameTab,
+    closeTerminal,
   } = session;
   // terminalRefsRef holds a stable Map<tabId, ref> — it's a per-tab ref cache
   // that's written by TerminalInstance's ref callbacks, not state that drives
@@ -530,6 +539,43 @@ function ZoneGridInner({
   const isSingleView = layout.id === "single" || maximizedZone !== null;
   const singleViewZone = maximizedZone ?? 0;
 
+  // Maximized-view navigation: step to the previous/next OCCUPIED zone and stay
+  // maximized. `findNextZone` skips empty zones and wraps; zone indices are
+  // stable across a close (`reconcileAssignments` preserves in-range zones), so
+  // the target index computed before the close is still right after it.
+  const maximizedNeighbour = useCallback(
+    (direction: 1 | -1): number | null => {
+      const current = assignments[singleViewZone];
+      const next = findNextZone(
+        layout.zones.length,
+        singleViewZone,
+        assignments,
+        (id) => id !== current,
+        direction,
+      );
+      return next === singleViewZone ? null : next;
+    },
+    [assignments, layout.zones.length, singleViewZone],
+  );
+
+  const goToMaximizedZone = useCallback(
+    (zone: number) => {
+      zoneLayout.setMaximizedZone(zone);
+      zoneLayout.setFocusedZone(zone);
+    },
+    [zoneLayout],
+  );
+
+  const deleteAndForward = useCallback(() => {
+    const tabId = assignments[singleViewZone];
+    if (!tabId) return;
+    const next = maximizedNeighbour(1);
+    closeTerminal(tabId);
+    // With nowhere to go, leave `maximizedZone` alone: `useZoneLayout` returns
+    // to the grid when the maximized tab was closed.
+    if (next !== null) goToMaximizedZone(next);
+  }, [assignments, singleViewZone, maximizedNeighbour, closeTerminal, goToMaximizedZone]);
+
   const handleZoneMouseDown = useCallback(
     (zoneIndex: number, e: React.MouseEvent) => {
       onZoneClick(zoneIndex, e.ctrlKey || e.metaKey);
@@ -617,6 +663,8 @@ function ZoneGridInner({
     // A maximized zone owns the page, so its prompts go in the full-height
     // right-hand column rather than the short strip a tiled zone gets.
     const maximizedPromptsOpen = !!tab?.claudeSessionId && promptTabs.has(tab.id);
+    const prevZone = maximizedNeighbour(-1);
+    const nextZone = maximizedNeighbour(1);
 
     return (
       <div
@@ -652,9 +700,50 @@ function ZoneGridInner({
                 <MessageSquare className="w-3 h-3" />
               </button>
             )}
-            <span className="text-[9px] text-[#565f89] ml-auto">
-              Esc or double-click to restore
-            </span>
+            <div className="flex items-center gap-0.5 ml-auto">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (prevZone !== null) goToMaximizedZone(prevZone);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                disabled={prevZone === null}
+                className="p-0.5 rounded shrink-0 text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 disabled:opacity-30 disabled:pointer-events-none "
+                title="Previous terminal"
+                aria-label="Previous terminal"
+              >
+                <ChevronLeft className="w-3 h-3" />
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (nextZone !== null) goToMaximizedZone(nextZone);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                disabled={nextZone === null}
+                className="p-0.5 rounded shrink-0 text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 disabled:opacity-30 disabled:pointer-events-none "
+                title="Next terminal"
+                aria-label="Next terminal"
+              >
+                <ChevronRight className="w-3 h-3" />
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  deleteAndForward();
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                className="p-0.5 rounded shrink-0 text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 disabled:opacity-30 disabled:pointer-events-none hover:!text-[#f7768e]"
+                title="Delete this terminal and go to the next"
+                aria-label="Delete and forward"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
+            </div>
+            <span className="text-[9px] text-[#565f89]">Esc or double-click to restore</span>
           </div>
         )}
 
