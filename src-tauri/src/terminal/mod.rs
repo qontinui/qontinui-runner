@@ -946,7 +946,7 @@ mod tests {
     /// 2, a byte-identical body, the absence of a clause) is racing every test
     /// that publishes a posture unless both take this lock. The two
     /// byte-identical anchors below are the ones that would actually break.
-    fn quiet_credential_posture() -> std::sync::MutexGuard<'static, ()> {
+    fn quiet_credential_posture() -> crate::test_env::TestLockGuard {
         let guard = crate::mcp::device_jwt_refresher::posture_test_lock();
         crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
         guard

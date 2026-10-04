@@ -2253,6 +2253,7 @@ mod tests {
     /// store. `cargo test` runs a binary's tests in parallel threads, so two
     /// tests each calling `reset_provision_store` would otherwise erase each
     /// other's writes intermittently — a flake, not a finding.
+    // test-lock: standalone — module-private; its two holders take no other test lock and never touch env
     fn store_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
