@@ -135,7 +135,8 @@ impl GithubAccess for RunnerGithub {
 }
 
 /// The runner's process posture: `CREATE_NO_WINDOW`, the prompt-proof git
-/// environment, the [`ChildTreeGuard`] reaper, and the Job Objects.
+/// environment, the [`ChildTreeGuard`] reaper, the Job Objects, and the
+/// tracked blocking pool.
 pub(crate) struct RunnerProcess;
 
 struct RunnerTree(ChildTreeGuard);
@@ -161,6 +162,15 @@ impl ProcessSpawn for RunnerProcess {
     }
     fn step_containment(&self) -> Box<dyn StepContainment> {
         Box::new(DispatchJob::create())
+    }
+    /// Through the runner's tracked blocking lanes, so the executor's archive
+    /// extraction is counted with every other blocking body this runner runs.
+    fn run_blocking(
+        &self,
+        job: Box<dyn FnOnce() + Send>,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        let handle = spawn_blocking_tracked(job);
+        Box::pin(async move { handle.await.map_err(|e| e.to_string()) })
     }
 }
 
