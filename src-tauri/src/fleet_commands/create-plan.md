@@ -470,13 +470,13 @@ and the plan misleads every later reader
 That has already happened. This command previously described a six-tier
 `non_author_allows_identities` ladder over `{device, agent, session}` for the
 work-unit check. **That was wrong about the code**: re-verified on qontinui-coord
-`origin/main` 2026-09-23 at `037fc1a8f`,
+`origin/main` 2026-10-03 at `f32fb04ad`,
 `work_unit_registry::authorize_target_transition` takes the two actor keys
 **plus an optional `independence` declaration** (`{verified, against, context}`),
-and does the flat `owner == attester` compare **only when no declaration is
-sent** — a well-formed one authorizes an Attested transition without that
-compare, while still refusing `attester_unresolved` when the caller's token
-derives no actor key; `non_author_allows_identities` is called only from
+and does the device-grain `owner == attester` compare **only when no
+declaration is sent** — a well-formed one authorizes an Attested transition
+without that compare, while still refusing `attester_unresolved` when the
+caller's token derives no actor key; `non_author_allows_identities` is called only from
 `gates.rs`. Fourteen plan status blocks now carry that invented ladder as fact.
 
 ⚠️ **Whether the coord instance serving YOU advertises that declaration is a
@@ -494,8 +494,8 @@ write landed. The declaration is STORED on the unit, so one you did not earn is
 a false witness statement with your actor key beside it.
 
 ⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`.
-The re-allocate prohibition is that refusal's alone: `attester_unresolved` wants a device-
-or agent-identified caller, which is a credential remedy rather than a route
+The re-allocate prohibition is that refusal's alone: `attester_unresolved` wants a caller
+coord admits as an SoD actor, which is a credential remedy rather than a route
 around a control.
 
 What you may safely rely on, because it is mechanism rather than policy: the
