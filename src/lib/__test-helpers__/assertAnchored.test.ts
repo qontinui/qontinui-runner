@@ -1,3 +1,6 @@
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
 import { afterEach, describe, it, expect, vi } from "vitest";
 
 import { assertAnchored, callsOf, subjectDir } from "./assertAnchored";
@@ -23,7 +26,11 @@ describe("assertAnchored", () => {
 });
 
 describe("subjectDir", () => {
-  const url = "file:///some/dir/x.test.ts";
+  // Built from a native absolute path: a literal `file:///some/dir/…` has no
+  // drive letter, and `fileURLToPath` rejects it on Windows.
+  const dir = path.resolve("some", "dir");
+  const url = pathToFileURL(path.join(dir, "x.test.ts")).href;
+  const ownDir = dir + path.sep;
   const saved = process.env.MP_STAGE;
 
   afterEach(() => {
@@ -34,12 +41,12 @@ describe("subjectDir", () => {
 
   it("is the test's own directory when MP_STAGE is unset", () => {
     delete process.env.MP_STAGE;
-    expect(subjectDir(url)).toBe("/some/dir/");
+    expect(subjectDir(url)).toBe(ownDir);
   });
 
   it("is the test's own directory when MP_STAGE is the empty string", () => {
     process.env.MP_STAGE = "";
-    expect(subjectDir(url)).toBe("/some/dir/");
+    expect(subjectDir(url)).toBe(ownDir);
   });
 
   it("honours MP_STAGE and warns, naming the staged directory", () => {
