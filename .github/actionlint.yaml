@@ -1,0 +1,24 @@
+# actionlint configuration — read by the `workflow-lint` job. Plan:
+# 2026-10-04-adopt-self-hosted-ci-scout-improvements, Phase 1. actionlint is
+# pinned at 1.7.12 and run with `-shellcheck=` (shellcheck is not a pinned
+# input of the job, so its findings would depend on the host).
+self-hosted-runner:
+  labels:
+    # The only runner registered to this repo: merytshost-public
+    # [self-hosted, Linux, X64, public-pool] (measured 2026-10-04).
+    - public-pool
+    # Used by toolcache-probe.yml (`[self-hosted, qontinui]`). Declared so the
+    # label is not reported as a typo, but NOTE: no runner registered to this
+    # repo carries it (2026-10-04), so that workflow cannot currently be
+    # picked up. Left unchanged here; it is runner-fleet placement, owned by
+    # plan 2026-10-04-coord-managed-ephemeral-self-hosted-ci-runner-fleet.
+    - qontinui
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      # Info-level shellcheck style notes, inert while the job passes
+      # `-shellcheck=`; kept so a local run with shellcheck enabled reports
+      # only what the job would act on.
+      - 'SC2086:info'
+      - 'SC2016:info'
+      - 'SC2129:style'
