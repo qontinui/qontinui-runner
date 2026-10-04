@@ -145,8 +145,11 @@ jobs:
           TAG: ${{ steps.get_version.outputs.tag }}
         run: |
           set -uo pipefail
-          out="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>&1)"
-          rc=$?
+          # `|| rc=$?`, not a bare capture then `rc=$?`: GitHub runs this as
+          # `bash -e`, which would exit on gh's non-zero BEFORE rc is read — so
+          # a brand-new version (no release yet) would fail with an empty log.
+          rc=0
+          out="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>&1)" || rc=$?
           if [[ $rc -ne 0 ]]; then
             if grep -qi 'release not found' <<<"${out}"; then
               echo "No release exists for ${TAG}; a new draft will be created."
