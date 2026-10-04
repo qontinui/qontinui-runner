@@ -74,7 +74,7 @@ pub(crate) struct CiSettingsDirective {
     #[serde(default)]
     pub enabled: bool,
     /// Absent or `null` = `None` = "use the host suggestion"
-    /// (`ci_node::host_sizing::suggested_concurrent_builds`); `Some(n)` is an
+    /// (`qontinui_ci_exec::host_sizing::suggested_concurrent_builds`); `Some(n)` is an
     /// explicit override, validated to `1..=64`. Carried through to
     /// `CiNodeSettings` verbatim, so a directive can express either.
     #[serde(default)]

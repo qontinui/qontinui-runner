@@ -14,7 +14,7 @@
 //!
 //! The runner is. It resolves its credential from `GITHUB_TOKEN` / `GH_TOKEN`
 //! or — the common case on an operator box — `gh auth token`
-//! (`session_pr_reconciler::resolve_github_token`, `ci_node::sibling`), which
+//! (`session_pr_reconciler::resolve_github_token`, `qontinui_ci_exec::sibling`), which
 //! is the *same user token the sampler measured*. It then polls on that token
 //! every 30s (`session_pr_reconciler::POLL_INTERVAL`) and as often as every 10s
 //! (`trigger_system::watchers::pr_watcher`). Re-measured 2026-09-01:

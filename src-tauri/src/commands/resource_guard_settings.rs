@@ -284,8 +284,8 @@ pub fn save_session_guard_settings(
 /// `2026-09-22-ci-capacity-is-hand-typed-...`, Phase 2): what an unset value
 /// resolves to on this host, the two host terms it was derived from, and which
 /// of them binds — so a value above it can be warned about by name.
-fn host_suggestion_json(cap: crate::ci_node::host_sizing::HostCapacity) -> serde_json::Value {
-    let (suggested, limiting_term) = crate::ci_node::host_sizing::suggestion_with_limit(cap);
+fn host_suggestion_json(cap: qontinui_ci_exec::host_sizing::HostCapacity) -> serde_json::Value {
+    let (suggested, limiting_term) = qontinui_ci_exec::host_sizing::suggestion_with_limit(cap);
     serde_json::json!({
         "suggested": suggested,
         "cpus": cap.cpus,
@@ -307,7 +307,7 @@ fn get_ci_node_settings_impl() -> Result<CommandResponse, AppError> {
     if let Some(obj) = data.as_object_mut() {
         obj.insert(
             "host_suggestion".to_string(),
-            host_suggestion_json(crate::ci_node::host_sizing::probe()),
+            host_suggestion_json(qontinui_ci_exec::host_sizing::probe()),
         );
     }
 
@@ -579,7 +579,7 @@ mod tests {
     /// the binding one.
     #[test]
     fn host_suggestion_payload_shape() {
-        let v = host_suggestion_json(crate::ci_node::host_sizing::HostCapacity {
+        let v = host_suggestion_json(qontinui_ci_exec::host_sizing::HostCapacity {
             mem_bytes: Some(368 * GIB),
             cpus: 48,
         });
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(v["cpus"], 48);
         assert_eq!(v["mem_gib"], 368);
         assert_eq!(v["limiting_term"], "cores");
-        let unknown = host_suggestion_json(crate::ci_node::host_sizing::HostCapacity {
+        let unknown = host_suggestion_json(qontinui_ci_exec::host_sizing::HostCapacity {
             mem_bytes: None,
             cpus: 8,
         });

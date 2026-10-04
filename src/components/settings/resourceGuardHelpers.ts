@@ -43,7 +43,7 @@ export const MAX_CONCURRENT_BUILDS_MAX = 64;
  * The runner's host-derived capacity suggestion, returned beside
  * `settings::CiNodeSettings` by `get_ci_node_settings` (Rust:
  * `commands::resource_guard_settings::host_suggestion_json`, over
- * `ci_node::host_sizing::suggestion_with_limit`). `mem_gib` and
+ * `qontinui_ci_exec::host_sizing::suggestion_with_limit`). `mem_gib` and
  * `limiting_term` are null when the host's memory could not be read.
  */
 export interface CiNodeHostSuggestion {

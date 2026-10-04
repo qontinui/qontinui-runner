@@ -16,7 +16,7 @@
 //! what it is about — no repo, no head sha, no tenant. Coord attributes it
 //! from its own dispatch row. That is what lets this lane use the device JWT
 //! rather than the fleet-wide `COORD_INGEST_TOKEN`, which must never be
-//! shipped to a customer machine; see [`super::junit`] before changing it.
+//! shipped to a customer machine; see `qontinui_ci_exec::junit` before changing it.
 //!
 //! Auth posture: **device-JWT bearer on every POST** (plan §4.3). Coord
 //! mounts both routes behind `require_jwt` and 403s any caller whose JWT
@@ -36,6 +36,11 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use qontinui_ci_exec::canonical::Outcome as CanonicalOutcome;
+use qontinui_ci_exec::host::BoxFuture;
+use qontinui_ci_exec::junit::TestArtifact;
+use qontinui_ci_exec::report::{LogSink, Reporter, StepSummary, Verdict};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -139,16 +144,8 @@ struct ProgressBody<'a> {
     progress_seq: u64,
 }
 
-/// One step's row in the result summary.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct StepSummary {
-    pub name: String,
-    /// `success` | `failure` | `cancelled`.
-    pub conclusion: String,
-    pub duration_secs: u64,
-}
-
-/// Streaming sink for one dispatch: `push()` lines from any task; a
+/// Streaming sink for one dispatch: lines pushed through its [`LinePusher`]s
+/// from any task; a
 /// dedicated flusher batches them to the progress route with a monotonic
 /// `progress_seq` and an on-failure retry queue. `finish()` closes the
 /// stream, drains what it can, and hands back the log tail.
@@ -173,16 +170,9 @@ impl ProgressSink {
         Self { tx, tail, flusher }
     }
 
-    /// Record one output line (tail ring + progress batch). Never blocks.
-    pub(crate) fn push(&self, line: &str) {
-        if let Ok(mut tail) = self.tail.lock() {
-            tail.push(line);
-        }
-        // A closed channel means finish() already ran — tail-only is fine.
-        let _ = self.tx.send(line.to_string());
-    }
-
-    /// A cloneable line-pusher for the stdout/stderr pump tasks.
+    /// A cloneable line-pusher — the executor's [`LogSink`]. Every clone must
+    /// be dropped before [`Self::finish`], which drains until the last sender
+    /// is gone.
     pub(crate) fn pusher(&self) -> LinePusher {
         LinePusher {
             tx: self.tx.clone(),
@@ -200,15 +190,17 @@ impl ProgressSink {
     }
 }
 
-/// Clone-able handle for pump tasks (same behavior as [`ProgressSink::push`]).
+/// Clone-able handle onto a [`ProgressSink`]: each line goes to the tail ring
+/// and the progress batch. Never blocks; a closed channel (finish already ran)
+/// keeps the tail only.
 #[derive(Clone)]
 pub(crate) struct LinePusher {
     tx: mpsc::UnboundedSender<String>,
     tail: Arc<Mutex<TailRing>>,
 }
 
-impl LinePusher {
-    pub(crate) fn push(&self, line: &str) {
+impl LogSink for LinePusher {
+    fn push(&self, line: &str) {
         if let Ok(mut tail) = self.tail.lock() {
             tail.push(line);
         }
@@ -363,41 +355,13 @@ async fn flusher_loop(
     }
 }
 
-/// Proof that a dispatch's result POST has been ATTEMPTED to completion —
-/// i.e. coord accepted it, refused it terminally, or the bounded retry
-/// schedule was exhausted.
-///
-/// This is a capability token, not a status: it exists so the dispatch
-/// worktree cannot be deleted before the reporting step has run. The report
-/// carries the JUnit artifact, and the JUnit artifact lives INSIDE the
-/// worktree, so "clean up, then report" silently destroys coord's Tier-7 gate
-/// input — the exact bug this type makes unrepresentable. The only way to mint
-/// one is [`post_result`], and the only consumer is
-/// `executor::DispatchWorkspace::cleanup`.
-///
-/// Do not derive `Default`, `Clone` or `Copy` on this, and do not construct it
-/// outside this module — every one of those would reopen the ordering hole.
-#[must_use = "a dispatch's worktree may only be cleaned up once its result has been reported"]
-pub(crate) struct ResultReported(());
-
-impl ResultReported {
-    /// TEST-ONLY receipt, so `DispatchWorkspace::cleanup` can be exercised
-    /// without a coord to POST to. `#[cfg(test)]` keeps the production
-    /// ordering guarantee intact: no shipped code path can reach this, so
-    /// cleanup still cannot run before a real `post_result`.
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        ResultReported(())
-    }
-}
-
 /// POST the final result, retrying on the [`RESULT_RETRY_SECS`] schedule.
 /// `reason` adds a `reason` key next to `steps` (used for admission
 /// rejections).
 ///
 /// `test_results` is this dispatch's captured JUnit artifact
-/// ([`super::junit::capture`]). It is a REQUIRED parameter — `None` is
-/// spelled explicitly at the call sites that genuinely have no artifact
+/// (`qontinui_ci_exec::junit::capture`). It is a REQUIRED parameter — `None`
+/// is spelled explicitly at the call sites that genuinely have no artifact
 /// (admission rejections, pre-checkout failures) — because an optional
 /// parameter with a default is exactly how the artifact went missing before:
 /// the file was emitted, then deleted, and nothing in the type system noticed.
@@ -405,7 +369,12 @@ impl ResultReported {
 /// The artifact carries NO attribution (`{format, raw}` only). Coord derives
 /// repo/head-sha/tenant from its own dispatch row, which is why this lane can
 /// use the device JWT instead of the fleet-wide `COORD_INGEST_TOKEN` — see
-/// [`super::junit`].
+/// `qontinui_ci_exec::junit`.
+///
+/// The executor's capture-before-cleanup receipt is minted by the crate after
+/// the reporter returns (`qontinui_ci_exec::report`), so this returns nothing:
+/// it is ATTEMPTED to completion — accepted, refused terminally, or the
+/// bounded retry schedule exhausted — before it returns either way.
 pub(crate) async fn post_result(
     coord_base: &str,
     dispatch_id: &str,
@@ -413,13 +382,13 @@ pub(crate) async fn post_result(
     steps: &[StepSummary],
     reason: Option<&str>,
     log_tail: &str,
-    test_results: Option<&super::junit::TestArtifact>,
+    test_results: Option<&TestArtifact>,
     // The canonical-configuration verdict. `None` means the gate had not run
     // yet at this exit (the manifest was not even parsed), which is reported
     // as `not_evaluated` — a different statement from `not_requested`, and
     // neither of them an absence for a consumer to interpret.
-    canonical: Option<&super::canonical::Outcome>,
-) -> ResultReported {
+    canonical: Option<&CanonicalOutcome>,
+) {
     let url = format!(
         "{}/coord/ci/dispatches/{}/result",
         coord_base.trim_end_matches('/'),
@@ -457,7 +426,7 @@ pub(crate) async fn post_result(
         .build()
     else {
         warn!("ci_node: reqwest client build failed; result POST skipped");
-        return ResultReported(());
+        return;
     };
     let mut attempts = 0usize;
     loop {
@@ -497,7 +466,7 @@ pub(crate) async fn post_result(
                 if let Some(note) = test_results_note(ok_body.as_deref(), test_results.is_some()) {
                     warn!("ci_node: dispatch {dispatch_id} {note}");
                 }
-                return ResultReported(());
+                return;
             }
             PostDisposition::TerminalConflict => {
                 // Coord already holds a terminal state (e.g. the lease
@@ -508,14 +477,14 @@ pub(crate) async fn post_result(
                     "ci_node: result POST for dispatch {dispatch_id} conflicted (409) — \
                      coord already recorded a terminal state; dropping"
                 );
-                return ResultReported(());
+                return;
             }
             PostDisposition::GiveUp => {
                 warn!(
                     "ci_node: result POST for dispatch {dispatch_id} rejected \
                      (status {status:?}) — non-retryable; dropping"
                 );
-                return ResultReported(());
+                return;
             }
             PostDisposition::Retry => {}
         }
@@ -526,7 +495,7 @@ pub(crate) async fn post_result(
                 attempts + 1,
                 dispatch_id
             );
-            return ResultReported(());
+            return;
         }
         let delay = RESULT_RETRY_SECS[attempts];
         warn!(
@@ -598,7 +567,7 @@ pub(crate) fn post_cancelled_result_detached(
     tokio::spawn(async move {
         // No artifact by construction: admission rejects BEFORE any checkout
         // exists, so there is no worktree that could have produced a report.
-        let _reported = post_result(
+        post_result(
             &coord_base,
             &dispatch_id,
             "cancelled",
@@ -612,6 +581,58 @@ pub(crate) fn post_cancelled_result_detached(
         )
         .await;
     });
+}
+
+/// The coord reporter for one dispatch: progress lines stream through a
+/// [`ProgressSink`], and the verdict is the result POST.
+pub(crate) struct CoordReporter {
+    coord_base: String,
+    dispatch_id: String,
+    sink: ProgressSink,
+}
+
+impl CoordReporter {
+    /// Start streaming for `dispatch_id`. `cancel` is the dispatch's token: a
+    /// terminal ledger state on a progress response cancels it (see
+    /// [`ProgressSink::start`]).
+    pub(crate) fn start(
+        coord_base: String,
+        dispatch_id: String,
+        cancel: CancellationToken,
+    ) -> Self {
+        let sink = ProgressSink::start(coord_base.clone(), dispatch_id.clone(), cancel);
+        Self {
+            coord_base,
+            dispatch_id,
+            sink,
+        }
+    }
+}
+
+impl Reporter for CoordReporter {
+    fn sink(&self) -> Arc<dyn LogSink> {
+        Arc::new(self.sink.pusher())
+    }
+
+    fn report<'a>(self: Box<Self>, verdict: Verdict<'a>) -> BoxFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            let tail = self.sink.finish().await;
+            post_result(
+                &self.coord_base,
+                &self.dispatch_id,
+                verdict.conclusion.as_str(),
+                verdict.steps,
+                verdict.reason,
+                &tail,
+                verdict.test_results,
+                verdict.canonical,
+            )
+            .await;
+        })
+    }
 }
 
 #[cfg(test)]
@@ -746,8 +767,8 @@ mod tests {
     /// absent from the body entirely when there is none.
     #[test]
     fn result_body_carries_the_artifact_under_test_results() {
-        let artifact = super::super::junit::TestArtifact {
-            format: super::super::junit::FORMAT_JUNIT_XML,
+        let artifact = TestArtifact {
+            format: qontinui_ci_exec::junit::FORMAT_JUNIT_XML,
             raw: "<testsuites/>".to_string(),
         };
         let mut body = serde_json::json!({
