@@ -38,13 +38,14 @@ on:
   pull_request:
     branches: [main]
 
-# Workflow-level permissions for the GITHUB_TOKEN fallback path. The
-# auto-commit uses CLORINDE_AUTOCOMMIT_TOKEN (a PAT) for the push so
-# downstream workflows re-trigger; these permissions only matter if the
-# PAT is unavailable and we surface a check failure.
+# Read-only at the workflow level; the write scopes live on `clorinde-verify`,
+# the only job that commits (zizmor excessive-permissions). Those write scopes
+# are for the GITHUB_TOKEN fallback path: the auto-commit uses
+# CLORINDE_AUTOCOMMIT_TOKEN (a PAT) for the push so downstream workflows
+# re-trigger; they only matter if the PAT is unavailable and we surface a
+# check failure.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 env:
   # The `cargo check` re-run against fresh bindings compiles the whole
@@ -68,8 +69,9 @@ jobs:
     outputs:
       bindings_relevant: ${{ steps.changes.outputs.bindings_relevant }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Detect Clorinde-relevant changes
@@ -159,6 +161,9 @@ jobs:
     needs: detect
     if: needs.detect.outputs.bindings_relevant == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
 
     services:
       postgres:
@@ -183,8 +188,11 @@ jobs:
       # re-trigger CI, which is detected later as a soft failure with
       # an artifact upload.
       - name: Checkout qontinui-runner
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          # Explicitly persisted: a later step in this job pushes from this
+          # checkout with this step's token (zizmor artipacked: deliberate).
+          persist-credentials: true
           path: qontinui-runner
           ref: ${{ github.head_ref || github.ref }}
           fetch-depth: 0
@@ -212,8 +220,9 @@ jobs:
           fi
 
       - name: Checkout qontinui-web (sibling)
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           repository: qontinui/qontinui-web
           path: qontinui-web
           ref: ${{ steps.resolve_ref.outputs.ref }}
@@ -237,7 +246,7 @@ jobs:
         shell: bash
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -267,7 +276,7 @@ jobs:
         run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       # Cache the clorinde CLI binary so subsequent runs skip the ~5min
       # cargo install step. The cache key is fixed because clorinde
@@ -275,7 +284,7 @@ jobs:
       # invalidate when needed.
       - name: Cache clorinde CLI
         id: cache-clorinde
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/clorinde
           key: clorinde-cli-${{ runner.os }}-v1
@@ -381,7 +390,7 @@ jobs:
         if: |
           steps.drift.outputs.drift == 'true' &&
           (steps.autocommit.outputs.pushed != 'true')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: clorinde-bindings-fresh
           path: qontinui-runner/src-tauri/clorinde/

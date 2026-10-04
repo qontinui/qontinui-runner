@@ -70,8 +70,9 @@ jobs:
     outputs:
       doc_relevant: ${{ steps.changes.outputs.doc_relevant }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Detect onboarding-doc-relevant changes
@@ -152,7 +153,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout qontinui-runner
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # src-tauri/Cargo.toml path-depends on the SIBLING qontinui-schemas
       # checkout (`qontinui-types` = ../../qontinui-schemas/rust,
@@ -167,7 +170,7 @@ jobs:
         uses: ./.github/actions/checkout-sibling
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       # `coord_doctor` lives in the runner's lib crate, which pulls Tauri (and
       # therefore glib/gtk/webkit) even though the doc emit itself touches none
@@ -199,7 +202,7 @@ jobs:
             at-spi2-core
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry

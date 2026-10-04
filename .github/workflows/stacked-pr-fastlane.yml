@@ -146,8 +146,9 @@ jobs:
       rust: ${{ steps.diff.outputs.rust }}
       frontend: ${{ steps.diff.outputs.frontend }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           # Both `base.sha` and `head.sha` must be reachable for the diff below.
           fetch-depth: 0
 
@@ -227,7 +228,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # src-tauri/Cargo.toml has a path dep on ../../qontinui-schemas/rust, so
       # the crate does not resolve without this. Same action, same
@@ -248,12 +251,12 @@ jobs:
         uses: ./.github/actions/checkout-sibling
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"
@@ -265,7 +268,7 @@ jobs:
       # `cargo fmt`/`cargo clippy` auto-switch to a component-less 1.95.0 and
       # fail with "'cargo-fmt' is not installed".
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
@@ -319,7 +322,7 @@ jobs:
       # from one-shot PR branches are exactly what evicted main's caches on
       # 2026-07-17 (runner PR #792). Restore, never save.
       - name: Cache Rust dependencies (restore only)
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
           workspaces: ". -> target"
@@ -368,17 +371,19 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Mirror ci.yml's frontend setup EXACTLY: pnpm 10.33.2, node 20, pnpm
       # cache keyed on the root lockfile, frozen-lockfile install.
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"

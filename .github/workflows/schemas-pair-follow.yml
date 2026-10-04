@@ -105,7 +105,7 @@ jobs:
       followups: ${{ steps.decide.outputs.followups }}
       unknowns: ${{ steps.decide.outputs.unknowns }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -166,14 +166,14 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out main's pair-follow tooling
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: main
           persist-credentials: false
 
       - name: Check out the runner PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ matrix.item.head_sha }}
           path: runner
@@ -224,7 +224,7 @@ jobs:
 
       - name: Upload the pair-follow bundle
         if: steps.pin.outputs.MODE == 'FOLLOW' || steps.pin.outputs.MODE == 'MERGE_ONLY'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pair-follow-${{ matrix.item.pr }}
           path: ${{ runner.temp }}/out/
@@ -251,7 +251,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out main's pair-follow tooling
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: main
@@ -260,7 +260,7 @@ jobs:
       - name: Download the pair-follow bundle
         id: dl
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pair-follow-${{ matrix.item.pr }}
           path: ${{ runner.temp }}/out
@@ -286,7 +286,15 @@ jobs:
       - name: No bundle for this PR
         if: steps.dl.outcome != 'success'
         shell: bash
-        run: echo "No pair-follow bundle for #${{ matrix.item.pr }} — see the compute leg."
+        # A block scalar, not a plain one: in a plain YAML scalar ` #` opens a
+        # COMMENT, so the old one-liner reached bash as `echo "No pair-follow
+        # bundle for` — an unterminated quote that failed this step instead of
+        # printing the note (found by actionlint/shellcheck). The PR number is
+        # passed through env rather than spliced into the script.
+        env:
+          PR_NUMBER: ${{ matrix.item.pr }}
+        run: |
+          echo "No pair-follow bundle for #${PR_NUMBER} — see the compute leg."
 
   verdict:
     name: Pair-follow verdict
