@@ -14,7 +14,7 @@
 //! and `auth.rs` must be able to consult the canonical identity before falling
 //! back to its own encrypted cache.
 //!
-//! The PATH and the PARSE both come from `qontinui_runner_lib::ambient` (plan
+//! The PATH and the PARSE both come from `crate::ambient` (plan
 //! `2026-09-03-runner-tests-read-ambient-machine-state`): the dozen hand-rolled
 //! `dirs::home_dir()/.qontinui/machine.json` readers this module used to list
 //! as a follow-up are folded into that one seam, and a test that reaches it
@@ -29,9 +29,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// Path to the per-device identity file — [`qontinui_runner_lib::ambient::machine_json_path`].
+/// Path to the per-device identity file — [`crate::ambient::machine_json_path`].
 pub fn machine_file_path() -> Option<PathBuf> {
-    qontinui_runner_lib::ambient::machine_json_path()
+    crate::ambient::machine_json_path()
 }
 
 /// Read the stored `device_id` from an explicit `machine.json` path.
@@ -48,8 +48,7 @@ pub fn read_device_id_at(path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    let machine =
-        qontinui_runner_lib::ambient::read_machine_json_at(path).map_err(|e| e.to_string())?;
+    let machine = crate::ambient::read_machine_json_at(path).map_err(|e| e.to_string())?;
     machine.device_id.ok_or_else(|| {
         format!(
             "{} has an empty device_id — inspect it, or `rm` it and re-run \

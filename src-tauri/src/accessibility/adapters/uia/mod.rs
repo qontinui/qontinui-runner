@@ -39,8 +39,8 @@ use super::super::traits::{
 pub mod common;
 pub mod uia3;
 
+use crate::wedge_diagnostics::spawn_blocking_tracked;
 use common::{detect_patterns, interact_with_element, FocusChangedHandler, UiaState};
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ---------------------------------------------------------------------------
 // Backend trait

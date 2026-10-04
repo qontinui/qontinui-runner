@@ -44,14 +44,15 @@
 //!
 //! # Why the lib crate
 //!
-//! `process_helpers` — where spawn-time exhaustion surfaces first — is compiled
-//! into both the lib and the runner bin. A static declared in a shared module
-//! is two statics, each seeing half the traffic. So this module is declared
-//! ONLY by the lib, and every caller in either crate spells it
+//! `process_helpers` — where spawn-time exhaustion surfaces first — is a lib
+//! module, and the runner bin's heartbeat and allocator breadcrumb read the
+//! same state. A module declared in both crate roots would be two statics, each
+//! seeing half the traffic. So this module is declared ONLY by the lib: lib
+//! callers spell it `crate::util::resource_exhaustion` and bin callers
 //! `qontinui_runner_lib::util::resource_exhaustion`, the same arrangement
 //! `wedge_diagnostics` uses for its blocking-pool counter. The episode book and
-//! the cached memory reading depend on that for the same reason: one episode,
-//! one reading, whichever crate's copy of `process_helpers` saw the failure.
+//! the cached memory reading depend on that: one episode, one reading, for the
+//! whole process.
 //!
 //! # The descriptor stamp (plan `2026-09-09-the-pong-receive-path-has-no-
 //! liveness-signal-so-fd-exhaustion-still-reads-as-ui-death`)

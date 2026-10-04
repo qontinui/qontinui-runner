@@ -118,10 +118,13 @@ pub fn decode_jwt_exp(token: &str) -> Option<i64> {
 /// The `tenant_id` claim on a device JWT, decoded WITHOUT verifying the
 /// signature.
 ///
-/// A local minimal reader for the same reason [`default_binding_tenant`] is
-/// one: `auth` compiles into BOTH the lib and the bin crate, while
-/// `qontinui_runner_lib::pair::tenant_id_from_oauth_claim` — the canonical
-/// decoder, whose behaviour this matches — is lib-only.
+/// A local reader rather than a call to `crate::pair::tenant_id_from_oauth_claim`,
+/// because the two do NOT behave the same: this one also accepts a payload
+/// encoded WITH base64 padding (falling back to the padded alphabet, as
+/// [`decode_jwt_exp`] does), which the canonical decoder rejects, and it
+/// answers a parsed `Uuid` rather than the raw claim string.
+/// `minimal_reader_equivalence_tests` pins each fixture row, the disagreeing
+/// one included.
 ///
 /// Coord is the authority on the value; it is read here only to decide which
 /// LOCAL slot a credential belongs in, never as an authorization decision.
@@ -2302,11 +2305,16 @@ impl HeldDeviceTenants {
 }
 
 /// The device's DEFAULT binding tenant, read from `paired_user.json`
-/// (v2 `default_tenant_id`, legacy `tenant_id` fallback). Kept as a local
-/// minimal reader because `auth` compiles into BOTH the lib and bin crates
-/// while `pair` (the canonical v2-aware reader) is lib-only — same
-/// documented duplication pattern as the census/backstop `machine.json`
-/// readers. `None` on any failure (unpaired runner).
+/// (v2 `default_tenant_id`, legacy `tenant_id` fallback). `None` on any
+/// failure (unpaired runner).
+///
+/// A local reader rather than a call to
+/// `crate::pair::read_paired_tenant_id_from_disk`, because the two do NOT
+/// behave the same: `pair` parses into a struct whose `user_id` is required,
+/// so a file naming a default tenant without a `user_id` reads as absent
+/// there and as bound here; and `pair` answers `None` for a missing file and a
+/// corrupt one alike, which [`default_binding_tenant_probe`] must tell apart.
+/// `minimal_reader_equivalence_tests` pins each fixture row.
 ///
 /// Callers that DESTROY something on the strength of this answer must use
 /// [`default_binding_tenant_probe`] instead — `None` here is ambiguous.
@@ -3239,6 +3247,236 @@ mod jwt_exp_tests {
         assert!(!jwt_is_expired("qontinui_runner_abc123"));
         assert!(!jwt_is_expired(""));
         assert!(!jwt_is_expired("aaa.!!!.ccc"));
+    }
+}
+
+/// The equivalence tables that decided whether `auth`'s two local readers of
+/// pairing state delegate to the canonical `crate::pair` readers (plan
+/// `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`
+/// Phase 3).
+///
+/// Both readers were written as local copies only because `auth` used to
+/// compile into the bin too, where `crate::pair` does not exist. That reason is
+/// gone, so each one delegates only if it answers the SAME on every fixture
+/// row. Neither does, so both stay local; each table pins the rows where the
+/// two disagree, so a later "simplify into a call to `pair`" fails here
+/// instead of silently changing an answer.
+#[cfg(test)]
+mod minimal_reader_equivalence_tests {
+    use super::*;
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+
+    const T_A: &str = "11111111-2222-4333-8444-555555555551";
+    const T_B: &str = "11111111-2222-4333-8444-555555555552";
+    const USER: &str = "99999999-2222-4333-8444-555555555559";
+
+    fn uuid(s: &str) -> Uuid {
+        Uuid::parse_str(s).unwrap()
+    }
+
+    fn jwt_from_payload(payload_b64: &str) -> String {
+        format!(
+            "{}.{payload_b64}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#)
+        )
+    }
+
+    /// The canonical reader, projected to the local reader's return type: a
+    /// delegation would have to parse the claim into a `Uuid` exactly this way.
+    fn canonical_jwt_tenant(token: &str) -> Option<Uuid> {
+        crate::pair::tenant_id_from_oauth_claim(token).and_then(|s| Uuid::parse_str(s.trim()).ok())
+    }
+
+    /// [`jwt_tenant_claim`] against `pair::tenant_id_from_oauth_claim`.
+    ///
+    /// Outcome: KEPT LOCAL. Every row agrees except a payload encoded WITH
+    /// base64 padding, which the local reader accepts (it falls back to the
+    /// padded alphabet, as [`decode_jwt_exp`] does) and the canonical decoder
+    /// rejects (unpadded only).
+    #[test]
+    fn jwt_tenant_claim_against_the_canonical_decoder() {
+        let tenant_claim = format!(r#"{{"tenant_id":"{T_A}"}}"#);
+        let padded = URL_SAFE.encode(tenant_claim.as_bytes());
+        assert!(
+            padded.ends_with('='),
+            "fixture must actually carry padding: {padded}"
+        );
+
+        // (row, token, local answer, delegates identically?)
+        let rows: Vec<(&str, String, Option<Uuid>, bool)> = vec![
+            (
+                "tenant_id claim (what a pair mints)",
+                jwt_from_payload(&URL_SAFE_NO_PAD.encode(tenant_claim.as_bytes())),
+                Some(uuid(T_A)),
+                true,
+            ),
+            (
+                "JWT with no tenant_id claim",
+                jwt_from_payload(&URL_SAFE_NO_PAD.encode(br#"{"sub":"x","exp":1}"#)),
+                None,
+                true,
+            ),
+            (
+                "tenant_id claim that is not a UUID",
+                jwt_from_payload(&URL_SAFE_NO_PAD.encode(br#"{"tenant_id":"not-a-uuid"}"#)),
+                None,
+                true,
+            ),
+            (
+                "surrounding whitespace",
+                format!(
+                    "  {}\n",
+                    jwt_from_payload(&URL_SAFE_NO_PAD.encode(tenant_claim.as_bytes()))
+                ),
+                Some(uuid(T_A)),
+                true,
+            ),
+            (
+                "corrupt: not a JWT",
+                "qontinui_runner_opaque".to_string(),
+                None,
+                true,
+            ),
+            ("corrupt: empty", String::new(), None, true),
+            (
+                "corrupt: payload is not JSON",
+                jwt_from_payload(&URL_SAFE_NO_PAD.encode(b"{not json")),
+                None,
+                true,
+            ),
+            (
+                "payload encoded with base64 padding",
+                jwt_from_payload(&padded),
+                Some(uuid(T_A)),
+                false,
+            ),
+        ];
+
+        for (row, token, local, agrees) in rows {
+            assert_eq!(jwt_tenant_claim(&token), local, "local reader, row: {row}");
+            let canonical = canonical_jwt_tenant(&token);
+            assert_eq!(
+                canonical == local,
+                agrees,
+                "row: {row} — local {local:?}, canonical {canonical:?}; a changed \
+                 agreement re-opens the delegation decision"
+            );
+        }
+    }
+
+    /// The canonical default-tenant reader, projected to `Option<Uuid>`.
+    fn canonical_default_tenant() -> Option<Uuid> {
+        crate::pair::read_paired_tenant_id_from_disk().and_then(|s| Uuid::parse_str(s.trim()).ok())
+    }
+
+    /// [`default_binding_tenant`] / [`default_binding_tenant_probe`] /
+    /// [`default_binding_tenant_in`] against
+    /// `pair::read_paired_tenant_id_from_disk`.
+    ///
+    /// Outcome: KEPT LOCAL, all three.
+    /// - The probe's whole job is to tell a MEASURED absence (`Unbound`) from
+    ///   an unreadable file (`Unknown`); the canonical reader answers `None`
+    ///   for both the missing-file and the corrupt-file rows, so it cannot
+    ///   stand in for the probe or for `_in`.
+    /// - The collapsed [`default_binding_tenant`] agrees with the canonical
+    ///   reader on every row except a file that names a default tenant but no
+    ///   `user_id`: `pair` parses into a struct whose `user_id` is required and
+    ///   reads that file as absent, while the local reader still finds the
+    ///   tenant. Delegating it alone would also make it disagree with the probe
+    ///   it collapses.
+    #[test]
+    fn default_binding_tenant_against_the_canonical_reader() {
+        let amb = crate::test_env::isolated_ambient();
+        let path = amb.dir().join("paired_user.json");
+
+        // (row, file contents or None for "no file", probe answer, delegates identically?)
+        let rows: Vec<(&str, Option<String>, BindingTenantRead, bool)> = vec![
+            (
+                "paired_user.json v2 (bindings + default_tenant_id)",
+                Some(format!(
+                    r#"{{"user_id":"{USER}","tenant_id":"{T_B}","default_tenant_id":"{T_B}",
+                        "bindings":[{{"tenant_id":"{T_A}","user_id":"{USER}"}},
+                                    {{"tenant_id":"{T_B}","user_id":"{USER}"}}]}}"#
+                )),
+                BindingTenantRead::Bound(uuid(T_B)),
+                true,
+            ),
+            (
+                "v2 whose default differs from the legacy mirror",
+                Some(format!(
+                    r#"{{"user_id":"{USER}","tenant_id":"{T_A}","default_tenant_id":"{T_B}"}}"#
+                )),
+                BindingTenantRead::Bound(uuid(T_B)),
+                true,
+            ),
+            (
+                "legacy tenant_id",
+                Some(format!(r#"{{"user_id":"{USER}","tenant_id":"{T_A}"}}"#)),
+                BindingTenantRead::Bound(uuid(T_A)),
+                true,
+            ),
+            (
+                "legacy file with no tenant_id",
+                Some(format!(r#"{{"user_id":"{USER}"}}"#)),
+                BindingTenantRead::Unbound,
+                true,
+            ),
+            ("missing file", None, BindingTenantRead::Unbound, true),
+            (
+                "corrupt file",
+                Some("{not json".to_string()),
+                BindingTenantRead::Unknown,
+                true,
+            ),
+            (
+                "tenant_id that is not a UUID",
+                Some(format!(
+                    r#"{{"user_id":"{USER}","tenant_id":"not-a-uuid"}}"#
+                )),
+                BindingTenantRead::Unknown,
+                true,
+            ),
+            (
+                "default tenant named, no user_id",
+                Some(format!(r#"{{"default_tenant_id":"{T_A}"}}"#)),
+                BindingTenantRead::Bound(uuid(T_A)),
+                false,
+            ),
+        ];
+
+        let mut probe_states_canonical_cannot_tell_apart = Vec::new();
+        for (row, contents, probe, agrees) in rows {
+            match &contents {
+                Some(c) => std::fs::write(&path, c).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            assert_eq!(default_binding_tenant_probe(), probe, "probe, row: {row}");
+            assert_eq!(
+                default_binding_tenant_in(amb.dir()),
+                probe,
+                "_in, row: {row}"
+            );
+            let local = default_binding_tenant();
+            let canonical = canonical_default_tenant();
+            assert_eq!(
+                canonical == local,
+                agrees,
+                "row: {row} — local {local:?}, canonical {canonical:?}; a changed \
+                 agreement re-opens the delegation decision"
+            );
+            if canonical.is_none() {
+                probe_states_canonical_cannot_tell_apart.push(probe);
+            }
+        }
+        // The canonical reader's `None` covers BOTH a measured absence and an
+        // unreadable file — the distinction the probe exists to keep.
+        assert!(
+            probe_states_canonical_cannot_tell_apart.contains(&BindingTenantRead::Unbound)
+                && probe_states_canonical_cannot_tell_apart.contains(&BindingTenantRead::Unknown),
+            "{probe_states_canonical_cannot_tell_apart:?}"
+        );
     }
 }
 
@@ -5577,8 +5815,9 @@ mod bearer_selection_tests {
         assert_eq!(mgr.list_tenant_device_jwt_tenants(), Vec::<Uuid>::new());
     }
 
-    /// [`jwt_tenant_claim`] must match `pair::tenant_id_from_oauth_claim`'s
-    /// behaviour — the canonical decoder it stands in for in the bin crate.
+    /// [`jwt_tenant_claim`] reads the `tenant_id` claim. Where it does and
+    /// does not agree with `pair::tenant_id_from_oauth_claim` is pinned by
+    /// `minimal_reader_equivalence_tests`.
     #[test]
     fn jwt_tenant_claim_reads_the_tenant_id_claim() {
         let t = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();

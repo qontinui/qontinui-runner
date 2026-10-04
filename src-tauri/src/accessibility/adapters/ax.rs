@@ -30,7 +30,7 @@ use super::super::model::{
 use super::super::traits::{
     ConnectionTarget, InteractionParams, InteractionResult, PlatformAdapter,
 };
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use crate::wedge_diagnostics::spawn_blocking_tracked;
 
 // ---------------------------------------------------------------------------
 // FFI declarations

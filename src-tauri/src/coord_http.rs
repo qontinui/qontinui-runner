@@ -8,11 +8,11 @@
 //! NOW. This is backward-compatible: coord still accepts anonymous calls
 //! today, so attaching a Bearer is safe to ship ahead of the coord gate.
 //!
-//! Both helpers delegate to [`qontinui_runner_lib::auth`] — the SAME token
+//! Both helpers delegate to [`crate::auth`] — the SAME token
 //! source the write-path [`attach_device_auth`] uses — so reads and writes
 //! present the identical bearer and feed the one auth-coverage metric.
 //!
-//! [`attach_device_auth`]: qontinui_runner_lib::auth::attach_device_auth
+//! [`attach_device_auth`]: crate::auth::attach_device_auth
 //!
 //! # The shared client
 //!
@@ -95,7 +95,7 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// Build a coord GET request with the device-JWT bearer attached when one is
 /// available, otherwise return the builder unchanged.
 ///
-/// The bearer comes from [`qontinui_runner_lib::auth::attach_device_auth`],
+/// The bearer comes from [`crate::auth::attach_device_auth`],
 /// which reads `AuthManager::get_access_token()` per call (no caching, since
 /// the JWT has a short TTL) and is NEVER fatal: an unpaired runner / empty
 /// keychain / IO error all collapse to "send anonymously" — exactly the
@@ -109,7 +109,7 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// unpaired→paired dogfood signal the write path reports.
 pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
     // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Callers adopt it one at a time as each establishes its own class: the tenant-policy poll (`session/coord_sync.rs::fetch_session_coordination_flag`) is the first, per plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3.
-    qontinui_runner_lib::auth::attach_device_auth(client.get(url))
+    crate::auth::attach_device_auth(client.get(url))
 }
 
 /// Build a coord POST request with the device-JWT bearer attached when one is
@@ -131,7 +131,7 @@ pub fn coord_post(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwe
     // observation door authorises the reporter DEVICE against the session's device or a grant
     // coord minted. A body field could be forged, so neither end is read from one. Nothing to
     // thread; terminal. Re-classify if a caller of a different class ever joins.
-    qontinui_runner_lib::auth::attach_device_auth(client.post(url))
+    crate::auth::attach_device_auth(client.post(url))
 }
 
 /// Build a coord PUT request with the device-JWT bearer attached when one is
@@ -143,7 +143,7 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
     // resolves to the bearer's own device. The default binding's credential therefore names the
     // right row by construction, and stays right however many tenants this device is bound to.
     // Re-classify if a second caller of a different class ever joins.
-    qontinui_runner_lib::auth::attach_device_auth(client.put(url))
+    crate::auth::attach_device_auth(client.put(url))
 }
 
 /// Tenant-STATING variant of [`coord_get`] (Phase 8b, plan
@@ -193,5 +193,5 @@ pub fn coord_get_for(
 /// `prompt_library`'s structured `auth` state. Mirrors the availability
 /// check inside [`coord_get`]; never fatal, never panics.
 pub fn have_device_token() -> bool {
-    qontinui_runner_lib::auth::device_bearer().is_some()
+    crate::auth::device_bearer().is_some()
 }

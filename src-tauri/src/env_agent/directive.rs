@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::enroll::{self, EnrollParams};
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use crate::wedge_diagnostics::spawn_blocking_tracked;
 
 /// The event-channel prefix coord publishes enroll directives on. The full
 /// channel is `<PREFIX>.<device_id>`.
