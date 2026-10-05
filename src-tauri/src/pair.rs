@@ -1139,18 +1139,23 @@ fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
 /// which the `paired_user.json` heal ([`coord_bound_tenants_for_heal_at`])
 /// would have resurrected. Only coord echoing the tenant again (the reset
 /// below), a fresh pairing ([`reset_omission_streak`]) or the tenant ceasing to
-/// be held locally removes it — and "ceasing to be held" must be MEASURED:
-/// with `carry_tombstones: Some(coord_set)` (the caller could not read the
-/// slot listing or the legacy slot this pass), every prior tombstone whose
-/// tenant coord did not echo is kept unchanged even though it is absent from
-/// `omitted`. It is not reported due: nothing local was read to clear.
+/// be held locally removes it — and "ceasing to be held" must be MEASURED.
+///
+/// `carry_unread: Some(coord_set)` says the caller could not read the slot
+/// listing or the legacy slot this pass, so `omitted` may lack a tenant for
+/// want of a read. Then EVERY prior record whose tenant coord did not echo and
+/// that `omitted` lacks is carried forward unchanged (no increment, no
+/// restamp): a tombstone stays a tombstone (not reported due — nothing local
+/// was read to clear), and a record below the threshold stays at its count
+/// and is reported HELD with it, so the report and the heal's bound set
+/// ([`coord_bound_tenants_for_heal_at`]) agree that it is still held.
 /// Returns `(due, held)`: due tenants with the unix second their run began, and
 /// held tenants with their current count. Caller holds the reconcile lock.
 #[allow(clippy::type_complexity)]
 fn advance_omission_streaks(
     paired_user: &std::path::Path,
     omitted: &[uuid::Uuid],
-    carry_tombstones: Option<&[uuid::Uuid]>,
+    carry_unread: Option<&[uuid::Uuid]>,
     now_unix: i64,
 ) -> (Vec<(uuid::Uuid, i64)>, Vec<(uuid::Uuid, u32)>) {
     let path = omission_streaks_path(paired_user);
@@ -1187,23 +1192,36 @@ fn advance_omission_streaks(
         }
         after.tenants.insert(key, streak);
     }
-    if let Some(coord_set) = carry_tombstones {
+    if let Some(coord_set) = carry_unread {
         for (key, prev) in &before.tenants {
-            let echoed = uuid::Uuid::parse_str(key.trim())
-                .map(|t| coord_set.contains(&t))
-                .unwrap_or(false);
-            if prev.consecutive >= RECONCILE_DROP_AFTER_OMISSIONS && !echoed {
-                after
-                    .tenants
-                    .entry(key.clone())
-                    .or_insert_with(|| prev.clone());
+            let tenant = uuid::Uuid::parse_str(key.trim()).ok();
+            let echoed = tenant.is_some_and(|t| coord_set.contains(&t));
+            if echoed || after.tenants.contains_key(key) {
+                continue;
+            }
+            after.tenants.insert(key.clone(), prev.clone());
+            if let Some(t) = tenant {
+                if prev.consecutive < RECONCILE_DROP_AFTER_OMISSIONS {
+                    held.push((t, prev.consecutive));
+                }
             }
         }
+        held.sort();
     }
     if after != before {
         write_omission_streaks(&path, &after);
     }
     (due, held)
+}
+
+/// Could this reconcile pass READ every local source of an omitted tenant —
+/// the per-tenant slot listing (`slot_list_ok`) and the legacy `access_token`
+/// (`legacy`, not `Unreadable`)? When not, the streak records it may lack are
+/// carried forward by [`advance_omission_streaks`]. A separate function so the
+/// legacy-only blind arm is testable: a temp store cannot make the legacy read
+/// unreadable while the listing (same encrypted file) still reads.
+fn omission_pass_is_fully_measured(slot_list_ok: bool, legacy: &crate::auth::SlotRead) -> bool {
+    slot_list_ok && !matches!(legacy, crate::auth::SlotRead::Unreadable(_))
 }
 
 /// A fresh pairing proves the binding is wanted: forget any omission streak the
@@ -1352,15 +1370,15 @@ fn reconcile_paired_bindings_locked(
         _ => None,
     };
     //
-    // A tombstone may only be lifted by a MEASURED absence. When the slot
-    // listing or the legacy read could not be made, a tenant held only there
-    // is missing from `omitted` because nothing was READ, not because it is
-    // gone — so every prior tombstone coord did not echo is carried forward
-    // unchanged. Lifting it would let the next readable pass restart the
-    // tenant at one (HELD), and a vanish then would hand it to the heal.
+    // A streak record may only be dropped on a MEASURED absence. When the
+    // slot listing or the legacy read could not be made, a tenant held only
+    // there is missing from `omitted` because nothing was READ, not because
+    // it is gone — so every prior record coord did not echo is carried
+    // forward unchanged. Dropping a tombstone would let the next readable
+    // pass restart the tenant at one (HELD) and a vanish hand it to the heal;
+    // dropping a held count would take the tenant out of the heal's set.
     let slot_list = mgr.try_list_tenant_device_jwt_tenants();
-    let fully_measured = slot_list.is_ok()
-        && !matches!(default_slot_read, crate::auth::SlotRead::Unreadable(_));
+    let fully_measured = omission_pass_is_fully_measured(slot_list.is_ok(), &default_slot_read);
     let mut omitted: Vec<uuid::Uuid> = bindings
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
@@ -1370,8 +1388,8 @@ fn reconcile_paired_bindings_locked(
         .collect();
     omitted.sort();
     omitted.dedup();
-    let carry_tombstones = (!fully_measured).then_some(coord_set);
-    let (due_runs, held) = advance_omission_streaks(path, &omitted, carry_tombstones, now_unix);
+    let carry_unread = (!fully_measured).then_some(coord_set);
+    let (due_runs, held) = advance_omission_streaks(path, &omitted, carry_unread, now_unix);
     report.held = held;
     let due: Vec<uuid::Uuid> = due_runs.iter().map(|(t, _)| *t).collect();
     let run_began = |t: &uuid::Uuid| {
@@ -7946,6 +7964,80 @@ mod vanished_paired_user_heal_tests {
         let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
         assert!(matches!(heal, PairedUserHeal::Refused(_)), "{heal:?}");
         assert!(!path.exists(), "the unbind is not resurrected");
+    }
+
+    /// Fix round 3, MEDIUM: a blind pass keeps a HELD count too. B, held only
+    /// by an orphan slot, is omitted once (count 1). A pass that cannot read
+    /// the store carries B's record forward UNCHANGED — still 1, not
+    /// restamped — reports it held, and B stays in the heal's bound set.
+    #[test]
+    fn a_held_count_survives_a_blind_pass_unchanged() {
+        let (dir, path, mgr) = store("held_blind");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("omit 1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+
+        let store_file = dir.path().join("tokens.enc");
+        let good = std::fs::read(&store_file).expect("store bytes");
+        std::fs::write(&store_file, b"not an encrypted store").unwrap();
+        let blind = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("blind");
+        std::fs::write(&store_file, &good).unwrap();
+        assert_eq!(blind.held, vec![(tb(), 1)], "reported held at its count");
+        let streaks = read_omission_streaks(&omission_streaks_path(&path));
+        let b = streaks.tenants.get(T_B).expect("B's record was carried");
+        assert_eq!(b.consecutive, 1, "not incremented");
+        assert_eq!(b.last_counted_at, T0, "not restamped");
+
+        let sidecar = dir.path().join("coord_bound_tenants.json");
+        let now = chrono::Utc::now().timestamp();
+        record_coord_bound_tenants_at(&sidecar, &[ta()], now).expect("echo");
+        assert_eq!(
+            coord_bound_tenants_for_heal_at(&path, &sidecar, now),
+            known(&[ta(), tb()]),
+            "B stays in the heal's set"
+        );
+    }
+
+    /// Fix round 3, LOW: the legacy-only blind arm. A temp store cannot make
+    /// the legacy read unreadable while the slot listing (the same encrypted
+    /// file) still reads, so the arm is pinned at its two halves: the pass
+    /// predicate treats an UNREADABLE legacy read as blind even with the
+    /// listing OK, and a blind advance keeps a tombstone that `omitted` lacks
+    /// (exactly the legacy-only tenant's shape, whose one source is
+    /// `legacy_claim`) and reports it neither due nor held.
+    #[test]
+    fn an_unreadable_legacy_read_alone_makes_the_pass_blind() {
+        use crate::auth::SlotRead;
+        assert!(!omission_pass_is_fully_measured(
+            true,
+            &SlotRead::Unreadable("test".into())
+        ));
+        assert!(!omission_pass_is_fully_measured(false, &SlotRead::Absent));
+        assert!(omission_pass_is_fully_measured(true, &SlotRead::Absent));
+        assert!(omission_pass_is_fully_measured(true, &SlotRead::PresentButDead));
+
+        let (_dir, path, _mgr) = store("legacy_blind");
+        // A tombstoned (two omissions with a measured legacy claim).
+        advance_omission_streaks(&path, &[ta()], None, T0);
+        let (due, _) = advance_omission_streaks(&path, &[ta()], None, T0 + 30);
+        assert_eq!(due.len(), 1, "A is due: a tombstone");
+        // The blind pass: the legacy read failed, so A is not in `omitted`.
+        let (due, held) = advance_omission_streaks(&path, &[], Some(&[tc()]), T0 + 60);
+        assert!(due.is_empty() && held.is_empty(), "{due:?} {held:?}");
+        let streaks = read_omission_streaks(&omission_streaks_path(&path));
+        assert_eq!(
+            streaks.tenants.get(T_A).map(|s| s.consecutive),
+            Some(RECONCILE_DROP_AFTER_OMISSIONS),
+            "the tombstone was carried, not lifted"
+        );
+        // A MEASURED absence (no carry) does lift it.
+        advance_omission_streaks(&path, &[], None, T0 + 90);
+        assert!(read_omission_streaks(&omission_streaks_path(&path))
+            .tenants
+            .is_empty());
     }
 
     /// Fix round, MEDIUM 2 + 3: the preserve re-reads the bound set under its
