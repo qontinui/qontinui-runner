@@ -967,8 +967,9 @@ pub(crate) fn claude_bin_path() -> String {
 
 /// `resolved` when it is launchable, else the bare [`claude_bin_path`].
 ///
-/// [`resolve_claude_bin`] accepts any regular file on unix and does not check
-/// the execute bit. A bare name goes through `execvp`, which skips a
+/// [`resolve_claude_bin`] prefers a launchable candidate on unix, but when no
+/// PATH entry is launchable it still returns the first one it found (so the
+/// gate continuation's pre-claim probe can name the fault). A bare name goes through `execvp`, which skips a
 /// non-executable PATH entry and keeps searching. Pinning an absolute path to
 /// such a file would trade that for an `EACCES` on every attempt. On
 /// Windows, and for anything that is not an absolute path, `resolved` is
@@ -10288,7 +10289,7 @@ pub(crate) async fn spawn_claude_child(
     // gate continuation's headless arm, so its pre-claim probe and this spawn
     // name the same file (plan
     // `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
-    // D2). `None` keeps the PATH-searched `claude_bin_path()`, unchanged for
+    // D2). `None` resolves here, as described at `bin` below — unchanged for
     // every other caller.
     bin_override: Option<&str>,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
@@ -16913,6 +16914,20 @@ mod tests {
                 },
             )
         };
+        // The retry budget spent on a transient kind: the detail coord parses
+        // must still lead with `CLI_UNAVAILABLE_HEAD`.
+        let headless_exhausted = || {
+            headless_spawn_error(
+                &bin,
+                "/work",
+                &crate::claude_cli_spawn::CliSpawnFailure {
+                    error: std::io::Error::from_raw_os_error(libc::EACCES),
+                    attempts: 4,
+                    elapsed: std::time::Duration::from_secs(10),
+                    transient_kind: Some("eacces"),
+                },
+            )
+        };
         let resource = || {
             pty_spawn_error(
                 TerminalSpawnError {
@@ -16930,6 +16945,11 @@ mod tests {
         for (label, error, stamp) in [
             ("pty", pty(), "claude_cli_unavailable:eacces"),
             ("headless", headless(), "claude_cli_unavailable:eacces"),
+            (
+                "headless-exhausted",
+                headless_exhausted(),
+                "claude_cli_unavailable:eacces",
+            ),
             (
                 "resource",
                 resource(),
@@ -16950,6 +16970,7 @@ mod tests {
         for (label, error) in [
             ("pty", pty()),
             ("headless", headless()),
+            ("headless-exhausted", headless_exhausted()),
             ("resource", resource()),
         ] {
             let (disposition, outcomes, deferrals) =
@@ -16969,6 +16990,12 @@ mod tests {
         }
         // The PTY detail #2674 classifies is the seam's own text, unrenamed.
         assert_eq!(pty().to_string(), pty_text);
+        assert!(
+            headless_exhausted()
+                .to_string()
+                .starts_with(crate::claude_cli_spawn::CLI_UNAVAILABLE_HEAD),
+            "an exhausted retry leads with the head coord keeps"
+        );
     }
 
     /// Review round 2 #6: a D5 deferral through the REAL
