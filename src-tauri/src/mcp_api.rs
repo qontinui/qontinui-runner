@@ -4040,7 +4040,7 @@ fn hand_off_transport_rung(
         emitter,
         lane,
         headers,
-        body,
+        operation,
         door,
         caller_session_id,
     )
@@ -4052,7 +4052,7 @@ fn hand_off_transport_rung_in(
     emitter: Arc<crate::session::coord_transport_rung::RungEmitter>,
     lane: uuid::Uuid,
     headers: &axum::http::HeaderMap,
-    body: &[u8],
+    operation: &'static str,
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
@@ -13727,8 +13727,9 @@ mod transport_rung_counter_tests {
 
     /// Hand one observation off exactly as `coord_write_proxy_handler` does —
     /// operation `write`, door = the upstream write URL — and return the single
-    /// outbox payload it lands, after a bounded wait. The caller holds
-    /// `series_lock`.
+    /// outbox payload it lands, after a bounded wait. Drives a PRIVATE
+    /// `TransportRungCounters`, like `successful_emit_increments_emitted`, so
+    /// no process-global counter or `series_lock` is needed.
     async fn forwarder_row(headers: &axum::http::HeaderMap) -> serde_json::Value {
         use crate::session::coord_transport_rung::{RungEmitter, OPERATION_WRITE};
         use crate::session::local_store::OutboxWriter;
@@ -13743,8 +13744,10 @@ mod transport_rung_counter_tests {
             &super::CoordWriteTarget::RegisterGate,
         );
 
-        let before = transport_rung_emitted_counter().load(Ordering::Relaxed);
-        hand_off_transport_rung(
+        let counters = TransportRungCounters::new();
+        let before = counters.emitted.load(Ordering::Relaxed);
+        hand_off_transport_rung_in(
+            &counters,
             emitter,
             uuid::Uuid::new_v4(),
             headers,
@@ -13753,7 +13756,7 @@ mod transport_rung_counter_tests {
             None,
         );
         assert_eq!(
-            transport_rung_emitted_counter().load(Ordering::Relaxed),
+            counters.emitted.load(Ordering::Relaxed),
             before + 1,
             "a forwarded write moves `emitted` by one, exactly as a proxied call does"
         );
@@ -13781,11 +13784,7 @@ mod transport_rung_counter_tests {
     /// `/gate` Part B's REST leg declares `write_forwarder` / `gate`; the row
     /// carries exactly that, and says `write`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn forwarded_write_declaring_write_forwarder_yields_a_write_forwarder_row() {
-        // Bumps the process-global `emitted` counter, which
-        // `successful_emit_increments_emitted` asserts EXACTLY.
-        let _serialised = series_lock();
         use crate::session::coord_transport_rung::{
             REPORTER_HEADER, REPORTER_STEP_HEADER, TRANSPORT_HEADER,
         };
@@ -13806,9 +13805,7 @@ mod transport_rung_counter_tests {
     /// A forwarded write nobody tagged is the VISIBLE untagged arm —
     /// `unknown` / `untagged` — never a skipped emit, and still a `write`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn forwarded_undeclared_write_yields_an_untagged_unknown_row() {
-        let _serialised = series_lock();
         let p = forwarder_row(&axum::http::HeaderMap::new()).await;
         assert_eq!(p["transport"], serde_json::json!("unknown"));
         assert_eq!(p["reporter"], serde_json::json!("untagged"));
