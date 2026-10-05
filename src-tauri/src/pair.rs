@@ -4717,11 +4717,11 @@ mod pair_code_hang_regression_tests {
             Ok(Err(e)) => panic!("pair-code redeem + persist failed: {e}"),
             // The worker panicked before sending (an assert or unwrap inside
             // the closure). This is a failure, not the hang the arm below
-            // describes; any keychain entries it wrote were removed by its
-            // cleanup guard during the unwind.
+            // describes; its cleanup guard attempted to remove any keychain
+            // entries it wrote during the unwind (best-effort).
             Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "pair-code redeem + persist worker thread panicked (see its panic above); any \
-                 keychain entries it wrote were removed by its cleanup guard during the unwind"
+                "pair-code redeem + persist worker thread panicked (see its panic above); its \
+                 cleanup guard attempted to remove any keychain entries it wrote during the unwind"
             ),
             Err(mpsc::RecvTimeoutError::Timeout) => panic!(
                 "pair-code redeem + persist did not complete within {WALL_CLOCK_BOUND:?} — this \

@@ -25,7 +25,7 @@
 //!   fails here, so whoever adds one must decide whether tests can
 //!   reach it — and give it a test seam (as `registry_creds` does with a fake
 //!   store) or route it through `AuthManager`'s guard.
-//! - A literal `set_var("QONTINUI_DISABLE_KEYCHAIN"` anywhere but the one file
+//! - A literal `set_var("QONTINUI_DISABLE_KEYCHAIN"` anywhere under `src/` but the one file
 //!   still pending PR #2001 fails here, and so does any mention of the
 //!   `"QONTINUI_DISABLE_KEYCHAIN"` name outside the four files that own it.
 //!   Either means someone is re-growing the per-module workaround instead of
@@ -66,13 +66,13 @@ const KEYRING_CALL_SITES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Files allowed to name `"QONTINUI_DISABLE_KEYCHAIN"`, and why.
+/// Files still allowed a literal `set_var("QONTINUI_DISABLE_KEYCHAIN", ...)`.
 /// `commands/auth.rs` `hermetic_auth_manager` still sets it; that file is owned
 /// by open PR qontinui-runner#2001, and Phase 6 of the plan removes the set
 /// after that lands.
-/// Files still allowed a literal `set_var("QONTINUI_DISABLE_KEYCHAIN", ...)`.
 const DISABLE_KEYCHAIN_SETTERS: &[&str] = &["commands/auth.rs"];
 
+/// Files allowed to name `"QONTINUI_DISABLE_KEYCHAIN"` at all, and why.
 const DISABLE_KEYCHAIN_NAMERS: &[(&str, &str)] = &[
     ("auth.rs", "the reader, and the guard's own regression test"),
     (
