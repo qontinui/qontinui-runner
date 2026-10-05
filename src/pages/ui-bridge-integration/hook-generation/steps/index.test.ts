@@ -1,15 +1,20 @@
 /**
  * STEP_HANDLERS is the composition point of the step machine (plan D2): it
- * must cover exactly the ten `IntegrationStep`s, and a missing step must be a
- * compile error rather than a silent no-op at runtime.
+ * must cover exactly the ten `IntegrationStep`s.
+ *
+ * Exhaustiveness is a compile-time property enforced by `steps/index.ts` itself
+ * (typed `Record<IntegrationStep, StepHandler>`, checked by `pnpm typecheck`);
+ * test files are excluded from tsc, so this file only checks the runtime keys.
  */
 
 import { describe, it, expect } from "vitest";
 
 import { STEP_HANDLERS } from "./index";
 import { explainerStep } from "./explainer";
-import type { IntegrationStep, StepHandler } from "./types";
+import type { IntegrationStep } from "./types";
 
+// `IntegrationStep` is a type-only union with no runtime value to derive this
+// from, so the expected keys are listed explicitly.
 const ALL_STEPS: IntegrationStep[] = [
   "hooks",
   "architecture-spec",
@@ -33,16 +38,5 @@ describe("STEP_HANDLERS", () => {
     expect(STEP_HANDLERS["explainer-index"]).toBe(explainerStep);
     expect(STEP_HANDLERS["explainer-cluster"]).toBe(explainerStep);
     expect(STEP_HANDLERS["explainer-page"]).toBe(explainerStep);
-  });
-
-  it("is typed so that a missing step is a type error (checked by tsc)", () => {
-    // The composition point satisfies the exhaustive Record…
-    const full = STEP_HANDLERS satisfies Record<IntegrationStep, StepHandler>;
-    // …and dropping any one key does not. `pnpm typecheck` fails if this
-    // `@ts-expect-error` ever stops being needed.
-    const { hooks: _dropped, ...withoutHooks } = full;
-    // @ts-expect-error — Property 'hooks' is missing in type
-    const incomplete: Record<IntegrationStep, StepHandler> = withoutHooks;
-    expect(Object.keys(incomplete)).not.toContain("hooks");
   });
 });
