@@ -64,7 +64,7 @@
 //! bulk request per invocation of a human-triggered endpoint is cheap enough
 //! that the trade is not worth taking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -154,6 +154,12 @@ pub struct StatusFetch {
     /// `since`), and wind-down falls back to not bounding the idle window by
     /// it. Never consulted by the restart verdict.
     pub finished_at_by_session_id: HashMap<String, i64>,
+    /// Ids coord could not resolve at all — its `unknown` list (no session row
+    /// matched) and its `invalid` list (not a UUID). They are absent from
+    /// `by_session_id` exactly as an unset axis is, but they are a different
+    /// fact: an unset axis is a row nobody has reported a status on, while
+    /// these had no row to read, so nothing about them was observed.
+    pub unresolved_ids: HashSet<String>,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.
     pub source: &'static str,
@@ -179,6 +185,7 @@ impl StatusFetch {
         Self {
             by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
+            unresolved_ids: HashSet::new(),
             source: "unavailable",
             degraded: true,
             note: note.into(),
@@ -302,6 +309,7 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
         return StatusFetch {
             by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
+            unresolved_ids: HashSet::new(),
             source: "not_needed",
             degraded: false,
             note: String::new(),
@@ -432,6 +440,12 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     );
     StatusFetch {
         finished_at_by_session_id: finished_at_from_body(&body),
+        unresolved_ids: body
+            .unknown
+            .iter()
+            .chain(body.invalid.iter())
+            .cloned()
+            .collect(),
         by_session_id,
         source: "coord",
         degraded: false,

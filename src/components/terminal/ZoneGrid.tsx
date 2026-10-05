@@ -35,7 +35,6 @@ import { ZoneHoverActions } from "./ZoneHoverActions";
 import type { LayoutPreset } from "./useZoneLayout";
 import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX, findNextZone } from "./useZoneLayout";
 import {
-  STATE_BORDER_COLORS,
   STATE_COLORS,
   STATE_GLOW,
   CompactZoneCard,
@@ -49,12 +48,13 @@ import {
   zoneFinishedBand,
   ZONE_HEADER_HEIGHT_PX,
   ZONE_FILTER_BAR_HEIGHT_PX,
-  ZONE_FOCUS_COLOR,
-  FINISHED_BAND_PX,
-  FINISHED_FOCUS_SHADOW,
-  finishedBorderImage,
 } from "./zone-grid";
-import { useFinishedSessions, type FinishedStates } from "./useFinishedSessions";
+import { zoneBorderStyle, maximizedBorderStyle } from "./zone-grid/zoneBorder";
+import {
+  useFinishedSessions,
+  type FinishedVerdict,
+  type SessionFinishedState,
+} from "./useFinishedSessions";
 import {
   useTerminalSession,
   useZoneMetadata,
@@ -98,9 +98,6 @@ function loadPromptTabs(pageId: string): Set<string> {
  * the value is now stated once and shared by both.
  */
 const MAXIMIZED_HEADER_HEIGHT_PX = 26;
-
-/** Computed once: the finished band's `border-image` never varies per zone. */
-const FINISHED_BORDER_IMAGE = finishedBorderImage();
 
 interface ZoneGridProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
@@ -232,6 +229,16 @@ function ZoneGridInner({
     [tabs],
   );
   const finishedStates = useFinishedSessions(claudeSessionIds);
+  // Each cell gets its own verdict as primitives, so a change to one session's
+  // state re-renders that cell and not the other memoized ones.
+  const finishedByTabId = useMemo(() => {
+    const m = new Map<string, SessionFinishedState>();
+    for (const t of tabs) {
+      const st = t.claudeSessionId ? finishedStates[t.claudeSessionId] : undefined;
+      if (st) m.set(t.id, st);
+    }
+    return m;
+  }, [tabs, finishedStates]);
   // Session-state tracking is fed by the single global `terminal-output` tap in
   // `TerminalSessionContext.PageSessionScope` (Phase 2), NOT by instance
   // `onOutput` callbacks — so tracking survives Phase 3 instance unmounting.
@@ -681,11 +688,25 @@ function ZoneGridInner({
     const maximizedPromptsOpen = !!tab?.claudeSessionId && promptTabs.has(tab.id);
     const prevZone = maximizedNeighbour(-1);
     const nextZone = maximizedNeighbour(1);
+    // The maximized view has no border of its own; a finished session still
+    // gets the band, around the whole view so the header sits inside it.
+    const maximizedFinished = zoneFinishedBand({
+      claudeSessionId: tab?.claudeSessionId,
+      verdict: tab ? finishedByTabId.get(tab.id)?.verdict : undefined,
+      held: tab ? finishedByTabId.get(tab.id)?.held : undefined,
+    });
 
     return (
       <div
         className="h-full w-full relative"
         onDoubleClickCapture={() => onZoneDoubleClick(singleViewZone)}
+        data-session-finished={maximizedFinished.verdict}
+        data-session-finished-held={maximizedFinished.held ? "true" : undefined}
+        style={maximizedBorderStyle({
+          state: (tab ? sessionStates[tab.id] : undefined) ?? "idle",
+          finishedBand: maximizedFinished.showBand,
+          finishedHeld: maximizedFinished.held,
+        })}
       >
         {tab && (
           <div
@@ -902,7 +923,8 @@ function ZoneGridInner({
           flashingTabs={flashingTabs}
           selectedZones={selectedZones}
           staleTabs={staleTabs}
-          finishedStates={finishedStates}
+          finishedVerdict={finishedByTabId.get(assignments[zoneIdx] ?? "")?.verdict}
+          finishedHeld={finishedByTabId.get(assignments[zoneIdx] ?? "")?.held}
           pinnedZones={pinnedZones}
           onTogglePin={onTogglePin}
           outputSearchQuery={outputSearchQuery}
@@ -1123,7 +1145,8 @@ function ZoneCellInner({
   flashingTabs,
   selectedZones,
   staleTabs,
-  finishedStates,
+  finishedVerdict,
+  finishedHeld,
   pinnedZones,
   onTogglePin,
   outputSearchQuery,
@@ -1187,8 +1210,10 @@ function ZoneCellInner({
   flashingTabs?: Set<string>;
   selectedZones?: Set<number>;
   staleTabs?: Set<string>;
-  /** Claude session id → finished state; a missing id is UNKNOWN. */
-  finishedStates?: FinishedStates;
+  /** This zone's session's finished verdict; absent reads as UNKNOWN. */
+  finishedVerdict?: FinishedVerdict;
+  /** The band is held from an earlier read the current one cannot confirm. */
+  finishedHeld?: boolean;
   pinnedZones?: Set<number>;
   onTogglePin?: (zoneIndex: number) => void;
   outputSearchQuery?: string;
@@ -1321,11 +1346,6 @@ function ZoneCellInner({
 
   const isFocused = zoneIdx === focusedZone;
   const state = (tab ? (sessionStates[tab.id as string] ?? "idle") : "idle") as SessionState;
-  const borderColor = isFocused
-    ? STATE_BORDER_COLORS[state] === "#2a2d3d"
-      ? ZONE_FOCUS_COLOR
-      : STATE_BORDER_COLORS[state]
-    : STATE_BORDER_COLORS[state];
 
   const isPinned = pinnedZones?.has(zoneIdx);
   const useCompact =
@@ -1375,13 +1395,10 @@ function ZoneCellInner({
   const isSelected = selectedZones?.has(zoneIdx);
   // FINISHED is the work axis, not liveness: a finished session's pane is
   // still a live terminal, so the band changes the border and nothing else.
-  const { verdict: finishedVerdict, showBand: showFinishedBand } = zoneFinishedBand({
+  const finishedBand = zoneFinishedBand({
     claudeSessionId: tab?.claudeSessionId,
-    finishedStates,
-    isDropTarget,
-    isSwapSource,
-    isSelected,
-    searchMatch,
+    verdict: finishedVerdict,
+    held: finishedHeld,
   });
 
   const firstTagColor = zoneTags?.[zoneIdx]?.[0]
@@ -1423,42 +1440,27 @@ function ZoneCellInner({
       // Ground truth for the tag filter, readable through the UI Bridge
       // without inferring anything from a computed opacity.
       data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
-      // Ground truth for the finished band: `finished` | `not_finished` |
-      // `unknown`, absent on a pane with no Claude session.
-      data-session-finished={finishedVerdict}
+      // Ground truth for the finished band: the CURRENT verdict (`finished` |
+      // `not_finished` | `unknown`, absent on a pane with no Claude session),
+      // plus whether a band is held from an earlier read it cannot confirm.
+      data-session-finished={finishedBand.verdict}
+      data-session-finished-held={finishedBand.held ? "true" : undefined}
       style={{
         gridColumn: zone.col,
         gridRow: zone.row,
-        ...(showFinishedBand
-          ? {
-              border: `${FINISHED_BAND_PX}px solid transparent`,
-              borderImage: FINISHED_BORDER_IMAGE,
-            }
-          : {
-              border: `${isFocused ? "2px" : isSwapSource ? "2px" : isSelected ? "2px" : searchMatch ? "2px" : "1px"} solid ${
-                isDropTarget
-                  ? "#7aa2f7"
-                  : isSwapSource
-                    ? "#ff9e64"
-                    : isSelected
-                      ? "#bb9af7"
-                      : searchMatch
-                        ? "#9ece6a"
-                        : isStale
-                          ? "#e0af68"
-                          : borderColor
-              }`,
-              borderLeftWidth: state === "needs-input" ? "3px" : "2px",
-              borderLeftColor: stateColor,
-              borderStyle: isSwapSource
-                ? "dashed"
-                : isStale && !isFocused && !searchMatch
-                  ? "dashed"
-                  : "solid",
-              borderLeftStyle: "solid",
-            }),
+        ...zoneBorderStyle({
+          state,
+          isFocused,
+          isDropTarget,
+          isSwapSource,
+          isSelected,
+          searchMatch,
+          isStale: !!isStale,
+          finishedBand: finishedBand.showBand,
+          finishedHeld: finishedBand.held,
+        }),
         borderRadius: "4px",
-        boxShadow: showFinishedBand && isFocused ? FINISHED_FOCUS_SHADOW : zoneShadow,
+        boxShadow: zoneShadow,
         transition: "border-color 0.2s, box-shadow 0.2s, opacity 0.3s",
         // EVERY dim lives in this one inline value, most-specific first.
         //

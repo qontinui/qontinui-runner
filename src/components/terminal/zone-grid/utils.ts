@@ -1,4 +1,4 @@
-import type { FinishedStates, FinishedVerdict } from "../useFinishedSessions";
+import type { FinishedVerdict } from "../useFinishedSessions";
 
 export function formatUptime(createdAt?: number): string | undefined {
   if (!createdAt) return undefined;
@@ -79,25 +79,24 @@ export function showSoloSessionInfo(opts: {
  * Whether a zone draws the chequered FINISHED band, and the verdict it exposes
  * on `data-session-finished`.
  *
- * Only a positive `finished` draws the band: a session id with no answer yet
- * (not polled, or coord unread) is `unknown` and keeps the ordinary border,
+ * The band draws on a positive `finished`, and — dimmed — on a `held` one (the
+ * current read could not answer; the last one that could said `finished`). A
+ * session with no answer at all is `unknown` and keeps the ordinary border,
  * because a missing mark is not evidence of either arm. A tab with no Claude
  * session has nothing to be finished, so its verdict is `undefined`.
  *
- * The operator's in-progress gestures — drop target, swap source, selection,
- * output-search match — outrank the band, so they stay visible on a finished
- * zone. The stale cue does not: a finished session going quiet is expected.
+ * Nothing else switches the band off, because switching it changes the border
+ * width and so resizes the zone's live PTY. Drop target, swap source,
+ * selection and the needs-input / error states recolour it instead
+ * (`finishedBandColor`); a search match keeps its glow.
  */
 export function zoneFinishedBand(opts: {
   claudeSessionId?: string;
-  finishedStates?: FinishedStates;
-  isDropTarget?: boolean;
-  isSwapSource?: boolean;
-  isSelected?: boolean;
-  searchMatch?: boolean;
-}): { verdict: FinishedVerdict | undefined; showBand: boolean } {
-  if (!opts.claudeSessionId) return { verdict: undefined, showBand: false };
-  const verdict = opts.finishedStates?.[opts.claudeSessionId]?.verdict ?? "unknown";
-  const gesture = opts.isDropTarget || opts.isSwapSource || opts.isSelected || opts.searchMatch;
-  return { verdict, showBand: verdict === "finished" && !gesture };
+  verdict?: FinishedVerdict;
+  held?: boolean;
+}): { verdict: FinishedVerdict | undefined; showBand: boolean; held: boolean } {
+  if (!opts.claudeSessionId) return { verdict: undefined, showBand: false, held: false };
+  const verdict = opts.verdict ?? "unknown";
+  const held = opts.held === true && verdict !== "finished";
+  return { verdict, showBand: verdict === "finished" || held, held };
 }
