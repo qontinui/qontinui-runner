@@ -183,7 +183,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process signalling WORK is attached right now (a shell, a nested `claude`, an unreadable image, or any child spawned after the session's first 60 s — a stdio MCP server the session started at boot is infrastructure and does not count), never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but the wind-down executor acts on the same verdict in two arms: its drain arm closes any `eligible` session WHILE COORD HOLDS THIS DEVICE DRAINED, and its `finished_close` arm closes a finished TERMINAL session after grace with NO drain at all, once every worktree that session touched is clean and pushed (looping agents and stewards are closed only under a drain); they are computed whether or not the runner is drained, the executor's own extra gates (the drain, the `finished_close` switch and its custody gate, a wall-clock-jump quarantine, the arm's census cadence, and a per-tick close budget) are NOT reflected in `eligibility`, so `eligible` is a candidacy and never a prediction; `windDown.custody` appears only when the `finished_close` arm judged that session on its latest pass and is that pass's verdict (`clean` / `dirty` / `unknown`, with the worktree it is about), never a probe made by this request — absent means \"not judged\", never \"clean\"; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -445,9 +445,13 @@ pub struct RestartReadiness {
     /// ⚠ **NOT a dry run since Phase 4**, and this is the WIRE contract, so an
     /// external consumer reads it here. THIS ENDPOINT closes nothing and the
     /// count is computed whether or not the runner is drained — but the
-    /// wind-down executor acts on the same verdict while the device IS drained.
+    /// wind-down executor acts on the same verdict: its drain arm while the
+    /// device IS drained, and its `finished_close` arm on finished terminal
+    /// sessions with no drain (plan
+    /// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`).
     /// It is therefore a count of CANDIDATES, not a prediction: the executor
-    /// applies further gates of its own (the drain, a wall-clock-jump
+    /// applies further gates of its own (the drain or the `finished_close`
+    /// switch, that arm's custody gate and census cadence, a wall-clock-jump
     /// quarantine, a per-tick budget, and a re-check immediately before each
     /// close). `null` when the terminal plane could not be determined — never
     /// `0`.
@@ -1077,8 +1081,9 @@ pub fn ai_plane_schema_gate(
 
 /// `windDownCandidates` for a resolved terminal plane: top-level processes
 /// whose wind-down verdict is `eligible`. Computed whether or not the runner is
-/// drained, and THIS endpoint closes none of them — but since Phase 4 the
-/// wind-down executor acts on the same verdict while drained, so this is a
+/// drained, and THIS endpoint closes none of them — but the wind-down executor
+/// acts on the same verdict (its drain arm while drained, its `finished_close`
+/// arm on custody-clean finished terminal sessions without one), so this is a
 /// count of candidates, not of sessions that will certainly be closed.
 pub fn wind_down_candidates_in(plane: &TerminalPlane) -> usize {
     plane
@@ -1216,11 +1221,17 @@ pub async fn restart_readiness_handler(
     // verdict, and stopped being true of it.
     let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
     let wind_down_observer::FreshPass {
-        pass,
+        mut pass,
         status_fetch,
         observed,
         unknowns: pass_unknowns,
     } = fresh;
+    // `windDown.custody`: the `finished_close` arm's last verdict for each
+    // session it judged. Read from what the arm published — never probed
+    // here, because this endpoint answers under a 2 s client timeout.
+    if let Some(p) = pass.as_mut() {
+        crate::session::finished_close::attach_last_custody(&mut p.report.terminal_hosted);
+    }
     unknowns.extend(pass_unknowns);
     let status_source = SessionStatusSource::from(&status_fetch);
 
@@ -1365,6 +1376,7 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
@@ -3125,6 +3137,12 @@ mod tests {
         );
         assert!(BOUNDARY.contains("THIS ENDPOINT closes nothing"));
         assert!(BOUNDARY.contains("WHILE COORD HOLDS THIS DEVICE DRAINED"));
+        // Plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain:
+        // a finished session is now also closed after grace with no drain, and
+        // the boundary must say so rather than imply a drain is required.
+        assert!(BOUNDARY.contains("with NO drain at all"));
+        assert!(BOUNDARY.contains("`windDown.custody`"));
+        assert!(BOUNDARY.contains("never \"clean\""));
         assert!(BOUNDARY.contains("a candidacy and never a prediction"));
         assert!(BOUNDARY.contains("windDownCandidates"));
         assert!(BOUNDARY.contains("whether or not the runner is drained"));

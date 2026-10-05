@@ -36,19 +36,33 @@
 //!   enumerated that pid) must reach `eligibility` as `ChildrenUnknown` rather
 //!   than being flattened into a confident "no children";
 //! - **kind** — steward registry, then looping-agent registry, else terminal.
+//!
+//! ## Custody inputs (the `finished_close` arm only)
+//!
+//! The executor's `finished_close` arm additionally needs
+//! [`wind_down::custody_gate`]'s inputs (plan
+//! `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
+//! D2b/D2c), and those cost git subprocesses and a coord read — so they are
+//! gathered here, by [`gather_custody`], ONLY for candidates `eligibility`
+//! already rated `Eligible`, never by `/restart-readiness`. The probes sit
+//! behind [`CustodyProbe`] so the gather is testable without shelling out;
+//! [`GitCustodyProbe`] is the shipped one, and every git call it makes is
+//! bounded by [`CUSTODY_PROBE_TIMEOUT`].
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent_worktree::custody::{self, coord::CoordOwnership};
 use crate::mcp::session_work_status::StatusFetch;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus, TrackingHealthPass};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wind_down::{
-    self, EligibilityInputs, GridIdle, SessionKind, Sideband, SidebandState, WindDownView,
-    WorkStatus,
+    self, CustodyInputs, CustodyMember, EligibilityInputs, GridIdle, MemberState, SessionKind,
+    Sideband, SidebandState, WindDownView, WorkStatus,
 };
 
 /// What one [`observe_and_apply`] pass looked at, kept so a caller that ACTS on
@@ -500,6 +514,509 @@ pub fn looping_terminal_ids(app: &tauri::AppHandle) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Custody inputs for the `finished_close` arm (D2b, D2c)
+// ---------------------------------------------------------------------------
+
+/// Bound on EACH git subprocess a custody probe runs. A probe that does not
+/// answer inside it is a failed probe, and a failed probe is `Unknown`.
+pub const CUSTODY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// coord's attributed-worktree index, or why it could not be read. Fetched
+/// once per arm pass and shared by every candidate in it.
+pub type OwnershipRead = Result<CoordOwnership, String>;
+
+/// Read coord's attributed-worktree index for every live session —
+/// `custody::coord::fetch_live_ownership`, which is complete or `Err`, never
+/// a silently short page (its docs say why the plain survey read is not) —
+/// with the liveness of `claude_session_ids`' coord rows read after it.
+pub async fn fetch_ownership(claude_session_ids: &[String]) -> OwnershipRead {
+    custody::coord::fetch_live_ownership(claude_session_ids).await
+}
+
+/// What the runner knows about one candidate before any probe runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCustodyContext {
+    /// The lifecycle record's `working_dir`, else the process cwd (which is
+    /// `None` on Windows — `tracking_health` reads it from `/proc`).
+    pub session_dir: Option<PathBuf>,
+    /// The `coord.sessions.id` the pane registered under — the key
+    /// `/coord/sessions/worktrees` lists allocations by.
+    pub coord_session_id: Option<String>,
+    /// The parked isolated-edit context's materialized worktrees; `Err` when
+    /// the context's slot could not be read (a poisoned lock), which must not
+    /// read as "no isolated worktrees".
+    pub isolated_worktrees: Result<Vec<PathBuf>, String>,
+}
+
+/// Collect [`SessionCustodyContext`] for one candidate from the pass that
+/// rated it and the live pane.
+pub fn custody_context(
+    app: &tauri::AppHandle,
+    pass: &TrackingHealthPass,
+    claude_session_id: &str,
+    terminal_id: &str,
+) -> SessionCustodyContext {
+    use tauri::Manager;
+
+    let record_dir = pass
+        .open_records
+        .iter()
+        .find(|r| r.claude_session_id == claude_session_id)
+        .and_then(|r| r.working_dir.clone());
+    let process_cwd = pass
+        .report
+        .terminal_hosted
+        .iter()
+        .find(|p| !p.nested_under_claude && p.session_id.as_deref() == Some(claude_session_id))
+        .and_then(|p| p.cwd.clone());
+    let session_dir = session_dir_from(record_dir.as_deref(), process_cwd.as_deref());
+    let pane = app
+        .try_state::<Arc<TerminalManager>>()
+        .and_then(|m| m.get(terminal_id));
+    SessionCustodyContext {
+        session_dir,
+        coord_session_id: pane
+            .as_ref()
+            .and_then(|s| s.coord_session_id())
+            .map(|id| id.to_string()),
+        // A pane that is gone parks no context at all.
+        isolated_worktrees: pane.map_or(Ok(Vec::new()), |s| s.isolated_edit_worktree_paths()),
+    }
+}
+
+/// PURE: the record's `working_dir`, else the process cwd. A blank value is
+/// not a directory.
+pub fn session_dir_from(record_dir: Option<&str>, process_cwd: Option<&str>) -> Option<PathBuf> {
+    [record_dir, process_cwd]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|d| !d.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The `coord.agent_worktrees.status` values whose work is OVER: the
+/// worktree's branch merged, or the allocation was abandoned.
+pub const RETIRED_LEDGER_STATUSES: [&str; 2] = ["merged", "abandoned"];
+
+/// One worktree coord attributes to the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedWorktree {
+    pub path: PathBuf,
+    /// The ledger says its work is over ([`RETIRED_LEDGER_STATUSES`]). Such a
+    /// row whose path is already gone was reaped, and has nothing left to
+    /// lose; a LIVE row whose path is gone is still an unknown.
+    pub retired: bool,
+}
+
+/// PURE: the worktrees coord attributes to the session, as absolute paths.
+///
+/// `Err` — which the gate reads as `Unknown` — when the index could not be
+/// read, when no coord session is known for the Claude session (neither the
+/// work-status reads nor the pane name one — its allocations cannot be looked
+/// up at all), when that session is not POSITIVELY known live (a
+/// session coord closed, or one that moved between states while the pages
+/// were read, is on no live page although its rows may exist — so its absence
+/// is not "no worktrees"; see `custody::coord::fetch_live_ownership`), or
+/// when a ledger path is relative
+/// and no workspace root resolves to anchor it.
+///
+/// The coord session is the one coord's own work-status reads agreed answers
+/// for `claude_session_id` — the row the route attributes that Claude
+/// session's ledger rows to. The pane's own coord id is only a fallback: a
+/// plain terminal the runner never bound carries none, yet coord can still
+/// hold a row (and worktrees) for its Claude session.
+pub fn attributed_worktrees(
+    ownership: &OwnershipRead,
+    claude_session_id: &str,
+    pane_coord_session_id: Option<&str>,
+    workspace_root: Option<&Path>,
+) -> Result<Vec<AttributedWorktree>, String> {
+    let index = ownership.as_ref().map_err(String::clone)?;
+    // The agreed row owns the Claude session's ledger rows; but when it is
+    // not known live and the pane's own row is, the pane's row is the one a
+    // live page listed them under, so prefer it rather than read Unknown.
+    let agreed = index.coord_session_for_claude(claude_session_id);
+    let resolved = match (agreed, pane_coord_session_id) {
+        (Some(agreed), Some(pane)) if !index.is_known_live(agreed) && index.is_known_live(pane) => {
+            Some(pane)
+        }
+        (agreed, pane) => agreed.or(pane),
+    };
+    let Some(session_id) = resolved else {
+        return Err(
+            "no coord session is known for this Claude session (coord's work-status reads did not \
+             agree on one and the pane carries none), so its worktree allocations cannot be looked up"
+                .to_string(),
+        );
+    };
+    if !index.is_known_live(session_id) {
+        return Err(format!(
+            "coord session {session_id} not on any live page (closed or unknown), so the \
+             worktrees allocated to it cannot be read"
+        ));
+    }
+    index
+        .worktrees_for_session(session_id)
+        .into_iter()
+        .map(|row| {
+            let raw = PathBuf::from(&row.worktree_path);
+            let path = if raw.is_absolute() {
+                raw
+            } else {
+                workspace_root.map(|root| root.join(&raw)).ok_or_else(|| {
+                    format!(
+                        "coord's ledger path {} is relative and the workspace root does not resolve",
+                        row.worktree_path
+                    )
+                })?
+            };
+            let retired = row
+                .ledger_status
+                .as_deref()
+                .is_some_and(|s| RETIRED_LEDGER_STATUSES.contains(&s));
+            Ok(AttributedWorktree { path, retired })
+        })
+        .collect()
+}
+
+/// The questions a custody gather asks of the filesystem and git, behind a
+/// seam so the gather is testable without either.
+#[async_trait::async_trait]
+pub trait CustodyProbe: Send + Sync {
+    /// Does `path` exist at all? `Err` when that could not be determined —
+    /// only a positive "not found" is `Ok(false)`.
+    async fn exists(&self, path: &Path) -> Result<bool, String>;
+    /// The root of the worktree containing `dir`. `Ok(None)` when `dir` is in
+    /// no repository at all; `Err` when `dir` cannot be read.
+    async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String>;
+    /// Probe one worktree root (D2c).
+    async fn member_state(&self, root: &Path) -> MemberState;
+    /// `wip_state` of the custody SLOT this session wrote in `root`, if any.
+    async fn slot_wip_state(&self, root: &Path, claude_session_id: &str) -> Option<String>;
+}
+
+/// Gather [`CustodyInputs`] for one candidate (D2b).
+///
+/// The set is the repo holding the session's directory, every attributed
+/// worktree and every isolated-edit worktree, each resolved to its worktree
+/// root and probed ONCE however many sources named it. A directory in no
+/// repository contributes no member, so a session at the workspace root is
+/// judged by its attributed worktrees alone. An attributed worktree whose
+/// ledger row is retired (merged or abandoned) and whose path no longer
+/// exists was reaped and is skipped; every other missing path is a failed
+/// probe.
+///
+/// When the verdict is already decided — no directory, or an unreadable
+/// attribution (the ownership read, or the isolated-edit context), both
+/// `Unknown` — nothing is probed: the probes could not change the answer and
+/// they are the expensive part.
+pub async fn gather_custody<P: CustodyProbe + ?Sized>(
+    probe: &P,
+    context: &SessionCustodyContext,
+    attributed: Result<Vec<AttributedWorktree>, String>,
+    claude_session_id: &str,
+) -> CustodyInputs {
+    let session_dir = context
+        .session_dir
+        .as_ref()
+        .map(|d| d.display().to_string());
+    let attribution = attributed.and_then(|coord| {
+        context
+            .isolated_worktrees
+            .clone()
+            .map(|isolated| (coord, isolated))
+            .map_err(|e| format!("the isolated-edit context could not be read: {e}"))
+    });
+    let ownership = attribution.as_ref().map(|_| ()).map_err(String::clone);
+    let (Some(dir), Ok((attributed, isolated))) = (context.session_dir.as_ref(), attribution)
+    else {
+        return CustodyInputs {
+            session_dir,
+            ownership,
+            members: Vec::new(),
+        };
+    };
+
+    let mut members: Vec<CustodyMember> = Vec::new();
+    let mut named: Vec<(&Path, bool)> = vec![(dir.as_path(), true)];
+    for worktree in &attributed {
+        if worktree.retired {
+            match probe.exists(&worktree.path).await {
+                // Reaped: its work is over and nothing is left to lose.
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => {
+                    members.push(CustodyMember {
+                        path: worktree.path.display().to_string(),
+                        state: MemberState::ProbeFailed(e),
+                        slot_wip_state: None,
+                    });
+                    continue;
+                }
+            }
+        }
+        named.push((worktree.path.as_path(), false));
+    }
+    named.extend(isolated.iter().map(|p| (p.as_path(), false)));
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (path, is_session_dir) in named {
+        match probe.worktree_root(path).await {
+            Ok(Some(root)) => {
+                if seen.insert(custody::norm(&root.to_string_lossy())) {
+                    roots.push(root);
+                }
+            }
+            // The session's own directory may legitimately sit outside every
+            // repo (the workspace root). A worktree coord or the isolated-edit
+            // context NAMED is supposed to be one, so not finding a repo there
+            // is a failed probe.
+            Ok(None) if is_session_dir => {}
+            Ok(None) => members.push(CustodyMember {
+                path: path.display().to_string(),
+                state: MemberState::ProbeFailed("not inside a git worktree".to_string()),
+                slot_wip_state: None,
+            }),
+            Err(e) => members.push(CustodyMember {
+                path: path.display().to_string(),
+                state: MemberState::ProbeFailed(e),
+                slot_wip_state: None,
+            }),
+        }
+    }
+    for root in roots {
+        let state = probe.member_state(&root).await;
+        let slot_wip_state = probe.slot_wip_state(&root, claude_session_id).await;
+        members.push(CustodyMember {
+            path: root.display().to_string(),
+            state,
+            slot_wip_state,
+        });
+    }
+    CustodyInputs {
+        session_dir,
+        ownership,
+        members,
+    }
+}
+
+/// The shipped [`CustodyProbe`]: a filesystem walk for the root, git for the
+/// state, and the custody slot store for the cross-check.
+#[derive(Debug, Clone, Copy)]
+pub struct GitCustodyProbe {
+    /// Bound on each git subprocess.
+    pub timeout: Duration,
+}
+
+impl Default for GitCustodyProbe {
+    fn default() -> Self {
+        Self {
+            timeout: CUSTODY_PROBE_TIMEOUT,
+        }
+    }
+}
+
+impl GitCustodyProbe {
+    /// Run `git --no-optional-locks -C <root> <args>` under [`Self::timeout`].
+    /// `Err` only when the process could not be run or did not finish in time;
+    /// a non-zero exit is returned for the caller to read, because for
+    /// `symbolic-ref -q` and `show-ref -q` it is an answer rather than a
+    /// failure.
+    ///
+    /// The probe runs in OTHER sessions' worktrees as readily as in this one's,
+    /// so it must leave no trace there: `--no-optional-locks` (and
+    /// `GIT_OPTIONAL_LOCKS=0`) stops `git status` taking `index.lock` to
+    /// refresh the index, which would make a peer's own `git` fail on a lock it
+    /// never took.
+    async fn git(&self, root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+        let mut cmd = crate::process_helpers::tokio_no_window("git");
+        cmd.arg("--no-optional-locks")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            // An inherited GIT_DIR / GIT_WORK_TREE would point every probe at
+            // some other repository than the one named by `-C`.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            // A probe must never touch the network: in a partial clone a
+            // missing object would otherwise be lazily fetched.
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        match tokio::time::timeout(self.timeout, cmd.output()).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(e)) => Err(format!("git {} could not run: {e}", args.join(" "))),
+            Err(_) => Err(format!(
+                "git {} did not finish within {} s",
+                args.join(" "),
+                self.timeout.as_secs()
+            )),
+        }
+    }
+
+    /// Run a git probe that must exit zero, returning its trimmed stdout.
+    async fn git_ok(&self, root: &Path, args: &[&str]) -> Result<String, String> {
+        let output = self.git(root, args).await?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(failed_git(args, &output))
+        }
+    }
+
+    /// Commits reachable from `HEAD` that are not pushed.
+    ///
+    /// * **With an upstream that resolves** — `rev-list --count
+    ///   <upstream>..HEAD`.
+    /// * **With none, a detached `HEAD`, or an upstream whose remote-tracking
+    ///   ref no longer resolves (pruned after its branch was deleted)** —
+    ///   `rev-list --count HEAD --not --remotes`: the commits on NO
+    ///   remote-tracking ref. `0` means every commit at `HEAD` is already on
+    ///   some remote, so nothing is unpushed; that is the shape of a freshly
+    ///   allocated worktree that made no commits (it sits on `origin/main`'s
+    ///   commit with no upstream), the most common finished session there is.
+    ///
+    /// Which arm applies is decided from exit codes and ref names, never from
+    /// git's (localisable) error text. Every call is local — `rev-list` reads
+    /// remote-tracking refs as this clone last saw them and fetches nothing,
+    /// and [`Self::git`] sets `GIT_NO_LAZY_FETCH` so a partial clone cannot
+    /// fetch a missing object behind the probe's back. `Err` only when a git
+    /// call failed or timed out.
+    async fn unpushed_commits(&self, root: &Path) -> Result<u64, String> {
+        let range = self
+            .resolved_upstream(root)
+            .await?
+            .map(|upstream| format!("{upstream}..HEAD"));
+        let args: Vec<&str> = match range.as_deref() {
+            Some(range) => vec!["rev-list", "--count", range],
+            None => vec!["rev-list", "--count", "HEAD", "--not", "--remotes"],
+        };
+        let count = self.git_ok(root, &args).await?;
+        count
+            .parse::<u64>()
+            .map_err(|e| format!("git {} printed {count:?}: {e}", args.join(" ")))
+    }
+
+    /// The full ref name of `HEAD`'s upstream when one is configured, is a
+    /// REMOTE-tracking ref, and still resolves; `None` for a detached `HEAD`
+    /// (`symbolic-ref -q` exits 1), a branch with no upstream (`for-each-ref`
+    /// prints nothing), an upstream that is a LOCAL branch (`--track main`:
+    /// `main..HEAD == 0` proves nothing was pushed), and an upstream whose ref
+    /// is gone (`show-ref --verify -q` exits 1).
+    async fn resolved_upstream(&self, root: &Path) -> Result<Option<String>, String> {
+        let head = self.git(root, &["symbolic-ref", "-q", "HEAD"]).await?;
+        match head.status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(None),
+            _ => return Err(failed_git(&["symbolic-ref", "-q", "HEAD"], &head)),
+        }
+        let head_ref = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let upstream = self
+            .git_ok(root, &["for-each-ref", "--format=%(upstream)", &head_ref])
+            .await?;
+        if !upstream.starts_with("refs/remotes/") {
+            return Ok(None);
+        }
+        let exists = self
+            .git(root, &["show-ref", "--verify", "-q", &upstream])
+            .await?;
+        match exists.status.code() {
+            Some(0) => Ok(Some(upstream)),
+            Some(1) => Ok(None),
+            _ => Err(failed_git(
+                &["show-ref", "--verify", "-q", &upstream],
+                &exists,
+            )),
+        }
+    }
+}
+
+/// One line describing a git probe that exited non-zero.
+fn failed_git(args: &[&str], output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let excerpt: String = stderr.trim().chars().take(200).collect();
+    format!("git {} exited {}: {excerpt}", args.join(" "), output.status)
+}
+
+#[async_trait::async_trait]
+impl CustodyProbe for GitCustodyProbe {
+    async fn exists(&self, path: &Path) -> Result<bool, String> {
+        let path = path.to_path_buf();
+        // Only `NotFound` is "missing". Permission denied, a stale mount or a
+        // walk that died says nothing about whether the worktree was reaped.
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            }
+        })
+        .await
+        .map_err(|e| format!("existence check died: {e}"))?
+    }
+
+    async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
+        let dir = dir.to_path_buf();
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            if !dir.is_dir() {
+                return Err(format!("{} is not a readable directory", dir.display()));
+            }
+            // The nearest ancestor holding a `.git` entry — a directory for a
+            // primary checkout, a file for a linked worktree — is what git
+            // itself would resolve, without a subprocess per candidate.
+            Ok(dir
+                .ancestors()
+                .find(|a| std::fs::symlink_metadata(a.join(".git")).is_ok())
+                .map(Path::to_path_buf))
+        })
+        .await
+        .map_err(|e| format!("worktree-root walk died: {e}"))?
+    }
+
+    async fn member_state(&self, root: &Path) -> MemberState {
+        match std::fs::metadata(root.join(".git")) {
+            Ok(meta) if meta.is_dir() => return MemberState::PrimaryCheckout,
+            Ok(_) => {}
+            Err(e) => return MemberState::ProbeFailed(format!("{}/.git: {e}", root.display())),
+        }
+        let status = match self
+            .git_ok(root, &["status", "--porcelain", "--untracked-files=normal"])
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => return MemberState::ProbeFailed(e),
+        };
+        match self.unpushed_commits(root).await {
+            Ok(ahead) => MemberState::Probed {
+                dirty: !status.is_empty(),
+                ahead,
+            },
+            Err(e) => MemberState::ProbeFailed(e),
+        }
+    }
+
+    async fn slot_wip_state(&self, root: &Path, claude_session_id: &str) -> Option<String> {
+        let root = root.to_path_buf();
+        let session_id = claude_session_id.to_string();
+        // A read that dies answers `None`, the same as an absent slot. That is
+        // safe only because the slot is a cross-check and never the source:
+        // the git probes above already judged the tree on their own.
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            custody::read_custody_slots(&root)
+                .into_iter()
+                .find(|slot| slot.session_id.as_deref() == Some(session_id.as_str()))
+                .and_then(|slot| slot.wip_state)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +1135,646 @@ mod tests {
     fn observing_without_a_terminal_manager_is_unobservable() {
         let got = observe_terminals(None, ["t1".to_string()].into());
         assert_eq!(got.get("t1"), Some(&TerminalObservation::UNOBSERVABLE));
+    }
+
+    // ── Custody inputs (finished_close, D2b/D2c) ─────────────────────────
+
+    use qontinui_runner_lib::wind_down::{custody_gate, CustodyUnknown, CustodyVerdict};
+
+    /// A [`CustodyProbe`] answering from a script and recording every call.
+    #[derive(Default)]
+    struct FakeProbe {
+        /// dir → its worktree root. Absent = in no repo.
+        roots: HashMap<PathBuf, PathBuf>,
+        /// dirs whose read fails.
+        unreadable: HashSet<PathBuf>,
+        /// root → its state. Absent = clean and pushed.
+        states: HashMap<PathBuf, MemberState>,
+        /// root → this session's slot wip_state.
+        slots: HashMap<PathBuf, String>,
+        /// paths that do not exist at all.
+        missing: HashSet<PathBuf>,
+        /// paths whose existence cannot be determined.
+        exists_unreadable: HashSet<PathBuf>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeProbe {
+        fn root(mut self, dir: &str, root: &str) -> Self {
+            self.roots.insert(PathBuf::from(dir), PathBuf::from(root));
+            self
+        }
+        fn state(mut self, root: &str, state: MemberState) -> Self {
+            self.states.insert(PathBuf::from(root), state);
+            self
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CustodyProbe for FakeProbe {
+        async fn exists(&self, path: &Path) -> Result<bool, String> {
+            if self.exists_unreadable.contains(path) {
+                return Err(format!("{}: permission denied", path.display()));
+            }
+            Ok(!self.missing.contains(path))
+        }
+        async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("root:{}", dir.display()));
+            if self.unreadable.contains(dir) {
+                return Err(format!("{} is not a readable directory", dir.display()));
+            }
+            Ok(self.roots.get(dir).cloned())
+        }
+        async fn member_state(&self, root: &Path) -> MemberState {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("probe:{}", root.display()));
+            self.states
+                .get(root)
+                .cloned()
+                .unwrap_or(MemberState::Probed {
+                    dirty: false,
+                    ahead: 0,
+                })
+        }
+        async fn slot_wip_state(&self, root: &Path, _claude_session_id: &str) -> Option<String> {
+            self.slots.get(root).cloned()
+        }
+    }
+
+    fn context(dir: Option<&str>, isolated: &[&str]) -> SessionCustodyContext {
+        SessionCustodyContext {
+            session_dir: dir.map(PathBuf::from),
+            coord_session_id: Some("c-1".to_string()),
+            isolated_worktrees: Ok(isolated.iter().map(PathBuf::from).collect()),
+        }
+    }
+
+    /// A live attributed worktree.
+    fn live(path: &str) -> AttributedWorktree {
+        AttributedWorktree {
+            path: PathBuf::from(path),
+            retired: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_in_a_clean_worktree_gathers_one_clean_member() {
+        let probe = FakeProbe::default().root("/ws/wt/repo/src", "/ws/wt/repo");
+        let inputs = gather_custody(
+            &probe,
+            &context(Some("/ws/wt/repo/src"), &[]),
+            Ok(vec![]),
+            "s",
+        )
+        .await;
+        assert_eq!(inputs.members.len(), 1);
+        assert_eq!(inputs.members[0].path, "/ws/wt/repo");
+        assert_eq!(custody_gate(&inputs), CustodyVerdict::Clean);
+    }
+
+    /// D2b: a workspace-root session has no repo of its own and is judged by
+    /// its attributed worktrees alone.
+    #[tokio::test]
+    async fn a_workspace_root_session_is_judged_by_its_attributed_worktrees() {
+        let probe = FakeProbe::default()
+            .root("/ws/agent-worktrees/a/repo", "/ws/agent-worktrees/a/repo")
+            .state(
+                "/ws/agent-worktrees/a/repo",
+                MemberState::Probed {
+                    dirty: true,
+                    ahead: 0,
+                },
+            );
+        let none = gather_custody(&probe, &context(Some("/ws"), &[]), Ok(vec![]), "s").await;
+        assert!(none.members.is_empty());
+        assert!(custody_gate(&none).is_clean(), "nothing attributed → clean");
+
+        let one = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![live("/ws/agent-worktrees/a/repo")]),
+            "s",
+        )
+        .await;
+        assert_eq!(one.members.len(), 1);
+        assert_eq!(custody_gate(&one).as_str(), "dirty");
+    }
+
+    /// A multi-worktree session with one dirty sibling is not clean, and a
+    /// worktree named by two sources is probed ONCE.
+    #[tokio::test]
+    async fn every_source_contributes_and_a_shared_root_is_probed_once() {
+        let probe = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .root("/ws/wt/b", "/ws/wt/b")
+            .state(
+                "/ws/wt/b",
+                MemberState::Probed {
+                    dirty: false,
+                    ahead: 3,
+                },
+            );
+        let inputs = gather_custody(
+            &probe,
+            &context(Some("/ws/wt/a"), &["/ws/wt/a", "/ws/wt/b"]),
+            Ok(vec![live("/ws/wt/a")]),
+            "s",
+        )
+        .await;
+        assert_eq!(
+            probe
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("probe:"))
+                .count(),
+            2,
+            "{:?}",
+            probe.calls()
+        );
+        assert_eq!(custody_gate(&inputs).reason(), Some("unpushed"));
+    }
+
+    /// The verdict is already `Unknown` without a directory or an ownership
+    /// read, so nothing is probed.
+    #[tokio::test]
+    async fn an_already_unknown_verdict_probes_nothing() {
+        let probe = FakeProbe::default().root("/ws/wt/a", "/ws/wt/a");
+        let no_dir = gather_custody(&probe, &context(None, &["/ws/wt/a"]), Ok(vec![]), "s").await;
+        assert_eq!(
+            custody_gate(&no_dir),
+            CustodyVerdict::Unknown(CustodyUnknown::NoSessionDir)
+        );
+        let no_ownership = gather_custody(
+            &probe,
+            &context(Some("/ws/wt/a"), &[]),
+            Err("coord returned 503".to_string()),
+            "s",
+        )
+        .await;
+        assert_eq!(
+            custody_gate(&no_ownership).reason(),
+            Some("ownership_unreadable")
+        );
+        assert!(probe.calls().is_empty(), "{:?}", probe.calls());
+    }
+
+    /// An attributed worktree that is not a repo, or a directory that cannot
+    /// be read, is a failed probe — never silently dropped.
+    #[tokio::test]
+    async fn a_named_worktree_that_is_not_a_repo_is_a_failed_probe() {
+        let mut probe = FakeProbe::default();
+        probe.unreadable.insert(PathBuf::from("/ws/gone"));
+        let inputs = gather_custody(
+            &probe,
+            &context(Some("/ws"), &["/ws/not-a-repo"]),
+            Ok(vec![live("/ws/gone")]),
+            "s",
+        )
+        .await;
+        assert_eq!(inputs.members.len(), 2);
+        assert!(inputs
+            .members
+            .iter()
+            .all(|m| matches!(m.state, MemberState::ProbeFailed(_))));
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
+    }
+
+    /// Review item 7b: a RETIRED ledger row (merged or abandoned) whose path
+    /// is gone was reaped and is skipped; a LIVE row whose path is gone, and a
+    /// retired row whose path still exists, are both still judged.
+    #[tokio::test]
+    async fn a_reaped_retired_worktree_is_skipped_and_a_missing_live_one_is_unknown() {
+        let mut probe = FakeProbe::default().root("/ws/kept", "/ws/kept");
+        probe.missing.insert(PathBuf::from("/ws/reaped"));
+        probe.missing.insert(PathBuf::from("/ws/lost"));
+        probe.unreadable.insert(PathBuf::from("/ws/lost"));
+        let retired = |p: &str| AttributedWorktree {
+            path: PathBuf::from(p),
+            retired: true,
+        };
+
+        let reaped = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![retired("/ws/reaped"), retired("/ws/kept")]),
+            "s",
+        )
+        .await;
+        assert_eq!(
+            reaped
+                .members
+                .iter()
+                .map(|m| m.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/ws/kept"],
+            "the reaped row contributes nothing; the retired row still on disk is probed"
+        );
+        assert!(custody_gate(&reaped).is_clean());
+
+        // Round-2 suggestion 5: a retired row whose existence cannot be read
+        // is not "reaped" — it is a failed probe.
+        probe.exists_unreadable.insert(PathBuf::from("/ws/denied"));
+        let denied = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![retired("/ws/denied")]),
+            "s",
+        )
+        .await;
+        assert_eq!(custody_gate(&denied).reason(), Some("probe_failed"));
+
+        let lost = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![live("/ws/lost")]),
+            "s",
+        )
+        .await;
+        assert_eq!(custody_gate(&lost).reason(), Some("probe_failed"));
+    }
+
+    /// Review item 8: an isolated-edit context that cannot be READ is not "no
+    /// isolated worktrees".
+    #[tokio::test]
+    async fn an_unreadable_isolated_edit_context_is_unknown() {
+        let probe = FakeProbe::default().root("/ws/wt/a", "/ws/wt/a");
+        let mut ctx = context(Some("/ws/wt/a"), &[]);
+        ctx.isolated_worktrees = Err("isolated-edit context lock poisoned".to_string());
+        let inputs = gather_custody(&probe, &ctx, Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("ownership_unreadable"));
+        assert!(probe.calls().is_empty(), "{:?}", probe.calls());
+    }
+
+    #[tokio::test]
+    async fn the_sessions_own_slot_is_the_cross_check() {
+        let mut probe = FakeProbe::default().root("/ws/wt/a", "/ws/wt/a");
+        probe
+            .slots
+            .insert(PathBuf::from("/ws/wt/a"), "deferred".to_string());
+        let inputs = gather_custody(&probe, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("wip_slot"));
+    }
+
+    #[test]
+    fn the_record_directory_wins_and_a_blank_one_falls_through() {
+        assert_eq!(
+            session_dir_from(Some("/rec"), Some("/cwd")),
+            Some(PathBuf::from("/rec"))
+        );
+        assert_eq!(
+            session_dir_from(Some("  "), Some("/cwd")),
+            Some(PathBuf::from("/cwd"))
+        );
+        assert_eq!(session_dir_from(None, None), None);
+    }
+
+    /// An index read from `json`, with `live` marked positively live.
+    fn ownership(json: &str, live: &[&str]) -> OwnershipRead {
+        let mut index = CoordOwnership::from_response(serde_json::from_str(json).unwrap());
+        index.mark_live(live.iter().copied());
+        Ok(index)
+    }
+
+    #[test]
+    fn attributed_worktrees_are_anchored_on_the_workspace_root() {
+        let own = ownership(
+            r#"{"sessions":[{"sessionId":"c-1","ownerSessionState":"active","worktrees":[
+                {"worktreePath":"agent-worktrees/a/repo","repo":"repo","ledgerStatus":"active"},
+                {"worktreePath":"/abs/wt","repo":"repo2","ledgerStatus":"merged"},
+                {"worktreePath":"/abs/old","repo":"repo3","ledgerStatus":"abandoned"},
+                {"worktreePath":"/abs/new","repo":"repo4"}]}]}"#,
+            &["c-1", "c-other"],
+        );
+        assert_eq!(
+            attributed_worktrees(&own, "claude-x", Some("c-1"), Some(Path::new("/ws"))).unwrap(),
+            vec![
+                live("/ws/agent-worktrees/a/repo"),
+                AttributedWorktree {
+                    path: PathBuf::from("/abs/wt"),
+                    retired: true
+                },
+                AttributedWorktree {
+                    path: PathBuf::from("/abs/old"),
+                    retired: true
+                },
+                // No ledger status is not "retired".
+                live("/abs/new"),
+            ]
+        );
+        assert!(
+            attributed_worktrees(&own, "claude-x", Some("c-1"), None).is_err(),
+            "a relative ledger path with no root to anchor it is not guessed"
+        );
+        assert_eq!(
+            attributed_worktrees(&own, "claude-x", Some("c-other"), None).unwrap(),
+            Vec::<AttributedWorktree>::new(),
+            "a session positively known live that holds no rows has nothing attributed"
+        );
+    }
+
+    /// Round-2 CRITICAL 1: a pane whose coord session is on NO validated live
+    /// page and not otherwise known live — coord auto-closed it — is Unknown,
+    /// never "nothing attributed". Its rows (a dirty sibling, say) may exist.
+    #[tokio::test]
+    async fn a_coord_session_absent_from_every_live_page_is_unknown() {
+        let own = ownership(
+            r#"{"sessions":[{"sessionId":"c-live","worktrees":[{"worktreePath":"/abs/a"}]}]}"#,
+            &["c-live"],
+        );
+        let err = attributed_worktrees(
+            &own,
+            "claude-x",
+            Some("c-autoclosed"),
+            Some(Path::new("/ws")),
+        )
+        .unwrap_err();
+        assert!(err.contains("not on any live page"), "{err}");
+        let inputs = gather_custody(
+            &FakeProbe::default().root("/ws/wt/a", "/ws/wt/a"),
+            &context(Some("/ws/wt/a"), &[]),
+            attributed_worktrees(
+                &own,
+                "claude-x",
+                Some("c-autoclosed"),
+                Some(Path::new("/ws")),
+            ),
+            "s",
+        )
+        .await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("ownership_unreadable"));
+    }
+
+    /// Phase 2 (temp runner, 2026-10-04): a plain runner terminal running
+    /// `claude` carries no coord id on its pane, yet coord holds a row for its
+    /// Claude session. The work-status reads' agreed row is the lookup key, and
+    /// it wins over a pane id that names a different (older) row.
+    #[test]
+    fn the_coord_row_work_status_agreed_on_is_used_when_the_pane_has_none() {
+        let mut index = CoordOwnership::from_response(
+            serde_json::from_str(
+                r#"{"sessions":[{"sessionId":"c-row","worktrees":[{"worktreePath":"/abs/sib"}]}]}"#,
+            )
+            .unwrap(),
+        );
+        index.mark_live(["c-row"]);
+        index.record_coord_rows([("CLAUDE-X".to_string(), "c-row".to_string())]);
+        let own: OwnershipRead = Ok(index);
+        assert_eq!(
+            attributed_worktrees(&own, "claude-x", None, Some(Path::new("/ws"))).unwrap(),
+            vec![live("/abs/sib")],
+            "the pane has no coord id, but coord's agreed row still finds the sibling"
+        );
+        assert_eq!(
+            attributed_worktrees(&own, "claude-x", Some("c-older"), Some(Path::new("/ws")))
+                .unwrap(),
+            vec![live("/abs/sib")],
+            "the agreed row, not the pane's older one, owns the Claude session's rows"
+        );
+        assert!(
+            attributed_worktrees(&own, "claude-other", None, Some(Path::new("/ws"))).is_err(),
+            "no agreed row and no pane id stays Unknown"
+        );
+
+        // The agreed (newest) row is closed while the pane's own row is live
+        // and holds the rows: the pane's row is used.
+        let mut index = CoordOwnership::from_response(
+            serde_json::from_str(
+                r#"{"sessions":[{"sessionId":"c-pane","worktrees":[{"worktreePath":"/abs/p"}]}]}"#,
+            )
+            .unwrap(),
+        );
+        index.mark_live(["c-pane"]);
+        index.record_coord_rows([("claude-y".to_string(), "c-closed".to_string())]);
+        let own: OwnershipRead = Ok(index);
+        assert_eq!(
+            attributed_worktrees(&own, "claude-y", Some("c-pane"), Some(Path::new("/ws"))).unwrap(),
+            vec![live("/abs/p")],
+            "a live pane row wins over a closed agreed row"
+        );
+        assert!(
+            attributed_worktrees(&own, "claude-y", None, Some(Path::new("/ws"))).is_err(),
+            "a closed agreed row with no live pane row stays Unknown"
+        );
+    }
+
+    #[test]
+    fn attributed_worktrees_fail_closed_without_a_read_or_a_coord_id() {
+        let own = ownership(r#"{"sessions":[]}"#, &["c-1"]);
+        assert!(attributed_worktrees(&own, "claude-x", None, Some(Path::new("/ws"))).is_err());
+        let failed: OwnershipRead = Err("coord returned 503".to_string());
+        assert_eq!(
+            attributed_worktrees(&failed, "claude-x", Some("c-1"), Some(Path::new("/ws"))),
+            Err("coord returned 503".to_string())
+        );
+    }
+
+    // ── The real git probe, against a temp repository ─────────────────────
+
+    /// Run git in `dir` with an identity and no hooks, panicking on failure.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=wind-down-test",
+                "-c",
+                "user.email=wind-down-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The D2c cases — clean, an untracked file, an unpushed commit, and a
+    /// branch with no upstream both with and without a local-only commit —
+    /// plus a detached HEAD and the primary-checkout case, through the
+    /// SHIPPED probe and a real git.
+    #[tokio::test]
+    async fn the_git_probe_reads_clean_untracked_unpushed_and_no_upstream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let primary = tmp.path().join("primary");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-q"]);
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                primary.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(primary.join("README"), "x").unwrap();
+        git(&primary, &["add", "README"]);
+        git(&primary, &["commit", "-q", "-m", "init"]);
+        git(&primary, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        git(&primary, &["fetch", "-q", "origin"]);
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feat",
+                linked.to_str().unwrap(),
+                "origin/main",
+            ],
+        );
+
+        let probe = GitCustodyProbe::default();
+        let clean = MemberState::Probed {
+            dirty: false,
+            ahead: 0,
+        };
+
+        // The root walk resolves a subdirectory to its worktree root.
+        std::fs::create_dir_all(linked.join("sub")).unwrap();
+        assert_eq!(
+            probe.worktree_root(&linked.join("sub")).await.unwrap(),
+            Some(linked.clone())
+        );
+
+        // Clean and pushed.
+        assert_eq!(probe.member_state(&linked).await, clean);
+
+        // An untracked file is dirty — `--untracked-files=normal`, unlike the
+        // custody hook's `-uno`.
+        std::fs::write(linked.join("scratch.txt"), "wip").unwrap();
+        assert_eq!(
+            probe.member_state(&linked).await,
+            MemberState::Probed {
+                dirty: true,
+                ahead: 0
+            }
+        );
+
+        // An unpushed commit.
+        git(&linked, &["add", "scratch.txt"]);
+        git(&linked, &["commit", "-q", "-m", "local only"]);
+        assert_eq!(
+            probe.member_state(&linked).await,
+            MemberState::Probed {
+                dirty: false,
+                ahead: 1
+            }
+        );
+
+        // Pushed, it is clean again.
+        git(&linked, &["push", "-q", "origin", "HEAD:main"]);
+        git(&linked, &["fetch", "-q", "origin"]);
+        assert_eq!(probe.member_state(&linked).await, clean);
+
+        // No upstream, HEAD on a remote-tracking ref's commit — the freshly
+        // allocated worktree that made no commits: nothing is unpushed.
+        git(&linked, &["switch", "-q", "-c", "no-upstream"]);
+        assert_eq!(probe.member_state(&linked).await, clean);
+
+        // No upstream, one local-only commit: on no remote ref, so unpushed.
+        std::fs::write(linked.join("local.txt"), "mine").unwrap();
+        git(&linked, &["add", "local.txt"]);
+        git(&linked, &["commit", "-q", "-m", "on no remote"]);
+        let one_unpushed = MemberState::Probed {
+            dirty: false,
+            ahead: 1,
+        };
+        assert_eq!(probe.member_state(&linked).await, one_unpushed);
+
+        // A detached HEAD has no upstream either and is judged the same way.
+        git(&linked, &["switch", "-q", "--detach"]);
+        assert_eq!(probe.member_state(&linked).await, one_unpushed);
+        git(&linked, &["switch", "-q", "--detach", "origin/main"]);
+        assert_eq!(probe.member_state(&linked).await, clean);
+
+        // Round-2 WARNING 3: an upstream that is a LOCAL branch proves nothing
+        // was pushed. `--track main` with a local-only commit: `main..HEAD`
+        // would read 0 — the probe must count commits on no remote ref.
+        git(&linked, &["switch", "-q", "--detach", "origin/main"]);
+        git(
+            &linked,
+            &["branch", "-q", "-f", "local-base", "origin/main"],
+        );
+        git(
+            &linked,
+            &[
+                "switch",
+                "-q",
+                "-c",
+                "tracks-local",
+                "--track",
+                "local-base",
+            ],
+        );
+        std::fs::write(linked.join("tracked-local.txt"), "mine").unwrap();
+        git(&linked, &["add", "tracked-local.txt"]);
+        git(
+            &linked,
+            &["commit", "-q", "-m", "local only, local upstream"],
+        );
+        git(&linked, &["branch", "-q", "-f", "local-base", "HEAD"]);
+        assert_eq!(
+            probe.member_state(&linked).await,
+            one_unpushed,
+            "`local-base..HEAD` is 0, but the commit is on no remote"
+        );
+
+        // Review item 7a: an upstream whose remote-tracking ref was pruned (its
+        // branch deleted on the remote) falls back to "on any remote ref".
+        git(&linked, &["switch", "-q", "-c", "pruned", "origin/main"]);
+        git(&linked, &["push", "-q", "-u", "origin", "pruned"]);
+        git(&linked, &["push", "-q", "origin", "--delete", "pruned"]);
+        git(&linked, &["fetch", "-q", "--prune", "origin"]);
+        assert_eq!(
+            probe.member_state(&linked).await,
+            clean,
+            "pruned upstream, HEAD on origin/main's commit"
+        );
+        std::fs::write(linked.join("pruned.txt"), "mine").unwrap();
+        git(&linked, &["add", "pruned.txt"]);
+        git(&linked, &["commit", "-q", "-m", "after the prune"]);
+        assert_eq!(probe.member_state(&linked).await, one_unpushed);
+
+        // A peer holding `index.lock` in the tree does not fail the probe: it
+        // runs `--no-optional-locks`, so it never needs that lock.
+        let git_dir = std::fs::read_to_string(linked.join(".git")).unwrap();
+        let admin = PathBuf::from(git_dir.trim().trim_start_matches("gitdir:").trim());
+        std::fs::write(admin.join("index.lock"), "").unwrap();
+        assert_eq!(probe.member_state(&linked).await, one_unpushed);
+        std::fs::remove_file(admin.join("index.lock")).unwrap();
+
+        // The primary clone's `.git` is a directory.
+        assert_eq!(
+            probe.member_state(&primary).await,
+            MemberState::PrimaryCheckout
+        );
+
+        // And outside any repository there is no root at all.
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(probe.worktree_root(outside.path()).await.unwrap(), None);
     }
 }

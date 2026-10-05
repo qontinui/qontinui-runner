@@ -227,6 +227,15 @@ pub const WIND_DOWN_CLOSE_UNKNOWN: &str = "close_unknown";
 /// is recorded rather than treated as a non-event.
 pub const WIND_DOWN_NOT_ATTEMPTED: &str = "exit_not_submitted";
 
+/// [`TerminalSessionRecord::wind_down_arm`] — the close was made by the
+/// executor's DRAIN arm: coord held this device drained.
+pub const WIND_DOWN_ARM_DRAIN: &str = "drain";
+/// [`TerminalSessionRecord::wind_down_arm`] — the close was made by the
+/// executor's `finished_close` arm: a finished, idle, custody-clean terminal
+/// session past grace, with no drain involved (plan
+/// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`).
+pub const WIND_DOWN_ARM_FINISHED_CLOSE: &str = "finished_close";
+
 /// Restore tier: the session was brought back with `claude --resume` and the
 /// provider handshake landed — the transcript continues.
 pub const RESTORE_TIER_RESUMED: &str = "resumed";
@@ -732,6 +741,15 @@ pub struct TerminalSessionRecord {
     /// Unix millis when [`Self::wind_down_outcome`] was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wind_down_at: Option<i64>,
+    /// WHICH executor arm produced [`Self::wind_down_outcome`]:
+    /// [`WIND_DOWN_ARM_DRAIN`] or [`WIND_DOWN_ARM_FINISHED_CLOSE`]. Written
+    /// together with the outcome, so the two always describe the same act.
+    /// `None` on a record no arm acted on — and on every outcome recorded
+    /// before the field existed, all of which were the drain arm's.
+    ///
+    /// Not [`Self::origin`]: that is session-id bind provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wind_down_arm: Option<String>,
     /// Free-text reason recorded alongside [`Self::finished_at`] (e.g.
     /// `"unattended: 6 units, all landed"`). Sticky; searchable in the
     /// Previous-sessions view.
@@ -2071,13 +2089,20 @@ impl SessionLifecycleStore {
     }
 
     /// Record what the wind-down executor did to this session — one of the
-    /// `WIND_DOWN_*` words above. No-op when the record is absent.
+    /// `WIND_DOWN_*` outcome words above — and which arm did it (one of the
+    /// `WIND_DOWN_ARM_*` words). No-op when the record is absent.
     ///
     /// Written whether or not the record is still `open`: the `closed` outcome
     /// is recorded on a record the close itself has usually just flipped, and
     /// the two statements are orthogonal (see
     /// [`TerminalSessionRecord::wind_down_outcome`]).
-    pub fn set_wind_down_outcome(&self, claude_session_id: &str, outcome: &str, at_ms: i64) {
+    pub fn set_wind_down_outcome(
+        &self,
+        claude_session_id: &str,
+        outcome: &str,
+        arm: &str,
+        at_ms: i64,
+    ) {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
@@ -2089,6 +2114,7 @@ impl SessionLifecycleStore {
             Some(rec) => {
                 rec.wind_down_outcome = Some(outcome.to_string());
                 rec.wind_down_at = Some(at_ms);
+                rec.wind_down_arm = Some(arm.to_string());
                 rec.clone()
             }
             None => return,
@@ -4069,6 +4095,7 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
@@ -7725,6 +7752,7 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,

@@ -1350,6 +1350,7 @@ fn registry_record_from_restore_payload(
         finished_at: None,
         wind_down_outcome: None,
         wind_down_at: None,
+        wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,

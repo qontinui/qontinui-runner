@@ -242,6 +242,7 @@ pub mod self_healing_settings;
 pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive Tauri commands
 pub mod session_identity; // Plan 2026-07-17-universal-coord-device-identity §6 — the persistent identity-shim PATH opt-in (delivery gate)
 pub mod session_info; // One-shot session-identity projection (durable record ⨝ live registry ⨝ PR ledger) for the zone-header session-info dropdown
+pub mod sessions_settings; // Settings > General > Sessions: the wind-down executor's finished_close switch (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain, D3)
 pub mod setup_discovery; // Native (pure-Rust) setup-wizard discovery — no Python interpreter needed
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution

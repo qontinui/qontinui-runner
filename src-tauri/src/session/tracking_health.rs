@@ -220,6 +220,86 @@ pub fn blocks_restart(status: Option<&SessionWorkStatus>) -> bool {
     !matches!(status, Some(SessionWorkStatus::Finished))
 }
 
+/// Child images that mean a `claude` has WORK in flight: the shells its Bash
+/// tool (and a background task started through it) runs under, and a nested
+/// `claude` (an agent process it launched). Compared against a child's image
+/// after [`normalize_image`].
+pub const WORK_CHILD_IMAGES: [&str; 14] = [
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "tcsh",
+    "csh",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "nu",
+    "busybox",
+    "claude",
+];
+
+/// PURE: an image name lowercased, path and `.exe` stripped.
+fn normalize_image(image: &str) -> String {
+    let base = image
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(image)
+        .trim()
+        .to_ascii_lowercase();
+    base.strip_suffix(".exe")
+        .map(str::to_string)
+        .unwrap_or(base)
+}
+
+/// How soon after its parent `claude` started a child must have started to
+/// count as session infrastructure: Claude Code spawns its stdio MCP servers
+/// while it boots, before any turn can run a tool.
+pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
+
+/// PURE: does this direct child of a `claude` count as WORK in flight?
+///
+/// The default is WORK; infrastructure is the exception that has to be
+/// earned with positive evidence. A child is infrastructure only when its
+/// image is readable, it is not a shell or a nested `claude` (the shells
+/// Claude Code's Bash tool runs commands and background tasks under, and an
+/// agent process it launched — always work), AND both creation times are
+/// known and it started within [`SESSION_START_CHILD_WINDOW_S`] of its parent:
+/// the stdio MCP servers a session spawns at boot (every fleet session holds a
+/// `coord-mcp-shim.py`), language servers. Anything else — an unreadable
+/// image, an unknown creation time, a child spawned later (a directly
+/// spawned `rg` or `git`, a job a shell `exec`'d into, an MCP server
+/// reconnected mid-session, a node-hosted nested agent) — is work, so the
+/// error is always toward keeping the session open.
+///
+/// Counting boot-time MCP servers as work made every MCP-equipped session
+/// permanently "busy", so wind-down could never close one (plan
+/// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
+/// Phase 2 on a temp runner, 2026-10-04).
+pub fn child_signals_work(
+    image: Option<&str>,
+    child_created_s: Option<i64>,
+    parent_created_s: Option<i64>,
+) -> bool {
+    let Some(image) = image else {
+        return true;
+    };
+    let name = normalize_image(image);
+    if name.is_empty() || WORK_CHILD_IMAGES.contains(&name.as_str()) {
+        return true;
+    }
+    let known = |t: Option<i64>| t.filter(|&s| s > 0);
+    match (known(child_created_s), known(parent_created_s)) {
+        (Some(child), Some(parent)) => {
+            let after = child - parent;
+            !(0..=SESSION_START_CHILD_WINDOW_S).contains(&after)
+        }
+        _ => true,
+    }
+}
+
 /// One live `claude` process in the runner's inclusive subtree, with every
 /// fact about it that the SNAPSHOT already carries.
 ///
@@ -258,8 +338,11 @@ pub struct LiveClaudeProcess {
     /// `/proc/<pid>/cwd` could not be read.
     pub cwd: Option<String>,
     /// **HINT, NOT A VERDICT.** `Some(true)` iff this pid has at least one
-    /// child in the same snapshot. A `claude` mid-tool-call has children (a
-    /// `cargo`, a `git`); a `claude` between turns has none and is NOT
+    /// child in the same snapshot that signals WORK — a shell, or a child
+    /// whose image could not be read ([`child_signals_work`]). Session
+    /// infrastructure (its stdio MCP servers) does not count. A `claude`
+    /// mid-tool-call has such a child (the shell running a `cargo`, a `git`);
+    /// a `claude` between turns has none and is NOT
     /// therefore idle, abandoned, or safe to kill. Read it as "there is
     /// visibly a child process attached right now", never as "this session is
     /// busy" — and never let it weaken the restart verdict, which counts every
@@ -313,13 +396,16 @@ pub struct LiveClaudeProcess {
     /// reader was `GET /restart-readiness`. Since Phase 4 the wind-down
     /// executor (`session::wind_down_executor`) reads the same field and ACTS
     /// on it — an `eligible` on a DRAINED device is a session the runner will
-    /// graceful-`/exit` on its next tick. Reading it costs nothing; writing a
-    /// wrong one closes a session.
+    /// graceful-`/exit` on its next tick, and an `eligible` FINISHED terminal
+    /// session is one its `finished_close` arm will close without a drain once
+    /// its custody is clean. Reading it costs nothing; writing a wrong one
+    /// closes a session.
     ///
     /// The two readers still differ, and the difference is the endpoint's, not
     /// this field's: `/restart-readiness` reports whatever the verdict says
     /// whether or not the runner is drained and closes nothing itself, while
-    /// the executor applies its own further gates (the drain, a wall-clock-jump
+    /// the executor applies its own further gates (the drain or the
+    /// `finished_close` switch, that arm's custody gate, a wall-clock-jump
     /// quarantine, a per-tick budget, and a re-check immediately before each
     /// close). So `eligible` here is a candidacy, never a prediction.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -719,10 +805,15 @@ pub fn evaluate(
             // absent there was not seen at all and its children are
             // UNCOMPUTABLE rather than absent.
             has_live_children: snapshot.creation_times.contains_key(&pid).then(|| {
-                snapshot
-                    .parent_map
-                    .get(&pid)
-                    .is_some_and(|kids| !kids.is_empty())
+                snapshot.parent_map.get(&pid).is_some_and(|kids| {
+                    kids.iter().any(|kid| {
+                        child_signals_work(
+                            snapshot.names.get(kid).map(String::as_str),
+                            snapshot.creation_times.get(kid).copied(),
+                            snapshot.creation_times.get(&pid).copied(),
+                        )
+                    })
+                })
             }),
             nested_under_claude,
             session_status: status.map(|s| s.as_wire()),
@@ -1024,6 +1115,7 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
@@ -1535,6 +1627,117 @@ mod tests {
         assert!(report.partition_covers_total());
     }
 
+    /// Phase 2 of plan `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`:
+    /// a stdio MCP server child (every fleet session holds a
+    /// `coord-mcp-shim.py`) is session infrastructure, not work, so it must not
+    /// make an idle `claude` read as having live children forever. A shell, a
+    /// nested `claude` or an unreadable image still does.
+    #[test]
+    fn only_a_boot_time_non_shell_child_is_infrastructure() {
+        let parent = Some(1_000);
+        let at_boot = Some(1_005);
+        let late = Some(1_000 + SESSION_START_CHILD_WINDOW_S + 1);
+        // Always work, whenever they started.
+        for image in [
+            "bash",
+            "/usr/bin/zsh",
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+            "pwsh.exe",
+            "claude",
+            "",
+        ] {
+            assert!(
+                child_signals_work(Some(image), at_boot, parent),
+                "{image:?}"
+            );
+        }
+        assert!(
+            child_signals_work(None, at_boot, parent),
+            "an unreadable image is work"
+        );
+        // A boot-time MCP server is infrastructure.
+        for image in ["python3", "node", "uv"] {
+            assert!(
+                !child_signals_work(Some(image), at_boot, parent),
+                "{image:?} at boot"
+            );
+        }
+        // A late non-shell child is work: a direct rg/git, an exec'd job, a
+        // node-hosted nested agent, a reconnected MCP server.
+        for image in ["rg", "git", "cargo", "node", "python3"] {
+            assert!(
+                child_signals_work(Some(image), late, parent),
+                "{image:?} late"
+            );
+        }
+        // Unknown creation times, or a child that predates its parent, are work.
+        assert!(child_signals_work(Some("python3"), None, parent));
+        assert!(child_signals_work(Some("python3"), at_boot, None));
+        assert!(child_signals_work(Some("python3"), Some(0), parent));
+        assert!(child_signals_work(Some("python3"), Some(990), parent));
+
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let born = now_s - 600;
+        // 10 holds only a boot-time MCP server; 11 a boot-time MCP server AND
+        // a shell; 12 a boot-time MCP server and a late `rg`.
+        let snap = snap_with(
+            &[
+                (1, &[10, 11, 12]),
+                (10, &[90]),
+                (11, &[91, 92]),
+                (12, &[93, 94]),
+            ],
+            &[
+                (10, born),
+                (11, born),
+                (12, born),
+                (90, born + 2),
+                (91, born + 2),
+                (92, now_s),
+                (93, born + 2),
+                (94, now_s),
+            ],
+            &[
+                (10, "claude"),
+                (11, "claude"),
+                (12, "claude"),
+                (90, "python3"),
+                (91, "node"),
+                (92, "bash"),
+                (93, "python3"),
+                (94, "rg"),
+            ],
+        );
+        let agent_runtime: HashSet<u32> = [10u32, 11, 12].into_iter().collect();
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &agent_runtime,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+        );
+        let children = |pid: u32| {
+            report
+                .headless_exempt
+                .iter()
+                .find(|p| p.pid == pid)
+                .and_then(|p| p.has_live_children)
+        };
+        assert_eq!(
+            children(10),
+            Some(false),
+            "a boot-time MCP server alone is not work"
+        );
+        assert_eq!(children(11), Some(true), "a shell beside it is");
+        assert_eq!(children(12), Some(true), "a late direct rg is");
+    }
+
     /// Every detail field comes from the snapshot (or the injected cwd map),
     /// and an unresolvable one is `None` — never a fabricated value.
     #[test]
@@ -1546,6 +1749,7 @@ mod tests {
         let snap = snap_with(
             &[(1, &[10, 11]), (10, &[99])],
             &[(10, now_s - 273), (11, 0), (99, now_s)],
+            // 99 is a `cargo` spawned 273 s after its parent — late, so work.
             &[(10, "claude"), (11, "claude"), (99, "cargo")],
         );
         let cwds: HashMap<u32, String> = [(

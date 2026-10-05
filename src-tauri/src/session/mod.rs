@@ -89,10 +89,11 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
+pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;
-pub mod wind_down_executor; // The wind-down TICK — the only place a drain closes a session (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4)
+pub mod wind_down_executor; // The wind-down TICK — the only place that closes a session for wind-down, drained (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4) or finished (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)
 pub mod workspace_tenant; // The workspace's own tenant declaration — tiers 1-3 of coord_mcp's authority order (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin, D1/Phase 1)
 

@@ -2887,6 +2887,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_remote_identities,
             commands::remote_attach::terminal_remote_history_load,
             commands::remote_attach::terminal_remote_interactivity,
+            commands::sessions_settings::finished_session_close_get,
+            commands::sessions_settings::finished_session_close_set,
             commands::remote_create::remote_create_preference_get,
             commands::remote_create::remote_create_preference_set,
             commands::remote_create::remote_create_preference_reconcile,
