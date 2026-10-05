@@ -2871,6 +2871,28 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The in-cwd device document spells its credential as a terminal env
+    /// reference with the workdir nonce as its default (plan
+    /// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`);
+    /// the doctor reads the DEFAULT arm, exactly as the boot reconcile does.
+    #[test]
+    fn parse_mcp_json_proxy_reads_the_default_arm_of_an_env_referenced_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http",
+               "url":"http://127.0.0.1:9877/coord-mcp",
+               "headers":{"Authorization":"Bearer ${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-wdnonce}",
+                          "X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-wdnonce}"}}}}"#,
+        )
+        .unwrap();
+        let facts = parse_mcp_json_proxy(&path).expect("parses the env-referenced shape");
+        assert_eq!(facts.port, 9877);
+        assert_eq!(facts.nonce, "wdnonce");
+        assert!(facts.has_static_authorization);
+    }
+
     /// Phase 2 (plan 2026-08-20): the runner also emits the nonce as
     /// `Authorization: Bearer <nonce>`. Check 6 must keep recognising a proxy
     /// config in that shape — a miss is SILENT here (a `None` reads as "not a

@@ -154,9 +154,97 @@ fn comment_mask(lines: &[&str]) -> Vec<bool> {
         .collect()
 }
 
+/// Per line: the `{` and `}` that are CODE, i.e. not inside a string or char
+/// literal. String state carries across lines, so a multi-line literal is
+/// skipped whole.
+///
+/// A raw `matches('{')` count was fooled by a literal such as
+/// `"\"name\":\"anyhow\"}"`: its lone `}` closed a `#[cfg(test)] mod` span
+/// early, every test after it read as production code, and a test that built
+/// `Command::new("claude")` was reported as an unlisted spawn site.
+fn code_braces(lines: &[&str]) -> Vec<(usize, usize)> {
+    // `Some(hashes)` while inside a string: `None` hashes = an ordinary
+    // `"..."` (backslash escapes apply), `Some(n)` = a raw `r#…#"…"#…#`.
+    let mut in_str: Option<Option<usize>> = None;
+    lines
+        .iter()
+        .map(|line| {
+            let b = line.as_bytes();
+            let (mut open, mut close) = (0, 0);
+            let mut i = 0;
+            while i < b.len() {
+                match in_str {
+                    Some(None) => {
+                        if b[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if b[i] == b'"' {
+                            in_str = None;
+                        }
+                        i += 1;
+                    }
+                    Some(Some(n)) => {
+                        if b[i] == b'"'
+                            && b[i + 1..].iter().take(n).filter(|&&c| c == b'#').count() == n
+                        {
+                            in_str = None;
+                            i += 1 + n;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    None => {
+                        if b[i..].starts_with(b"//") {
+                            break;
+                        }
+                        // Char literals: '{', '}', '"'.
+                        if b[i] == b'\''
+                            && i + 2 < b.len()
+                            && b[i + 2] == b'\''
+                            && matches!(b[i + 1], b'{' | b'}' | b'"')
+                        {
+                            i += 3;
+                            continue;
+                        }
+                        // `r"…"` / `r#"…"#`, also with a `b`/`c` prefix (`br#"…"#`):
+                        // the literal starts at the prefix, which must itself not
+                        // continue an identifier.
+                        let start = if i >= 1 && matches!(b[i - 1], b'b' | b'c') {
+                            i - 1
+                        } else {
+                            i
+                        };
+                        if b[i] == b'r'
+                            && (start == 0
+                                || !b[start - 1].is_ascii_alphanumeric() && b[start - 1] != b'_')
+                        {
+                            let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                            if b.get(i + 1 + hashes) == Some(&b'"') {
+                                in_str = Some(Some(hashes));
+                                i += 2 + hashes;
+                                continue;
+                            }
+                        }
+                        match b[i] {
+                            b'"' => in_str = Some(None),
+                            b'{' => open += 1,
+                            b'}' => close += 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            (open, close)
+        })
+        .collect()
+}
+
 /// Line spans covered by a `#[cfg(test)] mod … { … }`.
 fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
     let comments = comment_mask(lines);
+    let braces = code_braces(lines);
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("#[cfg(test)]") {
@@ -168,12 +256,12 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
             continue;
         };
         let mut depth = 0usize;
-        for (j, l) in lines.iter().enumerate().skip(open) {
+        for j in open..lines.len() {
             if comments[j] {
                 continue;
             }
-            depth += l.matches('{').count();
-            depth = depth.saturating_sub(l.matches('}').count());
+            depth += braces[j].0;
+            depth = depth.saturating_sub(braces[j].1);
             if depth == 0 {
                 spans.push((open, j + 1));
                 break;
@@ -789,6 +877,26 @@ fn a_new_primitive_caller_and_a_helper_caller_are_found_but_test_modules_are_not
             ("new_door.rs".to_string(), "recipe".to_string()),
             ("new_door.rs".to_string(), "uses_recipe".to_string()),
         ]
+    );
+}
+
+#[test]
+fn a_brace_inside_a_string_literal_does_not_end_a_test_module_early() {
+    // The shape that broke the real scan: a lone `}` inside a test's string
+    // literal used to close the `#[cfg(test)] mod` span, so a later test's
+    // spawn primitive was reported as an unlisted production site.
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "shim.rs".to_string(),
+        "#[cfg(test)]\nmod tests {\n    fn a() {\n        assert!(b.contains(\"\\\"name\\\":\\\"anyhow\\\"}\"));\n    }\n\
+         fn b() { let r = r#\"}\"#; let c = '}'; let x = br#\"x\"y}\"#; }\n\
+         fn c() {\n        let _ = ClaudeSession::spawn(x);\n    }\n}\n"
+            .to_string(),
+    );
+    let found = scan_sites(&sources, &BTreeMap::new());
+    assert!(
+        found.is_empty(),
+        "a test-only spawn must not be found: {found:?}"
     );
 }
 
