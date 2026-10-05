@@ -257,9 +257,10 @@ const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
 /// [`parse_tool_policy_consts`] plans for; it must degrade `cause` to
 /// `unknown`, not blank `commitsBehind` on every box in the fleet.
 ///
-/// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]) and
-/// inherits the fleet's single-source credential posture from
-/// [`crate::process_helpers::no_window`] — never a second copy here.
+/// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]), built by
+/// [`drift_git`], and so inherits the fleet's single-source credential
+/// posture from [`crate::process_helpers::no_window`] — never a second copy
+/// here — with the repo-locating environment scrubbed.
 /// `--no-write-fetch-head` keeps the fetch from rewriting the source
 /// checkout's per-worktree `FETCH_HEAD` (git writes it even for a refspec
 /// with a destination ref, and a peer mid-`git pull` there would otherwise
@@ -279,7 +280,7 @@ fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
     // status + stderr there, and still WARNs on a timeout) — `trunkSource`
     // says the fetch failed, never why.
     let fetched = {
-        let mut cmd = crate::process_helpers::no_window("git");
+        let mut cmd = drift_git();
         cmd.args([
             "-c",
             "gc.auto=0",
@@ -434,10 +435,40 @@ fn candidate_repo_dir() -> Option<PathBuf> {
         .find(|dir| dir.join(".git").exists())
 }
 
+/// The environment variables that make git read a repository OTHER than the
+/// one `current_dir` names. `git -C` / `current_dir` do not override an
+/// inherited `GIT_DIR`, so a runner started from a git hook (or any shell
+/// that exported these) would measure drift — and read the tool policy — from
+/// the caller's repo and index instead of [`candidate_repo_dir`].
+const REPO_LOCATING_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// Remove [`REPO_LOCATING_GIT_ENV`] from `cmd`'s child environment — both an
+/// inherited value and one set on `cmd` earlier.
+fn scrub_repo_locating_env(cmd: &mut std::process::Command) {
+    for var in REPO_LOCATING_GIT_ENV {
+        cmd.env_remove(var);
+    }
+}
+
+/// The one `git` command every drift probe starts from:
+/// [`crate::process_helpers::no_window`]'s posture, repo-locating env scrubbed.
+fn drift_git() -> std::process::Command {
+    let mut cmd = crate::process_helpers::no_window("git");
+    scrub_repo_locating_env(&mut cmd);
+    cmd
+}
+
 /// Run `git <args>` in `repo`, returning trimmed stdout on success. Any
 /// failure (spawn error, non-zero exit, empty output) → `None`.
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = crate::process_helpers::no_window("git");
+    let mut cmd = drift_git();
     // A credential prompt would sit until `DRIFT_GIT_TIMEOUT` reaps it, every
     // tick; refuse the prompt so an unauthenticated remote fails fast instead.
     cmd.args(args).current_dir(repo);
@@ -1020,28 +1051,24 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             std::fs::write(path, text).expect("write fixture");
         }
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=fixture",
-                    "-c",
-                    "user.email=fixture@example.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ])
-                .args(args)
-                .current_dir(repo)
-                // Run under a git hook (or any caller that exported them),
-                // these would point the fixture's git at the CALLER's repo
-                // and index instead of the tempdir.
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env_remove("GIT_COMMON_DIR")
-                .output()
-                .expect("git runs");
+            let mut cmd = std::process::Command::new("git");
+            cmd.args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(repo);
+            // Run under a git hook (or any caller that exported them), these
+            // would point the fixture's git at the CALLER's repo and index
+            // instead of the tempdir — the same scrub production applies.
+            scrub_repo_locating_env(&mut cmd);
+            let out = cmd.output().expect("git runs");
             assert!(out.status.success(), "git {args:?}: {out:?}");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
@@ -1109,26 +1136,91 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             }
         }
 
-        let (dir, sha) = git_fixture(&[("src-tauri/src/mcp_api.rs", SAMPLE)]);
-        let sink = Captured::default();
-        let buf = sink.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        // Scoped, not global: other tests run in parallel, and `run_probe`
-        // WARNs on this (the calling) thread.
-        let read = tracing::subscriber::with_default(subscriber, || {
-            read_trunk_tool_policy(dir.path(), &sha, "fetched")
-        });
+        /// Run `f` under a fresh WARN-level capture; its result and the text
+        /// logged. Scoped, not global: other tests run in parallel, and
+        /// `run_probe` WARNs on this (the calling) thread.
+        fn warns_of<R>(f: impl FnOnce() -> R) -> (R, String) {
+            let sink = Captured::default();
+            let buf = sink.0.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let out = tracing::subscriber::with_default(subscriber, f);
+            let logged = String::from_utf8_lossy(&buf.lock().expect("capture lock")).to_string();
+            (out, logged)
+        }
 
+        let (dir, sha) = git_fixture(&[("src-tauri/src/mcp_api.rs", SAMPLE)]);
+
+        // Positive control, through the SAME capture: a `git show` of a path
+        // that is not in the tree does WARN, and the capture records it.
+        // Without this, the absence assertion below would also pass if the
+        // capture recorded nothing at all.
+        let (shown, control) =
+            warns_of(|| git_output(dir.path(), &["show", &format!("{sha}:no/such/path")]));
+        assert!(shown.is_none(), "the path is absent from the fixture");
+        assert!(
+            control.contains("build_drift: git"),
+            "the capture must record git_output's WARN, or the absence \
+             assertion below proves nothing:\n{control}"
+        );
+
+        let (read, logged) = warns_of(|| read_trunk_tool_policy(dir.path(), &sha, "fetched"));
         let read = read.expect("the pre-split mcp_api.rs is read");
         assert_eq!(read.policy.deliberate, vec!["coord_create_pr"]);
-        let logged = String::from_utf8_lossy(&buf.lock().expect("capture lock")).to_string();
         assert!(
             !logged.contains("build_drift: git"),
             "an absent path on the list must not WARN:\n{logged}"
         );
+    }
+
+    /// Every drift probe's `git` drops the repo-locating variables: each is
+    /// REMOVED on the command (`get_envs` reports a removal as `None`), so an
+    /// inherited value never reaches the child.
+    #[test]
+    fn drift_git_removes_every_repo_locating_variable() {
+        let cmd = drift_git();
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in REPO_LOCATING_GIT_ENV {
+            assert!(
+                removed.iter().any(|r| r == var),
+                "drift_git must remove {var}; removed: {removed:?}"
+            );
+        }
+    }
+
+    /// And the list is the one that matters: with `GIT_DIR` naming a decoy
+    /// repo, git reads the DECOY although `current_dir` names the target —
+    /// until the scrub runs. The decoy is set on the `Command`, never on this
+    /// process's environment, which parallel tests share.
+    #[test]
+    fn a_decoy_git_dir_is_not_read_once_scrubbed() {
+        let (target, target_sha) = git_fixture(&[("a.txt", "target\n")]);
+        let (decoy, decoy_sha) = git_fixture(&[("a.txt", "decoy\n")]);
+        assert_ne!(target_sha, decoy_sha);
+        let head = |scrub: bool| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["rev-parse", "HEAD"])
+                .current_dir(target.path())
+                .env("GIT_DIR", decoy.path().join(".git"));
+            if scrub {
+                scrub_repo_locating_env(&mut cmd);
+            }
+            let out = cmd.output().expect("git runs");
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            head(false),
+            decoy_sha,
+            "control: an unscrubbed GIT_DIR wins"
+        );
+        assert_eq!(head(true), target_sha, "scrubbed, current_dir decides");
     }
 
     #[test]
