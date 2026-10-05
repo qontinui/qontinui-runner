@@ -837,7 +837,7 @@ GET /wrappers/{id}/status wrapper_status
 GET /ws/events ws_events_handler
 GET <ROUTE_PATH> get_github_budget
 GET,POST /ui-bridge/ai/page-summary ui_bridge_page_summary_handler
-MERGE <if crate::settings::load_settings().trac>
+MERGE <expr>
 MERGE accessibility::routes
 MERGE agent_tokens::routes
 MERGE agent_worktrees::routes
@@ -926,8 +926,6 @@ MERGE misc::routes
 MERGE models::routes
 MERGE monitors::routes
 MERGE network::routes
-MERGE next
-MERGE o
 MERGE observations_api::routes
 MERGE online_learning_api::routes
 MERGE orchestration_loop_api::routes
@@ -1795,6 +1793,5 @@ PUT /unified-workflows/{id} update_unified_workflow
 PUT /unified-workflows/{id}/example-status update_example_status_handler
 PUT /wrappers/{id}/credentials/{name} set_credential
 SERVICE /graphql/ws GraphQLSubscription::new
-UNREAD &bandit_context
 UNREAD concat!("/ui-bridge/ai/", $tail)
 UNREAD concat!("/ui-bridge/control/", $tail)

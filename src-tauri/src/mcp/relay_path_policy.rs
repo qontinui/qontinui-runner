@@ -714,9 +714,10 @@ pub(crate) mod tests {
         "get", "post", "put", "patch", "delete", "head", "options", "any",
     ];
 
-    /// The two route registration calls the walk reads.
-    const ROUTE_CALL: &str = ".route(";
-    const ROUTE_SERVICE_CALL: &str = ".route_service(";
+    /// The two route registration calls the walk reads, by method name
+    /// ([`Lexed::calls`] finds the `(` after it).
+    const ROUTE_CALL: &str = ".route";
+    const ROUTE_SERVICE_CALL: &str = ".route_service";
 
     /// Every `.rs` file under `src-tauri/src` with its path relative to
     /// `CARGO_MANIFEST_DIR` (`/`-separated), read at test time — the tree
@@ -897,10 +898,11 @@ pub(crate) mod tests {
             }
         }
 
-        /// Every item gated on a test-only cfg — `#[cfg(test)]` or
-        /// `#[cfg(all(test, …))]` — as `(attribute start, item start, item
-        /// end)`: a `mod … { … }`, a `fn … { … }`, or a `;`-terminated item
-        /// such as `mod tests;`.
+        /// Every item gated on a test-only cfg ([`is_test_cfg`]) as
+        /// `(attribute start, item start, item end)`: a `mod … { … }`, a
+        /// `fn … { … }`, a `;`-terminated item such as `mod tests;` — or a
+        /// struct field, enum variant or match arm, which ends where its
+        /// enclosing `}` / `)` / `]` closes if no `{` or `;` comes first.
         fn test_items(&self) -> Vec<(usize, usize, usize)> {
             let b = self.skel.as_bytes();
             let mut out = Vec::new();
@@ -909,14 +911,7 @@ pub(crate) mod tests {
                 let attr = from + rel;
                 let attr_end = matching_close(b, attr + 1);
                 from = attr_end + 1;
-                let text: String = self
-                    .skel
-                    .get(attr + 2..attr_end)
-                    .unwrap_or("")
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-                if text != "cfg(test)" && !text.starts_with("cfg(all(test,") {
+                if !is_test_cfg(&stripped(self.skel.get(attr + 2..attr_end).unwrap_or(""))) {
                     continue;
                 }
                 // Skip any further attributes, then find the item's body.
@@ -943,6 +938,12 @@ pub(crate) mod tests {
                             end = i + 1;
                             break;
                         }
+                        // The enclosing scope closed first: the gated thing
+                        // was a field, variant or arm, and ends here.
+                        b'}' | b')' | b']' => {
+                            end = i;
+                            break;
+                        }
                         b'(' | b'[' => i = matching_close(b, i) + 1,
                         _ => i += 1,
                     }
@@ -961,76 +962,331 @@ pub(crate) mod tests {
             }
         }
 
-        /// The files this file declares as out-of-line test-only modules
-        /// (`#[cfg(test)] mod foo_tests;`, honouring `#[path = "…"]`), as
-        /// paths relative to `CARGO_MANIFEST_DIR` — `rel` is this file's own.
-        /// Both of Rust's layouts are returned (`foo_tests.rs`,
-        /// `foo_tests/mod.rs`); only one can exist.
-        fn test_module_files(&self, rel: &str) -> Vec<String> {
-            let (dir, file) = rel.rsplit_once('/').unwrap_or(("", rel));
-            let stem = file.strip_suffix(".rs").unwrap_or(file);
-            let join = |a: &str, b: &str| {
-                if a.is_empty() {
-                    b.to_string()
-                } else {
-                    format!("{a}/{b}")
-                }
-            };
+        /// Every `mod <name> …` in the file, as `(keyword offset, name, the
+        /// byte after the name)`.
+        fn mod_keywords(&self) -> Vec<(usize, &str, usize)> {
+            let b = self.skel.as_bytes();
             let mut out = Vec::new();
-            for (attr, item, end) in self.test_items() {
-                let Some(decl) = self
-                    .skel
-                    .get(item..end)
-                    .and_then(|t| t.trim_end().strip_suffix(';'))
-                else {
-                    continue;
-                };
-                let mut words = decl.split_whitespace();
-                if words.find(|w| *w == "mod").is_none() {
+            let mut from = 0usize;
+            while let Some(rel) = self.skel.get(from..).and_then(|rest| rest.find("mod")) {
+                let at = from + rel;
+                from = at + 3;
+                if (at > 0 && is_ident_byte(b[at - 1]))
+                    || !b.get(from).is_some_and(u8::is_ascii_whitespace)
+                {
                     continue;
                 }
-                let Some(name) = words.next() else {
-                    continue;
-                };
-                // `#[path = "x.rs"]` among the attributes: relative to this
-                // file's directory.
-                let attrs = self.code.get(attr..item).unwrap_or("");
-                let path_attr = attrs.find("path").and_then(|at| {
-                    let rest = attrs
-                        .get(at + "path".len()..)?
-                        .trim_start()
-                        .strip_prefix('=')?;
-                    let rest = rest.trim_start().strip_prefix('"')?;
-                    rest.get(..rest.find('"')?)
-                });
-                if let Some(path) = path_attr {
-                    out.push(join(dir, path));
-                    continue;
+                let name_at = skip_whitespace(b, from);
+                let mut name_end = name_at;
+                while name_end < b.len() && is_ident_byte(b[name_end]) {
+                    name_end += 1;
                 }
-                let base = if matches!(stem, "mod" | "lib" | "main") {
-                    dir.to_string()
-                } else {
-                    join(dir, stem)
-                };
-                out.push(join(&base, &format!("{name}.rs")));
-                out.push(join(&base, &format!("{name}/mod.rs")));
+                if name_end > name_at {
+                    let name = self.skel.get(name_at..name_end).unwrap_or("");
+                    out.push((at, name, skip_whitespace(b, name_end)));
+                }
             }
             out
         }
 
-        /// The open index just past each `needle` occurrence in `skel` and the
-        /// index of the `)` closing it.
-        fn calls(&self, needle: &str) -> Vec<(usize, usize)> {
+        /// Where the attributes of the item whose keyword sits at `kw` begin:
+        /// back over a `pub` / `pub(…)` visibility, then over every `#[…]`.
+        fn attribute_stack_start(&self, kw: usize) -> usize {
             let b = self.skel.as_bytes();
+            let back_ws = |mut i: usize| {
+                while i > 0 && b[i - 1].is_ascii_whitespace() {
+                    i -= 1;
+                }
+                i
+            };
+            let mut i = back_ws(kw);
+            if i > 0 && b[i - 1] == b')' {
+                if let Some(open) = matching_open(b, i - 1) {
+                    i = back_ws(open);
+                }
+            }
+            if i >= 3 && b.get(i - 3..i) == Some(b"pub") {
+                i -= 3;
+            }
+            loop {
+                let end = back_ws(i);
+                if end == 0 || b[end - 1] != b']' {
+                    return i;
+                }
+                match matching_open(b, end - 1) {
+                    Some(open) if open > 0 && b[open - 1] == b'#' => i = open - 1,
+                    _ => return i,
+                }
+            }
+        }
+
+        /// The `"…"` of a `#[path = "…"]` among the attributes in
+        /// `[from, to)`, read one attribute at a time.
+        fn path_attribute(&self, from: usize, to: usize) -> Option<&str> {
+            let b = self.skel.as_bytes();
+            let mut i = skip_whitespace(b, from);
+            while i < to && b.get(i) == Some(&b'#') && b.get(i + 1) == Some(&b'[') {
+                let close = matching_close(b, i + 1);
+                let body = stripped(self.skel.get(i + 2..close).unwrap_or(""));
+                if body.starts_with("path=\"") {
+                    let lit = self.code.get(i + 2..close)?;
+                    let open = lit.find('"')?;
+                    let rest = lit.get(open + 1..)?;
+                    return rest.get(..rest.find('"')?);
+                }
+                i = skip_whitespace(b, close + 1);
+            }
+            None
+        }
+
+        /// The names of the inline `mod name { … }` blocks enclosing `at`,
+        /// outermost first.
+        fn enclosing_inline_mods(&self, at: usize) -> Vec<&str> {
+            let b = self.skel.as_bytes();
+            self.mod_keywords()
+                .into_iter()
+                .filter(|&(kw, _, after)| {
+                    kw < at && b.get(after) == Some(&b'{') && at < matching_close(b, after)
+                })
+                .map(|(_, name, _)| name)
+                .collect()
+        }
+
+        /// The files this file declares as test-only out-of-line modules, as
+        /// paths relative to `CARGO_MANIFEST_DIR` — `rel` is this file's own.
+        /// A `mod name;` is test-only when it is itself a test-only item, sits
+        /// inside one (`#[cfg(test)] mod tests { mod helpers; }`), or the whole
+        /// file is (`whole_file`). Resolved as rustc does: `#[path = "…"]`
+        /// relative to this file's directory (plus any enclosing inline
+        /// modules, under the file's stem unless it is a `mod.rs`/`lib.rs`/
+        /// `main.rs`), `..` normalised; otherwise both of Rust's layouts
+        /// (`name.rs`, `name/mod.rs`), only one of which can exist.
+        fn test_module_files(&self, rel: &str, whole_file: bool) -> Vec<String> {
+            let (dir, file) = rel.rsplit_once('/').unwrap_or(("", rel));
+            let stem = file.strip_suffix(".rs").unwrap_or(file);
+            let mod_rs = matches!(stem, "mod" | "lib" | "main");
+            let b = self.skel.as_bytes();
+            let test_spans = self.test_items();
             let mut out = Vec::new();
-            let mut from = 0usize;
-            while let Some(rel) = self.skel.get(from..).and_then(|rest| rest.find(needle)) {
-                let open = from + rel + needle.len();
-                from = open;
-                out.push((open, matching_close(b, open - 1)));
+            for (kw, name, after) in self.mod_keywords() {
+                if b.get(after) != Some(&b';') {
+                    continue;
+                }
+                let stack = self.attribute_stack_start(kw);
+                let gated = whole_file
+                    || test_spans.iter().any(|&(attr, _, end)| attr <= kw && kw < end);
+                if !gated {
+                    continue;
+                }
+                let inline = self.enclosing_inline_mods(kw);
+                let mut base = vec![dir];
+                if !mod_rs && (!inline.is_empty() || self.path_attribute(stack, kw).is_none()) {
+                    base.push(stem);
+                }
+                base.extend(inline.iter().copied());
+                let base = base.join("/");
+                match self.path_attribute(stack, kw) {
+                    Some(path) => out.push(normalized(&format!("{base}/{path}"))),
+                    None => {
+                        out.push(normalized(&format!("{base}/{name}.rs")));
+                        out.push(normalized(&format!("{base}/{name}/mod.rs")));
+                    }
+                }
             }
             out
         }
+
+        /// Each call of the method `name` (`.route`, `.merge`, …) in `skel`:
+        /// the index just past its `(` and the index of the `)` closing it.
+        /// Whitespace and a turbofish may sit between the name and the `(`
+        /// (`.route (`, `.route::<S>(`); a longer name (`.route_service` for
+        /// `.route`) is not a call of `name`.
+        fn calls(&self, name: &str) -> Vec<(usize, usize)> {
+            let b = self.skel.as_bytes();
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = self.skel.get(from..).and_then(|rest| rest.find(name)) {
+                let at = from + rel;
+                from = at + name.len();
+                if b.get(from).copied().is_some_and(is_ident_byte) {
+                    continue;
+                }
+                let mut open = skip_whitespace(b, from);
+                if b.get(open) == Some(&b':') && b.get(open + 1) == Some(&b':') {
+                    open = skip_whitespace(b, open + 2);
+                    if b.get(open) != Some(&b'<') {
+                        continue;
+                    }
+                    open = skip_whitespace(b, matching_angle(b, open) + 1);
+                }
+                if b.get(open) == Some(&b'(') {
+                    out.push((open + 1, matching_close(b, open)));
+                }
+            }
+            out
+        }
+
+        /// Each invocation of the macro `name!` in `skel` — `name!(…)`,
+        /// `name ! [ … ]`, `name!{…}` — as the index of its opening delimiter
+        /// and of the delimiter closing it. A longer identifier ending in
+        /// `name` is not an invocation.
+        fn macro_calls(&self, name: &str) -> Vec<(usize, usize)> {
+            let b = self.skel.as_bytes();
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = self.skel.get(from..).and_then(|rest| rest.find(name)) {
+                let at = from + rel;
+                from = at + name.len();
+                if (at > 0 && is_ident_byte(b[at - 1]))
+                    || b.get(from).copied().is_some_and(is_ident_byte)
+                {
+                    continue;
+                }
+                let bang = skip_whitespace(b, from);
+                if b.get(bang) != Some(&b'!') {
+                    continue;
+                }
+                let open = skip_whitespace(b, bang + 1);
+                if matches!(b.get(open), Some(b'(' | b'[' | b'{')) {
+                    let close = matching_close(b, open);
+                    out.push((open, close));
+                    from = close.max(from);
+                }
+            }
+            out
+        }
+
+        /// Whether the census reads this file: its code (comments and
+        /// literals aside) mentions `axum`, or it defines a `macro_rules!`
+        /// — a macro body names no types, and `add_dual!`'s own body is the
+        /// only record of the two paths each invocation expands to. So a
+        /// `.merge(` or `.route(` on some other type (a commit-report merge, a
+        /// bandit router) is not taken for an HTTP registration.
+        fn is_router_source(&self) -> bool {
+            let b = self.skel.as_bytes();
+            let defines_macro = self.skel.match_indices("macro_rules").any(|(at, word)| {
+                let after = at + word.len();
+                (at == 0 || !is_ident_byte(b[at - 1]))
+                    && b.get(skip_whitespace(b, after)) == Some(&b'!')
+            });
+            self.skel.contains("axum") || defines_macro
+        }
+
+        /// Whether the whole file is test-only: an inner `#![cfg(test)]` (or
+        /// `#![cfg(all(…, test, …))]`) among the attributes opening it.
+        fn is_test_only_file(&self) -> bool {
+            let b = self.skel.as_bytes();
+            let mut i = skip_whitespace(b, 0);
+            while b.get(i) == Some(&b'#') && b.get(i + 1) == Some(&b'!') {
+                let open = skip_whitespace(b, i + 2);
+                if b.get(open) != Some(&b'[') {
+                    break;
+                }
+                let close = matching_close(b, open);
+                if is_test_cfg(&stripped(self.skel.get(open + 1..close).unwrap_or(""))) {
+                    return true;
+                }
+                i = skip_whitespace(b, close + 1);
+            }
+            false
+        }
+    }
+
+    /// `i` advanced past any ASCII whitespace in `b`.
+    fn skip_whitespace(b: &[u8], mut i: usize) -> usize {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    /// The index of the `>` matching the `<` at `open` (or the end) — for a
+    /// turbofish, whose angle brackets [`matching_close`] does not count.
+    fn matching_angle(b: &[u8], open: usize) -> usize {
+        let mut depth = 0i32;
+        for (i, &c) in b.iter().enumerate().skip(open) {
+            match c {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        b.len()
+    }
+
+    /// The index of the bracket opening the one at `close` (a `)`, `]` or
+    /// `}`), searching backwards, or `None` when it is unbalanced.
+    fn matching_open(b: &[u8], close: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut i = close + 1;
+        while i > 0 {
+            i -= 1;
+            match b[i] {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' | b'[' | b'{' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `text` with every whitespace character removed.
+    fn stripped(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Whether an attribute body (whitespace removed, literal contents
+    /// blanked) gates on `test`: `cfg(test)`, or `cfg(all(…))` with `test`
+    /// among its top-level arguments (`cfg(all(feature="x",test))`).
+    fn is_test_cfg(attr: &str) -> bool {
+        if attr == "cfg(test)" {
+            return true;
+        }
+        let Some(args) = attr
+            .strip_prefix("cfg(all(")
+            .and_then(|rest| rest.strip_suffix("))"))
+        else {
+            return false;
+        };
+        let b = args.as_bytes();
+        let mut start = 0usize;
+        loop {
+            let comma = top_level_comma(b, start, b.len());
+            let end = comma.unwrap_or(b.len());
+            if args.get(start..end) == Some("test") {
+                return true;
+            }
+            match comma {
+                Some(c) => start = c + 1,
+                None => return false,
+            }
+        }
+    }
+
+    /// `path` with `.` components dropped and each `..` resolved against
+    /// the component before it.
+    fn normalized(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
     }
 
     /// Every `(METHOD, path)` the runner registers, parsed out of the source
@@ -1046,11 +1302,26 @@ pub(crate) mod tests {
     /// error worth avoiding in a test nobody can debug at 2am.
     ///
     /// `pub(crate)` so `mcp::origin_guard`'s allowlist tripwires reuse this
-    /// one enumerator rather than growing a second.
+    /// one enumerator rather than growing a second. It reads the same
+    /// registration walks as the HTTP route census — literal-path `.route(…)`
+    /// calls ([`walk_route_calls`]) and the two routes of every
+    /// `add_dual!(…)` ([`walk_add_dual`]) — over every file, test code
+    /// included.
     pub(crate) fn registered_routes() -> std::collections::HashSet<(String, String)> {
         let mut out = std::collections::HashSet::new();
         for (_, src) in crate_rust_sources() {
-            collect_routes(&Lexed::new(&src), ROUTING_VERBS, &mut out);
+            let lx = Lexed::new(&src);
+            collect_routes(&lx, ROUTING_VERBS, &mut out);
+            walk_add_dual(&lx, |dual| {
+                if let AddDual::Read {
+                    method, tail: path, ..
+                } = dual
+                {
+                    for path in dual_paths(path) {
+                        out.insert((method.clone(), path));
+                    }
+                }
+            });
         }
         out
     }
@@ -1185,20 +1456,20 @@ pub(crate) mod tests {
     /// below it, while ordinary route churn never approaches it.
     const MIN_CENSUS_LINES: usize = 1252;
 
-    /// The router-composition calls the census reads besides `.route(`: the
+    /// The router-composition methods the census reads besides `.route`: the
     /// sites that splice a whole sub-router (or a fallback) into the tree.
     /// Dropping one drops every route behind it, which no `.route(` line shows.
     const COMPOSITION_CALLS: &[(&str, &str, bool)] = &[
-        (".merge(", "MERGE", false),
-        (".nest(", "NEST", true),
-        (".nest_service(", "NEST_SERVICE", true),
-        (".fallback(", "FALLBACK", false),
-        (".fallback_service(", "FALLBACK_SERVICE", false),
+        (".merge", "MERGE", false),
+        (".nest", "NEST", true),
+        (".nest_service", "NEST_SERVICE", true),
+        (".fallback", "FALLBACK", false),
+        (".fallback_service", "FALLBACK_SERVICE", false),
     ];
 
     /// The macro that registers one handler under both `/ui-bridge/control/`
     /// and `/ui-bridge/ai/` (`mcp::ui_bridge::routing`).
-    const ADD_DUAL_CALL: &str = "add_dual!";
+    const ADD_DUAL_MACRO: &str = "add_dual";
 
     /// Whether `rel` (relative to `CARGO_MANIFEST_DIR`) is a test-only file:
     /// `tests.rs`, anything under a `tests/` directory, or a file some other
@@ -1213,23 +1484,30 @@ pub(crate) mod tests {
     }
 
     /// The `.rs` files under `src` that git tracks, relative to
-    /// `CARGO_MANIFEST_DIR` — or `None` when git cannot answer (no checkout,
-    /// no git binary), in which case the census reads every file on disk.
-    fn git_tracked_sources() -> Option<std::collections::HashSet<String>> {
+    /// `CARGO_MANIFEST_DIR` — or why git could not answer (no checkout, no
+    /// git binary), in which case the census reads every file on disk.
+    fn git_tracked_sources() -> Result<std::collections::HashSet<String>, String> {
         let out = std::process::Command::new("git")
             .args(["ls-files", "-z", "--", "src"])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
-            .ok()?;
+            .map_err(|e| format!("running git: {e}"))?;
         if !out.status.success() {
-            return None;
+            return Err(format!(
+                "git ls-files exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
         let listed: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
             .split('\0')
             .filter(|p| p.ends_with(".rs"))
             .map(str::to_string)
             .collect();
-        (!listed.is_empty()).then_some(listed)
+        if listed.is_empty() {
+            return Err("git ls-files listed no .rs file under src".to_string());
+        }
+        Ok(listed)
     }
 
     /// Every registration site in the runner's non-test source as one line,
@@ -1250,28 +1528,56 @@ pub(crate) mod tests {
     /// route or a merge, changing a method set or rebinding a handler changes
     /// it.
     ///
-    /// Read from: every `.rs` under `src` that git TRACKS (all of them when git
-    /// cannot answer), less test-only files and `#[cfg(test)]` items. A route
-    /// in a new file is therefore counted only once the file is `git add`ed.
+    /// Read from: every `.rs` under `src` that git TRACKS (all of them, with a
+    /// note on stderr, when git cannot answer) that is a router source
+    /// ([`Lexed::is_router_source`]), less test-only files ([`is_test_file`], an inner `#![cfg(test)]`, and —
+    /// transitively — every module a test-only file or item declares) and
+    /// test-only items. A route in a new file is therefore counted only once
+    /// the file is `git add`ed.
     pub(crate) fn http_route_census_lines() -> Vec<String> {
-        let tracked = git_tracked_sources();
+        let tracked = git_tracked_sources()
+            .map_err(|why| {
+                eprintln!(
+                    "http_route_census: {why} — reading every .rs file on disk, untracked ones \
+                     included"
+                );
+            })
+            .ok();
         let sources: Vec<(String, Lexed)> = crate_rust_sources()
             .into_iter()
             .filter(|(rel, _)| tracked.as_ref().is_none_or(|t| t.contains(rel)))
             .map(|(rel, src)| (rel, Lexed::new(&src)))
             .collect();
-        let test_modules: std::collections::HashSet<String> = sources
-            .iter()
-            .flat_map(|(rel, lx)| lx.test_module_files(rel))
-            .collect();
+        let test_files = test_only_files(&sources);
         let mut lines = Vec::new();
         for (rel, lx) in sources {
-            if !is_test_file(&rel, &test_modules) {
+            if lx.is_router_source() && !test_files.contains(&rel) {
                 census_lexed(lx, &mut lines);
             }
         }
         lines.sort();
         lines
+    }
+
+    /// Every test-only file among `sources`: [`is_test_file`] by name or
+    /// declaration, an inner `#![cfg(test)]`, or a module some test-only file
+    /// or item declares — followed to a fixpoint, so a test module's own
+    /// submodules count too.
+    fn test_only_files(sources: &[(String, Lexed)]) -> std::collections::HashSet<String> {
+        let mut test_files = std::collections::HashSet::new();
+        loop {
+            let before = test_files.len();
+            for (rel, lx) in sources {
+                let whole = is_test_file(rel, &test_files) || lx.is_test_only_file();
+                if whole {
+                    test_files.insert(rel.clone());
+                }
+                test_files.extend(lx.test_module_files(rel, whole));
+            }
+            if test_files.len() == before {
+                return test_files;
+            }
+        }
     }
 
     /// The census lines of one file's source, `#[cfg(test)]` items excluded.
@@ -1360,10 +1666,12 @@ pub(crate) mod tests {
     }
 
     /// The name a composition argument is recorded under: the last two
-    /// segments of a leading path (`crate::mcp::canvas::routes()` →
-    /// `canvas::routes`, `graphql_routes` → `graphql_routes`) — enough to keep
-    /// distinct sub-routers distinct while a move's qualifier change drops out
-    /// — `<closure>` for a closure, and the collapsed text for anything else.
+    /// segments of a leading path once any `self` / `super` / `crate`
+    /// qualifiers are dropped (`crate::mcp::canvas::routes()` and
+    /// `super::canvas::routes()` → `canvas::routes`, `self::sub` → `sub`) —
+    /// enough to keep distinct sub-routers distinct while a move's qualifier
+    /// change drops out — `<closure>` for a closure, and `<expr>` for
+    /// anything that does not start with a path (`if …`, `match …`).
     fn composition_target(lx: &Lexed, from: usize, to: usize) -> String {
         let expr = lx.skel.get(from..to).unwrap_or("").trim();
         if is_closure(expr) {
@@ -1373,10 +1681,17 @@ pub(crate) mod tests {
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
             .unwrap_or(expr.len());
         let path = expr.get(..len).unwrap_or("").trim_end_matches(':');
-        let segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
-        let is_keyword = matches!(segments.as_slice(), [only] if matches!(*only, "if" | "match" | "unsafe" | "loop"));
+        let segments: Vec<&str> = path
+            .split("::")
+            .filter(|s| !s.is_empty())
+            .skip_while(|s| matches!(*s, "self" | "super" | "crate"))
+            .collect();
+        let is_keyword = matches!(
+            segments.as_slice(),
+            [only] if matches!(*only, "if" | "match" | "unsafe" | "loop" | "async" | "move")
+        );
         if segments.is_empty() || is_keyword {
-            return format!("<{}>", collapsed(lx.code.get(from..to).unwrap_or("")));
+            return "<expr>".to_string();
         }
         segments
             .get(segments.len().saturating_sub(2)..)
@@ -1384,29 +1699,30 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
-    /// The two lines each `add_dual!(router, method, "tail", handler)` expands
-    /// to, or an `UNREAD` line when its arguments are not in that shape.
-    fn census_add_dual(lx: &Lexed, out: &mut Vec<String>) {
+    /// One `add_dual!(…)` invocation, as [`walk_add_dual`] reads it.
+    enum AddDual<'a> {
+        /// `add_dual!(router, <verb>, "<tail>", handler)`: the upper-cased
+        /// verb, the tail, and the handler's name.
+        Read {
+            method: String,
+            tail: &'a str,
+            handler: String,
+        },
+        /// Any other argument shape: the invocation's text, comments blanked.
+        Unread(&'a str),
+    }
+
+    /// The two paths an `add_dual!` tail is registered under
+    /// (`mcp::ui_bridge::routing`).
+    fn dual_paths(tail: &str) -> [String; 2] {
+        ["control", "ai"].map(|ns| format!("/ui-bridge/{ns}/{tail}"))
+    }
+
+    /// THE `add_dual!` walk: every invocation in the file, its arguments
+    /// read. Shared by [`registered_routes`] and the HTTP route census.
+    fn walk_add_dual<'a>(lx: &'a Lexed, mut visit: impl FnMut(AddDual<'a>)) {
         let skel = lx.skel.as_bytes();
-        let mut from = 0usize;
-        while let Some(rel) = lx
-            .skel
-            .get(from..)
-            .and_then(|rest| rest.find(ADD_DUAL_CALL))
-        {
-            let at = from + rel;
-            from = at + ADD_DUAL_CALL.len();
-            if at > 0 && is_ident_byte(skel[at - 1]) {
-                continue;
-            }
-            let mut open = from;
-            while open < skel.len() && skel[open].is_ascii_whitespace() {
-                open += 1;
-            }
-            if skel.get(open) != Some(&b'(') {
-                continue;
-            }
-            let close = matching_close(skel, open);
+        for (open, close) in lx.macro_calls(ADD_DUAL_MACRO) {
             let mut args = Vec::new();
             let mut start = open + 1;
             while let Some(comma) = top_level_comma(skel, start, close) {
@@ -1415,36 +1731,50 @@ pub(crate) mod tests {
             }
             args.push((start, close));
             let text = |(a, b): (usize, usize)| lx.code.get(a..b).unwrap_or("").trim();
-            let parsed = match args.as_slice() {
+            let read = match args.as_slice() {
                 [_, method, tail, handler] => {
                     let method = text(*method);
                     let tail = text(*tail)
                         .strip_prefix('"')
                         .and_then(|t| t.strip_suffix('"'));
                     match tail {
-                        Some(tail) if ROUTING_VERBS.contains(&method) => Some((
-                            method.to_ascii_uppercase(),
-                            tail.to_string(),
-                            handler_name(lx.skel.get(handler.0..handler.1).unwrap_or("")),
-                        )),
+                        Some(tail) if ROUTING_VERBS.contains(&method) => Some(AddDual::Read {
+                            method: method.to_ascii_uppercase(),
+                            tail,
+                            handler: handler_name(lx.skel.get(handler.0..handler.1).unwrap_or("")),
+                        }),
                         _ => None,
                     }
                 }
                 _ => None,
             };
-            match parsed {
-                Some((method, tail, handler)) => {
-                    for ns in ["control", "ai"] {
-                        out.push(format!("{method} /ui-bridge/{ns}/{tail} {handler}"));
-                    }
-                }
-                None => out.push(format!(
-                    "UNREAD {}",
-                    collapsed(lx.code.get(at..close + 1).unwrap_or(""))
-                )),
-            }
-            from = close;
+            visit(read.unwrap_or_else(|| {
+                // From the macro's name, wherever whitespace put the `!`.
+                let name_at = lx
+                    .skel
+                    .get(..open)
+                    .and_then(|before| before.rfind(ADD_DUAL_MACRO))
+                    .unwrap_or(open);
+                AddDual::Unread(lx.code.get(name_at..close + 1).unwrap_or(""))
+            }));
         }
+    }
+
+    /// The census lines of every `add_dual!` in one file: its two routes, or
+    /// an `UNREAD` line when its arguments are not in the expected shape.
+    fn census_add_dual(lx: &Lexed, out: &mut Vec<String>) {
+        walk_add_dual(lx, |dual| match dual {
+            AddDual::Read {
+                method,
+                tail,
+                handler,
+            } => {
+                for path in dual_paths(tail) {
+                    out.push(format!("{method} {path} {handler}"));
+                }
+            }
+            AddDual::Unread(text) => out.push(format!("UNREAD {}", collapsed(text))),
+        });
     }
 
     /// `text` with every whitespace run collapsed to one space, cut to 40
@@ -1657,9 +1987,12 @@ pub(crate) mod tests {
              {UPDATE_HTTP_ROUTE_SNAPSHOT}=1 bash <workspace-root>/qontinui-claude-config/scripts/\
              cargo-guard.sh test -- http_route_census\n\
              (cargo-guard refuses `--lib`: it narrows TARGETS; a name filter selects the test.)\n\
-             A pure move between files never changes the census; if a move did, the move \
-             dropped or altered a registration. A route in a file git does not track yet is not \
-             read — `git add` the file.",
+             A pure move between files never removes a census line: a move may only ADD \
+             composition lines (a new `.merge` of a split-out sub-router), so the 'missing from \
+             the tree' list above must be empty — anything in it is a registration the move \
+             dropped or altered. A route in a file git does not track yet, or in a file whose \
+             code never mentions `axum` (and defines no macro), is not read — `git add` the \
+             file, or name `axum` in it.",
             removed.len(),
             removed
                 .iter()
@@ -1678,10 +2011,32 @@ pub(crate) mod tests {
     /// The census reader against synthetic sources: methods group per
     /// handler, module paths are dropped, nested verbs, comments and literals
     /// are not read, compositions and `add_dual!` count, unclassifiable paths
-    /// surface as `UNREAD`, and `#[cfg(test)]` items are excluded.
+    /// surface as `UNREAD`, and test-only items are excluded — while a
+    /// test-only struct field, enum variant or match arm hides nothing after
+    /// its enclosing scope.
     #[test]
     fn the_census_reads_methods_handlers_and_named_paths() {
         let src = r##"
+struct Config {
+    #[cfg(test)]
+    probe: Option<Probe>,
+    live: bool,
+}
+
+enum Mode {
+    #[cfg(test)]
+    Mock(u8),
+    Live,
+}
+
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        #[cfg(test)]
+        Mode::Mock(_) => "mock",
+        Mode::Live => "live",
+    }
+}
+
 fn routes() -> Router {
     let r = Router::new()
         .route("/a", get(crate::mcp::x::alpha).post(crate::mcp::x::alpha))
@@ -1698,13 +2053,22 @@ fn routes() -> Router {
         .route(&format!("/g/{}", id), get(gee))
         .route("/m", post(move_terminal_handler))
         .route("/paren", get(paren_handler).layer(x(")")))
+        .route ("/spaced", get(spaced))
+        .route::<AppState>("/turbofish", get(turbo))
         // .route("/commented", get(nope))
         .merge(crate::mcp::canvas::routes())
+        .merge(super::canvas::routes())
+        .merge(self::sub)
+        .merge(super::sub)
+        .merge(sub)
+        .merge(health::sub)
+        .merge(if enabled { on_routes() } else { Router::new() })
         .merge(graphql_routes)
         .nest("/api", crate::api::router())
         .nest_service("/static", ServeDir::new("dist"))
         .fallback(not_found_handler);
     let r = add_dual!(r, post, "wait", crate::mcp::ui_bridge::wait_handler);
+    let r = add_dual ! (r, get, "spaced-dual", spaced_dual);
     let r = add_dual!(r, get, tail_from_const, h);
     let quoted = ".route(\"/in-a-string\", get(nope))";
     let raw = r#".route("/in-a-raw-string", get(nope))"#;
@@ -1722,26 +2086,12 @@ mod tests {
 fn unix_mock() -> Router {
     Router::new().route("/unix-mock", get(mock_handler))
 }
-"##;
-        let decls = Lexed::new(concat!(
-            "#[cfg(test)]\n#[path = \"p_tests.rs\"]\nmod p;\n",
-            "#[cfg(test)]\npub(crate) mod q_tests;\n",
-            "pub mod image_quality_tests;\n",
-        ))
-        .test_module_files("src/mcp/foo.rs");
-        assert_eq!(
-            decls,
-            vec![
-                "src/mcp/p_tests.rs",
-                "src/mcp/foo/q_tests.rs",
-                "src/mcp/foo/q_tests/mod.rs",
-            ]
-        );
-        let decls: std::collections::HashSet<String> = decls.into_iter().collect();
-        assert!(is_test_file("src/mcp/foo/q_tests.rs", &decls));
-        assert!(is_test_file("src/mcp/origin_guard/tests.rs", &decls));
-        assert!(!is_test_file("src/mcp/image_quality_tests.rs", &decls));
 
+#[cfg(all(feature = "e2e", test))]
+fn e2e_mock() -> Router {
+    Router::new().route("/e2e-mock", get(mock_handler))
+}
+"##;
         let mut lines = Vec::new();
         census_one_file(src, &mut lines);
         lines.sort();
@@ -1755,9 +2105,19 @@ fn unix_mock() -> Router {
                 "GET /c <closure>",
                 "GET /f phi",
                 "GET /paren paren_handler",
+                "GET /spaced spaced",
+                "GET /turbofish turbo",
+                "GET /ui-bridge/ai/spaced-dual spaced_dual",
+                "GET /ui-bridge/control/spaced-dual spaced_dual",
                 "GET,POST /a alpha",
+                "MERGE <expr>",
+                "MERGE canvas::routes",
                 "MERGE canvas::routes",
                 "MERGE graphql_routes",
+                "MERGE health::sub",
+                "MERGE sub",
+                "MERGE sub",
+                "MERGE sub",
                 "NEST /api api::router",
                 "NEST_SERVICE /static ServeDir::new",
                 "POST /e epsilon",
@@ -1771,6 +2131,103 @@ fn unix_mock() -> Router {
                 "UNREAD add_dual!(r, get, tail_from_const, h)",
             ]
         );
+
+        // `registered_routes` reads the same walks: literal `.route` paths
+        // and both routes of each readable `add_dual!`.
+        let mut registered = std::collections::HashSet::new();
+        let lx = Lexed::new(src);
+        collect_routes(&lx, ROUTING_VERBS, &mut registered);
+        walk_add_dual(&lx, |dual| {
+            if let AddDual::Read { method, tail, .. } = dual {
+                for path in dual_paths(tail) {
+                    registered.insert((method.clone(), path));
+                }
+            }
+        });
+        for (m, p) in [
+            ("POST", "/ui-bridge/control/wait"),
+            ("POST", "/ui-bridge/ai/wait"),
+            ("GET", "/spaced"),
+            ("GET", "/turbofish"),
+        ] {
+            assert!(
+                registered.contains(&(m.to_string(), p.to_string())),
+                "{m} {p} not registered"
+            );
+        }
+        assert!(Lexed::new(src).is_router_source());
+        assert!(Lexed::new("macro_rules! m { () => { r.route(\"/x\", get(h)) } }").is_router_source());
+        assert!(
+            !Lexed::new("// axum\nfn f(o: Other) { o.merge(next).route(&ctx) }").is_router_source()
+        );
+    }
+
+    /// Which files are test-only: by name, by an inner `#![cfg(test)]`, and
+    /// by a test-only `mod` declaration — `#[path]` read wherever it sits in
+    /// the attribute stack and normalised, enclosing inline modules honoured,
+    /// and a test module's own submodules followed.
+    #[test]
+    fn the_census_finds_test_only_files() {
+        assert!(Lexed::new("//! doc\n#![cfg(test)]\nuse x;\n").is_test_only_file());
+        assert!(Lexed::new("#![allow(dead_code)]\n#![cfg(all(feature = \"x\", test))]\n")
+            .is_test_only_file());
+        assert!(!Lexed::new("#![cfg(feature = \"test\")]\nfn f() {}\n").is_test_only_file());
+        assert!(!Lexed::new("fn f() {}\n#[cfg(test)]\nmod tests {}\n").is_test_only_file());
+
+        let decls = Lexed::new(concat!(
+            "#[cfg(test)]\n#[path = \"p_tests.rs\"]\nmod p;\n",
+            "#[path = \"../shared/r_tests.rs\"]\n#[cfg(test)]\nmod r;\n",
+            "#[allow(clippy::path_buf_push_overwrite)]\n#[cfg(test)]\n#[path = \"s_tests.rs\"]\nmod s;\n",
+            "#[cfg(test)]\npub(crate) mod q_tests;\n",
+            "pub mod image_quality_tests;\n",
+            "mod outer {\n    #[cfg(test)]\n    mod inner_tests;\n}\n",
+            "#[cfg(test)]\nmod tests {\n    mod helpers;\n}\n",
+        ))
+        .test_module_files("src/mcp/foo.rs", false);
+        assert_eq!(
+            decls,
+            vec![
+                "src/mcp/p_tests.rs",
+                "src/shared/r_tests.rs",
+                "src/mcp/s_tests.rs",
+                "src/mcp/foo/q_tests.rs",
+                "src/mcp/foo/q_tests/mod.rs",
+                "src/mcp/foo/outer/inner_tests.rs",
+                "src/mcp/foo/outer/inner_tests/mod.rs",
+                "src/mcp/foo/tests/helpers.rs",
+                "src/mcp/foo/tests/helpers/mod.rs",
+            ]
+        );
+        assert_eq!(
+            Lexed::new("pub mod a;\n").test_module_files("src/mcp/mod.rs", true),
+            vec!["src/mcp/a.rs", "src/mcp/a/mod.rs"]
+        );
+
+        let sources: Vec<(String, Lexed)> = [
+            ("src/mcp/foo.rs", "#[cfg(test)]\nmod foo_tests;\n"),
+            ("src/mcp/foo/foo_tests.rs", "mod deeper;\n"),
+            ("src/mcp/foo/foo_tests/deeper.rs", "fn f() {}\n"),
+            ("src/mcp/e2e.rs", "#![cfg(test)]\nmod part;\n"),
+            ("src/mcp/e2e/part.rs", "fn f() {}\n"),
+            ("src/mcp/origin_guard/tests.rs", "fn f() {}\n"),
+            ("src/mcp/image_quality_tests.rs", "fn routes() {}\n"),
+        ]
+        .into_iter()
+        .map(|(rel, src)| (rel.to_string(), Lexed::new(src)))
+        .collect();
+        let test_files = test_only_files(&sources);
+        for rel in [
+            "src/mcp/foo/foo_tests.rs",
+            "src/mcp/foo/foo_tests/deeper.rs",
+            "src/mcp/e2e.rs",
+            "src/mcp/e2e/part.rs",
+            "src/mcp/origin_guard/tests.rs",
+        ] {
+            assert!(test_files.contains(rel), "{rel} not test-only");
+        }
+        for rel in ["src/mcp/foo.rs", "src/mcp/image_quality_tests.rs"] {
+            assert!(!test_files.contains(rel), "{rel} taken for test-only");
+        }
     }
 
     /// **The mechanical tripwire.** An allowlist entry that names no
