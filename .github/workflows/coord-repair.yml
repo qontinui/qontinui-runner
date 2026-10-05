@@ -26,12 +26,19 @@
 # ci.toml with deny_unknown_fields, so a `[[repair]]` block would break their
 # CI-node dispatch for this repo. Until then every dispatch fails at "Select".
 #
+# WHICH CODE RUNS: a declaration must name repo scripts as
+# `../trusted/.github/...` (the default branch's copy, beside work/); the
+# helper's `select` refuses any other spelling. The `check` exit code is
+# forgeable whenever check executes PR code (cargo test, poetry run ...), so
+# coord's own re-validation of the patch is the boundary, not check_exit.
+#
 # INPUTS reach shell code ONLY through `env:`; nothing below interpolates
 # `${{ inputs.* }}` into a `run:` line (script injection). They are validated
 # before either checkout uses them.
 #
 # THE CONTRACT coord relies on — change it only together with coord's
-# dispatcher: the five inputs; the run-name; the artifact name
+# dispatcher: the six inputs (pr, head_sha, base_ref, step, kind,
+# correlation_id); the run-name; the artifact name
 # `coord-repair-<correlation_id>` holding exactly `repair.patch` and
 # `report.json` (schema `coord-repair/1`, see .github/scripts/coord-repair-run.py).
 name: coord-repair
@@ -46,6 +53,10 @@ on:
         type: string
       head_sha:
         description: The exact 40-hex PR head commit the repair runs against
+        required: true
+        type: string
+      base_ref:
+        description: The PR's base branch (the changed-files merge-base is taken against it)
         required: true
         type: string
       step:
@@ -65,7 +76,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: coord-repair-${{ inputs.pr }}-${{ inputs.step }}
+  group: coord-repair-${{ inputs.pr }}-${{ inputs.step }}-${{ inputs.kind }}
   cancel-in-progress: true
 
 jobs:
@@ -78,15 +89,33 @@ jobs:
     # comment), unlike the tag pins elsewhere in this repo: this workflow runs
     # PR-head code by design, so it takes no mutable reference on top of that.
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # Read-only, both. `pull-requests: read` is for the regen's sibling
+    # checkout, which reads the PR's coord dep-edge labels and the named
+    # sibling PR (ci.yml grants the same for the same action); nothing here
+    # can write.
+    permissions:
+      contents: read
+      pull-requests: read
+    # A cold regen build (cargo test of the whole crate, no shared cache:
+    # PR-built artefacts must not land in a cache main later restores) gets 45
+    # minutes; a format repair 30. COORD_REPAIR_BUDGET_SECS is the deadline,
+    # counted from the job's first step, that command + check share; the
+    # remainder of timeout-minutes is left for the artifact upload.
+    timeout-minutes: ${{ inputs.kind == 'regen' && 45 || 30 }}
     env:
       COORD_REPAIR_PR: ${{ inputs.pr }}
       COORD_REPAIR_HEAD_SHA: ${{ inputs.head_sha }}
+      COORD_REPAIR_BASE_REF: ${{ inputs.base_ref }}
       COORD_REPAIR_STEP: ${{ inputs.step }}
       COORD_REPAIR_KIND: ${{ inputs.kind }}
       COORD_REPAIR_CORRELATION_ID: ${{ inputs.correlation_id }}
       COORD_REPAIR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      COORD_REPAIR_BUDGET_SECS: ${{ inputs.kind == 'regen' && 2400 || 1320 }}
+      COORD_REPAIR_ARGV_CAP_SECS: ${{ inputs.kind == 'regen' && 2100 || 900 }}
     steps:
+      - name: Record the job's start (the repair's deadline counts from here)
+        run: echo "COORD_REPAIR_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Validate inputs
         shell: bash
         run: |
@@ -94,6 +123,7 @@ jobs:
           fail() { echo "::error title=coord-repair::$1"; exit 1; }
           [[ "$COORD_REPAIR_PR" =~ ^[1-9][0-9]{0,9}$ ]] || fail "pr must be a positive integer"
           [[ "$COORD_REPAIR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "head_sha must be 40 lowercase hex"
+          [[ "$COORD_REPAIR_BASE_REF" =~ ^[A-Za-z0-9._/-]{1,200}$ && "$COORD_REPAIR_BASE_REF" != *..* && "$COORD_REPAIR_BASE_REF" != -* ]] || fail "base_ref must be a plain branch name"
           [[ "$COORD_REPAIR_KIND" == "format" || "$COORD_REPAIR_KIND" == "regen" ]] || fail "kind must be format or regen"
           [[ "$COORD_REPAIR_CORRELATION_ID" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || fail "correlation_id must match ^[A-Za-z0-9._-]{1,64}$"
           [[ -n "${COORD_REPAIR_STEP//[[:space:]]/}" && ${#COORD_REPAIR_STEP} -le 256 ]] || fail "step must be non-empty and <= 256 chars"
@@ -116,6 +146,8 @@ jobs:
       - name: Select the declared repair
         run: python3 -B trusted/.github/scripts/coord-repair-run.py select --manifest trusted/.qontinui/ci.toml --out "$RUNNER_TEMP/coord-repair/selected.json"
 
+      # fetch-depth: 0 also fetches every branch to refs/remotes/origin/*,
+      # which is where the helper reads base_ref for the merge-base.
       - name: Check out the PR head
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -141,6 +173,9 @@ jobs:
         with:
           path: ${{ github.workspace }}/qontinui-schemas
           pin-file: work/.github/sibling-pins.conf
+          # Not a pull_request event, so name the PR: a declared adaptation
+          # PR then resolves exactly as it does in ci.yml.
+          pr-number: ${{ inputs.pr }}
 
       - name: "Regen: install dependencies (Ubuntu)"
         if: inputs.kind == 'regen'
