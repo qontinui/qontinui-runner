@@ -500,6 +500,23 @@ export function applyLayoutAssignments(
   return next;
 }
 
+/** Dense zone assignments for `orderedTabIds`: the i-th tab owns zone i. */
+export function compactAssignments(orderedTabIds: readonly string[]): ZoneAssignments {
+  const next: ZoneAssignments = {};
+  orderedTabIds.forEach((id, i) => {
+    next[i] = id;
+  });
+  return next;
+}
+
+/**
+ * How long a compaction request waits for its closes. `closeTerminal` drops
+ * the tab from state synchronously, so this never fires today; it bounds a
+ * future close that does not, which would otherwise re-lay-out the grid as a
+ * surprise whenever that tab finally went.
+ */
+const COMPACTION_TIMEOUT_MS = 5_000;
+
 // ── Hook ───────────────────────────────────────────────────────────────────
 
 /**
@@ -752,6 +769,53 @@ export function useZoneLayout(
     [applyLayout],
   );
 
+  /**
+   * A pending "keep AI sessions" compaction (`PruneTerminalsButton`): compact
+   * `order` into zones 0..n-1 of the smallest layout that fits, once none of
+   * `closing` is in `tabIds` any more.
+   *
+   * It waits rather than applying at request time because the closes and the
+   * compaction are separate state updates: applied first, the auto-grow effect
+   * would see the not-yet-closed tabs overflow the smaller layout and grow it
+   * straight back. Applied after, the layout is sized to the tabs that are
+   * actually left, so nothing can be hidden by it.
+   */
+  const [pendingCompaction, setPendingCompaction] = useState<{
+    order: string[];
+    closing: string[];
+  } | null>(null);
+
+  const requestCompaction = useCallback((order: string[], closing: string[]) => {
+    setPendingCompaction({ order, closing });
+  }, []);
+
+  useEffect(() => {
+    if (!pendingCompaction) return;
+    const timer = setTimeout(() => setPendingCompaction(null), COMPACTION_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [pendingCompaction]);
+
+  useEffect(() => {
+    if (!pendingCompaction) return;
+    if (pendingCompaction.closing.some((id) => tabIds.includes(id))) return;
+    setPendingCompaction(null);
+    // Tabs spawned between the request and now are appended rather than
+    // dropped — every live tab must still land in a zone.
+    const live = new Set(tabIds);
+    const ordered = pendingCompaction.order.filter((id) => live.has(id));
+    const inOrder = new Set(ordered);
+    for (const id of tabIds) if (!inOrder.has(id)) ordered.push(id);
+    const focusedTab = assignmentsRef.current[focusedZone];
+    // Every zone index is about to be re-dealt, so a restore reservation would
+    // pin a zone that no longer means what the record meant. A record whose tab
+    // lands later still reclaims its zone through `assignTabToZone`.
+    reservedZonesRef.current.clear();
+    setLayoutIdState(pickLayout(ordered.length));
+    setAssignments(compactAssignments(ordered));
+    setMaximizedZone(null);
+    setFocusedZone(Math.max(0, focusedTab ? ordered.indexOf(focusedTab) : 0));
+  }, [pendingCompaction, tabIds, focusedZone]);
+
   const assignTabToZone = useCallback((zoneIndex: number, tabId: string) => {
     // Reserve the zone so the creation-order auto-fill can't steal it while the
     // tab is mid-creation (restore path). Cleared in the setter below once the
@@ -883,6 +947,7 @@ export function useZoneLayout(
     setLayoutId,
     assignments,
     assignTabToZone,
+    requestCompaction,
     focusedZone,
     setFocusedZone,
     focusedTabId,
