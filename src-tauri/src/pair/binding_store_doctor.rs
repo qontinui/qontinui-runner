@@ -16,7 +16,7 @@
 //!
 //! Under a `$QONTINUI_SECURE_STORAGE_DIR` override the one other computed copy
 //! is the bare `data_local_dir()` default, and since qontinui-runner#1756
-//! converge deliberately RETAINS it (`SupersedeVerdict::RetainBareDefault`): it
+//! converge deliberately RETAINS it (it never renames any copy): it
 //! is another installation's canonical store, not a stray copy of ours. The
 //! merge from it is one-way (bare default → canonical) and deliberately
 //! incomplete — a tenant this process holds no credential for is withheld, a
@@ -142,9 +142,8 @@ impl BindingStoreCheck {
 /// across instances).
 pub fn binding_store_check() -> BindingStoreCheck {
     let paths = binding_store_candidate_paths();
-    // Passed explicitly for the same reason `converge_binding_store_with`
-    // takes it: resolved ambiently inside the core it would point at the
-    // developer's real home in every temp-home test.
+    // Passed explicitly: resolved ambiently inside the core it would point at
+    // the developer's real home in every temp-home test.
     let bare_default = paired_user_path_with(None);
     let mgr = crate::auth::AuthManager::new();
     let holds_credential = holds_credential_predicate(&mgr);
@@ -1035,9 +1034,7 @@ mod tests {
         let report = converge_binding_store_with(
             &b.canonical,
             std::slice::from_ref(&b.foreign),
-            Some(b.foreign.as_path()),
             &credentialed,
-            "2026-10-02",
         );
         assert_eq!(report.merged, vec![SECOND_TENANT.to_string()]);
         assert_eq!(
