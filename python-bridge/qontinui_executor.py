@@ -24,7 +24,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 # CRITICAL: Configure logging to use stderr FIRST before any other imports
 logging.basicConfig(
@@ -82,6 +82,7 @@ from event_manager import EventManager, EventType  # noqa: E402
 # CRITICAL: Import local python-bridge modules BEFORE qontinui library
 from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
+from executor_commands import CommandEntry, build_command_table  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 
@@ -202,6 +203,157 @@ class QontinuiExecutor:
     - Maintain execution state
     - Provide workflow execution interface
     """
+
+    # Command name -> handler method. ``build_command_table`` (executor_commands)
+    # validates every entry at import and decides once whether each method takes
+    # ``params``. Adding a command is one entry here (or in a mixin's COMMANDS).
+    COMMANDS: ClassVar[dict[str, str]] = {
+        "load": "_cmd_load",
+        "start": "_cmd_start",
+        "stop": "_cmd_stop",
+        "pause": "_cmd_pause",
+        "resume": "_cmd_resume",
+        "execute_action": "_cmd_execute_action",
+        "status": "_cmd_status",
+        "set_debug_settings": "_cmd_set_debug_settings",
+        "update_capture_settings": "_cmd_update_capture_settings",
+        "manual_capture_status": "_cmd_manual_capture_status",
+        "set_input_capture_enabled": "_cmd_set_input_capture_enabled",
+        "get_input_validation_status": "_cmd_get_input_validation_status",
+        # Test Results Handler commands (for QA Dashboard)
+        "test_results_configure": "_cmd_test_results_configure",
+        "test_results_status": "_cmd_test_results_status",
+        "ping": "_cmd_ping",
+        "navigate_to_state": "_cmd_navigate_to_state",
+        # Web extraction commands
+        "start_web_extraction": "_handle_start_web_extraction",
+        "stop_web_extraction": "_handle_stop_web_extraction",
+        "get_extraction_status": "_handle_get_extraction_status",
+        # Playwright State Collector commands
+        "start_playwright_collection": "_handle_start_playwright_collection",
+        "get_playwright_collection_status": "_handle_get_playwright_collection_status",
+        "get_playwright_collection_results": "_handle_get_playwright_collection_results",
+        "stop_playwright_collection": "_handle_stop_playwright_collection",
+        # UI-TARS extraction commands
+        "start_uitars_extraction": "_handle_start_uitars_extraction",
+        "stop_uitars_extraction": "_handle_stop_uitars_extraction",
+        "get_uitars_extraction_status": "_handle_get_uitars_extraction_status",
+        "get_uitars_extraction_results": "_handle_get_uitars_extraction_results",
+        # Vision extraction commands
+        "run_vision_extraction": "_handle_run_vision_extraction",
+        # Remote workflow execution from web app
+        "execute_workflow": "_handle_execute_workflow",
+        # Screenshot capture command (for direct capture via Python)
+        "capture_screenshot": "_handle_capture_screenshot",
+        # Get available monitors
+        "get_monitors": "_handle_get_monitors",
+        # SAM3 segmentation command
+        "segment_screenshot": "_handle_segment_screenshot",
+        # Verification Agent commands
+        "detect_current_states": "_handle_detect_current_states",
+        "verify_elements": "_handle_verify_elements",
+        "verification_capture_screenshot": "_handle_verification_capture_screenshot",
+        # Flakiness-aware execution commands
+        "get_flakiness_options": "_handle_get_flakiness_options",
+        # Interaction Recording commands (video + input capture for State Machine creation)
+        "start_interaction_recording": "_handle_start_interaction_recording",
+        "stop_interaction_recording": "_handle_stop_interaction_recording",
+        "get_interaction_recording_status": "_handle_get_interaction_recording_status",
+        # Page analysis commands for AI-powered test generation
+        "analyze_page_playwright": "_handle_analyze_page_playwright",
+        "analyze_page_playwright_script": "_handle_analyze_page_playwright_script",
+        "analyze_page_vision": "_handle_analyze_page_vision",
+        "generate_test_with_ai": "_handle_generate_test_with_ai",
+        # AI shell command generation
+        "generate_shell_command_with_ai": "_handle_generate_shell_command_with_ai",
+        # AI builder generation commands
+        "generate_context_with_ai": "_handle_generate_context_with_ai",
+        "generate_api_request_with_ai": "_handle_generate_api_request_with_ai",
+        "generate_task_prompt_with_ai": "_handle_generate_task_prompt_with_ai",
+        "suggest_exploration_strategy_with_ai": "_handle_suggest_exploration_strategy_with_ai",
+        "generate_test_and_agentic_step": "_handle_generate_test_and_agentic_step",
+        "explore_flow_step": "_handle_explore_flow_step",
+        # Pattern matching commands
+        "pattern_find": "_handle_pattern_find",
+        "pattern_find_all": "_handle_pattern_find_all",
+        # Integration testing commands
+        "testing_get_states": "_handle_testing_get_states",
+        "testing_get_transitions": "_handle_testing_get_transitions",
+        "testing_find_path": "_handle_testing_find_path",
+        "testing_traverse_to_state": "_handle_testing_traverse_to_state",
+        "testing_get_active_states": "_handle_testing_get_active_states",
+        "testing_set_mock_mode": "_handle_testing_set_mock_mode",
+        "testing_mock_click": "_handle_testing_mock_click",
+        "testing_mock_type": "_handle_testing_mock_type",
+        "testing_mock_screenshot": "_handle_testing_mock_screenshot",
+        "testing_get_mocked_actions": "_handle_testing_get_mocked_actions",
+        "testing_clear_mocked_actions": "_handle_testing_clear_mocked_actions",
+        "testing_start_run": "_handle_testing_start_run",
+        "testing_run_assertion": "_handle_testing_run_assertion",
+        "testing_run_test_case": "_handle_testing_run_test_case",
+        "testing_end_run": "_handle_testing_end_run",
+        "testing_get_run": "_handle_testing_get_run",
+        "testing_get_status": "_handle_testing_get_status",
+        "testing_get_results": "_handle_testing_get_results",
+        "testing_list_runs": "_handle_testing_list_runs",
+        # Model management commands
+        "models_list": "_handle_models_list",
+        "models_download": "_handle_models_download",
+        "models_delete": "_handle_models_delete",
+        "models_status": "_handle_models_status",
+        "models_disk_usage": "_handle_models_disk_usage",
+        # Accessibility capture commands
+        "capture_accessibility": "_handle_capture_accessibility",
+        "click_ref": "_handle_click_ref",
+        "fill_ref": "_handle_fill_ref",
+        "focus_ref": "_handle_focus_ref",
+        "get_ref": "_handle_get_ref",
+        "get_accessibility_snapshot": "_handle_get_accessibility_snapshot",
+        "get_accessibility_ai_context": "_handle_get_accessibility_ai_context",
+        "find_accessibility_elements": "_handle_find_accessibility_elements",
+        "disconnect_accessibility": "_handle_disconnect_accessibility",
+        "scan_cdp_ports": "_handle_scan_cdp_ports",
+        "list_browser_targets": "_handle_list_browser_targets",
+        "auto_connect_accessibility": "_handle_auto_connect_accessibility",
+        # AWAS (AI Web Action Standard) commands
+        "awas_discover": "_handle_awas_discover",
+        "awas_execute": "_handle_awas_execute",
+        "awas_check_support": "_handle_awas_check_support",
+        "awas_list_actions": "_handle_awas_list_actions",
+        "awas_extract_elements": "_handle_awas_extract_elements",
+        # UI Bridge exploration commands
+        "start_ui_bridge_exploration": "_handle_start_ui_bridge_exploration",
+        "get_ui_bridge_exploration_status": "_handle_get_ui_bridge_exploration_status",
+        "get_ui_bridge_exploration_results": "_handle_get_ui_bridge_exploration_results",
+        "stop_ui_bridge_exploration": "_handle_stop_ui_bridge_exploration",
+        # UI Bridge state discovery from render logs
+        "discover_states_from_renders": "_handle_discover_states_from_renders",
+        # UI Bridge state discovery from fingerprint co-occurrence data
+        "discover_states_from_fingerprints": "_handle_discover_states_from_fingerprints",
+        # UI Bridge automatic exploration
+        "run_ui_bridge_exploration": "_handle_run_ui_bridge_exploration",
+        # Click-to-Template capture commands
+        "start_click_capture": "_handle_start_click_capture",
+        "stop_click_capture": "_handle_stop_click_capture",
+        "get_click_capture_status": "_handle_get_click_capture_status",
+        "process_click_capture": "_handle_process_click_capture",
+        "generate_state_machine": "_handle_generate_state_machine",
+        # UI Bridge State Machine commands
+        "load_state_machine": "_handle_load_state_machine",
+        "get_state_machine_status": "_handle_get_state_machine_status",
+        "sm_execute_transition": "_handle_sm_execute_transition",
+        "sm_navigate_to_states": "_handle_sm_navigate_to_states",
+        "sm_get_active_states": "_handle_sm_get_active_states",
+        "sm_get_available_transitions": "_handle_sm_get_available_transitions",
+        "sm_get_permitted_triggers": "_handle_sm_get_permitted_triggers",
+        "sm_get_blocked_triggers": "_handle_sm_get_blocked_triggers",
+        "sm_get_mermaid_diagram": "_handle_sm_get_mermaid_diagram",
+        "clear_state_machine": "_handle_clear_state_machine",
+        # GUI Config Pipeline commands
+        "gui_config_capture_elements": "_handle_gui_config_capture_elements",
+        "gui_config_build": "_handle_gui_config_build",
+        "gui_config_capture_multi_state": "_handle_gui_config_capture_multi_state",
+    }
 
     def __init__(self) -> None:
         """Initialize executor and all modules."""
@@ -1158,529 +1310,229 @@ class QontinuiExecutor:
         if cmd_type not in ("ping", "status"):
             self.event_manager.emit_log("info", f"handle_command: received '{cmd_type}'")
 
-        if cmd_type == "load":
-            config_path = params.get("config_path")
-            success = self.load_configuration(config_path)
-            return {"success": success}
-
-        elif cmd_type == "start":
-            workflow_id = params.get("workflow_id") or params.get("workflow")
-            # Support both "monitor" and "monitor_index" parameter names
-            # Use explicit None check to handle monitor_index=0 correctly (0 is falsy in Python)
-            monitor = params.get("monitor_index")
-            if monitor is None:
-                monitor = params.get("monitor")  # Monitor index to use
-            # Get monitor offset from Rust (if provided)
-            monitor_offset_x = params.get("monitor_offset_x")
-            monitor_offset_y = params.get("monitor_offset_y")
-            # Get resolved initial_state_ids from Rust (if provided)
-            initial_state_ids = params.get("initial_state_ids")
-            self.event_manager.emit_log(
-                "info",
-                f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}",
-            )
-            # Write to debug file for monitor tracing
-            try:
-                with open(
-                    os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                    "a",
-                    encoding="utf-8",
-                ) as f:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    f.write(
-                        f"[{timestamp}] [PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n"
-                    )
-            except Exception:
-                pass
-            success = self.start_execution(
-                workflow_id,
-                monitor=monitor,
-                monitor_offset_x=monitor_offset_x,
-                monitor_offset_y=monitor_offset_y,
-                initial_state_ids=initial_state_ids,
-            )
-            return {"success": success}
-
-        elif cmd_type == "stop":
-            self.stop_execution()
-            return {"success": True}
-
-        elif cmd_type == "pause":
-            self.pause_execution()
-            return {"success": True}
-
-        elif cmd_type == "resume":
-            self.resume_execution()
-            return {"success": True}
-
-        elif cmd_type == "execute_action":
-            # Execute a single GUI action (e.g., click on an image)
-            action_type = params.get("action_type", "CLICK")
-            image_id = params.get("image_id")
-            monitor_index = params.get("monitor_index", 0)
-
-            if not image_id:
-                return {"success": False, "error": "image_id is required"}
-
-            if not self.gui_automation:
-                return {"success": False, "error": "GUI automation not initialized"}
-
-            self.event_manager.emit_log(
-                "info",
-                f"[EXECUTE_ACTION] Executing {action_type} on image: {image_id}",
-            )
-
-            # Build action data for gui_automation.execute_action()
-            action_data = {
-                "id": f"action-{action_type.lower()}-{time.time()}",
-                "type": action_type.upper(),
-                "config": {
-                    "target": {
-                        "type": "image",
-                        "imageIds": [image_id],
-                    }
-                },
-            }
-
-            try:
-                import asyncio
-
-                # Set monitor if provided
-                if self.executor_core.state_executor and monitor_index is not None:
-                    self.executor_core.state_executor.set_monitor(monitor_index)
-
-                # Execute the action (async method called from sync context)
-                loop = self._get_or_create_async_loop()
-                future = asyncio.run_coroutine_threadsafe(
-                    self.gui_automation.execute_action(action_data), loop
-                )
-                success = future.result(timeout=120)  # 2 minute timeout for single actions
-
-                self.event_manager.emit_log(
-                    "info" if success else "warning",
-                    f"[EXECUTE_ACTION] {action_type} on {image_id}: {'success' if success else 'failed'}",
-                )
-
-                return {
-                    "success": success,
-                    "action_type": action_type,
-                    "image_id": image_id,
-                }
-            except Exception as e:
-                error_msg = str(e)
-                self.event_manager.emit_log(
-                    "error",
-                    f"[EXECUTE_ACTION] Error executing {action_type} on {image_id}: {error_msg}",
-                )
-                return {
-                    "success": False,
-                    "action_type": action_type,
-                    "image_id": image_id,
-                    "error": error_msg,
-                }
-
-        elif cmd_type == "status":
-            return {
-                "success": True,
-                "is_running": self.is_running,
-                "config_loaded": self.config is not None,
-                "library_available": QONTINUI_AVAILABLE,
-            }
-
-        elif cmd_type == "set_debug_settings":
-            settings = params.get("settings", {})
-            self.executor_core.apply_debug_settings(settings)
-            return {"success": True}
-
-        elif cmd_type == "update_capture_settings":
-            settings = params.get("settings", {})
-            return self.capture_manager.update_settings(settings)  # type: ignore[no-any-return]
-
-        elif cmd_type == "manual_capture_status":
-            return {
-                "success": True,
-                "is_running": self.capture_manager.is_manual_capture_running(),
-            }
-
-        elif cmd_type == "set_input_capture_enabled":
-            # Enable/disable input capture for coordinate validation during execution
-            # When enabled, input will be automatically captured during workflow execution
-            enabled = params.get("enabled", False)
-            self.capture_input_for_validation = enabled
-            self.event_manager.emit_log(
-                "info",
-                f"Input capture for validation {'enabled' if enabled else 'disabled'}",
-            )
-            return {"success": True, "enabled": enabled}
-
-        elif cmd_type == "get_input_validation_status":
-            # Get current input validation status
-            is_monitoring = (
-                self.input_monitor_service is not None
-                and self._input_capture_session_id is not None
-            )
-            events_count = 0
-            if self.input_monitor_service and is_monitoring:
-                events_count = len(self.input_monitor_service.get_events())
-            return {
-                "success": True,
-                "enabled": self.capture_input_for_validation,
-                "is_monitoring": is_monitoring,
-                "events_count": events_count,
-                "session_id": self._input_capture_session_id,
-            }
-
-        # Test Results Handler commands (for QA Dashboard)
-        elif cmd_type == "test_results_configure":
-            enabled = params.get("enabled", False)
-            api_url = params.get("api_url", "")
-            access_token = params.get("access_token", "")
-            project_id = params.get("project_id")
-            self.event_manager.emit_log(
-                "info",
-                f"[TEST_RESULTS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}",
-            )
-            success = self.test_results_handler.configure(
-                enabled, api_url, access_token, project_id
-            )
-            return {"success": success}
-
-        elif cmd_type == "test_results_status":
-            return {
-                "success": True,
-                **self.test_results_handler.get_status(),
-            }
-
-        elif cmd_type == "ping":
-            pong_message = {"type": "pong", "timestamp": time.time()}
-            print(json.dumps(pong_message), flush=True)
-            return {"success": True}
-
-        elif cmd_type == "navigate_to_state":
-            # Support both "target_state_id" (from Rust action_service) and "state_id" (legacy)
-            state_id = params.get("target_state_id") or params.get("state_id")
-            return self.navigate_to_state(state_id)
-
-        # Web extraction commands
-        elif cmd_type == "start_web_extraction":
-            return self._handle_start_web_extraction(params)
-
-        elif cmd_type == "stop_web_extraction":
-            return self._handle_stop_web_extraction()
-
-        elif cmd_type == "get_extraction_status":
-            return self._handle_get_extraction_status()
-
-        # Playwright State Collector commands
-        elif cmd_type == "start_playwright_collection":
-            return self._handle_start_playwright_collection(params)
-
-        elif cmd_type == "get_playwright_collection_status":
-            return self._handle_get_playwright_collection_status(params)
-
-        elif cmd_type == "get_playwright_collection_results":
-            return self._handle_get_playwright_collection_results(params)
-
-        elif cmd_type == "stop_playwright_collection":
-            return self._handle_stop_playwright_collection()
-
-        # UI-TARS extraction commands
-        elif cmd_type == "start_uitars_extraction":
-            return self._handle_start_uitars_extraction(params)
-
-        elif cmd_type == "stop_uitars_extraction":
-            return self._handle_stop_uitars_extraction()
-
-        elif cmd_type == "get_uitars_extraction_status":
-            return self._handle_get_uitars_extraction_status()
-
-        elif cmd_type == "get_uitars_extraction_results":
-            return self._handle_get_uitars_extraction_results()
-
-        # Vision extraction commands
-        elif cmd_type == "run_vision_extraction":
-            return self._handle_run_vision_extraction(params)
-
-        # Remote workflow execution from web app
-        elif cmd_type == "execute_workflow":
-            return self._handle_execute_workflow(params)
-
-        # Screenshot capture command (for direct capture via Python)
-        elif cmd_type == "capture_screenshot":
-            return self._handle_capture_screenshot(params)
-
-        # Get available monitors
-        elif cmd_type == "get_monitors":
-            return self._handle_get_monitors()
-
-        # SAM3 segmentation command
-        elif cmd_type == "segment_screenshot":
-            return self._handle_segment_screenshot(params)
-
-        # Verification Agent commands
-        elif cmd_type == "detect_current_states":
-            return self._handle_detect_current_states(params)
-
-        elif cmd_type == "verify_elements":
-            return self._handle_verify_elements(params)
-
-        elif cmd_type == "verification_capture_screenshot":
-            return self._handle_verification_capture_screenshot(params)
-
-        # Flakiness-aware execution commands
-        elif cmd_type == "get_flakiness_options":
-            return self._handle_get_flakiness_options(params)
-
-        # Interaction Recording commands (video + input capture for State Machine creation)
-        elif cmd_type == "start_interaction_recording":
-            return self._handle_start_interaction_recording(params)
-
-        elif cmd_type == "stop_interaction_recording":
-            return self._handle_stop_interaction_recording()
-
-        elif cmd_type == "get_interaction_recording_status":
-            return self._handle_get_interaction_recording_status()
-
-        # Page analysis commands for AI-powered test generation
-        elif cmd_type == "analyze_page_playwright":
-            return self._handle_analyze_page_playwright(params)
-
-        elif cmd_type == "analyze_page_playwright_script":
-            return self._handle_analyze_page_playwright_script(params)
-
-        elif cmd_type == "analyze_page_vision":
-            return self._handle_analyze_page_vision(params)
-
-        elif cmd_type == "generate_test_with_ai":
-            return self._handle_generate_test_with_ai(params)
-
-        # AI shell command generation
-        elif cmd_type == "generate_shell_command_with_ai":
-            return self._handle_generate_shell_command_with_ai(params)
-
-        # AI builder generation commands
-        elif cmd_type == "generate_context_with_ai":
-            return self._handle_generate_context_with_ai(params)
-
-        elif cmd_type == "generate_api_request_with_ai":
-            return self._handle_generate_api_request_with_ai(params)
-
-        elif cmd_type == "generate_task_prompt_with_ai":
-            return self._handle_generate_task_prompt_with_ai(params)
-
-        elif cmd_type == "suggest_exploration_strategy_with_ai":
-            return self._handle_suggest_exploration_strategy_with_ai(params)
-
-        elif cmd_type == "generate_test_and_agentic_step":
-            return self._handle_generate_test_and_agentic_step(params)
-
-        elif cmd_type == "explore_flow_step":
-            return self._handle_explore_flow_step(params)
-
-        # Pattern matching commands
-        elif cmd_type == "pattern_find":
-            return self._handle_pattern_find(params)
-
-        elif cmd_type == "pattern_find_all":
-            return self._handle_pattern_find_all(params)
-
-        # Integration testing commands
-        elif cmd_type == "testing_get_states":
-            return self._handle_testing_get_states()
-
-        elif cmd_type == "testing_get_transitions":
-            return self._handle_testing_get_transitions()
-
-        elif cmd_type == "testing_find_path":
-            return self._handle_testing_find_path(params)
-
-        elif cmd_type == "testing_traverse_to_state":
-            return self._handle_testing_traverse_to_state(params)
-
-        elif cmd_type == "testing_get_active_states":
-            return self._handle_testing_get_active_states()
-
-        elif cmd_type == "testing_set_mock_mode":
-            return self._handle_testing_set_mock_mode(params)
-
-        elif cmd_type == "testing_mock_click":
-            return self._handle_testing_mock_click(params)
-
-        elif cmd_type == "testing_mock_type":
-            return self._handle_testing_mock_type(params)
-
-        elif cmd_type == "testing_mock_screenshot":
-            return self._handle_testing_mock_screenshot(params)
-
-        elif cmd_type == "testing_get_mocked_actions":
-            return self._handle_testing_get_mocked_actions()
-
-        elif cmd_type == "testing_clear_mocked_actions":
-            return self._handle_testing_clear_mocked_actions()
-
-        elif cmd_type == "testing_start_run":
-            return self._handle_testing_start_run(params)
-
-        elif cmd_type == "testing_run_assertion":
-            return self._handle_testing_run_assertion(params)
-
-        elif cmd_type == "testing_run_test_case":
-            return self._handle_testing_run_test_case(params)
-
-        elif cmd_type == "testing_end_run":
-            return self._handle_testing_end_run()
-
-        elif cmd_type == "testing_get_run":
-            return self._handle_testing_get_run(params)
-
-        elif cmd_type == "testing_get_status":
-            return self._handle_testing_get_status(params)
-
-        elif cmd_type == "testing_get_results":
-            return self._handle_testing_get_results(params)
-
-        elif cmd_type == "testing_list_runs":
-            return self._handle_testing_list_runs(params)
-
-        # Model management commands
-        elif cmd_type == "models_list":
-            return self._handle_models_list()
-
-        elif cmd_type == "models_download":
-            return self._handle_models_download(params)
-
-        elif cmd_type == "models_delete":
-            return self._handle_models_delete(params)
-
-        elif cmd_type == "models_status":
-            return self._handle_models_status(params)
-
-        elif cmd_type == "models_disk_usage":
-            return self._handle_models_disk_usage()
-
-        # Accessibility capture commands
-        elif cmd_type == "capture_accessibility":
-            return self._handle_capture_accessibility(params)
-
-        elif cmd_type == "click_ref":
-            return self._handle_click_ref(params)
-
-        elif cmd_type == "fill_ref":
-            return self._handle_fill_ref(params)
-
-        elif cmd_type == "focus_ref":
-            return self._handle_focus_ref(params)
-
-        elif cmd_type == "get_ref":
-            return self._handle_get_ref(params)
-
-        elif cmd_type == "get_accessibility_snapshot":
-            return self._handle_get_accessibility_snapshot()
-
-        elif cmd_type == "get_accessibility_ai_context":
-            return self._handle_get_accessibility_ai_context(params)
-
-        elif cmd_type == "find_accessibility_elements":
-            return self._handle_find_accessibility_elements(params)
-
-        elif cmd_type == "disconnect_accessibility":
-            return self._handle_disconnect_accessibility()
-
-        elif cmd_type == "scan_cdp_ports":
-            return self._handle_scan_cdp_ports(params)
-
-        elif cmd_type == "list_browser_targets":
-            return self._handle_list_browser_targets(params)
-
-        elif cmd_type == "auto_connect_accessibility":
-            return self._handle_auto_connect_accessibility(params)
-
-        # AWAS (AI Web Action Standard) commands
-        elif cmd_type == "awas_discover":
-            return self._handle_awas_discover(params)
-
-        elif cmd_type == "awas_execute":
-            return self._handle_awas_execute(params)
-
-        elif cmd_type == "awas_check_support":
-            return self._handle_awas_check_support(params)
-
-        elif cmd_type == "awas_list_actions":
-            return self._handle_awas_list_actions(params)
-
-        elif cmd_type == "awas_extract_elements":
-            return self._handle_awas_extract_elements(params)
-
-        # UI Bridge exploration commands
-        elif cmd_type == "start_ui_bridge_exploration":
-            return self._handle_start_ui_bridge_exploration(params)
-        elif cmd_type == "get_ui_bridge_exploration_status":
-            return self._handle_get_ui_bridge_exploration_status(params)
-        elif cmd_type == "get_ui_bridge_exploration_results":
-            return self._handle_get_ui_bridge_exploration_results(params)
-        elif cmd_type == "stop_ui_bridge_exploration":
-            return self._handle_stop_ui_bridge_exploration(params)
-
-        # UI Bridge state discovery from render logs
-        elif cmd_type == "discover_states_from_renders":
-            return self._handle_discover_states_from_renders(params)
-
-        # UI Bridge state discovery from fingerprint co-occurrence data
-        elif cmd_type == "discover_states_from_fingerprints":
-            return self._handle_discover_states_from_fingerprints(params)
-
-        # UI Bridge automatic exploration
-        elif cmd_type == "run_ui_bridge_exploration":
-            return self._handle_run_ui_bridge_exploration(params)
-
-        # Click-to-Template capture commands
-        elif cmd_type == "start_click_capture":
-            return self._handle_start_click_capture(params)
-
-        elif cmd_type == "stop_click_capture":
-            return self._handle_stop_click_capture(params)
-
-        elif cmd_type == "get_click_capture_status":
-            return self._handle_get_click_capture_status()
-
-        elif cmd_type == "process_click_capture":
-            return self._handle_process_click_capture(params)
-
-        elif cmd_type == "generate_state_machine":
-            return self._handle_generate_state_machine(params)
-
-        # UI Bridge State Machine commands
-        elif cmd_type == "load_state_machine":
-            return self._handle_load_state_machine(params)
-        elif cmd_type == "get_state_machine_status":
-            return self._handle_get_state_machine_status()
-        elif cmd_type == "sm_execute_transition":
-            return self._handle_sm_execute_transition(params)
-        elif cmd_type == "sm_navigate_to_states":
-            return self._handle_sm_navigate_to_states(params)
-        elif cmd_type == "sm_get_active_states":
-            return self._handle_sm_get_active_states()
-        elif cmd_type == "sm_get_available_transitions":
-            return self._handle_sm_get_available_transitions()
-        elif cmd_type == "sm_get_permitted_triggers":
-            return self._handle_sm_get_permitted_triggers(params)
-        elif cmd_type == "sm_get_blocked_triggers":
-            return self._handle_sm_get_blocked_triggers(params)
-        elif cmd_type == "sm_get_mermaid_diagram":
-            return self._handle_sm_get_mermaid_diagram(params)
-        elif cmd_type == "clear_state_machine":
-            return self._handle_clear_state_machine()
-
-        # GUI Config Pipeline commands
-        elif cmd_type == "gui_config_capture_elements":
-            return self._handle_gui_config_capture_elements(params)
-        elif cmd_type == "gui_config_build":
-            return self._handle_gui_config_build(params)
-        elif cmd_type == "gui_config_capture_multi_state":
-            return self._handle_gui_config_capture_multi_state(params)
-
-        else:
+        # ``params`` is decoded JSON, so the ``_cmd_*`` methods type it ``Any``.
+        entry = _COMMAND_TABLE.get(cmd_type) if isinstance(cmd_type, str) else None
+        if entry is None:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
+        handler = getattr(self, entry.method)
+        if entry.takes_params:
+            return handler(params)  # type: ignore[no-any-return]
+        return handler()  # type: ignore[no-any-return]
+
+    def _cmd_load(self, params: Any) -> dict[str, Any]:
+        """Handle the ``load`` command."""
+        config_path = params.get("config_path")
+        success = self.load_configuration(config_path)
+        return {"success": success}
+
+    def _cmd_start(self, params: Any) -> dict[str, Any]:
+        """Handle the ``start`` command."""
+        workflow_id = params.get("workflow_id") or params.get("workflow")
+        # Support both "monitor" and "monitor_index" parameter names
+        # Use explicit None check to handle monitor_index=0 correctly (0 is falsy in Python)
+        monitor = params.get("monitor_index")
+        if monitor is None:
+            monitor = params.get("monitor")  # Monitor index to use
+        # Get monitor offset from Rust (if provided)
+        monitor_offset_x = params.get("monitor_offset_x")
+        monitor_offset_y = params.get("monitor_offset_y")
+        # Get resolved initial_state_ids from Rust (if provided)
+        initial_state_ids = params.get("initial_state_ids")
+        self.event_manager.emit_log(
+            "info",
+            f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}",
+        )
+        # Write to debug file for monitor tracing
+        try:
+            with open(
+                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                "a",
+                encoding="utf-8",
+            ) as f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                f.write(
+                    f"[{timestamp}] [PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n"
+                )
+        except Exception:
+            pass
+        success = self.start_execution(
+            workflow_id,
+            monitor=monitor,
+            monitor_offset_x=monitor_offset_x,
+            monitor_offset_y=monitor_offset_y,
+            initial_state_ids=initial_state_ids,
+        )
+        return {"success": success}
+
+    def _cmd_stop(self, params: Any) -> dict[str, Any]:
+        """Handle the ``stop`` command."""
+        self.stop_execution()
+        return {"success": True}
+
+    def _cmd_pause(self, params: Any) -> dict[str, Any]:
+        """Handle the ``pause`` command."""
+        self.pause_execution()
+        return {"success": True}
+
+    def _cmd_resume(self, params: Any) -> dict[str, Any]:
+        """Handle the ``resume`` command."""
+        self.resume_execution()
+        return {"success": True}
+
+    def _cmd_execute_action(self, params: Any) -> dict[str, Any]:
+        """Handle the ``execute_action`` command."""
+        # Execute a single GUI action (e.g., click on an image)
+        action_type = params.get("action_type", "CLICK")
+        image_id = params.get("image_id")
+        monitor_index = params.get("monitor_index", 0)
+
+        if not image_id:
+            return {"success": False, "error": "image_id is required"}
+
+        if not self.gui_automation:
+            return {"success": False, "error": "GUI automation not initialized"}
+
+        self.event_manager.emit_log(
+            "info",
+            f"[EXECUTE_ACTION] Executing {action_type} on image: {image_id}",
+        )
+
+        # Build action data for gui_automation.execute_action()
+        action_data = {
+            "id": f"action-{action_type.lower()}-{time.time()}",
+            "type": action_type.upper(),
+            "config": {
+                "target": {
+                    "type": "image",
+                    "imageIds": [image_id],
+                }
+            },
+        }
+
+        try:
+            import asyncio
+
+            # Set monitor if provided
+            if self.executor_core.state_executor and monitor_index is not None:
+                self.executor_core.state_executor.set_monitor(monitor_index)
+
+            # Execute the action (async method called from sync context)
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                self.gui_automation.execute_action(action_data), loop
+            )
+            success = future.result(timeout=120)  # 2 minute timeout for single actions
+
+            self.event_manager.emit_log(
+                "info" if success else "warning",
+                f"[EXECUTE_ACTION] {action_type} on {image_id}: {'success' if success else 'failed'}",
+            )
+
+            return {
+                "success": success,
+                "action_type": action_type,
+                "image_id": image_id,
+            }
+        except Exception as e:
+            error_msg = str(e)
+            self.event_manager.emit_log(
+                "error",
+                f"[EXECUTE_ACTION] Error executing {action_type} on {image_id}: {error_msg}",
+            )
+            return {
+                "success": False,
+                "action_type": action_type,
+                "image_id": image_id,
+                "error": error_msg,
+            }
+
+    def _cmd_status(self, params: Any) -> dict[str, Any]:
+        """Handle the ``status`` command."""
+        return {
+            "success": True,
+            "is_running": self.is_running,
+            "config_loaded": self.config is not None,
+            "library_available": QONTINUI_AVAILABLE,
+        }
+
+    def _cmd_set_debug_settings(self, params: Any) -> dict[str, Any]:
+        """Handle the ``set_debug_settings`` command."""
+        settings = params.get("settings", {})
+        self.executor_core.apply_debug_settings(settings)
+        return {"success": True}
+
+    def _cmd_update_capture_settings(self, params: Any) -> dict[str, Any]:
+        """Handle the ``update_capture_settings`` command."""
+        settings = params.get("settings", {})
+        return self.capture_manager.update_settings(settings)  # type: ignore[no-any-return]
+
+    def _cmd_manual_capture_status(self, params: Any) -> dict[str, Any]:
+        """Handle the ``manual_capture_status`` command."""
+        return {
+            "success": True,
+            "is_running": self.capture_manager.is_manual_capture_running(),
+        }
+
+    def _cmd_set_input_capture_enabled(self, params: Any) -> dict[str, Any]:
+        """Handle the ``set_input_capture_enabled`` command."""
+        # Enable/disable input capture for coordinate validation during execution
+        # When enabled, input will be automatically captured during workflow execution
+        enabled = params.get("enabled", False)
+        self.capture_input_for_validation = enabled
+        self.event_manager.emit_log(
+            "info",
+            f"Input capture for validation {'enabled' if enabled else 'disabled'}",
+        )
+        return {"success": True, "enabled": enabled}
+
+    def _cmd_get_input_validation_status(self, params: Any) -> dict[str, Any]:
+        """Handle the ``get_input_validation_status`` command."""
+        # Get current input validation status
+        is_monitoring = (
+            self.input_monitor_service is not None and self._input_capture_session_id is not None
+        )
+        events_count = 0
+        if self.input_monitor_service and is_monitoring:
+            events_count = len(self.input_monitor_service.get_events())
+        return {
+            "success": True,
+            "enabled": self.capture_input_for_validation,
+            "is_monitoring": is_monitoring,
+            "events_count": events_count,
+            "session_id": self._input_capture_session_id,
+        }
+
+    def _cmd_test_results_configure(self, params: Any) -> dict[str, Any]:
+        """Handle the ``test_results_configure`` command."""
+        enabled = params.get("enabled", False)
+        api_url = params.get("api_url", "")
+        access_token = params.get("access_token", "")
+        project_id = params.get("project_id")
+        self.event_manager.emit_log(
+            "info",
+            f"[TEST_RESULTS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}",
+        )
+        success = self.test_results_handler.configure(enabled, api_url, access_token, project_id)
+        return {"success": success}
+
+    def _cmd_test_results_status(self, params: Any) -> dict[str, Any]:
+        """Handle the ``test_results_status`` command."""
+        return {
+            "success": True,
+            **self.test_results_handler.get_status(),
+        }
+
+    def _cmd_ping(self, params: Any) -> dict[str, Any]:
+        """Handle the ``ping`` command."""
+        pong_message = {"type": "pong", "timestamp": time.time()}
+        print(json.dumps(pong_message), flush=True)
+        return {"success": True}
+
+    def _cmd_navigate_to_state(self, params: Any) -> dict[str, Any]:
+        """Handle the ``navigate_to_state`` command."""
+        # Support both "target_state_id" (from Rust action_service) and "state_id" (legacy)
+        state_id = params.get("target_state_id") or params.get("state_id")
+        return self.navigate_to_state(state_id)
 
     def _handle_capture_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle screenshot capture command.
@@ -6979,6 +6831,10 @@ class QontinuiExecutor:
         except Exception as e:
             logger.exception(f"Failed to extract AWAS elements: {e}")
             return {"success": False, "error": str(e)}
+
+
+# Built once at import: raises on a duplicate command name or a missing method.
+_COMMAND_TABLE: dict[str, CommandEntry] = build_command_table(QontinuiExecutor)
 
 
 def main():
