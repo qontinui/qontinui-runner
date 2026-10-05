@@ -1139,13 +1139,18 @@ fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
 /// which the `paired_user.json` heal ([`coord_bound_tenants_for_heal_at`])
 /// would have resurrected. Only coord echoing the tenant again (the reset
 /// below), a fresh pairing ([`reset_omission_streak`]) or the tenant ceasing to
-/// be held locally removes it.
+/// be held locally removes it — and "ceasing to be held" must be MEASURED:
+/// with `carry_tombstones: Some(coord_set)` (the caller could not read the
+/// slot listing or the legacy slot this pass), every prior tombstone whose
+/// tenant coord did not echo is kept unchanged even though it is absent from
+/// `omitted`. It is not reported due: nothing local was read to clear.
 /// Returns `(due, held)`: due tenants with the unix second their run began, and
 /// held tenants with their current count. Caller holds the reconcile lock.
 #[allow(clippy::type_complexity)]
 fn advance_omission_streaks(
     paired_user: &std::path::Path,
     omitted: &[uuid::Uuid],
+    carry_tombstones: Option<&[uuid::Uuid]>,
     now_unix: i64,
 ) -> (Vec<(uuid::Uuid, i64)>, Vec<(uuid::Uuid, u32)>) {
     let path = omission_streaks_path(paired_user);
@@ -1181,6 +1186,19 @@ fn advance_omission_streaks(
             held.push((*t, streak.consecutive));
         }
         after.tenants.insert(key, streak);
+    }
+    if let Some(coord_set) = carry_tombstones {
+        for (key, prev) in &before.tenants {
+            let echoed = uuid::Uuid::parse_str(key.trim())
+                .map(|t| coord_set.contains(&t))
+                .unwrap_or(false);
+            if prev.consecutive >= RECONCILE_DROP_AFTER_OMISSIONS && !echoed {
+                after
+                    .tenants
+                    .entry(key.clone())
+                    .or_insert_with(|| prev.clone());
+            }
+        }
     }
     if after != before {
         write_omission_streaks(&path, &after);
@@ -1333,16 +1351,27 @@ fn reconcile_paired_bindings_locked(
         crate::auth::SlotRead::Usable(token) => crate::auth::jwt_tenant_claim(token),
         _ => None,
     };
+    //
+    // A tombstone may only be lifted by a MEASURED absence. When the slot
+    // listing or the legacy read could not be made, a tenant held only there
+    // is missing from `omitted` because nothing was READ, not because it is
+    // gone — so every prior tombstone coord did not echo is carried forward
+    // unchanged. Lifting it would let the next readable pass restart the
+    // tenant at one (HELD), and a vanish then would hand it to the heal.
+    let slot_list = mgr.try_list_tenant_device_jwt_tenants();
+    let fully_measured = slot_list.is_ok()
+        && !matches!(default_slot_read, crate::auth::SlotRead::Unreadable(_));
     let mut omitted: Vec<uuid::Uuid> = bindings
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
-        .chain(mgr.list_tenant_device_jwt_tenants())
+        .chain(slot_list.unwrap_or_default())
         .chain(legacy_claim)
         .filter(|t| !coord_set.contains(t))
         .collect();
     omitted.sort();
     omitted.dedup();
-    let (due_runs, held) = advance_omission_streaks(path, &omitted, now_unix);
+    let carry_tombstones = (!fully_measured).then_some(coord_set);
+    let (due_runs, held) = advance_omission_streaks(path, &omitted, carry_tombstones, now_unix);
     report.held = held;
     let due: Vec<uuid::Uuid> = due_runs.iter().map(|(t, _)| *t).collect();
     let run_began = |t: &uuid::Uuid| {
@@ -2118,13 +2147,16 @@ fn heal_vanished_paired_user_hooked(
     if legacy_default != Some(default_tenant) {
         // Never overwrite the legacy slot while it may still hold the ONLY
         // copy of a bound tenant's credential: a preserve that could not run
-        // or could not write leaves the copy undone this tick (the per-tenant
-        // slot still serves the default).
+        // or could not write leaves the copy undone — and it is NOT retried:
+        // the file is healed, so later ticks see nothing to heal. The legacy
+        // slot catches up at the next pairing or reconcile re-point (the
+        // per-tenant slot serves the default meanwhile).
         match preserve_legacy_credential(mgr, path, legacy_jwt.as_deref(), legacy_tenant, bound) {
             PreserveOutcome::Failed => tracing::warn!(
                 "paired_user.json heal: the legacy access_token could not be preserved, so it \
-                 is NOT overwritten with default {default_tenant}'s credential this tick (the \
-                 per-tenant slot still serves the default)"
+                 is NOT overwritten with default {default_tenant}'s credential; it stays as \
+                 it is until the next pairing or reconcile re-point (the per-tenant slot \
+                 serves the default meanwhile)"
             ),
             PreserveOutcome::NotNeeded
             | PreserveOutcome::Preserved
@@ -2207,7 +2239,7 @@ fn preserve_legacy_credential(
             tracing::warn!(
                 "paired_user.json heal: could not take the binding-store lock to preserve \
                  tenant {lt}'s legacy credential ({e}) — leaving the legacy slot untouched \
-                 this tick"
+                 until the next pairing or reconcile re-point"
             );
             return PreserveOutcome::Failed;
         }
@@ -2224,7 +2256,8 @@ fn preserve_legacy_credential(
             tracing::warn!(
                 "paired_user.json heal: coord's bound-tenant set is UNKNOWN on re-read ({why}) \
                  — cannot tell whether tenant {lt}'s legacy credential is a bound tenant's \
-                 only copy, so the legacy slot is left untouched this tick"
+                 only copy, so the legacy slot is left untouched until the next pairing or \
+                 reconcile re-point"
             );
             return PreserveOutcome::Failed;
         }
@@ -2249,7 +2282,8 @@ fn preserve_legacy_credential(
         Err(e) => {
             tracing::warn!(
                 "paired_user.json heal: could not preserve tenant {lt}'s legacy credential in its \
-                 per-tenant slot ({e:#}) — leaving the legacy slot untouched this tick"
+                 per-tenant slot ({e:#}) — leaving the legacy slot untouched until the next \
+                 pairing or reconcile re-point"
             );
             PreserveOutcome::Failed
         }
@@ -7738,6 +7772,48 @@ mod vanished_paired_user_heal_tests {
         assert!(r5.held.is_empty(), "{r5:?}");
         let r6 = reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0 + 150).expect("omit again");
         assert_eq!(r6.held, vec![(ta(), 1)], "a fresh run starts at one");
+    }
+
+    /// Fix round 2, MEDIUM 1: only a MEASURED absence lifts a tombstone. A is
+    /// tombstoned (dropped, its legacy token surviving); then one pass cannot
+    /// read the credential store at all, so A is missing from that pass's
+    /// omission set for want of a read, not because it is gone. The tombstone
+    /// is carried forward, the next readable omission does NOT restart A at
+    /// one, and a vanish after it still leaves the heal refusing A.
+    #[test]
+    fn an_unreadable_store_read_never_lifts_a_tombstone() {
+        let (dir, path, mgr) = store("tombstone_unreadable");
+        let jwt_a = live(T_A, USER);
+        persist_pairing_with(&mgr, &path, &pair_resp_for(&jwt_a), ta()).expect("pair A");
+        reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0).expect("omit 1");
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0 + 30).expect("omit 2");
+        assert_eq!(r2.dropped, vec![ta()], "A is tombstoned");
+
+        // One pass with the store unreadable: the legacy read is Unreadable
+        // and the slot listing errs.
+        let store_file = dir.path().join("tokens.enc");
+        let good = std::fs::read(&store_file).expect("store bytes");
+        std::fs::write(&store_file, b"not an encrypted store").unwrap();
+        assert!(mgr.try_list_tenant_device_jwt_tenants().is_err());
+        let blind = reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0 + 60).expect("blind");
+        assert!(blind.held.is_empty(), "{blind:?}");
+        std::fs::write(&store_file, &good).unwrap();
+        assert_eq!(mgr.get_access_token().ok().as_deref(), Some(jwt_a.as_str()));
+
+        // The next READABLE omission: A is still a tombstone, never re-held.
+        let r = reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0 + 90).expect("readable");
+        assert!(r.held.is_empty(), "the tombstone survived the blind pass: {r:?}");
+
+        // The vanish: the heal refuses A.
+        std::fs::remove_file(&path).expect("the deleter");
+        let sidecar = dir.path().join("coord_bound_tenants.json");
+        let now = chrono::Utc::now().timestamp();
+        record_coord_bound_tenants_at(&sidecar, &[tc()], now).expect("echo");
+        let bound = coord_bound_tenants_for_heal_at(&path, &sidecar, now);
+        assert_eq!(bound, known(&[tc()]));
+        let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
+        assert!(matches!(heal, PairedUserHeal::Refused(_)), "{heal:?}");
+        assert!(!path.exists(), "the unbind is not resurrected");
     }
 
     /// Fix round, MEDIUM 2 + 3: the preserve re-reads the bound set under its
