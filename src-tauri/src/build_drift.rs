@@ -221,10 +221,11 @@ fn parse_str_slice_const(source: &str, name: &str) -> Option<Vec<String>> {
 
 /// Parse the four coord-mcp tool-policy consts out of source text (whichever
 /// of `TOOL_POLICY_SOURCE_PATHS` declares them). Pure over its input, so the
-/// self-test in the `mcp_api` module can pin it against that module's own
-/// source (`mcp_api_sources`), the very text it reads: a reformat that breaks
-/// this parser breaks that test, not production (production degrades to
-/// `None`, i.e. `cause: "unknown"`).
+/// self-test in the `mcp_api` module can pin it — through
+/// [`first_parsable_tool_policy`], the same one-file-at-a-time selection
+/// production makes — against the working tree's own source: a reformat that
+/// breaks this parser breaks that test, not production (production degrades
+/// to `None`, i.e. `cause: "unknown"`).
 pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
     Some(ParsedToolPolicy {
         allowed: parse_str_slice_const(source, "COORD_MCP_ALLOWED_TOOLS")?,
@@ -252,7 +253,7 @@ const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
 /// This is split from [`read_trunk_tool_policy`] so a tool-policy PARSE
 /// failure cannot also destroy the drift COUNT: the two were independent
 /// before the caches were unified and must stay independent. A trunk that
-/// reformats `mcp_api.rs` past the hand-rolled parser is a case
+/// reformats the tool-policy source past the hand-rolled parser is a case
 /// [`parse_tool_policy_consts`] plans for; it must degrade `cause` to
 /// `unknown`, not blank `commitsBehind` on every box in the fleet.
 ///
@@ -322,7 +323,9 @@ fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
 /// parse fails, and the refusal's `cause` degrades to `unknown` although the
 /// policy sits one path further on. `read` is the `git show` seam, injected
 /// so the selection is testable against a fixture tree.
-fn first_parsable_tool_policy(read: impl Fn(&str) -> Option<String>) -> Option<ParsedToolPolicy> {
+pub(crate) fn first_parsable_tool_policy(
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<ParsedToolPolicy> {
     TOOL_POLICY_SOURCE_PATHS
         .iter()
         .find_map(|p| read(p).and_then(|text| parse_tool_policy_consts(&text)))
@@ -332,19 +335,50 @@ fn first_parsable_tool_policy(read: impl Fn(&str) -> Option<String>) -> Option<P
 /// [`TOOL_POLICY_SOURCE_PATHS`] declares it. `None` when no path is readable
 /// at that sha with the consts parsing — the caller keeps the sha regardless
 /// (see [`resolve_trunk_tip`]).
+///
+/// Only paths [`present_tool_policy_paths`] lists are `git show`n. Most of the
+/// list is ABSENT on any given trunk (the split's new path before the move,
+/// the pre-split one after it, and the crate-root spellings always), and
+/// `git_output` WARNs on every non-zero exit — so showing each path blind
+/// would log a routine miss at WARN on every tick on every box. A `show` of a
+/// path the listing says exists can still fail, and that one is unexpected
+/// and keeps its WARN.
+///
+/// Not hermetically testable end to end, which is why the git-backed test
+/// below drives this function and not its caller: [`check_once_blocking`]
+/// takes its repo from [`candidate_repo_dir`], fixed at COMPILE time to this
+/// source checkout, and calls this only after [`resolve_trunk_tip`] reports a
+/// real `fetched` origin result — neither of which a test can point at a
+/// fixture tree.
 fn read_trunk_tool_policy(
     repo: &Path,
     trunk_sha: &str,
     source: &'static str,
 ) -> Option<TrunkToolPolicy> {
-    let policy =
-        first_parsable_tool_policy(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
+    let present = present_tool_policy_paths(repo, trunk_sha)?;
+    let policy = first_parsable_tool_policy(|p| {
+        if present.iter().any(|q| q == p) {
+            git_output(repo, &["show", &format!("{trunk_sha}:{p}")])
+        } else {
+            None
+        }
+    })?;
     Some(TrunkToolPolicy {
         trunk_sha: trunk_sha.to_string(),
         read_at: chrono::Utc::now().timestamp_millis(),
         source,
         policy,
     })
+}
+
+/// Which of [`TOOL_POLICY_SOURCE_PATHS`] exist at `trunk_sha`, in ONE git call
+/// whose exit is 0 whether or not any of them does. Paths are spelled from the
+/// repo root (`--full-tree`), as `git show <sha>:<path>` reads them. `None`
+/// when the listing itself fails or names none of them.
+fn present_tool_policy_paths(repo: &Path, trunk_sha: &str) -> Option<Vec<String>> {
+    let mut args = vec!["ls-tree", "--full-tree", "--name-only", trunk_sha, "--"];
+    args.extend_from_slice(TOOL_POLICY_SOURCE_PATHS);
+    git_output(repo, &args).map(|listing| listing.lines().map(str::to_string).collect())
 }
 
 /// Clone of the most recent drift status, if any check has completed.
@@ -543,7 +577,7 @@ fn check_once_blocking() -> BuildDriftStatus {
     // then `trunkSource: local-ref` says the two may trail each other.
     //
     // The tool-policy PARSE is deliberately downstream of the sha: a trunk
-    // that reformats `mcp_api.rs` past the hand-rolled parser degrades `cause`
+    // that reformats the tool-policy source past the hand-rolled parser degrades `cause`
     // to `unknown` and must NOT also blank `commitsBehind`. The two readings
     // were independent before the caches were unified; unifying the STORE
     // must not couple the failures.
@@ -976,22 +1010,15 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         assert!(first_parsable_tool_policy(&read).is_none());
     }
 
-    /// The same post-split shape end to end through `git show`, so the path
-    /// list is proven against a real tree and not only the injected seam.
-    #[test]
-    fn read_trunk_tool_policy_finds_the_split_file_through_git_show() {
+    /// A one-commit git repo holding `files`, and that commit's sha.
+    fn git_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
-        let write = |rel: &str, text: &str| {
+        for (rel, text) in files {
             let path = repo.join(rel);
             std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
             std::fs::write(path, text).expect("write fixture");
-        };
-        write("src-tauri/src/mcp_api.rs", "mod coord_mcp_proxy;\n");
-        write(
-            "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
-            SAMPLE,
-        );
+        }
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args([
@@ -1006,6 +1033,13 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
                 ])
                 .args(args)
                 .current_dir(repo)
+                // Run under a git hook (or any caller that exported them),
+                // these would point the fixture's git at the CALLER's repo
+                // and index instead of the tempdir.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
                 .output()
                 .expect("git runs");
             assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -1015,6 +1049,30 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         git(&["add", "-A"]);
         git(&["commit", "--quiet", "-m", "fixture"]);
         let sha = git(&["rev-parse", "HEAD"]);
+        (dir, sha)
+    }
+
+    /// The same post-split shape end to end through `git show`, so the path
+    /// list is proven against a real tree and not only the injected seam.
+    #[test]
+    fn read_trunk_tool_policy_finds_the_split_file_through_git_show() {
+        let (dir, sha) = git_fixture(&[
+            ("src-tauri/src/mcp_api.rs", "mod coord_mcp_proxy;\n"),
+            (
+                "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+                SAMPLE,
+            ),
+        ]);
+        let repo = dir.path();
+        // Only the two paths that exist are listed, so only they are ever
+        // `git show`n.
+        assert_eq!(
+            present_tool_policy_paths(repo, &sha).expect("the listing succeeds"),
+            vec![
+                "src-tauri/src/mcp_api.rs",
+                "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+            ]
+        );
 
         let read = read_trunk_tool_policy(repo, &sha, "local-ref")
             .expect("the split tool_policy.rs is read through git show");
@@ -1022,6 +1080,54 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         assert_eq!(
             read.policy.allowed,
             vec!["coord_alpha", "coord_beta", "coord_gamma"]
+        );
+    }
+
+    /// The PRE-split trunk every box reads today: the consts are in
+    /// `mcp_api.rs`, and the split's `tool_policy.rs` — FIRST on the path list
+    /// — does not exist yet. Reading it must be silent at WARN. A blind
+    /// `git show` of each listed path runs `git_output` on the two absent
+    /// `tool_policy.rs` spellings first, and each non-zero exit WARNs — two
+    /// lines every tick on every box for an expected miss.
+    #[test]
+    fn a_pre_split_trunk_is_read_without_warning_about_the_absent_split_path() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let (dir, sha) = git_fixture(&[("src-tauri/src/mcp_api.rs", SAMPLE)]);
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        // Scoped, not global: other tests run in parallel, and `run_probe`
+        // WARNs on this (the calling) thread.
+        let read = tracing::subscriber::with_default(subscriber, || {
+            read_trunk_tool_policy(dir.path(), &sha, "fetched")
+        });
+
+        let read = read.expect("the pre-split mcp_api.rs is read");
+        assert_eq!(read.policy.deliberate, vec!["coord_create_pr"]);
+        let logged = String::from_utf8_lossy(&buf.lock().expect("capture lock")).to_string();
+        assert!(
+            !logged.contains("build_drift: git"),
+            "an absent path on the list must not WARN:\n{logged}"
         );
     }
 

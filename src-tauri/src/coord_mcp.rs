@@ -24249,20 +24249,8 @@ mod runner_credential_tests {
     /// needs a Tauri-backed `ApiState`; neither is constructible in a unit
     /// test.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_handler_heals_before_it_refuses_and_keeps_the_retryable_degrade() {
-        let text = crate::mcp_api::mcp_api_sources();
-        let start = text
-            .find("async fn coord_mcp_proxy_handler(")
-            .expect("coord_mcp_proxy_handler exists");
-        let end = text[start..]
-            .find("\n/// ")
-            .map(|i| start + i)
-            .unwrap_or(text.len());
-        let body = &text[start..end];
+        let body = &crate::mcp_api::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
 
         let bearer_arm = body
             .find("await_device_jwt_remint_for(session_tenant)")
@@ -24356,16 +24344,18 @@ mod runner_credential_tests {
     /// it off an AGENT principal's answer would serve a device-scope caller a
     /// list coord composed for a different principal.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_catalogue_is_recorded_only_from_a_device_principal_refusal() {
-        let text = crate::mcp_api::mcp_api_sources();
-        let at = text
+        // Inside the handler, so the window can never reach across into a
+        // neighbouring item or another file of the `mcp_api` module.
+        let body = crate::mcp_api::mcp_api_item_source("async fn coord_mcp_proxy_handler(");
+        let at = body
             .find("record_credential_free_doors(&bytes)")
-            .expect("the recorder is called");
-        let window = &text[at.saturating_sub(400)..at];
+            .expect("the handler calls the recorder");
+        let mut from = at.saturating_sub(400);
+        while !body.is_char_boundary(from) {
+            from -= 1;
+        }
+        let window = body.get(from..at).expect("both ends are char boundaries");
         assert!(
             window.contains("!(200..300).contains(&status)"),
             "gate the recorder on a non-2xx: a 2xx cannot carry a catalogue"

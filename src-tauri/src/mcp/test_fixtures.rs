@@ -3111,21 +3111,37 @@ mod tests {
     }
 
     /// The `routes()` merge in the `mcp_api` module (whichever of its files
-    /// holds it — [`crate::mcp_api::mcp_api_sources`]) must carry the matching
-    /// cfg attribute on the line immediately above it.
+    /// holds it — [`crate::mcp_api::mcp_api_source_files`]) must carry the
+    /// matching cfg attribute on the line immediately above it, IN THE SAME
+    /// FILE: the line above a file's first line is not "above" it, so the
+    /// files are searched one at a time and never as a concatenation.
+    /// Production text only ([`crate::mcp_api::production_files`]), so a test
+    /// quoting the call cannot stand in for it.
     #[test]
     fn mcp_api_routes_merge_is_cfg_gated() {
-        let src = crate::mcp_api::mcp_api_sources();
-        let lines: Vec<&str> = src.lines().map(str::trim).collect();
-        let merge_idx = lines
-            .iter()
-            .position(|l| l.contains("crate::mcp::test_fixtures::routes()"))
-            .expect("the mcp_api module must merge the test-fixtures routes");
+        let files = crate::mcp_api::production_files(&crate::mcp_api::mcp_api_source_files());
+        // (file, whether the line above it in THAT file is the gate)
+        let mut merges: Vec<(&str, bool)> = Vec::new();
+        for (rel, text) in &files {
+            let lines: Vec<&str> = text.lines().map(str::trim).collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("crate::mcp::test_fixtures::routes()") {
+                    let gated = i > 0
+                        && lines[i - 1]
+                            == r#"#[cfg(any(debug_assertions, feature = "test-fixtures"))]"#;
+                    merges.push((rel.as_str(), gated));
+                }
+            }
+        }
         assert!(
-            merge_idx > 0
-                && lines[merge_idx - 1]
-                    == r#"#[cfg(any(debug_assertions, feature = "test-fixtures"))]"#,
-            "the test_fixtures::routes() merge in the mcp_api module must be immediately preceded \
+            merges.len() == 1,
+            "the mcp_api module must merge the test-fixtures routes exactly once; found \
+             {merges:?}"
+        );
+        let (rel, gated) = merges[0];
+        assert!(
+            gated,
+            "the test_fixtures::routes() merge in {rel} must be immediately preceded \
              by the cfg gate — without it the debug routes mount in release builds",
         );
     }
