@@ -3841,8 +3841,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // believes exist. Merge the copies under a path THIS process
                 // would itself compute — the bare `data_local_dir()` default
                 // and a set `$QONTINUI_SECURE_STORAGE_DIR`, nothing found by
-                // scanning — into the canonical one, and leave each absorbed
-                // copy as `.superseded-<date>` rather than deleting it.
+                // scanning — into the canonical one. Absorbed copies are only
+                // read; converge never renames, rewrites or deletes one.
                 // Best-effort and fail-open: with no env override the
                 // candidate set is one path and this is a no-op.
                 let _ = qontinui_runner_lib::pair::converge_binding_store();
