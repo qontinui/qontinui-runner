@@ -23,7 +23,7 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
-unreviewed_ceiling = 239
+unreviewed_ceiling = 238
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -504,13 +504,6 @@ note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
 
 [[disposition]]
 class = "repo_layout"
-file = "src/fleet_commands.rs"
-symbol = "with_provenance"
-disposition = "unreviewed"
-note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
-
-[[disposition]]
-class = "repo_layout"
 file = "src/mcp/plan_library.rs"
 symbol = "const WRITE_CONTRACT"
 disposition = "unreviewed"
@@ -529,3 +522,63 @@ file = "src/reflection/workflow.rs"
 symbol = "build_ui_bridge_completion_steps"
 disposition = "unreviewed"
 note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "resolve_url"
+disposition = "fallback_correct"
+note = "Middle rung of the canonical mirror's clone-URL resolution: read the workspace qontinui-claude-config checkout's remote.origin.url when that checkout exists; absent, the https://github.com/qontinui/qontinui-claude-config.git default answers. Off the spawn path; no checkout is read or written beyond that one bounded git config."
+reviewed = [
+    ".map(|root| root.join(\"qontinui-claude-config\"))",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/provenance.rs"
+symbol = "const CANONICAL_REPO"
+disposition = "fallback_correct"
+note = "The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk."
+reviewed = [
+    "const CANONICAL_REPO: &str = \"qontinui-claude-config\";",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "const DEFAULT_URL"
+disposition = "fallback_correct"
+note = "Last rung of the canonical mirror's clone-URL resolution, after QONTINUI_CANONICAL_CORPUS_URL and the workspace checkout's remote.origin.url: a remote URL in the same https://github.com/qontinui/<repo>.git form ci_node uses, never a local path. Absent network, the mirror fails closed and the spawn falls to the next corpus rung."
+reviewed = [
+    "const DEFAULT_URL: &str = \"https://github.com/qontinui/qontinui-claude-config.git\";",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "const MIRROR_DIR"
+disposition = "fallback_correct"
+note = "The bare mirror's path UNDER the per-instance runner config dir — a directory the runner owns and creates, not an assumption about the workspace layout; the repo name is only the directory's label."
+reviewed = [
+    "const MIRROR_DIR: &str = \"canonical/qontinui-claude-config.git\";",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "refresh_into"
+disposition = "fallback_correct"
+note = "A log message naming which repo@sha the mirror is serving — diagnostic text, never a path resolved on disk."
+reviewed = [
+    "\"canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \\",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/capability_manifest.rs"
+symbol = "Rung::from_command_source"
+disposition = "fallback_correct"
+note = "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
+reviewed = [
+    "qontinui-claude-config origin/main), not an account-layer arm\",",
+]

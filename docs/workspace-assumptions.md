@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 74 | 88 | 74 | 0 | 0 | 0 |
+| `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
 | `dev_ports` | 26 | 26 | 26 | 0 | 0 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -18,7 +18,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 
-## `repo_layout` (74 rows)
+## `repo_layout` (79 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
@@ -38,8 +38,13 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/ambient.rs` | `const AMBIENT_ENV_KEYS` | `"QONTINUI_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `const AMBIENT_ENV_KEYS` | `"QONTINUI_WORKSPACE_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `const KEYS_REMOVED` | `"QONTINUI_WORKSPACE_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/canonical_corpus.rs` | `const DEFAULT_URL` | `const DEFAULT_URL: &str = "https://github.com/qontinui/qontinui-claude-config.git";` | 1 | fallback_correct — Last rung of the canonical mirror's clone-URL resolution, after QONTINUI_CANONICAL_CORPUS_URL and the workspace checkout's remote.origin.url: a remote URL in the same https://github.com/qontinui/<repo>.git form ci_node uses, never a local path. Absent network, the mirror fails closed and the spawn falls to the next corpus rung. | — (no CAPABILITY_SPECS row) |
+| `src/canonical_corpus.rs` | `const MIRROR_DIR` | `const MIRROR_DIR: &str = "canonical/qontinui-claude-config.git";` | 1 | fallback_correct — The bare mirror's path UNDER the per-instance runner config dir — a directory the runner owns and creates, not an assumption about the workspace layout; the repo name is only the directory's label. | — (no CAPABILITY_SPECS row) |
+| `src/canonical_corpus.rs` | `refresh_into` | `"canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \` | 1 | fallback_correct — A log message naming which repo@sha the mirror is serving — diagnostic text, never a path resolved on disk. | — (no CAPABILITY_SPECS row) |
+| `src/canonical_corpus.rs` | `resolve_url` | `.map(\|root\| root.join("qontinui-claude-config"))` | 1 | fallback_correct — Middle rung of the canonical mirror's clone-URL resolution: read the workspace qontinui-claude-config checkout's remote.origin.url when that checkout exists; absent, the https://github.com/qontinui/qontinui-claude-config.git default answers. Off the spawn path; no checkout is read or written beyond that one bounded git config. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `Rung::describe` | `"found under '<workspace-root>/qontinui-runner/src-tauri/…' — this \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `Rung::describe` | `'qontinui-claude-config') — answers only where that repo exists"` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/capability_manifest.rs` | `Rung::from_command_source` | `qontinui-claude-config origin/main), not an account-layer arm",` | 1 | fallback_correct — A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `copy is a no-op that logs \"no qontinui-root resolved; skipping \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -75,7 +80,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/fleet.rs` | `publish_tree_state` | `QONTINUI_ROOT to override). Skipping."` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `spawn_skill_parity_pass_if_due` | `located — set QONTINUI_ROOT or the runner's paths.workspace_root"` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet_commands.rs` | `const FLEET_COMMANDS` | `("ui-bridge", UI_BRIDGE),` | 1 | unreviewed | `fleet_commands` |
-| `src/fleet_commands.rs` | `with_provenance` | `"{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/main.rs` | `run_app` | `injected. Set $QONTINUI_ROOT (or 'paths.workspace_root') to \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/mcp/api_surface.rs` | `handle_scan` | `"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/mcp/plan_library.rs` | `const WRITE_CONTRACT` | `with (a runner scan uses '<repo>/<dir>', e.g. 'qontinui-dev-notes/prompts'). \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
@@ -87,6 +91,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/planning_bridge.rs` | `const HTN_SRC_REPOS` | `const HTN_SRC_REPOS: [&str; 2] = ["qontinui", "multistate"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `execute_htn_attempt` | `$QONTINUI_ROOT to the directory holding the repo checkouts if the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `execute_htn_attempt` | `is already installed for this interpreter. Set $QONTINUI_ROOT to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/provenance.rs` | `const CANONICAL_REPO` | `const CANONICAL_REPO: &str = "qontinui-claude-config";` | 1 | fallback_correct — The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk. | — (no CAPABILITY_SPECS row) |
 | `src/reflection/workflow.rs` | `build_ui_bridge_completion_steps` | `- Write the full plan to 'qontinui-dev-notes/ui-bridge-implementation-plan.md'` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | unreviewed | `slash_commands` |

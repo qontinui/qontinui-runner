@@ -781,7 +781,10 @@ pub async fn session_briefing_handler(
     // and `memory_clause_json` below says that in the payload so the panel
     // cannot imply a verdict this endpoint could not have.
     let memory_clause = crate::coord_mcp::CoordMcpDelivery::Unknown;
-    let text = crate::terminal::runner_context(api_port, memory_clause);
+    // No session either, so no served `.claude/` to measure: the header line
+    // says so rather than rendering a measurement of some other directory.
+    let served = crate::served_corpus::ServedCorpus::unknown("no session");
+    let text = crate::terminal::runner_context(api_port, memory_clause, &served);
 
     // The provenance of the same render. This is a pure cache read, so it
     // cannot disagree with the read inside `runner_context` unless a poll
