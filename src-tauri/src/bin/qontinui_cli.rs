@@ -409,6 +409,11 @@ fn pr_create(args: &[String]) -> ExitCode {
     let text = resp.text().unwrap_or_default();
     match pr_create_outcome(parsed.hold.is_some(), status, &text) {
         Ok(line) => {
+            if parsed.hold.is_some() {
+                if let Some(note) = joined_hold_note(&text) {
+                    eprintln!("qontinui-pr: {note}");
+                }
+            }
             // On success print the PR URL (and nothing else) to stdout.
             println!("{line}");
             ExitCode::SUCCESS
@@ -458,6 +463,27 @@ fn hold_echo_confirmed(v: &serde_json::Value) -> bool {
                 .is_some_and(|x| !x.trim().is_empty())
         })
     })
+}
+
+/// When coord's hold echo says `created: false`, the branch already carried a
+/// live hold and the PR JOINED it rather than placing a new one — the caller's
+/// `--hold` reason is not the one on record. Returns the stderr note naming
+/// the existing hold's `held_by` (still a success: the PR IS held).
+fn joined_hold_note(text: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let hold = v.get("hold")?.as_object()?;
+    if hold.get("created").and_then(|c| c.as_bool()) != Some(false) {
+        return None;
+    }
+    let held_by = hold
+        .get("held_by")
+        .and_then(|h| h.as_str())
+        .unwrap_or("<unknown>");
+    let reason = hold.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+    Some(format!(
+        "note: this PR joined an EXISTING live hold held by {held_by} (reason: {reason:?}) \
+         — no new hold was placed, so your --hold reason is not the one on record"
+    ))
 }
 
 /// Interpret the runner's answer to a create. `Ok` is the stdout line (the PR
@@ -1952,6 +1978,31 @@ mod tests {
                 r#"{"url":"https://github.com/o/r/pull/2"}"#
             ),
             Ok("https://github.com/o/r/pull/2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_joined_hold_is_noted_but_still_succeeds() {
+        let body = r#"{"url":"https://github.com/o/r/pull/5","hold":{"kind":"manual","reason":"older","held_by":"operator:jan","created":false}}"#;
+        // Still a success (the PR is held)…
+        assert_eq!(
+            pr_create_outcome(true, reqwest::StatusCode::CREATED, body),
+            Ok("https://github.com/o/r/pull/5".to_string())
+        );
+        // …with a note naming the existing hold's holder.
+        let note = joined_hold_note(body).expect("created:false must be noted");
+        assert!(note.contains("operator:jan"), "{note}");
+        assert!(note.contains("EXISTING live hold"), "{note}");
+        // A freshly placed hold (or an echo without the field) is not noted.
+        assert_eq!(
+            joined_hold_note(
+                r#"{"hold":{"kind":"create","reason":"r","held_by":"a","created":true}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            joined_hold_note(r#"{"hold":{"kind":"create","reason":"r","held_by":"a"}}"#),
+            None
         );
     }
 

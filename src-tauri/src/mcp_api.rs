@@ -11611,15 +11611,32 @@ async fn vcs_create_pull_request_handler(
     // Same coord-base resolution as every other loopback forwarder
     // (`COORD_HTTP_URL` override → profiles resolver → dev localhost).
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
-    let url = vcs_pr_upstream_url(&coord_base, owner, name);
-    let upstream_body = vcs_pr_upstream_body(&req);
+    forward_validated_vcs_pr(&req, owner, name, &bearer, &coord_base, coord_base_source).await
+}
+
+/// The handler's hand-off from a validated request to the forwarding leg: the
+/// upstream URL, the body, and — the load-bearing part — `require_hold_echo`
+/// set exactly when the request carries `hold`. A separate function (base and
+/// bearer as plain params) so that hand-off is tested against a mock coord; a
+/// hard-coded `false` here would turn every held create against a pre-hold
+/// coord into a silent success.
+async fn forward_validated_vcs_pr(
+    req: &VcsPullRequestBody,
+    owner: &str,
+    name: &str,
+    bearer: &str,
+    coord_base: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+) -> axum::response::Response {
+    let url = vcs_pr_upstream_url(coord_base, owner, name);
+    let upstream_body = vcs_pr_upstream_body(req);
     // The source is threaded through now rather than discarded at the `_`: this
     // was the ONE forwarder whose 502 named neither the URL it dialled nor
     // where that base came from, which is exactly what a misconfigured-upstream
     // 502 has to say to be actionable.
     forward_vcs_pr_post(
         &url,
-        &bearer,
+        bearer,
         &upstream_body,
         coord_base_source,
         req.hold.is_some(),
@@ -21996,9 +22013,9 @@ mod coord_write_proxy_tests {
 #[cfg(test)]
 mod vcs_pr_proxy_tests {
     use super::{
-        forward_vcs_pr_post, parse_owner_repo, vcs_create_pull_request_handler,
-        vcs_pr_hold_echo_confirmed, vcs_pr_upstream_body, vcs_pr_upstream_url, VcsPrHold,
-        VcsPullRequestBody,
+        forward_validated_vcs_pr, forward_vcs_pr_post, parse_owner_repo,
+        vcs_create_pull_request_handler, vcs_pr_hold_echo_confirmed, vcs_pr_upstream_body,
+        vcs_pr_upstream_url, VcsPrHold, VcsPullRequestBody,
     };
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
@@ -22411,6 +22428,56 @@ mod vcs_pr_proxy_tests {
         )
         .await;
         assert_eq!(resp.status(), 201);
+    }
+
+    /// The handler's hand-off pins `require_hold_echo` to the request: against
+    /// a coord that answers 2xx with NO hold echo, a request carrying `hold`
+    /// must come back as the UNHELD 502 (so the flag was `true`), and the same
+    /// request without `hold` must pass through as a success (so it was
+    /// `false`). Also checks the forwarded body carries the hold.
+    #[tokio::test]
+    async fn the_handler_hand_off_requires_the_echo_exactly_when_hold_is_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new().route(
+            "/coord/repos/{owner}/{repo}/pull-requests",
+            post(|body: axum::body::Bytes| async move {
+                let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                (
+                    axum::http::StatusCode::CREATED,
+                    axum::Json(serde_json::json!({
+                        "number": 9,
+                        "url": "https://github.com/o/r/pull/9",
+                        "sent": sent,
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+        let parse = |s: &str| serde_json::from_str::<VcsPullRequestBody>(s).unwrap();
+
+        let held = parse(r#"{"repo":"o/r","head":"h","title":"t","hold":{"reason":"why"}}"#);
+        let resp =
+            forward_validated_vcs_pr(&held, "o", "r", "jwt", &base, TEST_COORD_BASE_SOURCE).await;
+        assert_eq!(resp.status(), 502, "a held request must require the echo");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_HOLD_UNCONFIRMED");
+        let upstream: serde_json::Value =
+            serde_json::from_str(v["upstream_body"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            upstream["sent"]["hold"],
+            serde_json::json!({"reason": "why"})
+        );
+
+        let plain = parse(r#"{"repo":"o/r","head":"h","title":"t"}"#);
+        let resp =
+            forward_validated_vcs_pr(&plain, "o", "r", "jwt", &base, TEST_COORD_BASE_SOURCE).await;
+        assert_eq!(resp.status(), 201, "an unheld request must not require it");
+        let v = body_json(resp).await;
+        assert!(v["sent"].get("hold").is_none());
     }
 
     /// The base-resolution arm the VCS forwarder now reports in its 502s. Any
