@@ -11081,9 +11081,44 @@ struct VcsPullRequestBody {
     title: String,
     #[serde(default)]
     body: Option<String>,
+    /// Open the PR held (plan `2026-10-04-coord-pr-hold-without-github-drafts`
+    /// D3): coord places the hold BEFORE it creates the PR.
     #[serde(default)]
-    draft: Option<bool>,
+    hold: Option<VcsPrHold>,
+    /// Whether the inbound body carried the retired `draft` key at ALL (any
+    /// value, `null` included). Never forwarded: the handler refuses it with a
+    /// 422, mirroring coord's own `draft_retired` refusal, because dropping it
+    /// silently would open an UNHELD PR a caller meant to keep from landing.
+    #[serde(default, rename = "draft", deserialize_with = "json_key_present")]
+    draft_present: bool,
 }
+
+/// The `hold` object forwarded to coord's `coord_create_pr`: a required
+/// free-text `reason` and an optional `kind` (coord validates the vocabulary).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct VcsPrHold {
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+}
+
+/// `deserialize_with` for a presence flag: serde calls it only when the key
+/// is present, so any value (including `null`) yields `true`, and
+/// `#[serde(default)]` yields `false` when the key is absent.
+fn json_key_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(true)
+}
+
+/// The runner-side refusal of a retired `draft` field, before any credential
+/// I/O. Same 422 + `draft_retired` vocabulary coord answers with, so a caller
+/// sees one error whichever side caught it.
+const VCS_PR_DRAFT_RETIRED_ERR: &str = "draft_retired: use hold — coord holds PRs instead of \
+     relying on GitHub drafts (private repos on GitHub Free have none); send \
+     `hold: {reason, kind?}`";
 
 /// Split + validate an `owner/name` repo slug. Each segment must start with an
 /// ASCII alphanumeric and continue in `[A-Za-z0-9._-]`, with `.`/`..` rejected —
@@ -11123,8 +11158,8 @@ fn vcs_pr_upstream_body(req: &VcsPullRequestBody) -> serde_json::Value {
     if let Some(b) = &req.body {
         obj.insert("body".to_string(), serde_json::json!(b));
     }
-    if let Some(draft) = req.draft {
-        obj.insert("draft".to_string(), serde_json::json!(draft));
+    if let Some(hold) = &req.hold {
+        obj.insert("hold".to_string(), serde_json::json!(hold));
     }
     body
 }
@@ -11209,6 +11244,32 @@ async fn vcs_create_pull_request_handler(
                 .into_response();
         }
     };
+    if req.draft_present {
+        return (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "success": false,
+                "error": VCS_PR_DRAFT_RETIRED_ERR,
+                "code": "VCS_PR_PROXY_DRAFT_RETIRED",
+            })),
+        )
+            .into_response();
+    }
+    if req
+        .hold
+        .as_ref()
+        .is_some_and(|h| h.reason.trim().is_empty())
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "hold.reason must be non-empty",
+                "code": "VCS_PR_PROXY_BAD_REQUEST",
+            })),
+        )
+            .into_response();
+    }
     let (owner, name) = match parse_owner_repo(&req.repo) {
         Some(pair) => pair,
         None => {
@@ -21540,7 +21601,7 @@ mod coord_write_proxy_tests {
 mod vcs_pr_proxy_tests {
     use super::{
         forward_vcs_pr_post, parse_owner_repo, vcs_create_pull_request_handler,
-        vcs_pr_upstream_body, vcs_pr_upstream_url, VcsPullRequestBody,
+        vcs_pr_upstream_body, vcs_pr_upstream_url, VcsPrHold, VcsPullRequestBody,
     };
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
@@ -21604,13 +21665,18 @@ mod vcs_pr_proxy_tests {
             base: None,
             title: "feat: x".to_string(),
             body: None,
-            draft: None,
+            hold: None,
+            draft_present: false,
         };
         let v = vcs_pr_upstream_body(&minimal);
         assert_eq!(v, serde_json::json!({"head": "feat/x", "title": "feat: x"}));
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("repo"), "repo travels in the URL path");
-        assert!(!obj.contains_key("base") && !obj.contains_key("draft"));
+        assert!(!obj.contains_key("base") && !obj.contains_key("hold"));
+        assert!(
+            !obj.contains_key("draft"),
+            "draft is retired, never forwarded"
+        );
 
         let full = VcsPullRequestBody {
             repo: "o/r".to_string(),
@@ -21618,7 +21684,11 @@ mod vcs_pr_proxy_tests {
             base: Some("main".to_string()),
             title: "feat: x".to_string(),
             body: Some("body text".to_string()),
-            draft: Some(true),
+            hold: Some(VcsPrHold {
+                reason: "waiting on the migration".to_string(),
+                kind: Some("migration_order".to_string()),
+            }),
+            draft_present: false,
         };
         assert_eq!(
             vcs_pr_upstream_body(&full),
@@ -21627,9 +21697,52 @@ mod vcs_pr_proxy_tests {
                 "base": "main",
                 "title": "feat: x",
                 "body": "body text",
-                "draft": true,
+                "hold": {"reason": "waiting on the migration", "kind": "migration_order"},
             })
         );
+
+        // An absent `kind` is omitted, not nulled — coord picks the default.
+        let reason_only = VcsPullRequestBody {
+            hold: Some(VcsPrHold {
+                reason: "r".to_string(),
+                kind: None,
+            }),
+            ..minimal
+        };
+        assert_eq!(
+            vcs_pr_upstream_body(&reason_only)["hold"],
+            serde_json::json!({"reason": "r"})
+        );
+    }
+
+    /// The `draft` key is detected by PRESENCE (any value, `null` included)
+    /// and `hold` deserializes with its optional `kind`.
+    #[test]
+    fn vcs_pr_body_detects_draft_key_presence_and_parses_hold() {
+        let parse = |s: &str| serde_json::from_str::<VcsPullRequestBody>(s).unwrap();
+        let base = r#""repo":"o/r","head":"h","title":"t""#;
+        assert!(!parse(&format!("{{{base}}}")).draft_present);
+        for v in ["true", "false", "null"] {
+            assert!(
+                parse(&format!("{{{base},\"draft\":{v}}}")).draft_present,
+                "draft:{v} must be detected"
+            );
+        }
+        let held = parse(&format!(
+            "{{{base},\"hold\":{{\"reason\":\"why\",\"kind\":\"manual\"}}}}"
+        ));
+        assert_eq!(
+            held.hold,
+            Some(VcsPrHold {
+                reason: "why".to_string(),
+                kind: Some("manual".to_string()),
+            })
+        );
+        // A hold without a reason is a malformed body.
+        assert!(serde_json::from_str::<VcsPullRequestBody>(&format!(
+            "{{{base},\"hold\":{{\"kind\":\"manual\"}}}}"
+        ))
+        .is_err());
     }
 
     /// Absent `X-Coord-Mcp-Proxy-Key` → 401 with the route's own code, before
@@ -21703,6 +21816,49 @@ mod vcs_pr_proxy_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "agent nonce must reach body validation");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_BAD_REQUEST");
+
+        // The retired `draft` field is REFUSED with a 422 before any credential
+        // lookup — never stripped and forwarded as an unheld PR.
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"repo":"o/r","head":"h","title":"t","draft":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "draft must be refused, not dropped");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_DRAFT_RETIRED");
+        assert!(
+            v["error"].as_str().unwrap().starts_with("draft_retired"),
+            "{v}"
+        );
+
+        // A hold with a blank reason is a runner-side 400.
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"repo":"o/r","head":"h","title":"t","hold":{"reason":"  "}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
         let v = body_json(resp).await;
         assert_eq!(v["code"], "VCS_PR_PROXY_BAD_REQUEST");
 
