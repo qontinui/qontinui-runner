@@ -129,8 +129,8 @@ pub fn already_drained() -> bool {
 /// SHARED CONTRACT id used as the `refs/wip/<id>` leaf and the coord claim
 /// owner discriminator. Phase 3 reuses this exact helper verbatim.
 ///
-/// Mirrors the deterministic-v5 pattern gate-continuation uses
-/// (`agent_runtime::continuation_session_id`).
+/// (Gate continuations used to synthesize a v5 id the same way; they now pin
+/// a real Claude session id instead, see `agent_runtime::run_gate_continuation_inner`.)
 pub fn stable_ai_session_id(task_run_id: &str) -> Uuid {
     let name = format!("ai-session:{task_run_id}");
     Uuid::new_v5(&AI_SESSION_NS, name.as_bytes())
