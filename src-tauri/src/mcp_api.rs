@@ -266,6 +266,18 @@ fn strip_visibility(line: &str) -> &str {
 /// - the body ends inside its own file, so it can never run on into the next
 ///   file's text; and the item must be declared exactly once, so a duplicate
 ///   cannot shadow the real one by sorting first.
+///
+/// Two shapes the line-based scan cannot bound, stated so nobody relies on
+/// them:
+/// - a declaration whose signature line already closes its body (a one-line
+///   `fn x() {}`) has no column-0 `}` of its own, so the body would run on
+///   into the next item — it is REFUSED with a panic naming the line rather
+///   than returned wrong;
+/// - a raw string (or any literal) inside a `#[cfg(test)]` span that holds a
+///   line consisting of exactly `}` ends that span's skip early, so the test
+///   text after it would read as production code. Nothing in the module does
+///   that today; a test fixture that needs a column-0 `}` must build it with
+///   an escape (`"\n}\n"`) instead of a literal line.
 #[cfg(test)]
 pub(crate) fn mcp_api_item_source(signature: &str) -> String {
     item_source_in(&mcp_api_source_files(), signature)
@@ -282,6 +294,13 @@ fn item_source_in(files: &[(String, String)], signature: &str) -> String {
             if !strip_visibility(line).starts_with(signature) {
                 continue;
             }
+            assert!(
+                !line.trim_end().ends_with('}'),
+                "`{signature}` in {rel}:{} is declared on one line (`{line}`); its \
+                 body has no column-0 `}}` of its own, so this scan would run on \
+                 into the next item — spread the item over several lines",
+                i + 1
+            );
             let close = lines
                 .iter()
                 .skip(i + 1)
@@ -464,6 +483,21 @@ mod mcp_api_sources_tests {
         super::item_source_in(
             &[("mcp_api.rs".to_string(), "fn other() {\n}\n".to_string())],
             "fn missing(",
+        );
+    }
+
+    /// A one-line item is refused by name: its `{}` closes on the signature
+    /// line, so the next column-0 `}` belongs to some LATER item and the
+    /// returned "body" would carry that item's text.
+    #[test]
+    #[should_panic(expected = "`fn tiny(` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_declaration() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "fn tiny() {}\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "fn tiny(",
         );
     }
 
@@ -19767,20 +19801,9 @@ mod coord_provision_session_gate_tests {
     #[test]
     fn the_health_handler_emits_the_active_tenant_fields() {
         let src = &crate::mcp_api::mcp_api_sources();
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19809,21 +19832,9 @@ mod coord_provision_session_gate_tests {
     /// `Condition` task (same source-scan technique as the tests around it).
     #[test]
     fn the_health_handler_emits_the_scheduler_conditions_capability() {
-        let src = &crate::mcp_api::mcp_api_sources();
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -19856,21 +19867,9 @@ mod coord_provision_session_gate_tests {
     /// pin the active-tenant fields use.
     #[test]
     fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
-        let src = &crate::mcp_api::mcp_api_sources();
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -22452,20 +22451,9 @@ mod supervised_workers_health_tests {
     #[test]
     fn the_health_handler_emits_the_supervised_workers_block() {
         let src = crate::mcp_api::mcp_api_sources();
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -22550,20 +22538,9 @@ mod ui_bridge_binding_health_tests {
     #[test]
     fn the_health_handler_emits_the_ui_bridge_binding_block() {
         let src = crate::mcp_api::mcp_api_sources();
-        let lines: Vec<&str> = src.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("async fn health("))
-            .expect("the /health handler is `async fn health(`");
-        let end = lines[start..]
-            .iter()
-            .position(|l| *l == "}")
-            .map(|i| start + i)
-            .expect("the handler closes at column 0");
-        let region = lines[start..=end]
-            .iter()
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
