@@ -13719,46 +13719,57 @@ mod tests {
         assert!(!registry.is_valid(graced_only), "revoked graced nonce");
     }
 
-    /// The production lines of `src` with every `#[cfg(test)]` item removed
-    /// (brace-depth tracked) and whole-line comments dropped.
+    /// The production lines of `src`: every `#[cfg(test)]` item removed and
+    /// whole-line comments dropped.
+    ///
+    /// An item is bounded by INDENTATION, not by counting braces: it ends at
+    /// the first line at the attribute's own indentation that starts with `}`
+    /// (the item's closing brace, as rustfmt lays it out), or that ends with
+    /// `;` before any line at that indentation opened a block (a one-line
+    /// `static`/`use`/`const`). Brace counting is wrong here because braces
+    /// inside string literals — every `"{\"ts\":…` JSON fixture — unbalance
+    /// it: the skip opened at `#[cfg(test)] mod tests` never closed, and every
+    /// production item after it (`pub(crate) mod doctor`) silently vanished
+    /// from the scan. The same convention, generalized from column 0, as
+    /// `mcp_api`'s `production_constructs_exactly_one_relay_binding`.
+    ///
+    /// Panics if a skip is still open at end of input, so a filter that loses
+    /// its place can never pass as one that found nothing.
     fn production_source(src: &str) -> String {
         let mut out = String::new();
-        let mut depth: i64 = 0;
-        let mut pending = false;
-        let mut skip_to: Option<i64> = None;
-        for raw in src.lines() {
+        // `Some((indent, opened))` while inside a `#[cfg(test)]` item.
+        let mut skip: Option<(usize, bool)> = None;
+        let mut skip_started = 0usize;
+        for (i, raw) in src.lines().enumerate() {
             let t = raw.trim_start();
-            let comment = t.starts_with("//");
-            if !comment && t.starts_with("#[cfg(test)]") && skip_to.is_none() {
-                pending = true;
-            }
-            if skip_to.is_none() && !pending && !comment {
-                out.push_str(raw);
-                out.push('\n');
-            }
-            if comment {
-                continue;
-            }
-            let opens = raw.matches('{').count() as i64;
-            let closes = raw.matches(char::from(0x7d)).count() as i64;
-            if pending && skip_to.is_none() {
-                if opens > 0 {
-                    skip_to = Some(depth);
-                    pending = false;
-                } else if t.ends_with(';') {
-                    // A `#[cfg(test)]` on a one-line item (`use …;`).
-                    pending = false;
-                    depth += opens - closes;
-                    continue;
+            let indent = raw.len() - t.len();
+            match skip {
+                None => {
+                    if t.starts_with("#[cfg(test)]") {
+                        skip = Some((indent, false));
+                        skip_started = i + 1;
+                    } else if !t.starts_with("//") {
+                        out.push_str(raw);
+                        out.push('\n');
+                    }
                 }
-            }
-            depth += opens - closes;
-            if let Some(d) = skip_to {
-                if depth <= d {
-                    skip_to = None;
+                Some((at, opened)) => {
+                    if indent != at || t.is_empty() || t.starts_with("//") || t.starts_with("#[") {
+                        continue;
+                    }
+                    if t.starts_with(char::from(0x7d)) || (!opened && t.ends_with(';')) {
+                        skip = None;
+                    } else if t.ends_with('{') {
+                        skip = Some((at, true));
+                    }
                 }
             }
         }
+        assert!(
+            skip.is_none(),
+            "the #[cfg(test)] item opened at line {skip_started} never closed — the \
+             production filter lost its place, so its output is not the production code"
+        );
         out
     }
 
@@ -13774,6 +13785,13 @@ mod tests {
             .find(&close)
             .unwrap_or_else(|| panic!("`{signature}` has a body"));
         rest.get(..len).expect("`find` returns a char boundary")
+    }
+
+    /// How many times `<field>.lock()` (or `.<name>.lock()` through any
+    /// binding) appears in whitespace-squashed source.
+    fn prod_squashed_lock_sites(squashed: &str, field: &str) -> usize {
+        let name = field.trim_start_matches("self");
+        squashed.matches(&format!("{name}.lock()")).count()
     }
 
     /// Phase 1 source guard: the nonce maps have ONE owner behind ONE lock.
@@ -13799,6 +13817,21 @@ mod tests {
         let prod = production_source(full);
         let squash = |s: &str| s.split_whitespace().collect::<String>();
 
+        // The filter itself: production items AFTER the test modules survive
+        // it, and the test modules do not. A filter that never leaves a test
+        // module (the brace-counting one did, at `mod tests`) drops `doctor`.
+        assert!(
+            prod.contains("pub(crate) mod doctor {"),
+            "the production `doctor` module, placed between test modules, is scanned"
+        );
+        for test_only in [
+            "mod tests {",
+            "mod spawn_tenant_credential_tests {",
+            "#[test]",
+        ] {
+            assert!(!prod.contains(test_only), "`{test_only}` is filtered out");
+        }
+
         // (a) one lock per transition.
         for signature in [
             "    fn revoke(&self, nonce: &str) -> NonceRevocation {",
@@ -13821,16 +13854,50 @@ mod tests {
                 && state_revoke.contains("self.graced.remove(nonce)"),
             "NonceState::revoke clears the live AND the grace map:\n{state_revoke}"
         );
-        let registry_impl = item_body(&prod, "impl NonceRegistry {", "");
-        assert_eq!(
-            squash(registry_impl).matches(".lock()").count(),
-            1,
-            "NonceRegistry locks its mutex in exactly one accessor"
-        );
-        assert!(
-            squash(registry_impl).contains("unwrap_or_else(std::sync::PoisonError::into_inner)"),
-            "and that accessor recovers a poisoned lock"
-        );
+        // EVERY production impl block of each registry, together, locks its
+        // mutex exactly once — a second impl block cannot add a lock site.
+        for (ty, field) in [
+            ("NonceRegistry", "self.state"),
+            ("AgentTokenRegistry", "self.tokens"),
+        ] {
+            let impls: Vec<&str> = prod
+                .match_indices("\nimpl ")
+                .map(|(i, _)| {
+                    prod.get(i + 1..)
+                        .expect("`match_indices` is a char boundary")
+                })
+                .filter(|rest| {
+                    let header = rest.lines().next().unwrap_or_default();
+                    header
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|word| word == ty)
+                })
+                .map(|rest| {
+                    let header = rest.lines().next().unwrap_or_default();
+                    item_body(rest, header, "")
+                })
+                .collect();
+            assert!(!impls.is_empty(), "`{ty}` has a production impl block");
+            let all = squash(&impls.concat());
+            assert_eq!(
+                all.matches(".lock()").count(),
+                1,
+                "{ty} locks its mutex in exactly one accessor across all {} impl block(s)",
+                impls.len()
+            );
+            assert!(
+                all.contains(&format!(
+                    "{field}.lock().unwrap_or_else(std::sync::PoisonError::into_inner)"
+                )),
+                "and that accessor is `{field}` recovering a poisoned lock"
+            );
+            // Nor can a free function reach past the impls to lock it.
+            assert_eq!(
+                prod_squashed_lock_sites(&squash(&prod), field),
+                1,
+                "`{field}.lock()` appears once in all of production"
+            );
+        }
 
         // (b) one owner of the maps.
         let prod_squashed = squash(&prod);
@@ -13878,6 +13945,11 @@ mod tests {
 
         // The teardown seam outside this file holds the registries, not maps.
         let runtime = production_source(include_str!("agent_runtime.rs"));
+        assert!(
+            runtime.contains("fn teardown_in("),
+            "agent_runtime production is scanned"
+        );
+        assert!(!runtime.contains("#[test]"), "and its test modules are not");
         assert!(
             !squash(&runtime).contains("HashMap<String,crate::coord_mcp::NonceBinding>"),
             "agent_runtime holds &NonceRegistry, never a raw nonce map"
