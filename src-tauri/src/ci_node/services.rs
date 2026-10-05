@@ -1882,7 +1882,7 @@ mod tests {
     /// tests above pin to carry `-v`.
     #[test]
     fn no_removal_argv_is_spelled_by_hand() {
-        let src = include_str!("services.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("services.rs"));
         let hand_spelled = concat!("&[", "\"rm\"");
         assert!(
             !src.contains(hand_spelled),
