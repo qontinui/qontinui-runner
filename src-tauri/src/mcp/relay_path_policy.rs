@@ -1070,7 +1070,10 @@ pub(crate) mod tests {
             .iter()
             .position(|s| s.starts_with(|c: char| c.is_ascii_uppercase()))
             .unwrap_or(segments.len().saturating_sub(1));
-        let name = segments.get(keep_from..).map(|s| s.join("::")).unwrap_or_default();
+        let name = segments
+            .get(keep_from..)
+            .map(|s| s.join("::"))
+            .unwrap_or_default();
         if name.is_empty() {
             "<expr>".to_string()
         } else {
@@ -1162,9 +1165,17 @@ pub(crate) mod tests {
              A pure move between files never changes the census; if a move did, the move \
              dropped or altered a registration.",
             removed.len(),
-            removed.iter().map(|l| format!("  - {l}")).collect::<Vec<_>>().join("\n"),
+            removed
+                .iter()
+                .map(|l| format!("  - {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             added.len(),
-            added.iter().map(|l| format!("  + {l}")).collect::<Vec<_>>().join("\n"),
+            added
+                .iter()
+                .map(|l| format!("  + {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
     }
 
