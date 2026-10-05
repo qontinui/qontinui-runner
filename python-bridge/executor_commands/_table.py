@@ -58,6 +58,15 @@ def build_command_table(cls: type, mixins: Iterable[type]) -> dict[str, CommandE
                 raise ValueError(
                     f"command {name!r} names {source.__name__}.{method_name}, which does not exist"
                 )
+            # ``_takes_params`` drops the first parameter as ``self``, which is only right for
+            # a plain function. A staticmethod (no ``self``) or classmethod (``cls`` already
+            # bound) would be misread as taking no params and then called with none.
+            raw = inspect.getattr_static(cls, method_name)
+            if not inspect.isfunction(raw):
+                raise ValueError(
+                    f"command {name!r} names {source.__name__}.{method_name}, which is a "
+                    f"{type(raw).__name__}, not a plain method"
+                )
             table[name] = CommandEntry(method_name, _takes_params(method))
             owner[name] = source.__name__
     return table
