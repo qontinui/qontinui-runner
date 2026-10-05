@@ -444,7 +444,14 @@ async fn in_process_dismiss_recent_crash(
 ///
 /// # Args (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
 ///
-/// `{"tenantId": "<uuid>"}` names the tenant whose token the caller wants --
+/// The request is `POST /ui-bridge/invoke/get_coord_device_token
+/// {"args":{"tenantId":"<uuid>"}}`: `tenantId` is a key of the body's `args`
+/// field, NOT of the body. [`InvokeRequestBody`] reads `args` alone, so a
+/// top-level `tenantId` is silently dropped and the call arrives tenant-less
+/// (plan `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+/// D5). Everything below describes the `args` VALUE this fn receives.
+///
+/// `args.tenantId` names the tenant whose token the caller wants --
 /// the same key the Tauri command's `tenant_id` parameter takes over IPC.
 /// `tenant_id` is accepted as an alias (shell callers spell it that way); both
 /// present and disagreeing is a 400, as is a non-string value or any other key.
@@ -498,13 +505,20 @@ fn coord_device_token_error_status(err: &str) -> StatusCode {
     }
 }
 
-/// Parse `get_coord_device_token`'s args: `tenantId` (canonical) or its
-/// `tenant_id` alias, nothing else.
+/// Parse `get_coord_device_token`'s `args` VALUE (the body's `args` field,
+/// never the body itself): `tenantId` (canonical) or its `tenant_id` alias,
+/// nothing else.
 fn coord_device_token_tenant_arg(args: &Value) -> Result<Option<String>, String> {
     let obj = match args {
         Value::Null => return Ok(None),
         Value::Object(o) => o,
-        _ => return Err("args must be an object `{\"tenantId\": \"<uuid>\"}` or `{}`".to_string()),
+        _ => {
+            return Err(
+                "args must be an object `{\"tenantId\": \"<uuid>\"}` or `{}` -- the body is \
+                 `{\"args\":{\"tenantId\":\"<uuid>\"}}`"
+                    .to_string(),
+            )
+        }
     };
     if let Some(other) = obj.keys().find(|k| *k != "tenantId" && *k != "tenant_id") {
         return Err(format!(
@@ -1079,6 +1093,45 @@ mod in_process_dispatch_tests {
                 "save_cloud_sync_settings",
                 "save_session_metadata_sync_settings",
             ]
+        );
+    }
+
+    /// D5 of plan `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`:
+    /// the discovery surface (`GET /ui-bridge/commands` serves `description`
+    /// and `args_schema` bare) names the BODY envelope, so `{"tenantId":…}` can
+    /// no longer be read as the request body. The envelope is a literal here.
+    #[test]
+    fn the_device_token_entry_names_the_body_envelope() {
+        let entry = UI_BRIDGE_COMMANDS
+            .iter()
+            .find(|c| c.name == "get_coord_device_token")
+            .expect("get_coord_device_token is allowlisted");
+        assert!(
+            entry.description.contains(
+                r#"POST /ui-bridge/invoke/get_coord_device_token {"args":{"tenantId":"<uuid>"}}"#
+            ),
+            "{}",
+            entry.description
+        );
+        assert!(
+            !entry.description.contains(r#"Args: {"tenantId""#),
+            "the args-only wording reads as the request body: {}",
+            entry.description
+        );
+        let schema: Value =
+            serde_json::from_str(entry.args_schema).expect("args_schema is strict JSON");
+        assert!(
+            schema["description"]
+                .as_str()
+                .is_some_and(|d| d.contains(r#"{"args":{"tenantId":"<uuid>"}}"#)),
+            "args_schema must say it describes the `args` value: {}",
+            entry.args_schema
+        );
+        // The schema still describes the args VALUE: `tenantId` is its property.
+        assert!(
+            schema["properties"]["tenantId"].is_object(),
+            "{}",
+            entry.args_schema
         );
     }
 

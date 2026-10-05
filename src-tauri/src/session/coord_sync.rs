@@ -447,7 +447,12 @@ impl CoordSync {
         rec: &OutboxRecord,
         timeout: Duration,
     ) -> Result<(), CoordRegistrationFailure> {
-        let failure = match tokio::time::timeout(timeout, push_record(&self.inner, rec)).await {
+        let failure = match tokio::time::timeout(
+            timeout,
+            crate::auth::observe_degraded_send(push_record(&self.inner, rec)),
+        )
+        .await
+        {
             Ok(PushOutcome::Acked) => {
                 if let Err(e) = self.inner.outbox.ack(&[(rec.session_id, rec.seq)]) {
                     // Coord HAS the row, so the confirmation stands; the drain
@@ -1089,7 +1094,7 @@ async fn push_chain(
             out.aborted = true;
             break;
         }
-        match push_record(&inner, &rec).await {
+        match crate::auth::observe_degraded_send(push_record(&inner, &rec)).await {
             PushOutcome::Acked => {
                 out.acked_by_coord = true;
                 out.succeeded.push((rec.session_id, rec.seq));
@@ -1859,6 +1864,11 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 
     match result {
         Ok(resp) => {
+            // Attributes coord's answer to the call site, when this send went
+            // out UNAUTHENTICATED (`/health` `degradedUnauthenticatedWrites`
+            // `lastStatus`); a no-op for an authenticated send. Before the
+            // per-kind branches so every arm is covered.
+            crate::auth::note_degraded_send_status(resp.status().as_u16());
             if kind == "helper_task_created" {
                 return helper_task_outcome(rec, resp).await;
             }

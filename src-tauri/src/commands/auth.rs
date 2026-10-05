@@ -1659,6 +1659,20 @@ pub(crate) const DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV: &str =
 /// Stable prefix of the refusal a tenant-less call gets on a multi-slot runner.
 pub(crate) const DEVICE_TOKEN_TENANT_REQUIRED: &str = "get_coord_device_token:tenant_required";
 
+/// The exact HTTP request a caller sends to name a tenant, quoted VERBATIM in the
+/// [`DEVICE_TOKEN_TENANT_REQUIRED`] refusal.
+///
+/// The UI Bridge invoke route reads ONE body field, `args`
+/// (`mcp::ui_bridge_invoke_handlers::InvokeRequestBody`), so a `tenantId` sent at
+/// the top level of the body is silently dropped and the call is tenant-less
+/// again. The refusal used to say "UI Bridge invoke args: {"tenantId": …}", which
+/// reads as the request BODY, and at least one fleet script (`coord-revive.sh`
+/// L4) was written to exactly that misreading (plan
+/// `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+/// D5). Naming the whole envelope leaves nothing to infer.
+pub(crate) const DEVICE_TOKEN_INVOKE_ENVELOPE: &str =
+    r#"POST /ui-bridge/invoke/get_coord_device_token {"args":{"tenantId":"<uuid>"}}"#;
+
 /// Stable prefix of the refusal a malformed `tenant_id` gets.
 pub(crate) const DEVICE_TOKEN_TENANT_INVALID: &str = "get_coord_device_token:tenant_invalid";
 
@@ -1780,9 +1794,11 @@ pub(crate) fn coord_device_token_for(
             return Err(format!(
                 "{DEVICE_TOKEN_TENANT_REQUIRED}: this runner holds coord credentials for {} \
                  tenants, so a token requested without a tenant could belong to the wrong one \
-                 — pass `tenant_id` (UI Bridge invoke args: {{\"tenantId\": \"<uuid>\"}}) naming \
-                 the tenant the caller acts for. Operator override: set \
-                 {DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV}=1 on the runner to answer the default slot",
+                 — name the tenant the caller acts for. Over HTTP the request is \
+                 `{DEVICE_TOKEN_INVOKE_ENVELOPE}`: the tenant goes INSIDE `args`, and a \
+                 top-level `tenantId` is not read. Over Tauri IPC it is the `tenant_id` \
+                 argument. Operator override: set {DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV}=1 on \
+                 the runner to answer the default slot",
                 held_set.len()
             ));
         }
@@ -2244,6 +2260,34 @@ mod device_token_door_tests {
         assert!(
             !refusal.contains(&jwt_for(a)),
             "a refusal never carries a token"
+        );
+    }
+
+    /// D5 of plan `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`:
+    /// the refusal quotes the WHOLE HTTP envelope, so a caller cannot read the
+    /// args object as the request body. Pinned as a LITERAL typed out here, not
+    /// through [`DEVICE_TOKEN_INVOKE_ENVELOPE`]: a test reading the constant
+    /// would follow it into any wrong shape. The constant is pinned to the
+    /// literal separately so the two cannot drift either.
+    #[test]
+    fn the_tenant_required_refusal_names_the_invoke_envelope_verbatim() {
+        const ENVELOPE: &str =
+            r#"POST /ui-bridge/invoke/get_coord_device_token {"args":{"tenantId":"<uuid>"}}"#;
+        assert_eq!(DEVICE_TOKEN_INVOKE_ENVELOPE, ENVELOPE);
+
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        let refusal = coord_device_token_for(&am, None, &held(&am, Some(a)), false)
+            .expect_err("two slots and no tenant must refuse");
+        assert!(
+            refusal.contains(ENVELOPE),
+            "the refusal must quote the invoke envelope verbatim: {refusal}"
+        );
+        // The pre-D5 wording named the args object alone, which reads as the
+        // body — exactly the misreading coord-revive.sh L4 shipped.
+        assert!(
+            !refusal.contains("invoke args: {\"tenantId\""),
+            "the args-only wording reads as the request body: {refusal}"
         );
     }
 
