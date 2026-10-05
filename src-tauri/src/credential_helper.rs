@@ -547,17 +547,17 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
                 config = %config_path.display(),
                 "credential_helper: installed for {working_dir}"
             );
-            // Best-effort global hygiene: keep Git Credential Manager (from
-            // the system gitconfig) from popping an interactive password
-            // prompt for the coord host. Never aborts setup.
-            if let Err(e) = ensure_global_credential_hygiene(&coord_base, None) {
-                warn!("credential_helper: global credential hygiene failed (non-fatal): {e}");
-            }
             // Phase 4 — record the install in the in-process registry (so
             // session close can unset the repo-local config again) and
             // start the push-token refresh loop, deduped per session: a
             // second setup call for the SAME session registers the extra
             // working dir but must not spawn a second loop.
+            //
+            // Registered BEFORE the global hygiene below, which can take up to
+            // three git calls. A sibling install of this session that fails in
+            // that window consults the registry in `discard_failed_install`;
+            // seeing this install there is what stops it from stripping a
+            // shared config's helper and deleting the token file under us.
             let spawn_refresh = {
                 let mut reg = registry().lock().expect("credential registry poisoned");
                 let entry = reg.entry(session_id.to_string()).or_default();
@@ -575,6 +575,12 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
                     session_id.to_string(),
                     config_path.clone(),
                 ));
+            }
+            // Best-effort global hygiene: keep Git Credential Manager (from
+            // the system gitconfig) from popping an interactive password
+            // prompt for the coord host. Never aborts setup.
+            if let Err(e) = ensure_global_credential_hygiene(&coord_base, None) {
+                warn!("credential_helper: global credential hygiene failed (non-fatal): {e}");
             }
         }
         Err(e) => {
@@ -601,6 +607,8 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
 /// - If this call did not create the file, or any other install of the
 ///   session already succeeded (it is in the registry), or another git config
 ///   has been recorded since, the file is still needed: leave everything.
+/// - If our git config path never resolved, there is no way to name where a
+///   helper value may have landed: keep the file rather than erase evidence.
 /// - Otherwise remove our own helper value first, and delete the file only if
 ///   that worked. On failure the file and its `git_configs` record stay, and
 ///   the boot sweep retries once the file is old enough.
@@ -632,16 +640,24 @@ fn discard_failed_install(
     {
         return;
     }
-    if let Some(local_config) = local_config {
-        if unset_orphaned_install(local_config, config_path) == OrphanUnset::Failed {
-            warn!(
-                "credential_helper: could not undo the partial helper install in {}; \
-                 keeping {} so the boot sweep can retry",
-                local_config.display(),
-                config_path.display()
-            );
-            return;
-        }
+    let Some(local_config) = local_config else {
+        // The config path never resolved (`rev-parse` timed out or failed), so
+        // a helper value may have landed with no way to name where. Deleting
+        // the token file would only erase the evidence; leave it.
+        warn!(
+            "credential_helper: failed install with an unresolved git config; keeping {}",
+            config_path.display()
+        );
+        return;
+    };
+    if unset_orphaned_install(local_config, config_path) == OrphanUnset::Failed {
+        warn!(
+            "credential_helper: could not undo the partial helper install in {}; \
+             keeping {} so the boot sweep can retry",
+            local_config.display(),
+            config_path.display()
+        );
+        return;
     }
     let _ = std::fs::remove_file(config_path);
 }
@@ -1021,7 +1037,10 @@ fn unset_orphaned_install(local_config: &Path, token_file: &Path) -> OrphanUnset
             return OrphanUnset::Failed;
         }
     };
-    if !helpers.iter().any(|v| helper_names_token_file(v, file_name)) {
+    if !helpers
+        .iter()
+        .any(|v| helper_names_token_file(v, file_name))
+    {
         return OrphanUnset::NothingToDo;
     }
 
@@ -1050,9 +1069,10 @@ fn unset_orphaned_install(local_config: &Path, token_file: &Path) -> OrphanUnset
         }
     }
 
-    let qontinui_helper_remains = git_config_get_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[0])
-        .map(|values| values.iter().any(|v| v.contains("qontinui-git-credential")))
-        .unwrap_or(true);
+    let qontinui_helper_remains =
+        git_config_get_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[0])
+            .map(|values| values.iter().any(|v| v.contains("qontinui-git-credential")))
+            .unwrap_or(true);
     if !qontinui_helper_remains {
         if let Err(e) = git_config_unset_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[1]) {
             debug!("credential_helper: sweep unset useHttpPath in {shown}: {e}");
@@ -1071,7 +1091,13 @@ fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
         return None;
     }
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", &dir.to_string_lossy(), "rev-parse", "--git-path", "config"]);
+    cmd.args([
+        "-C",
+        &dir.to_string_lossy(),
+        "rev-parse",
+        "--git-path",
+        "config",
+    ]);
     let out = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
@@ -1081,7 +1107,11 @@ fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(&rel);
-    let path = if path.is_absolute() { path } else { dir.join(path) };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    };
     // Recorded for a sweep that may run in another process much later, so
     // store an absolute path. Not `fs::canonicalize`: on Windows that yields
     // a `\\?\` verbatim path, which git does not reliably accept for `--file`.
@@ -1685,11 +1715,21 @@ mod tests {
     /// Install the helper keys in `dir` pointing at `token`, and record the
     /// install in `token` exactly as `setup_credential_helper` does.
     fn install_and_record(dir: &Path, token: &Path) {
-        set_git_credential_helper(dir, Path::new("C:\\bin\\qontinui-git-credential.exe"), token)
-            .unwrap();
+        set_git_credential_helper(
+            dir,
+            Path::new("C:\\bin\\qontinui-git-credential.exe"),
+            token,
+        )
+        .unwrap();
         let local_config = git_local_config_file(dir).expect("resolve local config");
-        write_session_config(token, "https://coord.example", "t", &[], Some(&local_config))
-            .unwrap();
+        write_session_config(
+            token,
+            "https://coord.example",
+            "t",
+            &[],
+            Some(&local_config),
+        )
+        .unwrap();
     }
 
     /// The crash case: the session's teardown never ran, so the repo still
@@ -1865,8 +1905,7 @@ mod tests {
         git_init(repo.path());
         let token = temp.path().join("qontinui-git-cred-failed-install.json");
         let local_config = git_local_config_file(repo.path()).unwrap();
-        let created =
-            write_session_config(&token, "c", "t", &[], Some(&local_config)).unwrap();
+        let created = write_session_config(&token, "c", "t", &[], Some(&local_config)).unwrap();
         // The half-done install: only the helper key landed.
         let helper = format!(
             "C:/bin/qontinui-git-credential.exe --config {}",
@@ -1874,7 +1913,12 @@ mod tests {
         );
         git_config_add_at(Some(&local_config), INSTALLED_LOCAL_KEYS[0], &helper).unwrap();
 
-        discard_failed_install("no-such-session-failed-install", &token, Some(&local_config), created);
+        discard_failed_install(
+            "no-such-session-failed-install",
+            &token,
+            Some(&local_config),
+            created,
+        );
 
         assert!(!token.exists());
         assert_eq!(git_config_get(repo.path(), INSTALLED_LOCAL_KEYS[0]), None);
@@ -1894,7 +1938,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let created = write_session_config(&token, "c", "t", &[], None).unwrap();
+        // A real, resolved config: only the registry check can keep the file.
+        let repo = tempfile::tempdir().unwrap();
+        git_init(repo.path());
+        let local_config = git_local_config_file(repo.path()).unwrap();
+        let created = write_session_config(&token, "c", "t", &[], Some(&local_config)).unwrap();
         registry()
             .lock()
             .unwrap()
@@ -1903,10 +1951,48 @@ mod tests {
             .dirs
             .push(PathBuf::from("C:/the/sibling/that/succeeded"));
 
-        discard_failed_install(&session_id, &token, None, created);
+        discard_failed_install(&session_id, &token, Some(&local_config), created);
 
-        assert!(token.exists(), "the live sibling still needs the token file");
+        assert!(
+            token.exists(),
+            "the live sibling still needs the token file"
+        );
         registry().lock().unwrap().remove(&session_id);
+    }
+
+    /// Another install of the session has recorded a DIFFERENT git config
+    /// since this call created the file: the file is still that install's
+    /// record, so a failed install must leave it.
+    #[test]
+    fn discard_failed_install_keeps_the_file_another_config_was_recorded_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = temp.path().join("qontinui-git-cred-shared-record.json");
+        let ours = temp.path().join("ours-config");
+        let theirs = temp.path().join("theirs-config");
+        let created = write_session_config(&token, "c", "t", &[], Some(&ours)).unwrap();
+        write_session_config(&token, "c", "t", &[], Some(&theirs)).unwrap();
+
+        discard_failed_install(
+            "no-such-session-shared-record",
+            &token,
+            Some(&ours),
+            created,
+        );
+
+        assert!(token.exists(), "another install's record must survive");
+    }
+
+    /// With no resolved git config there is no way to name where a helper
+    /// value may have landed, so the token file is kept as the evidence.
+    #[test]
+    fn discard_failed_install_keeps_the_file_when_the_config_never_resolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = temp.path().join("qontinui-git-cred-unresolved.json");
+        let created = write_session_config(&token, "c", "t", &[], None).unwrap();
+
+        discard_failed_install("no-such-session-unresolved", &token, None, created);
+
+        assert!(token.exists());
     }
 
     /// The token file is the only record of where the keys are. When removing
@@ -1943,10 +2029,22 @@ mod tests {
     #[test]
     fn helper_names_token_file_is_anchored_to_a_path_separator() {
         let name = "qontinui-git-cred-a.json";
-        assert!(helper_names_token_file("x --config C:/t/qontinui-git-cred-a.json", name));
-        assert!(helper_names_token_file(r"x --config C:\t\qontinui-git-cred-a.json ", name));
-        assert!(!helper_names_token_file("x --config C:/t/xqontinui-git-cred-a.json", name));
-        assert!(!helper_names_token_file("x --config C:/t/qontinui-git-cred-a.json.bak", name));
+        assert!(helper_names_token_file(
+            "x --config C:/t/qontinui-git-cred-a.json",
+            name
+        ));
+        assert!(helper_names_token_file(
+            r"x --config C:\t\qontinui-git-cred-a.json ",
+            name
+        ));
+        assert!(!helper_names_token_file(
+            "x --config C:/t/xqontinui-git-cred-a.json",
+            name
+        ));
+        assert!(!helper_names_token_file(
+            "x --config C:/t/qontinui-git-cred-a.json.bak",
+            name
+        ));
     }
 
     #[test]
