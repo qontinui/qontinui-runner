@@ -27,7 +27,7 @@
 //! coord-minted `SubType::Agent` JWT. The DEVICE proxy attaches the live DEVICE
 //! JWT, so an agent session must NEVER route through the device proxy. Instead,
 //! agent sessions get their OWN per-agent proxy ([`ProxyPrincipal::Agent`]) that
-//! injects THEIR OWN refreshed agent JWT — held in [`AGENT_TOKENS`], a
+//! injects THEIR OWN refreshed agent JWT — held in [`AgentTokenRegistry`], a
 //! process-global `SharedToken` slot refreshed proactively from the agent's
 //! heartbeat loop so the 4h TTL never expires for a live agent. The proxy gate
 //! structurally binds nonce→principal→`sub_type`: a device nonce can only ever
@@ -83,7 +83,7 @@ pub(crate) enum ProxyPrincipal {
     /// from `AuthManager` per request.
     Device,
     /// A specific spawned agent — the bearer is THAT agent's own refreshed JWT,
-    /// looked up from [`AGENT_TOKENS`] by `agent_id` per request.
+    /// looked up from [`AgentTokenRegistry`] by `agent_id` per request.
     Agent { agent_id: Uuid },
 }
 
@@ -423,10 +423,7 @@ fn caller_named_tenant(
 /// lost to a restart just because it landed after the mint's own write.
 fn persist_on_settle() -> crate::coord_mcp_tenant::SettleHook {
     crate::coord_mcp_tenant::SettleHook::new(|| {
-        let live = proxy_nonces()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let live = NonceRegistry::global().live_snapshot();
         persist_proxy_nonces(&live);
     })
 }
@@ -1005,7 +1002,7 @@ pub(crate) fn missing_proxy_key_error() -> String {
     format!("{NO_PROXY_KEY_CAUSE}. {NO_PROXY_KEY_RECOVERY_HINT}")
 }
 
-/// The `AGENT_TOKENS`-slot-gone variant: the nonce IS registered, but the agent
+/// The `AgentTokenRegistry`-slot-gone variant: the nonce IS registered, but the agent
 /// it is bound to no longer has a live token slot.
 pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =
     "no live agent token for this proxy session: the agent this nonce is bound \
@@ -1737,18 +1734,1082 @@ pub(crate) fn coord_mcp_url_with_source() -> (String, qontinui_runner_lib::profi
     (format!("{base}/mcp"), source)
 }
 
-/// In-memory nonce registry for the loopback `/coord-mcp` proxy:
-/// nonce → [`NonceBinding`] (the workdir it was provisioned into + the
-/// [`ProxyPrincipal`] whose bearer it may inject). DEVICE bindings are mirrored
-/// to the encrypted local store (Phase 3b) when `COORD_MCP_PERSIST_NONCES` is
-/// not `0`, so the device set survives a runner rebuild/restart and an
-/// already-written `.mcp.json` keeps validating (the MCP client never re-reads
-/// the file). AGENT bindings are NEVER persisted (OQ3): a restarted runner has
-/// no live agent session, so a restored agent nonce MUST hard-fail closed — the
-/// handler 401s on the absent [`AGENT_TOKENS`] slot (process-global, never
-/// persisted). With persistence disabled this degrades to the prior
-/// process-lifetime-only behavior for device nonces too.
-static PROXY_NONCES: OnceLock<Mutex<HashMap<String, NonceBinding>>> = OnceLock::new();
+// ============================================================================
+// Nonce registry (plan 2026-10-04-runner-coord-mcp-rs-holds-twenty-
+// responsibilities-behind-shared-nonce-statics, Phase 1) — ONE owner for the
+// live, graced and tombstone maps, behind ONE lock
+// ============================================================================
+
+/// In-memory nonce registry for the loopback `/coord-mcp` proxy: the three maps
+/// every nonce passes through, owned by one type behind one mutex.
+///
+/// - **live** — nonce → [`NonceBinding`] (the workdir it was provisioned into +
+///   the [`ProxyPrincipal`] whose bearer it may inject). DEVICE bindings are
+///   mirrored to the encrypted local store (Phase 3b) when
+///   `COORD_MCP_PERSIST_NONCES` is not `0`, so the device set survives a runner
+///   rebuild/restart and an already-written `.mcp.json` keeps validating (the
+///   MCP client never re-reads the file). AGENT bindings are NEVER persisted
+///   (OQ3): a restarted runner has no live agent session, so a restored agent
+///   nonce MUST hard-fail closed — the handler 401s on the absent
+///   [`AgentTokenRegistry`] slot (process-global, never persisted). With
+///   persistence disabled this degrades to the prior process-lifetime-only
+///   behavior for device nonces too.
+/// - **graced** — an evicted DEVICE nonce → its expiry and the binding it was
+///   ([`GracedNonce`]). Separate from the live map so that one stays the single
+///   source of truth for a currently-provisioned nonce.
+/// - **tombstones** — what a no-longer-live key USED to be ([`NonceTombstone`]),
+///   read on the reject path.
+///
+/// **Why one lock.** These used to be three statics with three mutexes and a
+/// lock ORDER (live → graced → tombstones) that only a comment enforced: four
+/// sites held the live lock while taking the other two, `revoke_proxy_nonce`
+/// released live before taking graced, and `proxy_nonce_is_valid` read the two
+/// maps under two separate locks. Every transition is now a [`NonceState`]
+/// method that runs under the ONE lock, so "evict, then grace, then tombstone"
+/// and "revoke from live and from graced" are each one critical section, and
+/// there is no order left to get wrong. The maps are small (tombstones are
+/// capped at [`MAX_NONCE_TOMBSTONES`]; the persisted sets at
+/// [`MAX_PERSISTED_DEVICE_NONCES`]) and every critical section is a map
+/// operation — file I/O (persist, rotation log) and the session-identity
+/// marker check always run after the guard is dropped.
+///
+/// **Poison policy.** The single lock accessor, [`NonceRegistry::state`],
+/// recovers a poisoned mutex for EVERY method. Three separate locks used to
+/// confine a panic to one map; merging them must not widen how far a poison
+/// spreads, and teardown reaches this registry during a panic unwind, where a
+/// second panic aborts the runner.
+///
+/// Production uses the process-global [`NonceRegistry::global`]; a test can
+/// build its own with [`NonceRegistry::new`].
+pub(crate) struct NonceRegistry {
+    state: Mutex<NonceState>,
+}
+
+/// The three maps a [`NonceRegistry`] owns. Reachable only through the
+/// registry's lock guard; every transition is a method here, so it can only
+/// run while that lock is held. Nothing outside this module sees a field.
+#[derive(Default, Clone)]
+pub(crate) struct NonceState {
+    live: HashMap<String, NonceBinding>,
+    graced: HashMap<String, GracedNonce>,
+    tombstones: HashMap<String, NonceTombstone>,
+}
+
+static NONCE_REGISTRY: OnceLock<NonceRegistry> = OnceLock::new();
+
+/// What a live-map lookup found, read under the lock and judged outside it: an
+/// ephemeral hit still needs the session-identity marker (a filesystem stat),
+/// which must never run with the registry held.
+enum LiveHit {
+    /// Not registered, or an ephemeral whose TTL ran out (lazily evicted).
+    Absent,
+    /// A persistent binding — valid while registered.
+    Persistent(NonceBinding),
+    /// An unexpired ephemeral binding — valid only while the machine is opted in.
+    Ephemeral(NonceBinding),
+}
+
+impl LiveHit {
+    /// Apply the [`NonceLifetime`] rules that need I/O. Call with no lock held.
+    fn resolve(self) -> Option<NonceBinding> {
+        match self {
+            LiveHit::Absent => None,
+            LiveHit::Persistent(b) => Some(b),
+            LiveHit::Ephemeral(b) => session_identity_marker_present().then_some(b),
+        }
+    }
+
+    fn is_persistent(&self) -> bool {
+        matches!(self, LiveHit::Persistent(_))
+    }
+}
+
+/// What [`NonceState::revoke`] removed, for the forensics the caller emits
+/// after the lock is released.
+struct NonceRevocation {
+    /// The live binding, when there was one.
+    binding: Option<NonceBinding>,
+    /// The grace entry, when there was one.
+    graced: Option<GracedNonce>,
+    /// The surviving live map, when a live binding was removed (what persists).
+    snapshot: Option<HashMap<String, NonceBinding>>,
+}
+
+/// What [`NonceState::evict_workdir`] removed, split by how each class dies.
+struct WorkdirEviction {
+    snapshot: HashMap<String, NonceBinding>,
+    device: Vec<(String, NonceBinding)>,
+    ephemeral: Vec<(String, NonceBinding)>,
+    agent: Vec<(String, NonceBinding)>,
+}
+
+/// What [`NonceState::insert_minted`] evicted, plus the post-mint live map.
+struct MintOutcome {
+    snapshot: HashMap<String, NonceBinding>,
+    evicted_device: Vec<(String, NonceBinding)>,
+    evicted_agent: Vec<(String, NonceBinding)>,
+}
+
+/// What [`NonceState::restore_live`] did with a boot restore's bindings.
+struct LiveRestore {
+    /// Entries that were vacant and went in.
+    inserted: usize,
+    /// The inserted bindings whose expectation is unsettled, with their
+    /// workdir — resolved in the background once the lock is released.
+    to_resolve: Vec<(crate::coord_mcp_tenant::SessionExpectation, String)>,
+    /// The live map's size afterwards.
+    live_len: usize,
+}
+
+/// The registry facts a reject line is built from, read in one critical
+/// section ([`NonceState::attribution_source`]).
+enum AttributionSource {
+    Live {
+        workdir: String,
+        principal: &'static str,
+        terminal_id: Option<String>,
+    },
+    Tombstone(NonceTombstone),
+    Graced {
+        workdir: String,
+        terminal_id: Option<String>,
+        grace_until: std::time::SystemTime,
+    },
+    Unknown,
+}
+
+impl NonceRegistry {
+    /// A fresh, empty registry — the per-test handle, and what
+    /// [`Self::global`] initializes once.
+    pub(crate) fn new() -> Self {
+        NonceRegistry {
+            state: Mutex::new(NonceState::default()),
+        }
+    }
+
+    /// The process-global registry every production path uses.
+    pub(crate) fn global() -> &'static Self {
+        NONCE_REGISTRY.get_or_init(NonceRegistry::new)
+    }
+
+    /// THE lock accessor — the only place this registry's mutex is locked.
+    /// Recovers a poisoned lock (see the type's poison policy): every map
+    /// operation leaves the maps consistent between statements, so a poisoned
+    /// guard still holds usable state.
+    fn state(&self) -> std::sync::MutexGuard<'_, NonceState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A clone of the live map — for the census and the persist write, which
+    /// must run with no lock held.
+    fn live_snapshot(&self) -> HashMap<String, NonceBinding> {
+        self.state().live.clone()
+    }
+
+    /// How many live bindings are registered.
+    fn live_len(&self) -> usize {
+        self.state().live.len()
+    }
+
+    /// `nonce`'s binding IF it is currently valid (see [`live_binding`]).
+    /// One lock; the marker check for an ephemeral runs after it is released.
+    fn live_binding(&self, nonce: &str) -> Option<NonceBinding> {
+        if nonce.is_empty() {
+            return None;
+        }
+        let hit = self.state().live_lookup(nonce, std::time::Instant::now());
+        hit.resolve()
+    }
+
+    /// True iff `nonce` is a valid live binding OR a DEVICE nonce still inside
+    /// its grace window. Both maps are read under ONE lock, so a concurrent
+    /// [`Self::revoke`] (which clears both in one critical section) is seen
+    /// either entirely or not at all. The graced map is consulted only when the
+    /// live answer is not already final, exactly as before.
+    pub(crate) fn is_valid(&self, nonce: &str) -> bool {
+        if nonce.is_empty() {
+            return false;
+        }
+        let (hit, graced) = {
+            let mut state = self.state();
+            let now = std::time::Instant::now();
+            let hit = state.live_lookup(nonce, now);
+            let graced = !hit.is_persistent() && state.graced_is_valid(nonce, now);
+            (hit, graced)
+        };
+        hit.resolve().is_some() || graced
+    }
+
+    /// The principal `nonce` is bound to: the live binding's, else `Device` for
+    /// a nonce still inside its grace window (only DEVICE nonces are graced).
+    fn principal_for(&self, nonce: &str) -> Option<ProxyPrincipal> {
+        if nonce.is_empty() {
+            return None;
+        }
+        let (hit, graced) = {
+            let mut state = self.state();
+            let now = std::time::Instant::now();
+            let hit = state.live_lookup(nonce, now);
+            let graced = !hit.is_persistent() && state.graced_is_valid(nonce, now);
+            (hit, graced)
+        };
+        hit.resolve()
+            .map(|b| b.principal)
+            .or_else(|| graced.then_some(ProxyPrincipal::Device))
+    }
+
+    /// The typed pin `nonce` was provisioned under (see
+    /// [`proxy_session_pin_for_nonce`]).
+    fn session_pin_for(&self, nonce: &str) -> crate::session::tenant_pin::TenantPin {
+        use crate::session::tenant_pin::TenantPin;
+        let (hit, graced_tenant) = {
+            let mut state = self.state();
+            let now = std::time::Instant::now();
+            let hit = if nonce.is_empty() {
+                LiveHit::Absent
+            } else {
+                state.live_lookup(nonce, now)
+            };
+            (hit, state.graced_pin(nonce, now).map(|(t, _)| t))
+        };
+        if let Some(binding) = hit.resolve() {
+            return binding.session_pin;
+        }
+        graced_tenant
+            .map(TenantPin::Pinned)
+            .unwrap_or(TenantPin::Unpinned)
+    }
+
+    /// The pin and origin a still-open grace entry carries, when it is pinned.
+    fn graced_pin(&self, nonce: &str) -> Option<(Uuid, PinOrigin)> {
+        self.state().graced_pin(nonce, std::time::Instant::now())
+    }
+
+    /// The census over both maps, read under one lock (pure, no I/O).
+    fn device_session_pin_census(&self) -> DeviceSessionPinCensus {
+        let now = std::time::Instant::now();
+        let state = self.state();
+        device_session_pin_census_over(state.live.iter(), state.graced.iter(), now)
+    }
+
+    /// The first live nonce whose binding satisfies `pred`.
+    fn find_live_nonce(&self, pred: impl Fn(&NonceBinding) -> bool) -> Option<String> {
+        self.state()
+            .live
+            .iter()
+            .find(|(_, b)| pred(b))
+            .map(|(n, _)| n.clone())
+    }
+
+    /// The most recently minted live nonce whose binding satisfies `pred` (ties
+    /// broken by the nonce string, so the pick is total).
+    fn newest_live_nonce(&self, pred: impl Fn(&NonceBinding) -> bool) -> Option<String> {
+        self.state()
+            .live
+            .iter()
+            .filter(|(_, b)| pred(b))
+            .max_by(|(na, a), (nb, b)| a.minted_at.cmp(&b.minted_at).then_with(|| na.cmp(nb)))
+            .map(|(n, _)| n.clone())
+    }
+
+    /// The workdir of every live binding satisfying `pred`, in map order
+    /// (duplicates included — the caller dedupes by its own key).
+    fn live_workdirs(&self, pred: impl Fn(&NonceBinding) -> bool) -> Vec<String> {
+        self.state()
+            .live
+            .values()
+            .filter(|b| pred(b))
+            .map(|b| b.workdir.clone())
+            .collect()
+    }
+
+    /// [`NonceState::insert_minted`] under the lock.
+    fn insert_minted(
+        &self,
+        nonce: &str,
+        binding: NonceBinding,
+        workdir: &str,
+        terminal_id: Option<&str>,
+        now: std::time::Instant,
+    ) -> MintOutcome {
+        self.state()
+            .insert_minted(nonce, binding, workdir, terminal_id, now)
+    }
+
+    /// [`NonceState::evict_workdir`] under the lock. `None` when nothing is
+    /// bound to `workdir`.
+    fn evict_workdir(
+        &self,
+        workdir: &str,
+        cause_device: &str,
+        cause_ephemeral: &str,
+        cause_agent: &str,
+    ) -> Option<WorkdirEviction> {
+        self.state()
+            .evict_workdir(workdir, cause_device, cause_ephemeral, cause_agent)
+    }
+
+    /// Revoke ONE nonce: removed from the live map AND the grace map, and
+    /// tombstoned, in ONE critical section — so no reader can observe the
+    /// nonce graced-but-not-live halfway through a revoke.
+    fn revoke(&self, nonce: &str) -> NonceRevocation {
+        self.state().revoke(nonce)
+    }
+
+    /// [`revoke_agent_proxy_nonces`] over THIS registry — the seam
+    /// `agent_runtime::AgentRunTeardown` drops through, so its poison test can
+    /// drive the full revoke (census and forensics included) against a
+    /// poisoned registry of its own. Poison-tolerant, like every method here.
+    pub(crate) fn revoke_agent_proxy_nonces(&self, agent_id: Uuid) {
+        // Collect (nonce, binding) and record their tombstones under the lock;
+        // emit the forensics lines after releasing it (`log_rotation_event`
+        // does file I/O).
+        let cause = format!("agent teardown (agent {agent_id} — never graced, never persisted)");
+        let (revoked, remaining) = self.take_agent_proxy_nonces(agent_id, &cause);
+        note_agent_binding_census(&remaining);
+        for (nonce, b) in &revoked {
+            log_rotation_event("revoke", &b.workdir, nonce, &cause);
+        }
+        if !revoked.is_empty() {
+            info!(
+                "coord_mcp: revoked {} agent proxy nonce(s) for agent {agent_id}",
+                revoked.len()
+            );
+        }
+    }
+
+    /// The under-lock half of [`Self::revoke_agent_proxy_nonces`]: removes
+    /// every binding owned by `agent_id`, records their tombstones in the same
+    /// critical section, and returns the removed `(nonce, binding)` pairs plus
+    /// a snapshot of the survivors.
+    #[allow(clippy::type_complexity)]
+    fn take_agent_proxy_nonces(
+        &self,
+        agent_id: Uuid,
+        cause: &str,
+    ) -> (Vec<(String, NonceBinding)>, HashMap<String, NonceBinding>) {
+        self.state().take_agent(agent_id, cause)
+    }
+
+    /// [`NonceState::release_workdir`] under the lock.
+    #[allow(clippy::type_complexity)]
+    fn release_workdir(
+        &self,
+        workdir: &str,
+        cause: &str,
+    ) -> (
+        Vec<(String, NonceBinding)>,
+        Option<HashMap<String, NonceBinding>>,
+    ) {
+        self.state().release_workdir(workdir, cause)
+    }
+
+    /// [`NonceState::adopt`] under the lock.
+    fn adopt(&self, workdir: &str, nonce: &str, binding: NonceBinding) -> Vec<String> {
+        self.state().adopt(workdir, nonce, binding)
+    }
+
+    /// [`NonceState::restore_live`] under the lock.
+    fn restore_live(&self, entries: Vec<(String, NonceBinding)>) -> LiveRestore {
+        self.state().restore_live(entries)
+    }
+
+    /// [`NonceState::graced_snapshot`] under the lock.
+    fn graced_snapshot(&self) -> HashMap<String, crate::secure_storage::StoredGracedNonce> {
+        self.state().graced_snapshot()
+    }
+
+    /// [`NonceState::restore_graced`] under the lock.
+    fn restore_graced(
+        &self,
+        persisted: HashMap<String, crate::secure_storage::StoredGracedNonce>,
+    ) -> Vec<(String, String)> {
+        self.state().restore_graced(persisted)
+    }
+
+    /// Record one tombstone (see [`NonceState::tombstone`]).
+    #[cfg(test)]
+    fn record_tombstone(&self, nonce: &str, tombstone: NonceTombstone) {
+        self.state().tombstone(nonce, tombstone);
+    }
+
+    /// Resolve everything a rejected nonce can still be attributed to — see
+    /// [`reject_attribution_for_nonce`], which is this over the global registry.
+    pub(crate) fn reject_attribution(&self, nonce: &str) -> RejectAttribution {
+        if nonce.is_empty() {
+            return RejectAttribution::unknown(RejectAttribution::NO_KEY_PRESENTED);
+        }
+        let source = self.state().attribution_source(nonce);
+        match source {
+            AttributionSource::Live {
+                workdir,
+                principal,
+                terminal_id,
+            } => RejectAttribution {
+                // Phase 3c, read side. All three construction sites normalize,
+                // so this is belt-and-braces — but it is what actually makes
+                // this struct's doc ("never left empty") TRUE for every future
+                // construction site as well as today's three, and it is the one
+                // place every `reject` row provably passes through.
+                workdir: normalize_binding_workdir(&workdir),
+                principal: principal.to_string(),
+                terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
+                attribution: RejectAttribution::BOUND,
+                evicted_at: None,
+                grace_until: None,
+                evict_cause: None,
+            },
+            AttributionSource::Tombstone(t) => {
+                let now = std::time::SystemTime::now();
+                let attribution = match (t.kind, t.grace_until) {
+                    (TombstoneKind::Revoked, _) => RejectAttribution::REVOKED,
+                    (TombstoneKind::Superseded, Some(until)) if until <= now => {
+                        RejectAttribution::GRACED_EXPIRED
+                    }
+                    (TombstoneKind::Superseded, _) => RejectAttribution::SUPERSEDED,
+                };
+                RejectAttribution {
+                    workdir: normalize_binding_workdir(&t.workdir),
+                    principal: t.principal.to_string(),
+                    terminal_id: t.terminal_id.unwrap_or_else(|| "none".to_string()),
+                    attribution,
+                    evicted_at: (t.evicted_at != std::time::SystemTime::UNIX_EPOCH)
+                        .then_some(t.evicted_at),
+                    grace_until: t.grace_until,
+                    evict_cause: Some(t.cause),
+                }
+            }
+            // Grace map fallback: only DEVICE nonces are ever graced, so a hit
+            // here pins the principal class and, since Phase 1a, the binding it
+            // was.
+            AttributionSource::Graced {
+                workdir,
+                terminal_id,
+                grace_until,
+            } => RejectAttribution {
+                workdir: normalize_binding_workdir(&workdir),
+                principal: "device".to_string(),
+                terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
+                attribution: RejectAttribution::SUPERSEDED,
+                evicted_at: None,
+                grace_until: Some(grace_until),
+                evict_cause: None,
+            },
+            AttributionSource::Unknown => {
+                RejectAttribution::unknown(RejectAttribution::NEVER_REGISTERED)
+            }
+        }
+    }
+}
+
+/// Test-only access. Tests in this module reach the maps through these (or a
+/// fresh [`NonceRegistry::new`]); production code never does.
+#[cfg(test)]
+impl NonceRegistry {
+    /// A point-in-time copy of all three maps, taken under one lock.
+    pub(crate) fn test_snapshot(&self) -> NonceState {
+        self.state().clone()
+    }
+
+    /// The live map behind the registry's lock, for fixtures that seed or
+    /// clean it. Holding the guard holds the WHOLE registry, so a test must
+    /// drop it before calling anything that takes the lock again.
+    pub(crate) fn test_live(&self) -> test_guards::MapGuard<'_, HashMap<String, NonceBinding>> {
+        test_guards::MapGuard::new(self.state(), |s| &s.live, |s| &mut s.live)
+    }
+
+    /// The grace map behind the registry's lock (same caveat as [`Self::test_live`]).
+    pub(crate) fn test_graced(&self) -> test_guards::MapGuard<'_, HashMap<String, GracedNonce>> {
+        test_guards::MapGuard::new(self.state(), |s| &s.graced, |s| &mut s.graced)
+    }
+
+    /// The tombstone map behind the registry's lock (same caveat as
+    /// [`Self::test_live`]).
+    pub(crate) fn test_tombstones(
+        &self,
+    ) -> test_guards::MapGuard<'_, HashMap<String, NonceTombstone>> {
+        test_guards::MapGuard::new(self.state(), |s| &s.tombstones, |s| &mut s.tombstones)
+    }
+
+    /// True iff `nonce` is inside its grace window (lazily evicting it once
+    /// expired), ignoring the live map.
+    pub(crate) fn test_graced_is_valid(&self, nonce: &str) -> bool {
+        self.state()
+            .graced_is_valid(nonce, std::time::Instant::now())
+    }
+
+    /// The registry's mutex, for the poison tests.
+    pub(crate) fn test_mutex(&self) -> &Mutex<NonceState> {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+impl NonceState {
+    pub(crate) fn live_contains(&self, nonce: &str) -> bool {
+        self.live.contains_key(nonce)
+    }
+
+    pub(crate) fn graced_contains(&self, nonce: &str) -> bool {
+        self.graced.contains_key(nonce)
+    }
+
+    pub(crate) fn tombstone_contains(&self, nonce: &str) -> bool {
+        self.tombstones.contains_key(nonce)
+    }
+}
+
+/// A lock guard over the registry that derefs to ONE of its maps — what lets
+/// the existing map-shaped test fixtures keep their shape.
+#[cfg(test)]
+pub(crate) mod test_guards {
+    use super::NonceState;
+    use std::sync::MutexGuard;
+
+    pub(crate) struct MapGuard<'a, T> {
+        guard: MutexGuard<'a, NonceState>,
+        get: fn(&NonceState) -> &T,
+        get_mut: fn(&mut NonceState) -> &mut T,
+    }
+
+    impl<'a, T> MapGuard<'a, T> {
+        pub(super) fn new(
+            guard: MutexGuard<'a, NonceState>,
+            get: fn(&NonceState) -> &T,
+            get_mut: fn(&mut NonceState) -> &mut T,
+        ) -> Self {
+            MapGuard {
+                guard,
+                get,
+                get_mut,
+            }
+        }
+    }
+
+    impl<T> std::ops::Deref for MapGuard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            (self.get)(&self.guard)
+        }
+    }
+
+    impl<T> std::ops::DerefMut for MapGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            (self.get_mut)(&mut self.guard)
+        }
+    }
+}
+
+impl NonceState {
+    /// Look `nonce` up in the live map, lazily evicting an EXPIRED ephemeral so
+    /// the map stays bounded and the deadline fails closed exactly on time.
+    fn live_lookup(&mut self, nonce: &str, now: std::time::Instant) -> LiveHit {
+        let Some(binding) = self.live.get(nonce).cloned() else {
+            return LiveHit::Absent;
+        };
+        match binding.lifetime {
+            NonceLifetime::Persistent => LiveHit::Persistent(binding),
+            NonceLifetime::Ephemeral { expires_at } => {
+                if expires_at <= now {
+                    self.live.remove(nonce);
+                    LiveHit::Absent
+                } else {
+                    LiveHit::Ephemeral(binding)
+                }
+            }
+        }
+    }
+
+    /// Move DEVICE bindings just evicted into the grace map with a
+    /// [`DEVICE_EVICTED_NONCE_GRACE_TTL`] expiry, opportunistically pruning
+    /// expired entries so the map stays bounded. Only device bindings are
+    /// passed here (the caller filters); agent nonces are dropped outright to
+    /// fail closed.
+    fn grace_evicted(&mut self, evicted: &[(String, NonceBinding)]) {
+        if evicted.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let expires_at = now + DEVICE_EVICTED_NONCE_GRACE_TTL;
+        let grace_until = std::time::SystemTime::now() + DEVICE_EVICTED_NONCE_GRACE_TTL;
+        self.graced.retain(|_, g| g.expires_at > now);
+        for (n, b) in evicted {
+            self.graced.insert(
+                n.clone(),
+                GracedNonce {
+                    expires_at,
+                    grace_until,
+                    workdir: b.workdir.clone(),
+                    terminal_id: b.terminal_id.clone(),
+                    session_tenant: b.session_pin.pinned(),
+                    pin_origin: b.pin_origin,
+                },
+            );
+        }
+    }
+
+    /// True iff `nonce` is a DEVICE nonce still inside its grace TTL (Change 3).
+    /// Lazily evicts it once expired so grace fails closed exactly at the
+    /// deadline.
+    fn graced_is_valid(&mut self, nonce: &str, now: std::time::Instant) -> bool {
+        match self.graced.get(nonce) {
+            Some(g) if g.expires_at > now => true,
+            Some(_) => {
+                self.graced.remove(nonce);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// The tenant (and its origin) a still-open grace entry was pinned to.
+    fn graced_pin(&self, nonce: &str, now: std::time::Instant) -> Option<(Uuid, PinOrigin)> {
+        self.graced
+            .get(nonce)
+            .filter(|g| g.expires_at > now)
+            .and_then(|g| g.session_tenant.map(|t| (t, g.pin_origin)))
+    }
+
+    /// Project the grace map down to the shape the encrypted store persists
+    /// (Phase 1a): every entry whose window is still open, keyed by nonce.
+    /// Expired entries are dropped here as well as lazily on lookup, so the
+    /// store never carries a dead window. Bounded by
+    /// [`MAX_PERSISTED_DEVICE_NONCES`] like the binding snapshot — a grace
+    /// entry outlives its binding by at most one window, so the two sets are
+    /// the same order of size.
+    fn graced_snapshot(&self) -> HashMap<String, crate::secure_storage::StoredGracedNonce> {
+        let now = std::time::Instant::now();
+        let mut live: Vec<(&String, &GracedNonce)> = self
+            .graced
+            .iter()
+            .filter(|(_, g)| g.expires_at > now)
+            .collect();
+        if live.len() > MAX_PERSISTED_DEVICE_NONCES {
+            // Latest deadline first: the entries with the most window left are
+            // the ones a restart is most likely to need.
+            live.sort_by(|(na, a), (nb, b)| {
+                b.grace_until.cmp(&a.grace_until).then_with(|| na.cmp(nb))
+            });
+            live.truncate(MAX_PERSISTED_DEVICE_NONCES);
+        }
+        live.into_iter()
+            .map(|(n, g)| {
+                (
+                    n.clone(),
+                    crate::secure_storage::StoredGracedNonce {
+                        workdir: g.workdir.clone(),
+                        terminal_id: g.terminal_id.clone(),
+                        grace_until_unix: minted_at_to_unix(g.grace_until),
+                        session_tenant: g.session_tenant,
+                        session_tenant_origin: g.session_tenant.map(|_| g.pin_origin.into()),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Re-enter persisted grace entries after a restart (Phase 1a) — see
+    /// [`restore_graced_nonces`]. The grace insert and its tombstone happen in
+    /// this one critical section.
+    fn restore_graced(
+        &mut self,
+        persisted: HashMap<String, crate::secure_storage::StoredGracedNonce>,
+    ) -> Vec<(String, String)> {
+        let now_wall = std::time::SystemTime::now();
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        for (nonce, g) in persisted {
+            let grace_until = minted_at_from_unix(Some(g.grace_until_unix));
+            let Ok(remaining) = grace_until.duration_since(now_wall) else {
+                continue; // already expired — nothing to restore
+            };
+            if remaining.is_zero() || self.graced.contains_key(&nonce) {
+                continue;
+            }
+            self.graced.insert(
+                nonce.clone(),
+                GracedNonce {
+                    expires_at: now + remaining,
+                    grace_until,
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id.clone(),
+                    session_tenant: g.session_tenant,
+                    pin_origin: PinOrigin::restored(g.session_tenant, g.session_tenant_origin),
+                },
+            );
+            self.tombstone(
+                &nonce,
+                NonceTombstone {
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id,
+                    principal: "device",
+                    kind: TombstoneKind::Superseded,
+                    evicted_at: std::time::SystemTime::UNIX_EPOCH,
+                    grace_until: Some(grace_until),
+                    cause: "evicted before the previous runner exit; grace restored from the encrypted store".to_string(),
+                },
+            );
+            out.push((nonce, g.workdir));
+        }
+        out
+    }
+
+    /// Record one tombstone, pruning by age and by the hard cap. No I/O.
+    fn tombstone(&mut self, nonce: &str, tombstone: NonceTombstone) {
+        if nonce.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let map = &mut self.tombstones;
+        map.retain(|_, t| {
+            now.duration_since(t.reference_time())
+                .map(|age| age < NONCE_TOMBSTONE_TTL)
+                // A future-dated entry (clock step) is kept: age unknown ≠ old.
+                .unwrap_or(true)
+        });
+        map.insert(nonce.to_string(), tombstone);
+        if map.len() > MAX_NONCE_TOMBSTONES {
+            let mut by_age: Vec<(String, std::time::SystemTime)> = map
+                .iter()
+                .map(|(n, t)| (n.clone(), t.reference_time()))
+                .collect();
+            by_age.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            for (n, _) in by_age.into_iter().take(map.len() - MAX_NONCE_TOMBSTONES) {
+                map.remove(&n);
+            }
+        }
+    }
+
+    /// Tombstone every binding in `evicted` under one cause. `graced` says
+    /// whether the device entries were also placed in the grace map (the
+    /// caller decides that, since it depends on the binding class).
+    fn tombstone_all(
+        &mut self,
+        evicted: &[(String, NonceBinding)],
+        kind: TombstoneKind,
+        graced: bool,
+        cause: &str,
+    ) {
+        if evicted.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        for (nonce, b) in evicted {
+            let is_device = b.principal == ProxyPrincipal::Device;
+            self.tombstone(
+                nonce,
+                NonceTombstone {
+                    workdir: b.workdir.clone(),
+                    terminal_id: b.terminal_id.clone(),
+                    principal: if is_device { "device" } else { "agent" },
+                    kind,
+                    evicted_at: now,
+                    grace_until: (graced && is_device)
+                        .then(|| now + DEVICE_EVICTED_NONCE_GRACE_TTL),
+                    cause: cause.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Register a freshly minted binding — see [`mint_and_register_nonce`] for
+    /// the eviction rule. ONE pass does all pre-insert map maintenance (fused
+    /// from three: an expired-ephemeral sweep, a graceable collect, and a
+    /// persistent-eviction retain). The single `retain` closure decides removal
+    /// AND collects the grace set, so the map is walked once under the lock.
+    /// The insert, the grace of the evicted device keys and their tombstones
+    /// are ONE critical section: an in-flight request never finds an evicted
+    /// nonce neither live nor graced.
+    ///
+    /// `workdir` is the mint's RAW workdir argument, compared as given — not
+    /// the binding's normalized one — exactly as the eviction always compared.
+    fn insert_minted(
+        &mut self,
+        nonce: &str,
+        binding: NonceBinding,
+        workdir: &str,
+        terminal_id: Option<&str>,
+        now: std::time::Instant,
+    ) -> MintOutcome {
+        let ephemeral = binding.lifetime.is_ephemeral();
+        let mut evicted_graceable: Vec<(String, NonceBinding)> = Vec::new();
+        let mut evicted_agent: Vec<(String, NonceBinding)> = Vec::new();
+        self.live.retain(|n, b| {
+            // (1) Sweep EVERY expired ephemeral, whatever its workdir/class.
+            // Because an ephemeral mint no longer evicts a prior same-workdir
+            // ephemeral, expired ones would otherwise be reaped only lazily on
+            // their own re-lookup ([`live_binding`]) — so a long-lived opted-in
+            // runner minting across many distinct cwds could grow the map
+            // unbounded. Cheap, bounded to mint frequency; never touches a
+            // persistent nonce (no expiry) nor an unexpired ephemeral.
+            if let NonceLifetime::Ephemeral { expires_at } = b.lifetime {
+                if expires_at <= now {
+                    return false;
+                }
+            }
+            // (2) Class- AND terminal-scoped eviction. Only a PERSISTENT mint
+            // evicts, and only the prior PERSISTENT nonces for the same workdir
+            // AND the same terminal (the PTY re-provision case — never an
+            // ephemeral, so the class-scoping holds). Adding the terminal to the
+            // key is what lets two terminals share a cwd without the second
+            // spawn 401ing the first one's live MCP client; with both sides
+            // `None` it is byte-for-byte the previous same-workdir rule. An
+            // EPHEMERAL mint evicts NOTHING: two DIFFERENT bare sessions routinely
+            // share a cwd, and an ephemeral eviction is not graced, so removing a
+            // sibling ephemeral nonce would 401 the other session's
+            // already-connected MCP client mid-session. The DEVICE nonces among
+            // the evicted set are collected to ride the device-evicted grace
+            // TTL (Change 3; widened by plan 2026-07-27 Phase 5/R3) — an
+            // in-flight client that cached one keeps validating until it
+            // reconnects; agent nonces are NOT graced (they hard-fail closed on
+            // re-mint), so they are dropped without being collected.
+            if !ephemeral
+                && b.workdir == workdir
+                && b.terminal_id.as_deref() == terminal_id
+                && !b.lifetime.is_ephemeral()
+            {
+                if b.principal == ProxyPrincipal::Device {
+                    evicted_graceable.push((n.clone(), b.clone()));
+                } else {
+                    evicted_agent.push((n.clone(), b.clone()));
+                }
+                return false;
+            }
+            true
+        });
+        self.live.insert(nonce.to_string(), binding);
+        self.grace_evicted(&evicted_graceable);
+        // Phase 1d: the tombstone is what lets a later `reject` on either key
+        // name the workdir it belonged to and whether it was still graced.
+        self.tombstone_all(
+            &evicted_graceable,
+            TombstoneKind::Superseded,
+            true,
+            EVICT_CAUSE_REMINT,
+        );
+        self.tombstone_all(
+            &evicted_agent,
+            TombstoneKind::Superseded,
+            false,
+            EVICT_CAUSE_REMINT_AGENT,
+        );
+        MintOutcome {
+            snapshot: self.live.clone(),
+            evicted_device: evicted_graceable,
+            evicted_agent,
+        }
+    }
+
+    /// Evict every binding for `workdir` — see
+    /// [`evict_proxy_nonces_for_workdir`]. The removal, the grace of the
+    /// persistent device keys and every tombstone are ONE critical section.
+    fn evict_workdir(
+        &mut self,
+        workdir: &str,
+        cause_device: &str,
+        cause_ephemeral: &str,
+        cause_agent: &str,
+    ) -> Option<WorkdirEviction> {
+        let collect = |live: &HashMap<String, NonceBinding>,
+                       pred: &dyn Fn(&NonceBinding) -> bool| {
+            live.iter()
+                .filter(|(_, b)| b.workdir == workdir && pred(b))
+                .map(|(n, b)| (n.clone(), b.clone()))
+                .collect::<Vec<(String, NonceBinding)>>()
+        };
+        let device = collect(&self.live, &|b| {
+            b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral()
+        });
+        if device.is_empty() && !self.live.values().any(|b| b.workdir == workdir) {
+            return None; // nothing bound to this workdir — skip the persist write
+        }
+        let ephemeral = collect(&self.live, &|b| {
+            b.principal == ProxyPrincipal::Device && b.lifetime.is_ephemeral()
+        });
+        let agent = collect(&self.live, &|b| b.principal != ProxyPrincipal::Device);
+        self.live.retain(|_, b| b.workdir != workdir);
+        self.grace_evicted(&device);
+        self.tombstone_all(&device, TombstoneKind::Superseded, true, cause_device);
+        self.tombstone_all(
+            &ephemeral,
+            TombstoneKind::Superseded,
+            false,
+            cause_ephemeral,
+        );
+        self.tombstone_all(&agent, TombstoneKind::Superseded, false, cause_agent);
+        Some(WorkdirEviction {
+            snapshot: self.live.clone(),
+            device,
+            ephemeral,
+            agent,
+        })
+    }
+
+    /// Revoke ONE nonce from the live map AND the grace map (revocation is
+    /// total — grace only ever survives supersession, never an explicit
+    /// revoke) and tombstone it, in one critical section.
+    fn revoke(&mut self, nonce: &str) -> NonceRevocation {
+        let binding = self.live.remove(nonce);
+        let snapshot = binding.as_ref().map(|_| self.live.clone());
+        let graced = self.graced.remove(nonce);
+        if let Some(b) = &binding {
+            self.tombstone_all(
+                std::slice::from_ref(&(nonce.to_string(), b.clone())),
+                TombstoneKind::Revoked,
+                false,
+                "explicit revoke",
+            );
+        } else if let Some(g) = &graced {
+            // The binding is long gone; the grace entry still knows the workdir.
+            self.tombstone(
+                nonce,
+                NonceTombstone {
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id.clone(),
+                    principal: "device",
+                    kind: TombstoneKind::Revoked,
+                    evicted_at: std::time::SystemTime::now(),
+                    grace_until: None,
+                    cause: "explicit revoke (grace registry only)".to_string(),
+                },
+            );
+        }
+        NonceRevocation {
+            binding,
+            graced,
+            snapshot,
+        }
+    }
+
+    /// Remove every binding owned by `agent_id` and tombstone them. Returns the
+    /// removed pairs plus a clone of the survivors: teardown does NOT go
+    /// through `persist_proxy_nonces` (agent nonces are never persisted), so
+    /// without that clone the newest census would keep naming bindings that
+    /// are already gone — and the boot readback would then classify torn-down
+    /// sessions. Same clone-a-snapshot idiom as the mint, on a path that fires
+    /// once per agent teardown.
+    #[allow(clippy::type_complexity)]
+    fn take_agent(
+        &mut self,
+        agent_id: Uuid,
+        cause: &str,
+    ) -> (Vec<(String, NonceBinding)>, HashMap<String, NonceBinding>) {
+        let mut revoked = Vec::new();
+        self.live.retain(|n, b| {
+            if b.principal == (ProxyPrincipal::Agent { agent_id }) {
+                revoked.push((n.clone(), b.clone()));
+                return false;
+            }
+            true
+        });
+        self.tombstone_all(&revoked, TombstoneKind::Revoked, false, cause);
+        (revoked, self.live.clone())
+    }
+
+    /// Remove every binding for `workdir` on session close and tombstone them.
+    /// Returns the removed pairs (the terminal id rides along so the caller's
+    /// forensics line can carry the Phase 4 join key — the binding is gone the
+    /// moment `retain` returns) and, when anything was removed, the survivors
+    /// to persist.
+    #[allow(clippy::type_complexity)]
+    fn release_workdir(
+        &mut self,
+        workdir: &str,
+        cause: &str,
+    ) -> (
+        Vec<(String, NonceBinding)>,
+        Option<HashMap<String, NonceBinding>>,
+    ) {
+        let mut revoked: Vec<(String, NonceBinding)> = Vec::new();
+        self.live.retain(|n, b| {
+            if b.workdir == workdir {
+                revoked.push((n.clone(), b.clone()));
+                return false;
+            }
+            true
+        });
+        self.tombstone_all(&revoked, TombstoneKind::Revoked, false, cause);
+        let snapshot = (!revoked.is_empty()).then(|| self.live.clone());
+        (revoked, snapshot)
+    }
+
+    /// Register an on-disk nonce for `workdir`, evicting the workdir's prior
+    /// persistent terminal-less bindings (not graced, not tombstoned — see
+    /// [`adopt_on_disk_nonce`]). Returns the evicted nonces.
+    fn adopt(&mut self, workdir: &str, nonce: &str, binding: NonceBinding) -> Vec<String> {
+        // Persistent AND terminal-less only — an adopted nonce came from a
+        // runner-written `.mcp.json`, and must NOT evict a bare session's
+        // ephemeral nonce for the same workdir (the class-scoping rationale in
+        // `mint_and_register_nonce`) nor a live TERMINAL's per-terminal nonce
+        // for it (the same rationale applied to the terminal key: the adopted
+        // nonce replaces the shared `.mcp.json` credential, which is the
+        // terminal-less one). Byte-for-byte the previous behavior before
+        // per-terminal nonces existed, when every persistent binding was
+        // terminal-less.
+        let mut evicted: Vec<String> = Vec::new();
+        self.live.retain(|n, b| {
+            if b.workdir == workdir && b.terminal_id.is_none() && !b.lifetime.is_ephemeral() {
+                evicted.push(n.clone());
+                return false;
+            }
+            true
+        });
+        self.live.insert(nonce.to_string(), binding);
+        evicted
+    }
+
+    /// Merge a boot restore's bindings into the live map: live mints win on
+    /// collision (an occupied slot is left alone).
+    fn restore_live(&mut self, entries: Vec<(String, NonceBinding)>) -> LiveRestore {
+        let mut inserted = 0usize;
+        let mut to_resolve = Vec::new();
+        for (nonce, binding) in entries {
+            if self.live.contains_key(&nonce) {
+                continue;
+            }
+            if binding.expected.settled().is_none() {
+                to_resolve.push((binding.expected.clone(), binding.workdir.clone()));
+            }
+            self.live.insert(nonce, binding);
+            inserted += 1;
+        }
+        LiveRestore {
+            inserted,
+            to_resolve,
+            live_len: self.live.len(),
+        }
+    }
+
+    /// The three sources a reject is attributed from, in order: the live map,
+    /// the tombstone map (what the key USED to be), then the grace map for a
+    /// graced key with no tombstone (only reachable if the tombstone aged out
+    /// first). Read-only: unlike [`NonceState::live_lookup`] this never evicts.
+    fn attribution_source(&self, nonce: &str) -> AttributionSource {
+        if let Some(b) = self.live.get(nonce) {
+            return AttributionSource::Live {
+                workdir: b.workdir.clone(),
+                principal: match b.principal {
+                    ProxyPrincipal::Device => "device",
+                    ProxyPrincipal::Agent { .. } => "agent",
+                },
+                terminal_id: b.terminal_id.clone(),
+            };
+        }
+        if let Some(t) = self.tombstones.get(nonce) {
+            return AttributionSource::Tombstone(t.clone());
+        }
+        if let Some(g) = self.graced.get(nonce) {
+            return AttributionSource::Graced {
+                workdir: g.workdir.clone(),
+                terminal_id: g.terminal_id.clone(),
+                grace_until: g.grace_until,
+            };
+        }
+        AttributionSource::Unknown
+    }
+}
 
 /// Per-agent live-token registry for the agent-proxy path: `agent_id` →
 /// the agent's [`crate::agent_token::SharedToken`] slot. Built fresh at the
@@ -1758,33 +2819,85 @@ static PROXY_NONCES: OnceLock<Mutex<HashMap<String, NonceBinding>>> = OnceLock::
 /// bound to [`ProxyPrincipal::Agent`] whose `agent_id` has no slot here is a
 /// hard 401 — which is exactly what makes a restart (or a torn-down agent)
 /// fail closed.
-static AGENT_TOKENS: OnceLock<Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>> =
-    OnceLock::new();
+///
+/// Kept apart from [`NonceRegistry`]: it is keyed by `agent_id`, not by nonce,
+/// and its lifecycle is the agent run's, not the nonce's. Same poison policy:
+/// its one lock accessor recovers a poisoned mutex, because teardown removes a
+/// slot while a panicking run task unwinds.
+pub(crate) struct AgentTokenRegistry {
+    tokens: Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>,
+}
 
-/// `pub(crate)` so `agent_runtime::AgentRunTeardown` can bind the global map
-/// into its explicit-map teardown seam.
-pub(crate) fn agent_tokens() -> &'static Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> {
-    AGENT_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+static AGENT_TOKEN_REGISTRY: OnceLock<AgentTokenRegistry> = OnceLock::new();
+
+impl AgentTokenRegistry {
+    /// A fresh, empty registry — the per-test handle, and what
+    /// [`Self::global`] initializes once.
+    pub(crate) fn new() -> Self {
+        AgentTokenRegistry {
+            tokens: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The process-global registry every production path uses.
+    pub(crate) fn global() -> &'static Self {
+        AGENT_TOKEN_REGISTRY.get_or_init(AgentTokenRegistry::new)
+    }
+
+    /// THE lock accessor — poison-recovering, like [`NonceRegistry::state`].
+    fn tokens(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, crate::agent_token::SharedToken>> {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Register (or replace) the live-token slot for `agent_id`.
+    pub(crate) fn register(&self, agent_id: Uuid, slot: crate::agent_token::SharedToken) {
+        self.tokens().insert(agent_id, slot);
+    }
+
+    /// The live-token slot for `agent_id` (the `Arc` is cloned out, so the lock
+    /// is released immediately).
+    pub(crate) fn lookup(&self, agent_id: Uuid) -> Option<crate::agent_token::SharedToken> {
+        self.tokens().get(&agent_id).cloned()
+    }
+
+    /// Every registered slot, cloned out so the lock is released before the
+    /// caller awaits on any of them.
+    fn slots(&self) -> Vec<(Uuid, crate::agent_token::SharedToken)> {
+        self.tokens()
+            .iter()
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect()
+    }
+
+    /// Drop the slot for `agent_id`. Idempotent and poison-tolerant: it runs
+    /// from `agent_runtime::AgentRunTeardown::drop`, including during a panic
+    /// unwind, where a second panic aborts the whole runner. A poisoned map
+    /// still holds a usable `HashMap`; removing an entry from it is exactly as
+    /// correct as from a clean one.
+    pub(crate) fn remove(&self, agent_id: Uuid) {
+        self.tokens().remove(&agent_id);
+    }
+
+    /// The registry's mutex, for the poison tests.
+    #[cfg(test)]
+    pub(crate) fn test_mutex(&self) -> &Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> {
+        &self.tokens
+    }
 }
 
 /// Register (or replace) the live-token slot for `agent_id`. Called at the agent
 /// spawn site after building the slot from the launch payload's JWT.
 pub(crate) fn register_agent_token(agent_id: Uuid, slot: crate::agent_token::SharedToken) {
-    agent_tokens()
-        .lock()
-        .expect("agent token map poisoned")
-        .insert(agent_id, slot);
+    AgentTokenRegistry::global().register(agent_id, slot);
 }
 
 /// Look up the live-token slot for `agent_id` (clones the `Arc` out so the lock
 /// is released immediately). `None` after teardown / before registration → the
 /// proxy handler 401s, failing closed.
 pub(crate) fn lookup_agent_token(agent_id: Uuid) -> Option<crate::agent_token::SharedToken> {
-    agent_tokens()
-        .lock()
-        .expect("agent token map poisoned")
-        .get(&agent_id)
-        .cloned()
+    AgentTokenRegistry::global().lookup(agent_id)
 }
 
 /// Snapshot every registered slot's refresh health, newest problem first.
@@ -1797,14 +2910,7 @@ pub(crate) fn lookup_agent_token(agent_id: Uuid) -> Option<crate::agent_token::S
 /// Ordering puts `Rejected` first, then `Degraded`, then healthy — a reader
 /// scanning the head of the list sees the problems without paging.
 pub(crate) async fn agent_token_health_snapshot() -> Vec<crate::agent_token::AgentTokenHealth> {
-    let slots: Vec<(Uuid, crate::agent_token::SharedToken)> = {
-        agent_tokens()
-            .lock()
-            .expect("agent token map poisoned")
-            .iter()
-            .map(|(id, slot)| (*id, slot.clone()))
-            .collect()
-    };
+    let slots = AgentTokenRegistry::global().slots();
     let now = chrono::Utc::now().timestamp();
     let mut out = Vec::with_capacity(slots.len());
     for (agent_id, slot) in slots {
@@ -1826,27 +2932,10 @@ pub(crate) async fn agent_token_health_snapshot() -> Vec<crate::agent_token::Age
 }
 
 /// Drop the live-token slot for `agent_id` on teardown so a torn-down agent's
-/// nonce hard-fails closed. Idempotent.
-///
-/// POISON-TOLERANT, deliberately unlike its siblings: it runs from
-/// `agent_runtime::AgentRunTeardown::drop`, which also runs while a panicking
-/// run task unwinds, and a second panic there aborts the whole runner. A
-/// poisoned map still holds a usable `HashMap`; removing an entry from it is
-/// exactly as correct as from a clean one.
+/// nonce hard-fails closed. Idempotent and poison-tolerant (see
+/// [`AgentTokenRegistry::remove`]).
 pub(crate) fn remove_agent_token(agent_id: Uuid) {
-    remove_agent_token_in(agent_tokens(), agent_id);
-}
-
-/// [`remove_agent_token`] over an explicit map — the seam its poison tests
-/// (here and in `agent_runtime`) use, so a test never poisons the
-/// process-global map other tests `expect` on.
-pub(crate) fn remove_agent_token_in(
-    map: &Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>,
-    agent_id: Uuid,
-) {
-    map.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&agent_id);
+    AgentTokenRegistry::global().remove(agent_id);
 }
 
 /// Guards [`restore_proxy_nonces_from_store`] so a second boot-restore (e.g. an
@@ -1863,14 +2952,6 @@ static PROXY_NONCES_RESTORED: OnceLock<()> = OnceLock::new();
 /// the log stays one-line-per-process-per-outcome, while a disabled call leaves
 /// the actual restore still available to a later enabled one.
 static PROXY_NONCES_RESTORE_DISABLED_LOGGED: OnceLock<()> = OnceLock::new();
-
-/// `pub(crate)` so `agent_runtime::AgentRunTeardown` can bind the global map
-/// into its explicit-map teardown seam.
-///
-/// Teardown seam only; mutate through the owning module's functions.
-pub(crate) fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
-    PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 /// The AGENT arm of the grace-TTL split (plan
 /// 2026-07-27-coord-mcp-flake-remediation, Phase 5/R3): the pre-split 90s
@@ -1915,7 +2996,27 @@ const DEVICE_EVICTED_NONCE_GRACE_TTL: std::time::Duration =
 /// A device nonce kept transiently valid after eviction: its in-process expiry
 /// plus the binding it used to be, so the entry can be persisted across a
 /// restart and re-entered with its remaining window.
-struct GracedNonce {
+///
+/// Held in [`NonceRegistry`]'s grace map. **Persisted since plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential` Phase 1a.**
+/// This used to be process-local and "intentionally forgotten across a
+/// restart". Measured on the operator box 2026-09-02 (rotation log, 2916
+/// lines, 165 `reject` rows): of the 144 rejects that carried a key prefix,
+/// **61** were keys this runner had evicted AND graced, with a runner restart
+/// between the `grace` line and the `reject` — the grace set died with the
+/// process while every `.mcp.json` on disk still carried the key. Only **4**
+/// rejects hit an evicted key inside a live runner, and all four landed
+/// 6.07–6.98 h after eviction, i.e. AFTER the 6 h window closed honestly.
+/// Zero rejects hit an evicted key inside a live runner's window. So the
+/// same-session re-mint plus grace works within one process; what broke was
+/// the restart. The graced set therefore rides the same encrypted store as
+/// the persistent bindings ([`graced_nonce_snapshot`] → the nonce persist
+/// queue → [`restore_proxy_nonces_from`]), carrying its wall-clock deadline so
+/// a restored entry re-enters with exactly its REMAINING window, never a fresh
+/// one. Device-class, persistent-class, loopback-only — the same posture as
+/// persisting the live bindings themselves.
+#[derive(Clone)]
+pub(crate) struct GracedNonce {
     /// The monotonic deadline the request path checks.
     expires_at: std::time::Instant,
     /// The same deadline on the wall clock — what goes to disk. Kept beside the
@@ -1937,112 +3038,14 @@ struct GracedNonce {
     pin_origin: PinOrigin,
 }
 
-/// Transient grace registry: an evicted DEVICE nonce → its expiry and the
-/// binding it was. Separate from [`PROXY_NONCES`] so the live map stays the
-/// single source of truth for a currently-provisioned nonce.
-///
-/// **Persisted since plan
-/// `2026-09-02-steering-layers-unreadable-without-a-credential` Phase 1a.**
-/// This used to be process-local and "intentionally forgotten across a
-/// restart". Measured on the operator box 2026-09-02 (rotation log, 2916
-/// lines, 165 `reject` rows): of the 144 rejects that carried a key prefix,
-/// **61** were keys this runner had evicted AND graced, with a runner restart
-/// between the `grace` line and the `reject` — the grace set died with the
-/// process while every `.mcp.json` on disk still carried the key. Only **4**
-/// rejects hit an evicted key inside a live runner, and all four landed
-/// 6.07–6.98 h after eviction, i.e. AFTER the 6 h window closed honestly.
-/// Zero rejects hit an evicted key inside a live runner's window. So the
-/// same-session re-mint plus grace works within one process; what broke was
-/// the restart. The graced set therefore rides the same encrypted store as
-/// the persistent bindings ([`graced_nonce_snapshot`] → the nonce persist
-/// queue → [`restore_proxy_nonces_from`]), carrying its wall-clock deadline so
-/// a restored entry re-enters with exactly its REMAINING window, never a fresh
-/// one. Device-class, persistent-class, loopback-only — the same posture as
-/// persisting the live bindings themselves.
-static GRACED_NONCES: OnceLock<Mutex<HashMap<String, GracedNonce>>> = OnceLock::new();
-
-fn graced_nonces() -> &'static Mutex<HashMap<String, GracedNonce>> {
-    GRACED_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Move DEVICE bindings just evicted into the grace registry with a
-/// [`DEVICE_EVICTED_NONCE_GRACE_TTL`] expiry, opportunistically pruning expired
-/// entries so the map stays bounded. Only device bindings are passed here (the
-/// caller filters); agent nonces are dropped outright to fail closed.
-fn grace_evicted_device_nonces(evicted: &[(String, NonceBinding)]) {
-    if evicted.is_empty() {
-        return;
-    }
-    let now = std::time::Instant::now();
-    let expires_at = now + DEVICE_EVICTED_NONCE_GRACE_TTL;
-    let grace_until = std::time::SystemTime::now() + DEVICE_EVICTED_NONCE_GRACE_TTL;
-    let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
-    graced.retain(|_, g| g.expires_at > now);
-    for (n, b) in evicted {
-        graced.insert(
-            n.clone(),
-            GracedNonce {
-                expires_at,
-                grace_until,
-                workdir: b.workdir.clone(),
-                terminal_id: b.terminal_id.clone(),
-                session_tenant: b.session_pin.pinned(),
-                pin_origin: b.pin_origin,
-            },
-        );
-    }
-}
-
-/// True iff `nonce` is a DEVICE nonce still inside its grace TTL (Change 3).
-/// Lazily evicts it once expired so grace fails closed exactly at the deadline.
-fn graced_nonce_is_valid(nonce: &str) -> bool {
-    let now = std::time::Instant::now();
-    let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
-    match graced.get(nonce) {
-        Some(g) if g.expires_at > now => true,
-        Some(_) => {
-            graced.remove(nonce);
-            false
-        }
-        None => false,
-    }
-}
-
-/// Project the grace registry down to the shape the encrypted store persists
-/// (Phase 1a): every entry whose window is still open, keyed by nonce. Expired
-/// entries are dropped here as well as lazily on lookup, so the store never
-/// carries a dead window. Bounded by [`MAX_PERSISTED_DEVICE_NONCES`] like the
-/// binding snapshot — a grace entry outlives its binding by at most one
-/// window, so the two sets are the same order of size.
+/// The grace map projected to the shape the encrypted store persists — see
+/// [`NonceState::graced_snapshot`].
 fn graced_nonce_snapshot() -> HashMap<String, crate::secure_storage::StoredGracedNonce> {
-    let now = std::time::Instant::now();
-    let graced = graced_nonces().lock().expect("graced nonce map poisoned");
-    let mut live: Vec<(&String, &GracedNonce)> =
-        graced.iter().filter(|(_, g)| g.expires_at > now).collect();
-    if live.len() > MAX_PERSISTED_DEVICE_NONCES {
-        // Latest deadline first: the entries with the most window left are the
-        // ones a restart is most likely to need.
-        live.sort_by(|(na, a), (nb, b)| b.grace_until.cmp(&a.grace_until).then_with(|| na.cmp(nb)));
-        live.truncate(MAX_PERSISTED_DEVICE_NONCES);
-    }
-    live.into_iter()
-        .map(|(n, g)| {
-            (
-                n.clone(),
-                crate::secure_storage::StoredGracedNonce {
-                    workdir: g.workdir.clone(),
-                    terminal_id: g.terminal_id.clone(),
-                    grace_until_unix: minted_at_to_unix(g.grace_until),
-                    session_tenant: g.session_tenant,
-                    session_tenant_origin: g.session_tenant.map(|_| g.pin_origin.into()),
-                },
-            )
-        })
-        .collect()
+    NonceRegistry::global().graced_snapshot()
 }
 
 /// Re-enter persisted grace entries after a restart (Phase 1a): each one whose
-/// wall-clock deadline is still ahead goes back into the grace registry with
+/// wall-clock deadline is still ahead goes back into the grace map with
 /// its REMAINING window and into the tombstone map so a later reject can still
 /// be attributed. Returns the `(nonce, workdir)` pairs that re-entered, for
 /// the forensics lines the caller emits; entries already past their
@@ -2054,50 +3057,7 @@ fn graced_nonce_snapshot() -> HashMap<String, crate::secure_storage::StoredGrace
 fn restore_graced_nonces(
     persisted: HashMap<String, crate::secure_storage::StoredGracedNonce>,
 ) -> Vec<(String, String)> {
-    let now_wall = std::time::SystemTime::now();
-    let now = std::time::Instant::now();
-    let mut restored = Vec::new();
-    {
-        let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
-        for (nonce, g) in persisted {
-            let grace_until = minted_at_from_unix(Some(g.grace_until_unix));
-            let Ok(remaining) = grace_until.duration_since(now_wall) else {
-                continue; // already expired — nothing to restore
-            };
-            if remaining.is_zero() || graced.contains_key(&nonce) {
-                continue;
-            }
-            graced.insert(
-                nonce.clone(),
-                GracedNonce {
-                    expires_at: now + remaining,
-                    grace_until,
-                    workdir: g.workdir.clone(),
-                    terminal_id: g.terminal_id.clone(),
-                    session_tenant: g.session_tenant,
-                    pin_origin: PinOrigin::restored(g.session_tenant, g.session_tenant_origin),
-                },
-            );
-            restored.push((nonce, g.workdir, g.terminal_id, grace_until));
-        }
-    }
-    let mut out = Vec::with_capacity(restored.len());
-    for (nonce, workdir, terminal_id, grace_until) in restored {
-        record_nonce_tombstone(
-            &nonce,
-            NonceTombstone {
-                workdir: workdir.clone(),
-                terminal_id,
-                principal: "device",
-                kind: TombstoneKind::Superseded,
-                evicted_at: std::time::SystemTime::UNIX_EPOCH,
-                grace_until: Some(grace_until),
-                cause: "evicted before the previous runner exit; grace restored from the encrypted store".to_string(),
-            },
-        );
-        out.push((nonce, workdir));
-    }
-    out
+    NonceRegistry::global().restore_graced(persisted)
 }
 
 // ============================================================================
@@ -2118,10 +3078,11 @@ enum TombstoneKind {
 
 /// Everything a `reject` line can still say about a key that is no longer
 /// live. Written at every eviction and revocation site, read on the reject
-/// path. Process-local except for the graced subset, which
-/// [`restore_graced_nonces`] re-creates from the store after a restart.
+/// path. Held in [`NonceRegistry`]'s tombstone map. Process-local except for
+/// the graced subset, which [`restore_graced_nonces`] re-creates from the
+/// store after a restart.
 #[derive(Debug, Clone)]
-struct NonceTombstone {
+pub(crate) struct NonceTombstone {
     workdir: String,
     terminal_id: Option<String>,
     /// `"device"` / `"agent"`.
@@ -2155,85 +3116,6 @@ const NONCE_TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(
 
 /// Hard cap on tombstones regardless of age (oldest dropped first).
 const MAX_NONCE_TOMBSTONES: usize = 1024;
-
-static NONCE_TOMBSTONES: OnceLock<Mutex<HashMap<String, NonceTombstone>>> = OnceLock::new();
-
-fn nonce_tombstones() -> &'static Mutex<HashMap<String, NonceTombstone>> {
-    NONCE_TOMBSTONES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Record one tombstone, pruning by age and by the hard cap. Safe to call
-/// under the registry lock (no I/O); the lock order everywhere is registry →
-/// grace → tombstones, and this takes only the last.
-fn record_nonce_tombstone(nonce: &str, tombstone: NonceTombstone) {
-    record_nonce_tombstone_in(nonce_tombstones(), nonce, tombstone);
-}
-
-/// [`record_nonce_tombstone`] over an explicit map — the seam its poison test
-/// uses, so the test never poisons the process-global map the reject path
-/// reads.
-fn record_nonce_tombstone_in(
-    tombstones: &Mutex<HashMap<String, NonceTombstone>>,
-    nonce: &str,
-    tombstone: NonceTombstone,
-) {
-    if nonce.is_empty() {
-        return;
-    }
-    let now = std::time::SystemTime::now();
-    // Poison-tolerant: launch teardown records tombstones during a panic
-    // unwind, and a tombstone is diagnostic state that is safe to keep using.
-    let mut map = tombstones
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    map.retain(|_, t| {
-        now.duration_since(t.reference_time())
-            .map(|age| age < NONCE_TOMBSTONE_TTL)
-            // A future-dated entry (clock step) is kept: age unknown ≠ old.
-            .unwrap_or(true)
-    });
-    map.insert(nonce.to_string(), tombstone);
-    if map.len() > MAX_NONCE_TOMBSTONES {
-        let mut by_age: Vec<(String, std::time::SystemTime)> = map
-            .iter()
-            .map(|(n, t)| (n.clone(), t.reference_time()))
-            .collect();
-        by_age.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        for (n, _) in by_age.into_iter().take(map.len() - MAX_NONCE_TOMBSTONES) {
-            map.remove(&n);
-        }
-    }
-}
-
-/// Tombstone every binding in `evicted` under one cause. `graced` says
-/// whether the device entries were also placed in the grace registry (the
-/// caller decides that, since it depends on the binding class).
-fn record_nonce_tombstones(
-    evicted: &[(String, NonceBinding)],
-    kind: TombstoneKind,
-    graced: bool,
-    cause: &str,
-) {
-    if evicted.is_empty() {
-        return;
-    }
-    let now = std::time::SystemTime::now();
-    for (nonce, b) in evicted {
-        let is_device = b.principal == ProxyPrincipal::Device;
-        record_nonce_tombstone(
-            nonce,
-            NonceTombstone {
-                workdir: b.workdir.clone(),
-                terminal_id: b.terminal_id.clone(),
-                principal: if is_device { "device" } else { "agent" },
-                kind,
-                evicted_at: now,
-                grace_until: (graced && is_device).then(|| now + DEVICE_EVICTED_NONCE_GRACE_TTL),
-                cause: cause.to_string(),
-            },
-        );
-    }
-}
 
 // ============================================================================
 // Rotation forensics (plan 2026-07-27-coord-mcp-flake-remediation, Phase 4/R6)
@@ -2649,7 +3531,7 @@ fn reject_throttle_admit(prefix: &str) -> Option<u64> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("reject throttle map poisoned");
-    // Opportunistic prune (the shape `grace_evicted_device_nonces` uses): a
+    // Opportunistic prune (the shape `NonceState::grace_evicted` uses): a
     // long-lived runner can see many distinct dead keys, and an entry quiet for
     // well over a window has nothing left to throttle or report.
     map.retain(|_, t| now.duration_since(t.last_logged) < REJECT_LOG_THROTTLE * 10);
@@ -2756,85 +3638,10 @@ impl RejectAttribution {
 /// into [`log_rotation_event_with`], which does file I/O, and
 /// `log_rotation_event` documents that callers must not hold the registry lock
 /// across it. The clones are the price of that discipline. Cheap enough to run
-/// synchronously on the 401 path — three uncontended mutex reads, no I/O —
+/// synchronously on the 401 path — one registry lock, no I/O —
 /// which is what lets the 401 BODY carry the same attribution as the log line.
 pub(crate) fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
-    if nonce.is_empty() {
-        return RejectAttribution::unknown(RejectAttribution::NO_KEY_PRESENTED);
-    }
-    let live = {
-        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        map.get(nonce).map(|b| {
-            (
-                b.workdir.clone(),
-                match b.principal {
-                    ProxyPrincipal::Device => "device".to_string(),
-                    ProxyPrincipal::Agent { .. } => "agent".to_string(),
-                },
-                b.terminal_id.clone(),
-            )
-        })
-    };
-    if let Some((workdir, principal, terminal_id)) = live {
-        return RejectAttribution {
-            // Phase 3c, read side. All three construction sites normalize, so
-            // this is belt-and-braces — but it is what actually makes this
-            // struct's doc ("never left empty") TRUE for every future
-            // construction site as well as today's three, and it is the one
-            // place every `reject` row provably passes through.
-            workdir: normalize_binding_workdir(&workdir),
-            principal,
-            terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
-            attribution: RejectAttribution::BOUND,
-            evicted_at: None,
-            grace_until: None,
-            evict_cause: None,
-        };
-    }
-    // Poison-tolerant, matching the writer: a tombstone is diagnostic state.
-    let tombstone = nonce_tombstones()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(nonce)
-        .cloned();
-    if let Some(t) = tombstone {
-        let now = std::time::SystemTime::now();
-        let attribution = match (t.kind, t.grace_until) {
-            (TombstoneKind::Revoked, _) => RejectAttribution::REVOKED,
-            (TombstoneKind::Superseded, Some(until)) if until <= now => {
-                RejectAttribution::GRACED_EXPIRED
-            }
-            (TombstoneKind::Superseded, _) => RejectAttribution::SUPERSEDED,
-        };
-        return RejectAttribution {
-            workdir: normalize_binding_workdir(&t.workdir),
-            principal: t.principal.to_string(),
-            terminal_id: t.terminal_id.unwrap_or_else(|| "none".to_string()),
-            attribution,
-            evicted_at: (t.evicted_at != std::time::SystemTime::UNIX_EPOCH).then_some(t.evicted_at),
-            grace_until: t.grace_until,
-            evict_cause: Some(t.cause),
-        };
-    }
-    // Grace map fallback: only DEVICE nonces are ever graced, so a hit here
-    // pins the principal class and, since Phase 1a, the binding it was.
-    let graced = graced_nonces()
-        .lock()
-        .expect("graced nonce map poisoned")
-        .get(nonce)
-        .map(|g| (g.workdir.clone(), g.terminal_id.clone(), g.grace_until));
-    if let Some((workdir, terminal_id, grace_until)) = graced {
-        return RejectAttribution {
-            workdir: normalize_binding_workdir(&workdir),
-            principal: "device".to_string(),
-            terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
-            attribution: RejectAttribution::SUPERSEDED,
-            evicted_at: None,
-            grace_until: Some(grace_until),
-            evict_cause: None,
-        };
-    }
-    RejectAttribution::unknown(RejectAttribution::NEVER_REGISTERED)
+    NonceRegistry::global().reject_attribution(nonce)
 }
 
 /// RFC 3339 rendering of an optional wall-clock instant for a log line or a
@@ -3497,7 +4304,7 @@ fn agent_census_extra(
 ///
 /// [`device_nonce_snapshot`] filters `principal == ProxyPrincipal::Device`
 /// (OQ3), so every agent binding is discarded on the way to disk. That drop
-/// rests on one premise, stated verbatim beside [`AGENT_TOKENS`]: *"AGENT
+/// rests on one premise, stated verbatim in [`NonceRegistry`]'s doc: *"AGENT
 /// bindings are NEVER persisted (OQ3): a restarted runner has no live agent
 /// session, so a restored agent nonce MUST hard-fail closed."*
 ///
@@ -4045,10 +4852,7 @@ pub(crate) async fn log_agent_binding_liveness_at_boot(
 pub(crate) fn log_agent_binding_census_at_boot() {
     // Clone under the lock, emit outside it — file I/O must never run with the
     // registry held. Once per boot, so the clone is not on any hot path.
-    let snapshot = {
-        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        map.clone()
-    };
+    let snapshot = NonceRegistry::global().live_snapshot();
     note_agent_binding_census(&snapshot);
 }
 
@@ -4449,10 +5253,7 @@ pub(crate) fn restore_proxy_nonces_from_store() -> NonceRestoreOutcome {
         // registry count.
         return NonceRestoreOutcome {
             inserted: 0,
-            live_map_len: proxy_nonces()
-                .lock()
-                .expect("proxy nonce map poisoned")
-                .len(),
+            live_map_len: NonceRegistry::global().live_len(),
         };
     }
     let store = match crate::secure_storage::SecureStorage::new() {
@@ -4561,15 +5362,11 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
             log_restore_event(0, 0, graced, &reason);
             return NonceRestoreOutcome {
                 inserted: 0,
-                live_map_len: proxy_nonces()
-                    .lock()
-                    .expect("proxy nonce map poisoned")
-                    .len(),
+                live_map_len: NonceRegistry::global().live_len(),
             };
         }
     };
     let persisted_total = persisted.len();
-    let mut inserted = 0usize;
     // Sampled ONCE for the whole restore (a filesystem read), and held across
     // the registry lock below rather than taken under it.
     let restore_time_pin = crate::session::tenant_pin::resolve_tenant_pin();
@@ -4610,28 +5407,11 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
             }
             .with_settle_hook(persist_on_settle());
-            (nonce, binding, expected)
-        })
-        .collect();
-    // Restored bindings whose expectation is unsettled: resolved in the
-    // background once the lock is released, so a restored session's first
-    // tools/call does not wait out the resolver budget.
-    let mut to_resolve: Vec<(crate::coord_mcp_tenant::SessionExpectation, String)> = Vec::new();
-    let live_map_len = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        for (nonce, binding, expected) in persisted {
-            let vacant = !map.contains_key(&nonce);
-            if vacant && expected.settled().is_none() {
-                to_resolve.push((
-                    expected.clone(),
-                    normalize_binding_workdir(&binding.workdir),
-                ));
-            }
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
             // is unconditionally a Device principal. An agent nonce can never be
             // restored — its slot is process-global and gone after a restart, so
             // it would hard-fail closed anyway.
-            map.entry(nonce).or_insert(NonceBinding {
+            let restored = NonceBinding {
                 // Phase 3c: the persisted store can carry an empty workdir from
                 // any runner that predates the normalization, so the restore is
                 // a second entry point and needs it too — otherwise the `""`
@@ -4703,19 +5483,25 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 // [`minted_at_from_unix`] and [`NonceBinding::minted_at`].
                 minted_at: minted_at_from_unix(binding.minted_at_unix),
                 expected,
-            });
-            if vacant {
-                inserted += 1;
-            }
-        }
-        map.len()
-    };
+            };
+            (nonce, restored)
+        })
+        .collect();
+    // Live mints win on collision; restored bindings whose expectation is
+    // unsettled are resolved in the background once the lock is released, so
+    // a restored session's first tools/call does not wait out the resolver
+    // budget.
+    let LiveRestore {
+        inserted,
+        to_resolve,
+        live_len: live_map_len,
+    } = NonceRegistry::global().restore_live(persisted);
     for (expected, workdir) in &to_resolve {
         expected.spawn_resolution(expectation_workdir(workdir));
     }
     // Honest counts: `inserted` is what the restore actually recovered,
     // `skipped` is the persisted entries a live mint already occupied (the
-    // `or_insert` no-op), and `live_map_len` is the map size afterwards — a
+    // vacant-only insert's no-op), and `live_map_len` is the map size afterwards — a
     // THIRD number that counts this process's own mints too.
     //
     // All three used to collapse into one on the way out: the return value was
@@ -4859,7 +5645,7 @@ fn register_session_proxy_nonce(workdir: &str, session_tenant: Option<Uuid>) -> 
 /// `workdir`. Unlike [`register_proxy_nonce`] this is NOT persisted (OQ3) — an
 /// agent nonce must hard-fail closed across a restart, which is automatic since
 /// [`persist_proxy_nonces`] drops non-device bindings. The per-request bearer
-/// comes from the agent's own [`AGENT_TOKENS`] slot, never the device JWT.
+/// comes from the agent's own [`AgentTokenRegistry`] slot, never the device JWT.
 ///
 /// `terminal_id: None` — a headless agent subprocess is spawned directly
 /// (`agent_runtime::run_agent_subprocess`), never through the PTY/terminal seam,
@@ -5029,98 +5815,33 @@ fn mint_and_register_nonce_with(
         (ProxyPrincipal::Device, true) => "ephemeral device mint (mint route)",
         (ProxyPrincipal::Agent { .. }, _) => "agent mint",
     };
-    let (snapshot, evicted_device, evicted_agent) = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // ONE pass does all pre-insert map maintenance (fused from three: an
-        // expired-ephemeral sweep, a graceable collect, and a persistent-eviction
-        // retain). The single `retain` closure decides removal AND collects the
-        // grace set into `evicted_graceable`, so the map is walked once under the
-        // lock. Semantics are byte-for-byte the prior three passes — see this
-        // fn's doc for the eviction rule.
-        let mut evicted_graceable: Vec<(String, NonceBinding)> = Vec::new();
-        let mut evicted_agent: Vec<(String, NonceBinding)> = Vec::new();
-        map.retain(|n, b| {
-            // (1) Sweep EVERY expired ephemeral, whatever its workdir/class.
-            // Because an ephemeral mint no longer evicts a prior same-workdir
-            // ephemeral, expired ones would otherwise be reaped only lazily on
-            // their own re-lookup ([`live_binding`]) — so a long-lived opted-in
-            // runner minting across many distinct cwds could grow the map
-            // unbounded. Cheap, bounded to mint frequency; never touches a
-            // persistent nonce (no expiry) nor an unexpired ephemeral.
-            if let NonceLifetime::Ephemeral { expires_at } = b.lifetime {
-                if expires_at <= now {
-                    return false;
-                }
-            }
-            // (2) Class- AND terminal-scoped eviction. Only a PERSISTENT mint
-            // evicts, and only the prior PERSISTENT nonces for the same workdir
-            // AND the same terminal (the PTY re-provision case — never an
-            // ephemeral, so the class-scoping holds). Adding the terminal to the
-            // key is what lets two terminals share a cwd without the second
-            // spawn 401ing the first one's live MCP client; with both sides
-            // `None` it is byte-for-byte the previous same-workdir rule. An
-            // EPHEMERAL mint evicts NOTHING: two DIFFERENT bare sessions routinely
-            // share a cwd, and an ephemeral eviction is not graced, so removing a
-            // sibling ephemeral nonce would 401 the other session's
-            // already-connected MCP client mid-session. The DEVICE nonces among
-            // the evicted set are collected to ride the device-evicted grace
-            // TTL (Change 3; widened by plan 2026-07-27 Phase 5/R3) — an
-            // in-flight client that cached one keeps validating until it
-            // reconnects; agent nonces are NOT graced (they hard-fail closed on
-            // re-mint), so they are dropped without being collected.
-            if !ephemeral
-                && b.workdir == workdir
-                && b.terminal_id.as_deref() == terminal_id
-                && !b.lifetime.is_ephemeral()
-            {
-                if b.principal == ProxyPrincipal::Device {
-                    evicted_graceable.push((n.clone(), b.clone()));
-                } else {
-                    evicted_agent.push((n.clone(), b.clone()));
-                }
-                return false;
-            }
-            true
-        });
-        map.insert(
-            nonce.clone(),
-            NonceBinding {
-                // Phase 3c: normalized at the MINT so `""` never enters the map
-                // and every downstream reader — rotation rows, the census, the
-                // reject attribution — sees one sentinel instead of two.
-                workdir: normalize_binding_workdir(workdir),
-                principal,
-                lifetime,
-                session_pin,
-                pin_origin,
-                // Frozen at mint time, exactly like `session_pin`. This is
-                // the deterministic leg of caller self-identification — see
-                // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
-                terminal_id: terminal_id.map(str::to_string),
-                minted_at: std::time::SystemTime::now(),
-                expected,
-            },
-        );
-        grace_evicted_device_nonces(&evicted_graceable);
-        // Phase 1d: the tombstone is what lets a later `reject` on either key
-        // name the workdir it belonged to and whether it was still graced.
-        record_nonce_tombstones(
-            &evicted_graceable,
-            TombstoneKind::Superseded,
-            true,
-            EVICT_CAUSE_REMINT,
-        );
-        record_nonce_tombstones(
-            &evicted_agent,
-            TombstoneKind::Superseded,
-            false,
-            EVICT_CAUSE_REMINT_AGENT,
-        );
-        (map.clone(), evicted_graceable, evicted_agent)
+    let binding = NonceBinding {
+        // Phase 3c: normalized at the MINT so `""` never enters the map
+        // and every downstream reader — rotation rows, the census, the
+        // reject attribution — sees one sentinel instead of two.
+        workdir: normalize_binding_workdir(workdir),
+        principal,
+        lifetime,
+        session_pin,
+        pin_origin,
+        // Frozen at mint time, exactly like `session_pin`. This is
+        // the deterministic leg of caller self-identification — see
+        // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
+        terminal_id: terminal_id.map(str::to_string),
+        minted_at: std::time::SystemTime::now(),
+        expected,
     };
+    // Insert, grace the evicted device keys and tombstone every evicted key in
+    // ONE critical section — see [`NonceState::insert_minted`] for the
+    // eviction rule.
+    let MintOutcome {
+        snapshot,
+        evicted_device,
+        evicted_agent,
+    } = NonceRegistry::global().insert_minted(&nonce, binding, workdir, terminal_id, now);
     // Rotation forensics (Phase 4/R6) — emitted AFTER the registry lock is
     // released (file I/O must never run under it). The "grace" lines live here
-    // rather than inside `grace_evicted_device_nonces` for the same reason:
+    // rather than inside `NonceState::grace_evicted` for the same reason:
     // both its callers invoke it under the registry lock, atomically with the
     // eviction, and moving the grace insert outside the lock would open a
     // window where an in-flight request finds its nonce neither live nor
@@ -5199,60 +5920,15 @@ pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
     const CAUSE_EPHEMERAL: &str =
         "per-session workdir closed (ephemeral — never graced, kill switch stays enforceable)";
     const CAUSE_AGENT: &str = "per-session workdir closed (agent — fails closed, never graced)";
-    let (snapshot, evicted_device, evicted_ephemeral, evicted_agent) = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let evicted_device: Vec<(String, NonceBinding)> = map
-            .iter()
-            .filter(|(_, b)| {
-                b.workdir == workdir
-                    && b.principal == ProxyPrincipal::Device
-                    && !b.lifetime.is_ephemeral()
-            })
-            .map(|(n, b)| (n.clone(), b.clone()))
-            .collect();
-        if evicted_device.is_empty() && !map.values().any(|b| b.workdir == workdir) {
-            return; // nothing bound to this workdir — skip the persist write
-        }
-        let evicted_ephemeral: Vec<(String, NonceBinding)> = map
-            .iter()
-            .filter(|(_, b)| {
-                b.workdir == workdir
-                    && b.principal == ProxyPrincipal::Device
-                    && b.lifetime.is_ephemeral()
-            })
-            .map(|(n, b)| (n.clone(), b.clone()))
-            .collect();
-        let evicted_agent: Vec<(String, NonceBinding)> = map
-            .iter()
-            .filter(|(_, b)| b.workdir == workdir && b.principal != ProxyPrincipal::Device)
-            .map(|(n, b)| (n.clone(), b.clone()))
-            .collect();
-        map.retain(|_, b| b.workdir != workdir);
-        grace_evicted_device_nonces(&evicted_device);
-        record_nonce_tombstones(
-            &evicted_device,
-            TombstoneKind::Superseded,
-            true,
-            CAUSE_DEVICE,
-        );
-        record_nonce_tombstones(
-            &evicted_ephemeral,
-            TombstoneKind::Superseded,
-            false,
-            CAUSE_EPHEMERAL,
-        );
-        record_nonce_tombstones(
-            &evicted_agent,
-            TombstoneKind::Superseded,
-            false,
-            CAUSE_AGENT,
-        );
-        (
-            map.clone(),
-            evicted_device,
-            evicted_ephemeral,
-            evicted_agent,
-        )
+    // Removal, grace and tombstones in ONE critical section.
+    let Some(WorkdirEviction {
+        snapshot,
+        device: evicted_device,
+        ephemeral: evicted_ephemeral,
+        agent: evicted_agent,
+    }) = NonceRegistry::global().evict_workdir(workdir, CAUSE_DEVICE, CAUSE_EPHEMERAL, CAUSE_AGENT)
+    else {
+        return; // nothing bound to this workdir — skip the persist write
     };
     // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
     let grace_cause = rotation_grace_cause();
@@ -5320,42 +5996,18 @@ pub(crate) fn terminal_id_for_nonce(nonce: &str) -> Option<String> {
 ///   live session's identity, whereas evicting would kill it permanently (the
 ///   MCP client never re-reads its config, so it could never pick up a re-mint).
 ///
-/// The map lock is released before the gate's filesystem check — a proxy request
-/// must never hold the registry lock across I/O.
+/// The registry lock is released before the gate's filesystem check — a proxy
+/// request must never hold the registry lock across I/O.
 fn live_binding(nonce: &str) -> Option<NonceBinding> {
-    if nonce.is_empty() {
-        return None;
-    }
-    let binding = proxy_nonces()
-        .lock()
-        .expect("proxy nonce map poisoned")
-        .get(nonce)
-        .cloned()?;
-    match binding.lifetime {
-        NonceLifetime::Persistent => Some(binding),
-        NonceLifetime::Ephemeral { expires_at } => {
-            if expires_at <= std::time::Instant::now() {
-                proxy_nonces()
-                    .lock()
-                    .expect("proxy nonce map poisoned")
-                    .remove(nonce);
-                return None;
-            }
-            session_identity_marker_present().then_some(binding)
-        }
-    }
+    NonceRegistry::global().live_binding(nonce)
 }
 
 /// True iff `nonce` is a currently-registered AND currently-valid per-session
 /// proxy key ([`live_binding`] — expiry + revocation applied) OR a DEVICE nonce
-/// still inside its post-eviction grace TTL (Change 3). The live-map lock is
-/// taken and released before the grace check so the two maps are never held at
-/// once.
+/// still inside its post-eviction grace TTL (Change 3). Both maps are read
+/// under the registry's one lock ([`NonceRegistry::is_valid`]).
 pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
-    if nonce.is_empty() {
-        return false;
-    }
-    live_binding(nonce).is_some() || graced_nonce_is_valid(nonce)
+    NonceRegistry::global().is_valid(nonce)
 }
 
 /// Resolve the [`ProxyPrincipal`] a registered nonce is bound to. `None` for an
@@ -5364,15 +6016,11 @@ pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
 /// chosen by the binding (device JWT vs the agent's own JWT) rather than the
 /// other way around.
 pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
-    if nonce.is_empty() {
-        return None;
-    }
-    let live = live_binding(nonce).map(|b| b.principal);
     // Grace fallback (Change 3): only DEVICE nonces are ever graced, so a graced
     // hit resolves to a Device principal — the handler then injects the live
     // device JWT and `proxy_request_gate` still enforces device-nonce ⇒
     // device-bearer (no scope-elevation surface).
-    live.or_else(|| graced_nonce_is_valid(nonce).then_some(ProxyPrincipal::Device))
+    NonceRegistry::global().principal_for(nonce)
 }
 
 /// The typed pin a DEVICE proxy nonce was provisioned under.
@@ -5386,19 +6034,7 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
 /// whether it may proceed at all. Only a binding minted on a machine that could
 /// not state its tenant reads `Unresolvable`.
 pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant_pin::TenantPin {
-    use crate::session::tenant_pin::TenantPin;
-    if let Some(binding) = live_binding(nonce) {
-        return binding.session_pin;
-    }
-    let now = std::time::Instant::now();
-    graced_nonces()
-        .lock()
-        .expect("graced nonce map poisoned")
-        .get(nonce)
-        .filter(|g| g.expires_at > now)
-        .and_then(|g| g.session_tenant)
-        .map(TenantPin::Pinned)
-        .unwrap_or(TenantPin::Unpinned)
+    NonceRegistry::global().session_pin_for(nonce)
 }
 
 /// How this process's live DEVICE coord-mcp keys hold their tenant — the
@@ -5412,7 +6048,7 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
 /// declares a tenant, which this census does not read (it would mean a file
 /// read per binding), so `follows_machine_pin` is an upper bound.
 ///
-/// Graced keys count too. A device key evicted into [`graced_nonces`] — the
+/// Graced keys count too. A device key evicted into the grace map — the
 /// normal path whenever a second session or terminal re-mints `.mcp.json` in
 /// the same cwd — keeps serving requests for [`DEVICE_EVICTED_NONCE_GRACE_TTL`]
 /// (hours, not moments), and [`proxy_session_pin_for_nonce`] resolves it
@@ -5470,20 +6106,11 @@ fn device_session_pin_census_over<'a>(
     census
 }
 
-/// [`device_session_pin_census_over`] the process-global registries. The live
-/// map is snapshotted (cloned) under its lock and released BEFORE the graced
-/// lock is taken, so the two locks are never nested; the snapshot is what lets
-/// a graced key that is also live be counted once.
+/// [`device_session_pin_census_over`] the process-global registry, both maps
+/// read under its one lock (a pure count, no I/O), so a graced key that is also
+/// live is counted once against a consistent view.
 pub(crate) fn device_session_pin_census() -> DeviceSessionPinCensus {
-    let now = std::time::Instant::now();
-    let live: Vec<(String, NonceBinding)> = proxy_nonces()
-        .lock()
-        .expect("proxy nonce map poisoned")
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let graced = graced_nonces().lock().expect("graced nonce map poisoned");
-    device_session_pin_census_over(live.iter().map(|(k, v)| (k, v)), graced.iter(), now)
+    NonceRegistry::global().device_session_pin_census()
 }
 
 #[cfg(test)]
@@ -5590,7 +6217,7 @@ mod device_session_pin_census_tests {
         let pinned_key = format!("census-g-pinned-{}", Uuid::now_v7().simple());
         let unpinned_key = format!("census-g-unpinned-{}", Uuid::now_v7().simple());
         {
-            let mut map = graced_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_graced();
             map.insert(pinned_key.clone(), graced(later, Some(t)));
             map.insert(unpinned_key.clone(), graced(later, None));
         }
@@ -5603,7 +6230,7 @@ mod device_session_pin_census_tests {
             TenantPin::Unpinned
         );
         {
-            let mut map = graced_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_graced();
             map.remove(&pinned_key);
             map.remove(&unpinned_key);
         }
@@ -7055,41 +7682,15 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
     if nonce.is_empty() {
         return;
     }
-    // Capture the revoked binding's workdir under the lock so the forensics
-    // line below can name it — after the lock is released (file I/O).
-    let (snapshot, revoked_binding) = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        match map.remove(nonce) {
-            None => (None, None),
-            Some(b) => (Some(map.clone()), Some(b)),
-        }
-    };
-    let graced_removed = graced_nonces()
-        .lock()
-        .expect("graced nonce map poisoned")
-        .remove(nonce);
-    if let Some(b) = &revoked_binding {
-        record_nonce_tombstones(
-            std::slice::from_ref(&(nonce.to_string(), b.clone())),
-            TombstoneKind::Revoked,
-            false,
-            "explicit revoke",
-        );
-    } else if let Some(g) = &graced_removed {
-        // The binding is long gone; the grace entry still knows the workdir.
-        record_nonce_tombstone(
-            nonce,
-            NonceTombstone {
-                workdir: g.workdir.clone(),
-                terminal_id: g.terminal_id.clone(),
-                principal: "device",
-                kind: TombstoneKind::Revoked,
-                evicted_at: std::time::SystemTime::now(),
-                grace_until: None,
-                cause: "explicit revoke (grace registry only)".to_string(),
-            },
-        );
-    }
+    // Live removal, grace removal and the tombstone are ONE critical section
+    // ([`NonceRegistry::revoke`]); the revoked binding's workdir rides out so
+    // the forensics line below can name it — after the lock is released (file
+    // I/O).
+    let NonceRevocation {
+        binding: revoked_binding,
+        graced: graced_removed,
+        snapshot,
+    } = NonceRegistry::global().revoke(nonce);
     let revoked_workdir = revoked_binding.map(|b| b.workdir);
     let graced_removed = graced_removed.is_some();
     // Rotation forensics (Phase 3): an explicit revoke is the one way a key
@@ -7128,69 +7729,13 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
 /// already panic-free in production (the census gate treats a poisoned lock as
 /// "emit", and the rotation-log write is best-effort).
 pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
-    revoke_agent_proxy_nonces_in(proxy_nonces(), agent_id);
-}
-
-/// [`revoke_agent_proxy_nonces`] over an explicit nonce map — the seam
-/// `agent_runtime::AgentRunTeardown` drops through, so its poison test can drive
-/// the full revoke (census and forensics included) against a poisoned LOCAL map.
-pub(crate) fn revoke_agent_proxy_nonces_in(
-    map: &Mutex<HashMap<String, NonceBinding>>,
-    agent_id: Uuid,
-) {
-    // Collect (nonce, binding) and record their tombstones under the lock;
-    // emit the forensics lines after releasing it (`log_rotation_event` does
-    // file I/O).
-    let cause = format!("agent teardown (agent {agent_id} — never graced, never persisted)");
-    let (revoked, remaining) = take_agent_proxy_nonces_in(map, agent_id, &cause);
-    note_agent_binding_census(&remaining);
-    for (nonce, b) in &revoked {
-        log_rotation_event("revoke", &b.workdir, nonce, &cause);
-    }
-    if !revoked.is_empty() {
-        info!(
-            "coord_mcp: revoked {} agent proxy nonce(s) for agent {agent_id}",
-            revoked.len()
-        );
-    }
-}
-
-/// The under-lock half of [`revoke_agent_proxy_nonces`], over an explicit map:
-/// removes every binding owned by `agent_id`, records their tombstones under
-/// the registry lock (the lock order everywhere is registry → grace →
-/// tombstones), and returns the removed `(nonce, binding)` pairs plus a
-/// snapshot of the survivors. Poison-tolerant, because launch teardown reaches
-/// it during a panic unwind. The seam its poison test uses, so the test never
-/// poisons the process-global map other tests `expect` on.
-#[allow(clippy::type_complexity)]
-fn take_agent_proxy_nonces_in(
-    map: &Mutex<HashMap<String, NonceBinding>>,
-    agent_id: Uuid,
-    cause: &str,
-) -> (Vec<(String, NonceBinding)>, HashMap<String, NonceBinding>) {
-    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut revoked = Vec::new();
-    map.retain(|n, b| {
-        if b.principal == (ProxyPrincipal::Agent { agent_id }) {
-            revoked.push((n.clone(), b.clone()));
-            return false;
-        }
-        true
-    });
-    record_nonce_tombstones(&revoked, TombstoneKind::Revoked, false, cause);
-    // Clone the surviving map for the census. Teardown does NOT go through
-    // `persist_proxy_nonces` (agent nonces are never persisted), so without
-    // this the newest census would keep naming bindings that are already
-    // gone — and the boot readback would then classify torn-down sessions.
-    // Same clone-a-snapshot idiom as `mint_and_register_nonce`, on a path
-    // that fires once per agent teardown.
-    (revoked, map.clone())
+    NonceRegistry::global().revoke_agent_proxy_nonces(agent_id);
 }
 
 /// Round-4 review: the teardown-reached lock helpers survive a POISONED lock.
-/// They take an explicit map so these tests poison a LOCAL mutex — poisoning
-/// the process-global maps would break every parallel test that `expect`s on
-/// them.
+/// They run on a registry INSTANCE so these tests poison a LOCAL registry's
+/// mutex — poisoning the process-global registry would leak into every
+/// parallel test that reads it.
 #[cfg(test)]
 pub(crate) mod teardown_poison_tests {
     use super::*;
@@ -7246,16 +7791,16 @@ pub(crate) mod teardown_poison_tests {
 
     #[test]
     fn remove_agent_token_in_tolerates_a_poisoned_map() {
-        let map: Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> = Mutex::new(HashMap::new());
-        poison(&map);
-        remove_agent_token_in(&map, Uuid::now_v7());
+        let registry = AgentTokenRegistry::new();
+        poison(registry.test_mutex());
+        registry.remove(Uuid::now_v7());
     }
 
     #[test]
     fn take_agent_proxy_nonces_in_tolerates_a_poisoned_map() {
-        let map: Mutex<HashMap<String, NonceBinding>> = Mutex::new(HashMap::new());
-        poison(&map);
-        let (revoked, remaining) = take_agent_proxy_nonces_in(&map, Uuid::now_v7(), "test");
+        let registry = NonceRegistry::new();
+        poison(registry.test_mutex());
+        let (revoked, remaining) = registry.take_agent_proxy_nonces(Uuid::now_v7(), "test");
         assert!(revoked.is_empty());
         assert!(remaining.is_empty());
     }
@@ -7267,13 +7812,12 @@ pub(crate) mod teardown_poison_tests {
     /// process-global one is read by the reject path and other tests.
     #[test]
     fn record_nonce_tombstone_in_tolerates_a_poisoned_map_during_an_unwind() {
-        let map: Mutex<HashMap<String, NonceTombstone>> = Mutex::new(HashMap::new());
-        poison(&map);
-        struct RecordOnDrop<'a>(&'a Mutex<HashMap<String, NonceTombstone>>);
+        let registry = NonceRegistry::new();
+        poison(registry.test_mutex());
+        struct RecordOnDrop<'a>(&'a NonceRegistry);
         impl Drop for RecordOnDrop<'_> {
             fn drop(&mut self) {
-                record_nonce_tombstone_in(
-                    self.0,
+                self.0.record_tombstone(
                     "poisoned-tombstone-nonce",
                     NonceTombstone {
                         workdir: "/tmp/poisoned-tombstone".to_string(),
@@ -7288,7 +7832,7 @@ pub(crate) mod teardown_poison_tests {
             }
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = RecordOnDrop(&map);
+            let _guard = RecordOnDrop(&registry);
             panic!("simulated teardown panic");
         }));
         assert!(
@@ -7296,20 +7840,11 @@ pub(crate) mod teardown_poison_tests {
             "the panic propagates; the drop did not abort"
         );
         assert!(
-            map.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key("poisoned-tombstone-nonce"),
+            registry
+                .test_snapshot()
+                .tombstone_contains("poisoned-tombstone-nonce"),
             "the tombstone is recorded through the poisoned lock"
         );
-    }
-
-    /// Removes one tombstone from the process-global map, so a test that drives
-    /// a real revoke leaves nothing behind.
-    pub(crate) fn remove_global_tombstone(nonce: &str) {
-        nonce_tombstones()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(nonce);
     }
 }
 
@@ -7341,29 +7876,15 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
             return;
         }
     }
-    let (revoked_bindings, snapshot) = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // The terminal id rides along so the forensics line below can carry the
-        // Phase 4 join key. Resolved HERE because the binding is gone from the
-        // map the moment `retain` returns — a later `terminal_id_for_nonce`
-        // would find nothing and report every session-close revoke as unknown.
-        let mut revoked_bindings: Vec<(String, NonceBinding)> = Vec::new();
-        map.retain(|n, b| {
-            if b.workdir == workdir {
-                revoked_bindings.push((n.clone(), b.clone()));
-                return false;
-            }
-            true
-        });
-        record_nonce_tombstones(
-            &revoked_bindings,
-            TombstoneKind::Revoked,
-            false,
-            "session close (last open session for this workdir)",
-        );
-        let snapshot = (!revoked_bindings.is_empty()).then(|| map.clone());
-        (revoked_bindings, snapshot)
-    };
+    // Removal and tombstones in ONE critical section. The terminal id rides
+    // along in each removed binding so the forensics line below can carry the
+    // Phase 4 join key — the binding is gone from the map the moment the
+    // removal returns, so a later `terminal_id_for_nonce` would find nothing
+    // and report every session-close revoke as unknown.
+    let (revoked_bindings, snapshot) = NonceRegistry::global().release_workdir(
+        workdir,
+        "session close (last open session for this workdir)",
+    );
     let revoked = revoked_bindings.len();
     // Rotation forensics: session close is the LARGEST revoke path in
     // production, and until now the only one that emitted nothing. Plan
@@ -7698,7 +8219,7 @@ pub(crate) async fn read_usable_device_jwt_for(tenant: Option<Uuid>) -> Option<S
 /// tightly-bounded [`DEVICE_JWT_REMINT_WAIT`] for a usable JWT to appear.
 /// Returns the fresh token if one re-mints within the bound, else `None` (the
 /// caller then degrades to [`device_jwt_refreshing_error`]). Agent-bound proxy
-/// requests do NOT use this — they refresh via their own `AGENT_TOKENS` slot.
+/// requests do NOT use this — they refresh via their own `AgentTokenRegistry` slot.
 pub(crate) async fn await_device_jwt_remint() -> Option<String> {
     await_device_jwt_remint_for(None).await
 }
@@ -7994,13 +8515,9 @@ fn carried_pin_for_rewrite(old_nonce: Option<&str>) -> MintPin {
             _ => MintPin::MachineNow,
         };
     }
-    let now = std::time::Instant::now();
-    graced_nonces()
-        .lock()
-        .expect("graced nonce map poisoned")
-        .get(old)
-        .filter(|g| g.expires_at > now)
-        .and_then(|g| g.session_tenant.map(|t| MintPin::Carried(t, g.pin_origin)))
+    NonceRegistry::global()
+        .graced_pin(old)
+        .map(|(t, origin)| MintPin::Carried(t, origin))
         .unwrap_or(MintPin::MachineNow)
 }
 
@@ -8704,7 +9221,7 @@ fn note_stdio_fall_open(workdir: &str, nonce: &str, reason: &str) {
 /// [`write_coord_mcp_proxy_config`] (loopback proxy URL on the bound port + a
 /// per-session nonce header, NO baked bearer), but the nonce is bound to
 /// [`ProxyPrincipal::Agent`] for `agent_id` — so the proxy injects THAT agent's
-/// own refreshed JWT (from [`AGENT_TOKENS`]) per request, never the device JWT.
+/// own refreshed JWT (from [`AgentTokenRegistry`]) per request, never the device JWT.
 /// This is what lets an agent session outlive the 4h agent-JWT TTL (the static
 /// bake at the old spawn site silently lost coord-mcp at expiry).
 ///
@@ -9363,18 +9880,15 @@ pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
 ) {
     // Resolve the nonce we just wrote for this workdir so the probe authenticates
     // exactly as the session's MCP client will.
-    let nonce = {
-        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // The RUNNER-SPAWN nonce specifically: the caller just wrote one for
-        // this workdir, and a bare session may hold an ephemeral nonce for the
-        // same cwd. Probing with the ephemeral one would make this probe's
-        // verdict depend on the opt-in marker — and a revoked ephemeral nonce
-        // would 401, dropping a bogus "UNREACHABLE" breadcrumb into the user's
-        // cwd for a config that is in fact healthy.
-        map.iter()
-            .find(|(_, b)| b.workdir.as_str() == workdir && !b.lifetime.is_ephemeral())
-            .map(|(n, _)| n.clone())
-    };
+    //
+    // The RUNNER-SPAWN nonce specifically: the caller just wrote one for this
+    // workdir, and a bare session may hold an ephemeral nonce for the same cwd.
+    // Probing with the ephemeral one would make this probe's verdict depend on
+    // the opt-in marker — and a revoked ephemeral nonce would 401, dropping a
+    // bogus "UNREACHABLE" breadcrumb into the user's cwd for a config that is
+    // in fact healthy.
+    let nonce = NonceRegistry::global()
+        .find_live_nonce(|b| b.workdir.as_str() == workdir && !b.lifetime.is_ephemeral());
     let Some(nonce) = nonce else {
         return; // no nonce → nothing to probe against (already handled upstream)
     };
@@ -10747,16 +11261,9 @@ enum SessionNonce {
 }
 
 fn session_nonce(terminal_id: &str, workdir: Option<&str>) -> SessionNonce {
-    let terminal_nonce = {
-        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        map.iter()
-            .filter(|(_, b)| {
-                b.terminal_id.as_deref() == Some(terminal_id)
-                    && b.principal == ProxyPrincipal::Device
-            })
-            .max_by(|(na, a), (nb, b)| a.minted_at.cmp(&b.minted_at).then_with(|| na.cmp(nb)))
-            .map(|(n, _)| n.clone())
-    };
+    let terminal_nonce = NonceRegistry::global().newest_live_nonce(|b| {
+        b.terminal_id.as_deref() == Some(terminal_id) && b.principal == ProxyPrincipal::Device
+    });
     if let Some(nonce) = terminal_nonce {
         return SessionNonce::Nonce(Some(nonce));
     }
@@ -11819,64 +12326,42 @@ fn adopt_on_disk_nonce(
     // No settle hook: this function deliberately never persists (see its
     // tail). The expectation is re-derived with the binding on the next boot.
     let expected_for_resolution = expected.clone();
-    let evicted = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // Persistent AND terminal-less only — an adopted nonce came from a
-        // runner-written `.mcp.json`, and must NOT evict a bare session's
-        // ephemeral nonce for the same workdir (the class-scoping rationale in
-        // `mint_and_register_nonce`) nor a live TERMINAL's per-terminal nonce
-        // for it (the same rationale applied to the terminal key: the adopted
-        // nonce replaces the shared `.mcp.json` credential, which is the
-        // terminal-less one). Byte-for-byte the previous behavior before
-        // per-terminal nonces existed, when every persistent binding was
-        // terminal-less.
-        let mut evicted: Vec<String> = Vec::new();
-        map.retain(|n, b| {
-            if b.workdir == workdir && b.terminal_id.is_none() && !b.lifetime.is_ephemeral() {
-                evicted.push(n.clone());
-                return false;
-            }
-            true
-        });
-        map.insert(
-            nonce.to_string(),
-            NonceBinding {
-                // Phase 3c: the third and last entry point into the map.
-                workdir: normalize_binding_workdir(workdir),
-                principal: ProxyPrincipal::Device,
-                lifetime: NonceLifetime::Persistent,
-                // PROVENANCE TELEMETRY (Phase 1d), same as the restore path
-                // above. A `.mcp.json` stores only URL + nonce, so the session's
-                // own tenant is unrecoverable; what IS knowable is the machine's
-                // pin at adopt time, and since Phase 1b stripped this field of
-                // its authority over credential selection, recording that is
-                // honest rather than load-bearing. The bearer for an adopted
-                // nonce is resolved at request time by
-                // `session_tenant_or_refuse`, exactly as for a freshly-minted
-                // one.
-                //
-                // `principal: ProxyPrincipal::Device` above is UNCHANGED and
-                // must stay that way — `58414a05d` hardened the emitter side so
-                // an agent-scoped config is not adoptable as Device, and this
-                // field is the consumer half of that pair.
-                session_pin: adopt_pin,
-                pin_origin: PinOrigin::MachineSampled,
-                // Same reason for the terminal: a `.mcp.json` carries only URL
-                // + nonce, so the terminal the file was originally provisioned
-                // for is unrecoverable — and that terminal's PTY died with the
-                // previous runner anyway. Caller self-identification falls back
-                // to the workdir leg for an adopted nonce.
-                terminal_id: None,
-                // NOT `now()` — see this function's doc comment. The age comes
-                // from the `.mcp.json` the nonce was read from, so an adopted
-                // binding never outranks a genuinely newer one in the persisted
-                // set's newest-first cut.
-                minted_at,
-                expected,
-            },
-        );
-        evicted
+    let binding = NonceBinding {
+        // Phase 3c: the third and last entry point into the map.
+        workdir: normalize_binding_workdir(workdir),
+        principal: ProxyPrincipal::Device,
+        lifetime: NonceLifetime::Persistent,
+        // PROVENANCE TELEMETRY (Phase 1d), same as the restore path
+        // above. A `.mcp.json` stores only URL + nonce, so the session's
+        // own tenant is unrecoverable; what IS knowable is the machine's
+        // pin at adopt time, and since Phase 1b stripped this field of
+        // its authority over credential selection, recording that is
+        // honest rather than load-bearing. The bearer for an adopted
+        // nonce is resolved at request time by
+        // `session_tenant_or_refuse`, exactly as for a freshly-minted
+        // one.
+        //
+        // `principal: ProxyPrincipal::Device` above is UNCHANGED and
+        // must stay that way — `58414a05d` hardened the emitter side so
+        // an agent-scoped config is not adoptable as Device, and this
+        // field is the consumer half of that pair.
+        session_pin: adopt_pin,
+        pin_origin: PinOrigin::MachineSampled,
+        // Same reason for the terminal: a `.mcp.json` carries only URL
+        // + nonce, so the terminal the file was originally provisioned
+        // for is unrecoverable — and that terminal's PTY died with the
+        // previous runner anyway. Caller self-identification falls back
+        // to the workdir leg for an adopted nonce.
+        terminal_id: None,
+        // NOT `now()` — see this function's doc comment. The age comes
+        // from the `.mcp.json` the nonce was read from, so an adopted
+        // binding never outranks a genuinely newer one in the persisted
+        // set's newest-first cut.
+        minted_at,
+        expected,
     };
+    // Eviction and insert in ONE critical section — see [`NonceState::adopt`].
+    let evicted = NonceRegistry::global().adopt(workdir, nonce, binding);
     // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
     for n in &evicted {
         log_rotation_event(
@@ -12579,11 +13064,10 @@ pub(crate) fn sweep_stale_breadcrumbs_once(bound_port: u16) -> usize {
     // Collect under the lock and probe OUTSIDE it: the probe re-locks the same
     // map to resolve the workdir's nonce.
     let workdirs: Vec<String> = {
-        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         let mut seen = std::collections::HashSet::new();
-        map.values()
-            .filter(|b| !b.lifetime.is_ephemeral())
-            .map(|b| b.workdir.clone())
+        NonceRegistry::global()
+            .live_workdirs(|b| !b.lifetime.is_ephemeral())
+            .into_iter()
             .filter(|w| seen.insert(workdir_census_key(w)))
             .collect()
     };
@@ -13129,6 +13613,265 @@ mod tests {
         assert!(secret_eq(b"", b""));
     }
 
+    /// A PERSISTENT device binding for the registry tests below. Persistent so
+    /// that validity never consults the session-identity marker (a filesystem
+    /// stat that would make the answer depend on the machine).
+    fn registry_test_binding(workdir: &str) -> NonceBinding {
+        NonceBinding {
+            workdir: workdir.to_string(),
+            principal: ProxyPrincipal::Device,
+            lifetime: NonceLifetime::Persistent,
+            session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+            pin_origin: PinOrigin::MachineSampled,
+            terminal_id: None,
+            minted_at: std::time::SystemTime::now(),
+            expected: Default::default(),
+        }
+    }
+
+    /// Plan `2026-10-04-runner-coord-mcp-rs-holds-twenty-responsibilities-
+    /// behind-shared-nonce-statics` Phase 1. A revoke used to take the live
+    /// lock, release it, then take the grace lock — so a nonce present in BOTH
+    /// maps still validated through the grace arm between the two steps. With
+    /// one registry lock, [`NonceState::revoke`] clears both maps in one call.
+    /// Deterministic rather than racing a validator thread: a few-instruction
+    /// window is not a reliable oracle, so the structure is what is pinned —
+    /// here by effect, and by
+    /// `nonce_registry_has_one_lock_and_is_the_only_owner_of_the_maps` by
+    /// source.
+    #[test]
+    fn revoke_removes_live_and_graced_in_one_critical_section() {
+        let registry = NonceRegistry::new();
+        let nonce = "registry-test-live-and-graced";
+        let binding = registry_test_binding("/registry-test/revoke");
+        registry
+            .test_live()
+            .insert(nonce.to_string(), binding.clone());
+        registry
+            .state()
+            .grace_evicted(&[(nonce.to_string(), binding)]);
+        let before = registry.test_snapshot();
+        assert!(
+            before.live_contains(nonce) && before.graced_contains(nonce),
+            "precondition: the nonce is both live and graced"
+        );
+
+        let revoked = registry.revoke(nonce);
+        assert!(revoked.binding.is_some(), "the live binding was removed");
+        assert!(revoked.graced.is_some(), "the grace entry was removed");
+        assert!(
+            revoked.snapshot.is_some(),
+            "a live removal yields a snapshot to persist"
+        );
+
+        let after = registry.test_snapshot();
+        assert!(
+            !after.live_contains(nonce) && !after.graced_contains(nonce),
+            "one snapshot shows the nonce gone from BOTH maps"
+        );
+        assert!(after.tombstone_contains(nonce), "the revoke is tombstoned");
+        assert!(!registry.is_valid(nonce), "a revoked nonce never validates");
+    }
+
+    /// [`NonceRegistry::is_valid`] reads both maps: a live-only and a
+    /// graced-only nonce each validate, an unknown one does not, and neither
+    /// validates once revoked.
+    #[test]
+    fn registry_is_valid_sees_live_and_graced_and_nothing_after_revoke() {
+        let registry = NonceRegistry::new();
+        let live_only = "registry-test-live-only";
+        let graced_only = "registry-test-graced-only";
+        registry.test_live().insert(
+            live_only.to_string(),
+            registry_test_binding("/registry-test/live"),
+        );
+        registry.state().grace_evicted(&[(
+            graced_only.to_string(),
+            registry_test_binding("/registry-test/graced"),
+        )]);
+        let snapshot = registry.test_snapshot();
+        assert!(snapshot.live_contains(live_only) && !snapshot.graced_contains(live_only));
+        assert!(snapshot.graced_contains(graced_only) && !snapshot.live_contains(graced_only));
+
+        assert!(registry.is_valid(live_only), "a live-only nonce validates");
+        assert!(
+            registry.is_valid(graced_only),
+            "a graced-only nonce validates"
+        );
+        assert!(!registry.is_valid("registry-test-neither"));
+        assert!(!registry.is_valid(""), "the empty nonce never validates");
+
+        registry.revoke(live_only);
+        registry.revoke(graced_only);
+        assert!(!registry.is_valid(live_only), "revoked live nonce");
+        assert!(!registry.is_valid(graced_only), "revoked graced nonce");
+    }
+
+    /// The production lines of `src` with every `#[cfg(test)]` item removed
+    /// (brace-depth tracked) and whole-line comments dropped.
+    fn production_source(src: &str) -> String {
+        let mut out = String::new();
+        let mut depth: i64 = 0;
+        let mut pending = false;
+        let mut skip_to: Option<i64> = None;
+        for raw in src.lines() {
+            let t = raw.trim_start();
+            let comment = t.starts_with("//");
+            if !comment && t.starts_with("#[cfg(test)]") && skip_to.is_none() {
+                pending = true;
+            }
+            if skip_to.is_none() && !pending && !comment {
+                out.push_str(raw);
+                out.push('\n');
+            }
+            if comment {
+                continue;
+            }
+            let opens = raw.matches('{').count() as i64;
+            let closes = raw.matches(char::from(0x7d)).count() as i64;
+            if pending && skip_to.is_none() {
+                if opens > 0 {
+                    skip_to = Some(depth);
+                    pending = false;
+                } else if t.ends_with(';') {
+                    // A `#[cfg(test)]` on a one-line item (`use …;`).
+                    pending = false;
+                    depth += opens - closes;
+                    continue;
+                }
+            }
+            depth += opens - closes;
+            if let Some(d) = skip_to {
+                if depth <= d {
+                    skip_to = None;
+                }
+            }
+        }
+        out
+    }
+
+    /// The body of the item whose signature line starts with `signature`, up to
+    /// its closing brace at `indent`.
+    fn item_body<'a>(src: &'a str, signature: &str, indent: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` exists"));
+        let close = format!("\n{indent}{}\n", char::from(0x7d));
+        let end = src[start..]
+            .find(&close)
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("`{signature}` has a body"));
+        &src[start..end]
+    }
+
+    /// Phase 1 source guard: the nonce maps have ONE owner behind ONE lock.
+    ///
+    /// (a) `NonceRegistry::revoke` and `NonceRegistry::is_valid` each take the
+    /// registry lock exactly once, the registry's impl locks its mutex in
+    /// exactly one place (the poison-recovering accessor), and
+    /// `NonceState::revoke` clears both the live and the grace map — so a
+    /// revoke, and a validity read, are each one critical section. Splitting
+    /// either into two `state()` calls turns this red.
+    ///
+    /// (b) No production code outside the registry owns a nonce map: there is
+    /// exactly one `Mutex<NonceState>`, no `Mutex` around a nonce-keyed map,
+    /// no `static` typed with a nonce value, and the grace and tombstone maps
+    /// are spelled only inside `NonceState`. The live map's TYPE still appears
+    /// as an owned snapshot in the persist/census signatures and the
+    /// transitions' `snapshot` return fields (a clone, never a second owner),
+    /// so for it the guard pins the FIELD: one `live:` field, inside
+    /// `NonceState`.
+    #[test]
+    fn nonce_registry_has_one_lock_and_is_the_only_owner_of_the_maps() {
+        let full = include_str!("coord_mcp.rs");
+        let prod = production_source(full);
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+
+        // (a) one lock per transition.
+        for signature in [
+            "    fn revoke(&self, nonce: &str) -> NonceRevocation {",
+            "    pub(crate) fn is_valid(&self, nonce: &str) -> bool {",
+        ] {
+            let body = item_body(&prod, signature, "    ");
+            assert_eq!(
+                body.matches("self.state()").count(),
+                1,
+                "`{signature}` must take the registry lock exactly once:\n{body}"
+            );
+            assert!(
+                !body.contains(".lock()"),
+                "`{signature}` locks only via state()"
+            );
+        }
+        let state_revoke = item_body(&prod, "    fn revoke(&mut self, nonce: &str)", "    ");
+        assert!(
+            state_revoke.contains("self.live.remove(nonce)")
+                && state_revoke.contains("self.graced.remove(nonce)"),
+            "NonceState::revoke clears the live AND the grace map:\n{state_revoke}"
+        );
+        let registry_impl = item_body(&prod, "impl NonceRegistry {", "");
+        assert_eq!(
+            squash(registry_impl).matches(".lock()").count(),
+            1,
+            "NonceRegistry locks its mutex in exactly one accessor"
+        );
+        assert!(
+            squash(registry_impl).contains("unwrap_or_else(std::sync::PoisonError::into_inner)"),
+            "and that accessor recovers a poisoned lock"
+        );
+
+        // (b) one owner of the maps.
+        let prod_squashed = squash(&prod);
+        assert_eq!(prod_squashed.matches("Mutex<NonceState>").count(), 1);
+        for value in ["NonceBinding", "GracedNonce", "NonceTombstone"] {
+            let needle = format!("Mutex<HashMap<String,{value}>>");
+            assert_eq!(
+                prod_squashed.matches(&needle).count(),
+                0,
+                "a raw `{needle}` is a second owner of a nonce map"
+            );
+            let statics: Vec<&str> = prod
+                .lines()
+                .filter(|l| l.trim_start().starts_with("static ") && l.contains(value))
+                .collect();
+            assert!(
+                statics.is_empty(),
+                "a static holds a nonce map: {statics:?}"
+            );
+        }
+        let state_def = item_body(&prod, "pub(crate) struct NonceState {", "");
+        for (value, field) in [("GracedNonce", "graced"), ("NonceTombstone", "tombstones")] {
+            let needle = format!("HashMap<String,{value}>");
+            assert_eq!(
+                prod_squashed.matches(&needle).count(),
+                1,
+                "`{needle}` is spelled only by the `{field}` field of NonceState"
+            );
+            assert!(squash(state_def).contains(&format!("{field}:{needle},")));
+        }
+        // A `snapshot` field is the post-transition CLONE a transition hands
+        // back for the persist write (`MintOutcome`, `WorkdirEviction`) — a
+        // return value, never an owner — so it is the one named exemption.
+        let live_fields: Vec<&str> = prod
+            .lines()
+            .filter(|l| squash(l).ends_with(":HashMap<String,NonceBinding>,"))
+            .filter(|l| !l.trim_start().starts_with("snapshot:"))
+            .collect();
+        assert_eq!(
+            live_fields,
+            vec!["    live: HashMap<String, NonceBinding>,"],
+            "the live map is a field of NonceState and of nothing else"
+        );
+        assert!(squash(state_def).contains("live:HashMap<String,NonceBinding>,"));
+
+        // The teardown seam outside this file holds the registries, not maps.
+        let runtime = production_source(include_str!("agent_runtime.rs"));
+        assert!(
+            !squash(&runtime).contains("HashMap<String,crate::coord_mcp::NonceBinding>"),
+            "agent_runtime holds &NonceRegistry, never a raw nonce map"
+        );
+    }
+
     /// §1/E — the mint route's nonces are EPHEMERAL: revoked the moment the
     /// machine is opted out (the operator's real off switch, re-checked per
     /// request rather than only at mint), while a runner-spawn PERSISTENT nonce
@@ -13192,9 +13935,8 @@ mod tests {
         // Both mint DEVICE principals — the route can never elevate to agent.
         let bare_again = register_session_proxy_nonce(&wd, None);
         assert!(matches!(
-            proxy_nonces()
-                .lock()
-                .unwrap()
+            NonceRegistry::global()
+                .test_live()
                 .get(&bare_again)
                 .map(|b| b.principal.clone()),
             Some(ProxyPrincipal::Device)
@@ -13205,7 +13947,7 @@ mod tests {
         // the first session's already-connected MCP client would 401 mid-session.
         // Both bindings coexist, each living out its own TTL.
         {
-            let map = proxy_nonces().lock().unwrap();
+            let map = NonceRegistry::global().test_live();
             assert!(
                 map.contains_key(&bare_nonce),
                 "an ephemeral mint must NOT evict a prior same-workdir ephemeral nonce"
@@ -13233,7 +13975,7 @@ mod tests {
         let expired = format!("expired-sweep-{}", uuid::Uuid::now_v7().simple());
         let live = format!("live-sweep-{}", uuid::Uuid::now_v7().simple());
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.insert(
                 expired.clone(),
                 NonceBinding {
@@ -13270,7 +14012,7 @@ mod tests {
         // Any mint triggers the opportunistic sweep.
         let persistent = register_proxy_nonce(&wd, None, None);
 
-        let map = proxy_nonces().lock().unwrap();
+        let map = NonceRegistry::global().test_live();
         assert!(
             !map.contains_key(&expired),
             "an expired ephemeral binding is swept from the map on the next mint"
@@ -13296,7 +14038,7 @@ mod tests {
 
         // An already-expired ephemeral binding.
         let expired = "expired-nonce-for-lifetime-test".to_string();
-        proxy_nonces().lock().unwrap().insert(
+        NonceRegistry::global().test_live().insert(
             expired.clone(),
             NonceBinding {
                 workdir: wd.clone(),
@@ -13316,7 +14058,7 @@ mod tests {
             "an ephemeral nonce past its deadline fails closed"
         );
         assert!(
-            !proxy_nonces().lock().unwrap().contains_key(&expired),
+            !NonceRegistry::global().test_live().contains_key(&expired),
             "an expired ephemeral nonce is lazily evicted so the map stays bounded"
         );
 
@@ -13380,7 +14122,7 @@ mod tests {
         assert_ne!(n1, n2, "each terminal gets its own nonce");
 
         assert!(
-            proxy_nonces().lock().unwrap().contains_key(&n1),
+            NonceRegistry::global().test_live().contains_key(&n1),
             "a second terminal's mint must NOT evict the first terminal's LIVE \
              nonce for the same workdir (it would 401 its MCP client mid-session)"
         );
@@ -13399,11 +14141,11 @@ mod tests {
         let n1b = register_proxy_nonce(&wd, Some(t1.as_str()), None);
         assert_ne!(n1b, n1);
         assert!(
-            !proxy_nonces().lock().unwrap().contains_key(&n1),
+            !NonceRegistry::global().test_live().contains_key(&n1),
             "a same-terminal re-mint still evicts that terminal's prior nonce"
         );
         assert!(
-            proxy_nonces().lock().unwrap().contains_key(&n2),
+            NonceRegistry::global().test_live().contains_key(&n2),
             "...and never touches the sibling terminal's"
         );
     }
@@ -13434,13 +14176,13 @@ mod tests {
 
         let b = register_proxy_nonce(&wd, None, None);
         assert!(
-            !proxy_nonces().lock().unwrap().contains_key(&a),
+            !NonceRegistry::global().test_live().contains_key(&a),
             "a terminal-less re-provision into the same cwd still evicts its \
              terminal-less predecessor (unchanged behavior)"
         );
-        assert!(proxy_nonces().lock().unwrap().contains_key(&b));
+        assert!(NonceRegistry::global().test_live().contains_key(&b));
         assert!(
-            proxy_nonces().lock().unwrap().contains_key(&owned),
+            NonceRegistry::global().test_live().contains_key(&owned),
             "a terminal-less mint must never evict a per-terminal nonce for the \
              same workdir"
         );
@@ -13463,7 +14205,7 @@ mod tests {
         let persistent = register_proxy_nonce(&wd, None, None);
         let ephemeral = register_session_proxy_nonce(&wd, None);
 
-        let snapshot = proxy_nonces().lock().unwrap().clone();
+        let snapshot = NonceRegistry::global().test_live().clone();
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         let loaded = store.load_coord_mcp_nonces();
@@ -14014,7 +14756,7 @@ mod tests {
         assert_eq!(calls.get(), 3, "returns on the first usable read, no more");
     }
 
-    /// `AGENT_TOKENS` register / lookup / remove round-trip.
+    /// `AgentTokenRegistry` register / lookup / remove round-trip.
     #[test]
     fn agent_token_registry_round_trip() {
         let agent_id = uuid::Uuid::new_v4();
@@ -15533,12 +16275,11 @@ mod tests {
             "the sibling's nonce must still be LIVE — not evicted, not graced"
         );
         assert!(
-            !graced_nonces().lock().unwrap().contains_key(&n1),
+            !NonceRegistry::global().test_graced().contains_key(&n1),
             "a reuse must never move the incumbent onto the grace TTL"
         );
-        let persistent_device_for_wd = proxy_nonces()
-            .lock()
-            .unwrap()
+        let persistent_device_for_wd = NonceRegistry::global()
+            .test_live()
             .values()
             .filter(|b| {
                 b.workdir == wd
@@ -15890,22 +16631,19 @@ mod tests {
         // CURRENT file, so extra volume from an unrelated test measurably
         // raises its flake rate. This test is about the sweep's enumeration,
         // not about minting.
-        proxy_nonces()
-            .lock()
-            .expect("proxy nonce map poisoned")
-            .insert(
-                format!("sweep-test-{}", uuid::Uuid::now_v7()),
-                NonceBinding {
-                    workdir: wd.clone(),
-                    principal: ProxyPrincipal::Device,
-                    lifetime: NonceLifetime::Persistent,
-                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
-                    pin_origin: PinOrigin::MachineSampled,
-                    terminal_id: None,
-                    minted_at: std::time::SystemTime::now(),
-                    expected: Default::default(),
-                },
-            );
+        NonceRegistry::global().test_live().insert(
+            format!("sweep-test-{}", uuid::Uuid::now_v7()),
+            NonceBinding {
+                workdir: wd.clone(),
+                principal: ProxyPrincipal::Device,
+                lifetime: NonceLifetime::Persistent,
+                session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                pin_origin: PinOrigin::MachineSampled,
+                terminal_id: None,
+                minted_at: std::time::SystemTime::now(),
+                expected: Default::default(),
+            },
+        );
         sweep_stale_breadcrumbs_once(1); // :1 — nothing listens there
         assert!(
             !has_degraded_breadcrumb(&wd),
@@ -16399,7 +17137,7 @@ mod tests {
         // Simulate a restart: drop the nonce from the in-memory map, then
         // restore from the injected store via the same merge the boot path runs.
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.remove(&nonce);
         }
         assert!(
@@ -16511,7 +17249,7 @@ mod tests {
         let (named, _) = session_expectation_for_nonce(&named_pin).expect("restored");
         assert_eq!(named.caller_named().map(|c| c.tenant_id), Some(owner));
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             for n in [&with, &without, &legacy_pin, &named_pin] {
                 map.remove(n);
             }
@@ -16544,12 +17282,12 @@ mod tests {
             exp.resolve(workdir.as_deref()).await,
             qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo
         );
-        let snap = device_nonce_snapshot(&proxy_nonces().lock().unwrap().clone());
+        let snap = device_nonce_snapshot(&NonceRegistry::global().test_live().clone());
         assert_eq!(
             snap.get(&nonce).and_then(|b| b.expected_tenant.clone()),
             Some(qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo)
         );
-        proxy_nonces().lock().unwrap().remove(&nonce);
+        NonceRegistry::global().test_live().remove(&nonce);
     }
 
     /// OQ3 — an AGENT nonce is NEVER mirrored to the persisted store, while a
@@ -16597,7 +17335,7 @@ mod tests {
 
         // Cleanup the in-memory map entries.
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.remove(&agent_nonce);
             map.remove(&dev_nonce);
         }
@@ -16665,7 +17403,7 @@ mod tests {
         // Simulate the restart: both nonces leave the live map, then the boot
         // restore merges them back.
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.remove(&a);
             map.remove(&b);
         }
@@ -16721,7 +17459,7 @@ mod tests {
         );
 
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.remove(&a);
             map.remove(&b);
             map.remove(&fresh_a);
@@ -16775,7 +17513,7 @@ mod tests {
         );
 
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.remove(&nonce);
         }
         let _ = std::fs::remove_dir_all(&store_dir);
@@ -16833,7 +17571,7 @@ mod tests {
         );
 
         {
-            let mut m = proxy_nonces().lock().unwrap();
+            let mut m = NonceRegistry::global().test_live();
             m.remove(&device);
             m.remove(&agent);
             m.remove(&ephemeral);
@@ -17035,7 +17773,7 @@ mod tests {
         );
 
         {
-            let mut m = proxy_nonces().lock().unwrap();
+            let mut m = NonceRegistry::global().test_live();
             m.remove(&n_old);
             m.remove(&n_new);
             m.remove(&n_legacy);
@@ -17230,7 +17968,7 @@ mod tests {
         );
 
         {
-            let mut m = proxy_nonces().lock().unwrap();
+            let mut m = NonceRegistry::global().test_live();
             m.remove(&live_nonce);
             m.remove(&missing);
         }
@@ -17555,7 +18293,7 @@ mod tests {
         // Drop this test's bindings out of the process-global registry so they
         // do not accumulate into a sibling test's snapshot.
         {
-            let mut m = proxy_nonces().lock().unwrap();
+            let mut m = NonceRegistry::global().test_live();
             for n in [&n_keep, &n_keepauth, &n_adopt] {
                 m.remove(n);
             }
@@ -17649,7 +18387,7 @@ mod tests {
         // agent nonce is never persisted, so it is NEVER registered in the next
         // process — the precondition the adopt arm keys on.
         {
-            let mut m = proxy_nonces().lock().unwrap();
+            let mut m = NonceRegistry::global().test_live();
             m.remove(&nonce);
         }
         assert!(
@@ -17873,7 +18611,7 @@ mod tests {
         }
 
         {
-            let mut m = proxy_nonces().lock().unwrap();
+            let mut m = NonceRegistry::global().test_live();
             for n in &nonces {
                 m.remove(n);
             }
@@ -18677,7 +19415,7 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         // Arm 1 — lazy expiry (unchanged by the split).
         let nonce = format!("expired-{}", uuid::Uuid::new_v4().simple());
-        graced_nonces().lock().unwrap().insert(
+        NonceRegistry::global().test_graced().insert(
             nonce.clone(),
             GracedNonce {
                 expires_at: std::time::Instant::now(),
@@ -18689,11 +19427,11 @@ mod tests {
             },
         );
         assert!(
-            !graced_nonce_is_valid(&nonce),
+            !NonceRegistry::global().test_graced_is_valid(&nonce),
             "an already-elapsed grace entry must be invalid"
         );
         assert!(
-            !graced_nonces().lock().unwrap().contains_key(&nonce),
+            !NonceRegistry::global().test_graced().contains_key(&nonce),
             "an expired grace entry must be lazily evicted on the failing check"
         );
 
@@ -18711,9 +19449,8 @@ mod tests {
         let before = std::time::Instant::now();
         let a = register_proxy_nonce(&wd, None, None);
         let _b = register_proxy_nonce(&wd, None, None); // evicts + graces `a`
-        let expires_at = graced_nonces()
-            .lock()
-            .unwrap()
+        let expires_at = NonceRegistry::global()
+            .test_graced()
             .get(&a)
             .expect("an evicted device nonce enters the grace map")
             .expires_at;
@@ -18737,7 +19474,7 @@ mod tests {
         let a2 = register_agent_proxy_nonce(&awd, agent_id);
         let _b2 = register_agent_proxy_nonce(&awd, agent_id);
         assert!(
-            !graced_nonces().lock().unwrap().contains_key(&a2),
+            !NonceRegistry::global().test_graced().contains_key(&a2),
             "an evicted AGENT nonce must never enter the grace map"
         );
         assert!(
@@ -18752,7 +19489,7 @@ mod tests {
         let e = register_session_proxy_nonce(&ewd, None);
         evict_proxy_nonces_for_workdir(&ewd);
         assert!(
-            !graced_nonces().lock().unwrap().contains_key(&e),
+            !NonceRegistry::global().test_graced().contains_key(&e),
             "an evicted EPHEMERAL device nonce must never enter the grace map"
         );
     }
@@ -19070,7 +19807,7 @@ mod tests {
             .expect("write the test store");
         // `b` is already live, so the restore must SKIP it and restore only `a`.
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.insert(
                 b.clone(),
                 NonceBinding {
@@ -19102,7 +19839,7 @@ mod tests {
         }
 
         {
-            let mut map = proxy_nonces().lock().unwrap();
+            let mut map = NonceRegistry::global().test_live();
             map.remove(&a);
             map.remove(&b);
         }
@@ -20787,10 +21524,7 @@ mod reject_row_workdir_sentinel_tests {
         assert_eq!(attr.principal, "device");
 
         // Leave the process-global map as we found it.
-        proxy_nonces()
-            .lock()
-            .expect("proxy nonce map poisoned")
-            .remove(&nonce);
+        NonceRegistry::global().test_live().remove(&nonce);
     }
 
     /// Phase 1d (plan 2026-09-02-steering-layers-unreadable-without-a-
@@ -20838,7 +21572,7 @@ mod reject_row_workdir_sentinel_tests {
 
         // graced_expired: the same tombstone, once its window is behind us.
         {
-            let mut map = nonce_tombstones().lock().unwrap();
+            let mut map = NonceRegistry::global().test_tombstones();
             let t = map
                 .get_mut(&first)
                 .expect("tombstone for the superseded key");
@@ -20875,7 +21609,7 @@ mod reject_row_workdir_sentinel_tests {
         revoke_proxy_nonce(&first);
         revoke_agent_proxy_nonces(agent_id);
         for n in [&first, &second, &a1] {
-            nonce_tombstones().lock().unwrap().remove(n.as_str());
+            NonceRegistry::global().test_tombstones().remove(n.as_str());
         }
     }
 
@@ -20924,7 +21658,9 @@ mod reject_row_workdir_sentinel_tests {
         }
         assert!(!RUNNER_REFUSED_BEFORE_FORWARD.contains("  "));
         revoke_proxy_nonce(&first);
-        nonce_tombstones().lock().unwrap().remove(first.as_str());
+        NonceRegistry::global()
+            .test_tombstones()
+            .remove(first.as_str());
     }
 
     /// Phase 1a: the grace set survives a restart with its REMAINING window.
@@ -20974,8 +21710,8 @@ mod reject_row_workdir_sentinel_tests {
 
         // Simulate a restart: the process-local grace and tombstone maps are
         // gone; the key no longer validates.
-        graced_nonces().lock().unwrap().remove(&old);
-        nonce_tombstones().lock().unwrap().remove(&old);
+        NonceRegistry::global().test_graced().remove(&old);
+        NonceRegistry::global().test_tombstones().remove(&old);
         assert!(
             !proxy_nonce_is_valid(&old),
             "precondition: grace lost with the process"
@@ -20991,9 +21727,8 @@ mod reject_row_workdir_sentinel_tests {
             proxy_nonce_is_valid(&old),
             "a graced key must validate again after a restart inside its window"
         );
-        let restored = graced_nonces()
-            .lock()
-            .unwrap()
+        let restored = NonceRegistry::global()
+            .test_graced()
             .get(&old)
             .map(|g| g.expires_at);
         let restored = restored.expect("re-entered the grace registry");
@@ -21028,8 +21763,8 @@ mod reject_row_workdir_sentinel_tests {
 
         // Leave the process-global maps as we found them.
         release_workdir_on_session_close(&wd);
-        graced_nonces().lock().unwrap().remove(&old);
-        nonce_tombstones().lock().unwrap().remove(&old);
+        NonceRegistry::global().test_graced().remove(&old);
+        NonceRegistry::global().test_tombstones().remove(&old);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
@@ -23607,9 +24342,8 @@ mod spawn_tenant_credential_tests {
 
     /// Does the registry hold ANY nonce minted for `terminal_id`?
     fn terminal_has_nonce(terminal_id: &str) -> bool {
-        proxy_nonces()
-            .lock()
-            .unwrap()
+        NonceRegistry::global()
+            .test_live()
             .values()
             .any(|b| b.terminal_id.as_deref() == Some(terminal_id))
     }
@@ -23813,7 +24547,7 @@ mod spawn_tenant_credential_tests {
             "the mint-time pin must reach the store"
         );
 
-        proxy_nonces().lock().unwrap().remove(&nonce);
+        NonceRegistry::global().test_live().remove(&nonce);
         restore_proxy_nonces_from(&store);
         assert_eq!(
             proxy_session_pin_for_nonce(&nonce),
@@ -23830,7 +24564,9 @@ mod spawn_tenant_credential_tests {
             Some(&term),
             Some(tenant_b()),
         );
-        assert!(live_binding(&nonce).is_none() && graced_nonce_is_valid(&nonce));
+        assert!(
+            live_binding(&nonce).is_none() && NonceRegistry::global().test_graced_is_valid(&nonce)
+        );
         assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
     }
 
@@ -24250,7 +24986,7 @@ mod spawn_tenant_credential_tests {
         let wd_stale = workdir(&amb, "stale");
         write_coord_mcp_proxy_config(&wd_stale, PORT, Some(tenant_b()));
         let stale = read_proxy_nonce(&Path::new(&wd_stale).join(".mcp.json")).unwrap();
-        proxy_nonces().lock().unwrap().remove(&stale);
+        NonceRegistry::global().test_live().remove(&stale);
         match deliver_terminal_coord_mcp(&wd_stale, &terminal(), Some(tenant_b()), Some(PORT)) {
             Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
                 assert_eq!(declared, DeclaredWorkdirKey::NotLive)
@@ -24290,9 +25026,8 @@ mod spawn_tenant_credential_tests {
 
     /// Every nonce the registry holds bound to `wd`, whatever its class.
     fn nonces_bound_to(wd: &str) -> usize {
-        proxy_nonces()
-            .lock()
-            .unwrap()
+        NonceRegistry::global()
+            .test_live()
             .values()
             .filter(|b| b.workdir == wd || b.workdir == normalize_binding_workdir(wd))
             .count()
@@ -24486,8 +25221,8 @@ mod spawn_tenant_credential_tests {
             Some(StoredPinOrigin::MachineSampled)
         );
 
-        proxy_nonces().lock().unwrap().remove(&explicit);
-        proxy_nonces().lock().unwrap().remove(&sampled);
+        NonceRegistry::global().test_live().remove(&explicit);
+        NonceRegistry::global().test_live().remove(&sampled);
         restore_proxy_nonces_from(&store);
         assert_eq!(
             live_binding(&explicit).unwrap().pin_origin,
@@ -24573,7 +25308,10 @@ mod spawn_tenant_credential_tests {
         let graced = read_proxy_nonce(&Path::new(&wd_g).join(".mcp.json")).unwrap();
         amb.write_active_tenant_id(tenant_a());
         write_coord_mcp_proxy_config(&wd_g, PORT, None); // evicts + graces `graced`
-        assert!(live_binding(&graced).is_none() && graced_nonce_is_valid(&graced));
+        assert!(
+            live_binding(&graced).is_none()
+                && NonceRegistry::global().test_graced_is_valid(&graced)
+        );
         assert_eq!(
             carried_pin_for_rewrite(Some(&graced)),
             MintPin::Carried(tenant_b(), PinOrigin::MachineSampled)
