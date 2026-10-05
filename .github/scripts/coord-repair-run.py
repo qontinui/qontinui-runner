@@ -150,15 +150,60 @@ def validated_inputs() -> dict:
     }
 
 
-def names_repo_script(token: str) -> bool:
-    """Does this argv element name something under a `.github` directory?"""
-    return any(part == ".github" for part in re.split(r"[/\\=]", token))
+# Interpreters whose `-c`/`-e` flag takes inline code. Inline code can reach a
+# repo script under any spelling (`cd .git""hub`, variables, ...), so no token
+# check can bound it: a declaration naming one with such a flag is refused.
+INLINE_INTERPRETERS = {
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "ksh",
+    "python",
+    "python3",
+    "node",
+    "perl",
+    "ruby",
+    "pwsh",
+    "powershell",
+}
+INLINE_FLAGS = {"-c", "-e", "--eval", "-Command", "-command", "-EncodedCommand"}
+# Separators a shell or `env -S` would split one argv element on.
+WORD_SPLIT = re.compile(r"[\s;&|<>()`'\"$]+")
+
+
+def names_repo_script(piece: str) -> bool:
+    """Does this word name something under a `.github` directory?"""
+    return any(part == ".github" for part in re.split(r"[/\\=]", piece))
+
+
+def check_inline_code(argv: list[str], label: str) -> None:
+    for i, token in enumerate(argv):
+        if os.path.basename(token) in INLINE_INTERPRETERS and any(
+            t in INLINE_FLAGS for t in argv[i + 1 :]
+        ):
+            die(
+                f"{label} runs inline code ({token} with -c/-e); declare a script under ../trusted/.github/ instead"
+            )
 
 
 def check_trusted_spelling(token: str, label: str) -> None:
-    """A `.github/` path must be `../trusted/.github/...`, nothing looser."""
-    if not names_repo_script(token):
+    """Every word of the token naming a `.github/` path must be spelled
+    `../trusted/.github/...`, nothing looser. Split on whitespace and shell
+    metacharacters, so a path buried in a longer string is still seen."""
+    for piece in WORD_SPLIT.split(token):
+        if piece:
+            check_trusted_piece(piece, token, label)
+
+
+def check_trusted_piece(piece: str, token: str, label: str) -> None:
+    if not names_repo_script(piece):
         return
+    if piece != token:
+        die(
+            f"{label} element {token!r} embeds a repo path inside a longer string; name the script as its own argv element"
+        )
+    token = piece
     if not token.startswith(TRUSTED_PREFIX + ".github/"):
         die(
             f"{label} element {token!r} names a repo script but is not spelled "
@@ -178,6 +223,7 @@ def argv_field(repair: dict, field: str, index: int) -> list[str]:
         or not value[0].strip()
     ):
         die(f"repair[{index}].{field} must be a non-empty argv array of strings")
+    check_inline_code(value, f"repair[{index}].{field}")
     for token in value:
         check_trusted_spelling(token, f"repair[{index}].{field}")
     return value
@@ -312,6 +358,13 @@ def glob_pathspecs(allowed_paths: list[str]) -> list[str]:
     return [f":(top,glob){g}" for g in allowed_paths]
 
 
+def kill_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def run_argv(
     argv: list[str], work: Path, extra_env: dict, deadline: float, cap: int, label: str
 ) -> int:
@@ -338,10 +391,7 @@ def run_argv(
     try:
         code = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_group(proc.pid)
         proc.wait()
         print("::endgroup::", flush=True)
         print(
@@ -349,6 +399,10 @@ def run_argv(
             file=sys.stderr,
         )
         return EXIT_TIMEOUT
+    # The direct child exited; anything it left running in its group (a
+    # backgrounded daemon, a stray build server) must not keep writing to
+    # work/ while the patch is taken, nor outlive the step.
+    kill_group(proc.pid)
     print("::endgroup::", flush=True)
     if code < 0:  # killed by a signal: report it the way a shell does
         code = 128 + (-code)
@@ -417,13 +471,22 @@ def cmd_run(args: argparse.Namespace) -> None:
         selected["command"], work, extra_env, deadline, cap, "command"
     )
 
-    # Stage what the repair changed inside allowed_paths — NEW files included
-    # (a plain `git diff` would drop them and report an empty patch) — and
-    # nothing outside. What it changed outside is reported, not shipped:
-    # coord refuses on it rather than reading a silently narrowed patch.
-    # Listed first and added by literal name: `git add` refuses a pathspec
-    # that matches nothing, and an allowed glob the repair did not touch is
-    # the normal case.
+    # The command must leave HEAD where it found it: a commit (or checkout)
+    # would make every diff below lie about what the repair changed.
+    head_after = git(work, "rev-parse", "HEAD").decode().strip()
+    if head_after != inputs["head_sha"]:
+        die(
+            f"the command moved work/'s HEAD to {head_after}; a repair may change files, never commit"
+        )
+    head_sha = inputs["head_sha"]
+
+    # Start the index over (mixed reset: the worktree keeps every change), so
+    # nothing the command itself `git add`ed rides into the patch, then stage
+    # exactly what it changed INSIDE allowed_paths — NEW files included (a
+    # plain `git diff` would drop them). Listed first and added by literal
+    # name: `git add` refuses a pathspec that matches nothing, and an allowed
+    # glob the repair did not touch is the normal case.
+    git(work, "reset", "-q")
     touched = decode_paths(
         git(
             work,
@@ -446,6 +509,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             "--",
             *(f":(top,literal){p}" for p in sorted(set(touched))),
         )
+    # Against the requested head_sha, restricted to allowed_paths: the patch
+    # can only ever carry allowed files, whatever the index holds.
     patch = git(
         work,
         "-c",
@@ -455,20 +520,30 @@ def cmd_run(args: argparse.Namespace) -> None:
         "--binary",
         "--no-color",
         "--no-ext-diff",
-        "HEAD",
+        head_sha,
+        "--",
+        *pathspecs,
     )
     (out_dir / "repair.patch").write_bytes(patch)
     print(f"repair.patch: {len(patch)} bytes")
-    modified_outside = decode_paths(
-        git(work, "diff", "--name-only", "-z"), "modified outside allowed_paths"
+
+    # What it changed OUTSIDE allowed_paths is reported, not shipped: coord
+    # refuses on it rather than reading a silently narrowed patch.
+    touched_set = set(touched)
+    tracked_changed = decode_paths(
+        git(work, "diff", "--name-only", "-z", head_sha), "changed vs head_sha"
     )
     untracked_outside = decode_paths(
         git(work, "ls-files", "--others", "--exclude-standard", "-z"),
         "untracked outside allowed_paths",
     )
+    modified_outside = sorted(
+        {p for p in [*tracked_changed, *untracked_outside] if p not in touched_set}
+    )
     if modified_outside:
         print(
-            f"::warning title=coord-repair::the repair modified {len(modified_outside)} tracked file(s) outside allowed_paths: {modified_outside[:20]}"
+            f"::warning title=coord-repair::the repair changed {len(modified_outside)} path(s) outside "
+            f"allowed_paths (not in the patch): {modified_outside[:20]}"
         )
 
     check_exit = run_argv(selected["check"], work, extra_env, deadline, cap, "check")
@@ -483,9 +558,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         "command_exit": command_exit,
         "check_exit": check_exit,
         "changed_files": changed,
-        # Informational. Tracked files the command changed OUTSIDE
-        # allowed_paths (not in the patch), and how many untracked files it
-        # left outside them (build output and the like; not in the patch).
+        # Paths the command changed OUTSIDE allowed_paths — tracked files
+        # differing from head_sha plus new untracked (not gitignored) files —
+        # none of which is in the patch; and, informationally, how many of
+        # them are untracked.
         "modified_outside_allowed": modified_outside,
         "untracked_ignored": len(untracked_outside),
     }
