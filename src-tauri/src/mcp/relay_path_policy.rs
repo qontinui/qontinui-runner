@@ -709,25 +709,20 @@ pub(crate) mod tests {
     // The drift tripwires — mechanical, against the real route table
     // ------------------------------------------------------------------
 
-    /// Every `(METHOD, path)` the runner registers, parsed out of the source
-    /// tree. Axum 0.8 exposes no router introspection (the reason
-    /// `ui_bridge::manifest_matches_route_calls` scans source too), so the
-    /// registrations themselves are the only machine-readable route table
-    /// there is.
-    ///
-    /// Deliberately permissive about METHOD: it collects every routing verb
-    /// appearing anywhere in the `.route(...)` call. A false positive there
-    /// only makes this tripwire accept an allowlist entry it should have
-    /// questioned; a false NEGATIVE would fail a correct entry, which is the
-    /// error worth avoiding in a test nobody can debug at 2am.
-    ///
-    /// `pub(crate)` so `mcp::origin_guard`'s allowlist tripwires reuse this
-    /// one enumerator rather than growing a second.
-    pub(crate) fn registered_routes() -> std::collections::HashSet<(String, String)> {
-        const VERBS: &[&str] = &[
-            "get", "post", "put", "patch", "delete", "head", "options", "any",
-        ];
-        let mut out = std::collections::HashSet::new();
+    /// The routing verbs a `MethodRouter` is built from.
+    const ROUTING_VERBS: &[&str] = &[
+        "get", "post", "put", "patch", "delete", "head", "options", "any",
+    ];
+
+    /// The two registration calls the walk reads. Spelled with `concat!` so
+    /// this file's own text never contains a call shape the walk would read.
+    const ROUTE_CALL: &str = concat!(".route", "(");
+    const ROUTE_SERVICE_CALL: &str = concat!(".route_service", "(");
+
+    /// Every `.rs` file under `src-tauri/src`, read at test time — the tree
+    /// both the allowlist tripwires and the route census scan.
+    fn crate_rust_sources() -> Vec<String> {
+        let mut out = Vec::new();
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
@@ -743,46 +738,97 @@ pub(crate) mod tests {
                 if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
-                let Ok(src) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                collect_routes(&src, VERBS, &mut out);
+                if let Ok(src) = std::fs::read_to_string(&path) {
+                    out.push(src);
+                }
             }
         }
         out
     }
 
-    /// Pull `(METHOD, path)` pairs out of one file's `.route("…", …)` calls.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
-    fn collect_routes(
-        src: &str,
-        verbs: &[&str],
-        out: &mut std::collections::HashSet<(String, String)>,
-    ) {
+    /// Every `(METHOD, path)` the runner registers, parsed out of the source
+    /// tree. Axum 0.8 exposes no router introspection (the reason
+    /// `ui_bridge::manifest_matches_route_calls` scans source too), so the
+    /// registrations themselves are the only machine-readable route table
+    /// there is.
+    ///
+    /// Deliberately permissive about METHOD: it collects every routing verb
+    /// appearing anywhere in the `.route(...)` call. A false positive there
+    /// only makes this tripwire accept an allowlist entry it should have
+    /// questioned; a false NEGATIVE would fail a correct entry, which is the
+    /// error worth avoiding in a test nobody can debug at 2am.
+    ///
+    /// `pub(crate)` so `mcp::origin_guard`'s allowlist tripwires reuse this
+    /// one enumerator rather than growing a second.
+    pub(crate) fn registered_routes() -> std::collections::HashSet<(String, String)> {
+        let mut out = std::collections::HashSet::new();
+        for src in crate_rust_sources() {
+            collect_routes(&src, ROUTING_VERBS, &mut out);
+        }
+        out
+    }
+
+    /// One registration call site, as [`walk_route_calls`] reads it.
+    struct RouteCall<'a> {
+        /// Byte offset of the call's needle in its file.
+        at: usize,
+        path: RoutePath<'a>,
+        /// Everything after the path argument, up to the `)` closing the call.
+        chain: &'a str,
+    }
+
+    /// A registration call's first argument.
+    enum RoutePath<'a> {
+        /// A string literal: the registered path itself.
+        Literal(&'a str),
+        /// A constant or binding (`ROUTE_PATH`, `template`) whose value a
+        /// source scan cannot read — recorded by name so the site still counts.
+        Named(&'a str),
+    }
+
+    /// THE walk: every `needle` call in `src` whose first argument is a string
+    /// literal or a plain (possibly `::`-qualified) name, with the text of the
+    /// rest of the call. Both [`collect_routes`] and the HTTP route census read
+    /// the tree through this one walk, so they cannot disagree about which
+    /// calls exist.
+    fn walk_route_calls<'a>(src: &'a str, needle: &str, mut visit: impl FnMut(RouteCall<'a>)) {
         let bytes = src.as_bytes();
-        let needle = ".route(";
         let mut from = 0usize;
-        while let Some(rel) = src[from..].find(needle) {
-            let open = from + rel + needle.len();
+        while let Some(rel) = src.get(from..).and_then(|rest| rest.find(needle)) {
+            let at = from + rel;
+            let open = at + needle.len();
             from = open;
-            // The first token must be a string literal — anything else is a
-            // route registered from a constant, which this scan cannot read.
-            let Some(q1) = src[open..].find('"').map(|i| open + i) else {
+            let Some(after_open) = src.get(open..) else {
                 continue;
             };
-            if src[open..q1].chars().any(|c| !c.is_whitespace()) {
-                continue;
-            }
-            let Some(q2) = src[q1 + 1..].find('"').map(|i| q1 + 1 + i) else {
+            let first = open + (after_open.len() - after_open.trim_start().len());
+            let Some(arg) = src.get(first..) else {
                 continue;
             };
-            let path = &src[q1 + 1..q2];
-            // Walk to the `)` that closes `.route(`.
+            let (path, chain_start) = if let Some(literal) = arg.strip_prefix('"') {
+                let Some(len) = literal.find('"') else {
+                    continue;
+                };
+                let Some(path) = literal.get(..len) else {
+                    continue;
+                };
+                (RoutePath::Literal(path), first + 1 + len + 1)
+            } else {
+                let len = arg
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                    .unwrap_or(arg.len());
+                let name = arg.get(..len).unwrap_or("");
+                let then_comma = arg
+                    .get(len..)
+                    .is_some_and(|rest| rest.trim_start().starts_with(','));
+                if name.is_empty() || !then_comma {
+                    continue;
+                }
+                (RoutePath::Named(name), first + len)
+            };
+            // Walk to the `)` that closes the call.
             let mut depth = 1usize;
-            let mut i = q2 + 1;
+            let mut i = chain_start;
             while i < bytes.len() && depth > 0 {
                 match bytes[i] {
                     b'(' => depth += 1,
@@ -791,27 +837,370 @@ pub(crate) mod tests {
                 }
                 i += 1;
             }
-            let chain = &src[q2 + 1..i.saturating_sub(1)];
+            let Some(chain) = src.get(chain_start..i.saturating_sub(1)) else {
+                continue;
+            };
+            visit(RouteCall { at, path, chain });
+        }
+    }
+
+    /// Pull `(METHOD, path)` pairs out of one file's literal-path `.route(…)`
+    /// calls.
+    fn collect_routes(
+        src: &str,
+        verbs: &[&str],
+        out: &mut std::collections::HashSet<(String, String)>,
+    ) {
+        walk_route_calls(src, ROUTE_CALL, |call| {
+            let RoutePath::Literal(path) = call.path else {
+                return;
+            };
+            let chain = call.chain;
             for verb in verbs {
                 // `get(` / `.get(` / `routing::get(` all count.
                 let mut at = 0usize;
-                while let Some(rel) = chain[at..].find(verb) {
+                while let Some(rel) = chain.get(at..).and_then(|rest| rest.find(verb)) {
                     let start = at + rel;
                     at = start + verb.len();
-                    let before_ok = start == 0
-                        || !chain[..start]
-                            .chars()
-                            .next_back()
-                            .map(|c| c.is_alphanumeric() || c == '_')
-                            .unwrap_or(false);
-                    let after_ok = chain[at..].trim_start().starts_with('(');
+                    let before_ok = !chain
+                        .get(..start)
+                        .and_then(|before| before.chars().next_back())
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    let after_ok = chain
+                        .get(at..)
+                        .is_some_and(|after| after.trim_start().starts_with('('));
                     if before_ok && after_ok {
                         out.insert((verb.to_uppercase(), path.to_string()));
                         break;
                     }
                 }
             }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // The HTTP route census — a snapshot of every registration site
+    // ------------------------------------------------------------------
+
+    /// The census snapshot, relative to `CARGO_MANIFEST_DIR`.
+    const HTTP_ROUTE_SNAPSHOT: &str = "http-routes.snapshot.txt";
+    /// Set to `1` to rewrite the snapshot from the tree instead of comparing.
+    const UPDATE_HTTP_ROUTE_SNAPSHOT: &str = "UPDATE_HTTP_ROUTE_SNAPSHOT";
+
+    /// Every registration site in the tree as one `<METHODS> <path> <handler>`
+    /// line, sorted, duplicates kept. There is deliberately NO file or module
+    /// column, and the handler is named without its module qualifiers: moving
+    /// a handler or a whole router between files leaves the census identical,
+    /// while dropping a route, changing its methods or rebinding its handler
+    /// changes it.
+    pub(crate) fn http_route_census_lines() -> Vec<String> {
+        let mut lines = Vec::new();
+        for src in crate_rust_sources() {
+            census_one_file(&src, &mut lines);
         }
+        lines.sort();
+        lines
+    }
+
+    fn census_one_file(src: &str, out: &mut Vec<String>) {
+        for (needle, is_service) in [(ROUTE_CALL, false), (ROUTE_SERVICE_CALL, true)] {
+            walk_route_calls(src, needle, |call| {
+                if in_line_comment(src, call.at) {
+                    return;
+                }
+                let path = match call.path {
+                    RoutePath::Literal(p) if !p.is_empty() && !p.contains(char::is_whitespace) => {
+                        p.to_string()
+                    }
+                    // A literal with whitespace is prose that happens to
+                    // follow the call shape (a string or doc example), never
+                    // a path.
+                    RoutePath::Literal(_) => return,
+                    RoutePath::Named(name) => format!("<{name}>"),
+                };
+                if is_service {
+                    out.push(format!("SERVICE {path} {}", handler_name(call.chain)));
+                    return;
+                }
+                let pairs = method_handlers(call.chain);
+                if pairs.is_empty() {
+                    // A `MethodRouter` built by a helper call rather than inline:
+                    // the methods are not visible here, the site still is.
+                    out.push(format!("? {path} {}", handler_name(call.chain)));
+                    return;
+                }
+                let mut by_handler: std::collections::BTreeMap<
+                    String,
+                    std::collections::BTreeSet<String>,
+                > = std::collections::BTreeMap::new();
+                for (verb, handler) in pairs {
+                    by_handler.entry(handler).or_default().insert(verb);
+                }
+                for (handler, verbs) in by_handler {
+                    let verbs: Vec<String> = verbs.into_iter().collect();
+                    out.push(format!("{} {path} {handler}", verbs.join(",")));
+                }
+            });
+        }
+    }
+
+    /// Whether the byte at `at` sits after a `//` on its own line.
+    fn in_line_comment(src: &str, at: usize) -> bool {
+        let line_start = src
+            .get(..at)
+            .and_then(|before| before.rfind('\n'))
+            .map_or(0, |n| n + 1);
+        src.get(line_start..at)
+            .is_some_and(|line| line.contains("//"))
+    }
+
+    /// If `b[i]` opens a string or char literal, the index just past it.
+    fn skip_literal(b: &[u8], i: usize) -> Option<usize> {
+        match b.get(i) {
+            Some(b'"') => {
+                let mut j = i + 1;
+                while j < b.len() {
+                    match b[j] {
+                        b'\\' => j += 2,
+                        b'"' => return Some(j + 1),
+                        _ => j += 1,
+                    }
+                }
+                Some(b.len())
+            }
+            // `'('` / `'\''` — a lifetime (`'a`) has no closing quote here.
+            Some(b'\'') if b.get(i + 2) == Some(&b'\'') => Some(i + 3),
+            Some(b'\'') if b.get(i + 1) == Some(&b'\\') && b.get(i + 3) == Some(&b'\'') => {
+                Some(i + 4)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_ident_byte(c: u8) -> bool {
+        c.is_ascii_alphanumeric() || c == b'_'
+    }
+
+    /// The `(VERB, handler)` pairs of a `MethodRouter` chain such as
+    /// `get(a).post(b).layer(…)`. Only verbs at the chain's top level count, so
+    /// a verb inside a handler closure or a layer argument is not mistaken for
+    /// a registration. `get_service(…)` and friends count as their verb.
+    fn method_handlers(chain: &str) -> Vec<(String, String)> {
+        let b = chain.as_bytes();
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < b.len() {
+            if let Some(next) = skip_literal(b, i) {
+                i = next;
+                continue;
+            }
+            let c = b[i];
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 && is_ident_byte(c) && (i == 0 || !is_ident_byte(b[i - 1])) => {
+                    let mut end = i;
+                    while end < b.len() && is_ident_byte(b[end]) {
+                        end += 1;
+                    }
+                    let word = chain.get(i..end).unwrap_or("");
+                    let verb = word.strip_suffix("_service").unwrap_or(word);
+                    let mut open = end;
+                    while open < b.len() && b[open].is_ascii_whitespace() {
+                        open += 1;
+                    }
+                    if ROUTING_VERBS.contains(&verb) && b.get(open) == Some(&b'(') {
+                        let close = matching_close(b, open);
+                        let arg = chain.get(open + 1..close).unwrap_or("");
+                        out.push((verb.to_ascii_uppercase(), handler_name(arg)));
+                        i = close + 1;
+                    } else {
+                        i = end;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The index of the `)` matching the `(` at `open` (or the end).
+    fn matching_close(b: &[u8], open: usize) -> usize {
+        let mut depth = 0i32;
+        let mut i = open;
+        while i < b.len() {
+            if let Some(next) = skip_literal(b, i) {
+                i = next;
+                continue;
+            }
+            match b[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        b.len()
+    }
+
+    /// The name a handler expression is registered under, without the module
+    /// path it is reached through: `crate::mcp::x::handler` → `handler`,
+    /// `GraphQLSubscription::new(…)` → `GraphQLSubscription::new`, a closure →
+    /// `<closure>`. Dropping the leading lowercase (module) segments is what
+    /// keeps the census stable across a move between files.
+    fn handler_name(expr: &str) -> String {
+        let expr = expr.trim_start().trim_start_matches(',').trim_start();
+        if expr.starts_with('|') || expr.starts_with("move") || expr.starts_with("async") {
+            return "<closure>".to_string();
+        }
+        let len = expr
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .unwrap_or(expr.len());
+        let path = expr.get(..len).unwrap_or("").trim_end_matches(':');
+        let segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
+        let keep_from = segments
+            .iter()
+            .position(|s| s.starts_with(|c: char| c.is_ascii_uppercase()))
+            .unwrap_or(segments.len().saturating_sub(1));
+        let name = segments.get(keep_from..).map(|s| s.join("::")).unwrap_or_default();
+        if name.is_empty() {
+            "<expr>".to_string()
+        } else {
+            name
+        }
+    }
+
+    /// Lines of `a` not matched in `b`, as a multiset difference.
+    fn multiset_minus(a: &[String], b: &[String]) -> Vec<String> {
+        let mut remaining: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for line in b {
+            *remaining.entry(line.as_str()).or_default() += 1;
+        }
+        let mut out = Vec::new();
+        for line in a {
+            match remaining.get_mut(line.as_str()) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => out.push(line.clone()),
+            }
+        }
+        out
+    }
+
+    /// **The HTTP route census.** Every route registration in the tree,
+    /// pinned against `src-tauri/http-routes.snapshot.txt`. A dropped route, a
+    /// changed method set or a rebound handler fails it; moving code between
+    /// files does not, because the census carries no file column. Guards the
+    /// `mcp_api.rs` split (plan
+    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`).
+    #[test]
+    fn http_route_census() {
+        let actual = http_route_census_lines();
+        assert!(
+            actual.len() > 500,
+            "the route census found only {} registrations — the walk is broken, not the router",
+            actual.len()
+        );
+        let snapshot =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(HTTP_ROUTE_SNAPSHOT);
+        if std::env::var(UPDATE_HTTP_ROUTE_SNAPSHOT).as_deref() == Ok("1") {
+            let mut text = String::from(
+                "# HTTP route census: every route registration call under src-tauri/src, one\n\
+                 # `<METHODS> <path> <handler>` line each, sorted, duplicates kept. `?` = a\n\
+                 # MethodRouter built elsewhere; `SERVICE` = a route_service mount; `<name>` = a\n\
+                 # path held in a constant or binding. No file column, so a move between files\n\
+                 # leaves this unchanged. GENERATED by mcp::relay_path_policy::tests::\n\
+                 # http_route_census; regenerate with UPDATE_HTTP_ROUTE_SNAPSHOT=1.\n",
+            );
+            for line in &actual {
+                text.push_str(line);
+                text.push('\n');
+            }
+            std::fs::write(&snapshot, text)
+                .unwrap_or_else(|e| panic!("writing {}: {e}", snapshot.display()));
+            eprintln!(
+                "http_route_census: rewrote {} ({} routes)",
+                snapshot.display(),
+                actual.len()
+            );
+            return;
+        }
+        let text = std::fs::read_to_string(&snapshot).unwrap_or_else(|e| {
+            panic!(
+                "reading {}: {e} — generate it with \
+                 `{UPDATE_HTTP_ROUTE_SNAPSHOT}=1` and this test",
+                snapshot.display()
+            )
+        });
+        let expected: Vec<String> = text
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        if expected == actual {
+            return;
+        }
+        let removed = multiset_minus(&expected, &actual);
+        let added = multiset_minus(&actual, &expected);
+        panic!(
+            "the HTTP route table changed.\n\
+             \n\
+             In the snapshot, missing from the tree ({} — a dropped or re-methoded route):\n{}\n\
+             \n\
+             In the tree, missing from the snapshot ({}):\n{}\n\
+             \n\
+             If the change is intended, regenerate the snapshot and commit it:\n  \
+             {UPDATE_HTTP_ROUTE_SNAPSHOT}=1 <cargo-guard.sh test> http_route_census\n\
+             A pure move between files never changes the census; if a move did, the move \
+             dropped or altered a registration.",
+            removed.len(),
+            removed.iter().map(|l| format!("  - {l}")).collect::<Vec<_>>().join("\n"),
+            added.len(),
+            added.iter().map(|l| format!("  + {l}")).collect::<Vec<_>>().join("\n"),
+        );
+    }
+
+    /// The census reader against synthetic sources: methods group per
+    /// handler, module paths are dropped, nested verbs and comments are not
+    /// read, and named paths still count.
+    #[test]
+    fn the_census_reads_methods_handlers_and_named_paths() {
+        let src = [
+            "Router::new()",
+            "    {R}\"/a\", get(crate::mcp::x::alpha).post(crate::mcp::x::alpha))",
+            "    {R}\"/b\", axum::routing::get(beta).delete(gamma).layer(from_fn(get_mw)))",
+            "    {R}\"/c\", get(|| async { s.get(1) }))",
+            "    {R}ROUTE_PATH, put(delta))",
+            "    {R}\"/d\", built_elsewhere())",
+            "    {S}\"/ws\", GraphQLSubscription::new(schema.clone()))",
+            "    // {R}\"/commented\", get(nope))",
+        ]
+        .join("\n")
+        .replace("{R}", ROUTE_CALL)
+        .replace("{S}", ROUTE_SERVICE_CALL);
+        let mut lines = Vec::new();
+        census_one_file(&src, &mut lines);
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                "? /d built_elsewhere",
+                "DELETE /b gamma",
+                "GET /b beta",
+                "GET /c <closure>",
+                "GET,POST /a alpha",
+                "PUT <ROUTE_PATH> delta",
+                "SERVICE /ws GraphQLSubscription::new",
+            ]
+        );
     }
 
     /// **The mechanical tripwire.** An allowlist entry that names no
