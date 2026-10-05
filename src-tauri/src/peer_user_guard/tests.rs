@@ -757,7 +757,7 @@ async fn a_genuine_other_user_is_refused() {
         .refused_other_user
         .load(std::sync::atomic::Ordering::Relaxed);
     let mut parts = prefix.split_whitespace();
-    let out = tokio::process::Command::new(parts.next().unwrap())
+    let out = crate::process_helpers::tokio_no_window(parts.next().unwrap())
         .args(parts)
         .args(["curl", "-sS", "-m", "5", &format!("http://{addr}/health")])
         .output()
