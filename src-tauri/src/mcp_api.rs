@@ -1025,12 +1025,12 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
     )
 }
 
-/// `/health` `degradedUnauthenticatedWrites`: the per-site ledger of BOTH
+/// `/health` `degradedUnauthenticatedRequests`: the per-site ledger of BOTH
 /// compiled copies of `auth` (`lib.rs` `pub mod auth` — the plan adapter and
 /// session archive send through it — and this binary's `mod auth`), merged by
 /// site. Each copy holds its own statics, so either alone is a partial count
 /// that reads as the whole.
-fn degraded_unauthenticated_writes_health() -> serde_json::Value {
+fn degraded_unauthenticated_requests_health() -> serde_json::Value {
     let lib = qontinui_runner_lib::auth::degraded_writes_snapshot()
         .into_iter()
         .map(|s| crate::auth::DegradedWriteSite {
@@ -1707,7 +1707,7 @@ async fn health(
         // 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device
         // D6). Observability only — the credential choice is unchanged. Merges
         // BOTH compiled copies of `auth`; `lastStatus: null` is UNKNOWN.
-        "degradedUnauthenticatedWrites": degraded_unauthenticated_writes_health(),
+        "degradedUnauthenticatedRequests": degraded_unauthenticated_requests_health(),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -21780,7 +21780,7 @@ mod ui_bridge_binding_health_tests {
     }
 }
 
-/// `/health` `degradedUnauthenticatedWrites` must merge BOTH compiled copies of
+/// `/health` `degradedUnauthenticatedRequests` must merge BOTH compiled copies of
 /// `auth` (plan 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device
 /// V8): the lib copy carries live sites (plan adapter, session archive), so a
 /// block that read only this binary's copy would under-count and read as whole.
@@ -21800,7 +21800,7 @@ mod degraded_writes_health_tests {
         qontinui_runner_lib::auth::note_degraded_send(shared, 2);
         qontinui_runner_lib::auth::note_degraded_send(shared, 2);
 
-        let v = degraded_unauthenticated_writes_health();
+        let v = degraded_unauthenticated_requests_health();
         let sent = |loc: &Location<'_>| {
             let key = format!("{}:{}", loc.file(), loc.line());
             v["sites"]

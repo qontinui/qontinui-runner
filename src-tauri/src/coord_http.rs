@@ -190,7 +190,7 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// copies is a census item, not a line to slip into this one.
 ///
 /// `#[track_caller]` so a degraded unauthenticated send is attributed to the
-/// CALLER's line in `/health` `degradedUnauthenticatedWrites`, not to this
+/// CALLER's line in `/health` `degradedUnauthenticatedRequests`, not to this
 /// helper's one line for every route through it.
 #[track_caller]
 pub fn coord_get_for(

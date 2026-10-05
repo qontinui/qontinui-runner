@@ -2937,22 +2937,28 @@ pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
 /// `07b54b4b3`) counts `outcome="anonymous"` for exactly 8 routes —
 /// `sessions_create`, `sessions_update`, `sessions_close`, `sessions_steal`,
 /// `claims_acquire`, `claims_heartbeat`, `claims_release`, `agents_allocate`.
-/// A degraded write to any other route is counted by nothing on coord, and
+/// A degraded request to any other route is counted by nothing on coord, and
 /// none of it is attributed to a runner call site.
 const COORD_ANONYMOUS_METRIC_NOTE: &str = "coord's only related counter is \
      coord_data_plane_auth_requests_total{route,outcome=\"anonymous\"} \
      (qontinui-coord crates/coord/src/data_plane_observe.rs), which covers 8 routes \
      only (sessions create/update/close/steal, claims acquire/heartbeat/release, \
      agents allocate) and does not attribute a request to a runner call site; a \
-     degraded write to any other route is counted by nothing on coord";
+     degraded request to any other route is counted by nothing on coord";
 
-/// One call site's record of tenant-owned writes it sent UNAUTHENTICATED
-/// because the owning tenant was unresolvable on a multi-bound device.
+/// One call site's record of tenant-owned coord requests it sent
+/// UNAUTHENTICATED because the owning tenant was unresolvable on a multi-bound
+/// device. REQUESTS, not only writes: the ledger counts every
+/// `TenantScope::Unresolved` send that degraded, and several sites are reads
+/// (`GET`s in `plan_workunit_adapter::push`, `coord_http::coord_get_for`) —
+/// a read creates no row, so a site here is not by itself a wrong-tenant or
+/// anonymous row on coord.
 ///
 /// `last_status` is the HTTP status coord answered to this site's MOST RECENT
 /// degraded send, and only where a dispatch that sees the response records it
 /// ([`note_degraded_send_status`] — today `session::coord_sync`'s
-/// `push_record`). `None` is UNKNOWN: no dispatch observed the answer (most
+/// `push_record`, including its `agent_notification` and gate-bootstrap
+/// sends). `None` is UNKNOWN: no dispatch observed the answer (most
 /// sites), or the send failed below HTTP. It is NEVER success. A new send
 /// resets it, and a status is accepted only for the send it answers (a per-site
 /// sequence number, see [`DegradedWriteLedger::record_status`]), so
@@ -2963,8 +2969,10 @@ pub struct DegradedWriteSite {
     /// `file:line` of the `attach_device_auth_for` / `attach_device_auth_blocking`
     /// call — or of the nearest synchronous `#[track_caller]` forwarding helper's
     /// caller. An `async fn` helper cannot propagate `#[track_caller]` on stable
-    /// Rust, so a site inside one names the helper's line, which still names the
-    /// route.
+    /// Rust, so a site inside one names the HELPER's line — and when that helper
+    /// serves several routes (e.g. `install_effects_producer::coord_client`'s
+    /// shared `post_json`, used for declare, predict-and-check and verify) those
+    /// routes share ONE row and cannot be told apart here.
     pub site: String,
     /// Degraded sends from this site since this copy of the module started.
     pub sent: u64,
@@ -3110,8 +3118,9 @@ fn note_degraded_send_on(
     send
 }
 
-/// Run `fut` — one dispatch that makes at most one coord send and inspects the
-/// response — so that [`note_degraded_send_status`] inside it can attribute the
+/// Run `fut` — one dispatch that inspects the response of each coord send it
+/// makes (recording each with [`note_degraded_send_status`] right after it, so
+/// a later send cannot inherit an earlier one's status) — so that [`note_degraded_send_status`] inside it can attribute the
 /// status to the site that degraded. Costs one task-local scope; a dispatch
 /// whose send was authenticated records nothing.
 pub async fn observe_degraded_send<F: std::future::Future>(fut: F) -> F::Output {
@@ -3144,7 +3153,10 @@ pub fn degraded_writes_snapshot() -> Vec<DegradedWriteSite> {
 
 /// Merge two copies' snapshots by site: `sent` adds, and `last_at` /
 /// `last_status` come from whichever copy sent last, so they keep describing
-/// one send. Sorted by site for a stable `/health` body.
+/// one send. On an exact `last_at` tie (two copies degrading at one site in the
+/// same millisecond) an observed status wins over a null one — the two rows
+/// then describe two simultaneous sends, and a known answer to one of them is
+/// more informative than UNKNOWN. Sorted by site for a stable `/health` body.
 pub fn merge_degraded_write_snapshots(
     a: Vec<DegradedWriteSite>,
     b: impl IntoIterator<Item = DegradedWriteSite>,
@@ -3156,7 +3168,11 @@ pub fn merge_degraded_write_snapshots(
             Some(have) => {
                 have.sent += entry.sent;
                 // RFC 3339 UTC with a fixed format orders lexically.
-                if entry.last_at > have.last_at {
+                let newer = entry.last_at > have.last_at;
+                let tie_fills_unknown = entry.last_at == have.last_at
+                    && have.last_status.is_none()
+                    && entry.last_status.is_some();
+                if newer || tie_fills_unknown {
                     have.last_at = entry.last_at;
                     have.last_status = entry.last_status;
                 }
@@ -3169,7 +3185,7 @@ pub fn merge_degraded_write_snapshots(
     by_site.into_values().collect()
 }
 
-/// The `GET /health` `degradedUnauthenticatedWrites` block for `sites`.
+/// The `GET /health` `degradedUnauthenticatedRequests` block for `sites`.
 pub fn degraded_writes_health_json(sites: &[DegradedWriteSite]) -> serde_json::Value {
     let total: u64 = sites.iter().map(|s| s.sent).sum();
     serde_json::json!({
@@ -3184,29 +3200,32 @@ pub fn degraded_writes_health_json(sites: &[DegradedWriteSite]) -> serde_json::V
             }))
             .collect::<Vec<_>>(),
         "outcomeNote": format!(
-            "Each site sent tenant-owned coord writes UNAUTHENTICATED because the owning \
+            "Each site sent tenant-owned coord requests UNAUTHENTICATED because the owning \
              tenant could not be resolved on a multi-bound device (presenting the default \
-             binding's credential would attribute the row to the wrong tenant). Counts are \
+             binding's credential would attribute the row to the wrong tenant). Requests, \
+             not only writes: some sites are reads (GETs), which create no row. A site \
+             inside a shared async helper names the helper's line, so routes through it \
+             share one row. Counts are \
              since this runner process started. lastStatus is coord's HTTP answer to the \
              site's most recent such send, recorded only where a dispatch sees the response \
-             (session::coord_sync push_record); null means UNKNOWN, never success. \
+             (session::coord_sync push_record, all its arms); null means UNKNOWN, never success. \
              {COORD_ANONYMOUS_METRIC_NOTE}."
         ),
     })
 }
 
-/// Warn — once per CALL SITE — that a tenant-owned write degraded to
+/// Warn — once per CALL SITE — that a tenant-owned request degraded to
 /// unauthenticated on a multi-bound device. Per site rather than per call
 /// because the sites include periodic loops, and per site rather than per
 /// process because one process-wide latch named whichever site happened to
 /// degrade first and hid the rest.
 fn warn_unresolved_on_multi_bound(site: &str, binding_count: usize) {
     warn!(
-        "coord data-plane: a tenant-owned write at {site} could not resolve its owning \
+        "coord data-plane: a tenant-owned request at {site} could not resolve its owning \
          tenant on a device holding {binding_count} bindings — sending it UNAUTHENTICATED \
          rather than presenting the default binding's credential, which would attribute \
          the row to the wrong tenant. Further sends from this site are counted, not \
-         logged: GET /health degradedUnauthenticatedWrites. The outcome is NOT observed \
+         logged: GET /health degradedUnauthenticatedRequests. The outcome is NOT observed \
          here, and {COORD_ANONYMOUS_METRIC_NOTE}."
     );
 }
@@ -6281,10 +6300,22 @@ mod degraded_write_tests {
             older_first,
             vec![site("s:1", 2, "2026-10-05T10:00:00.000Z", Some(500))]
         );
+        // An exact tie: the observed status wins over UNKNOWN, in either order.
+        for (a, b) in [(None, Some(409)), (Some(409), None)] {
+            let tied = merge_degraded_write_snapshots(
+                vec![site("t:1", 1, "2026-10-05T10:00:00.000Z", a)],
+                vec![site("t:1", 1, "2026-10-05T10:00:00.000Z", b)],
+            );
+            assert_eq!(
+                tied,
+                vec![site("t:1", 2, "2026-10-05T10:00:00.000Z", Some(409))],
+                "tie {a:?} / {b:?}"
+            );
+        }
     }
 
     /// The `/health` block's key names, as LITERALS — a rename is a contract
-    /// change for every reader of `degradedUnauthenticatedWrites`.
+    /// change for every reader of `degradedUnauthenticatedRequests`.
     #[test]
     fn the_health_block_has_the_documented_shape() {
         let v = degraded_writes_health_json(&[
@@ -6317,6 +6348,10 @@ mod degraded_write_tests {
         );
         let note = v["outcomeNote"].as_str().unwrap();
         assert!(note.contains("null means UNKNOWN"), "{note}");
+        assert!(
+            note.contains("not only writes") && note.contains("GETs"),
+            "the note does not claim every counted send was a write: {note}"
+        );
         assert!(
             note.contains("coord_data_plane_auth_requests_total") && note.contains("8 routes"),
             "the note names coord's counter WITH its limit: {note}"
