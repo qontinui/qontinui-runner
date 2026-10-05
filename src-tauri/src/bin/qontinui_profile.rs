@@ -64,11 +64,11 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use qontinui_runner_lib::pair::{
     coord_http_base, pair_via_browser, pair_with_auth_token, pair_with_pair_code, persist_pairing,
-    tenant_id_from_oauth_claim, PairCompleteResponse,
+    resolve_cli_web_base, tenant_id_from_oauth_claim, CliWebBaseSource, PairCompleteResponse,
 };
 use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
-    load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile, PROD_API_BASE_URL,
+    load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -907,7 +907,7 @@ fn cmd_device_show() -> ExitCode {
 // device pair — bind this device to a web-backend user
 // ============================================================================
 //
-// Two modes:
+// Three modes:
 //
 // 1. `--browser` (default): opens `{web_backend}/connect-runner?state=<nonce>
 //    &callback=http://127.0.0.1:<port>/auth/runner-token-callback
@@ -917,8 +917,14 @@ fn cmd_device_show() -> ExitCode {
 //    `POST /coord/devices/pair-complete`, and receive a device-token JWT.
 //
 // 2. `--auth-token <oauth>`: headless. POSTs `Authorization: Bearer <oauth>`
-//    to coord's `POST /coord/devices/pair-cli`; receives the device-token JWT
-//    directly.
+//    to the qontinui-WEB backend's `POST {web_base}/api/v1/devices/pair-cli`
+//    (which injects `tenant_id` server-side and proxies to coord's
+//    `/coord/devices/pair-cli`); receives the device-token JWT directly. The
+//    web base comes from `pair::resolve_cli_web_base`, never the coord host —
+//    coord serves no `/api/v1/devices/*` route. Still requires
+//    `paired_user.json` from an earlier pairing.
+//
+// 3. `--pair-code <CODE>`: headless redemption against the same web base.
 //
 // On success we persist:
 //
@@ -966,87 +972,13 @@ fn select_pair_mode(
     }
 }
 
-/// Which rung of [`resolve_pair_code_base`] produced the URL.
-///
-/// The three rungs have three DIFFERENT remediations when a redeem fails
-/// against the resolved host, and the URL alone does not distinguish them —
-/// `https://api.qontinui.io` looks identical whether it came from an operator
-/// export, from a coord_url in `profiles.json`, or from the compiled-in
-/// default. Reporting the winning arm turns "wrong host" from a guess into a
-/// one-line fix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PairCodeBaseSource {
-    /// `$QONTINUI_WEB_BASE` was set to a non-blank value. Fix: correct or
-    /// unset that var.
-    EnvOverride,
-    /// Nothing configured; the compiled-in production default. Fix: set
-    /// `$QONTINUI_WEB_BASE` if you are not pairing against production (a
-    /// local dev backend is `http://127.0.0.1:8000`).
-    ProdDefault,
-}
-
-impl PairCodeBaseSource {
-    /// Short operator-facing label naming the arm and how to change it.
-    fn as_str(self) -> &'static str {
-        match self {
-            PairCodeBaseSource::EnvOverride => "$QONTINUI_WEB_BASE override",
-            PairCodeBaseSource::ProdDefault => {
-                "compiled-in production default (no $QONTINUI_WEB_BASE)"
-            }
-        }
-    }
-}
-
-/// Resolve the base URL for pair-code redemption, WITH the arm that produced
-/// it. Two rungs, in order:
-///
-/// 1. `web_base_env` (`$QONTINUI_WEB_BASE`) — an explicit operator override.
-///    Blank/whitespace counts as unset, matching how every other rung ladder
-///    in this workspace reads an exported-but-empty var.
-/// 2. [`PROD_API_BASE_URL`] — the fleet's real production default.
-///
-/// # Why there is no derive-from-coord rung
-///
-/// There used to be a middle rung that derived this base from the active
-/// profile's `coord_url`, on the assumption that web and coord co-locate.
-/// It was removed because it is **never** correct, in either environment:
-///
-/// * In PRODUCTION the two are different services — coord is
-///   `coord.qontinui.io`, the web backend is `api.qontinui.io`. The derived
-///   base sent a web-backend route to coord, which answers
-///   `401 missing operator Bearer token`. Measured on a headless box
-///   2026-09-02.
-/// * In DEV they share a host but NOT a port, and the derivation strips the
-///   port — `http://localhost:9870` derived to `http://localhost`, i.e. port
-///   80, while the dev backend listens on 8000.
-///
-/// So the rung could only ever be right for a deployment serving the web
-/// backend on port 80 of coord's own host, which is not a deployment this
-/// fleet has. A rung that is never correct is worse than no rung, because it
-/// outranks the working default and makes the failure look like a client bug.
-///
-/// The canonical four-rung resolver (`api_config::resolve_api_base_url`, which
-/// additionally weighs `$QONTINUI_WEB_BACKEND_URL`, `$QONTINUI_API_URL` and the
-/// persisted `web_integration.backend_url`) is deliberately NOT used here:
-/// `api_config` is declared in `main.rs`, so it belongs to the runner binary's
-/// module tree and is unreachable from this separate binary. Re-implementing
-/// its precedence here would be the second copy of the precedence rule that
-/// module's own docs name as the dominant divergence hazard.
-///
-/// The [`PairCodeBaseSource`] half is returned rather than logged here so the
-/// function stays pure and the caller owns the output surface.
-fn resolve_pair_code_base(web_base_env: Option<&str>) -> (String, PairCodeBaseSource) {
-    if let Some(explicit) = web_base_env.filter(|s| !s.trim().is_empty()) {
-        // Trailing slash would build `<base>//api/v1/...`; trim it here so the
-        // one operator-supplied rung cannot produce a malformed URL.
-        return (
-            explicit.trim().trim_end_matches('/').to_string(),
-            PairCodeBaseSource::EnvOverride,
-        );
-    }
-    (
-        PROD_API_BASE_URL.to_string(),
-        PairCodeBaseSource::ProdDefault,
+/// The web-backend base for the headless pair flows, read from the real
+/// environment and the active profile. Thin I/O shell over the pure
+/// [`resolve_cli_web_base`] (whose tests live in the lib's `pair` module).
+fn cli_web_base() -> (String, CliWebBaseSource) {
+    resolve_cli_web_base(
+        std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+        qontinui_runner_lib::profiles::api_url_with_source(),
     )
 }
 
@@ -1092,15 +1024,15 @@ fn cmd_device_pair(
         }
     };
     // `base` (the coord HTTP base, derived from the active profile's
-    // coord_url) is required unconditionally for Browser/AuthToken modes.
-    // PairCode mode only consults it as a secondary fallback — see
-    // `resolve_pair_code_base` — so a missing/unreadable profiles.json must
-    // NOT hard-error here: that would force every fresh machine to run
-    // `qontinui_profile init` (which writes an unrelated local-dev DB/
-    // Redis/blob stack profile it will never use) just to redeem a pair
-    // code against production. Fleet-join, 2026-08-24.
+    // coord_url) is required ONLY for Browser mode, which still dials coord's
+    // `/coord/devices/pair-start`. PairCode and AuthToken both talk to the
+    // web backend (`pair::resolve_cli_web_base`) and never consult it, so a
+    // missing/unreadable profiles.json must NOT hard-error for them: that
+    // would force every fresh machine to run `qontinui_profile init` (which
+    // writes an unrelated local-dev DB/Redis/blob stack profile it will never
+    // use) just to pair headlessly against production. Fleet-join, 2026-08-24.
     let base_result = coord_http_base();
-    if !matches!(mode, PairMode::PairCode(_)) {
+    if matches!(mode, PairMode::Browser) {
         if let Err(e) = &base_result {
             eprintln!("error: could not resolve coord_url: {}", e);
             return ExitCode::from(2);
@@ -1158,27 +1090,22 @@ fn cmd_device_pair(
                 }
             };
             // Pair codes redeem against the web backend. Resolution order
-            // lives in `resolve_pair_code_base` — see its doc comment.
-            let (web_base, base_source) =
-                resolve_pair_code_base(std::env::var("QONTINUI_WEB_BASE").ok().as_deref());
-            // Print the URL *and* which rung produced it: the two rungs have
+            // lives in `resolve_cli_web_base` — see its doc comment.
+            let (web_base, base_source) = cli_web_base();
+            // Print the URL *and* which rung produced it: the rungs have
             // different fixes, and the URL alone does not say which one an
             // operator staring at a failed redeem should reach for.
-            println!(
-                "Redeeming pair code against {} ({})",
-                web_base,
-                base_source.as_str()
-            );
+            println!("Redeeming pair code against {web_base} ({base_source})");
             pair_with_pair_code(&web_base, code, &device_id)
         }
         PairMode::AuthToken(token) => {
-            let origin = qontinui_runner_lib::pair::PairBaseOrigin {
-                label: "coord_url (profiles.json / COORD_HTTP_URL)".to_string(),
-                remedy: "Set coord_url in ~/.qontinui/profiles.json or export COORD_HTTP_URL."
-                    .to_string(),
-            };
+            // `pair-cli` is a qontinui-web route, never a coord one: dial the
+            // same web base the pair-code arm does, not `base`.
+            let (web_base, base_source) = cli_web_base();
+            println!("Pairing via pair-cli against {web_base} ({base_source})");
+            let origin = base_source.pair_base_origin();
             pair_with_auth_token(
-                &base,
+                &web_base,
                 token,
                 preflight_tenant_id.expect("set above"),
                 &origin,
@@ -2298,117 +2225,6 @@ mod tests {
             }
             other => panic!("expected Device::Pair {{pair_code}}, got {:?}", other),
         }
-    }
-
-    // ------------------------------------------------------------------
-    // resolve_pair_code_base — fleet-join, 2026-08-24. A fresh machine
-    // with no profiles.json and no override must still be able to redeem
-    // a pair code against production, not hard-error.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn resolve_pair_code_base_prefers_env_override_over_everything() {
-        assert_eq!(
-            resolve_pair_code_base(Some("https://custom.example")),
-            (
-                "https://custom.example".to_string(),
-                PairCodeBaseSource::EnvOverride
-            )
-        );
-    }
-
-    #[test]
-    fn resolve_pair_code_base_ignores_an_empty_env_override() {
-        // An empty string is not a real override — e.g. `QONTINUI_WEB_BASE=`
-        // in an env file. Falls through exactly as if unset, and must report
-        // the arm that actually won rather than the one that was skipped.
-        assert_eq!(
-            resolve_pair_code_base(Some("")),
-            (
-                PROD_API_BASE_URL.to_string(),
-                PairCodeBaseSource::ProdDefault
-            )
-        );
-    }
-
-    #[test]
-    fn resolve_pair_code_base_never_returns_the_coord_host() {
-        // REGRESSION. A middle rung used to derive this base from the active
-        // profile's coord_url. In production that sent a WEB-backend route to
-        // coord, which answers 401 (measured headless 2026-09-02); in dev it
-        // stripped the port and pointed at :80 instead of :8000. Nothing may
-        // reintroduce a coord-derived answer here: with no override the ONLY
-        // permitted result is the production web base.
-        let (base, arm) = resolve_pair_code_base(None);
-        assert_eq!(base, PROD_API_BASE_URL);
-        assert_eq!(arm, PairCodeBaseSource::ProdDefault);
-        assert!(
-            !base.contains("coord"),
-            "pair-code base must never resolve to a coord host, got {base}"
-        );
-    }
-
-    #[test]
-    fn resolve_pair_code_base_treats_whitespace_env_as_unset() {
-        // An exported-but-blank var is how a shell says "absent"; it must not
-        // win the ladder and produce an empty base.
-        assert_eq!(
-            resolve_pair_code_base(Some("   ")),
-            (
-                PROD_API_BASE_URL.to_string(),
-                PairCodeBaseSource::ProdDefault
-            )
-        );
-    }
-
-    #[test]
-    fn resolve_pair_code_base_trims_a_trailing_slash_from_the_override() {
-        // `QONTINUI_WEB_BASE=https://x/` would otherwise build `https://x//api/v1/...`.
-        assert_eq!(
-            resolve_pair_code_base(Some("https://custom.example/")),
-            (
-                "https://custom.example".to_string(),
-                PairCodeBaseSource::EnvOverride
-            )
-        );
-    }
-
-    #[test]
-    fn resolve_pair_code_base_falls_back_to_prod_default_with_nothing_configured() {
-        // The fresh-machine case this whole fix is for: no profiles.json
-        // (coord_base is None), no QONTINUI_WEB_BASE. Must resolve to the
-        // fleet's real production API host, not error and not silently
-        // point at localhost.
-        assert_eq!(
-            resolve_pair_code_base(None),
-            (
-                PROD_API_BASE_URL.to_string(),
-                PairCodeBaseSource::ProdDefault
-            )
-        );
-    }
-
-    #[test]
-    fn pair_code_base_sources_have_distinct_operator_labels() {
-        // The whole point of the second return value: an operator reading the
-        // printed line must be able to tell the three rungs apart, because
-        // each has a different fix. Identical labels would be worse than none.
-        let labels = [
-            PairCodeBaseSource::EnvOverride.as_str(),
-            PairCodeBaseSource::ProdDefault.as_str(),
-        ];
-        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            labels.len(),
-            "labels must be distinct: {labels:?}"
-        );
-        assert!(labels.iter().all(|l| !l.is_empty()));
-        // Each label must name the knob the operator would turn.
-        assert!(PairCodeBaseSource::EnvOverride
-            .as_str()
-            .contains("QONTINUI_WEB_BASE"));
-        assert!(PairCodeBaseSource::ProdDefault.as_str().contains("default"));
     }
 
     #[test]
