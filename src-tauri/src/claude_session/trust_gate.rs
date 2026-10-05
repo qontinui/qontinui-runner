@@ -101,12 +101,16 @@ const DIAL_KEY: &str = "implement_tier:";
 
 /// The autonomy tiers, TIGHTEST first — the same vocabulary and the same
 /// ordering coord pins in `AUTONOMY_TIERS_TIGHTEST_FIRST`. A value outside this
-/// set is [`DialParse::Unrecognised`], never coerced to a neighbour.
+/// set is [`DialParse::Unrecognised`], never coerced to a neighbour — including
+/// the retired `draft-required`, renamed `hold-required` by plan
+/// `2026-10-04-coord-pr-hold-without-github-drafts` D5 because GitHub drafts do
+/// not exist on private repos under GitHub Free; the tier now means "open the
+/// PR with a coord `security_tier` hold".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AutonomyTier {
     AskFirst,
-    DraftRequired,
+    HoldRequired,
     Proceed,
 }
 
@@ -114,7 +118,7 @@ impl AutonomyTier {
     pub fn as_wire(self) -> &'static str {
         match self {
             AutonomyTier::AskFirst => "ask-first",
-            AutonomyTier::DraftRequired => "draft-required",
+            AutonomyTier::HoldRequired => "hold-required",
             AutonomyTier::Proceed => "proceed",
         }
     }
@@ -122,7 +126,7 @@ impl AutonomyTier {
     fn from_wire(s: &str) -> Option<Self> {
         match s {
             "ask-first" => Some(AutonomyTier::AskFirst),
-            "draft-required" => Some(AutonomyTier::DraftRequired),
+            "hold-required" => Some(AutonomyTier::HoldRequired),
             "proceed" => Some(AutonomyTier::Proceed),
             _ => None,
         }
@@ -218,7 +222,7 @@ pub enum EnforcementPosture {
 ///
 /// * `proceed` — the tenant has said security-surface work proceeds and is
 ///   reported. Preserve the landed behaviour exactly, and report.
-/// * `draft-required` — the tenant wants security-surface work attenuated and
+/// * `hold-required` — the tenant wants security-surface work attenuated and
 ///   visible rather than blocked. Withholding the mint is the attenuation: the
 ///   work happens, the ambient-trust grant does not.
 /// * `ask-first` — the tenant wants an operator decision before security-surface
@@ -280,7 +284,7 @@ pub fn posture_for(dial: &DialResolution) -> (EnforcementPosture, &'static str) 
 fn posture_for_tier(tier: AutonomyTier) -> EnforcementPosture {
     match tier {
         AutonomyTier::Proceed => EnforcementPosture::Report,
-        AutonomyTier::DraftRequired => EnforcementPosture::Withhold,
+        AutonomyTier::HoldRequired => EnforcementPosture::Withhold,
         AutonomyTier::AskFirst => EnforcementPosture::Block,
     }
 }
@@ -376,7 +380,7 @@ fn dial_override() -> Option<AutonomyTier> {
         None => {
             warn!(
                 value = %raw,
-                "{DIAL_OVERRIDE_ENV} is not one of ask-first|draft-required|proceed; ignoring it \
+                "{DIAL_OVERRIDE_ENV} is not one of ask-first|hold-required|proceed; ignoring it \
                  and reading the tenant dial"
             );
             None
@@ -2085,8 +2089,8 @@ mod tests {
             DialParse::Present(AutonomyTier::Proceed)
         );
         assert_eq!(
-            parse_autonomy_dial("implement_tier: `draft-required`"),
-            DialParse::Present(AutonomyTier::DraftRequired)
+            parse_autonomy_dial("implement_tier: `hold-required`"),
+            DialParse::Present(AutonomyTier::HoldRequired)
         );
         assert_eq!(
             parse_autonomy_dial("  implement_tier: ask-first  — and the prose names proceed too"),
@@ -2095,7 +2099,9 @@ mod tests {
     }
 
     /// The parser run over the SHAPE THIS TENANT ACTUALLY SERVES, excerpted
-    /// verbatim from `policy/security-and-autonomy` v6 (read 2026-09-06). The
+    /// from `policy/security-and-autonomy` v6 (read 2026-09-06), with the
+    /// middle tier's glossary line as plan
+    /// `2026-10-04-coord-pr-hold-without-github-drafts` D5 rewrites it. The
     /// trap it pins: the prose immediately below the clause names all three
     /// tiers in backticks, so anything looser than a line-anchored parse would
     /// "find" a tier in the explanation rather than in the clause.
@@ -2107,7 +2113,7 @@ mod tests {
 
 THE AUTONOMY DIAL. One of:
 - `proceed` — implement and let it land like ordinary work.
-- `draft-required` — implement fully, but open the PR with `gh pr create --draft`.
+- `hold-required` — implement fully, but open the PR with a `security_tier` hold + an operator_approval gate.
 - `ask-first` — do not implement. Stop at a vetted plan and surface it.
 ";
         assert_eq!(
@@ -2143,6 +2149,29 @@ THE AUTONOMY DIAL. One of:
         );
     }
 
+    /// The retired token is NOT an alias: a document still serving
+    /// `draft-required` is Unrecognised, which posture-maps to Block — the
+    /// rename fails closed rather than silently loosening or tightening.
+    #[test]
+    fn the_retired_draft_required_token_is_unrecognised_and_blocks() {
+        assert_eq!(
+            parse_autonomy_dial("implement_tier: draft-required"),
+            DialParse::Unrecognised("draft-required".to_string())
+        );
+        assert_eq!(AutonomyTier::from_wire("draft-required"), None);
+        assert_eq!(
+            AutonomyTier::from_wire(AutonomyTier::HoldRequired.as_wire()),
+            Some(AutonomyTier::HoldRequired)
+        );
+        assert_eq!(
+            posture_for(&DialResolution::Unrecognised {
+                raw: "draft-required".to_string()
+            })
+            .0,
+            EnforcementPosture::Block
+        );
+    }
+
     #[test]
     fn every_dial_resolution_maps_to_a_posture() {
         assert_eq!(
@@ -2154,7 +2183,7 @@ THE AUTONOMY DIAL. One of:
         );
         assert_eq!(
             posture_for(&DialResolution::Fresh {
-                tier: AutonomyTier::DraftRequired
+                tier: AutonomyTier::HoldRequired
             })
             .0,
             EnforcementPosture::Withhold
@@ -3180,7 +3209,7 @@ THE AUTONOMY DIAL. One of:
         .unwrap();
         let _env_lock = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[DIAL_OVERRIDE_ENV]);
-        std::env::set_var(DIAL_OVERRIDE_ENV, "draft-required");
+        std::env::set_var(DIAL_OVERRIDE_ENV, "hold-required");
         let cwd = target.path().to_string_lossy().into_owned();
         let acct = account.path().to_string_lossy().into_owned();
 

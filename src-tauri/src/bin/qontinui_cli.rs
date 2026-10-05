@@ -101,7 +101,10 @@ OPTIONS (create):
   --title <text>        PR title (required; `--title -` reads the first line of stdin)
   --body <text>         PR body
   --body-file <path>    Read the PR body from a file
-  --draft               Open as a draft PR
+  --hold <reason>       Open the PR HELD: coord records a hold before it creates
+                        the PR, so the merge train never lands it until the hold
+                        is released (coord_set_pr_hold). Replaces the retired
+                        --draft, which private repos on GitHub Free cannot honour.
 
 OPTIONS (plan-library-backfill):
   --dry-run             Scan and report only — no backend is contacted
@@ -198,8 +201,17 @@ struct PrCreateArgs {
     title: Option<String>,
     body: Option<String>,
     body_file: Option<String>,
-    draft: bool,
+    /// `--hold <reason>`: forwarded as `hold: {reason}` so coord places the
+    /// hold BEFORE it creates the PR (no window in which a green PR is
+    /// eligible to land).
+    hold: Option<String>,
 }
+
+/// Error for the retired `--draft` flag. A loud refusal rather than an
+/// "unknown flag": a caller still passing `--draft` meant "do not land this",
+/// and must be told the flag that now means that.
+const DRAFT_RETIRED_ERR: &str = "--draft is retired: GitHub drafts do not exist on private repos \
+     under GitHub Free, so coord holds PRs instead — use --hold <reason>";
 
 fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
     let mut out = PrCreateArgs::default();
@@ -216,7 +228,7 @@ fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
         };
         // Take the flag's value: the inline `=value` if given, else the next
         // argv element — but a next element that LOOKS like a flag is an error
-        // (`--title --draft` must not yield a PR titled "--draft"); use
+        // (`--title --hold` must not yield a PR titled "--hold"); use
         // `--flag=value` for values that legitimately begin with `--`.
         let mut consumed = 1usize;
         let mut take_value = |slot: &mut Option<String>| -> Result<(), String> {
@@ -244,12 +256,13 @@ fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
             "--title" => take_value(&mut out.title)?,
             "--body" => take_value(&mut out.body)?,
             "--body-file" => take_value(&mut out.body_file)?,
-            "--draft" => {
-                if inline.is_some() {
-                    return Err("--draft does not take a value".to_string());
+            "--hold" => {
+                take_value(&mut out.hold)?;
+                if out.hold.as_deref().is_some_and(|r| r.trim().is_empty()) {
+                    return Err("--hold requires a non-empty reason".to_string());
                 }
-                out.draft = true;
             }
+            "--draft" => return Err(DRAFT_RETIRED_ERR.to_string()),
             other => return Err(format!("unknown flag {other:?}")),
         }
         i += consumed;
@@ -366,8 +379,8 @@ fn pr_create(args: &[String]) -> ExitCode {
     if let Some(b) = body {
         payload["body"] = serde_json::json!(b);
     }
-    if parsed.draft {
-        payload["draft"] = serde_json::json!(true);
+    if let Some(reason) = &parsed.hold {
+        payload["hold"] = serde_json::json!({ "reason": reason });
     }
 
     let client = match reqwest::blocking::Client::builder()
@@ -1749,7 +1762,8 @@ mod tests {
             "feat: x",
             "--body",
             "body text",
-            "--draft",
+            "--hold",
+            "waiting on the schema migration",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1760,7 +1774,10 @@ mod tests {
         assert_eq!(parsed.base.as_deref(), Some("develop"));
         assert_eq!(parsed.title.as_deref(), Some("feat: x"));
         assert_eq!(parsed.body.as_deref(), Some("body text"));
-        assert!(parsed.draft);
+        assert_eq!(
+            parsed.hold.as_deref(),
+            Some("waiting on the schema migration")
+        );
     }
 
     #[test]
@@ -1773,8 +1790,8 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_flag_like_value() {
-        // `--title --draft` must NOT yield a PR titled "--draft".
-        let args: Vec<String> = ["--title", "--draft"]
+        // `--title --hold` must NOT yield a PR titled "--hold".
+        let args: Vec<String> = ["--title", "--hold"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1797,22 +1814,48 @@ mod tests {
     #[test]
     fn parse_args_supports_flag_equals_value_form() {
         // Values that legitimately begin with `--` use the `=` form.
-        let args: Vec<String> = ["--title=--weird title", "--base=main", "--draft"]
+        let args: Vec<String> = ["--title=--weird title", "--base=main", "--hold=a=b reason"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let parsed = parse_pr_create_args(&args).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("--weird title"));
         assert_eq!(parsed.base.as_deref(), Some("main"));
-        assert!(parsed.draft);
+        assert_eq!(parsed.hold.as_deref(), Some("a=b reason"));
         // Value containing `=` splits only on the FIRST `=`.
         let args: Vec<String> = vec!["--body=a=b=c".to_string()];
         assert_eq!(
             parse_pr_create_args(&args).unwrap().body.as_deref(),
             Some("a=b=c")
         );
-        // --draft takes no value.
-        assert!(parse_pr_create_args(&["--draft=true".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_hold_requires_a_reason() {
+        // No value, a flag-like value, and a blank value are all refused —
+        // a hold without a reason is the silent-stall shape coord rejects.
+        assert!(parse_pr_create_args(&["--hold".to_string()]).is_err());
+        let flag_like: Vec<String> = ["--hold", "--title"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_pr_create_args(&flag_like).is_err());
+        let blank = parse_pr_create_args(&["--hold=  ".to_string()]).unwrap_err();
+        assert!(blank.contains("non-empty reason"), "{blank}");
+        // Absent --hold leaves the PR unheld.
+        let none: Vec<String> = ["--title", "t"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_pr_create_args(&none).unwrap().hold, None);
+    }
+
+    #[test]
+    fn parse_args_refuses_retired_draft_loudly() {
+        // `--draft` is not silently ignored (that would open an UNHELD PR the
+        // caller meant to keep from landing): it names its replacement.
+        for form in ["--draft", "--draft=true"] {
+            let err = parse_pr_create_args(&[form.to_string()]).unwrap_err();
+            assert!(err.contains("--hold <reason>"), "{form}: {err}");
+            assert!(err.contains("retired"), "{form}: {err}");
+        }
     }
 
     #[test]
