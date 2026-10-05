@@ -16,12 +16,12 @@ never share a line:
 | **REACHABILITY (now)** | What answers me at this instant? | True only at probe time |
 
 **The identity predicate is `$QONTINUI_RUNNER_CONTEXT` being non-empty — iff.**
-The runner injects it at spawn
-(`qontinui-runner/src-tauri/src/terminal/session.rs:753`) from the single source
-of truth `terminal::runner_context()` (`terminal/mod.rs:338`), and its first line
+The runner injects it at spawn, in `TerminalSession::spawn`
+(`qontinui-runner/src-tauri/src/terminal/session.rs`), from the single source
+of truth `terminal::runner_context()` (`terminal/mod.rs`), and its first line
 is the attributable marker
 `[source: qontinui-runner/runner_context@<version>+<git-sha>]`
-(`RUNNER_CONTEXT_SOURCE_MARKER`, `terminal/mod.rs:211`). It is fixed for the
+(`RUNNER_CONTEXT_SOURCE_MARKER`, `terminal/mod.rs`). It is fixed for the
 session's lifetime and survives a runner restart.
 
 **Line 2, where present, is the PROVENANCE line** — a sequence of
