@@ -1277,8 +1277,8 @@ pub fn record_and_reconcile_coord_bound_tenants(
 ) -> Result<BindingReconcileReport, String> {
     let mgr = crate::auth::AuthManager::new();
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
-    let sidecar = coord_bound_tenants_path()
-        .ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    let sidecar =
+        coord_bound_tenants_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
     record_and_reconcile_at(
         &mgr,
         &path,
@@ -7647,7 +7647,11 @@ mod vanished_paired_user_heal_tests {
         assert_eq!(r2.dropped_slots, vec![tb()]);
         assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_none());
         let bound = coord_bound_tenants_for_heal_at(&path, &sidecar, now);
-        assert_eq!(bound, known(&[ta()]), "a confirmed drop is excluded from the heal's set");
+        assert_eq!(
+            bound,
+            known(&[ta()]),
+            "a confirmed drop is excluded from the heal's set"
+        );
         let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
         assert!(
             matches!(&heal, PairedUserHeal::Healed { tenants, .. } if tenants == &vec![ta()]),
@@ -7780,13 +7784,18 @@ mod vanished_paired_user_heal_tests {
         let now = chrono::Utc::now().timestamp();
         record_coord_bound_tenants_at(&sidecar, &[tc()], now).expect("echo");
         let bound = coord_bound_tenants_for_heal_at(&path, &sidecar, now);
-        assert_eq!(bound, known(&[tc()]), "the tombstone keeps A out of the set");
+        assert_eq!(
+            bound,
+            known(&[tc()]),
+            "the tombstone keeps A out of the set"
+        );
         let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
         assert!(matches!(heal, PairedUserHeal::Refused(_)), "{heal:?}");
         assert!(!path.exists(), "the unbind is not resurrected");
 
         // Coord echoing A again lifts the tombstone (the existing reset).
-        let r5 = reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0 + 120).expect("echo A");
+        let r5 =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0 + 120).expect("echo A");
         assert!(r5.held.is_empty(), "{r5:?}");
         let r6 = reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0 + 150).expect("omit again");
         assert_eq!(r6.held, vec![(ta(), 1)], "a fresh run starts at one");
@@ -7820,7 +7829,10 @@ mod vanished_paired_user_heal_tests {
 
         // The next READABLE omission: A is still a tombstone, never re-held.
         let r = reconcile_paired_bindings_at(&mgr, &path, &[tc()], T0 + 90).expect("readable");
-        assert!(r.held.is_empty(), "the tombstone survived the blind pass: {r:?}");
+        assert!(
+            r.held.is_empty(),
+            "the tombstone survived the blind pass: {r:?}"
+        );
 
         // The vanish: the heal refuses A.
         std::fs::remove_file(&path).expect("the deleter");
@@ -7885,7 +7897,10 @@ mod vanished_paired_user_heal_tests {
         ));
         assert!(!omission_pass_is_fully_measured(false, &SlotRead::Absent));
         assert!(omission_pass_is_fully_measured(true, &SlotRead::Absent));
-        assert!(omission_pass_is_fully_measured(true, &SlotRead::PresentButDead));
+        assert!(omission_pass_is_fully_measured(
+            true,
+            &SlotRead::PresentButDead
+        ));
 
         let (_dir, path, _mgr) = store("legacy_blind");
         // A tombstoned (two omissions with a measured legacy claim).
@@ -8039,7 +8054,9 @@ mod vanished_paired_user_heal_tests {
                     },
                 )
             });
-            in_lock_rx.recv().expect("the heal reached its locked section");
+            in_lock_rx
+                .recv()
+                .expect("the heal reached its locked section");
             (healer, release_tx)
         }
 
@@ -8073,7 +8090,10 @@ mod vanished_paired_user_heal_tests {
             .expect("the pairing succeeds once the heal releases");
         let pf = read_file(&path);
         let by_tenant = |t: &str| pf.bindings.iter().find(|b| b.tenant_id == t).cloned();
-        assert!(by_tenant(T_A).is_some(), "the healed binding survives: {pf:?}");
+        assert!(
+            by_tenant(T_A).is_some(),
+            "the healed binding survives: {pf:?}"
+        );
         assert!(
             by_tenant(T_C).is_some_and(|b| b.paired_at.is_some()),
             "the pairing's binding survives the heal's write: {pf:?}"
