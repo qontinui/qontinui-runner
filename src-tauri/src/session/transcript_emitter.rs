@@ -580,7 +580,7 @@ impl TranscriptEmitter {
         // rows that coord has already said it will not take, until the next
         // runner start. No offset is reserved, so nothing leaves a hole.
         if super::coord_sync::transcript_sync_refused(session_id) {
-            return;
+            return 0;
         }
 
         // Gate 3 — redact unconditionally. Workflow runs carry no
