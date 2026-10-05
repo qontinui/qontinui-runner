@@ -3,7 +3,9 @@
 # `[[repair]]` in .qontinui/ci.toml names (plan
 # 2026-09-24-coord-deterministic-ci-repair-lane §3 recipe 2).
 #
-# Usage (from the repo root, which is where coord-repair.yml runs it):
+# Usage — coord-repair.yml runs it from the PR-head checkout (work/) as the
+# default branch's copy, `../trusted/.github/scripts/<this>`; it acts on its
+# CWD's git toplevel, never on the tree it was read from:
 #   COORD_REPAIR_CHANGED_FILES=<file> bash .github/scripts/repair-fmt.sh [[!]path-prefix ...]
 #
 #   COORD_REPAIR_CHANGED_FILES  newline-separated repo-relative paths the PR
@@ -43,6 +45,12 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git wor
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# The restore step below reverts every tracked file the run modified outside
+# the selected set, so it must start from a tree with no tracked changes of
+# its own — otherwise it would silently discard them. coord-repair.yml always
+# runs it on a fresh checkout; anywhere else, a dirty tree is a refusal.
+git diff --quiet HEAD -- || die "the work tree has uncommitted tracked changes; refusing (the mod-reach restore would discard them)"
+
 declare -a includes=() excludes=()
 for arg in "$@"; do
   [[ -n "$arg" && "$arg" != "!" ]] || die "empty path prefix"
@@ -62,12 +70,14 @@ in_scope() {
 }
 
 # The edition of the crate owning a repo-relative path: walk up to the nearest
-# Cargo.toml carrying a [package] table.
+# Cargo.toml carrying a [package] table. Either quote style is accepted; a
+# [package] with no `edition` key is edition 2015, which is what cargo itself
+# assumes for it.
 workspace_edition() {
   awk '
     /^\[/ { in_ws = ($0 ~ /^\[workspace\.package\][[:space:]]*$/) }
     in_ws && /^[[:space:]]*edition[[:space:]]*=/ {
-      if (match($0, /"[0-9]+"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+      if (match($0, /["\047][0-9]+["\047]/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
     }
   ' Cargo.toml 2>/dev/null
 }
@@ -81,10 +91,15 @@ edition_of() {
     if [[ -f "$manifest" ]] && grep -q '^\[package\]' "$manifest"; then
       ed="$(awk '
         /^\[/ { in_pkg = ($0 ~ /^\[package\][[:space:]]*$/) }
-        in_pkg && /^[[:space:]]*edition[[:space:]]*=/ {
-          if (match($0, /"[0-9]+"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+        in_pkg && /^[[:space:]]*edition[[:space:]]*(\.[[:space:]]*workspace[[:space:]]*=[[:space:]]*true|=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true)/ {
+          found = 1; print "workspace"; exit
         }
-        in_pkg && /^[[:space:]]*edition[[:space:]]*\.[[:space:]]*workspace[[:space:]]*=[[:space:]]*true/ { print "workspace"; exit }
+        in_pkg && /^[[:space:]]*edition[[:space:]]*=/ {
+          found = 1
+          if (match($0, /["\047][0-9]+["\047]/)) print substr($0, RSTART + 1, RLENGTH - 2)
+          exit
+        }
+        END { if (!found) print "2015" }
       ' "$manifest")"
       [[ "$ed" == "workspace" ]] && ed="$(workspace_edition)"
       printf '%s' "$ed"
