@@ -195,3 +195,32 @@ export function extractJsonBlock(content: string): string | null {
   }
   return null;
 }
+
+/**
+ * Group generated files for the preview: page-specific files (page specs,
+ * registrations, tutorial data) go under `Page: /<name>`, everything else
+ * under `Project`. Groups keep first-seen order.
+ */
+export function groupFilesByPage(files: GeneratedFile[]): Record<string, GeneratedFile[]> {
+  return files.reduce<Record<string, GeneratedFile[]>>((acc, f) => {
+    // Group by: page-specific files go under their page route, others under "project"
+    const isPageSpec =
+      f.filePath.endsWith(".spec.uibridge.json") && !f.filePath.includes("architecture");
+    const isPageReg = f.filePath.includes("/pages/") && f.filePath.includes("-registrations");
+    const isPageTut = f.filePath.includes("tutorial/data/");
+    let group = "Project";
+    if (isPageSpec || isPageReg || isPageTut) {
+      // Extract page name from file path
+      const parts = f.filePath.split("/");
+      const fileName = parts[parts.length - 1];
+      const pageName = fileName
+        .replace("-registrations.tsx", "")
+        .replace(".spec.uibridge.json", "")
+        .replace(".ts", "");
+      group = `Page: /${pageName}`;
+    }
+    if (!acc[group]) acc[group] = [];
+    acc[group].push(f);
+    return acc;
+  }, {});
+}

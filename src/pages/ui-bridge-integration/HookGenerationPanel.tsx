@@ -19,7 +19,6 @@ import {
   ChevronRight,
   Play,
   AlertTriangle,
-  Circle,
   BookOpen,
   FolderOpen,
 } from "lucide-react";
@@ -41,41 +40,21 @@ import type {
   WriteHooksResult,
   PageComponent,
   PageGenerationOptions,
-  ReadPageSourceResult,
 } from "./types";
-import { getApiBase } from "@/lib/runner-api";
-import { planDemoScript, fetchRegisteredElements } from "@/lib/demo-video/script-planner";
-import { executeScript } from "@/lib/demo-video/script-executor";
-import { generateNarration } from "@/lib/demo-video/narration-generator";
-import type { DemoScript } from "@/lib/demo-video/types";
-import { DEFAULT_RECORDING_CONFIG } from "@/lib/demo-video/types";
-import { generateTour } from "@/lib/product-tour/tour-generator";
-import type { ProductTour } from "@/types/product-tour";
-import { PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
-import { instanceStorage } from "@/lib/instance-storage";
-import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import {
   buildRegistrationPrompt,
   extractInlineRegistrations,
   buildPageSpecPrompt,
   buildTutorialPrompt,
   buildArchitectureDiagramPrompt,
-  buildExplainerIndexPrompt,
-  buildExplainerClusterPrompt,
-  buildExplainerPagePrompt,
-  type ExplainerSpecSummary,
-  type ExplainerCluster,
 } from "@/lib/page-analysis-prompt-builder";
 import { describeThrown } from "@/lib/utils";
-import {
-  type GeneratedFile,
-  extractGeneratedFiles,
-  extractMermaidFile,
-  gatherExplainerInputs,
-  clusterSpecsByPrefix,
-  extractMarkdownFiles,
-  extractJsonBlock,
-} from "./hook-generation/parse";
+import { type GeneratedFile, groupFilesByPage } from "./hook-generation/parse";
+import type { PanelPhase, StepStatus } from "./hook-generation/steps/types";
+import { StepIndicator } from "./hook-generation/StepIndicator";
+import { useStepMachine } from "./hook-generation/useStepMachine";
+import { recordPreviewPrompt } from "./hook-generation/previewPrompts";
+import { useCoordinatorEvents } from "./hook-generation/useCoordinatorEvents";
 import {
   readFile,
   readPageSource,
@@ -83,116 +62,6 @@ import {
   cacheArchitectureSpec,
   type WriteHooksFile,
 } from "./integrationApi";
-
-// =============================================================================
-// Step types
-// =============================================================================
-
-type IntegrationStep =
-  | "hooks"
-  | "architecture-spec"
-  | "page-registrations"
-  | "page-spec"
-  | "page-tutorial"
-  | "page-architecture-diagram"
-  | "page-demo-script"
-  | "explainer-index"
-  | "explainer-cluster"
-  | "explainer-page";
-
-interface StepStatus {
-  state: "pending" | "active" | "done" | "skipped" | "error";
-  label: string;
-}
-
-type PanelPhase =
-  | "idle"
-  | "generating-hooks"
-  | "generating-spec"
-  | "generating-page-registrations"
-  | "generating-page-spec"
-  | "generating-page-tutorial"
-  | "generating-page-architecture-diagram"
-  | "generating-project-explainer"
-  | "preview"
-  | "applying"
-  | "applied";
-
-// =============================================================================
-// Progress Step Indicator
-// =============================================================================
-
-function StepIndicator({ steps }: { steps: StepStatus[] }) {
-  return (
-    <div className="flex flex-col gap-1 mb-3">
-      {steps.map((step, i) => (
-        <div key={`${step.label}-${i}`} className="flex items-center gap-2 text-xs">
-          {step.state === "done" ? (
-            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
-          ) : step.state === "active" ? (
-            <Loader2 className="w-3.5 h-3.5 text-purple-400 animate-spin shrink-0" />
-          ) : step.state === "error" ? (
-            <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-          ) : step.state === "skipped" ? (
-            <Circle className="w-3.5 h-3.5 text-muted-foreground/30 shrink-0" />
-          ) : (
-            <Circle className="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
-          )}
-          <span
-            className={
-              step.state === "active"
-                ? "text-purple-400 font-medium"
-                : step.state === "done"
-                  ? "text-green-400"
-                  : step.state === "error"
-                    ? "text-red-400"
-                    : "text-muted-foreground/60"
-            }
-          >
-            {step.label}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// =============================================================================
-// Async helpers (extracted outside component to avoid fetch-in-useEffect lint)
-// =============================================================================
-
-async function fetchAndSendSpecPrompt(params: {
-  signal: AbortSignal;
-  isRegenSpec: boolean;
-  projectPath: string;
-  analysis: { framework: string; project_path: string };
-  /** `useAiSession().sendMessage`; its outcome is not consulted here. */
-  sendMessage: (msg: string) => Promise<unknown>;
-}): Promise<void> {
-  const { signal, isRegenSpec, projectPath, analysis, sendMessage } = params;
-  let specPrompt: string;
-  if (isRegenSpec) {
-    let existingSpec = "";
-    try {
-      const data = await readFile(projectPath, "project.architecture.uibridge.json", signal);
-      if (signal.aborted) return;
-      if (data.success && data.data) existingSpec = data.data;
-    } catch (_e) {
-      if (signal.aborted) return;
-      // Fall through to fresh generation
-    }
-    specPrompt = existingSpec
-      ? buildArchitectureSpecRegenPrompt(analysis, existingSpec)
-      : buildArchitectureSpecPrompt(analysis);
-  } else {
-    specPrompt = buildArchitectureSpecPrompt(analysis);
-  }
-  if (signal.aborted) return;
-  await sendMessage(
-    "Now generate an architecture spec for this project. You already have context from the hook generation step — use what you learned.\n\n" +
-      specPrompt,
-  );
-}
 
 // =============================================================================
 // HookGenerationPanel
@@ -216,981 +85,55 @@ export function HookGenerationPanel({
   );
   const [includeArchSpec, setIncludeArchSpec] = useState(true);
   const [generatedFiles, setGeneratedFiles] = useState<GeneratedFile[]>([]);
-  useEffect(() => {
-    allGeneratedFilesRef.current = generatedFiles;
-  }, [generatedFiles]);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
   const [writeResult, setWriteResult] = useState<WriteHooksResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stepStatuses, setStepStatuses] = useState<StepStatus[]>([]);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  // Track what we're waiting for in the AI flow
-  const pendingStepRef = useRef<IntegrationStep | null>(null);
-  const prevSessionStateRef = useRef<string>(session.sessionState);
-  const specRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Per-page generation queue
-  const pageQueueRef = useRef<PageComponent[]>([]);
-  // Budget: how many pages we process before rolling to a fresh AI session.
-  // Keeps context from growing unbounded on large projects — each page ships
-  // ~4-6 prompts (registrations, spec, tutorial, …) so 5 pages ≈ 20-30 turns,
-  // well inside a single session's window.
-  const SESSION_PAGE_BUDGET = 5;
-  const pagesInSessionRef = useRef(0);
-
-  // Project Explainer phase: kicks off after per-page generation when the
-  // `generateProjectExplainer` flag is set. One AI call per item below; each
-  // response is a single markdown file saved to src/specs/explainer/.
-  interface ExplainerQueueItem {
-    kind: "index" | "cluster" | "page";
-    /** For cluster/page items. */
-    clusterId?: string;
-    /** For page items. */
-    specId?: string;
-  }
-  const explainerQueueRef = useRef<ExplainerQueueItem[]>([]);
-  const explainerContextRef = useRef<{
-    specs: ExplainerSpecSummary[];
-    arch: Map<string, string>;
-    clusters: ExplainerCluster[];
-    projectName: string;
-  } | null>(null);
-  const explainerCurrentRef = useRef<ExplainerQueueItem | null>(null);
-  // Explainer calls share the SESSION_PAGE_BUDGET but count independently.
-  const explainerCallsInSessionRef = useRef(0);
-
-  // Ref mirror of `generatedFiles` so closures inside handleSessionTransition
-  // (which captures state at a moment in time) can read the latest list —
-  // the explainer phase starts once per-page generation finishes and needs
-  // the full set of just-generated specs + arch diagrams.
-  const allGeneratedFilesRef = useRef<GeneratedFile[]>([]);
-
-  // Bridged from handleSessionTransition so handleGeneratePages can invoke
-  // chainToDemoScript for the first page in a demo/tour-only run (where no
-  // AI prompt anchors the flow). The function is nested inside the session-
-  // transition useEffect's closure; flattening the whole graph would be
-  // disruptive, so we pass it out via a ref instead.
-  const chainToDemoScriptRef = useRef<((route: string, signal: AbortSignal) => void) | null>(null);
-  const currentControllerRef = useRef<AbortController | null>(null);
-
-  // Pages as originally passed to handleGeneratePages — pageQueueRef gets
-  // drained during the run, so the Project Explainer falls back to this
-  // when it needs to load specs from disk (for demo/tour + explainer runs
-  // where no fresh specs were generated).
-  const originalPagesRef = useRef<PageComponent[]>([]);
-
-  const effectiveAnalysisRef = useRef<ProjectAnalysis | null>(null);
-
-  const pageOptionsRef = useRef<PageGenerationOptions>({
-    generateRegistrations: true,
-    generateDataPageIds: true,
-    generateSpecs: true,
-    generateTutorials: false,
-    generateArchitectureDiagrams: false,
-    generateDemoVideos: false,
-    generateProductTours: false,
-    generateProjectExplainer: false,
-  });
-  const currentPageRef = useRef<{
-    page: PageComponent;
-    source: ReadPageSourceResult | null;
-    registrationOutput: string;
-  } | null>(null);
-  // Collected demo video scripts for batch recording after all pages are done
-  const demoVideoScriptsRef = useRef<DemoScript[]>([]);
-  // Collected product tours for batch saving after all pages are done
-  const productToursRef = useRef<ProductTour[]>([]);
-  // Last generated spec JSON per page (used by demo script planner and tour generator)
-  const lastSpecJsonRef = useRef<string>("");
-
-  // Track how many AI messages we've already processed to avoid duplicate extraction
-  const processedMessageCountRef = useRef(0);
-
   // Page route being processed — mirrored from currentPageRef so the UI can
   // re-render on page transitions without reading the ref during render.
   const [currentPageName, setCurrentPageName] = useState<string>("");
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const prevSessionStateRef = useRef<string>(session.sessionState);
 
   const isRegenHooks = analysis.has_generated_hooks;
   const isRegenSpec = analysis.has_architecture_spec;
 
-  // Clean up retry timer on unmount
-  useEffect(() => {
-    return () => {
-      if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
-    };
-  }, []);
+  // The AI step machine: its refs + handleSessionTransition.
+  const {
+    pendingStepRef,
+    pageQueueRef,
+    pagesInSessionRef,
+    allGeneratedFilesRef,
+    chainToDemoScriptRef,
+    currentControllerRef,
+    originalPagesRef,
+    effectiveAnalysisRef,
+    pageOptionsRef,
+    currentPageRef,
+    demoVideoScriptsRef,
+    productToursRef,
+    lastSpecJsonRef,
+    processedMessageCountRef,
+    handleSessionTransition,
+  } = useStepMachine({
+    session,
+    projectPath,
+    analysis,
+    isRegenSpec,
+    includeArchSpec,
+    generatedFiles,
+    setPhase,
+    setGeneratedFiles,
+    setStepStatuses,
+    setExpandedFiles,
+    setError,
+    setCurrentPageName,
+  });
 
   // Auto-scroll on streaming content
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [session.streamingContent, session.messages]);
-
-  // When AI transitions to ready, handle the current step completion.
-  // Core logic extracted into useCallback to keep fetch() out of useEffect body.
-  const handleSessionTransition = useCallback(
-    (params: {
-      controller: AbortController;
-      setRetryTimer: (t: ReturnType<typeof setTimeout> | null) => void;
-      prevState: string;
-      sessionState: string;
-      messages: typeof session.messages;
-      streamingContent: string;
-      taskRunId: string | undefined;
-      sendMessage: typeof session.sendMessage;
-    }) => {
-      const {
-        controller,
-        setRetryTimer,
-        prevState,
-        sessionState,
-        messages,
-        streamingContent,
-        taskRunId,
-        sendMessage,
-      } = params;
-
-      // Only process when transitioning from "processing" to "ready" —
-      // ignore the initial "ready" from createSession (before sendMessage)
-      const shouldProcess = sessionState === "ready" && prevState === "processing";
-      const currentStep = shouldProcess ? pendingStepRef.current : null;
-
-      if (!shouldProcess || !currentStep) {
-        return;
-      }
-
-      // Gather AI content — for per-page steps, only look at NEW messages
-      // to prevent re-extracting files from earlier steps
-      const aiMessages = messages.filter((m) => m.role === "ai");
-      const isPerPageStep =
-        currentStep === "page-registrations" ||
-        currentStep === "page-spec" ||
-        currentStep === "page-tutorial" ||
-        currentStep === "page-architecture-diagram" ||
-        currentStep === "explainer-index" ||
-        currentStep === "explainer-cluster" ||
-        currentStep === "explainer-page";
-      const relevantMessages = isPerPageStep
-        ? aiMessages.slice(processedMessageCountRef.current)
-        : aiMessages;
-      const allContent = relevantMessages.map((m) => m.content).join("\n\n");
-      const fullContent = streamingContent ? allContent + "\n\n" + streamingContent : allContent;
-
-      if (currentStep === "hooks") {
-        const files = extractGeneratedFiles(fullContent);
-        if (files.length > 0) {
-          setGeneratedFiles(files);
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.label.includes("Hook") ? { ...s, state: "done" } : s)),
-          );
-
-          // If architecture spec is included, proceed to that step
-          if (includeArchSpec) {
-            pendingStepRef.current = "architecture-spec";
-            setPhase("generating-spec");
-            setStepStatuses((prev) =>
-              prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "active" } : s)),
-            );
-            // Send the architecture spec prompt in the same session
-            const analysisForPrompt = { framework: analysis.framework, project_path: projectPath };
-            fetchAndSendSpecPrompt({
-              signal: controller.signal,
-              isRegenSpec,
-              projectPath,
-              analysis: analysisForPrompt,
-              sendMessage,
-            });
-          } else {
-            // No spec step — go to preview
-            pendingStepRef.current = null;
-            setExpandedFiles(new Set(files.map((f) => f.filePath)));
-            setPhase("preview");
-          }
-        } else {
-          pendingStepRef.current = null;
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.label.includes("Hook") ? { ...s, state: "error" } : s)),
-          );
-          setError("AI did not produce any files with // FILE: markers. Try regenerating.");
-          setPhase("idle");
-        }
-      } else if (currentStep === "architecture-spec") {
-        // Extract JSON — try immediately, then retry via API if text events are still in transit
-        const handleSpecError = () => {
-          if (controller.signal.aborted) return;
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "error" } : s)),
-          );
-          setError(
-            "Architecture spec generation did not produce valid JSON. You can still apply the hook files.",
-          );
-          pendingStepRef.current = null;
-          setPhase("preview");
-        };
-
-        const tryExtractSpec = (content: string) => {
-          const jsonBlock = extractJsonBlock(content);
-          if (jsonBlock) {
-            let specFileName = "project.architecture.uibridge.json";
-            try {
-              const parsed = JSON.parse(jsonBlock);
-              if (typeof parsed.projectName === "string" && parsed.projectName) {
-                specFileName =
-                  parsed.projectName
-                    .toLowerCase()
-                    .replace(/[^a-z0-9]+/g, "-")
-                    .replace(/^-|-$/g, "") + ".architecture.uibridge.json";
-              }
-            } catch {
-              // Use default name
-            }
-
-            setGeneratedFiles((prev) => [...prev, { filePath: specFileName, content: jsonBlock }]);
-            setStepStatuses((prev) =>
-              prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "done" } : s)),
-            );
-            pendingStepRef.current = null;
-            setExpandedFiles(new Set(generatedFiles.map((f) => f.filePath).concat(["spec"])));
-            setPhase("preview");
-            return true;
-          }
-          return false;
-        };
-
-        // Try extracting from current content
-        const specContent = messages
-          .filter((m) => m.role === "ai")
-          .map((m) => m.content)
-          .join("\n\n");
-        const fullSpecContent = streamingContent
-          ? specContent + "\n\n" + streamingContent
-          : specContent;
-
-        if (!tryExtractSpec(fullSpecContent)) {
-          // Race condition: text events still in transit. Retry via API.
-          if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
-          const timer = setTimeout(async () => {
-            specRetryTimerRef.current = null;
-            setRetryTimer(null);
-            if (controller.signal.aborted || !taskRunId) {
-              if (!controller.signal.aborted) handleSpecError();
-              return;
-            }
-
-            try {
-              const resp = await fetch(
-                `${getApiBase()}/task-runs/${taskRunId}/output?tail_chars=200000`,
-                { signal: controller.signal },
-              );
-              if (controller.signal.aborted) return;
-              const data = await resp.json();
-              const apiOutput: string = data?.output || "";
-              if (!tryExtractSpec(apiOutput)) {
-                handleSpecError();
-              }
-            } catch {
-              if (!controller.signal.aborted) {
-                handleSpecError();
-              }
-            }
-          }, 1000);
-          specRetryTimerRef.current = timer;
-          setRetryTimer(timer);
-        }
-
-        // ---- Per-page step handlers ----
-      } else if (currentStep === "page-registrations") {
-        processedMessageCountRef.current = aiMessages.length; // Mark messages as processed
-        const files = extractGeneratedFiles(fullContent);
-        if (files.length > 0) {
-          setGeneratedFiles((prev) => [...prev, ...files]);
-          // Store registration output for spec/tutorial prompts
-          if (currentPageRef.current) {
-            currentPageRef.current.registrationOutput = files.map((f) => f.content).join("\n\n");
-          }
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-          );
-        }
-
-        // Chain to page-spec if enabled
-        const opts = pageOptionsRef.current;
-        const cur = currentPageRef.current;
-        if (opts.generateSpecs && cur?.source) {
-          pendingStepRef.current = "page-spec";
-          setPhase("generating-page-spec");
-          setStepStatuses((prev) => [
-            ...prev,
-            { state: "active", label: `Spec: ${cur.page.route}` },
-          ]);
-
-          // Load existing spec for merge mode if available
-          (async () => {
-            let existingSpec: string | undefined;
-            if (cur.page.has_spec) {
-              const specName = `${cur.page.route.replace(/^\//, "").replace(/\//g, "-") || "root"}.spec.uibridge.json`;
-              existingSpec =
-                (await readProjectFile(`src/specs/${specName}`, controller.signal)) ||
-                (await readProjectFile(specName, controller.signal)) ||
-                undefined;
-            }
-            const specPrompt = buildPageSpecPrompt(
-              cur.source!.main_source,
-              cur.source!.imported_sources,
-              cur.page.component_name,
-              cur.page.route,
-              cur.registrationOutput || "",
-              existingSpec,
-            );
-            sendMessage(
-              "Now generate a page spec (.spec.uibridge.json) for this page.\n\n" + specPrompt,
-            );
-          })();
-        } else if (opts.generateTutorials && cur?.source) {
-          // Skip to tutorial
-          pendingStepRef.current = "page-tutorial";
-          setPhase("generating-page-tutorial");
-          setStepStatuses((prev) => [
-            ...prev,
-            { state: "active", label: `Tutorial: ${cur.page.route}` },
-          ]);
-          const tutPrompt = buildTutorialPrompt(
-            cur.source.main_source,
-            cur.page.component_name,
-            cur.page.route,
-            cur.registrationOutput || "",
-            "",
-          );
-          sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
-        } else if (opts.generateArchitectureDiagrams && cur?.source) {
-          chainToArchitectureDiagram(cur);
-        } else if (opts.generateDemoVideos || opts.generateProductTours) {
-          // Skip to demo script / product tour planning
-          chainToDemoScript(cur?.page.route ?? "", controller.signal);
-        } else {
-          // Advance to next page
-          advanceToNextPage(controller.signal);
-        }
-      } else if (currentStep === "page-spec") {
-        processedMessageCountRef.current = aiMessages.length;
-        const jsonBlock = extractJsonBlock(fullContent);
-        if (jsonBlock) {
-          lastSpecJsonRef.current = jsonBlock;
-          const specName = currentPageRef.current
-            ? `${currentPageRef.current.page.route.replace(/^\//, "").replace(/\//g, "-") || "root"}.spec.uibridge.json`
-            : "page.spec.uibridge.json";
-          setGeneratedFiles((prev) => [...prev, { filePath: specName, content: jsonBlock }]);
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-          );
-        }
-
-        // Chain to tutorial if enabled
-        const opts = pageOptionsRef.current;
-        const cur = currentPageRef.current;
-        if (opts.generateTutorials && cur?.source) {
-          pendingStepRef.current = "page-tutorial";
-          setPhase("generating-page-tutorial");
-          setStepStatuses((prev) => [
-            ...prev,
-            { state: "active", label: `Tutorial: ${cur.page.route}` },
-          ]);
-          const tutPrompt = buildTutorialPrompt(
-            cur.source.main_source,
-            cur.page.component_name,
-            cur.page.route,
-            cur.registrationOutput || "",
-            jsonBlock || "",
-          );
-          sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
-        } else if (opts.generateArchitectureDiagrams && cur?.source) {
-          chainToArchitectureDiagram(cur);
-        } else if (opts.generateDemoVideos || opts.generateProductTours) {
-          chainToDemoScript(cur?.page.route ?? "", controller.signal);
-        } else {
-          advanceToNextPage(controller.signal);
-        }
-      } else if (currentStep === "page-tutorial") {
-        processedMessageCountRef.current = aiMessages.length;
-        const files = extractGeneratedFiles(fullContent);
-        if (files.length > 0) {
-          setGeneratedFiles((prev) => [...prev, ...files]);
-        }
-        setStepStatuses((prev) =>
-          prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-        );
-        const opts = pageOptionsRef.current;
-        const cur = currentPageRef.current;
-        if (opts.generateArchitectureDiagrams && cur?.source) {
-          chainToArchitectureDiagram(cur);
-        } else if (opts.generateDemoVideos || opts.generateProductTours) {
-          chainToDemoScript(cur?.page.route ?? "", controller.signal);
-        } else {
-          advanceToNextPage(controller.signal);
-        }
-      } else if (currentStep === "page-architecture-diagram") {
-        processedMessageCountRef.current = aiMessages.length;
-        const diag = extractMermaidFile(fullContent);
-        if (diag) {
-          setGeneratedFiles((prev) => [...prev, diag]);
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-          );
-        } else {
-          // No Mermaid block came back — mark the step errored but keep going.
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "error" } : s)),
-          );
-        }
-        const opts = pageOptionsRef.current;
-        const cur = currentPageRef.current;
-        if (opts.generateDemoVideos || opts.generateProductTours) {
-          chainToDemoScript(cur?.page.route ?? "", controller.signal);
-        } else {
-          advanceToNextPage(controller.signal);
-        }
-      } else if (currentStep === "page-demo-script") {
-        // Demo script planning is handled inline (non-AI) — this case handles
-        // the completion signal. The script was already added to demoVideoScriptsRef
-        // by chainToDemoScript. Just advance.
-        setStepStatuses((prev) =>
-          prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-        );
-        advanceToNextPage(controller.signal);
-      } else if (
-        currentStep === "explainer-index" ||
-        currentStep === "explainer-cluster" ||
-        currentStep === "explainer-page"
-      ) {
-        processedMessageCountRef.current = aiMessages.length;
-        const files = extractMarkdownFiles(fullContent);
-        if (files.length > 0) {
-          setGeneratedFiles((prev) => [...prev, ...files]);
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-          );
-        } else {
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "error" } : s)),
-          );
-        }
-        advanceExplainerQueue();
-      }
-
-      // Helper: chain to the architecture-diagram step. Uses the same source
-      // + registrations we already fetched for this page.
-      function chainToArchitectureDiagram(cur: {
-        page: PageComponent;
-        source: ReadPageSourceResult | null;
-        registrationOutput: string;
-      }) {
-        if (!cur.source) {
-          advanceToNextPage(controller.signal);
-          return;
-        }
-        pendingStepRef.current = "page-architecture-diagram";
-        setPhase("generating-page-architecture-diagram");
-        setStepStatuses((prev) => [
-          ...prev,
-          { state: "active", label: `Architecture diagram: ${cur.page.route}` },
-        ]);
-        const archPrompt = buildArchitectureDiagramPrompt(
-          cur.source.main_source,
-          cur.source.imported_sources,
-          cur.page.component_name,
-          cur.page.route,
-          cur.registrationOutput || "",
-        );
-        sendMessage(`Now generate the architecture diagram for this page.\n\n` + archPrompt);
-      }
-
-      // Helper: chain to demo script + product tour planning (non-AI — calls planner APIs directly)
-      // Exposed via ref so handleGeneratePages can invoke it for demo/tour-only
-      // re-runs that have no AI prompt to anchor the first-page flow on.
-      chainToDemoScriptRef.current = chainToDemoScript;
-      function chainToDemoScript(route: string, signal: AbortSignal) {
-        pendingStepRef.current = "page-demo-script";
-        const opts = pageOptionsRef.current;
-        const parts = [
-          opts.generateDemoVideos && "Demo",
-          opts.generateProductTours && "Tour",
-        ].filter(Boolean);
-        setStepStatuses((prev) => [
-          ...prev,
-          { state: "active", label: `${parts.join(" + ")}: ${route}` },
-        ]);
-
-        (async () => {
-          // If this run didn't generate specs (demo/tour-only re-run), the
-          // in-memory lastSpecJsonRef is either empty or leftover from a
-          // previous page — neither is right for the current page. Always
-          // re-read the current page's spec from disk in that case so each
-          // page's demo/tour uses its own spec.
-          if (!opts.generateSpecs) {
-            const slug = route.replace(/^\//, "").replace(/\//g, "-") || "root";
-            const existing = await readProjectFile(`src/specs/${slug}.spec.uibridge.json`, signal);
-            if (signal.aborted) return;
-            lastSpecJsonRef.current = existing || "";
-          }
-          // Parse the last generated spec JSON into a SpecConfig
-          let specConfig: SpecConfig | null = null;
-          if (lastSpecJsonRef.current) {
-            try {
-              specConfig = JSON.parse(lastSpecJsonRef.current) as SpecConfig;
-            } catch {
-              // Spec JSON couldn't be parsed
-            }
-          }
-
-          if (specConfig) {
-            const elements = await fetchRegisteredElements();
-
-            // Demo video script
-            if (opts.generateDemoVideos) {
-              try {
-                const script = await planDemoScript(specConfig, elements);
-                demoVideoScriptsRef.current.push(script);
-              } catch (err) {
-                console.warn("Demo script planning failed for", route, err);
-              }
-            }
-
-            // Product tour
-            if (opts.generateProductTours) {
-              try {
-                const tour = await generateTour(specConfig, elements, "new-user");
-                productToursRef.current.push(tour);
-              } catch (err) {
-                console.warn("Product tour generation failed for", route, err);
-              }
-            }
-          }
-
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-          );
-          advanceToNextPage(signal);
-        })();
-      }
-
-      // Helper: advance to the next page in the queue or go to preview/recording
-      function advanceToNextPage(signal: AbortSignal) {
-        const queue = pageQueueRef.current;
-        if (queue.length > 0) {
-          const nextPage = queue.shift()!;
-          // Count the page we just finished (the one before this advance).
-          pagesInSessionRef.current += 1;
-          // Rotate to a fresh AI session at the batch boundary so context
-          // doesn't grow unbounded on large projects. Each batch is
-          // independent — the per-page prompts already include the page
-          // source, so a fresh session doesn't lose information.
-          if (pagesInSessionRef.current >= SESSION_PAGE_BUDGET) {
-            pagesInSessionRef.current = 0;
-            setStepStatuses((prev) => [
-              ...prev,
-              { state: "active", label: `Rotating to fresh AI session...` },
-            ]);
-            (async () => {
-              if (signal.aborted) return;
-              await session.close();
-              if (signal.aborted) return;
-              session.resetSession();
-              const id = await session.createSession("Page Preparation: AI Generation (batch)");
-              if (signal.aborted) return;
-              if (!id) {
-                setError("Failed to rotate AI session");
-                return;
-              }
-              setStepStatuses((prev) =>
-                prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-              );
-              startPageGeneration(nextPage, signal);
-            })();
-            return;
-          }
-          startPageGeneration(nextPage, signal);
-        } else {
-          // All pages done
-          pendingStepRef.current = null;
-          currentPageRef.current = null;
-          setCurrentPageName("");
-
-          // Save product tours if any were generated
-          const tours = productToursRef.current;
-          if (tours.length > 0) {
-            const existing = instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []);
-            const newIds = new Set(tours.map((t) => t.id));
-            const merged = [...existing.filter((t) => !newIds.has(t.id)), ...tours];
-            instanceStorage.setJSON(PRODUCT_TOURS_STORAGE_KEY, merged);
-            productToursRef.current = [];
-          }
-
-          // If demo videos were planned, start batch recording
-          const scripts = demoVideoScriptsRef.current;
-          if (scripts.length > 0 && pageOptionsRef.current.generateDemoVideos) {
-            setStepStatuses((prev) => [
-              ...prev,
-              {
-                state: "active",
-                label: `Recording ${scripts.length} demo video${scripts.length !== 1 ? "s" : ""}...`,
-              },
-            ]);
-            (async () => {
-              for (let i = 0; i < scripts.length; i++) {
-                const script = scripts[i];
-                try {
-                  const result = await executeScript(script, DEFAULT_RECORDING_CONFIG);
-                  const narr = generateNarration(script, result);
-                  setGeneratedFiles((prev) => [
-                    ...prev,
-                    {
-                      filePath: `${script.targetPage.replace(/^\//, "").replace(/\//g, "-") || "demo"}-narration.srt`,
-                      content: narr.srt,
-                    },
-                    {
-                      filePath: `${script.targetPage.replace(/^\//, "").replace(/\//g, "-") || "demo"}-narration.md`,
-                      content: narr.markdown,
-                    },
-                  ]);
-                } catch (err) {
-                  console.warn(`Demo video recording failed for ${script.title}:`, err);
-                }
-              }
-              demoVideoScriptsRef.current = [];
-              setStepStatuses((prev) =>
-                prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-              );
-              if (!(await maybeStartExplainerPhase())) {
-                setPhase("preview");
-              }
-            })();
-          } else {
-            (async () => {
-              if (!(await maybeStartExplainerPhase())) {
-                setPhase("preview");
-              }
-            })();
-          }
-        }
-      }
-
-      /** If generateProjectExplainer is on and we haven't started yet, kick off
-       * the explainer phase (index → clusters → pages). Returns true when the
-       * phase was started so the caller knows to NOT transition to preview.
-       *
-       * Async because when no specs were generated in this run (e.g. a
-       * demo/tour + explainer re-run), we fall back to reading existing specs
-       * + architecture diagrams from disk for every page in the run, so the
-       * explainer can still compose a document. */
-      async function maybeStartExplainerPhase(): Promise<boolean> {
-        if (!pageOptionsRef.current.generateProjectExplainer) return false;
-        if (explainerContextRef.current) return false; // already running
-
-        let { specs, arch } = gatherExplainerInputs(allGeneratedFilesRef.current);
-
-        if (specs.length === 0) {
-          // No fresh specs in memory — fall back to reading existing specs +
-          // architecture diagrams from disk for each page we were asked about.
-          const diskFiles: GeneratedFile[] = [];
-          for (const p of originalPagesRef.current) {
-            if (controller.signal.aborted) return false;
-            const slug = p.route.replace(/^\//, "").replace(/\//g, "-") || "root";
-            const specBody = await readProjectFile(
-              `src/specs/${slug}.spec.uibridge.json`,
-              controller.signal,
-            );
-            if (specBody) {
-              diskFiles.push({
-                filePath: `${slug}.spec.uibridge.json`,
-                content: specBody,
-              });
-            }
-            const archBody = await readProjectFile(
-              `src/specs/architecture/${slug}.arch.mmd`,
-              controller.signal,
-            );
-            if (archBody) {
-              diskFiles.push({
-                filePath: `src/specs/architecture/${slug}.arch.mmd`,
-                content: archBody,
-              });
-            }
-          }
-          if (controller.signal.aborted) return false;
-          const fromDisk = gatherExplainerInputs(diskFiles);
-          specs = fromDisk.specs;
-          arch = fromDisk.arch;
-        }
-
-        if (specs.length === 0) return false; // still nothing — give up
-        const clusters = clusterSpecsByPrefix(specs);
-        const projectName = projectPath.split(/[\\/]/).filter(Boolean).slice(-1)[0] || "Project";
-        explainerContextRef.current = { specs, arch, clusters, projectName };
-        // Build the queue: one index, N clusters, then all pages grouped by cluster.
-        const queue: ExplainerQueueItem[] = [{ kind: "index" }];
-        for (const c of clusters) queue.push({ kind: "cluster", clusterId: c.id });
-        for (const c of clusters) {
-          for (const specId of c.specIds) {
-            queue.push({ kind: "page", clusterId: c.id, specId });
-          }
-        }
-        explainerQueueRef.current = queue;
-        explainerCallsInSessionRef.current = 0;
-        setStepStatuses((prev) => [
-          ...prev,
-          {
-            state: "active",
-            label: `Project Explainer (${queue.length} files: index + ${clusters.length} clusters + ${specs.length} pages)`,
-          },
-        ]);
-        advanceExplainerQueue();
-        return true;
-      }
-
-      /** Pick the next explainer item and fire its prompt. Session-rotates at
-       * the same SESSION_PAGE_BUDGET boundary used by per-page generation. */
-      function advanceExplainerQueue() {
-        const queue = explainerQueueRef.current;
-        const ctx = explainerContextRef.current;
-        if (!ctx || queue.length === 0) {
-          explainerContextRef.current = null;
-          explainerCurrentRef.current = null;
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-          );
-          setPhase("preview");
-          return;
-        }
-        // Session rotation
-        if (explainerCallsInSessionRef.current >= SESSION_PAGE_BUDGET) {
-          explainerCallsInSessionRef.current = 0;
-          setStepStatuses((prev) => [
-            ...prev,
-            { state: "active", label: `Rotating to fresh AI session (explainer)...` },
-          ]);
-          (async () => {
-            if (controller.signal.aborted) return;
-            await session.close();
-            if (controller.signal.aborted) return;
-            session.resetSession();
-            const id = await session.createSession("Project Explainer (batch)");
-            if (controller.signal.aborted) return;
-            if (!id) {
-              setError("Failed to rotate AI session during explainer phase");
-              return;
-            }
-            setStepStatuses((prev) =>
-              prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
-            );
-            advanceExplainerQueue();
-          })();
-          return;
-        }
-        explainerCallsInSessionRef.current++;
-        const next = queue.shift()!;
-        explainerCurrentRef.current = next;
-        setPhase("generating-project-explainer");
-        if (next.kind === "index") {
-          pendingStepRef.current = "explainer-index";
-          setStepStatuses((prev) => [...prev, { state: "active", label: "Explainer: index.md" }]);
-          sendMessage(buildExplainerIndexPrompt(ctx.projectName, ctx.specs, ctx.clusters));
-        } else if (next.kind === "cluster") {
-          const cluster = ctx.clusters.find((c) => c.id === next.clusterId);
-          if (!cluster) return advanceExplainerQueue();
-          const specsInCluster = ctx.specs.filter((s) => cluster.specIds.includes(s.specId));
-          const otherClusters = ctx.clusters
-            .filter((c) => c.id !== cluster.id)
-            .map((c) => ({ id: c.id, name: c.name, description: c.description }));
-          pendingStepRef.current = "explainer-cluster";
-          setStepStatuses((prev) => [
-            ...prev,
-            { state: "active", label: `Explainer: ${cluster.id}.md (cluster)` },
-          ]);
-          sendMessage(
-            buildExplainerClusterPrompt(ctx.projectName, cluster, specsInCluster, otherClusters),
-          );
-        } else {
-          // kind === "page"
-          const cluster = ctx.clusters.find((c) => c.id === next.clusterId);
-          const spec = ctx.specs.find((s) => s.specId === next.specId);
-          if (!cluster || !spec) return advanceExplainerQueue();
-          const slug = spec.specId.replace(/[^a-z0-9-]/gi, "-");
-          const archDiagram = ctx.arch.get(spec.specId) || null;
-          const siblings = ctx.specs
-            .filter((s) => cluster.specIds.includes(s.specId) && s.specId !== spec.specId)
-            .map((s) => ({
-              slug: s.specId.replace(/[^a-z0-9-]/gi, "-"),
-              title: s.specId,
-              tagline: (s.description || "").replace(/\s+/g, " ").slice(0, 80),
-            }));
-          pendingStepRef.current = "explainer-page";
-          setStepStatuses((prev) => [
-            ...prev,
-            { state: "active", label: `Explainer: ${cluster.id}/${slug}.md` },
-          ]);
-          sendMessage(
-            buildExplainerPagePrompt(
-              ctx.projectName,
-              cluster.id,
-              slug,
-              spec,
-              archDiagram,
-              siblings,
-            ),
-          );
-        }
-      }
-
-      /** Read an existing file from the project (returns empty string on failure). */
-      async function readProjectFile(filePath: string, signal: AbortSignal): Promise<string> {
-        try {
-          const data = await readFile(projectPath, filePath, signal);
-          if (signal.aborted) return "";
-          return data.success && data.data ? data.data : "";
-        } catch {
-          return "";
-        }
-      }
-
-      async function startPageGeneration(page: PageComponent, signal: AbortSignal) {
-        currentPageRef.current = { page, source: null, registrationOutput: "" };
-        setCurrentPageName(page.route);
-        setStepStatuses((prev) => [
-          ...prev,
-          { state: "active", label: `Registrations: ${page.route}` },
-        ]);
-
-        // Fetch page source
-        try {
-          const data = await readPageSource(
-            { projectPath, componentPath: page.component_path, maxDepth: 2 },
-            signal,
-          );
-          if (signal.aborted) return;
-          if (data.success && data.data) {
-            currentPageRef.current!.source = data.data;
-          }
-        } catch {
-          if (signal.aborted) return;
-        }
-
-        const source = currentPageRef.current?.source;
-        if (!source) {
-          setStepStatuses((prev) =>
-            prev.map((s) => (s.state === "active" ? { ...s, state: "error" } : s)),
-          );
-          advanceToNextPage(signal);
-          return;
-        }
-
-        const opts = pageOptionsRef.current;
-        if (opts.generateRegistrations) {
-          pendingStepRef.current = "page-registrations";
-          setPhase("generating-page-registrations");
-
-          // Load existing registrations for merge mode
-          let existingRegs: string | undefined;
-          if (page.has_registrations) {
-            const pageName = page.component_name.toLowerCase().replace(/page$/, "");
-            existingRegs = await readProjectFile(
-              `src/lib/ui-bridge/pages/${pageName}-registrations.tsx`,
-              signal,
-            );
-            if (!existingRegs) {
-              // Try reading from the component file itself (inline registrations)
-              existingRegs = undefined;
-            }
-          }
-
-          const prompt = buildRegistrationPrompt(
-            source.main_source,
-            source.imported_sources,
-            page.component_name,
-            page.route,
-            (effectiveAnalysisRef.current ?? analysis).framework,
-            existingRegs || undefined,
-            // Inline `useUIElement` / `useUIComponent` calls the page already
-            // contains. Without this, the side-file the LLM emits would
-            // duplicate them and runtime would double-register.
-            extractInlineRegistrations(source.main_source),
-          );
-          if (typeof window !== "undefined") {
-            const w = window as unknown as {
-              __qontinuiPreviewPrompts?: Array<{
-                pageRoute: string;
-                pageName: string;
-                prompt: string;
-                timestamp: number;
-              }>;
-            };
-            w.__qontinuiPreviewPrompts = w.__qontinuiPreviewPrompts ?? [];
-            w.__qontinuiPreviewPrompts.unshift({
-              pageRoute: page.route,
-              pageName: page.component_name,
-              prompt,
-              timestamp: Date.now(),
-            });
-            if (w.__qontinuiPreviewPrompts.length > 20) {
-              w.__qontinuiPreviewPrompts.length = 20;
-            }
-          }
-          await sendMessage(
-            `Analyze the page at ${page.route} and generate UI Bridge registrations.\n\n` + prompt,
-          );
-        } else if (opts.generateSpecs) {
-          pendingStepRef.current = "page-spec";
-          setPhase("generating-page-spec");
-          setStepStatuses((prev) => [
-            ...prev.filter((s) => s.state !== "active"),
-            { state: "active", label: `Spec: ${page.route}` },
-          ]);
-          const specPrompt = buildPageSpecPrompt(
-            source.main_source,
-            source.imported_sources,
-            page.component_name,
-            page.route,
-            "",
-          );
-          await sendMessage(`Generate a page spec for ${page.route}.\n\n` + specPrompt);
-        } else if (opts.generateTutorials) {
-          pendingStepRef.current = "page-tutorial";
-          setPhase("generating-page-tutorial");
-          setStepStatuses((prev) => [
-            ...prev.filter((s) => s.state !== "active"),
-            { state: "active", label: `Tutorial: ${page.route}` },
-          ]);
-          const tutPrompt = buildTutorialPrompt(
-            source.main_source,
-            page.component_name,
-            page.route,
-            "",
-            "",
-          );
-          await sendMessage(`Generate a tutorial for ${page.route}.\n\n` + tutPrompt);
-        } else if (opts.generateArchitectureDiagrams) {
-          pendingStepRef.current = "page-architecture-diagram";
-          setPhase("generating-page-architecture-diagram");
-          setStepStatuses((prev) => [
-            ...prev.filter((s) => s.state !== "active"),
-            { state: "active", label: `Architecture diagram: ${page.route}` },
-          ]);
-          const archPrompt = buildArchitectureDiagramPrompt(
-            source.main_source,
-            source.imported_sources,
-            page.component_name,
-            page.route,
-            "",
-          );
-          await sendMessage(`Generate an architecture diagram for ${page.route}.\n\n` + archPrompt);
-        } else if (opts.generateDemoVideos || opts.generateProductTours) {
-          // Only demo videos / product tours selected — chain directly
-          chainToDemoScript(page.route, signal);
-        }
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [projectPath, analysis.framework, isRegenSpec, includeArchSpec],
-  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1350,6 +293,8 @@ export function HookGenerationPanel({
     projectPath,
     isRegenHooks,
     isRegenSpec,
+    // Stable refs owned by useStepMachine (listed for exhaustive-deps).
+    pendingStepRef,
   ]);
 
   // Start per-page AI generation (called from PageSelectionPanel via window event)
@@ -1444,24 +389,7 @@ export function HookGenerationPanel({
               undefined,
               extractInlineRegistrations(pSource.main_source),
             );
-            const w = window as unknown as {
-              __qontinuiPreviewPrompts?: Array<{
-                pageRoute: string;
-                pageName: string;
-                prompt: string;
-                timestamp: number;
-              }>;
-            };
-            w.__qontinuiPreviewPrompts = w.__qontinuiPreviewPrompts ?? [];
-            w.__qontinuiPreviewPrompts.unshift({
-              pageRoute: p.route,
-              pageName: p.component_name,
-              prompt: pPrompt,
-              timestamp: Date.now(),
-            });
-            if (w.__qontinuiPreviewPrompts.length > 20) {
-              w.__qontinuiPreviewPrompts.length = 20;
-            }
+            recordPreviewPrompt(p.route, p.component_name, pPrompt);
             doneLabels.push(`${p.route} (preview)`);
             setStepStatuses((prev) =>
               prev.map((s, idx) => (idx === i ? { ...s, state: "done" } : s)),
@@ -1541,26 +469,8 @@ export function HookGenerationPanel({
           // contains. Prevents duplicate registrations in the side-file.
           extractInlineRegistrations(source.main_source),
         );
-        if (typeof window !== "undefined") {
-          const w = window as unknown as {
-            __qontinuiPreviewPrompts?: Array<{
-              pageRoute: string;
-              pageName: string;
-              prompt: string;
-              timestamp: number;
-            }>;
-          };
-          w.__qontinuiPreviewPrompts = w.__qontinuiPreviewPrompts ?? [];
-          w.__qontinuiPreviewPrompts.unshift({
-            pageRoute: firstPage.route,
-            pageName: firstPage.component_name,
-            prompt,
-            timestamp: Date.now(),
-          });
-          if (w.__qontinuiPreviewPrompts.length > 20) {
-            w.__qontinuiPreviewPrompts.length = 20;
-          }
-        }
+        if (typeof window !== "undefined")
+          recordPreviewPrompt(firstPage.route, firstPage.component_name, prompt);
         await session.sendMessage(
           `Analyze the page at ${firstPage.route} and generate UI Bridge registrations.\n\n` +
             prompt,
@@ -1619,7 +529,25 @@ export function HookGenerationPanel({
         }
       }
     },
-    [session, analysis, projectPath],
+    [
+      session,
+      analysis,
+      projectPath,
+      // Stable refs owned by useStepMachine (listed for exhaustive-deps).
+      chainToDemoScriptRef,
+      currentControllerRef,
+      currentPageRef,
+      demoVideoScriptsRef,
+      effectiveAnalysisRef,
+      lastSpecJsonRef,
+      originalPagesRef,
+      pageOptionsRef,
+      pageQueueRef,
+      pagesInSessionRef,
+      pendingStepRef,
+      processedMessageCountRef,
+      productToursRef,
+    ],
   );
 
   // Listen for page generation trigger from PageSelectionPanel via CustomEvent
@@ -1646,53 +574,8 @@ export function HookGenerationPanel({
     return () => window.removeEventListener("ui-bridge-generate-pages", handler);
   }, [handleGeneratePages]);
 
-  // Broadcast phase transitions so the top-level coordinator (one-click
-  // "Integrate this Project" flow) can react without reading our internal
-  // state. We emit three events:
-  //   - ui-bridge-generate-pages-complete : phase → "preview" (files ready)
-  //   - ui-bridge-generate-pages-applied  : phase → "applied" (files on disk)
-  //   - ui-bridge-generate-pages-error    : error set while generating
-  // The detail payload uses the step-statuses array which already tracks
-  // per-page success/failure, so the coordinator can render "Retry failed"
-  // without duplicating state here.
-  const prevPhaseRef = useRef<PanelPhase>(phase);
-  useEffect(() => {
-    const prev = prevPhaseRef.current;
-    prevPhaseRef.current = phase;
-    if (prev === phase) return;
-    if (phase === "preview") {
-      const failedLabels = stepStatuses.filter((s) => s.state === "error").map((s) => s.label);
-      const doneLabels = stepStatuses.filter((s) => s.state === "done").map((s) => s.label);
-      window.dispatchEvent(
-        new CustomEvent("ui-bridge-generate-pages-complete", {
-          detail: {
-            filesGenerated: allGeneratedFilesRef.current.length,
-            doneSteps: doneLabels,
-            failedSteps: failedLabels,
-          },
-        }),
-      );
-    } else if (phase === "applied") {
-      window.dispatchEvent(
-        new CustomEvent("ui-bridge-generate-pages-applied", {
-          detail: { filesWritten: writeResult?.files_written ?? [] },
-        }),
-      );
-    }
-  }, [phase, stepStatuses, writeResult]);
-
-  // Mirror errors during generation onto the coordinator's progress UI.
-  const prevErrorRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (error && error !== prevErrorRef.current) {
-      window.dispatchEvent(
-        new CustomEvent("ui-bridge-generate-pages-error", {
-          detail: { message: error },
-        }),
-      );
-    }
-    prevErrorRef.current = error;
-  }, [error]);
+  // Broadcast phase transitions and generation errors to the coordinator.
+  useCoordinatorEvents({ phase, stepStatuses, writeResult, error, allGeneratedFilesRef });
 
   // Apply generated files to project
   const handleApply = useCallback(async () => {
@@ -1763,27 +646,7 @@ export function HookGenerationPanel({
     phase === "generating-hooks" || phase === "generating-spec" || isPerPagePhase;
 
   // Group generated files by page for preview
-  const groupedFiles = generatedFiles.reduce<Record<string, GeneratedFile[]>>((acc, f) => {
-    // Group by: page-specific files go under their page route, others under "project"
-    const isPageSpec =
-      f.filePath.endsWith(".spec.uibridge.json") && !f.filePath.includes("architecture");
-    const isPageReg = f.filePath.includes("/pages/") && f.filePath.includes("-registrations");
-    const isPageTut = f.filePath.includes("tutorial/data/");
-    let group = "Project";
-    if (isPageSpec || isPageReg || isPageTut) {
-      // Extract page name from file path
-      const parts = f.filePath.split("/");
-      const fileName = parts[parts.length - 1];
-      const pageName = fileName
-        .replace("-registrations.tsx", "")
-        .replace(".spec.uibridge.json", "")
-        .replace(".ts", "");
-      group = `Page: /${pageName}`;
-    }
-    if (!acc[group]) acc[group] = [];
-    acc[group].push(f);
-    return acc;
-  }, {});
+  const groupedFiles = groupFilesByPage(generatedFiles);
 
   return (
     <div className="p-4 rounded-lg border border-border bg-card/50" data-task-phase={phase}>
