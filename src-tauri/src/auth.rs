@@ -350,12 +350,13 @@ fn keychain_enabled_env() -> bool {
 }
 
 /// Set once, at load time, in the runner's two unit-test binaries (the lib's
-/// and the runner bin's — each crate root carries the hook); never set in a
-/// shipped runner. Integration tests (`tests/*.rs`) and the auxiliary
-/// `src/bin/*` test binaries carry no hook; none of them reaches the keychain
-/// today, and `tests/keychain_call_sites_are_enumerated.rs` keeps new keychain
-/// call sites from appearing unnoticed. While it is set, [`AuthManager::keychain_enabled`] answers
-/// `false` for every instance not built by
+/// and the runner bin's — each crate root carries the hook, and the bin's
+/// marks the linked lib's copy too); never set in a shipped runner.
+/// Integration tests (`tests/*.rs`) and the auxiliary `src/bin/*` test binaries
+/// carry no hook; none of them reaches the keychain today, and
+/// `tests/keychain_call_sites_are_enumerated.rs` keeps new keychain call sites
+/// from appearing unnoticed. While it is set, [`AuthManager::keychain_enabled`]
+/// answers `false` for every instance not built by
 /// [`AuthManager::with_storage_force_keychain`].
 ///
 /// Why a process marker and not `#[cfg(test)]` or `QONTINUI_DISABLE_KEYCHAIN`:
