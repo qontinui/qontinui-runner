@@ -339,14 +339,25 @@ on:
       - 'merge-candidate-spec/**'
       - 'merge-candidate-batch/**'
 
-# Serialise per ref. `cancel-in-progress: false` on purpose, matching
+# `cancel-in-progress: false` on purpose, matching
 # atlas-schema-check.yml and page-spec-paths.yml rather than the two
 # cancel-in-progress siblings: a cancelled run on a gating workflow presents to
 # coord as an unverified tip (the condition ci-rerun-on-declaration.yml's header
 # describes), and this gate is eligible to become a required context. An 8s job
 # is not worth manufacturing that.
+# Since 2026-10-05 (shared hosted-job cap relief) the GROUP is one expression:
+# a first-attempt pull_request run shares a per-PR group (so a newer push
+# reaps an older head's PENDING run, but cancel-in-progress stays false, so a
+# RUNNING gate is never cancelled); every other run gets its own group,
+# so a pending main or merge-candidate run is never reaped. coord resolves a
+# one-expression group to "", which run_is_reaper_at_risk never matches, so an
+# in-flight main run here no longer hard-blocks a land (the old per-ref group
+# resolved to exactly the prospective main-push group).
+# KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
+# compares groups with `=`, so every "" group matches every other one and
+# suppresses its auto re-run; the fix belongs in coord.
 concurrency:
-  group: forbid-untimed-subprocess-${{ github.ref }}
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
   cancel-in-progress: false
 
 permissions:

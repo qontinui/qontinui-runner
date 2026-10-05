@@ -103,6 +103,30 @@ on:
 permissions:
   contents: read
 
+# PR-SCOPED SUPERSESSION (shared hosted-job cap relief, 2026-10-05). A FIRST-
+# attempt `pull_request` run joins a per-workflow, per-PR group and cancels the
+# run it supersedes there: a `synchronize` cancels the older head's run, and a
+# `reopened` cancels the same-head run it re-does (coord's ci-abandoned
+# recovery is a close+reopen). Every OTHER run -- whichever of push (main,
+# develop, merge-candidate*/** -- coord's candidate CI), schedule,
+# workflow_dispatch and workflow_run this file has, and EVERY re-run (run_attempt > 1) -- gets a
+# group unique to its run id + attempt, so it is never cancelled, never reaped
+# while pending, and never queues behind anything.
+# The group is ONE expression on purpose: coord models a group template by
+# interpolating only `github.event_name` / `github.ref` and collapsing every
+# other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
+# and run_is_reaper_at_risk never matches an empty group, so no push run here is
+# modelled as reapable by a land. (KNOWN coord gap: the budget-cancel candidate
+# scan in stuck_pr_watcher.rs compares groups with `=`, so every "" group
+# matches every other one and suppresses its auto re-run; fix belongs in coord.)
+# RESIDUAL: two pushes seconds apart can have
+# their runs CREATED out of order, so the older head's run cancels the newer
+# head's; the next push (or a close+reopen) heals it.
+# Pattern: qontinui-claude-config#1475.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
 jobs:
   unit-tests:
     name: Flake-escalate unit tests
