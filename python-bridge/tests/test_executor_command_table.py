@@ -19,7 +19,8 @@ It does see ``send_command_async(`` calls, and the hand-built
 ``ExecutorCommand { command: "...".to_string() }`` literals under ``src-tauri/src/executor/``.
 
 **No CI job runs this file yet** (no workflow runs ``python-bridge/tests``); run it
-locally with ``python -m pytest python-bridge/tests/test_executor_command_table.py``.
+locally with ``cd python-bridge && python -m pytest tests/test_executor_command_table.py``
+(``tests/conftest.py`` imports ``models``, so pytest must run from ``python-bridge/``).
 """
 
 from __future__ import annotations
