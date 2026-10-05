@@ -2181,10 +2181,10 @@ mod device_token_door_tests {
     /// recovery when the `.enc` store will not decrypt. On Linux the keyring
     /// call fails and is swallowed as `debug!`, which is why it stays invisible
     /// until Windows. `isolated_ambient` now sets the key itself
-    /// (`ambient::test_support::KEYS_SET_TO_ONE`); this guard stays because an
-    /// `AuthManager` in this module may be built outside a fixture. It is safe
-    /// inside one, which holds `env_lock` and has already captured the key for
-    /// restore.
+    /// (`ambient::test_support::KEYS_SET_TO_ONE`), so this `set_var` is
+    /// redundant belt-and-braces. Call this ONLY while a fixture is held: the
+    /// fixture holds `env_lock` and has captured the key for restore, and
+    /// outside one this write would leak to every later test.
     ///
     /// Every `AuthManager` in this module comes from here, so the ordering
     /// (guard BEFORE the first `store_tokens`) is enforced rather than
