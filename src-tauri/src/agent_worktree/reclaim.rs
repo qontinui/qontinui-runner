@@ -2334,6 +2334,19 @@ mod tests {
         }
     }
 
+    /// A canonical checkout root under a fresh tempdir, with no `src-tauri/`
+    /// and no `target/`, so `sink_path` resolves `"target"` to a literal
+    /// `<root>/target` on every machine. Naming the real primary checkout
+    /// here made these tests read the box they run on: where that checkout
+    /// exists it has `src-tauri/`, `census::target_dir_for` resolves
+    /// `src-tauri/target`, and the rejunction degrades to a layout-mismatch
+    /// Skip. Plan `2026-10-05-four-runner-unit-tests-read-the-machine-they-run-on`.
+    fn scratch_checkout(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn remove_unlinks_every_junction_before_removing_worktree() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
@@ -2438,7 +2451,8 @@ mod tests {
     fn unarmed_rejunction_skips_even_with_canonical() {
         // rejunction_armed=false → advisory-only Skip.
         let i = instr(ReclaimAction::Rejunction, &["target"], false);
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = scratch_checkout(&dir, "canonical");
         let steps = plan_reclaim(&i, false, false, Some(&canonical), true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
@@ -2460,14 +2474,15 @@ mod tests {
         )));
 
         // ...while a Rejunction in the SAME tick actually executes.
-        let rj = instr(ReclaimAction::Rejunction, &["target"], false);
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let rj_steps = plan_reclaim(&rj, true, false, Some(&canonical), true);
+        let dir = tempfile::tempdir().unwrap();
+        let wt = scratch_checkout(&dir, "wt-foo");
+        let canonical = scratch_checkout(&dir, "canonical");
+        let rj_steps = rejunction_steps_for(&wt, &canonical, &["target"]);
         assert_eq!(
             rj_steps,
             vec![ReclaimStep::CreateJunction {
-                link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/target"),
-                target: PathBuf::from("D:/qontinui-root/qontinui-runner/target"),
+                link: wt.join("target"),
+                target: canonical.join("target"),
             }]
         );
     }
@@ -2478,7 +2493,8 @@ mod tests {
         // nothing destructive, for either action kind.
         for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
             let i = instr(action, &["target", "node_modules"], false);
-            let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = scratch_checkout(&dir, "canonical");
             let steps = plan_reclaim(&i, false, false, Some(&canonical), true);
             assert_eq!(steps.len(), 1);
             assert!(matches!(steps[0], ReclaimStep::Skip(_)));
@@ -2493,24 +2509,21 @@ mod tests {
 
     #[test]
     fn rejunction_creates_junctions_to_canonical() {
-        let i = instr(
-            ReclaimAction::Rejunction,
-            &["target", "node_modules"],
-            false,
-        );
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+        let dir = tempfile::tempdir().unwrap();
+        let wt = scratch_checkout(&dir, "wt-foo");
+        let canonical = scratch_checkout(&dir, "canonical");
         // rejunction_armed=true.
-        let steps = plan_reclaim(&i, true, false, Some(&canonical), true);
+        let steps = rejunction_steps_for(&wt, &canonical, &["target", "node_modules"]);
         assert_eq!(
             steps,
             vec![
                 ReclaimStep::CreateJunction {
-                    link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/target"),
-                    target: PathBuf::from("D:/qontinui-root/qontinui-runner/target"),
+                    link: wt.join("target"),
+                    target: canonical.join("target"),
                 },
                 ReclaimStep::CreateJunction {
-                    link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/node_modules"),
-                    target: PathBuf::from("D:/qontinui-root/qontinui-runner/node_modules"),
+                    link: wt.join("node_modules"),
+                    target: canonical.join("node_modules"),
                 },
             ]
         );
@@ -2543,7 +2556,8 @@ mod tests {
         // The stale-census husk-guard (R1): a worktree missing on disk must
         // yield ONLY a Skip — for both actions, armed and unarmed — never a
         // step that could create a filesystem path.
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = scratch_checkout(&dir, "canonical");
         for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
             for (rj_armed, rm_armed) in [(false, false), (true, true)] {
                 let i = instr(action.clone(), &["target", "node_modules"], false);
