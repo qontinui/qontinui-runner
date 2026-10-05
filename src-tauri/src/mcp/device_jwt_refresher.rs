@@ -5160,10 +5160,13 @@ pub(crate) fn publish_default_binding_verdict(verdict: DefaultBindingVerdict) {
 /// blocking pool (it may read the credential store). The heal logs its own
 /// outcome; a join failure only defers it to the next tick.
 ///
-/// Phase 3: returns the tick's [`DefaultBindingVerdict`] (after recording it
-/// for the posture derivation), which the Pair arm's bail reads to tell "no
-/// credential" from "credential, no default binding".
-async fn heal_vanished_binding_store() -> DefaultBindingVerdict {
+/// Phase 3: records the tick's [`DefaultBindingVerdict`] in its cell
+/// ([`publish_default_binding_verdict`]), which both the posture derivation
+/// and the Pair arm's bail read ([`default_binding_verdict`]) — so a tick that
+/// measured nothing (a deferred heal, a failed join) keeps the last MEASURED
+/// verdict for both, instead of the bail publishing "no credential" over a
+/// measured "credential, no default binding".
+async fn heal_vanished_binding_store() {
     let verdict = match spawn_blocking_tracked(|| {
         let heal = qontinui_runner_lib::pair::heal_vanished_paired_user();
         let census = matches!(heal, qontinui_runner_lib::pair::PairedUserHeal::Refused(_))
@@ -5180,8 +5183,7 @@ async fn heal_vanished_binding_store() -> DefaultBindingVerdict {
             DefaultBindingVerdict::Unknown(format!("the heal task did not complete ({e})"))
         }
     };
-    publish_default_binding_verdict(verdict.clone());
-    verdict
+    publish_default_binding_verdict(verdict);
 }
 
 async fn refresher_loop(
@@ -5212,7 +5214,7 @@ async fn refresher_loop(
         // BEFORE anything below reads it, so the tier (`device_is_paired`),
         // the sweep inputs and the Pair arm's `user_id` read all see the
         // rewritten file instead of idling "not paired yet".
-        let binding_verdict = heal_vanished_binding_store().await;
+        heal_vanished_binding_store().await;
 
         // Snapshot settings + needs-refresh decision once per iteration.
         let settings_snapshot = settings::load_settings();
@@ -5605,7 +5607,10 @@ async fn refresher_loop(
                         // (b) a usable per-tenant slot that the heal refused
                         // to point a default binding at. Reporting (b) as (a)
                         // was the 2026-09-28 "no coord credential" misreport.
-                        let progress = unpaired_bail_progress(&binding_verdict);
+                        // The CELL, not this tick's raw verdict: an Unknown
+                        // tick (a deferred heal) never overwrites a measured
+                        // one there.
+                        let progress = unpaired_bail_progress(&default_binding_verdict());
                         match &progress {
                             PairProgress::BailNoDefaultBinding {
                                 usable_tenants,
@@ -12438,6 +12443,18 @@ mod tenant_slot_refresh_tests {
         publish_default_binding_verdict(slot_without_binding(false));
         publish_default_binding_verdict(DefaultBindingVerdict::Unknown("join failed".into()));
         assert_eq!(default_binding_verdict(), slot_without_binding(false));
+        // A heal that could not take the binding-store lock is Unknown too: the
+        // Pair arm's bail reads the CELL, so it still says "credential held, no
+        // default binding" rather than publishing "no coord credential".
+        use qontinui_runner_lib::pair::PairedUserHeal as H;
+        publish_default_binding_verdict(classify_default_binding(
+            &H::Deferred("lock busy".into()),
+            None,
+        ));
+        assert!(matches!(
+            unpaired_bail_progress(&default_binding_verdict()),
+            PairProgress::BailNoDefaultBinding { .. }
+        ));
         publish_default_binding_verdict(DefaultBindingVerdict::Bound);
         assert_eq!(default_binding_verdict(), DefaultBindingVerdict::Bound);
         reset_posture();
