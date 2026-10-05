@@ -7043,7 +7043,7 @@ async fn coord_mcp_proxy_handler(
     // Pick the bearer by principal:
     //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
     //    off the async executor), the same fresh token `backend_relay` reads.
-    //  - Agent  → THAT agent's own refreshed JWT from its AGENT_TOKENS slot; a
+    //  - Agent  → THAT agent's own refreshed JWT from its AgentTokenRegistry slot; a
     //    belt-and-suspenders `maybe_refresh` keeps it live on the request path
     //    too. An absent slot (torn-down / restarted agent) is a hard 401.
     // `mut` because the Phase 3a credential gate below may replace this with a
@@ -19081,7 +19081,7 @@ mod coord_provision_session_gate_tests {
         // Diagnostic only: the registry is process-global and sibling tests
         // mint into it concurrently, so a whole-map before/after equality
         // would race them. The property asserted below is caller-scoped.
-        let before = crate::coord_mcp::proxy_nonces().lock().unwrap().len();
+        let before = crate::coord_mcp::NonceRegistry::global().test_live().len();
 
         let resp = super::provision_session_after_gate(body.as_bytes());
         assert_eq!(resp.status(), 403);
@@ -19098,7 +19098,7 @@ mod coord_provision_session_gate_tests {
             "the refusal names the heal: {err}"
         );
 
-        let registry = crate::coord_mcp::proxy_nonces().lock().unwrap();
+        let registry = crate::coord_mcp::NonceRegistry::global().test_live();
         assert!(
             registry.values().all(|b| b.workdir() != cwd_str),
             "a refused tenant must mint NOTHING for the caller's cwd (registry had {before} \

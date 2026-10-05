@@ -1687,28 +1687,26 @@ fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
 /// agent_id can register, so this teardown can never strip a newer run's
 /// token, nonces or daemons.
 ///
-/// Holds the three maps it tears down by reference so the drop runs through
-/// [`teardown_in`], which a test can drive over poisoned LOCAL maps.
-/// Production builds it with [`AgentRunTeardown::global`].
+/// Holds the two registries and the daemon map it tears down by reference so
+/// the drop runs through [`teardown_in`], which a test can drive over poisoned
+/// LOCAL instances. Production builds it with [`AgentRunTeardown::global`].
 #[allow(clippy::type_complexity)]
 struct AgentRunTeardown<'a> {
     agent_id: uuid::Uuid,
-    tokens: &'a std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
-    >,
-    nonces: &'a std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    tokens: &'a crate::coord_mcp::AgentTokenRegistry,
+    nonces: &'a crate::coord_mcp::NonceRegistry,
     daemons: &'a std::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
     >,
 }
 
 impl AgentRunTeardown<'static> {
-    /// The production teardown, over the process-global maps.
+    /// The production teardown, over the process-global registries.
     fn global(agent_id: uuid::Uuid) -> Self {
         AgentRunTeardown {
             agent_id,
-            tokens: crate::coord_mcp::agent_tokens(),
-            nonces: crate::coord_mcp::proxy_nonces(),
+            tokens: crate::coord_mcp::AgentTokenRegistry::global(),
+            nonces: crate::coord_mcp::NonceRegistry::global(),
             daemons: crate::agent_daemons::registry(),
         }
     }
@@ -1720,21 +1718,20 @@ impl Drop for AgentRunTeardown<'_> {
     }
 }
 
-/// The per-agent teardown over explicit maps: live-token removal, proxy-nonce
-/// revoke, daemon stop. Every lock it takes recovers a poisoned mutex.
+/// The per-agent teardown over explicit registries: live-token removal,
+/// proxy-nonce revoke, daemon stop. Every lock it takes recovers a poisoned
+/// mutex.
 #[allow(clippy::type_complexity)]
 fn teardown_in(
-    tokens: &std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
-    >,
-    nonces: &std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    tokens: &crate::coord_mcp::AgentTokenRegistry,
+    nonces: &crate::coord_mcp::NonceRegistry,
     daemons: &std::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
     >,
     agent_id: uuid::Uuid,
 ) {
-    crate::coord_mcp::remove_agent_token_in(tokens, agent_id);
-    crate::coord_mcp::revoke_agent_proxy_nonces_in(nonces, agent_id);
+    tokens.remove(agent_id);
+    nonces.revoke_agent_proxy_nonces(agent_id);
     crate::agent_daemons::stop_for_agent_in(daemons, agent_id);
 }
 
@@ -8753,7 +8750,7 @@ async fn run_agent_subprocess(
         };
 
         // Wire the per-agent durability (agent_pusher) + observability (dirty_poller)
-        // daemons onto the SAME refreshing token slot registered in AGENT_TOKENS, so
+        // daemons onto the SAME refreshing token slot in AgentTokenRegistry, so
         // the proxy, heartbeat, pusher, and poller all read one slot (single-slot
         // invariant — agent_token/mod.rs:1). A credential is guaranteed here —
         // Step 0b refused the launch otherwise — so the daemons spawn iff a coord
@@ -9882,7 +9879,7 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
             );
         }
         // Proactively refresh the agent's coord-mcp proxy token (OQ4). The 30s
-        // tick ≪ the 30-min refresh margin, so the per-agent JWT in AGENT_TOKENS
+        // tick ≪ the 30-min refresh margin, so the per-agent registry JWT
         // is renewed well before its 4h TTL — independent of coord-mcp call
         // activity. Coord's /agents/:id/refresh-token rejects an ALREADY-expired
         // token, so a live agent must never let it lapse; the request-path
@@ -14805,12 +14802,12 @@ mod tests {
     }
 
     /// Round-5 review: an `AgentRunTeardown` built over POISONED maps, dropped
-    /// while a panic unwinds, neither aborts nor leaks. All three maps are LOCAL
-    /// copies (poisoning the process-global ones would break parallel tests that
-    /// `expect` on them), each holding an entry for the agent and each poisoned
-    /// before the drop. A panic from any helper inside a drop during unwinding
-    /// aborts the test binary, so this test fails if any teardown helper goes
-    /// back to `expect` on its lock.
+    /// while a panic unwinds, neither aborts nor leaks. The two registries and
+    /// the daemon map are LOCAL instances (poisoning the process-global ones
+    /// would leak into parallel tests that read them), each holding an entry
+    /// for the agent and each poisoned before the drop. A panic from any helper
+    /// inside a drop during unwinding aborts the test binary, so this test fails
+    /// if any teardown helper goes back to `expect` on its lock.
     ///
     /// Global side effects: the revoke's census records the LOCAL map's result
     /// in the process-global last-census record, so the test holds a
@@ -14818,9 +14815,8 @@ mod tests {
     /// a failed assertion included. Not reversible: when a forensics test has
     /// switched the shared rotation log on, the revoke appends one `revoke`
     /// line (this test's unique `teardown-test-<agent>` workdir) and at most one
-    /// `agent_binding_census` line to that file. The revoke also records a
-    /// tombstone for the nonce in the process-global tombstone map; the test
-    /// asserts it and then removes it.
+    /// `agent_binding_census` line to that file. The revoke's tombstone lands
+    /// in the LOCAL registry, where the test asserts it.
     #[test]
     fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
         use std::collections::HashMap;
@@ -14828,9 +14824,8 @@ mod tests {
         let _census_restore = crate::coord_mcp::teardown_poison_tests::census_record_guard();
         let agent = uuid::Uuid::now_v7();
 
-        let tokens: Mutex<HashMap<uuid::Uuid, crate::agent_token::SharedToken>> =
-            Mutex::new(HashMap::new());
-        tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        let tokens = crate::coord_mcp::AgentTokenRegistry::new();
+        tokens.register(
             agent,
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
                 token: "teardown-test-token".into(),
@@ -14839,10 +14834,9 @@ mod tests {
                 health: Default::default(),
             })),
         );
-        let nonces: Mutex<HashMap<String, crate::coord_mcp::NonceBinding>> =
-            Mutex::new(HashMap::new());
+        let nonces = crate::coord_mcp::NonceRegistry::new();
         let nonce = format!("teardown-test-nonce-{agent}");
-        nonces.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        nonces.test_live().insert(
             nonce.clone(),
             crate::coord_mcp::teardown_poison_tests::agent_nonce_binding(agent),
         );
@@ -14853,8 +14847,8 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .insert(agent, Default::default());
 
-        crate::coord_mcp::teardown_poison_tests::poison(&tokens);
-        crate::coord_mcp::teardown_poison_tests::poison(&nonces);
+        crate::coord_mcp::teardown_poison_tests::poison(tokens.test_mutex());
+        crate::coord_mcp::teardown_poison_tests::poison(nonces.test_mutex());
         crate::coord_mcp::teardown_poison_tests::poison(&daemons);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -14872,23 +14866,16 @@ mod tests {
         );
 
         assert!(
-            !tokens
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&agent),
+            tokens.lookup(agent).is_none(),
             "the live-token entry is removed"
         );
         assert!(
-            !nonces
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&nonce),
+            !nonces.test_snapshot().live_contains(&nonce),
             "the agent's proxy nonce is revoked"
         );
-        // The nonce was never in the GLOBAL registry, so this attribution can
-        // only come from the tombstone the teardown recorded.
-        let attribution = crate::coord_mcp::reject_attribution_for_nonce(&nonce).attribution;
-        crate::coord_mcp::teardown_poison_tests::remove_global_tombstone(&nonce);
+        // The nonce is no longer live, so this attribution can only come from
+        // the tombstone the teardown recorded in the same registry.
+        let attribution = nonces.reject_attribution(&nonce).attribution;
         assert_eq!(
             attribution,
             crate::coord_mcp::RejectAttribution::REVOKED,
