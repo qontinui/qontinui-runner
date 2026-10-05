@@ -2165,7 +2165,7 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
     //  2. TARGET: catch up the grant table from coord's device-bound poll.
     //  3. TARGET: mirror the `accept_remote_attach` preference to coord's
     //     device row so the mint reads this device's current answer.
-    crate::mcp::remote_terminal::client().on_relay_connected();
+    crate::mcp::remote_terminal::relay_connected();
     if let Some(registry) = api_state
         .app_handle
         .try_state::<Arc<crate::session::SessionRegistry>>()
@@ -2970,11 +2970,11 @@ async fn handle_relay_command(
             // on here, and a check would be dead code. The sibling `error` arm
             // below checks it because `handle_inbound` genuinely can return
             // `false` for that one.
-            crate::mcp::remote_terminal::client().handle_inbound(&msg_type, data);
+            crate::mcp::remote_terminal::route_inbound(&msg_type, data);
             None
         }
         "error" => {
-            if !crate::mcp::remote_terminal::client().handle_inbound("error", data) {
+            if !crate::mcp::remote_terminal::route_inbound("error", data) {
                 warn!(
                     body = %serde_json::to_string(&data).unwrap_or_default(),
                     "Relay error frame with no pending remote-attach request"

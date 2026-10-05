@@ -37,8 +37,8 @@
 //! [`ERROR_EXIT_CODE`] (`1`), matching `LocalPty`'s "non-zero falls back to 1".
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -129,6 +129,43 @@ pub fn lost_output_marker(lost_bytes: u64) -> Vec<u8> {
 pub const RELAY_LOST_MARKER: &[u8] =
     b"\r\n\x1b[1;33m[qontinui] relay connection lost \xe2\x80\x94 the remote session is still \
 running; this tab reattaches when the relay returns\x1b[0m\r\n";
+
+/// In-band notice written when the TARGET's relay socket is gone while this
+/// pane is live or reattaching — the backend answered `target_not_connected`.
+/// Written once per supervision; the reattach supervisor keeps retrying.
+pub const TARGET_NOT_CONNECTED_MARKER: &[u8] =
+    b"\r\n\x1b[1;33m[qontinui] the remote machine is not connected to the relay \xe2\x80\x94 \
+retrying until it returns\x1b[0m\r\n";
+
+/// In-band notice written when a reattach that followed a lost marker
+/// succeeded. Without it the lost marker stayed the pane's last word even
+/// after the tab was live again, whenever the target had produced nothing new.
+pub const REATTACHED_MARKER: &[u8] = b"\r\n\x1b[1;32m[qontinui] reattached\x1b[0m\r\n";
+
+/// In-band notice written when the pane closes on a fatal remote error, so a
+/// dead tab says it is dead (and why) instead of leaving an earlier "will
+/// reattach" notice as its last line.
+pub fn closed_marker(code: &str, message: &str) -> Vec<u8> {
+    let detail = if message.is_empty() {
+        String::new()
+    } else {
+        format!(": {message}")
+    };
+    format!(
+        "\r\n\x1b[1;31m[qontinui] remote tab closed ({code}){detail} — close this tab and \
+         attach again\x1b[0m\r\n"
+    )
+    .into_bytes()
+}
+
+/// The grant a pane presents. Shared with the pane's writers and swapped in
+/// place when the reattach supervisor renews an expired grant, so every frame
+/// after the swap carries the new jti.
+#[derive(Debug, Clone)]
+pub struct GrantIdent {
+    pub jti: String,
+    pub grant: String,
+}
 
 /// Wall-clock milliseconds since the Unix epoch — the clock every
 /// [`RemoteInteractivity`] timestamp is on, so the frontend's "Ns ago" reads
@@ -226,10 +263,21 @@ struct InteractivityState {
 
 /// A [`PaneIo`] over the backend relay for one remote terminal.
 pub struct RemotePaneIo {
-    grant_jti: String,
+    /// The grant JWT and its jti, kept so a relay reconnect can re-present it
+    /// — and replaced when an expired one is renewed.
+    ident: Arc<RwLock<GrantIdent>>,
     terminal_id: String,
-    /// The grant JWT, kept so a relay reconnect can re-present it.
-    grant: String,
+    /// The coord session this pane views — what a grant renewal mints for.
+    /// `None` for a pane built without one, which therefore cannot renew.
+    session_id: Option<String>,
+    /// The device the pane was attached to. A renewal coord now places on a
+    /// different device is refused rather than silently followed.
+    target_device_id: Option<String>,
+    /// A reattach supervisor owns this pane right now (at most one does).
+    reattaching: AtomicBool,
+    /// A "relay lost" / "target not connected" notice is the pane's latest
+    /// word, so a successful reattach must say it recovered.
+    awaiting_reattach: AtomicBool,
     sink: Arc<dyn RemoteFrameSink>,
     /// Sender half of the output channel. `None` once closed — the reader
     /// sees EOF when the last sender drops.
@@ -283,9 +331,15 @@ impl RemotePaneIo {
             let _ = tx.send(seed.buffer);
         }
         Self {
-            grant_jti: grant_jti.into(),
+            ident: Arc::new(RwLock::new(GrantIdent {
+                jti: grant_jti.into(),
+                grant: grant.into(),
+            })),
             terminal_id: terminal_id.into(),
-            grant: grant.into(),
+            session_id: None,
+            target_device_id: None,
+            reattaching: AtomicBool::new(false),
+            awaiting_reattach: AtomicBool::new(false),
             sink,
             output_tx: Mutex::new(Some(tx)),
             output_rx: Mutex::new(Some(rx)),
@@ -365,7 +419,7 @@ impl RemotePaneIo {
         };
         if !accepted {
             warn!(
-                grant_jti = %self.grant_jti,
+                grant_jti = %self.grant_jti(),
                 terminal_id = %self.terminal_id,
                 seq = ?acked.seq,
                 error = ?acked.error,
@@ -387,9 +441,19 @@ impl RemotePaneIo {
     /// The relay re-established this pane's attachment (a reattach after a
     /// relay drop). The target behind it may now be a different build, so
     /// what it proved about acknowledging input no longer holds.
+    ///
+    /// When a lost / not-connected notice is the pane's latest word, the
+    /// recovery is written into the pane too — otherwise a reattach that
+    /// delivered no new bytes left "relay connection lost" as the last line
+    /// of a tab that was live again.
     pub fn note_reattached(&self) {
-        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
-        g.snapshot.acks_since_attach = 0;
+        {
+            let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
+            g.snapshot.acks_since_attach = 0;
+        }
+        if self.awaiting_reattach.swap(false, Ordering::AcqRel) {
+            self.push_local(REATTACHED_MARKER);
+        }
     }
 
     /// Queue a zero-byte WRITE PROBE (`probe: true`) — plan
@@ -416,7 +480,7 @@ impl RemotePaneIo {
         g.next_seq = g.next_seq.saturating_add(1);
         self.sink.send_frame(json!({
             "type": "remote_terminal_input",
-            "grant_jti": self.grant_jti,
+            "grant_jti": self.grant_jti(),
             "terminal_id": self.terminal_id,
             "data": "",
             "seq": seq,
@@ -449,8 +513,76 @@ impl RemotePaneIo {
         (start < self.seed_start).then_some((start, self.seed_start))
     }
 
-    pub fn grant_jti(&self) -> &str {
-        &self.grant_jti
+    /// Record the coord session this pane views, so an expired grant can be
+    /// renewed for it.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Record the device this pane is attached to, so a grant renewal can
+    /// refuse a session coord has since placed elsewhere.
+    pub fn with_target_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.target_device_id = Some(device_id.into());
+        self
+    }
+
+    pub fn target_device_id(&self) -> Option<&str> {
+        self.target_device_id.as_deref()
+    }
+
+    pub fn grant_jti(&self) -> String {
+        self.ident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .jti
+            .clone()
+    }
+
+    pub fn grant(&self) -> String {
+        self.ident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .grant
+            .clone()
+    }
+
+    /// Replace the grant this pane presents (a renewal). Every frame built
+    /// after this — input, resize, flow, detach, reattach — carries the new
+    /// jti. Returns the jti it replaced.
+    pub fn set_grant(&self, jti: impl Into<String>, grant: impl Into<String>) -> String {
+        let mut g = self.ident.write().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::replace(&mut g.jti, jti.into());
+        g.grant = grant.into();
+        old
+    }
+
+    /// Claim the pane for a reattach supervisor. `false` when one already
+    /// owns it — the caller must not start a second.
+    pub fn try_begin_reattach(&self) -> bool {
+        self.reattaching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the claim taken by [`Self::try_begin_reattach`].
+    pub fn end_reattach(&self) {
+        self.reattaching.store(false, Ordering::Release);
+    }
+
+    pub fn is_reattaching(&self) -> bool {
+        self.reattaching.load(Ordering::Acquire)
+    }
+
+    /// The target's relay socket is gone: say so, and remember that a
+    /// recovery must be announced.
+    pub fn note_target_not_connected(&self) {
+        self.awaiting_reattach.store(true, Ordering::Release);
+        self.push_local(TARGET_NOT_CONNECTED_MARKER);
     }
 
     pub fn terminal_id(&self) -> &str {
@@ -518,6 +650,7 @@ impl RemotePaneIo {
     /// stays open (a drop is not an exit) and the client reattaches on
     /// reconnect.
     pub fn note_relay_lost(&self) {
+        self.awaiting_reattach.store(true, Ordering::Release);
         self.push_local(RELAY_LOST_MARKER);
     }
 
@@ -532,7 +665,7 @@ impl RemotePaneIo {
         let end = start.saturating_add(ring.buffer.len() as u64);
         if have >= end {
             debug!(
-                grant_jti = %self.grant_jti,
+                grant_jti = %self.grant_jti(),
                 have,
                 ring_end = end,
                 "remote pane: reattach ring adds nothing new"
@@ -551,7 +684,7 @@ impl RemotePaneIo {
             if have < start {
                 let lost = start - have;
                 warn!(
-                    grant_jti = %self.grant_jti,
+                    grant_jti = %self.grant_jti(),
                     lost_bytes = lost,
                     "remote pane: reattach ring starts past the last byte seen — output was lost while detached"
                 );
@@ -583,12 +716,15 @@ impl RemotePaneIo {
     /// exit with [`ERROR_EXIT_CODE`].
     pub fn mark_error(&self, code: &str, message: &str) {
         warn!(
-            grant_jti = %self.grant_jti,
+            grant_jti = %self.grant_jti(),
             terminal_id = %self.terminal_id,
             code,
             message,
             "remote pane: target reported an error — closing the pane"
         );
+        // Written BEFORE the channel closes, so the reader delivers it ahead
+        // of EOF and a dead tab says why it is dead.
+        self.push_local(&closed_marker(code, message));
         self.mark_exit(ERROR_EXIT_CODE);
     }
 
@@ -631,14 +767,14 @@ impl RemotePaneIo {
         }
         let sent = self.send(json!({
             "type": "remote_terminal_detach",
-            "grant_jti": self.grant_jti,
+            "grant_jti": self.grant_jti(),
             "terminal_id": self.terminal_id,
         }));
         *slot = match &sent {
             Ok(()) => DetachOutcome::Queued,
             Err(e) => {
                 warn!(
-                    grant_jti = %self.grant_jti,
+                    grant_jti = %self.grant_jti(),
                     terminal_id = %self.terminal_id,
                     error = %e,
                     "remote pane: remote_terminal_detach could not be queued — the relay keeps the binding until the source socket drops or the grant expires"
@@ -667,7 +803,7 @@ impl RemotePaneIo {
         json!({
             "type": "remote_terminal_attach",
             "request_id": request_id,
-            "grant": self.grant,
+            "grant": self.grant(),
             "cols": cols,
             "rows": rows,
             "have_offset": self.remote_offset(),
@@ -708,7 +844,7 @@ impl Read for ChannelReader {
 /// `Write` that ships each write as one `remote_terminal_input` frame,
 /// stamped with the pane's next `seq`.
 struct FrameWriter {
-    grant_jti: String,
+    ident: Arc<RwLock<GrantIdent>>,
     terminal_id: String,
     sink: Arc<dyn RemoteFrameSink>,
     interactivity: Arc<Mutex<InteractivityState>>,
@@ -730,7 +866,7 @@ impl Write for FrameWriter {
         self.sink
             .send_frame(json!({
                 "type": "remote_terminal_input",
-                "grant_jti": self.grant_jti,
+                "grant_jti": self.ident.read().unwrap_or_else(|e| e.into_inner()).jti.clone(),
                 "terminal_id": self.terminal_id,
                 "data": STANDARD.encode(buf),
                 "seq": seq,
@@ -766,7 +902,7 @@ impl PaneIo for RemotePaneIo {
 
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
         Ok(Box::new(FrameWriter {
-            grant_jti: self.grant_jti.clone(),
+            ident: self.ident.clone(),
             terminal_id: self.terminal_id.clone(),
             sink: self.sink.clone(),
             interactivity: self.interactivity.clone(),
@@ -778,7 +914,7 @@ impl PaneIo for RemotePaneIo {
         self.rows.store(rows, Ordering::Relaxed);
         self.send(json!({
             "type": "remote_terminal_resize",
-            "grant_jti": self.grant_jti,
+            "grant_jti": self.grant_jti(),
             "terminal_id": self.terminal_id,
             "cols": cols,
             "rows": rows,
@@ -811,7 +947,7 @@ impl PaneIo for RemotePaneIo {
     fn set_paused(&self, paused: bool) -> Result<(), String> {
         self.send(json!({
             "type": "remote_terminal_flow",
-            "grant_jti": self.grant_jti,
+            "grant_jti": self.grant_jti(),
             "terminal_id": self.terminal_id,
             "paused": paused,
         }))
@@ -1297,8 +1433,65 @@ pub(crate) mod tests {
         let pane = pane(&sink, AttachedRing::default());
         let reader = pane.reader().unwrap();
         pane.mark_error("session_not_local", "no such session here");
-        assert!(read_to_end_blocking(reader).is_empty());
+        // The close is announced in the pane before EOF — a dead tab says
+        // why it is dead rather than leaving an older notice as its last line.
+        assert_eq!(
+            read_to_end_blocking(reader),
+            closed_marker("session_not_local", "no such session here")
+        );
         assert_eq!(pane.wait(), Ok(ERROR_EXIT_CODE));
+    }
+
+    /// Plan 2026-10-02 D3: a reattach after a lost notice says it recovered;
+    /// a reattach with no notice outstanding writes nothing (an ordinary
+    /// flow resync must not spam the pane).
+    #[test]
+    fn a_reattach_after_a_lost_notice_announces_the_recovery() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let reader = pane.reader().unwrap();
+        pane.note_reattached();
+        pane.note_relay_lost();
+        pane.note_reattached();
+        pane.note_reattached();
+        pane.note_target_not_connected();
+        pane.note_reattached();
+        pane.mark_exit(0);
+        let mut expected = RELAY_LOST_MARKER.to_vec();
+        expected.extend_from_slice(REATTACHED_MARKER);
+        expected.extend_from_slice(TARGET_NOT_CONNECTED_MARKER);
+        expected.extend_from_slice(REATTACHED_MARKER);
+        assert_eq!(read_to_end_blocking(reader), expected);
+    }
+
+    /// Plan 2026-10-02 D2: a renewed grant replaces the jti on EVERY frame
+    /// the pane builds afterwards — including a writer taken before the swap.
+    #[test]
+    fn a_renewed_grant_is_carried_by_every_later_frame() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let mut w = pane.writer().unwrap();
+        assert_eq!(pane.set_grant("jti-2", "grant-2.jwt"), "jti-1");
+        assert_eq!(pane.grant_jti(), "jti-2");
+        w.write_all(b"x").unwrap();
+        pane.resize(90, 30).unwrap();
+        let f = pane.reattach_frame("reattach:jti-2");
+        assert_eq!(f["grant"], "grant-2.jwt");
+        for frame in sink.frames() {
+            assert_eq!(frame["grant_jti"], "jti-2", "{frame}");
+        }
+    }
+
+    /// Only one supervisor may claim a pane at a time.
+    #[test]
+    fn reattach_claim_is_exclusive_until_released() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        assert!(pane.try_begin_reattach());
+        assert!(!pane.try_begin_reattach());
+        assert!(pane.is_reattaching());
+        pane.end_reattach();
+        assert!(pane.try_begin_reattach());
     }
 
     /// Reattach splice: bytes already delivered are skipped; a ring that

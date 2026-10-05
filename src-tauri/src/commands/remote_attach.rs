@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use super::CommandResponse;
 use crate::mcp::remote_terminal::{
-    client, AttachError, AttachRefusal, AttachedReply, ATTACH_TIMEOUT,
+    client, AttachError, AttachRefusal, AttachedReply, GrantRenewer, RenewedGrant, ATTACH_TIMEOUT,
 };
 use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
@@ -427,26 +427,9 @@ pub async fn terminal_attach_remote(
 // ---------------------------------------------------------------------------
 
 /// How long the source keeps re-presenting the SAME grant while the target has
-/// not recorded it yet.
-///
-/// **Sized against the TARGET's catch-up poll, which is a property of the
-/// target's BUILD and therefore not shortenable from here.** A target learns a
-/// grant from a push on `qontinui.sessions.<tenant>.<device>.attach_request`
-/// or from its catch-up `GET /sessions/attach-requests`; a target whose runner
-/// predates the on-demand re-read has only those two, so a dropped push leaves
-/// the poll as the only feed. That poll is 15 s on a runner carrying
-/// [`crate::session::attach::POLL_INTERVAL`] as it now stands, and **60 s on
-/// every build that predates it** — which is the population this window exists
-/// for. 80 s covers one whole 60 s tick plus the catch-up GET's own budget and
-/// clock skew, against a grant coord gives 900 s of life, so the wait spends a
-/// small fraction of the capability it is waiting on.
-///
-/// It bounds the RE-PRESENTATION schedule, not the wall clock: each
-/// presentation carries its own [`ATTACH_TIMEOUT`] (20 s), so a final attempt
-/// that times out can carry the total to ~100 s. A timeout is a settled stop
-/// (see [`present_grant_until_target_records_it`]), so that happens at most
-/// once and never compounds.
-pub(crate) const GRANT_LEARN_WINDOW: Duration = Duration::from_secs(80);
+/// not recorded it yet. Defined beside the reattach supervisor, which uses the
+/// same window after a grant renewal, so the two cannot drift; see its doc.
+pub(crate) use crate::mcp::remote_terminal::GRANT_LEARN_WINDOW;
 
 /// Gap between two presentations of the same grant. Short enough that a 15 s
 /// poll is caught within a tick of recording the row, long enough that the
@@ -751,21 +734,29 @@ pub(crate) async fn open_remote_tab(
         ));
     }
 
-    let pane = Arc::new(RemotePaneIo::new(
-        minted.grant_jti.clone(),
-        attached.terminal_id.clone(),
-        minted.grant.clone(),
-        client().sink(),
-        cols,
-        rows,
-        attached.ring,
-    ));
-    client().register_pane(pane.clone());
-
     let target_id = minted
         .target_device_id
         .clone()
         .unwrap_or_else(|| device_id.clone());
+    let pane = Arc::new(
+        RemotePaneIo::new(
+            minted.grant_jti.clone(),
+            attached.terminal_id.clone(),
+            minted.grant.clone(),
+            client().sink(),
+            cols,
+            rows,
+            attached.ring,
+        )
+        .with_session_id(session_uuid.to_string())
+        .with_target_device_id(target_id.clone()),
+    );
+    // So a reattach that finds this grant expired can mint the next one.
+    client().set_grant_renewer(Arc::new(CoordGrantRenewer {
+        app: app_handle.clone(),
+    }));
+    client().register_pane(pane.clone());
+
     let device_label = non_blank(device_label).unwrap_or_else(|| short_id(&target_id));
     let title = format!(
         "{}: {}",
@@ -839,6 +830,74 @@ pub(crate) async fn open_remote_tab(
             Err(format!("remote_attach:session_spawn_failed: {e}"))
         }
     }
+}
+
+/// Renews an expired attach grant for a live remote tab — plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches` (D2).
+///
+/// The same mint the picker uses, so the same issuance policy applies: a
+/// session coord no longer places in this tenant, or a device that stopped
+/// accepting remote attach, is refused here exactly as a fresh attach would
+/// be, and the reattach supervisor closes the tab with that refusal. The
+/// placement check a fresh attach makes (`coord_places_session_on`) is made
+/// here too: a session coord now places on a different device is refused with
+/// that reason, rather than surfacing later as a terminal mismatch.
+struct CoordGrantRenewer {
+    app: tauri::AppHandle,
+}
+
+impl GrantRenewer for CoordGrantRenewer {
+    fn renew<'a>(
+        &'a self,
+        session_id: &'a str,
+        target_device_id: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let session = uuid::Uuid::parse_str(session_id)
+                .map_err(|e| format!("remote_attach:invalid_session_id: {session_id:?}: {e}"))?;
+            let minted = mint_attach_grant(&coord_base_for(&self.app), session).await?;
+            if let Some(refusal) = renewal_placement_refusal(
+                &session.to_string(),
+                target_device_id,
+                minted.target_device_id.as_deref(),
+            ) {
+                return Err(refusal);
+            }
+            info!(
+                session = %session,
+                grant_jti = %minted.grant_jti,
+                expires_at = ?minted.expires_at,
+                "remote attach: grant renewed for a reattach"
+            );
+            Ok(RenewedGrant {
+                grant: minted.grant,
+                grant_jti: minted.grant_jti,
+            })
+        })
+    }
+}
+
+/// Why a renewed grant must be refused, or `None` when it may be used: the
+/// pane was attached to `attached_to`, and coord now places the session on
+/// `minted_target`. The same `coord_places_session_on` rule a fresh attach
+/// applies — an unreported placement is refused too. A pane that recorded no
+/// device (`None`) is not checked.
+pub(crate) fn renewal_placement_refusal(
+    session: &str,
+    attached_to: Option<&str>,
+    minted_target: Option<&str>,
+) -> Option<String> {
+    let attached_to = attached_to?;
+    if coord_places_session_on(attached_to, minted_target) {
+        return None;
+    }
+    let now_on = minted_target.unwrap_or("<unreported>");
+    Some(format!(
+        "remote_attach:target_mismatch: coord now places session {session} on device \
+         {now_on}, not {attached_to} — the session moved"
+    ))
 }
 
 /// What closing a remote tab did about the relay's `(target, terminal)`
@@ -1029,6 +1088,25 @@ pub fn terminal_remote_interactivity(
     })
 }
 
+/// The grant jti a remote tab's pane presents RIGHT NOW.
+///
+/// The tab identity records the jti the tab was opened with, but the reattach
+/// supervisor renews an expired grant and re-keys the client's routing table
+/// under the new jti (plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches`, D2). The
+/// manager-held pane carries the current one, so resolve through it and fall
+/// back to the identity's only when the manager holds no pane.
+fn current_grant_jti(
+    terminal_manager: &TerminalManager,
+    terminal_id: &str,
+    identity: &RemoteTabIdentity,
+) -> String {
+    terminal_manager
+        .remote_pane(terminal_id)
+        .map(|pane| pane.grant_jti())
+        .unwrap_or_else(|| identity.grant_jti.clone())
+}
+
 /// The body of [`terminal_remote_interactivity`], with the live-pane lookup
 /// injected so it is testable without the process-wide client.
 pub(crate) fn remote_interactivity_response(
@@ -1041,7 +1119,7 @@ pub(crate) fn remote_interactivity_response(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = live_pane(&identity.grant_jti) else {
+    let Some(pane) = live_pane(&current_grant_jti(terminal_manager, terminal_id, &identity)) else {
         return Ok(CommandResponse {
             success: false,
             message: Some("the remote pane behind this tab is closed".to_string()),
@@ -1078,7 +1156,8 @@ pub async fn terminal_remote_history_load(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = client().pane(&identity.grant_jti) else {
+    let grant_jti = current_grant_jti(&terminal_manager, &terminal_id, &identity);
+    let Some(pane) = client().pane(&grant_jti) else {
         return Err(format!(
             "remote_attach:pane_gone: the remote pane behind terminal {terminal_id} is closed"
         ));
@@ -1102,7 +1181,7 @@ pub async fn terminal_remote_history_load(
     let end = start.saturating_add(reply.ring.buffer.len() as u64);
     info!(
         terminal_id = %terminal_id,
-        grant_jti = %identity.grant_jti,
+        grant_jti = %grant_jti,
         requested_from = from,
         requested_to = to,
         got_from = start,
@@ -1786,5 +1865,54 @@ mod interactivity_command_tests {
         ] {
             assert!(d.get(key).is_some(), "missing {key} in {d}");
         }
+    }
+
+    /// Plan 2026-10-02, review round 2: a renewal coord now places on another
+    /// device (or does not place at all) is refused; the same device passes.
+    #[test]
+    fn a_renewal_placed_on_another_device_is_refused() {
+        use super::renewal_placement_refusal;
+        assert_eq!(
+            renewal_placement_refusal("s", Some("dev-a"), Some("DEV-A")),
+            None
+        );
+        let moved = renewal_placement_refusal("s", Some("dev-a"), Some("dev-b")).unwrap();
+        assert!(
+            moved.starts_with("remote_attach:target_mismatch"),
+            "{moved}"
+        );
+        assert!(
+            moved.contains("dev-b") && moved.contains("dev-a"),
+            "{moved}"
+        );
+        assert!(renewal_placement_refusal("s", Some("dev-a"), None).is_some());
+        assert_eq!(renewal_placement_refusal("s", None, Some("dev-b")), None);
+    }
+
+    /// Plan 2026-10-02 (vet): after the reattach supervisor renews the grant,
+    /// the routing table knows the pane only by the NEW jti while the tab
+    /// identity still names the old one. The lookup must follow the pane, or a
+    /// live, renewed tab reports itself closed.
+    #[test]
+    fn a_renewed_pane_is_found_by_its_current_jti() {
+        let tm = TerminalManager::new();
+        tm.set_remote_identity("tab-1", identity());
+        let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "rt-1",
+            "g",
+            sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        tm.set_remote_pane("tab-1", pane.clone());
+        pane.set_grant("jti-2", "g2");
+        let r = remote_interactivity_response(&tm, "tab-1", |jti| {
+            (jti == "jti-2").then(|| pane.clone())
+        })
+        .unwrap();
+        assert!(r.success, "a renewed pane was reported closed");
     }
 }
