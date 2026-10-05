@@ -90,7 +90,9 @@ describe("useStepMachine handleSessionTransition", () => {
     machine.pendingStepRef.current = "page-spec";
     machine.processedMessageCountRef.current = 1;
     const params = transition({
-      messages: [aiMessage("old reply"), userMessage("next prompt"), aiMessage("new reply")],
+      // User message FIRST: the cursor counts AI messages only, so slicing the
+      // raw list before filtering would wrongly keep "old reply".
+      messages: [userMessage("first prompt"), aiMessage("old reply"), aiMessage("new reply")],
       streamingContent: "tail",
     });
 
@@ -100,10 +102,25 @@ describe("useStepMachine handleSessionTransition", () => {
     const [ctx, content] = handlers["page-spec"].mock.calls[0] as [StepContext, StepContent];
     expect(ctx.controller).toBe(params.controller);
     expect(ctx.pendingStepRef).toBe(machine.pendingStepRef);
-    // Per-page step: only AI messages past the processed cursor, plus streaming tail.
+    // Handlers receive the FULL AI list (they advance the cursor to its length)...
     expect(content.aiMessages.map((m) => m.content)).toEqual(["old reply", "new reply"]);
+    // ...while a per-page step's content is only the AI messages past the cursor, plus the tail.
     expect(content.fullContent).toBe("new reply\n\ntail");
     expect(machine.chainToDemoScriptRef.current).toBe(ctx.flow.chainToDemoScript);
+  });
+
+  it("on processing → ready for a whole-session step, ignores the processed cursor", () => {
+    const machine = mountMachine();
+    machine.pendingStepRef.current = "hooks";
+    machine.processedMessageCountRef.current = 1;
+
+    machine.handleSessionTransition(
+      transition({ messages: [aiMessage("old reply"), aiMessage("new reply")] }),
+    );
+
+    expect(calledHandlers()).toEqual(["hooks"]);
+    const [, content] = handlers.hooks.mock.calls[0] as [StepContext, StepContent];
+    expect(content.fullContent).toBe("old reply\n\nnew reply");
   });
 
   it.each([
