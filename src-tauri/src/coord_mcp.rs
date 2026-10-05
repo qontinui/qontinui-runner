@@ -7036,12 +7036,11 @@ mod session_tenant_resolution_tests {
         // Wiring: no `mcp_api` refusal site hardcodes the old code any more,
         // and the four refusal sites return the struct's body. The needle is
         // split so this test's own source cannot satisfy it.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let text = crate::mcp_api::mcp_api_sources();
         let hardcoded = concat!("\"COORD_MCP_PROXY_", "TENANT_UNRESOLVABLE\"");
         assert!(
             !text.contains(hardcoded),
-            "mcp_api.rs must build refusal bodies from ProxyRefusal, not hardcode {hardcoded}"
+            "the mcp_api module must build refusal bodies from ProxyRefusal, not hardcode {hardcoded}"
         );
         assert!(
             text.matches("refusal.json_body()").count() >= 4,
@@ -24255,8 +24254,7 @@ mod runner_credential_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_handler_heals_before_it_refuses_and_keeps_the_retryable_degrade() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let text = crate::mcp_api::mcp_api_sources();
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -24363,8 +24361,7 @@ mod runner_credential_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_catalogue_is_recorded_only_from_a_device_principal_refusal() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let text = crate::mcp_api::mcp_api_sources();
         let at = text
             .find("record_credential_free_doors(&bytes)")
             .expect("the recorder is called");

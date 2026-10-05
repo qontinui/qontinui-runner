@@ -73,6 +73,10 @@ const SCAN_ROOTS: &[&str] = &[
     "src/orchestration_loop",
     "src/spec_experimentation",
     "src/doctor",
+    // The children of the `mcp_api` module as it is split out of
+    // `src/mcp_api.rs` (which stays in `SCAN_FILES` below). Absent until the
+    // first move lands; a missing root is skipped, not an error.
+    "src/mcp_api",
 ];
 
 /// Extra standalone files that define Tauri commands outside the roots above.
