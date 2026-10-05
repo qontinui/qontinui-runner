@@ -303,6 +303,24 @@ fn fact_is_fresh(fact: Option<&Value>, fresh_for_secs: i64, now: DateTime<Utc>) 
     measured && at.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= fresh_for_secs)
 }
 
+/// How long after a session starts the sweep leaves it alone: the target's
+/// remote-create attach deadline plus [`REPROBE_SLACK`], so a probe can never
+/// be the attach that disarms the reaper for an orphaned remote create.
+pub(crate) const ATTACH_DEADLINE_GUARD: Duration = Duration::from_secs(
+    crate::mcp::remote_create_reaper::REMOTE_CREATE_ATTACH_DEADLINE.as_secs()
+        + REPROBE_SLACK.as_secs(),
+);
+
+/// `true` when the row's `startedAt` parses and lies within `window` of `now`
+/// (a start in the future counts as young). Absent or unparseable is `false`.
+fn started_within(row: &Value, window: Duration, now: DateTime<Utc>) -> bool {
+    row.get("startedAt")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .is_some_and(|at| now.signed_duration_since(at).num_seconds() < window.as_secs() as i64)
+}
+
 fn is_fresh_traffic_ok(fact: Option<&Value>, fresh_for_secs: i64, now: DateTime<Utc>) -> bool {
     fact.is_some_and(|f| {
         f.get("state").and_then(|v| v.as_str()) == Some("ok")
@@ -344,6 +362,16 @@ pub(crate) fn skip_reason(
     }
     if row.get("interactiveSurface").and_then(|v| v.as_str()) == Some("none") {
         return Some("not_interactive");
+    }
+    // A session younger than the target's attach-deadline (plus slack) is left
+    // to the target's `remote_create_reaper` first: a probe attach is an
+    // ordinary grant attach, the target marks the terminal ATTACHED on it, and
+    // a remote-created terminal whose creator's reply was lost would then never
+    // be reaped. Past the deadline the reaper has decided (an orphan is gone,
+    // an owned terminal is unaffected), so the next sweep measures it. A row
+    // with no `startedAt` is probed: the age is unknown, not young.
+    if started_within(row, ATTACH_DEADLINE_GUARD, now) {
+        return Some("attach_deadline_pending");
     }
     let read = row.get("readableRemotely");
     let write = row.get("writableRemotely");
@@ -1418,6 +1446,39 @@ mod tests {
     /// `skip_reason` for a runner holding no attempt stamp for the row.
     fn skip_reason_no_stamp(row: &Value, f: i64, now: DateTime<Utc>) -> Option<&'static str> {
         skip_reason(row, f, now, None)
+    }
+
+    /// A probe attach would mark a remote-created terminal attached on the
+    /// target and disarm its attach-deadline reaper, so a session younger than
+    /// that deadline is not probed; past it, or with no start time, it is.
+    #[test]
+    fn young_session_is_left_to_the_attach_deadline_reaper() {
+        let now = Utc::now();
+        let guard = ATTACH_DEADLINE_GUARD.as_secs() as i64;
+        assert!(
+            ATTACH_DEADLINE_GUARD > crate::mcp::remote_create_reaper::REMOTE_CREATE_ATTACH_DEADLINE,
+            "the guard must outlast the reaper's deadline"
+        );
+        let started = |age: i64| {
+            row(
+                900,
+                json!({"startedAt": (now - chrono::Duration::seconds(age)).to_rfc3339()}),
+            )
+        };
+        assert_eq!(
+            skip_reason_no_stamp(&started(60), 1800, now),
+            Some("attach_deadline_pending")
+        );
+        assert_eq!(
+            skip_reason_no_stamp(&started(guard - 1), 1800, now),
+            Some("attach_deadline_pending")
+        );
+        assert_eq!(skip_reason_no_stamp(&started(guard + 1), 1800, now), None);
+        assert_eq!(skip_reason_no_stamp(&row(901, json!({})), 1800, now), None);
+        assert_eq!(
+            skip_reason_no_stamp(&row(902, json!({"startedAt": "not-a-time"})), 1800, now),
+            None
+        );
     }
 
     fn sid(n: u128) -> String {
