@@ -443,7 +443,7 @@ impl ScanDivergence {
     }
 
     /// UNKNOWN with a named reason. Used for the failures that happen OUTSIDE
-    /// [`measure_scan_divergence`] — a probe task that could not be joined —
+    /// [`measure_scan_divergence_pinned`] — a probe task that could not be joined —
     /// so those never degrade into silence either.
     pub fn unknown(plans_dir: Option<String>, detail: impl Into<String>) -> Self {
         Self {
@@ -527,7 +527,7 @@ impl ScanDivergence {
     }
 }
 
-/// The four git reads [`measure_scan_divergence`] needs, behind a trait so the
+/// The four git reads [`measure_scan_divergence_pinned`] needs, behind a trait so the
 /// measurement is a pure function of its answers.
 ///
 /// Injected rather than called directly because the interesting cases — no
@@ -708,23 +708,15 @@ pub fn combine_refresh_stamps(
     }
 }
 
-/// Measure the scan source against the ref it should be reading.
+/// Measure the scan source against the ref it should be reading, resolving the
+/// default ref through the cycle's [`CycleRefPin`] — the tick's door, so the
+/// reading's `ref_sha` / `behind` / `ahead` / `ref_age_secs` describe the
+/// commit the cycle's `ref` census is listed at (plan
+/// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
 ///
 /// Pure over `git` and the clock: every branch is reachable from a fake
 /// reader, which is what makes the four states testable without a repo on
-/// disk, and `now_unix` is a parameter so the ref's age is too.
-pub fn measure_scan_divergence(
-    plans_dir: Option<&Path>,
-    git: &dyn GitRefReader,
-    now_unix: i64,
-) -> ScanDivergence {
-    measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
-}
-
-/// [`measure_scan_divergence`] resolving the default ref through the cycle's
-/// [`CycleRefPin`] — the tick's door, so the reading's `ref_sha` / `behind` /
-/// `ahead` / `ref_age_secs` describe the commit the cycle's `ref` census is
-/// listed at (plan `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
+/// disk, and the clock is a parameter so the ref's age is too.
 ///
 /// `clock` is read AFTER the pin resolves, never before: on a writing pin the
 /// first resolution performs the cycle's fetch (up to `SCAN_FETCH_TIMEOUT`), and
@@ -752,13 +744,13 @@ pub fn measure_scan_divergence_pinned(
     reading.observed_at(now_unix)
 }
 
-/// The tick's measurement: [`measure_scan_divergence`] plus the reading's
+/// The tick's measurement: [`measure_scan_divergence_pinned`] plus the reading's
 /// plan-library `source_repo` key.
 ///
 /// Run on the blocking pool with the git probes because
 /// [`super::body_push::derive_source_repo`] walks the filesystem for a `.git`
 /// — work that does not belong on the single-worker runtime the scan-root
-/// report is later posted from. Kept out of [`measure_scan_divergence`] so
+/// report is later posted from. Kept out of [`measure_scan_divergence_pinned`] so
 /// that stays pure over its fake reader.
 fn measure_scan_source(
     dir: &Path,
@@ -5691,6 +5683,20 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
+
+    /// [`measure_scan_divergence_pinned`] with no pin and a constant clock —
+    /// the shape most probe tests want. Test-only: since the probe reads the
+    /// cycle's pin (plan
+    /// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`) production
+    /// has no unpinned caller, and a public unpinned door would invite one
+    /// that re-creates the probe-vs-census commit mismatch.
+    fn measure_scan_divergence(
+        plans_dir: Option<&Path>,
+        git: &dyn GitRefReader,
+        now_unix: i64,
+    ) -> ScanDivergence {
+        measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
+    }
 
     /// W2: [`read_device_binding_count`] fills `local` from
     /// `auth::device_binding_count`, and nothing else observes WHICH auth
