@@ -13769,11 +13769,11 @@ mod tests {
             .find(signature)
             .unwrap_or_else(|| panic!("`{signature}` exists"));
         let close = format!("\n{indent}{}\n", char::from(0x7d));
-        let end = src[start..]
+        let rest = src.get(start..).expect("`find` returns a char boundary");
+        let len = rest
             .find(&close)
-            .map(|i| start + i)
             .unwrap_or_else(|| panic!("`{signature}` has a body"));
-        &src[start..end]
+        rest.get(..len).expect("`find` returns a char boundary")
     }
 
     /// Phase 1 source guard: the nonce maps have ONE owner behind ONE lock.
