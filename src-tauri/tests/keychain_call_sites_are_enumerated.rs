@@ -25,10 +25,12 @@
 //!   fails here, so whoever adds one must decide whether tests can
 //!   reach it — and give it a test seam (as `registry_creds` does with a fake
 //!   store) or route it through `AuthManager`'s guard.
-//! - A new mention of the `"QONTINUI_DISABLE_KEYCHAIN"` name outside the
-//!   files that legitimately own it fails here — a `set_var` of it means
-//!   someone is re-growing the per-module workaround instead of trusting the
-//!   guard, however the call is spelled or wrapped.
+//! - A literal `set_var("QONTINUI_DISABLE_KEYCHAIN"` anywhere but the one file
+//!   still pending PR #2001 fails here, and so does any mention of the
+//!   `"QONTINUI_DISABLE_KEYCHAIN"` name outside the four files that own it.
+//!   Either means someone is re-growing the per-module workaround instead of
+//!   trusting the guard. A per-file scan cannot see a setter wrapped in a
+//!   helper inside one of those four files; review is the backstop there.
 //!
 //! A source scan, not a proof: it cannot see a keychain call spelled through an
 //! aliased import, a re-export or a macro. The load-time guard itself covers the
@@ -68,6 +70,9 @@ const KEYRING_CALL_SITES: &[(&str, &str)] = &[
 /// `commands/auth.rs` `hermetic_auth_manager` still sets it; that file is owned
 /// by open PR qontinui-runner#2001, and Phase 6 of the plan removes the set
 /// after that lands.
+/// Files still allowed a literal `set_var("QONTINUI_DISABLE_KEYCHAIN", ...)`.
+const DISABLE_KEYCHAIN_SETTERS: &[&str] = &["commands/auth.rs"];
+
 const DISABLE_KEYCHAIN_NAMERS: &[(&str, &str)] = &[
     ("auth.rs", "the reader, and the guard's own regression test"),
     (
@@ -168,5 +173,24 @@ fn no_test_reenables_the_per_module_keychain_workaround() {
         "{unlisted:?} name QONTINUI_DISABLE_KEYCHAIN. A test binary already never reaches the OS \
          keychain (auth::deny_os_keychain_for_this_test_process), so the per-module workaround \
          is redundant and races sibling tests on process env — remove it."
+    );
+    let stale: Vec<&&str> = allowed
+        .iter()
+        .filter(|path| !found.iter().any(|f| f == *path))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "DISABLE_KEYCHAIN_NAMERS lists file(s) that no longer name the variable: {stale:?}"
+    );
+
+    let setters = files_containing("set_var(\"QONTINUI_DISABLE_KEYCHAIN\"");
+    let unlisted_setters: Vec<&String> = setters
+        .iter()
+        .filter(|path| !DISABLE_KEYCHAIN_SETTERS.contains(&path.as_str()))
+        .collect();
+    assert!(
+        unlisted_setters.is_empty(),
+        "{unlisted_setters:?} set QONTINUI_DISABLE_KEYCHAIN; the load-time guard makes that \
+         redundant — remove it."
     );
 }
