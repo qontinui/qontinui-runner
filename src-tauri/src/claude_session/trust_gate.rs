@@ -366,14 +366,29 @@ static DIAL: Lazy<Mutex<DialCache>> = Lazy::new(|| {
     })
 });
 
+/// The override value retired by plan
+/// `2026-10-04-coord-pr-hold-without-github-drafts` D5. Unlike the SERVED dial
+/// (where a stale token reads Unrecognised → Block), a stale override is
+/// honoured as its successor: ignoring it would fall back to the tenant dial,
+/// which may be LOOSER than what the operator pinned on this box.
+const RETIRED_DRAFT_REQUIRED_OVERRIDE: &str = "draft-required";
+
 /// Read the operator override, if any. `None` when unset or unparseable — an
 /// unparseable override is IGNORED rather than silently tightening or loosening
-/// the gate, and it is logged.
+/// the gate, and it is logged. The retired `draft-required` is read as
+/// [`AutonomyTier::HoldRequired`] with a deprecation warning.
 fn dial_override() -> Option<AutonomyTier> {
     let raw = std::env::var(DIAL_OVERRIDE_ENV).ok()?;
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
+    }
+    if raw == RETIRED_DRAFT_REQUIRED_OVERRIDE {
+        warn!(
+            "{DIAL_OVERRIDE_ENV}={RETIRED_DRAFT_REQUIRED_OVERRIDE} is deprecated — honouring it \
+             as hold-required; set {DIAL_OVERRIDE_ENV}=hold-required"
+        );
+        return Some(AutonomyTier::HoldRequired);
     }
     match AutonomyTier::from_wire(raw) {
         Some(t) => Some(t),
@@ -2149,7 +2164,26 @@ THE AUTONOMY DIAL. One of:
         );
     }
 
-    /// The retired token is NOT an alias: a document still serving
+    /// The OPERATOR override is the one place the retired token is still
+    /// honoured — as its successor, never ignored into a possibly-looser
+    /// tenant dial.
+    #[test]
+    fn a_retired_draft_required_override_is_honoured_as_hold_required() {
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[DIAL_OVERRIDE_ENV]);
+        std::env::set_var(DIAL_OVERRIDE_ENV, "draft-required");
+        assert_eq!(dial_override(), Some(AutonomyTier::HoldRequired));
+        std::env::set_var(DIAL_OVERRIDE_ENV, " hold-required ");
+        assert_eq!(dial_override(), Some(AutonomyTier::HoldRequired));
+        std::env::set_var(DIAL_OVERRIDE_ENV, "drafty");
+        assert_eq!(
+            dial_override(),
+            None,
+            "a genuinely unknown value is still ignored"
+        );
+    }
+
+    /// The retired token is NOT an alias in the SERVED dial: a document still serving
     /// `draft-required` is Unrecognised, which posture-maps to Block — the
     /// rename fails closed rather than silently loosening or tightening.
     #[test]

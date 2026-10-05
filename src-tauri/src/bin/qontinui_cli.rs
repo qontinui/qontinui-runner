@@ -370,18 +370,14 @@ fn pr_create(args: &[String]) -> ExitCode {
         }
     };
 
-    let mut payload = serde_json::json!({
-        "repo": repo,
-        "head": head,
-        "base": base,
-        "title": title,
-    });
-    if let Some(b) = body {
-        payload["body"] = serde_json::json!(b);
-    }
-    if let Some(reason) = &parsed.hold {
-        payload["hold"] = serde_json::json!({ "reason": reason });
-    }
+    let payload = pr_create_payload(
+        &repo,
+        &head,
+        &base,
+        &title,
+        body.as_deref(),
+        parsed.hold.as_deref(),
+    );
 
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -411,21 +407,95 @@ fn pr_create(args: &[String]) -> ExitCode {
 
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
-    if status.is_success() {
-        // On success print the PR URL (and nothing else) to stdout.
-        let pr_url = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
-        match pr_url {
-            Some(u) => println!("{u}"),
-            None => println!("{}", text.trim()),
+    match pr_create_outcome(parsed.hold.is_some(), status, &text) {
+        Ok(line) => {
+            // On success print the PR URL (and nothing else) to stdout.
+            println!("{line}");
+            ExitCode::SUCCESS
         }
-        ExitCode::SUCCESS
-    } else {
-        // Coord's (or the runner proxy's) error body, verbatim, to stderr.
-        eprintln!("qontinui-pr: create failed ({status}): {}", text.trim());
-        ExitCode::from(1)
+        Err(msg) => {
+            eprintln!("qontinui-pr: {msg}");
+            ExitCode::from(1)
+        }
     }
+}
+
+/// The JSON body `qontinui-pr create` POSTs to the runner's
+/// `/vcs/pull-requests`. Pure, so its shape is testable: absent options are
+/// omitted, and `--hold <reason>` becomes `"hold": {"reason": ...}`.
+fn pr_create_payload(
+    repo: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: Option<&str>,
+    hold_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "repo": repo,
+        "head": head,
+        "base": base,
+        "title": title,
+    });
+    if let Some(b) = body {
+        payload["body"] = serde_json::json!(b);
+    }
+    if let Some(reason) = hold_reason {
+        payload["hold"] = serde_json::json!({ "reason": reason });
+    }
+    payload
+}
+
+/// Whether a create success body confirms a requested hold: a top-level
+/// `hold` object with non-empty `kind`, `reason` and `held_by`. The runner's
+/// forwarder checks the same thing; the CLI re-checks because a runner that
+/// predates that check passes coord's body through unexamined.
+fn hold_echo_confirmed(v: &serde_json::Value) -> bool {
+    v.get("hold").and_then(|h| h.as_object()).is_some_and(|h| {
+        ["kind", "reason", "held_by"].iter().all(|k| {
+            h.get(*k)
+                .and_then(|x| x.as_str())
+                .is_some_and(|x| !x.trim().is_empty())
+        })
+    })
+}
+
+/// Interpret the runner's answer to a create. `Ok` is the stdout line (the PR
+/// URL); `Err` is the stderr message and means a non-zero exit. A HELD create
+/// whose 2xx body does not echo the hold is an `Err` naming the PR as UNHELD:
+/// the PR exists, nothing holds it, and reporting success would hide that.
+fn pr_create_outcome(
+    hold_requested: bool,
+    status: reqwest::StatusCode,
+    text: &str,
+) -> Result<String, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if !status.is_success() {
+        // The runner's own UNHELD verdict already names the PR — relay it as
+        // is rather than as a "create failed" (the PR WAS created).
+        if let Some(v) = &parsed {
+            if v.get("code").and_then(|c| c.as_str()) == Some("VCS_PR_PROXY_HOLD_UNCONFIRMED") {
+                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or(text);
+                return Err(format!("{err} ({status})"));
+            }
+        }
+        // Coord's (or the runner proxy's) error body, verbatim.
+        return Err(format!("create failed ({status}): {}", text.trim()));
+    }
+    let pr_url = parsed
+        .as_ref()
+        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
+    if hold_requested && !parsed.as_ref().is_some_and(hold_echo_confirmed) {
+        let shown = pr_url.as_deref().unwrap_or("<no url in the response>");
+        return Err(format!(
+            "PR {shown} was created UNHELD: the create answered {status} but did not confirm \
+             the requested hold (no `hold` echo with kind/reason/held_by — coord likely \
+             predates PR holds). The merge train may land it: hold it with \
+             coord_set_pr_hold or close it now. Response: {}",
+            text.trim()
+        ));
+    }
+    Ok(pr_url.unwrap_or_else(|| text.trim().to_string()))
 }
 
 // ===========================================================================
@@ -1845,6 +1915,71 @@ mod tests {
         // Absent --hold leaves the PR unheld.
         let none: Vec<String> = ["--title", "t"].iter().map(|s| s.to_string()).collect();
         assert_eq!(parse_pr_create_args(&none).unwrap().hold, None);
+    }
+
+    #[test]
+    fn pr_create_payload_shape() {
+        let held = pr_create_payload("o/r", "feat/x", "main", "t", Some("b"), Some("why"));
+        assert_eq!(
+            held,
+            serde_json::json!({
+                "repo": "o/r",
+                "head": "feat/x",
+                "base": "main",
+                "title": "t",
+                "body": "b",
+                "hold": {"reason": "why"},
+            })
+        );
+        let plain = pr_create_payload("o/r", "feat/x", "main", "t", None, None);
+        let obj = plain.as_object().unwrap();
+        assert!(!obj.contains_key("hold") && !obj.contains_key("body"));
+        assert!(!obj.contains_key("draft"), "draft is retired");
+    }
+
+    #[test]
+    fn pr_create_outcome_succeeds_when_the_hold_is_echoed() {
+        let body = r#"{"url":"https://github.com/o/r/pull/1","hold":{"kind":"create","reason":"why","held_by":"agent:a"}}"#;
+        assert_eq!(
+            pr_create_outcome(true, reqwest::StatusCode::CREATED, body),
+            Ok("https://github.com/o/r/pull/1".to_string())
+        );
+        // An unheld create needs no echo.
+        assert_eq!(
+            pr_create_outcome(
+                false,
+                reqwest::StatusCode::CREATED,
+                r#"{"url":"https://github.com/o/r/pull/2"}"#
+            ),
+            Ok("https://github.com/o/r/pull/2".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_create_outcome_reports_unheld_when_a_2xx_lacks_the_echo() {
+        for body in [
+            r#"{"url":"https://github.com/o/r/pull/3"}"#,
+            r#"{"url":"https://github.com/o/r/pull/3","hold":{"kind":"create","reason":"why"}}"#,
+        ] {
+            let err = pr_create_outcome(true, reqwest::StatusCode::CREATED, body).unwrap_err();
+            assert!(err.contains("https://github.com/o/r/pull/3"), "{err}");
+            assert!(err.contains("UNHELD"), "{err}");
+        }
+        // The runner's own UNHELD verdict is relayed as itself, not as
+        // "create failed".
+        let err = pr_create_outcome(
+            true,
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"code":"VCS_PR_PROXY_HOLD_UNCONFIRMED","error":"PR https://github.com/o/r/pull/4 was created UNHELD"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("PR https://github.com/o/r/pull/4 was created UNHELD"),
+            "{err}"
+        );
+        // A genuine failure stays a "create failed".
+        let err = pr_create_outcome(true, reqwest::StatusCode::FORBIDDEN, "nope").unwrap_err();
+        assert!(err.starts_with("create failed (403"), "{err}");
     }
 
     #[test]

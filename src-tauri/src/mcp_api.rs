@@ -11254,7 +11254,11 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
 /// Request body for `POST /vcs/pull-requests`. `repo` is `owner/name`; every
 /// other field is forwarded to coord's PR-creation route (the coord body is
 /// this struct MINUS `repo`, which travels in the coord URL path instead).
+///
+/// `deny_unknown_fields`: a misspelled key (`held`, `hold_reason`) must be a
+/// loud 400, never silently dropped — a dropped hold key opens an UNHELD PR.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VcsPullRequestBody {
     repo: String,
     head: String,
@@ -11264,13 +11268,15 @@ struct VcsPullRequestBody {
     #[serde(default)]
     body: Option<String>,
     /// Open the PR held (plan `2026-10-04-coord-pr-hold-without-github-drafts`
-    /// D3): coord places the hold BEFORE it creates the PR.
-    #[serde(default)]
+    /// D3): coord places the hold BEFORE it creates the PR. `hold: null` is
+    /// refused rather than read as "no hold" — omit the key for an unheld PR.
+    #[serde(default, deserialize_with = "deserialize_hold_non_null")]
     hold: Option<VcsPrHold>,
     /// Whether the inbound body carried the retired `draft` key at ALL (any
-    /// value, `null` included). Never forwarded: the handler refuses it with a
-    /// 422, mirroring coord's own `draft_retired` refusal, because dropping it
-    /// silently would open an UNHELD PR a caller meant to keep from landing.
+    /// value, `null` included). Declared (so `deny_unknown_fields` does not
+    /// swallow it into a generic 400) and never forwarded: the handler refuses
+    /// it with a specific 422, because dropping it silently would open an
+    /// UNHELD PR a caller meant to keep from landing.
     #[serde(default, rename = "draft", deserialize_with = "json_key_present")]
     draft_present: bool,
 }
@@ -11278,6 +11284,7 @@ struct VcsPullRequestBody {
 /// The `hold` object forwarded to coord's `coord_create_pr`: a required
 /// free-text `reason` and an optional `kind` (coord validates the vocabulary).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct VcsPrHold {
     reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -11295,9 +11302,24 @@ where
     Ok(true)
 }
 
+/// `deserialize_with` for `hold`: present-and-`null` is an error, so a caller
+/// cannot believe it asked for a hold while the forwarder reads "no hold".
+fn deserialize_hold_non_null<'de, D>(deserializer: D) -> Result<Option<VcsPrHold>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match <Option<VcsPrHold> as serde::Deserialize>::deserialize(deserializer)? {
+        Some(h) => Ok(Some(h)),
+        None => Err(serde::de::Error::custom(
+            "hold: null is refused — omit `hold` for an unheld PR, or send {reason, kind?}",
+        )),
+    }
+}
+
 /// The runner-side refusal of a retired `draft` field, before any credential
-/// I/O. Same 422 + `draft_retired` vocabulary coord answers with, so a caller
-/// sees one error whichever side caught it.
+/// I/O. It uses the 422 + `draft_retired` vocabulary that coord's own refusal
+/// adopts in the same plan's Phase 3, so a caller sees one error whichever side
+/// catches it once both have landed.
 const VCS_PR_DRAFT_RETIRED_ERR: &str = "draft_retired: use hold — coord holds PRs instead of \
      relying on GitHub drafts (private repos on GitHub Free have none); send \
      `hold: {reason, kind?}`";
@@ -11595,7 +11617,32 @@ async fn vcs_create_pull_request_handler(
     // was the ONE forwarder whose 502 named neither the URL it dialled nor
     // where that base came from, which is exactly what a misconfigured-upstream
     // 502 has to say to be actionable.
-    forward_vcs_pr_post(&url, &bearer, &upstream_body, coord_base_source).await
+    forward_vcs_pr_post(
+        &url,
+        &bearer,
+        &upstream_body,
+        coord_base_source,
+        req.hold.is_some(),
+    )
+    .await
+}
+
+/// Whether a coord PR-create success body CONFIRMS a requested hold: a
+/// top-level `hold` object carrying non-empty `kind`, `reason` and `held_by`.
+/// A coord that predates holds ignores the request's `hold` and answers a
+/// plain 2xx — this is the check that catches it.
+fn vcs_pr_hold_echo_confirmed(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(hold) = v.get("hold").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    ["kind", "reason", "held_by"].iter().all(|k| {
+        hold.get(*k)
+            .and_then(|x| x.as_str())
+            .is_some_and(|x| !x.trim().is_empty())
+    })
 }
 
 /// Forward the PR-creation POST to coord and return coord's status + headers +
@@ -11604,11 +11651,17 @@ async fn vcs_create_pull_request_handler(
 /// local mock coord with a synthetic bearer — same seam discipline as
 /// [`forward_coord_write_post`], but with the plan's 10s overall timeout (PR
 /// creation is a single bounded GitHub write behind coord).
+///
+/// `require_hold_echo`: the request asked for a hold. A 2xx whose body does not
+/// echo it ([`vcs_pr_hold_echo_confirmed`]) is turned into a 502
+/// `VCS_PR_PROXY_HOLD_UNCONFIRMED` naming the PR as UNHELD — never a success,
+/// because the PR exists and the train is free to land it.
 async fn forward_vcs_pr_post(
     url: &str,
     bearer: &str,
     body: &serde_json::Value,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    require_hold_echo: bool,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -11696,6 +11749,36 @@ async fn forward_vcs_pr_post(
                 .into_response();
         }
     };
+    if require_hold_echo && (200..300).contains(&status) && !vcs_pr_hold_echo_confirmed(&bytes) {
+        let pr_url = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
+        let shown = pr_url.as_deref().unwrap_or("<coord returned no url>");
+        warn!(
+            "vcs pr proxy: coord answered {status} to a HELD create but did not echo the \
+             hold — PR {shown} is UNHELD (upstream_url={url}, \
+             coord_base_source={coord_base_source})"
+        );
+        return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "PR {shown} was created UNHELD: coord answered {status} but did not \
+                     confirm the requested hold (no `hold` echo with kind/reason/held_by — \
+                     this coord likely predates PR holds). The merge train may land it: \
+                     hold it with coord_set_pr_hold or close it now."
+                ),
+                "code": "VCS_PR_PROXY_HOLD_UNCONFIRMED",
+                "pr_url": pr_url,
+                "upstream_status": status,
+                "upstream_body": String::from_utf8_lossy(&bytes),
+                "upstream_url": url,
+                "coord_base_source": coord_base_source.as_str(),
+            })),
+        )
+            .into_response();
+    }
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -21914,7 +21997,8 @@ mod coord_write_proxy_tests {
 mod vcs_pr_proxy_tests {
     use super::{
         forward_vcs_pr_post, parse_owner_repo, vcs_create_pull_request_handler,
-        vcs_pr_upstream_body, vcs_pr_upstream_url, VcsPrHold, VcsPullRequestBody,
+        vcs_pr_hold_echo_confirmed, vcs_pr_upstream_body, vcs_pr_upstream_url, VcsPrHold,
+        VcsPullRequestBody,
     };
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
@@ -22195,6 +22279,140 @@ mod vcs_pr_proxy_tests {
         assert_eq!(v["code"], "VCS_PR_PROXY_AGENT_GONE");
     }
 
+    /// `deny_unknown_fields` on both structs: a misspelled top-level key and an
+    /// unknown key inside `hold` are refused, and `hold: null` is refused
+    /// rather than read as "no hold". `draft` stays a DECLARED field so it
+    /// still reaches the specific 422 instead of a generic parse error.
+    #[test]
+    fn vcs_pr_body_refuses_unknown_keys_and_null_hold() {
+        let parse = |s: &str| serde_json::from_str::<VcsPullRequestBody>(s);
+        let misspelled = parse(r#"{"repo":"o/r","head":"h","title":"t","held":{"reason":"r"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(misspelled.contains("held"), "{misspelled}");
+        let inner =
+            parse(r#"{"repo":"o/r","head":"h","title":"t","hold":{"reason":"r","gate":"x"}}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(inner.contains("gate"), "{inner}");
+        let null_hold = parse(r#"{"repo":"o/r","head":"h","title":"t","hold":null}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(null_hold.contains("hold: null is refused"), "{null_hold}");
+        assert!(
+            parse(r#"{"repo":"o/r","head":"h","title":"t","draft":true}"#)
+                .unwrap()
+                .draft_present
+        );
+    }
+
+    /// The echo predicate: a top-level `hold` object with non-empty
+    /// kind/reason/held_by, nothing less.
+    #[test]
+    fn vcs_pr_hold_echo_requires_kind_reason_and_held_by() {
+        let full = br#"{"url":"u","hold":{"kind":"create","reason":"r","held_by":"agent:x"}}"#;
+        assert!(vcs_pr_hold_echo_confirmed(full));
+        for body in [
+            &br#"{"url":"u"}"#[..],
+            br#"{"url":"u","hold":null}"#,
+            br#"{"url":"u","hold":true}"#,
+            br#"{"url":"u","hold":{"kind":"create","reason":"r"}}"#,
+            br#"{"url":"u","hold":{"kind":"create","reason":"","held_by":"a"}}"#,
+            br#"not json"#,
+        ] {
+            assert!(
+                !vcs_pr_hold_echo_confirmed(body),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// A HELD create against a coord that echoes the hold passes through as
+    /// success; against a coord that answers 2xx WITHOUT the echo (one that
+    /// predates holds and silently ignored the field) it is a 502 naming the
+    /// PR URL as UNHELD — never a success.
+    #[tokio::test]
+    async fn forward_vcs_pr_post_fails_closed_without_a_hold_echo() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/repos/new/coord/pull-requests",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::CREATED,
+                        axum::Json(serde_json::json!({
+                            "number": 7,
+                            "url": "https://github.com/new/coord/pull/7",
+                            "hold": {"kind": "create", "reason": "r", "held_by": "agent:a"},
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/coord/repos/old/coord/pull-requests",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::CREATED,
+                        axum::Json(serde_json::json!({
+                            "number": 8,
+                            "url": "https://github.com/old/coord/pull/8",
+                        })),
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+        let body = serde_json::json!({"head": "h", "title": "t", "hold": {"reason": "r"}});
+
+        let resp = forward_vcs_pr_post(
+            &vcs_pr_upstream_url(&base, "new", "coord"),
+            "jwt",
+            &body,
+            TEST_COORD_BASE_SOURCE,
+            true,
+        )
+        .await;
+        assert_eq!(resp.status(), 201, "an echoed hold is a success");
+        let v = body_json(resp).await;
+        assert_eq!(v["hold"]["held_by"], "agent:a");
+
+        let resp = forward_vcs_pr_post(
+            &vcs_pr_upstream_url(&base, "old", "coord"),
+            "jwt",
+            &body,
+            TEST_COORD_BASE_SOURCE,
+            true,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            502,
+            "a missing echo must never read as success"
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "VCS_PR_PROXY_HOLD_UNCONFIRMED");
+        assert_eq!(v["pr_url"], "https://github.com/old/coord/pull/8");
+        let err = v["error"].as_str().unwrap();
+        assert!(err.contains("https://github.com/old/coord/pull/8"), "{err}");
+        assert!(err.contains("UNHELD"), "{err}");
+
+        // An UNHELD request needs no echo: the same old coord is a success.
+        let resp = forward_vcs_pr_post(
+            &vcs_pr_upstream_url(&base, "old", "coord"),
+            "jwt",
+            &serde_json::json!({"head": "h", "title": "t"}),
+            TEST_COORD_BASE_SOURCE,
+            false,
+        )
+        .await;
+        assert_eq!(resp.status(), 201);
+    }
+
     /// The base-resolution arm the VCS forwarder now reports in its 502s. Any
     /// arm would do for the transport tests below; naming one explicitly is
     /// what makes the field's presence assertable.
@@ -22252,8 +22470,14 @@ mod vcs_pr_proxy_tests {
         // Happy path: 201 + coord's body verbatim, bearer injected.
         let url = vcs_pr_upstream_url(&base, "qontinui", "qontinui-runner");
         let body = serde_json::json!({"head": "feat/x", "title": "feat: x"});
-        let resp =
-            forward_vcs_pr_post(&url, "test-device-jwt", &body, TEST_COORD_BASE_SOURCE).await;
+        let resp = forward_vcs_pr_post(
+            &url,
+            "test-device-jwt",
+            &body,
+            TEST_COORD_BASE_SOURCE,
+            false,
+        )
+        .await;
         assert_eq!(resp.status(), 201);
         let v = body_json(resp).await;
         assert_eq!(v["number"], 42);
@@ -22271,8 +22495,14 @@ mod vcs_pr_proxy_tests {
         // Non-2xx coord verdict: status + body verbatim, not reshaped.
         // (The specific mock route wins over the {owner}/{repo} template.)
         let url = vcs_pr_upstream_url(&base, "other", "denied");
-        let resp =
-            forward_vcs_pr_post(&url, "test-device-jwt", &body, TEST_COORD_BASE_SOURCE).await;
+        let resp = forward_vcs_pr_post(
+            &url,
+            "test-device-jwt",
+            &body,
+            TEST_COORD_BASE_SOURCE,
+            false,
+        )
+        .await;
         assert_eq!(resp.status(), 403);
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -22297,6 +22527,7 @@ mod vcs_pr_proxy_tests {
             "test-device-jwt",
             &serde_json::json!({"head": "h"}),
             TEST_COORD_BASE_SOURCE,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 502);
