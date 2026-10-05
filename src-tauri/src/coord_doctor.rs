@@ -984,9 +984,23 @@ fn paired_user_missing_detail(
                 tenants.join(", ")
             )
         }
+        // No usable per-tenant slot, but the legacy access_token holds a
+        // usable token: the heal DOES rebuild from it (its legacy arm), so
+        // this is not "not paired".
+        Ok(c) if c.legacy_slot_usable => format!(
+            "{state}, but the legacy access_token slot holds a VALID coord credential (no \
+             per-tenant slot does). The runner's device-JWT refresher self-heals the file \
+             from that credential's claims every tick (pair::heal_vanished_paired_user, \
+             guarded by coord's bound-tenant set in coord_bound_tenants.json plus the \
+             tenants the binding reconcile is still holding in coord_omission_streaks.json); \
+             if this persists, the heal REFUSED — the runner log line `paired_user.json heal \
+             refused: <why>` and /health coordCredential.detail name the guard (including \
+             when that credential belongs to a tenant coord no longer binds). Sign in to \
+             re-pair."
+        ),
         Ok(_) => format!(
-            "{state} — runner not paired, and no valid per-tenant device-JWT slot exists for \
-             the self-heal to rebuild it from"
+            "{state} — runner not paired: neither a per-tenant device-JWT slot nor the legacy \
+             access_token holds a valid credential for the self-heal to rebuild it from"
         ),
         Err(e) => format!(
             "{state} — and whether a valid per-tenant credential exists to heal it from is \
@@ -2769,11 +2783,34 @@ mod tests {
         }
         assert!(!held.contains("not paired"), "{held}");
 
-        let none = paired_user_missing_detail(
+        // Only the LEGACY slot is usable: the heal rebuilds from it, so this
+        // is a held credential, never "not paired".
+        let legacy_only = paired_user_missing_detail(
             &absent,
             &Ok(crate::pair::HeldCredentialCensus {
                 usable_tenant_slots: vec![],
                 legacy_slot_usable: true,
+            }),
+        );
+        for needle in [
+            "legacy access_token slot holds a VALID",
+            "heal_vanished_paired_user",
+            "heal refused",
+            "coordCredential.detail",
+        ] {
+            assert!(
+                legacy_only.contains(needle),
+                "missing {needle:?} in: {legacy_only}"
+            );
+        }
+        assert!(!legacy_only.contains("not paired"), "{legacy_only}");
+
+        // Neither a per-tenant slot nor the legacy slot is usable.
+        let none = paired_user_missing_detail(
+            &absent,
+            &Ok(crate::pair::HeldCredentialCensus {
+                usable_tenant_slots: vec![],
+                legacy_slot_usable: false,
             }),
         );
         assert!(none.contains("runner not paired"), "{none}");
