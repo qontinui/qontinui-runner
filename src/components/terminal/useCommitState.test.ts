@@ -22,6 +22,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { TerminalTab } from "./useTerminalManager";
 import type { CommitState } from "./useCommitState";
+import { mergeProbeAnswers } from "./useCommitState";
 
 // ── Mocks (hoisted per vitest semantics) ─────────────────────────────────
 const mockListen = vi.fn();
@@ -165,6 +166,34 @@ describe("stale-cap at render time", () => {
     };
     const result = applyStaleCap(states, now);
     expect(result["tab-1"].status).toBe("dirty");
+  });
+});
+
+describe("mergeProbeAnswers — an UNKNOWN answer is never shown as the old state", () => {
+  it("pins a tab to unknown + stale when the runner answers success:false", () => {
+    const prev = { "tab-1": aState({ status: "empty", generated_at_ms: 1 }) };
+    const next = mergeProbeAnswers(prev, [{ tabId: "tab-1", state: null }]);
+    expect(next["tab-1"].status).toBe("unknown");
+    expect(next["tab-1"].stale).toBe(true);
+  });
+
+  it("stores a fresh answer as-is", () => {
+    const fresh = aState({ status: "clean" });
+    const next = mergeProbeAnswers({}, [{ tabId: "tab-1", state: fresh }]);
+    expect(next["tab-1"]).toBe(fresh);
+  });
+
+  it("marks an already-unknown but un-stale entry stale", () => {
+    const prev = { "tab-1": aState({ status: "unknown" }) };
+    const next = mergeProbeAnswers(prev, [{ tabId: "tab-1", state: null }]);
+    expect(next).not.toBe(prev);
+    expect(next["tab-1"].stale).toBe(true);
+  });
+
+  it("returns prev itself when an unknown answer changes nothing", () => {
+    const prev = { "tab-1": aState({ status: "unknown", stale: true }) };
+    expect(mergeProbeAnswers(prev, [{ tabId: "tab-1", state: null }])).toBe(prev);
+    expect(mergeProbeAnswers({}, [{ tabId: "tab-2", state: null }])).toEqual({});
   });
 });
 

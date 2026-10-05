@@ -1344,26 +1344,53 @@ pub async fn commit_session_progress(
 /// mid-merge. Called by `useCommitState` on mount and on a 30 s interval per
 /// tab.
 ///
-/// All errors collapse to `success: false` with the inner status code +
-/// message in `message`. The `data` field carries the `CommitState` JSON
-/// blob.
+/// Gated by the background-work verdict: the tracker read (no `git`) always
+/// runs, and [`crate::mcp::ai_session::poll_commit_state`] decides whether the
+/// `git` probe does. Under memory pressure the answer may be the last known
+/// state with `stale: true`, or — with no recent one — `success: false`
+/// (UNKNOWN), never a fresh-looking guess.
+///
+/// All errors collapse to `success: false` with the inner message in
+/// `message`. The `data` field carries the `CommitState` JSON blob.
 #[tauri::command]
 pub async fn get_session_commit_state(
     app: tauri::AppHandle,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
-    use crate::mcp::ai_session::session_commit_state_inner;
-    match session_commit_state_inner(&app, &task_run_id).await {
+    use crate::mcp::ai_session::{
+        commit_state_poll_ctx, poll_commit_state, probe_commit_state, session_touched_files,
+    };
+
+    let failed = |msg: String| CommandResponse {
+        success: false,
+        message: Some(msg),
+        data: None,
+    };
+    let files = match session_touched_files(&app, &task_run_id).await {
+        Ok(files) => files,
+        Err((_status, msg)) => return Ok(failed(msg)),
+    };
+    let verdict = crate::resource_guard::background_work_verdict();
+    match poll_commit_state(
+        &verdict,
+        &commit_state_poll_ctx(),
+        &task_run_id,
+        files,
+        crate::git_status_subset::now_ms(),
+        probe_commit_state,
+    )
+    .await
+    {
         Ok(state) => Ok(CommandResponse {
             success: true,
-            message: None,
+            message: state.stale.then(|| {
+                "Last known commit state, not a fresh one — the probe was skipped under \
+                 memory pressure."
+                    .to_string()
+            }),
             data: Some(serde_json::to_value(&state).unwrap_or_default()),
         }),
-        Err((_status, msg)) => Ok(CommandResponse {
-            success: false,
-            message: Some(msg),
-            data: None,
-        }),
+        Err(msg) => Ok(failed(msg)),
     }
 }
 

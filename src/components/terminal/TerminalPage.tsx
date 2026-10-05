@@ -63,7 +63,6 @@ import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-sessions-registry";
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
-import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
 import { useSessionBoundEvents } from "./useSessionBoundEvents";
 import {
@@ -661,14 +660,16 @@ function TerminalPageInner({
     return holderTab?.claudeSessionId;
   }, [showWaitingBanner, activeLockState?.counterpartyName, tabs]);
 
-  // Per-tab commit-readiness state (Plan §3) — drives the
-  // CommitTrafficLight badge that previously rendered inside the
-  // TerminalTabBar tab strip. Phase 9c removed that consumer; the hook
-  // still runs because its file-system polling side effects (PG
-  // recent-editors snapshot) are load-bearing for other consumers.
-  useCommitState(tabs);
+  // `useCommitState` is deliberately NOT called here. Its only consumer, the
+  // CommitTrafficLight badge in the tab strip, was removed in Phase 9c, and
+  // the hook has no side effect anyone reads: `get_session_commit_state` is a
+  // pure read (a PG tracker SELECT plus `git status` per repo). Calling it
+  // anyway spent 3-7+ `git` spawns per tab every 30 s for a value nothing
+  // rendered — the poll plan 2026-10-01-resource-guard-floors-follow-ups
+  // Phase 4 gates. A future badge mounts the hook where it renders.
+  //
   // Per-tab registry-awareness counts (pty-launched-ai-tabs-warning-plan
-  // Phase 2). Same situation as commitStates above — the hook's side
+  // Phase 2). Its consumer is gone too, but unlike commit state the hook's side
   // effect (HTTP polling of /file-registry/probe-conflicts) feeds the
   // global registry; the per-tab badge consumer in TerminalTabBar is
   // gone, but other surfaces (HoldingLockBanner / SuggestionChip) read
