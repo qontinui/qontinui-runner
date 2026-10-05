@@ -714,17 +714,17 @@ pub(crate) mod tests {
         "get", "post", "put", "patch", "delete", "head", "options", "any",
     ];
 
-    /// The two registration calls the walk reads. Spelled with `concat!` so
-    /// this file's own text never contains a call shape the walk would read.
-    const ROUTE_CALL: &str = concat!(".route", "(");
-    const ROUTE_SERVICE_CALL: &str = concat!(".route_service", "(");
+    /// The two route registration calls the walk reads.
+    const ROUTE_CALL: &str = ".route(";
+    const ROUTE_SERVICE_CALL: &str = ".route_service(";
 
-    /// Every `.rs` file under `src-tauri/src`, read at test time — the tree
+    /// Every `.rs` file under `src-tauri/src` with its path relative to
+    /// `CARGO_MANIFEST_DIR` (`/`-separated), read at test time — the tree
     /// both the allowlist tripwires and the route census scan.
-    fn crate_rust_sources() -> Vec<String> {
+    fn crate_rust_sources() -> Vec<(String, String)> {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut out = Vec::new();
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![root];
+        let mut stack = vec![manifest.join("src")];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -738,12 +738,299 @@ pub(crate) mod tests {
                 if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
+                let Ok(rel) = path.strip_prefix(&manifest) else {
+                    continue;
+                };
+                let rel = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 if let Ok(src) = std::fs::read_to_string(&path) {
-                    out.push(src);
+                    out.push((rel, src));
                 }
             }
         }
         out
+    }
+
+    /// One Rust source file as two views of identical byte length, so an
+    /// offset found in one addresses the same text in the other:
+    ///
+    /// - `code` — the source with every comment blanked to spaces, so a
+    ///   comment reads as whitespace wherever it sits;
+    /// - `skel` — `code` with every string, raw-string and char literal's
+    ///   CONTENTS blanked as well (delimiters kept), so a call shape inside a
+    ///   literal is never found and a bracket inside one is never counted.
+    ///
+    /// Newlines survive both, so line structure is kept. Search and bracket
+    /// matching run on `skel`; literal text (a path) is read from `code`.
+    struct Lexed {
+        code: String,
+        skel: String,
+    }
+
+    impl Lexed {
+        fn new(src: &str) -> Self {
+            let b = src.as_bytes();
+            let n = b.len();
+            let mut code = b.to_vec();
+            let mut skel = b.to_vec();
+            let blank = |v: &mut Vec<u8>, from: usize, to: usize| {
+                for byte in v.iter_mut().take(to.min(n)).skip(from) {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+            };
+            let mut i = 0usize;
+            while i < n {
+                let c = b[i];
+                let next = b.get(i + 1).copied();
+                if c == b'/' && next == Some(b'/') {
+                    let end = b[i..].iter().position(|&x| x == b'\n').map_or(n, |p| i + p);
+                    blank(&mut code, i, end);
+                    blank(&mut skel, i, end);
+                    i = end;
+                } else if c == b'/' && next == Some(b'*') {
+                    let mut depth = 1usize;
+                    let mut j = i + 2;
+                    while j < n && depth > 0 {
+                        if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                            depth += 1;
+                            j += 2;
+                        } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                            depth -= 1;
+                            j += 2;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    blank(&mut code, i, j);
+                    blank(&mut skel, i, j);
+                    i = j;
+                } else if c == b'"' {
+                    let mut j = i + 1;
+                    while j < n && b[j] != b'"' {
+                        j += if b[j] == b'\\' { 2 } else { 1 };
+                    }
+                    blank(&mut skel, i + 1, j);
+                    i = j + 1;
+                } else if c == b'\'' {
+                    // `'x'`, `'\n'`, `'\u{..}'` are literals; `'a` is a lifetime.
+                    if next == Some(b'\\') {
+                        let close = b[(i + 3).min(n)..]
+                            .iter()
+                            .position(|&x| x == b'\'')
+                            .map_or(n, |p| i + 3 + p);
+                        blank(&mut skel, i + 1, close);
+                        i = close + 1;
+                    } else {
+                        let width = src
+                            .get(i + 1..)
+                            .and_then(|rest| rest.chars().next())
+                            .map_or(1, char::len_utf8);
+                        if b.get(i + 1 + width) == Some(&b'\'') {
+                            blank(&mut skel, i + 1, i + 1 + width);
+                            i += 2 + width;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else if is_ident_byte(c) && (i == 0 || !is_ident_byte(b[i - 1])) {
+                    // A raw string (`r"…"`, `r#"…"#`, `br"…"`) starts like an
+                    // identifier; anything else is an identifier, skipped whole
+                    // so its letters are never read as a literal prefix.
+                    let hashes_at = match (c, next) {
+                        (b'r', _) => Some(i + 1),
+                        (b'b' | b'c', Some(b'r')) => Some(i + 2),
+                        _ => None,
+                    };
+                    let raw_open = hashes_at.and_then(|h| {
+                        let hashes = b[h.min(n)..].iter().take_while(|&&x| x == b'#').count();
+                        (b.get(h + hashes) == Some(&b'"')).then_some((h + hashes + 1, hashes))
+                    });
+                    if let Some((body, hashes)) = raw_open {
+                        let mut j = body;
+                        while j < n {
+                            if b[j] == b'"'
+                                && b[(j + 1).min(n)..]
+                                    .iter()
+                                    .take(hashes)
+                                    .filter(|&&x| x == b'#')
+                                    .count()
+                                    == hashes
+                            {
+                                break;
+                            }
+                            j += 1;
+                        }
+                        blank(&mut skel, body, j);
+                        i = j + 1 + hashes;
+                    } else {
+                        while i < n && is_ident_byte(b[i]) {
+                            i += 1;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            // Blanking replaces whole characters (every one begins and ends
+            // inside the blanked span) with ASCII spaces, so both stay UTF-8.
+            Self {
+                code: String::from_utf8(code).expect("blanking whole characters keeps UTF-8"),
+                skel: String::from_utf8(skel).expect("blanking whole characters keeps UTF-8"),
+            }
+        }
+
+        /// Blank `[from, to)` in both views.
+        fn blank(&mut self, from: usize, to: usize) {
+            for view in [&mut self.code, &mut self.skel] {
+                let mut bytes = std::mem::take(view).into_bytes();
+                for byte in bytes.iter_mut().take(to).skip(from) {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+                *view = String::from_utf8(bytes).expect("a test item spans whole characters");
+            }
+        }
+
+        /// Every item gated on a test-only cfg — `#[cfg(test)]` or
+        /// `#[cfg(all(test, …))]` — as `(attribute start, item start, item
+        /// end)`: a `mod … { … }`, a `fn … { … }`, or a `;`-terminated item
+        /// such as `mod tests;`.
+        fn test_items(&self) -> Vec<(usize, usize, usize)> {
+            let b = self.skel.as_bytes();
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = self.skel.get(from..).and_then(|rest| rest.find("#[")) {
+                let attr = from + rel;
+                let attr_end = matching_close(b, attr + 1);
+                from = attr_end + 1;
+                let text: String = self
+                    .skel
+                    .get(attr + 2..attr_end)
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                if text != "cfg(test)" && !text.starts_with("cfg(all(test,") {
+                    continue;
+                }
+                // Skip any further attributes, then find the item's body.
+                let mut i = attr_end + 1;
+                loop {
+                    while i < b.len() && b[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if b.get(i) == Some(&b'#') && b.get(i + 1) == Some(&b'[') {
+                        i = matching_close(b, i + 1) + 1;
+                    } else {
+                        break;
+                    }
+                }
+                let item = i;
+                let mut end = b.len();
+                while i < b.len() {
+                    match b[i] {
+                        b'{' => {
+                            end = matching_close(b, i) + 1;
+                            break;
+                        }
+                        b';' => {
+                            end = i + 1;
+                            break;
+                        }
+                        b'(' | b'[' => i = matching_close(b, i) + 1,
+                        _ => i += 1,
+                    }
+                }
+                out.push((attr, item, end));
+                from = end;
+            }
+            out
+        }
+
+        /// Blank every test-only item ([`Self::test_items`]) in both views.
+        /// Mock routers built inside unit tests are not the runner's routes.
+        fn blank_test_items(&mut self) {
+            for (attr, _, end) in self.test_items() {
+                self.blank(attr, end);
+            }
+        }
+
+        /// The files this file declares as out-of-line test-only modules
+        /// (`#[cfg(test)] mod foo_tests;`, honouring `#[path = "…"]`), as
+        /// paths relative to `CARGO_MANIFEST_DIR` — `rel` is this file's own.
+        /// Both of Rust's layouts are returned (`foo_tests.rs`,
+        /// `foo_tests/mod.rs`); only one can exist.
+        fn test_module_files(&self, rel: &str) -> Vec<String> {
+            let (dir, file) = rel.rsplit_once('/').unwrap_or(("", rel));
+            let stem = file.strip_suffix(".rs").unwrap_or(file);
+            let join = |a: &str, b: &str| {
+                if a.is_empty() {
+                    b.to_string()
+                } else {
+                    format!("{a}/{b}")
+                }
+            };
+            let mut out = Vec::new();
+            for (attr, item, end) in self.test_items() {
+                let Some(decl) = self
+                    .skel
+                    .get(item..end)
+                    .and_then(|t| t.trim_end().strip_suffix(';'))
+                else {
+                    continue;
+                };
+                let mut words = decl.split_whitespace();
+                if words.find(|w| *w == "mod").is_none() {
+                    continue;
+                }
+                let Some(name) = words.next() else {
+                    continue;
+                };
+                // `#[path = "x.rs"]` among the attributes: relative to this
+                // file's directory.
+                let attrs = self.code.get(attr..item).unwrap_or("");
+                let path_attr = attrs.find("path").and_then(|at| {
+                    let rest = attrs
+                        .get(at + "path".len()..)?
+                        .trim_start()
+                        .strip_prefix('=')?;
+                    let rest = rest.trim_start().strip_prefix('"')?;
+                    rest.get(..rest.find('"')?)
+                });
+                if let Some(path) = path_attr {
+                    out.push(join(dir, path));
+                    continue;
+                }
+                let base = if matches!(stem, "mod" | "lib" | "main") {
+                    dir.to_string()
+                } else {
+                    join(dir, stem)
+                };
+                out.push(join(&base, &format!("{name}.rs")));
+                out.push(join(&base, &format!("{name}/mod.rs")));
+            }
+            out
+        }
+
+        /// The open index just past each `needle` occurrence in `skel` and the
+        /// index of the `)` closing it.
+        fn calls(&self, needle: &str) -> Vec<(usize, usize)> {
+            let b = self.skel.as_bytes();
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = self.skel.get(from..).and_then(|rest| rest.find(needle)) {
+                let open = from + rel + needle.len();
+                from = open;
+                out.push((open, matching_close(b, open - 1)));
+            }
+            out
+        }
     }
 
     /// Every `(METHOD, path)` the runner registers, parsed out of the source
@@ -762,18 +1049,17 @@ pub(crate) mod tests {
     /// one enumerator rather than growing a second.
     pub(crate) fn registered_routes() -> std::collections::HashSet<(String, String)> {
         let mut out = std::collections::HashSet::new();
-        for src in crate_rust_sources() {
-            collect_routes(&src, ROUTING_VERBS, &mut out);
+        for (_, src) in crate_rust_sources() {
+            collect_routes(&Lexed::new(&src), ROUTING_VERBS, &mut out);
         }
         out
     }
 
     /// One registration call site, as [`walk_route_calls`] reads it.
     struct RouteCall<'a> {
-        /// Byte offset of the call's needle in its file.
-        at: usize,
         path: RoutePath<'a>,
-        /// Everything after the path argument, up to the `)` closing the call.
+        /// Everything after the path argument, up to the `)` closing the
+        /// call, from the literal-blanked view.
         chain: &'a str,
     }
 
@@ -782,76 +1068,83 @@ pub(crate) mod tests {
         /// A string literal: the registered path itself.
         Literal(&'a str),
         /// A constant or binding (`ROUTE_PATH`, `template`) whose value a
-        /// source scan cannot read — recorded by name so the site still counts.
+        /// source scan cannot read — recorded by its last path segment, so the
+        /// site still counts and a `super::`/`crate::` qualifier added or
+        /// dropped by a move does not change it.
         Named(&'a str),
+        /// Anything else (`&format!(…)`, `concat!(…)`): the argument text,
+        /// comments blanked, so the site is visible as a blind spot.
+        Unread(&'a str),
     }
 
-    /// THE walk: every `needle` call in `src` whose first argument is a string
-    /// literal or a plain (possibly `::`-qualified) name, with the text of the
-    /// rest of the call. Both [`collect_routes`] and the HTTP route census read
-    /// the tree through this one walk, so they cannot disagree about which
-    /// calls exist.
-    fn walk_route_calls<'a>(src: &'a str, needle: &str, mut visit: impl FnMut(RouteCall<'a>)) {
-        let bytes = src.as_bytes();
-        let mut from = 0usize;
-        while let Some(rel) = src.get(from..).and_then(|rest| rest.find(needle)) {
-            let at = from + rel;
-            let open = at + needle.len();
-            from = open;
-            let Some(after_open) = src.get(open..) else {
+    /// THE walk: every `needle` call in the file, its first argument
+    /// classified, with the text of the rest of the call. Comments read as
+    /// whitespace and calls inside literals are not calls. Both
+    /// [`collect_routes`] and the HTTP route census read the tree through this
+    /// one walk, so they cannot disagree about which calls exist.
+    fn walk_route_calls<'a>(lx: &'a Lexed, needle: &str, mut visit: impl FnMut(RouteCall<'a>)) {
+        let skel = lx.skel.as_bytes();
+        for (open, close) in lx.calls(needle) {
+            let mut first = open;
+            while first < close && skel[first].is_ascii_whitespace() {
+                first += 1;
+            }
+            let Some(arg) = lx.skel.get(first..close) else {
                 continue;
             };
-            let first = open + (after_open.len() - after_open.trim_start().len());
-            let Some(arg) = src.get(first..) else {
-                continue;
-            };
-            let (path, chain_start) = if let Some(literal) = arg.strip_prefix('"') {
-                let Some(len) = literal.find('"') else {
+            let name_len = arg
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                .unwrap_or(arg.len());
+            let (path, chain_start) = if arg.starts_with('"') {
+                let Some(len) = arg.get(1..).and_then(|rest| rest.find('"')) else {
                     continue;
                 };
-                let Some(path) = literal.get(..len) else {
+                let Some(path) = lx.code.get(first + 1..first + 1 + len) else {
                     continue;
                 };
                 (RoutePath::Literal(path), first + 1 + len + 1)
+            } else if name_len > 0
+                && arg
+                    .get(name_len..)
+                    .is_some_and(|rest| rest.trim_start().starts_with(','))
+            {
+                let name = arg.get(..name_len).unwrap_or("");
+                let last = name.rsplit("::").find(|s| !s.is_empty()).unwrap_or(name);
+                (RoutePath::Named(last), first + name_len)
             } else {
-                let len = arg
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-                    .unwrap_or(arg.len());
-                let name = arg.get(..len).unwrap_or("");
-                let then_comma = arg
-                    .get(len..)
-                    .is_some_and(|rest| rest.trim_start().starts_with(','));
-                if name.is_empty() || !then_comma {
-                    continue;
-                }
-                (RoutePath::Named(name), first + len)
+                let comma = top_level_comma(skel, first, close).unwrap_or(close);
+                let text = lx.code.get(first..comma).unwrap_or("");
+                (RoutePath::Unread(text), comma)
             };
-            // Walk to the `)` that closes the call.
-            let mut depth = 1usize;
-            let mut i = chain_start;
-            while i < bytes.len() && depth > 0 {
-                match bytes[i] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                i += 1;
-            }
-            let Some(chain) = src.get(chain_start..i.saturating_sub(1)) else {
+            let Some(chain) = lx.skel.get(chain_start..close) else {
                 continue;
             };
-            visit(RouteCall { at, path, chain });
+            visit(RouteCall { path, chain });
         }
+    }
+
+    /// The first `,` at bracket depth 0 in `b[from..to)`.
+    fn top_level_comma(b: &[u8], from: usize, to: usize) -> Option<usize> {
+        let mut i = from;
+        while i < to {
+            match b[i] {
+                b'(' | b'[' | b'{' => i = matching_close(b, i),
+                b',' => return Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Pull `(METHOD, path)` pairs out of one file's literal-path `.route(…)`
     /// calls.
     fn collect_routes(
-        src: &str,
+        lx: &Lexed,
         verbs: &[&str],
         out: &mut std::collections::HashSet<(String, String)>,
     ) {
-        walk_route_calls(src, ROUTE_CALL, |call| {
+        walk_route_calls(lx, ROUTE_CALL, |call| {
             let RoutePath::Literal(path) = call.path else {
                 return;
             };
@@ -886,37 +1179,119 @@ pub(crate) mod tests {
     const HTTP_ROUTE_SNAPSHOT: &str = "http-routes.snapshot.txt";
     /// Set to `1` to rewrite the snapshot from the tree instead of comparing.
     const UPDATE_HTTP_ROUTE_SNAPSHOT: &str = "UPDATE_HTTP_ROUTE_SNAPSHOT";
+    /// The non-vacuity floor: ~70% of the census as regenerated on 2026-10-05
+    /// (1789 lines). A walk that silently stops reading — a lexer that
+    /// swallows a whole file, a needle that no longer matches — falls far
+    /// below it, while ordinary route churn never approaches it.
+    const MIN_CENSUS_LINES: usize = 1252;
 
-    /// Every registration site in the tree as one `<METHODS> <path> <handler>`
-    /// line, sorted, duplicates kept. There is deliberately NO file or module
-    /// column, and the handler is named without its module qualifiers: moving
-    /// a handler or a whole router between files leaves the census identical,
-    /// while dropping a route, changing its methods or rebinding its handler
-    /// changes it.
+    /// The router-composition calls the census reads besides `.route(`: the
+    /// sites that splice a whole sub-router (or a fallback) into the tree.
+    /// Dropping one drops every route behind it, which no `.route(` line shows.
+    const COMPOSITION_CALLS: &[(&str, &str, bool)] = &[
+        (".merge(", "MERGE", false),
+        (".nest(", "NEST", true),
+        (".nest_service(", "NEST_SERVICE", true),
+        (".fallback(", "FALLBACK", false),
+        (".fallback_service(", "FALLBACK_SERVICE", false),
+    ];
+
+    /// The macro that registers one handler under both `/ui-bridge/control/`
+    /// and `/ui-bridge/ai/` (`mcp::ui_bridge::routing`).
+    const ADD_DUAL_CALL: &str = "add_dual!";
+
+    /// Whether `rel` (relative to `CARGO_MANIFEST_DIR`) is a test-only file:
+    /// `tests.rs`, anything under a `tests/` directory, or a file some other
+    /// file declares as a test-only module (`#[cfg(test)] mod
+    /// tier_matrix_tests;`). A `*_tests.rs` NAME alone does not qualify —
+    /// `mcp/image_quality_tests.rs` and `mcp/verification_tests.rs` are
+    /// production route families.
+    fn is_test_file(rel: &str, test_module_files: &std::collections::HashSet<String>) -> bool {
+        let mut parts = rel.split('/');
+        let file = parts.next_back().unwrap_or("");
+        file == "tests.rs" || test_module_files.contains(rel) || parts.any(|dir| dir == "tests")
+    }
+
+    /// The `.rs` files under `src` that git tracks, relative to
+    /// `CARGO_MANIFEST_DIR` — or `None` when git cannot answer (no checkout,
+    /// no git binary), in which case the census reads every file on disk.
+    fn git_tracked_sources() -> Option<std::collections::HashSet<String>> {
+        let out = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", "src"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let listed: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|p| p.ends_with(".rs"))
+            .map(str::to_string)
+            .collect();
+        (!listed.is_empty()).then_some(listed)
+    }
+
+    /// Every registration site in the runner's non-test source as one line,
+    /// sorted, duplicates kept:
+    ///
+    /// - `<METHODS> <path> <handler>` — a `.route(…)`, or one of the two
+    ///   routes an `add_dual!(…)` expands to;
+    /// - `? <path> <expr>` — a `.route(…)` whose `MethodRouter` is built
+    ///   elsewhere; `SERVICE <path> <expr>` — a `.route_service(…)`;
+    /// - `MERGE <target>`, `NEST <prefix> <target>`, `NEST_SERVICE …`,
+    ///   `FALLBACK <target>`, `FALLBACK_SERVICE <target>` — a composition site;
+    /// - `UNREAD <text>` — a registration whose path argument a source scan
+    ///   cannot classify: a visible blind spot rather than a silent one.
+    ///
+    /// There is deliberately NO file or module column, and names are reduced
+    /// past their module qualifiers: moving a handler, a sub-router or a whole
+    /// router between files leaves the census identical, while dropping a
+    /// route or a merge, changing a method set or rebinding a handler changes
+    /// it.
+    ///
+    /// Read from: every `.rs` under `src` that git TRACKS (all of them when git
+    /// cannot answer), less test-only files and `#[cfg(test)]` items. A route
+    /// in a new file is therefore counted only once the file is `git add`ed.
     pub(crate) fn http_route_census_lines() -> Vec<String> {
+        let tracked = git_tracked_sources();
+        let sources: Vec<(String, Lexed)> = crate_rust_sources()
+            .into_iter()
+            .filter(|(rel, _)| tracked.as_ref().is_none_or(|t| t.contains(rel)))
+            .map(|(rel, src)| (rel, Lexed::new(&src)))
+            .collect();
+        let test_modules: std::collections::HashSet<String> = sources
+            .iter()
+            .flat_map(|(rel, lx)| lx.test_module_files(rel))
+            .collect();
         let mut lines = Vec::new();
-        for src in crate_rust_sources() {
-            census_one_file(&src, &mut lines);
+        for (rel, lx) in sources {
+            if !is_test_file(&rel, &test_modules) {
+                census_lexed(lx, &mut lines);
+            }
         }
         lines.sort();
         lines
     }
 
+    /// The census lines of one file's source, `#[cfg(test)]` items excluded.
     fn census_one_file(src: &str, out: &mut Vec<String>) {
+        census_lexed(Lexed::new(src), out);
+    }
+
+    /// [`census_one_file`] over an already-lexed file.
+    fn census_lexed(mut lx: Lexed, out: &mut Vec<String>) {
+        lx.blank_test_items();
+        let lx = &lx;
         for (needle, is_service) in [(ROUTE_CALL, false), (ROUTE_SERVICE_CALL, true)] {
-            walk_route_calls(src, needle, |call| {
-                if in_line_comment(src, call.at) {
-                    return;
-                }
+            walk_route_calls(lx, needle, |call| {
                 let path = match call.path {
-                    RoutePath::Literal(p) if !p.is_empty() && !p.contains(char::is_whitespace) => {
-                        p.to_string()
-                    }
-                    // A literal with whitespace is prose that happens to
-                    // follow the call shape (a string or doc example), never
-                    // a path.
-                    RoutePath::Literal(_) => return,
+                    RoutePath::Literal(p) => p.to_string(),
                     RoutePath::Named(name) => format!("<{name}>"),
+                    RoutePath::Unread(text) => {
+                        out.push(format!("UNREAD {}", collapsed(text)));
+                        return;
+                    }
                 };
                 if is_service {
                     out.push(format!("SERVICE {path} {}", handler_name(call.chain)));
@@ -929,72 +1304,185 @@ pub(crate) mod tests {
                     out.push(format!("? {path} {}", handler_name(call.chain)));
                     return;
                 }
-                let mut by_handler: std::collections::BTreeMap<
-                    String,
-                    std::collections::BTreeSet<String>,
-                > = std::collections::BTreeMap::new();
-                for (verb, handler) in pairs {
-                    by_handler.entry(handler).or_default().insert(verb);
-                }
-                for (handler, verbs) in by_handler {
-                    let verbs: Vec<String> = verbs.into_iter().collect();
-                    out.push(format!("{} {path} {handler}", verbs.join(",")));
-                }
+                push_method_lines(&path, pairs, out);
             });
         }
+        census_compositions(lx, out);
+        census_add_dual(lx, out);
     }
 
-    /// Whether the byte at `at` sits after a `//` on its own line.
-    fn in_line_comment(src: &str, at: usize) -> bool {
-        let line_start = src
-            .get(..at)
-            .and_then(|before| before.rfind('\n'))
-            .map_or(0, |n| n + 1);
-        src.get(line_start..at)
-            .is_some_and(|line| line.contains("//"))
+    /// One `<METHODS> <path> <handler>` line per handler of a route.
+    fn push_method_lines(path: &str, pairs: Vec<(String, String)>, out: &mut Vec<String>) {
+        let mut by_handler: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for (verb, handler) in pairs {
+            by_handler.entry(handler).or_default().insert(verb);
+        }
+        for (handler, verbs) in by_handler {
+            let verbs: Vec<String> = verbs.into_iter().collect();
+            out.push(format!("{} {path} {handler}", verbs.join(",")));
+        }
     }
 
-    /// If `b[i]` opens a string or char literal, the index just past it.
-    fn skip_literal(b: &[u8], i: usize) -> Option<usize> {
-        match b.get(i) {
-            Some(b'"') => {
-                let mut j = i + 1;
-                while j < b.len() {
-                    match b[j] {
-                        b'\\' => j += 2,
-                        b'"' => return Some(j + 1),
-                        _ => j += 1,
+    /// The `MERGE` / `NEST` / `FALLBACK` lines of one file.
+    fn census_compositions(lx: &Lexed, out: &mut Vec<String>) {
+        let skel = lx.skel.as_bytes();
+        for &(needle, label, has_prefix) in COMPOSITION_CALLS {
+            for (open, close) in lx.calls(needle) {
+                if !has_prefix {
+                    out.push(format!("{label} {}", composition_target(lx, open, close)));
+                    continue;
+                }
+                let comma = top_level_comma(skel, open, close).unwrap_or(close);
+                let prefix = lx.code.get(open..comma).unwrap_or("").trim();
+                let is_name = !prefix.is_empty()
+                    && prefix
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+                let prefix = match prefix.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+                    Some(literal) => literal.to_string(),
+                    // A named prefix by its last segment, as a named route path.
+                    None if is_name => {
+                        format!(
+                            "<{}>",
+                            prefix
+                                .rsplit("::")
+                                .find(|s| !s.is_empty())
+                                .unwrap_or(prefix)
+                        )
+                    }
+                    None => format!("<{}>", collapsed(prefix)),
+                };
+                let target = composition_target(lx, (comma + 1).min(close), close);
+                out.push(format!("{label} {prefix} {target}"));
+            }
+        }
+    }
+
+    /// The name a composition argument is recorded under: the last two
+    /// segments of a leading path (`crate::mcp::canvas::routes()` →
+    /// `canvas::routes`, `graphql_routes` → `graphql_routes`) — enough to keep
+    /// distinct sub-routers distinct while a move's qualifier change drops out
+    /// — `<closure>` for a closure, and the collapsed text for anything else.
+    fn composition_target(lx: &Lexed, from: usize, to: usize) -> String {
+        let expr = lx.skel.get(from..to).unwrap_or("").trim();
+        if is_closure(expr) {
+            return "<closure>".to_string();
+        }
+        let len = expr
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .unwrap_or(expr.len());
+        let path = expr.get(..len).unwrap_or("").trim_end_matches(':');
+        let segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
+        let is_keyword = matches!(segments.as_slice(), [only] if matches!(*only, "if" | "match" | "unsafe" | "loop"));
+        if segments.is_empty() || is_keyword {
+            return format!("<{}>", collapsed(lx.code.get(from..to).unwrap_or("")));
+        }
+        segments
+            .get(segments.len().saturating_sub(2)..)
+            .map(|s| s.join("::"))
+            .unwrap_or_default()
+    }
+
+    /// The two lines each `add_dual!(router, method, "tail", handler)` expands
+    /// to, or an `UNREAD` line when its arguments are not in that shape.
+    fn census_add_dual(lx: &Lexed, out: &mut Vec<String>) {
+        let skel = lx.skel.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = lx
+            .skel
+            .get(from..)
+            .and_then(|rest| rest.find(ADD_DUAL_CALL))
+        {
+            let at = from + rel;
+            from = at + ADD_DUAL_CALL.len();
+            if at > 0 && is_ident_byte(skel[at - 1]) {
+                continue;
+            }
+            let mut open = from;
+            while open < skel.len() && skel[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if skel.get(open) != Some(&b'(') {
+                continue;
+            }
+            let close = matching_close(skel, open);
+            let mut args = Vec::new();
+            let mut start = open + 1;
+            while let Some(comma) = top_level_comma(skel, start, close) {
+                args.push((start, comma));
+                start = comma + 1;
+            }
+            args.push((start, close));
+            let text = |(a, b): (usize, usize)| lx.code.get(a..b).unwrap_or("").trim();
+            let parsed = match args.as_slice() {
+                [_, method, tail, handler] => {
+                    let method = text(*method);
+                    let tail = text(*tail)
+                        .strip_prefix('"')
+                        .and_then(|t| t.strip_suffix('"'));
+                    match tail {
+                        Some(tail) if ROUTING_VERBS.contains(&method) => Some((
+                            method.to_ascii_uppercase(),
+                            tail.to_string(),
+                            handler_name(lx.skel.get(handler.0..handler.1).unwrap_or("")),
+                        )),
+                        _ => None,
                     }
                 }
-                Some(b.len())
+                _ => None,
+            };
+            match parsed {
+                Some((method, tail, handler)) => {
+                    for ns in ["control", "ai"] {
+                        out.push(format!("{method} /ui-bridge/{ns}/{tail} {handler}"));
+                    }
+                }
+                None => out.push(format!(
+                    "UNREAD {}",
+                    collapsed(lx.code.get(at..close + 1).unwrap_or(""))
+                )),
             }
-            // `'('` / `'\''` — a lifetime (`'a`) has no closing quote here.
-            Some(b'\'') if b.get(i + 2) == Some(&b'\'') => Some(i + 3),
-            Some(b'\'') if b.get(i + 1) == Some(&b'\\') && b.get(i + 3) == Some(&b'\'') => {
-                Some(i + 4)
-            }
-            _ => None,
+            from = close;
         }
+    }
+
+    /// `text` with every whitespace run collapsed to one space, cut to 40
+    /// characters — the stable rendering of an argument the census cannot read.
+    fn collapsed(text: &str) -> String {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(40)
+            .collect()
     }
 
     fn is_ident_byte(c: u8) -> bool {
         c.is_ascii_alphanumeric() || c == b'_'
     }
 
+    /// Whether `expr` begins a closure: `|…|`, or the keyword `move` /
+    /// `async` — as a whole word, so `move_terminal_handler` is a name.
+    fn is_closure(expr: &str) -> bool {
+        let starts_word = |kw: &str| {
+            expr.strip_prefix(kw)
+                .is_some_and(|rest| !rest.bytes().next().is_some_and(is_ident_byte))
+        };
+        expr.starts_with('|') || starts_word("move") || starts_word("async")
+    }
+
     /// The `(VERB, handler)` pairs of a `MethodRouter` chain such as
-    /// `get(a).post(b).layer(…)`. Only verbs at the chain's top level count, so
-    /// a verb inside a handler closure or a layer argument is not mistaken for
-    /// a registration. `get_service(…)` and friends count as their verb.
+    /// `get(a).post(b).layer(…)`, read from the literal-blanked view. Only
+    /// verbs at the chain's top level count, so a verb inside a handler
+    /// closure or a layer argument is not mistaken for a registration.
+    /// `get_service(…)` and friends count as their verb.
     fn method_handlers(chain: &str) -> Vec<(String, String)> {
         let b = chain.as_bytes();
         let mut out = Vec::new();
         let mut depth = 0i32;
         let mut i = 0usize;
         while i < b.len() {
-            if let Some(next) = skip_literal(b, i) {
-                i = next;
-                continue;
-            }
             let c = b[i];
             match c {
                 b'(' | b'[' | b'{' => depth += 1,
@@ -1027,15 +1515,12 @@ pub(crate) mod tests {
         out
     }
 
-    /// The index of the `)` matching the `(` at `open` (or the end).
+    /// The index of the bracket matching the one at `open` (or the end), in
+    /// text whose comments and literal contents are already blanked.
     fn matching_close(b: &[u8], open: usize) -> usize {
         let mut depth = 0i32;
         let mut i = open;
         while i < b.len() {
-            if let Some(next) = skip_literal(b, i) {
-                i = next;
-                continue;
-            }
             match b[i] {
                 b'(' | b'[' | b'{' => depth += 1,
                 b')' | b']' | b'}' => {
@@ -1058,7 +1543,7 @@ pub(crate) mod tests {
     /// keeps the census stable across a move between files.
     fn handler_name(expr: &str) -> String {
         let expr = expr.trim_start().trim_start_matches(',').trim_start();
-        if expr.starts_with('|') || expr.starts_with("move") || expr.starts_with("async") {
+        if is_closure(expr) {
             return "<closure>".to_string();
         }
         let len = expr
@@ -1098,8 +1583,9 @@ pub(crate) mod tests {
         out
     }
 
-    /// **The HTTP route census.** Every route registration in the tree,
-    /// pinned against `src-tauri/http-routes.snapshot.txt`. A dropped route, a
+    /// **The HTTP route census.** Every route registration and router
+    /// composition in the runner's non-test source, pinned against
+    /// `src-tauri/http-routes.snapshot.txt`. A dropped route, merge or nest, a
     /// changed method set or a rebound handler fails it; moving code between
     /// files does not, because the census carries no file column. Guards the
     /// `mcp_api.rs` split (plan
@@ -1108,20 +1594,26 @@ pub(crate) mod tests {
     fn http_route_census() {
         let actual = http_route_census_lines();
         assert!(
-            actual.len() > 500,
-            "the route census found only {} registrations — the walk is broken, not the router",
+            actual.len() >= MIN_CENSUS_LINES,
+            "the route census found only {} lines (floor {MIN_CENSUS_LINES}) — the walk is \
+             broken, not the router",
             actual.len()
         );
         let snapshot =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(HTTP_ROUTE_SNAPSHOT);
         if std::env::var(UPDATE_HTTP_ROUTE_SNAPSHOT).as_deref() == Ok("1") {
             let mut text = String::from(
-                "# HTTP route census: every route registration call under src-tauri/src, one\n\
-                 # `<METHODS> <path> <handler>` line each, sorted, duplicates kept. `?` = a\n\
-                 # MethodRouter built elsewhere; `SERVICE` = a route_service mount; `<name>` = a\n\
-                 # path held in a constant or binding. No file column, so a move between files\n\
-                 # leaves this unchanged. GENERATED by mcp::relay_path_policy::tests::\n\
-                 # http_route_census; regenerate with UPDATE_HTTP_ROUTE_SNAPSHOT=1.\n",
+                "# HTTP route census: every route registration and router composition in the\n\
+                 # runner's non-test source under src-tauri/src (git-tracked files; test files\n\
+                 # and #[cfg(test)] items excluded), one line each, sorted, duplicates kept.\n\
+                 # `<METHODS> <path> <handler>` = a route (add_dual! counts as its two routes);\n\
+                 # `?` = a MethodRouter built elsewhere; `SERVICE` = a route_service mount;\n\
+                 # `<name>` = a path held in a constant or binding; MERGE / NEST / NEST_SERVICE\n\
+                 # / FALLBACK / FALLBACK_SERVICE = a composition site; UNREAD = a registration\n\
+                 # whose path argument the scan cannot read. No file column, so a move between\n\
+                 # files leaves this unchanged. GENERATED by\n\
+                 # mcp::relay_path_policy::tests::http_route_census; regenerate with\n\
+                 # UPDATE_HTTP_ROUTE_SNAPSHOT=1.\n",
             );
             for line in &actual {
                 text.push_str(line);
@@ -1130,7 +1622,7 @@ pub(crate) mod tests {
             std::fs::write(&snapshot, text)
                 .unwrap_or_else(|e| panic!("writing {}: {e}", snapshot.display()));
             eprintln!(
-                "http_route_census: rewrote {} ({} routes)",
+                "http_route_census: rewrote {} ({} lines)",
                 snapshot.display(),
                 actual.len()
             );
@@ -1156,14 +1648,18 @@ pub(crate) mod tests {
         panic!(
             "the HTTP route table changed.\n\
              \n\
-             In the snapshot, missing from the tree ({} — a dropped or re-methoded route):\n{}\n\
+             In the snapshot, missing from the tree ({} — a dropped or re-methoded route, or a \
+             dropped merge/nest):\n{}\n\
              \n\
              In the tree, missing from the snapshot ({}):\n{}\n\
              \n\
              If the change is intended, regenerate the snapshot and commit it:\n  \
-             {UPDATE_HTTP_ROUTE_SNAPSHOT}=1 <cargo-guard.sh test> http_route_census\n\
+             {UPDATE_HTTP_ROUTE_SNAPSHOT}=1 bash <workspace-root>/qontinui-claude-config/scripts/\
+             cargo-guard.sh test -- http_route_census\n\
+             (cargo-guard refuses `--lib`: it narrows TARGETS; a name filter selects the test.)\n\
              A pure move between files never changes the census; if a move did, the move \
-             dropped or altered a registration.",
+             dropped or altered a registration. A route in a file git does not track yet is not \
+             read — `git add` the file.",
             removed.len(),
             removed
                 .iter()
@@ -1180,36 +1676,99 @@ pub(crate) mod tests {
     }
 
     /// The census reader against synthetic sources: methods group per
-    /// handler, module paths are dropped, nested verbs and comments are not
-    /// read, and named paths still count.
+    /// handler, module paths are dropped, nested verbs, comments and literals
+    /// are not read, compositions and `add_dual!` count, unclassifiable paths
+    /// surface as `UNREAD`, and `#[cfg(test)]` items are excluded.
     #[test]
     fn the_census_reads_methods_handlers_and_named_paths() {
-        let src = [
-            "Router::new()",
-            "    {R}\"/a\", get(crate::mcp::x::alpha).post(crate::mcp::x::alpha))",
-            "    {R}\"/b\", axum::routing::get(beta).delete(gamma).layer(from_fn(get_mw)))",
-            "    {R}\"/c\", get(|| async { s.get(1) }))",
-            "    {R}ROUTE_PATH, put(delta))",
-            "    {R}\"/d\", built_elsewhere())",
-            "    {S}\"/ws\", GraphQLSubscription::new(schema.clone()))",
-            "    // {R}\"/commented\", get(nope))",
-        ]
-        .join("\n")
-        .replace("{R}", ROUTE_CALL)
-        .replace("{S}", ROUTE_SERVICE_CALL);
+        let src = r##"
+fn routes() -> Router {
+    let r = Router::new()
+        .route("/a", get(crate::mcp::x::alpha).post(crate::mcp::x::alpha))
+        .route("/b", axum::routing::get(beta).delete(gamma).layer(from_fn(get_mw)))
+        .route("/c", get(|| async { s.get(1) }))
+        .route(ROUTE_PATH, put(delta))
+        .route(super::QUALIFIED_PATH, put(delta))
+        .route("/d", built_elsewhere())
+        .route_service("/ws", GraphQLSubscription::new(schema.clone()))
+        .route(
+            // a comment before the path
+            "/e", post(epsilon))
+        .route(/* inline */ "/f", get(phi))
+        .route(&format!("/g/{}", id), get(gee))
+        .route("/m", post(move_terminal_handler))
+        .route("/paren", get(paren_handler).layer(x(")")))
+        // .route("/commented", get(nope))
+        .merge(crate::mcp::canvas::routes())
+        .merge(graphql_routes)
+        .nest("/api", crate::api::router())
+        .nest_service("/static", ServeDir::new("dist"))
+        .fallback(not_found_handler);
+    let r = add_dual!(r, post, "wait", crate::mcp::ui_bridge::wait_handler);
+    let r = add_dual!(r, get, tail_from_const, h);
+    let quoted = ".route(\"/in-a-string\", get(nope))";
+    let raw = r#".route("/in-a-raw-string", get(nope))"#;
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    fn mock() -> Router {
+        Router::new().route("/mock", get(mock_handler)).merge(mock_routes())
+    }
+}
+
+#[cfg(all(test, unix))]
+fn unix_mock() -> Router {
+    Router::new().route("/unix-mock", get(mock_handler))
+}
+"##;
+        let decls = Lexed::new(concat!(
+            "#[cfg(test)]\n#[path = \"p_tests.rs\"]\nmod p;\n",
+            "#[cfg(test)]\npub(crate) mod q_tests;\n",
+            "pub mod image_quality_tests;\n",
+        ))
+        .test_module_files("src/mcp/foo.rs");
+        assert_eq!(
+            decls,
+            vec![
+                "src/mcp/p_tests.rs",
+                "src/mcp/foo/q_tests.rs",
+                "src/mcp/foo/q_tests/mod.rs",
+            ]
+        );
+        let decls: std::collections::HashSet<String> = decls.into_iter().collect();
+        assert!(is_test_file("src/mcp/foo/q_tests.rs", &decls));
+        assert!(is_test_file("src/mcp/origin_guard/tests.rs", &decls));
+        assert!(!is_test_file("src/mcp/image_quality_tests.rs", &decls));
+
         let mut lines = Vec::new();
-        census_one_file(&src, &mut lines);
+        census_one_file(src, &mut lines);
         lines.sort();
         assert_eq!(
             lines,
             vec![
                 "? /d built_elsewhere",
                 "DELETE /b gamma",
+                "FALLBACK not_found_handler",
                 "GET /b beta",
                 "GET /c <closure>",
+                "GET /f phi",
+                "GET /paren paren_handler",
                 "GET,POST /a alpha",
+                "MERGE canvas::routes",
+                "MERGE graphql_routes",
+                "NEST /api api::router",
+                "NEST_SERVICE /static ServeDir::new",
+                "POST /e epsilon",
+                "POST /m move_terminal_handler",
+                "POST /ui-bridge/ai/wait wait_handler",
+                "POST /ui-bridge/control/wait wait_handler",
+                "PUT <QUALIFIED_PATH> delta",
                 "PUT <ROUTE_PATH> delta",
                 "SERVICE /ws GraphQLSubscription::new",
+                "UNREAD &format!(\"/g/{}\", id)",
+                "UNREAD add_dual!(r, get, tail_from_const, h)",
             ]
         );
     }
