@@ -169,6 +169,17 @@ pub struct AdapterMetrics {
     /// record — a secondary/temp runner (it runs no register heartbeat), or a
     /// primary whose heartbeat is not succeeding.
     pub work_unit_writes_withheld_unknown_total: AtomicU64,
+    /// The work-unit write posture the loop decided on its last ARMED tick
+    /// (gauge) — see [`work_unit_write_posture`]. The two counters above say
+    /// how often writes were withheld; only this says whether they are being
+    /// withheld NOW, which is what a surface claiming "work units reach coord"
+    /// has to read.
+    ///
+    /// `None` before the first armed tick, and reset to `None` on every idle
+    /// (tier-off) tick: the posture is decided only when something is scanned,
+    /// so a reading left over from before the tier went off would describe a
+    /// cycle that is no longer running.
+    pub work_unit_write_posture: std::sync::Mutex<Option<WorkUnitWritePosture>>,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -197,6 +208,9 @@ pub struct MetricsSnapshot {
     pub seed_errors_total: u64,
     pub work_unit_writes_withheld_total: u64,
     pub work_unit_writes_withheld_unknown_total: u64,
+    /// The last armed tick's posture; `None` before one, or while the tier is
+    /// off — see [`AdapterMetrics::work_unit_write_posture`].
+    pub work_unit_write_posture: Option<WorkUnitWritePosture>,
 }
 
 impl AdapterMetrics {
@@ -237,6 +251,10 @@ impl AdapterMetrics {
             work_unit_writes_withheld_unknown_total: self
                 .work_unit_writes_withheld_unknown_total
                 .load(Ordering::Relaxed),
+            work_unit_write_posture: *self
+                .work_unit_write_posture
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
         }
     }
 }
@@ -3870,6 +3888,12 @@ impl LoopState {
                 ScanDivergence::not_scanning().observed_at(chrono::Utc::now().timestamp()),
                 metrics,
             );
+            // No posture is decided on an idle tick, so none may stand: see
+            // [`AdapterMetrics::work_unit_write_posture`].
+            *metrics
+                .work_unit_write_posture
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             // Nothing is scanned — but a device whose plans dir was just
             // cleared must SAY so to the read side, or its last `measured` row
             // keeps being quoted until it ages out. The body sync's library
@@ -3955,6 +3979,10 @@ impl LoopState {
             self.bulk_seeded = false;
         }
         self.last_write_posture = Some(posture);
+        *metrics
+            .work_unit_write_posture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(posture);
 
         // ONE ref state for this whole cycle (see [`CycleRefPin`]). Created
         // here, after the posture and BEFORE the scan-divergence probe, so the
@@ -13783,6 +13811,11 @@ Body.
         assert_eq!(snap.work_unit_writes_withheld_total, 2);
         assert_eq!(snap.work_unit_writes_withheld_unknown_total, 0);
         assert_eq!(snap.cycles_total, 2, "a withheld cycle is still a cycle");
+        assert_eq!(
+            snap.work_unit_write_posture,
+            Some(WorkUnitWritePosture::WithheldMultiBound(3)),
+            "the gauge says withheld NOW, not just that it once was"
+        );
         let logged = logs.text();
         assert_eq!(
             logged.matches("bound to 3 tenants").count(),
@@ -13801,6 +13834,19 @@ Body.
             "the active plan and the archive stamp both push when single-bound"
         );
         assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 0);
+        assert_eq!(
+            metrics.snapshot().work_unit_write_posture,
+            Some(WorkUnitWritePosture::Write)
+        );
+
+        // Tier switched off: no posture is decided, so none may stand.
+        *cell.lock().unwrap() = PathInputs::default();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            metrics.snapshot().work_unit_write_posture,
+            None,
+            "an idle tick clears the posture rather than leaving the last one standing"
+        );
     }
 
     /// **A WITHHELD cycle still LISTS the ref, and still reports both stem
