@@ -480,6 +480,7 @@ impl AuthManager {
     /// Use [`Self::with_storage_and_machine_file`] to exercise the canonical
     /// identity path against a tempdir.
     #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_storage(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
@@ -505,6 +506,7 @@ impl AuthManager {
     /// would race every other test reading `QONTINUI_DISABLE_KEYCHAIN` in
     /// parallel) and without touching any non-test code path.
     #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_storage_force_keychain(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
@@ -518,6 +520,7 @@ impl AuthManager {
     /// canonical-identity branch of [`Self::get_device_id`] is testable
     /// against a tempdir.
     #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_storage_and_machine_file(
         secure_storage: SecureStorage,
         machine_file: std::path::PathBuf,
@@ -3293,6 +3296,11 @@ mod minimal_reader_equivalence_tests {
     /// base64 padding, which the local reader accepts (it falls back to the
     /// padded alphabet, as [`decode_jwt_exp`] does) and the canonical decoder
     /// rejects (unpadded only).
+    ///
+    /// "Agrees" is measured against [`canonical_jwt_tenant`], i.e. `pair`'s
+    /// claim string after `trim()` and `Uuid::parse_str` — the adapter a
+    /// delegation would need. `pair` itself returns the raw claim string, so
+    /// the non-UUID-claim row agrees only through that adapter.
     #[test]
     fn jwt_tenant_claim_against_the_canonical_decoder() {
         let tenant_claim = format!(r#"{{"tenant_id":"{T_A}"}}"#);
@@ -3441,6 +3449,22 @@ mod minimal_reader_equivalence_tests {
                 Some(format!(r#"{{"default_tenant_id":"{T_A}"}}"#)),
                 BindingTenantRead::Bound(uuid(T_A)),
                 false,
+            ),
+            (
+                "default_tenant_id that is not a string",
+                Some(format!(
+                    r#"{{"user_id":"{USER}","default_tenant_id":123,"tenant_id":"{T_A}"}}"#
+                )),
+                BindingTenantRead::Bound(uuid(T_A)),
+                false,
+            ),
+            (
+                "default_tenant_id null",
+                Some(format!(
+                    r#"{{"user_id":"{USER}","default_tenant_id":null,"tenant_id":"{T_A}"}}"#
+                )),
+                BindingTenantRead::Bound(uuid(T_A)),
+                true,
             ),
         ];
 

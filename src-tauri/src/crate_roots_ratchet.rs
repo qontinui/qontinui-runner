@@ -415,16 +415,19 @@ fn no_util_child_is_declared_in_both_util_trees() {
     );
 }
 
-/// `auth` is ONE module instance: the bin's `crate::auth` IS the lib's
-/// `qontinui_runner_lib::auth`, so its statics (`DATA_PLANE_TOTAL` /
-/// `DATA_PLANE_AUTHED`, the keychain circuit breaker, the one-shot warning
-/// latches) exist once per process.
+/// The bin's `crate::auth` IS the lib's `qontinui_runner_lib::auth`: one
+/// module under both names, so `TenantScope` is one type and the bin reaches
+/// the lib's statics (`DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED`, the keychain
+/// circuit breaker, the one-shot warning latches) rather than copies of them.
 ///
 /// A compile-level assertion: while the bin declared its own `mod auth`, the
 /// two `TenantScope`s were nominally distinct types and this binding did not
 /// type-check (E0308) — `repo_detection` needed a hand-written `rebadge` to
-/// cross between them. The runtime assert only keeps the test from being
-/// empty.
+/// cross between them. It proves nothing about a second copy of `auth.rs`
+/// under ANOTHER module name; that is what
+/// [`no_path_attribute_outside_the_lib_points_at_a_lib_file`] and
+/// [`no_module_is_declared_in_both_crate_roots`] rule out. The runtime assert
+/// only keeps the test from being empty.
 #[test]
 fn auth_is_one_module_instance() {
     let scope: qontinui_runner_lib::auth::TenantScope = crate::auth::TenantScope::Device;
