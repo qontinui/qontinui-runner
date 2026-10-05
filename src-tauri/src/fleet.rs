@@ -323,7 +323,11 @@ fn read_slot_claim_candidates() -> Option<Vec<uuid::Uuid>> {
     qontinui_runner_lib::pair::usable_slot_claim_tenants().map(|(_, candidates)| candidates)
 }
 
-/// Heartbeat source: `machine.json`'s `active_tenant_id`.
+/// Heartbeat source: `machine.json`'s `active_tenant_id`. A DIRECT pin read,
+/// so it is classified in `commands::tenant::PIN_SURFACES`
+/// (`register_heartbeat_slot_fallback_default`, live): `read_machine_json` is a
+/// fresh file read, and this runs on every heartbeat that reaches the slot
+/// fallback.
 fn read_active_tenant() -> Option<uuid::Uuid> {
     qontinui_runner_lib::ambient::read_machine_json().active_tenant_uuid()
 }
@@ -2167,60 +2171,45 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
-            // The PREVIOUS echo, read before this one is recorded: a binding
-            // drop needs both to omit the tenant (`drop_confirmed_coord_set`),
-            // so one transient or short echo cannot destroy a binding and its
-            // credential slot (plan
-            // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential,
-            // Phase 4).
-            let prior_echo = qontinui_runner_lib::pair::coord_bound_tenants();
-            // Record coord's COUNT before reconciling: the plan adapter asks
-            // "is this device bound to more than one tenant?", which the
-            // slot-backed binding file cannot answer (plan
-            // 2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device).
-            if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
-                tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
-            }
-            match qontinui_runner_lib::pair::drop_confirmed_coord_set(&coord_set, &prior_echo) {
-                None => tracing::debug!(
-                    "fleet::heartbeat: no previous tenant_ids echo on record — deferring \
-                     binding reconciliation one heartbeat so a drop is confirmed twice"
-                ),
-                Some(confirmed) => {
-                    // Off the async worker: the reconcile holds file locks that may
-                    // wait (bounded) on a peer process.
-                    let reconciled = spawn_blocking_tracked(move || {
-                        qontinui_runner_lib::pair::reconcile_paired_bindings(&confirmed)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
-                    match reconciled {
-                        Ok(report) => {
-                            if report.changed() {
-                                info!(
-                                    "fleet::heartbeat: reconciled bindings against coord \
-                                     (dropped={:?} dropped_slots={:?} default_repointed={:?})",
-                                    report.dropped, report.dropped_slots, report.default_repointed
-                                );
-                            }
-                            // Only tenants THIS echo names: one held over from
-                            // the previous echo is being unbound, not a gap.
-                            for (t, slot) in report.coord_only {
-                                if coord_set.contains(&t) {
-                                    warn_coord_only_binding_once(t, slot);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
-                        }
+            // Record the echo AND reconcile against it under ONE hold of the
+            // binding-store lock, so the paired_user.json heal never reads
+            // this echo beside the previous pass's omission streaks (plan
+            // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential).
+            // Off the async worker: the lock waits (bounded) on a peer process.
+            let reconcile_set = coord_set;
+            let reconciled = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::pair::record_and_reconcile_coord_bound_tenants(&reconcile_set)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
+            match reconciled {
+                Ok(report) => {
+                    if report.changed() {
+                        info!(
+                            "fleet::heartbeat: reconciled bindings against coord \
+                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+                            report.dropped, report.dropped_slots, report.default_repointed
+                        );
                     }
+                    for (t, slot) in report.coord_only {
+                        warn_coord_only_binding_once(t, slot);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
                 }
             }
         } else if let Some(resp_tenant) = response_tenant_id(&body) {
             // Legacy echo-heal (single-value; v2-file-aware no-op).
             // Scheduled for deletion in Phase 10 item 4.
-            if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant) {
+            // Off the async worker: it takes the binding-store lock, whose
+            // wait is bounded but may sit on a peer process.
+            let backfilled = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("backfill task failed: {e}")));
+            if let Err(e) = backfilled {
                 tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
             }
         }
