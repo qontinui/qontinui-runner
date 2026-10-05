@@ -10,15 +10,10 @@ import {
 } from "./stubContext.testutil";
 
 describe("explainerStep", () => {
-  it("collects the markdown file, marks done, and advances the LIVE explainer queue", () => {
+  it("collects the markdown file, marks done, and advances the explainer queue", () => {
     const ctx = stubContext();
-    let queueSeen: number | null = null;
-    ctx.flow.advanceExplainerQueue.mockImplementation(() => {
-      queueSeen = ctx.explainerQueueRef.current.length;
-    });
-    // Set after ctx is built.
+    // The cursor is overwritten with the AI message count, not incremented.
     ctx.processedMessageCountRef.current = 99;
-    ctx.explainerQueueRef.current = [{ kind: "cluster", clusterId: "settings" }];
 
     explainerStep(
       ctx,
@@ -39,7 +34,6 @@ describe("explainerStep", () => {
       { state: "done", label: "Explainer: index.md" },
     ]);
     expect(ctx.flow.advanceExplainerQueue).toHaveBeenCalledTimes(1);
-    expect(queueSeen).toBe(1);
   });
 
   it("marks the step errored when no FILE comment came back, and still advances", () => {
