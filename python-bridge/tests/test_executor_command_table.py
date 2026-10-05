@@ -15,6 +15,11 @@ construction:
   literals in a ``match``, not call arguments. All three are in the table already.
 
 Any other sender that passes a non-literal command name is likewise out of reach.
+It does see ``send_command_async(`` calls, and the hand-built
+``ExecutorCommand { command: "...".to_string() }`` literals under ``src-tauri/src/executor/``.
+
+**No CI job runs this file yet** (no workflow runs ``python-bridge/tests``); run it
+locally with ``python -m pytest python-bridge/tests/test_executor_command_table.py``.
 """
 
 from __future__ import annotations
@@ -54,7 +59,10 @@ KNOWN_UNHANDLED: dict[str, str] = {
 }
 
 # Newline-tolerant: ``\s*`` spans the line break when the literal sits on the next line.
-_SEND_RE = re.compile(r'send_command(?:_and_wait)?\(\s*"([^"]+)"')
+_SEND_RE = re.compile(r'send_command(?:_and_wait|_async)?\(\s*"([^"]+)"')
+# The bridge also builds ``ExecutorCommand { command: "...".to_string(), .. }`` by hand.
+_STRUCT_RE = re.compile(r'\bcommand:\s*"([^"]+)"\.to_string\(\)')
+RUST_EXECUTOR_DIR = RUST_SRC / "executor"
 
 
 def _load_snapshot_script():
@@ -96,15 +104,25 @@ def _executor_table() -> dict[str, tuple[str, bool]]:
     return snapshot_script.extract_table(_source(), BRIDGE_DIR / "executor_commands")
 
 
-def rust_sent_commands(text: str) -> set[str]:
-    """Literal first arguments of ``send_command[_and_wait](`` calls in ``text``."""
-    return set(_SEND_RE.findall(text))
+def rust_sent_commands(text: str, *, struct_literals: bool = False) -> set[str]:
+    """Literal first arguments of ``send_command[_and_wait|_async](`` calls in ``text``.
+
+    With ``struct_literals``, also the ``command: "...".to_string()`` fields of hand-built
+    ``ExecutorCommand`` values (only meaningful inside ``src-tauri/src/executor/``).
+    """
+    sent = set(_SEND_RE.findall(text))
+    if struct_literals:
+        sent |= set(_STRUCT_RE.findall(text))
+    return sent
 
 
 def _all_rust_sent_commands() -> set[str]:
     sent: set[str] = set()
     for path in RUST_SRC.rglob("*.rs"):
-        sent |= rust_sent_commands(path.read_text(encoding="utf-8", errors="replace"))
+        sent |= rust_sent_commands(
+            path.read_text(encoding="utf-8", errors="replace"),
+            struct_literals=RUST_EXECUTOR_DIR in path.parents,
+        )
     return sent
 
 
@@ -169,6 +187,18 @@ def test_send_scanner_is_newline_tolerant():
         "bridge.send_command_and_wait(&cmd_type, params, timeout);\n"
     )
     assert rust_sent_commands(text) == {"single_line", "zz_new_cmd"}
+
+
+def test_send_scanner_sees_async_sends_and_struct_literals():
+    text = (
+        'self.send_command_async("zz_async", None);\n'
+        "let cmd = ExecutorCommand {\n"
+        '    command: "zz_struct".to_string(),\n'
+        "    params: None,\n"
+        "};\n"
+    )
+    assert rust_sent_commands(text) == {"zz_async"}
+    assert rust_sent_commands(text, struct_literals=True) == {"zz_async", "zz_struct"}
 
 
 def test_every_rust_sent_command_is_handled():
@@ -306,6 +336,18 @@ def test_build_command_table_rejects_missing_method():
         COMMANDS = {"a": "_nope"}
 
     with pytest.raises(ValueError, match="does not exist"):
+        table_module.build_command_table(Core, ())
+
+
+@pytest.mark.parametrize("decorator", [staticmethod, classmethod])
+def test_build_command_table_rejects_a_decorated_handler(decorator):
+    # Arity is read by dropping the first parameter as ``self``; a staticmethod or
+    # classmethod handler would be misclassified as no-args and then called with none.
+    class Core:
+        COMMANDS = {"a": "_h"}
+        _h = decorator(lambda *args: {})
+
+    with pytest.raises(ValueError, match="not a plain method"):
         table_module.build_command_table(Core, ())
 
 
