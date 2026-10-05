@@ -6444,6 +6444,9 @@ async fn run_continuation_terminal(
             .map(|s| crate::mcp::types::runner_api_port(s.inner()));
         let coord_mcp =
             crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+        // What `<workdir>/.claude/` serves, for the briefing's `[served-corpus: …]`
+        // header line. Bounded, off the runtime worker, fail-soft to UNKNOWN.
+        let served = crate::served_corpus::probe_async(workdir).await;
 
         // The argv, built HERE rather than beside `launch_cfg` above: the briefing
         // it carries gates its memory clause on `coord_mcp`, which the call
@@ -6462,7 +6465,11 @@ async fn run_continuation_terminal(
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
             compose_continuation_system_prompt(
-                crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+                crate::terminal::runner_context(
+                    crate::terminal::spawn_seam_api_port(),
+                    coord_mcp,
+                    &served,
+                ),
                 payload.brief.as_ref(),
             ),
         ));
@@ -7427,6 +7434,7 @@ async fn run_condition_check_terminal(
         crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &crate::served_corpus::probe_async(workdir.as_str()).await,
         ),
     ));
     // Carried to the child env by the capture hint below; from the SAME
@@ -9429,6 +9437,9 @@ fn pick_autonomous_git_identity(
 pub(crate) fn finalize_headless_child_env(
     cmd: &mut tokio::process::Command,
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    // What the child's `<workdir>/.claude/` serves — measured by the caller,
+    // for the same reason `coord_mcp` is: it needs I/O `runner_context` forbids.
+    served: &crate::served_corpus::ServedCorpus,
 ) {
     // The coord-mcp outcome is the OPPOSITE case to the port below, and both
     // rules point the same way: ship the value only the right frame knows. The
@@ -9450,7 +9461,7 @@ pub(crate) fn finalize_headless_child_env(
     let runner_api_port = crate::terminal::spawn_seam_api_port();
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
-        crate::terminal::runner_context(runner_api_port, coord_mcp),
+        crate::terminal::runner_context(runner_api_port, coord_mcp, served),
     );
     cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
@@ -9635,7 +9646,8 @@ pub(crate) async fn spawn_claude_child(
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
-    finalize_headless_child_env(&mut cmd, coord_mcp);
+    let served = crate::served_corpus::probe_async(workdir).await;
+    finalize_headless_child_env(&mut cmd, coord_mcp, &served);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
@@ -10812,7 +10824,11 @@ mod tests {
             cmd.env(name, "hunter2");
         }
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
 
@@ -10845,6 +10861,15 @@ mod tests {
                 .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
             "the runner-context briefing must still be exported"
         );
+        // The served-corpus header line the caller measured must reach the
+        // exported briefing verbatim — the headless seam is one of the two
+        // env seams that make it readable by `/whereami`.
+        assert!(
+            envs.iter().any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT"
+                && v.as_deref()
+                    .is_some_and(|b| b.lines().any(|l| l == "[served-corpus: UNKNOWN (test)]"))),
+            "the exported briefing must carry the served-corpus header line"
+        );
     }
 
     /// The non-interactive git credential posture, asserted from the ONE shared
@@ -10858,7 +10883,11 @@ mod tests {
         // shape of coord finding 0056361d.
         cmd.env("GIT_ASKPASS", "/some/gui/askpass");
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::credential_helper::assert_non_interactive_git_posture_tokio(
             &cmd,
@@ -10905,7 +10934,11 @@ mod tests {
         set_bound_port(41_238);
 
         let mut cmd = tokio::process::Command::new("dummy");
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         let envs: std::collections::HashMap<String, String> = cmd
             .as_std()
@@ -11341,6 +11374,7 @@ mod tests {
         let briefing = crate::terminal::runner_context(
             9876,
             crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
         );
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
