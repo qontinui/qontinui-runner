@@ -1502,24 +1502,6 @@ pub fn coord_http_base_from_url(coord_url: &str) -> String {
 // Pair: headless (--auth-token)
 // ============================================================================
 
-/// POST `Authorization: Bearer <user-jwt>` +
-/// `X-Qontinui-User-Id: <uuid>` to `POST /api/v1/devices/pair-cli` (the
-/// web backend's pair-cli proxy, which injects `tenant_id` server-side
-/// and forwards to coord). Coord verifies the bearer token, looks up the
-/// device, and returns a fresh device-token JWT.
-///
-/// Requirements (Defect 5):
-/// - `~/.qontinui/machine.json` must exist with a UUID `device_id`
-///   (run `qontinui_profile device init` first).
-/// - `{data_local_dir}/com.qontinui.runner/paired_user.json` must exist
-///   from a prior browser-pair (pair-cli is a refresh path, not a
-///   first-pair path).
-///
-/// Thin wrapper around [`pair_with_auth_token_with_ids`] — reads
-/// `device_id` and `user_id` from disk then delegates. Tests use the
-/// parameterized form directly so they can run hermetically against an
-/// in-process mock web backend without touching `~/.qontinui` or the
-/// `data_local_dir`.
 /// Decode the unverified payload of a JWT and pull the `tenant_id`
 /// claim, if any. Returns `None` if the token isn't a JWT, the payload
 /// isn't valid base64-decoded JSON, or no `tenant_id` claim is present.
@@ -1557,10 +1539,11 @@ fn tenant_id_from_jwt_claim(token: &str, claim: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Where a pair base URL came from and how to change it, built by the caller
-/// (this lib cannot see the bin-side `ApiBaseUrlArm`). Only rendered into the
-/// error when the request never got an answer, where the URL alone leaves the
-/// operator unable to tell which knob chose it.
+/// Where a pair base URL came from and how to change it. For the CLI web-base
+/// flows build it with [`CliWebBaseSource::pair_base_origin`]; other callers
+/// (the device-JWT refresher) build it from their own resolution ladder. Only
+/// rendered into the error when the request never got an answer, where the
+/// URL alone leaves the operator unable to tell which knob chose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairBaseOrigin {
     /// Short name of the rung/caller that chose the base.
@@ -1685,11 +1668,17 @@ pub fn resolve_cli_web_base(
     fn normalize(s: &str) -> String {
         s.trim().trim_end_matches('/').to_string()
     }
-    if let Some(explicit) = env.filter(|s| !s.trim().is_empty()) {
-        return (normalize(explicit), CliWebBaseSource::EnvOverride);
+    // Normalize BEFORE the blank test: a value of only slashes ("/", " // ")
+    // is not blank, but it normalizes to "" and would otherwise yield a
+    // host-less base. Such a value counts as unset, like a blank one.
+    if let Some(explicit) = env.map(normalize).filter(|s| !s.is_empty()) {
+        return (explicit, CliWebBaseSource::EnvOverride);
     }
-    if let Some((url, src)) = profile.filter(|(u, _)| !u.trim().is_empty()) {
-        return (normalize(&url), CliWebBaseSource::ProfileApiUrl(src));
+    if let Some((url, src)) = profile
+        .map(|(u, s)| (normalize(&u), s))
+        .filter(|(u, _)| !u.is_empty())
+    {
+        return (url, CliWebBaseSource::ProfileApiUrl(src));
     }
     (
         crate::profiles::PROD_API_BASE_URL.to_string(),
@@ -1757,6 +1746,30 @@ mod cli_web_base_tests {
         assert_eq!(
             resolve_cli_web_base(Some("  "), profile("   ")).1,
             CliWebBaseSource::ProdDefault
+        );
+    }
+
+    #[test]
+    fn slash_only_values_are_unset_on_both_rungs() {
+        // REGRESSION (review of e8ea66b81). A value that is only slashes is not
+        // blank before normalization but is empty after it; testing blankness
+        // first let it through as a host-less base ("" + "/api/v1/...").
+        for v in ["/", " // ", "///"] {
+            assert_eq!(
+                resolve_cli_web_base(Some(v), None),
+                (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault),
+                "env {v:?}"
+            );
+            assert_eq!(
+                resolve_cli_web_base(None, profile(v)),
+                (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault),
+                "profile {v:?}"
+            );
+        }
+        // A slash-only env override falls through to a real profile value.
+        assert_eq!(
+            resolve_cli_web_base(Some("/"), profile("https://p.example")).0,
+            "https://p.example"
         );
     }
 
@@ -1903,6 +1916,24 @@ fn describe_send_error(url: &str, e: &reqwest::Error, origin: &PairBaseOrigin) -
     msg
 }
 
+/// POST `Authorization: Bearer <user-jwt>` +
+/// `X-Qontinui-User-Id: <uuid>` to `POST /api/v1/devices/pair-cli` (the
+/// web backend's pair-cli proxy, which injects `tenant_id` server-side
+/// and forwards to coord). Coord verifies the bearer token, looks up the
+/// device, and returns a fresh device-token JWT.
+///
+/// Requirements (Defect 5):
+/// - `~/.qontinui/machine.json` must exist with a UUID `device_id`
+///   (run `qontinui_profile device init` first).
+/// - `{data_local_dir}/com.qontinui.runner/paired_user.json` must exist
+///   from a prior browser-pair (pair-cli is a refresh path, not a
+///   first-pair path).
+///
+/// Thin wrapper around [`pair_with_auth_token_with_ids`] — reads
+/// `device_id` and `user_id` from disk then delegates. Tests use the
+/// parameterized form directly so they can run hermetically against an
+/// in-process mock web backend without touching `~/.qontinui` or the
+/// `data_local_dir`.
 pub fn pair_with_auth_token(
     base: &str,
     oauth_token: &str,
@@ -2166,10 +2197,11 @@ pub fn pair_via_browser(
     // the active profile's api_url, then the production default). This
     // deliberately does NOT derive from `coord_base` — see
     // `resolve_cli_web_base` for the reasoning and the measured failure.
-    let (web_base, _) = resolve_cli_web_base(
+    let (web_base, web_source) = resolve_cli_web_base(
         std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
         crate::profiles::api_url_with_source(),
     );
+    eprintln!("Opening connect-runner on {web_base} ({web_source})");
     let hostname_now = detect_hostname();
 
     // Bind a port for the callback. Use 0 to let the OS pick — then read it

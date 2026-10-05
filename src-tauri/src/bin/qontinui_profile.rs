@@ -187,8 +187,10 @@ enum DeviceCmd {
     /// Bind this device to a web-backend user. Default mode opens
     /// /connect-runner in the system browser and waits for the user's
     /// confirmation; `--auth-token <token>` takes a pre-issued OAuth token
-    /// and headlessly POSTs to coord. On success persists the device-token
-    /// JWT + paired user_id locally.
+    /// and headlessly POSTs to the web backend's pair-cli route (resolved
+    /// from $QONTINUI_WEB_BASE, the profile's api_url, or production — never
+    /// the coord host). On success persists the device-token JWT + paired
+    /// user_id locally.
     Pair {
         /// Headless mode: use a pre-issued OAuth token. Mutually exclusive
         /// with `--browser` and `--pair-code`.
@@ -1031,14 +1033,17 @@ fn cmd_device_pair(
     // would force every fresh machine to run `qontinui_profile init` (which
     // writes an unrelated local-dev DB/Redis/blob stack profile it will never
     // use) just to pair headlessly against production. Fleet-join, 2026-08-24.
-    let base_result = coord_http_base();
-    if matches!(mode, PairMode::Browser) {
-        if let Err(e) = &base_result {
-            eprintln!("error: could not resolve coord_url: {}", e);
-            return ExitCode::from(2);
+    let browser_coord_base: Option<String> = if matches!(mode, PairMode::Browser) {
+        match coord_http_base() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("error: could not resolve coord_url: {}", e);
+                return ExitCode::from(2);
+            }
         }
-    }
-    let base = base_result.unwrap_or_default();
+    } else {
+        None
+    };
 
     // Resolve tenant_id when needed. For PairCode mode the tenant is
     // carried back in the redeem response (we resolve it from there
@@ -1111,7 +1116,12 @@ fn cmd_device_pair(
                 &origin,
             )
         }
-        PairMode::Browser => pair_via_browser(&base, preflight_tenant_id.expect("set above")),
+        PairMode::Browser => pair_via_browser(
+            browser_coord_base
+                .as_deref()
+                .expect("coord base resolved above for Browser mode"),
+            preflight_tenant_id.expect("set above"),
+        ),
     };
 
     match result {
