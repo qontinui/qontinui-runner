@@ -975,7 +975,8 @@ fn paired_user_missing_detail(
                  default binding pointing at them. The runner's device-JWT refresher \
                  self-heals the file from those slots every tick \
                  (pair::heal_vanished_paired_user, guarded by coord's bound-tenant set in \
-                 coord_bound_tenants.json); if this persists, the heal REFUSED — the runner log \
+                 coord_bound_tenants.json plus the tenants the binding reconcile is still \
+                 holding in coord_omission_streaks.json); if this persists, the heal REFUSED — the runner log \
                  line `paired_user.json heal refused: <why>` and /health \
                  coordCredential.detail name the guard (including when those slots belong \
                  only to tenants coord no longer binds). Sign in to re-pair.",

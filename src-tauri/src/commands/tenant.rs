@@ -324,6 +324,16 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  resource_sample publish_once)",
     },
     PinSurface {
+        surface: "register_heartbeat_slot_fallback_default",
+        timing: PinTiming::Live,
+        readers: &["fleet.rs::read_active_tenant"],
+        detail: "the register heartbeat's DEFAULT tenant when paired_user.json and a usable \
+                 legacy slot both miss (fleet.rs resolve_heartbeat_binding_set): re-read on \
+                 every heartbeat (30 s) that reaches the per-tenant-slot fallback, and honoured \
+                 only while it is among the usable slots coord's bound set lists \
+                 (heartbeat_slot_fallback); no other resolver reads it",
+    },
+    PinSurface {
         surface: "session_outbox_tenant_backfill",
         timing: PinTiming::Live,
         readers: &[

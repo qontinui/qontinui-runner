@@ -446,44 +446,17 @@ fn read_paired_user_file_at(path: &std::path::Path) -> Option<PairedUserFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Serializes every read-modify-write of `paired_user.json` in this process.
-///
-/// Five writers share the file — [`persist_pairing_with`],
-/// [`reconcile_paired_bindings_with`], [`backfill_paired_tenant_id`],
-/// [`converge_binding_store_with`] and [`heal_vanished_paired_user_with`] —
-/// and each READS the file, decides, then WRITES it. Without one lock two of
-/// them interleave and the later rename silently discards the earlier one's
-/// change (a heal landing over a pairing that was just written, or a
-/// reconcile's drop resurrected by a stale backfill). Held across the whole
-/// read-decide-write, never nested: none of the five calls another while
-/// holding it (plan
-/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
-/// review finding 4). The heal's two credential copies
-/// ([`preserve_legacy_credential`], [`copy_default_into_legacy_slot`]) also
-/// take it — each alone, after the heal's file-write guard is dropped — so
-/// their recheck-then-write is atomic against a pairing's credential writes
-/// (review round 3). It does NOT cover the background refresher, which writes
-/// the legacy slot and its per-tenant mirror without this lock: a re-mint
-/// landing inside a heal's copy can be overwritten by an older (still usable)
-/// token, which the next refresh replaces.
-static PAIRED_USER_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Take [`PAIRED_USER_WRITE`]. A poisoned lock is recovered: it guards no
-/// data, only ordering, so a panicked holder leaves nothing inconsistent.
-fn paired_user_write_lock() -> std::sync::MutexGuard<'static, ()> {
-    PAIRED_USER_WRITE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Atomic write of `paired_user.json` (tmp + rename), pretty-printed —
 /// the shared writer for [`persist_pairing`], [`backfill_paired_tenant_id`],
 /// [`reconcile_paired_bindings`], [`converge_binding_store`] and
-/// [`heal_vanished_paired_user`]. Callers hold [`paired_user_write_lock`].
+/// [`heal_vanished_paired_user`]. Every caller holds the binding-reconcile
+/// lock ([`lock_binding_reconcile`]) across its whole read-decide-write.
 ///
 /// The temp name is unique per write (`<file>.tmp.<pid>.<n>`): a shared
 /// `paired_user.json.tmp` let two processes on one storage dir (a primary and
-/// an instance runner, or the CLI) truncate each other's half-written temp.
+/// an instance runner, or the CLI) truncate each other's half-written temp —
+/// and a unique name keeps that true even for a writer that a lock bug ever
+/// leaves outside the lock.
 fn write_paired_user_file(path: &std::path::Path, pf: &PairedUserFile) -> Result<(), String> {
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
@@ -648,7 +621,10 @@ pub(crate) fn read_paired_binding_tenant_ids_at(path: &std::path::Path) -> Vec<u
 /// Scheduled for deletion in Phase 10 item 4 (with the echo-heal).
 pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
-    let _write = paired_user_write_lock();
+    // The same lock every other `paired_user.json` writer holds, so this
+    // read-modify-write cannot interleave with a pairing, a reconcile or a
+    // heal and silently discard (or resurrect) its change.
+    let _lock = lock_binding_reconcile(&path, RECONCILE_LOCK_WAIT)?;
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -779,15 +755,6 @@ struct CoordBoundTenantsFile {
     tenant_ids: Vec<String>,
     /// Unix seconds when a register echo last carried this set.
     observed_at: i64,
-    /// The echo BEFORE `tenant_ids` (sorted, distinct), so a reader that
-    /// must not act on a single echo can take `tenant_ids ∪ prior_tenant_ids`
-    /// — the same two-echo union [`drop_confirmed_coord_set`] gives the
-    /// reconciler (plan
-    /// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
-    /// review finding 2). `None` on a sidecar written before the field
-    /// existed, which reads as "no prior echo" (current only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prior_tenant_ids: Option<Vec<String>>,
 }
 
 /// Past this age a recorded set is UNKNOWN, not evidence: coord may have
@@ -806,15 +773,11 @@ pub fn coord_bound_tenants_path() -> Option<PathBuf> {
     paired_user_path().map(|p| p.with_file_name("coord_bound_tenants.json"))
 }
 
-/// Record coord's echoed binding set (heartbeat-only writer). Returns whether
-/// the file was written. Best-effort for the caller: an `Err` means the count
-/// stays whatever the previous record (or its absence) says.
-pub fn record_coord_bound_tenants(coord_set: &[uuid::Uuid]) -> Result<bool, String> {
-    let path =
-        coord_bound_tenants_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
-    record_coord_bound_tenants_at(&path, coord_set, chrono::Utc::now().timestamp())
-}
-
+/// Record coord's echoed binding set. Returns whether the file was written.
+/// Best-effort for the caller: an `Err` means the count stays whatever the
+/// previous record (or its absence) says. Its one production caller is
+/// [`record_and_reconcile_at`], which holds the binding-store lock, so the
+/// record and the reconcile it feeds are one atomic step for the heal.
 pub(crate) fn record_coord_bound_tenants_at(
     path: &std::path::Path,
     coord_set: &[uuid::Uuid],
@@ -823,33 +786,21 @@ pub(crate) fn record_coord_bound_tenants_at(
     let mut ids: Vec<String> = coord_set.iter().map(|t| t.to_string()).collect();
     ids.sort();
     ids.dedup();
-    let existing = std::fs::read(path)
+    if let Some(existing) = std::fs::read(path)
         .ok()
-        .and_then(|b| serde_json::from_slice::<CoordBoundTenantsFile>(&b).ok());
-    if let Some(existing) = &existing {
+        .and_then(|b| serde_json::from_slice::<CoordBoundTenantsFile>(&b).ok())
+    {
         let age = now_unix - existing.observed_at;
-        // Skip only when BOTH echoes already equal this one: a set that just
-        // changed is written once more when it repeats, so `prior_tenant_ids`
-        // stops carrying a tenant the last two echoes both omit.
-        if existing.tenant_ids == ids
-            && existing.prior_tenant_ids.as_ref() == Some(&ids)
-            && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age)
-        {
+        if existing.tenant_ids == ids && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age) {
             return Ok(false);
         }
     }
-    // The previous echo becomes the prior. With no readable previous record
-    // there is no earlier echo, so the prior is this echo itself: the union
-    // a two-echo reader takes is then exactly this echo, and a steady state
-    // needs no second write to settle.
-    let prior_tenant_ids = Some(existing.map_or_else(|| ids.clone(), |e| e.tenant_ids));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let body = serde_json::to_vec_pretty(&CoordBoundTenantsFile {
         tenant_ids: ids,
         observed_at: now_unix,
-        prior_tenant_ids,
     })
     .map_err(|e| format!("serialize coord_bound_tenants.json: {e}"))?;
     // Its own tmp name: never the `json.tmp` `write_paired_user_file` uses.
@@ -949,89 +900,32 @@ pub fn coord_bound_tenants_at_within(
     now_unix: i64,
     max_age_secs: i64,
 ) -> CoordBoundTenantsRead {
-    match read_coord_bound_tenants_file(path, now_unix, max_age_secs) {
-        Ok(file) => CoordBoundTenantsRead::Known(parse_tenant_set(file.tenant_ids.iter())),
-        Err(why) => CoordBoundTenantsRead::Unknown(why),
-    }
-}
-
-/// Coord's bound-tenant set over the last TWO register echoes (`current ∪
-/// prior`), fresh enough to ACT on ([`BINDING_GAP_ASK_MAX_AGE_SECS`]).
-///
-/// What the `paired_user.json` heal reads: one short echo omitting tenant X
-/// right before a heal must not cost X its binding for good — the healed file
-/// would then exist, the heal never re-run, and reconcile only ever report X
-/// `coord_only`. The reconciler already demands two echoes before a DROP
-/// ([`drop_confirmed_coord_set`]); the heal takes the same union, so a tenant
-/// in EITHER echo with a valid slot is healed (review finding 2). A sidecar
-/// with no prior echo recorded reads as the current echo alone.
-pub fn coord_bound_tenants_two_echo_for_ask() -> CoordBoundTenantsRead {
-    let Some(path) = coord_bound_tenants_path() else {
-        return CoordBoundTenantsRead::Unknown(
-            "the secure-storage dir could not be resolved, so coord_bound_tenants.json \
-             has no path on this box",
-        );
-    };
-    coord_bound_tenants_two_echo_at_within(
-        &path,
-        chrono::Utc::now().timestamp(),
-        BINDING_GAP_ASK_MAX_AGE_SECS,
-    )
-}
-
-/// Path-parameterized core of [`coord_bound_tenants_two_echo_for_ask`]. The
-/// freshness rules are [`coord_bound_tenants_at_within`]'s, verbatim (one
-/// reader), and apply to the record's `observed_at`.
-pub fn coord_bound_tenants_two_echo_at_within(
-    path: &std::path::Path,
-    now_unix: i64,
-    max_age_secs: i64,
-) -> CoordBoundTenantsRead {
-    match read_coord_bound_tenants_file(path, now_unix, max_age_secs) {
-        Ok(file) => CoordBoundTenantsRead::Known(parse_tenant_set(
-            file.tenant_ids
-                .iter()
-                .chain(file.prior_tenant_ids.iter().flatten()),
-        )),
-        Err(why) => CoordBoundTenantsRead::Unknown(why),
-    }
-}
-
-/// Sorted, distinct, well-formed UUIDs out of stringified ids.
-fn parse_tenant_set<'a>(ids: impl Iterator<Item = &'a String>) -> Vec<uuid::Uuid> {
-    ids.filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-/// The ONE reader of `coord_bound_tenants.json`: parse it and apply the
-/// freshness window, or say why nothing was established.
-fn read_coord_bound_tenants_file(
-    path: &std::path::Path,
-    now_unix: i64,
-    max_age_secs: i64,
-) -> Result<CoordBoundTenantsFile, &'static str> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
+            return CoordBoundTenantsRead::Unknown(
                 "coord_bound_tenants.json is ABSENT — the heartbeat has never recorded \
                  coord's binding set for this device here, so the bound set is UNKNOWN \
                  (not zero)",
             )
         }
-        Err(_) => return Err("coord_bound_tenants.json could not be read (permissions or I/O)"),
+        Err(_) => {
+            return CoordBoundTenantsRead::Unknown(
+                "coord_bound_tenants.json could not be read (permissions or I/O)",
+            )
+        }
     };
     let Ok(file) = serde_json::from_slice::<CoordBoundTenantsFile>(&bytes) else {
-        return Err("coord_bound_tenants.json is malformed — nothing was established");
+        return CoordBoundTenantsRead::Unknown(
+            "coord_bound_tenants.json is malformed — nothing was established",
+        );
     };
     let age = now_unix - file.observed_at;
     // A reader that ACTS demands a tighter window than the 24 h report; say
     // which window refused it.
     let is_act_window = max_age_secs < COORD_BOUND_TENANTS_MAX_AGE_SECS;
     if age > max_age_secs && is_act_window {
-        return Err(
+        return CoordBoundTenantsRead::Unknown(
             "coord_bound_tenants.json is older than the window this reader may ACT on \
              (BINDING_GAP_ASK_MAX_AGE_SECS) — a live heartbeat restamps it hourly, so the \
              heartbeat is down or coord stopped echoing tenant_ids, and an unbind since \
@@ -1043,19 +937,26 @@ fn read_coord_bound_tenants_file(
         // Getting here means the heartbeat is down or coord stopped echoing
         // `tenant_ids` — an unpair seen by neither would otherwise be counted
         // forever, and a stale set is not evidence.
-        return Err(
+        return CoordBoundTenantsRead::Unknown(
             "coord_bound_tenants.json is older than COORD_BOUND_TENANTS_MAX_AGE_SECS \
              (24h) — the heartbeat is down or coord stopped echoing tenant_ids, so the \
              bound set is UNKNOWN (not zero)",
         );
     }
     if age < -300 {
-        return Err(
+        return CoordBoundTenantsRead::Unknown(
             "coord_bound_tenants.json is stamped implausibly in the future — the clock \
              moved, so the record is not evidence",
         );
     }
-    Ok(file)
+    CoordBoundTenantsRead::Known(
+        file.tenant_ids
+            .iter()
+            .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Reconcile the local binding state (`paired_user.json` v2 entries +
@@ -1128,7 +1029,9 @@ struct OmissionStreak {
 /// Written by the reconcile (advance) and by `persist_pairing_with` (reset on a
 /// fresh pairing). Both do so only while holding the binding-reconcile lock
 /// ([`lock_binding_reconcile`]), which serializes them across threads and
-/// processes.
+/// processes. Read, under the same lock, by the `paired_user.json` heal, whose
+/// bound set includes the tenants it is holding
+/// ([`coord_bound_tenants_for_heal_at`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct OmissionStreaksFile {
     #[serde(default)]
@@ -1143,6 +1046,15 @@ fn omission_streaks_path(paired_user: &std::path::Path) -> PathBuf {
 /// reconcile pass AND a whole `persist_pairing_with`, so a pairing can never
 /// land between a reconcile's decision and its clears, and the streak file is
 /// never read-modify-written by two writers at once.
+///
+/// It is THE lock for every read-modify-write of `paired_user.json`: the
+/// `paired_user.json` heal ([`heal_vanished_paired_user_with`]) holds it from
+/// its re-check through its write and re-takes it for each credential copy,
+/// and [`backfill_paired_tenant_id`] and [`converge_binding_store_with`] hold
+/// it across theirs — so no writer's rename can silently discard another's
+/// change. None of them calls another while holding it, and
+/// [`crate::secure_storage::lock_file_exclusive_within`] REFUSES a nested
+/// acquisition on one thread rather than deadlocking on it.
 fn lock_binding_reconcile(
     paired_user: &std::path::Path,
     timeout: std::time::Duration,
@@ -1155,12 +1067,21 @@ fn lock_binding_reconcile(
 /// get it just tries again next heartbeat.
 const RECONCILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long the startup [`converge_binding_store_with`] waits for the lock. It
+/// runs on the runner's setup thread, ahead of window creation, so it waits
+/// briefly and skips (best-effort, retried next start) rather than stall the
+/// window behind another process's pairing or reconcile.
+const CONVERGE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long `persist_pairing_with` waits for the reconcile lock. It runs AFTER
 /// coord already minted the credential, so failing here discards a good token:
 /// the budget must sit clearly above a reconcile's worst-case hold: three
 /// store-lock waits (the one batched conditional clear, then the default
 /// re-point's `store_tokens` — its legacy write and its `mirror_into_tenant_slot`
 /// write — 10 s each), one bounded keychain call (3 s), plus file I/O (~33 s).
+/// The heal's holds stay inside that: its decision section writes no
+/// credential, and its longest copy section is one `store_tokens` (two store
+/// waits and one keychain call).
 pub(crate) const PAIRING_RECONCILE_LOCK_WAIT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -1283,39 +1204,124 @@ pub(crate) fn reconcile_paired_bindings_at(
 ) -> Result<BindingReconcileReport, String> {
     // One pass is one critical section: decide, then clear, with no pairing
     // able to interleave (persist_pairing_with takes the same lock).
-    let _write = paired_user_write_lock();
     let _reconcile_lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
+    reconcile_paired_bindings_locked(mgr, path, coord_set, now_unix)
+}
+
+/// The register heartbeat's ONE critical section over a `tenant_ids` echo:
+/// record it in `coord_bound_tenants.json` AND reconcile against it under a
+/// single hold of the binding-store lock ([`lock_binding_reconcile`]).
+///
+/// The `paired_user.json` heal reads the echo and the omission streaks
+/// together under that lock ([`coord_bound_tenants_for_heal_at`]). Recorded
+/// outside it, a heal could land between the record and the reconcile and see
+/// echo N+1 (omitting tenant B) beside the streaks of pass N (no entry for B):
+/// B in neither half, healed out of the file for good. One hold makes the
+/// pair atomic. A lock that cannot be had records NOTHING either — the
+/// sidecar is restamped by the next heartbeat — rather than reopen that gap.
+/// A failed record is logged and the reconcile still runs, as before.
+pub fn record_and_reconcile_coord_bound_tenants(
+    coord_set: &[uuid::Uuid],
+) -> Result<BindingReconcileReport, String> {
+    let mgr = crate::auth::AuthManager::new();
+    let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    let sidecar = coord_bound_tenants_path()
+        .ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    record_and_reconcile_at(
+        &mgr,
+        &path,
+        &sidecar,
+        coord_set,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// Parameterized core of [`record_and_reconcile_coord_bound_tenants`].
+pub(crate) fn record_and_reconcile_at(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    sidecar: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    now_unix: i64,
+) -> Result<BindingReconcileReport, String> {
+    let _reconcile_lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
+    // Record coord's COUNT before reconciling: the plan adapter asks "is this
+    // device bound to more than one tenant?", which the slot-backed binding
+    // file cannot answer (plan
+    // 2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device).
+    if let Err(e) = record_coord_bound_tenants_at(sidecar, coord_set, now_unix) {
+        tracing::debug!("reconcile: coord-bound tenant record non-fatal: {e}");
+    }
+    reconcile_paired_bindings_locked(mgr, path, coord_set, now_unix)
+}
+
+/// The body of one reconcile pass. The caller holds [`lock_binding_reconcile`].
+fn reconcile_paired_bindings_locked(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    now_unix: i64,
+) -> Result<BindingReconcileReport, String> {
     let mut report = BindingReconcileReport::default();
 
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Never paired locally — nothing to reconcile. Coord-side
-            // bindings without ANY local file are still worth flagging.
-            // No file means no default binding, so no legacy-slot fallback
-            // applies to any of them; the slot state is reported anyway
-            // because an orphan slot with no file is a real (and different)
-            // state from never having been issued one.
-            for t in coord_set {
-                report
-                    .coord_only
-                    .push((*t, crate::auth::read_tenant_slot(mgr, t).state()));
+    // An ABSENT file is reconciled as an empty binding set, never skipped: its
+    // slots are all orphans and run the same omission streaks as any other
+    // (plan 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential).
+    // Skipping froze the streaks for exactly the window a vanished file opens,
+    // so the heal — which reads them to tell a held tenant from a dropped one
+    // ([`coord_bound_tenants_for_heal_at`]) — could resurrect a tenant coord
+    // had omitted from every echo since. No file means no default binding, so
+    // no legacy-slot fallback applies to any coord tenant (each is reported
+    // `coord_only` with its own slot's state), and nothing below writes a
+    // file into the gap: the heal and pairing own its re-creation.
+    //
+    // An UNPARSEABLE file is walked the same way, for the same reason — the
+    // heal treats it as vanished too — and is never overwritten here: the heal
+    // sets it aside before it rebuilds.
+    let no_bindings = || PairedUserFile {
+        user_id: String::new(),
+        tenant_id: None,
+        bindings: Vec::new(),
+        default_tenant_id: None,
+    };
+    let (pf, file_unusable) = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<PairedUserFile>(&bytes) {
+            Ok(pf) => (pf, false),
+            Err(e) => {
+                tracing::warn!(
+                    "reconcile: {} is unparseable ({e}) — reconciling its slots as an empty \
+                     binding set and leaving the file to the heal",
+                    path.display()
+                );
+                (no_bindings(), true)
             }
-            return Ok(report);
-        }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (no_bindings(), true),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let pf: PairedUserFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
 
     // Hysteresis: a tenant (binding or orphan slot) missing from this echo is
     // dropped only once it has been missing from RECONCILE_DROP_AFTER_OMISSIONS
     // consecutive echoes; until then it is held exactly as if coord had echoed it.
+    //
+    // The tenant a USABLE legacy `access_token` names is tracked too. On a
+    // legacy-only install that token is a tenant's ONLY credential, held by
+    // neither a binding entry nor a per-tenant slot; without a streak of its
+    // own, one short echo would take it out of the heal's bound set
+    // ([`coord_bound_tenants_for_heal_at`]) and the heal would discard it.
+    // Tracking it clears nothing: a due tenant with no per-tenant slot has no
+    // slot to clear, and the legacy slot is never cleared here.
     let bindings = pf.effective_bindings();
+    let default_slot_read = crate::auth::read_legacy_slot(mgr);
+    let legacy_claim = match &default_slot_read {
+        crate::auth::SlotRead::Usable(token) => crate::auth::jwt_tenant_claim(token),
+        _ => None,
+    };
     let mut omitted: Vec<uuid::Uuid> = bindings
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
         .chain(mgr.list_tenant_device_jwt_tenants())
+        .chain(legacy_claim)
         .filter(|t| !coord_set.contains(t))
         .collect();
     omitted.sort();
@@ -1475,8 +1481,8 @@ pub(crate) fn reconcile_paired_bindings_at(
     // for the default tenant and no other — exactly as the selector does.
     // Flagging a tenant the selector serves would send an operator to re-pair
     // something that works; NOT flagging one whose slot expired is the defect
-    // this predicate was unified to end.
-    let default_slot_read = crate::auth::read_legacy_slot(mgr);
+    // this predicate was unified to end. (`default_slot_read` was read once,
+    // above, with the omission set; the clears never touch the legacy slot.)
     let default_slot = default_slot_read.state();
     // ...and whether that token is the DEFAULT binding's credential at all: a
     // usable legacy token whose claim names another tenant (or an unclaimed one
@@ -1538,7 +1544,10 @@ pub(crate) fn reconcile_paired_bindings_at(
 
     let changed =
         !report.dropped.is_empty() || report.default_repointed.is_some() || dropped_malformed;
-    if changed {
+    // An absent or unparseable file has no bindings to drop and no default to
+    // re-point, so `changed` is false there by construction; the guard states
+    // it.
+    if changed && !file_unusable {
         let default_binding = new_default.and_then(|d| {
             kept.iter()
                 .find(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(d))
@@ -1573,42 +1582,6 @@ fn most_recently_paired(bindings: &[PairedBinding]) -> Option<&PairedBinding> {
     bindings.iter().max_by(|a, b| a.paired_at.cmp(&b.paired_at))
 }
 
-/// Phase 4 of plan
-/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`:
-/// the set the heartbeat may hand [`reconcile_paired_bindings`], which DROPS
-/// every local binding (and clears its credential slot) that set omits.
-///
-/// A drop is destructive and a slot it clears cannot be healed locally, so a
-/// single register echo is not enough evidence for one: a transient or short
-/// echo would cost the operator a re-pair per tenant. A drop therefore needs
-/// TWO consecutive observations — this echo (`current`) and the previous one
-/// recorded in `coord_bound_tenants.json` (`prior`, read BEFORE this echo is
-/// recorded). The result is `current ∪ prior`, so only a tenant absent from
-/// both is dropped; a real unbind is honoured one heartbeat later.
-///
-/// `None` when `prior` is UNKNOWN: with no previous observation there is no
-/// confirmation, and the caller skips reconciliation for this echo (it records
-/// the echo, so the next heartbeat has its `prior`). Unknown is never read as
-/// "confirmed" (served policy `verification-and-evidence`
-/// `unknown-must-not-render-as-a-default`).
-pub fn drop_confirmed_coord_set(
-    current: &[uuid::Uuid],
-    prior: &CoordBoundTenantsRead,
-) -> Option<Vec<uuid::Uuid>> {
-    match prior {
-        CoordBoundTenantsRead::Known(prior) => Some(
-            current
-                .iter()
-                .chain(prior.iter())
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-        ),
-        CoordBoundTenantsRead::Unknown(_) => None,
-    }
-}
-
 // ============================================================================
 // Self-heal of a vanished `paired_user.json` (plan
 // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential,
@@ -1638,6 +1611,11 @@ pub enum PairedUserHeal {
     /// The file needs healing, credentials exist, but a guard refused — and
     /// why. Nothing was written.
     Refused(String),
+    /// The pass could not take the binding-store lock
+    /// ([`lock_binding_reconcile`]) — a pairing, reconcile or heal in another
+    /// thread or process held it past the wait. NOTHING was measured or
+    /// written; the next tick retries. Never read as a refusal: no guard ran.
+    Deferred(String),
 }
 
 /// Why `paired_user.json` at `path` needs healing — `Ok(None)` when it does
@@ -1673,15 +1651,17 @@ pub fn paired_user_heal_cause() -> Result<Option<&'static str>, String> {
 }
 
 /// Heal a vanished `paired_user.json` for THIS process's storage dir, from
-/// the held device JWTs and coord's act-grade bound set over its last two
-/// register echoes ([`coord_bound_tenants_two_echo_for_ask`]). See
+/// the held device JWTs and the bound set the reconciler itself honours
+/// ([`coord_bound_tenants_for_heal_at`]). See
 /// [`heal_vanished_paired_user_with`] for the rule. Blocking (file +
-/// credential-store reads).
+/// credential-store I/O and the binding-store lock, whose wait is bounded):
+/// callers run it off any async worker.
 ///
 /// Cheap when there is nothing to heal: the file is classified BEFORE the
-/// credential store is opened, so a healthy runner pays one small file read.
+/// lock is taken or the credential store opened, so a healthy runner pays
+/// one small file read.
 pub fn heal_vanished_paired_user() -> PairedUserHeal {
-    let Some(path) = paired_user_path() else {
+    let (Some(path), Some(sidecar)) = (paired_user_path(), coord_bound_tenants_path()) else {
         return PairedUserHeal::Refused(
             "the secure-storage dir could not be resolved, so paired_user.json has no path"
                 .to_string(),
@@ -1691,11 +1671,61 @@ pub fn heal_vanished_paired_user() -> PairedUserHeal {
         return PairedUserHeal::NotNeeded;
     }
     let mgr = crate::auth::AuthManager::new();
-    let heal = heal_vanished_paired_user_with(&mgr, &path, &coord_bound_tenants_two_echo_for_ask());
-    if let PairedUserHeal::Refused(why) = &heal {
-        log_heal_refusal_on_change(why);
+    let heal = heal_vanished_paired_user_hooked(
+        &mgr,
+        &path,
+        &|| coord_bound_tenants_for_heal_at(&path, &sidecar, chrono::Utc::now().timestamp()),
+        &HealHooks::NONE,
+    );
+    match &heal {
+        PairedUserHeal::Refused(why) => log_heal_refusal_on_change(why),
+        PairedUserHeal::Deferred(why) => tracing::debug!("paired_user.json heal deferred: {why}"),
+        _ => {}
     }
     heal
+}
+
+/// What the heal treats as coord's bound set: the act-grade echo
+/// ([`coord_bound_tenants_at_within`] over [`BINDING_GAP_ASK_MAX_AGE_SECS`])
+/// PLUS every tenant the reconciler is currently HOLDING — omitted from the
+/// latest echo, but fewer than [`RECONCILE_DROP_AFTER_OMISSIONS`] consecutive
+/// times, per `coord_omission_streaks.json`. `Unknown` when the echo is.
+///
+/// ONE source of truth for "is this tenant still bound": the reconciler keeps
+/// a held tenant's binding and slot exactly as if coord had echoed it, so the
+/// heal does too — one short echo right before a heal cannot cost a tenant
+/// its binding. A tenant whose omission run REACHED the threshold has been
+/// consumed from the streak file (and its slot cleared by that reconcile), so
+/// it is in neither half and is never resurrected. The heal does not touch
+/// the streaks: a healed binding for a held tenant is dropped by the very
+/// next reconcile that omits it again, as it would have been had the file
+/// never vanished. The caller holds [`lock_binding_reconcile`], and the one
+/// writer of both files ([`record_and_reconcile_at`]) writes them under it in
+/// one hold, so the echo and the streaks are read as one consistent state.
+pub(crate) fn coord_bound_tenants_for_heal_at(
+    paired_user: &std::path::Path,
+    sidecar: &std::path::Path,
+    now_unix: i64,
+) -> CoordBoundTenantsRead {
+    match coord_bound_tenants_at_within(sidecar, now_unix, BINDING_GAP_ASK_MAX_AGE_SECS) {
+        CoordBoundTenantsRead::Known(mut set) => {
+            set.extend(held_omission_tenants(paired_user));
+            set.sort();
+            set.dedup();
+            CoordBoundTenantsRead::Known(set)
+        }
+        unknown @ CoordBoundTenantsRead::Unknown(_) => unknown,
+    }
+}
+
+/// Tenants `coord_omission_streaks.json` holds below the drop threshold.
+fn held_omission_tenants(paired_user: &std::path::Path) -> Vec<uuid::Uuid> {
+    read_omission_streaks(&omission_streaks_path(paired_user))
+        .tenants
+        .iter()
+        .filter(|(_, streak)| streak.consecutive < RECONCILE_DROP_AFTER_OMISSIONS)
+        .filter_map(|(t, _)| uuid::Uuid::parse_str(t.trim()).ok())
+        .collect()
 }
 
 /// A refusal repeats every refresher tick; log it when its reason CHANGES,
@@ -1730,10 +1760,11 @@ struct HealSource {
 ///
 /// 1. `bound` is [`CoordBoundTenantsRead::Known`]. `Unknown` heals nothing:
 ///    a coord-side unbind must never be resurrected (09-25 vet correction 11),
-///    and an unread set cannot rule one out. Production passes the union of
-///    coord's last TWO echoes, the same union the reconciler requires before
-///    a drop, so one short echo cannot cost a tenant its binding (review
-///    finding 2).
+///    and an unread set cannot rule one out. Production passes
+///    [`coord_bound_tenants_for_heal_at`] — the latest echo plus the tenants
+///    the reconciler's omission hysteresis is still HOLDING — so one short
+///    echo cannot cost a tenant its binding, and a drop the reconciler has
+///    confirmed is never undone (review finding 2).
 /// 2. the credential is VALID — decodable and unexpired
 ///    ([`crate::auth::read_tenant_slot`] / [`crate::auth::read_legacy_slot`]
 ///    → `Usable`, the same predicate the bearer selector applies) — its own
@@ -1757,15 +1788,24 @@ struct HealSource {
 /// for a tenant coord does not list as bound is discarded, never given a
 /// slot ([`preserve_legacy_credential`]).
 ///
-/// The recheck, the rename-aside of an unparseable file and the write run
-/// under [`paired_user_write_lock`], so a pairing that lands while the slots
-/// were being read is never overwritten (review finding 4). The credential
-/// copies run after that guard is dropped, each re-taking the lock briefly
-/// and RE-CHECKING before it writes — the preserve only while its tenant
-/// still has no usable slot, the default's legacy copy only while the file
-/// still names the healed default and user and the legacy slot still holds
-/// what the heal read — so a pairing that lands in between is never
-/// overwritten either (review round 3). An unparseable file is renamed aside to
+/// Everything from the re-check of the file through its write — the
+/// credential reads, the bound-set read, the guards, the rename-aside of an
+/// unparseable file and the write — runs under the binding-store lock
+/// ([`lock_binding_reconcile`]), the SAME cross-process lock
+/// [`reconcile_paired_bindings_with`] holds for a whole pass and
+/// [`persist_pairing_with`] for a whole pairing. So a pairing never lands
+/// between the heal's decision and its write, and a reconcile never decides
+/// against a half-healed store (review finding 4). Nothing called under it
+/// takes it again (the lock REFUSES a nested same-thread acquisition); the
+/// credential-store writes below take only the store's own lock. The
+/// credential copies run after that section releases the lock, each
+/// re-taking it briefly and RE-CHECKING before it writes — the preserve only
+/// while its tenant still has no usable slot, the default's legacy copy only
+/// while the file still names the healed default and user and the legacy slot
+/// still holds what the heal read — so a pairing that lands in between is
+/// never overwritten either (review round 3). A lock that cannot be had within
+/// its wait is [`PairedUserHeal::Deferred`] (nothing measured, nothing
+/// written). An unparseable file is renamed aside to
 /// `paired_user.json.unparseable-<UTC timestamp>` before the write, never
 /// silently destroyed (review finding 7).
 ///
@@ -1784,23 +1824,71 @@ pub(crate) fn heal_vanished_paired_user_with(
     path: &std::path::Path,
     bound: &CoordBoundTenantsRead,
 ) -> PairedUserHeal {
-    heal_vanished_paired_user_hooked(mgr, path, bound, &|| {}, &|| {})
+    heal_vanished_paired_user_hooked(mgr, path, &|| bound.clone(), &HealHooks::NONE)
 }
 
-/// [`heal_vanished_paired_user_with`] with two hooks, one per window a
-/// concurrent pairing can land in: `before_write` runs after the credentials
-/// are read and immediately BEFORE the write lock is taken for the file
-/// write; `before_copy` runs after that lock is released and immediately
-/// BEFORE the credential copies ([`preserve_legacy_credential`] and the
-/// default's legacy-slot copy). Production passes no-ops; the recheck tests
-/// land real pairings there.
+/// Test seams for [`heal_vanished_paired_user_hooked`], one per window a
+/// concurrent writer can land in. Production passes [`HealHooks::NONE`].
+pub(crate) struct HealHooks<'a> {
+    /// After the unlocked first look at the file, immediately BEFORE the
+    /// binding-store lock is taken — a pairing landing here is seen by the
+    /// locked re-check.
+    pub before_lock: &'a dyn Fn(),
+    /// INSIDE the locked section, after the decision and immediately before
+    /// the set-aside and the write — a concurrent writer on another thread
+    /// must wait for the lock here.
+    pub while_locked: &'a dyn Fn(),
+    /// After the locked section released the lock and immediately BEFORE the
+    /// credential copies ([`preserve_legacy_credential`] and
+    /// [`copy_default_into_legacy_slot`]).
+    pub before_copy: &'a dyn Fn(),
+}
+
+fn no_heal_hook() {}
+
+impl HealHooks<'static> {
+    /// No hooks.
+    pub(crate) const NONE: Self = Self {
+        before_lock: &no_heal_hook,
+        while_locked: &no_heal_hook,
+        before_copy: &no_heal_hook,
+    };
+}
+
+/// [`heal_vanished_paired_user_with`] over an injected bound-set READER
+/// (called once, under the lock) and [`HealHooks`].
 fn heal_vanished_paired_user_hooked(
     mgr: &crate::auth::AuthManager,
     path: &std::path::Path,
-    bound: &CoordBoundTenantsRead,
-    before_write: &dyn Fn(),
-    before_copy: &dyn Fn(),
+    bound: &dyn Fn() -> CoordBoundTenantsRead,
+    hooks: &HealHooks<'_>,
 ) -> PairedUserHeal {
+    // An unlocked first look, so a healthy file costs no lock.
+    match paired_user_vanished_cause(path) {
+        Ok(Some(_)) => {}
+        Ok(None) => return PairedUserHeal::NotNeeded,
+        Err(e) => {
+            return PairedUserHeal::Refused(format!(
+                "paired_user.json could not be read ({e}) — an unreadable file is not a \
+                 vanished one, so it is left alone"
+            ))
+        }
+    }
+    (hooks.before_lock)();
+    // The decision and the write are ONE critical section under the lock every
+    // `paired_user.json` writer holds. Released (dropped) right after the
+    // write, before the credential copies.
+    let lock = match lock_binding_reconcile(path, RECONCILE_LOCK_WAIT) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return PairedUserHeal::Deferred(format!(
+                "the binding-store lock could not be taken ({e}) — nothing measured or \
+                 written; the next tick retries"
+            ))
+        }
+    };
+    // A real pairing may have landed since the first look. Re-check the
+    // predicate under the lock so a heal never clobbers it.
     let cause = match paired_user_vanished_cause(path) {
         Ok(Some(cause)) => cause,
         Ok(None) => return PairedUserHeal::NotNeeded,
@@ -1841,8 +1929,10 @@ fn heal_vanished_paired_user_hooked(
         // to heal from, and that is not a guard refusing.
         return PairedUserHeal::NothingToHealFrom;
     }
-    // Guard 1: coord's bound set must be KNOWN.
-    let known = match bound {
+    // Guard 1: coord's bound set must be KNOWN. Read under the lock, so it
+    // is the set the reconciler is acting on right now.
+    let bound = bound();
+    let known = match &bound {
         CoordBoundTenantsRead::Known(set) => set,
         CoordBoundTenantsRead::Unknown(why) => {
             return PairedUserHeal::Refused(format!(
@@ -1969,64 +2059,45 @@ fn heal_vanished_paired_user_hooked(
         );
     };
 
-    before_write();
-    // The recheck, the set-aside and the file write run under the write lock.
-    // The credential-store copies below re-take it on their own after this
-    // guard is dropped, and do their (bounded) keychain I/O under it, as
-    // `persist_pairing_with` already does (review round 3).
-    let cause = {
-        let _write = paired_user_write_lock();
-        // A real pairing may have landed while the credentials were read.
-        // Re-check the predicate under the lock so a heal never clobbers it.
-        let cause = match paired_user_vanished_cause(path) {
-            Ok(Some(c)) => c,
-            Ok(None) => return PairedUserHeal::NotNeeded,
+    (hooks.while_locked)();
+    if cause == "unparseable" {
+        match set_aside_unparseable(path) {
+            Ok(aside) => tracing::warn!(
+                "paired_user.json heal: the unparseable file was renamed aside to {} before \
+                 the rebuild (nothing reads it; kept for inspection)",
+                aside.display()
+            ),
             Err(e) => {
                 return PairedUserHeal::Refused(format!(
-                    "paired_user.json became unreadable before the heal could write ({e}) — left \
-                 alone"
+                    "paired_user.json is unparseable and could not be renamed aside ({e}) — \
+                     refusing to overwrite it"
                 ))
             }
-        };
-        if cause == "unparseable" {
-            match set_aside_unparseable(path) {
-                Ok(aside) => tracing::warn!(
-                    "paired_user.json heal: the unparseable file was renamed aside to {} before \
-                 the rebuild (nothing reads it; kept for inspection)",
-                    aside.display()
-                ),
-                Err(e) => {
-                    return PairedUserHeal::Refused(format!(
-                        "paired_user.json is unparseable and could not be renamed aside ({e}) — \
-                     refusing to overwrite it"
-                    ))
-                }
-            }
         }
-        let out = PairedUserFile {
-            user_id: default_source.binding.user_id.clone(),
-            tenant_id: Some(default_tenant.to_string()),
-            bindings,
-            default_tenant_id: Some(default_tenant.to_string()),
-        };
-        if let Err(e) = write_paired_user_file(path, &out) {
-            return PairedUserHeal::Refused(format!(
-                "paired_user.json is {cause} and {} tenant(s) qualified, but the write failed: {e}",
-                tenants.len()
-            ));
-        }
-        cause
+    }
+    let out = PairedUserFile {
+        user_id: default_source.binding.user_id.clone(),
+        tenant_id: Some(default_tenant.to_string()),
+        bindings,
+        default_tenant_id: Some(default_tenant.to_string()),
     };
+    if let Err(e) = write_paired_user_file(path, &out) {
+        return PairedUserHeal::Refused(format!(
+            "paired_user.json is {cause} and {} tenant(s) qualified, but the write failed: {e}",
+            tenants.len()
+        ));
+    }
+    drop(lock);
     // D4: the legacy access_token slot holds the DEFAULT binding's JWT. The
-    // copies run after the file-write lock is released, each re-taking it
+    // copies run after the binding-store lock is released, each re-taking it
     // briefly and RE-CHECKING before it writes (review round 3): a pairing
     // (`persist_pairing_with`, which writes its credentials under the same
     // lock) that landed in between must never have its fresh token replaced
     // by the older one this heal read. The preserve still precedes the
     // replacing `store_tokens`.
-    before_copy();
+    (hooks.before_copy)();
     if legacy_default != Some(default_tenant) {
-        preserve_legacy_credential(mgr, legacy_jwt.as_deref(), legacy_tenant, known);
+        preserve_legacy_credential(mgr, path, legacy_jwt.as_deref(), legacy_tenant, known);
         copy_default_into_legacy_slot(mgr, path, default_source, &legacy_before);
     }
     tracing::warn!(
@@ -2046,18 +2117,20 @@ fn heal_vanished_paired_user_hooked(
 /// Before the heal overwrites the legacy slot with the default's JWT: a
 /// USABLE legacy credential whose claim names a tenant with no usable
 /// per-tenant slot of its own is that tenant's ONLY copy, so it is written to
-/// `device_jwt:<tenant>` first — but ONLY when coord's known (two-echo) set
-/// lists that tenant as bound (a bound tenant whose token failed another
+/// `device_jwt:<tenant>` first — but ONLY when the heal's known set
+/// ([`coord_bound_tenants_for_heal_at`]) lists that tenant as bound (a bound tenant whose token failed another
 /// guard, e.g. a missing `user_id` claim). A tenant OUTSIDE the known set is
 /// one coord unbound: preserving its token would mint a `device_jwt:<tenant>`
 /// slot for an unbound tenant, which the refresher would keep refreshing and
 /// which would feed the credential posture (the fold and the heartbeat's slot
-/// fallback) until the next confirmed reconcile clears it as an orphan
-/// ([`reconcile_paired_bindings_with`]) (review round 2, MEDIUM 1). Its token is discarded (logged, never its content) and
-/// overwritten. Best-effort and logged; a claimless token has no slot to go
-/// to and is overwritten, as before.
+/// fallback) until reconcile's omission streak clears it as an orphan
+/// ([`reconcile_paired_bindings_with`]) (review round 2, MEDIUM 1). Its token
+/// is discarded (logged, never its content) and overwritten. Best-effort and
+/// logged; a claimless token has no slot to go to and is overwritten, as
+/// before.
 fn preserve_legacy_credential(
     mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
     legacy_jwt: Option<&str>,
     legacy_tenant: Option<uuid::Uuid>,
     known: &[uuid::Uuid],
@@ -2065,11 +2138,24 @@ fn preserve_legacy_credential(
     let (Some(jwt), Some(lt)) = (legacy_jwt, legacy_tenant) else {
         return;
     };
-    // The usable-slot check and the write are one step under the write lock,
-    // so a pairing for `lt` that lands meanwhile (it writes `lt`'s slot under
-    // the same lock) is seen and never overwritten with this older token
-    // (review round 3). Nothing called here takes the lock.
-    let _write = paired_user_write_lock();
+    // The usable-slot check and the write are one step under the
+    // binding-store lock, so a pairing for `lt` that lands meanwhile (it
+    // writes `lt`'s slot under the same lock) is seen and never overwritten
+    // with this older token (review round 3). Nothing called here takes it
+    // again; the slot write takes only the store's own lock. The pairing
+    // budget: like a pairing, this runs after a decision that is lost if it
+    // gives up, and a holder's worst case is a reconcile's.
+    let _lock = match lock_binding_reconcile(path, PAIRING_RECONCILE_LOCK_WAIT) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                "paired_user.json heal: could not take the binding-store lock to preserve \
+                 tenant {lt}'s legacy credential ({e}) — leaving the legacy slot untouched \
+                 this tick"
+            );
+            return;
+        }
+    };
     if matches!(
         crate::auth::read_tenant_slot(mgr, &lt),
         crate::auth::SlotRead::Usable(_)
@@ -2099,8 +2185,9 @@ fn preserve_legacy_credential(
 
 /// The heal's D4 copy of the default binding's JWT into the legacy
 /// `access_token` slot (which `store_tokens` also mirrors into
-/// `device_jwt:<default>`), done under [`paired_user_write_lock`] and ONLY
-/// while nothing has moved since the heal read and wrote (review round 3):
+/// `device_jwt:<default>`), done under the binding-store lock
+/// ([`lock_binding_reconcile`]) and ONLY while nothing has moved since the
+/// heal read and wrote (review round 3):
 ///
 /// - the file still names `source.tenant` as its default, and that binding —
 ///   and the file's top-level `user_id` — still name `source`'s user (a
@@ -2116,7 +2203,13 @@ fn preserve_legacy_credential(
 /// own credential. It can, however, leave the legacy slot holding another
 /// tenant's token while the file names this default (D4 out of step) until
 /// the next pairing or reconcile — the right side to err on.
-/// Tokens are compared, never logged. Nothing called here takes the lock.
+///
+/// The lock covers every `paired_user.json` writer, NOT the background
+/// refresher, which writes the legacy slot and its per-tenant mirror under the
+/// credential store's own lock only: a re-mint landing inside this copy can be
+/// overwritten by an older (still usable) token, which the next refresh
+/// replaces. Tokens are compared, never logged. Nothing called here takes the
+/// binding-store lock again; `store_tokens` takes only the store's own lock.
 fn copy_default_into_legacy_slot(
     mgr: &crate::auth::AuthManager,
     path: &std::path::Path,
@@ -2124,8 +2217,18 @@ fn copy_default_into_legacy_slot(
     legacy_before: &crate::secure_storage::StoredTokenRead,
 ) {
     use crate::secure_storage::StoredTokenRead;
-    let _write = paired_user_write_lock();
     let default_tenant = source.tenant;
+    let _lock = match lock_binding_reconcile(path, PAIRING_RECONCILE_LOCK_WAIT) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                "paired_user.json heal: could not take the binding-store lock to copy default \
+                 {default_tenant}'s credential into the legacy access_token ({e}) — skipped \
+                 (the per-tenant slot still serves it)"
+            );
+            return;
+        }
+    };
     let file_still_ours = read_paired_user_file_at(path).is_some_and(|pf| {
         let default_is_ours = pf
             .effective_default_tenant_id()
@@ -3337,7 +3440,6 @@ pub(crate) fn persist_pairing_with(
     resp: &PairCompleteResponse,
     tenant_id: uuid::Uuid,
 ) -> Result<(), String> {
-    let _write = paired_user_write_lock();
     // 1. The paired tenant's slot ALWAYS gets the fresh JWT.
     //
     // `_fresh` (overwrite a present-but-unreadable store) because `persist_pairing`
@@ -6117,8 +6219,23 @@ pub(crate) fn converge_binding_store_with(
     others: &[PathBuf],
     holds_credential: &dyn Fn(&uuid::Uuid, bool) -> Option<bool>,
 ) -> BindingStoreMergeReport {
-    let _write = paired_user_write_lock();
     let mut report = BindingStoreMergeReport::default();
+    // The lock every `paired_user.json` writer holds, on the CANONICAL file
+    // this pass rewrites: a pairing, reconcile or heal racing the merge would
+    // otherwise have its write discarded by the merge's rename. Best-effort
+    // like the rest of the pass: a lock that cannot be had skips convergence
+    // (nothing is merged or renamed) rather than writing without it.
+    let _lock = match lock_binding_reconcile(canonical, CONVERGE_LOCK_WAIT) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "converge_binding_store: could not take the binding-store lock for {} ({e}) \
+                 — skipping convergence this start (nothing merged or renamed)",
+                canonical.display()
+            );
+            return report;
+        }
+    };
 
     // The canonical file is the base. A missing one is not an invitation to
     // synthesize a binding store out of stale copies: with nothing local to
@@ -7291,47 +7408,32 @@ mod vanished_paired_user_heal_tests {
         assert_eq!(std::fs::read(&path).unwrap(), healthy.as_bytes());
     }
 
-    /// Phase 4: a binding drop needs two consecutive observations. One short
-    /// echo keeps every tenant the previous echo held; an absent previous
-    /// record defers reconciliation entirely.
-    #[test]
-    fn a_single_short_echo_cannot_drop_a_binding() {
-        let prior = known(&[ta(), tb()]);
-        assert_eq!(
-            drop_confirmed_coord_set(&[ta()], &prior),
-            Some(vec![ta(), tb()])
-        );
-        assert_eq!(
-            drop_confirmed_coord_set(&[], &prior),
-            Some(vec![ta(), tb()])
-        );
-        // Confirmed on the second echo: the prior is now the short set.
-        assert_eq!(
-            drop_confirmed_coord_set(&[ta()], &known(&[ta()])),
-            Some(vec![ta()])
-        );
-        assert_eq!(
-            drop_confirmed_coord_set(&[ta()], &CoordBoundTenantsRead::Unknown("never recorded")),
-            None
-        );
-    }
+    /// Reconcile clock for the hysteresis tests; successive heartbeats are
+    /// 30 s apart (above `RECONCILE_OMISSION_MIN_SPACING_SECS`).
+    const T0: i64 = 1_790_000_000;
 
-    /// End to end over the real reconciler: a short echo, run through the
-    /// confirmation, leaves both bindings and both slots in place.
+    /// Phase 4 over the reconciler's own omission hysteresis: ONE short echo
+    /// after a heal keeps the healed tenant's binding AND slot (held, not
+    /// dropped); only a second consecutive omission drops them.
     #[test]
-    fn a_short_echo_through_the_confirmation_keeps_bindings_and_slots() {
+    fn a_single_short_echo_after_a_heal_holds_the_binding_and_slot() {
         let (_dir, path, mgr) = store("short_echo");
         mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
             .expect("slot A");
         mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
             .expect("slot B");
-        heal_vanished_paired_user_with(&mgr, &path, &known(&[ta(), tb()]));
-        let confirmed =
-            drop_confirmed_coord_set(&[ta()], &known(&[ta(), tb()])).expect("prior known");
-        let report = reconcile_paired_bindings_with(&mgr, &path, &confirmed).expect("reconcile");
-        assert!(report.dropped.is_empty(), "{report:?}");
+        assert!(matches!(
+            heal_vanished_paired_user_with(&mgr, &path, &known(&[ta(), tb()])),
+            PairedUserHeal::Healed { .. }
+        ));
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("short echo");
+        assert!(r1.dropped.is_empty(), "{r1:?}");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
         assert_eq!(read_paired_binding_tenant_ids_at(&path), vec![ta(), tb()]);
         assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("confirmed");
+        assert_eq!(r2.dropped, vec![tb()]);
+        assert_eq!(read_paired_binding_tenant_ids_at(&path), vec![ta()]);
     }
 
     /// Phase 3: the census counts VALIDITY, not presence — an expired slot is
@@ -7368,27 +7470,36 @@ mod vanished_paired_user_heal_tests {
 
     // ---- review fixes (findings 2, 4, 5, 6, 7, 9, 1) ----
 
-    /// Finding 2: a heal reads BOTH recorded echoes. One short echo omitting
-    /// T_B right before the heal must not cost B its binding.
+    /// Finding 2, on the reconciler's single source of truth: the heal's
+    /// bound set is the latest echo PLUS every tenant the omission
+    /// hysteresis is HOLDING ([`coord_bound_tenants_for_heal_at`]) — so one
+    /// short echo right before a heal does not cost a held tenant its binding
+    /// — and never a tenant whose drop the reconciler has confirmed. Both arms
+    /// run with the file ABSENT, which the reconcile walks as an empty binding
+    /// set, so the streaks keep counting through the very window a vanished
+    /// file opens.
     #[test]
-    fn heal_uses_the_two_echo_union_so_one_short_echo_does_not_lose_a_tenant() {
-        let (dir, path, mgr) = store("two_echo");
+    fn the_heal_counts_a_held_tenant_and_never_a_confirmed_drop() {
+        // Arm 1 — B omitted ONCE: held, so healed beside A.
+        let (dir, path, mgr) = store("held_once");
         mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
             .expect("slot A");
         mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
             .expect("slot B");
         let sidecar = dir.path().join("coord_bound_tenants.json");
         let now = chrono::Utc::now().timestamp();
-        record_coord_bound_tenants_at(&sidecar, &[ta(), tb()], now - 60).expect("echo 1");
-        record_coord_bound_tenants_at(&sidecar, &[ta()], now).expect("short echo 2");
-        // The single-echo read the reconciler's `prior` uses sees only A…
+        record_coord_bound_tenants_at(&sidecar, &[ta()], now).expect("short echo");
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)], "the absent file still counts B");
+        assert!(!r1.changed(), "{r1:?}");
+        assert!(!path.exists(), "a reconcile never writes into the gap");
+        // The echo alone would lose B…
         assert_eq!(
             coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS),
             known(&[ta()])
         );
-        // …the heal's read is the union.
-        let bound =
-            coord_bound_tenants_two_echo_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS);
+        // …the heal's read keeps the tenant the reconciler is holding.
+        let bound = coord_bound_tenants_for_heal_at(&path, &sidecar, now);
         assert_eq!(bound, known(&[ta(), tb()]));
         let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
         assert!(
@@ -7397,46 +7508,245 @@ mod vanished_paired_user_heal_tests {
         );
         assert_eq!(read_paired_binding_tenant_ids_at(&path), vec![ta(), tb()]);
 
-        // A tenant BOTH echoes omit is not healed.
-        record_coord_bound_tenants_at(&sidecar, &[ta()], now + 1).expect("echo 3 confirms");
-        assert_eq!(
-            coord_bound_tenants_two_echo_at_within(&sidecar, now + 1, BINDING_GAP_ASK_MAX_AGE_SECS),
-            known(&[ta()])
+        // Arm 2 — B omitted TWICE: the drop is confirmed (its orphan slot is
+        // cleared by that reconcile) and the heal never brings it back.
+        let (dir, path, mgr) = store("confirmed_drop");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
+        let sidecar = dir.path().join("coord_bound_tenants.json");
+        record_coord_bound_tenants_at(&sidecar, &[ta()], now).expect("short echo");
+        reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert_eq!(r2.dropped_slots, vec![tb()]);
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_none());
+        let bound = coord_bound_tenants_for_heal_at(&path, &sidecar, now);
+        assert_eq!(bound, known(&[ta()]), "a confirmed drop is in neither half");
+        let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
+        assert!(
+            matches!(&heal, PairedUserHeal::Healed { tenants, .. } if tenants == &vec![ta()]),
+            "{heal:?}"
         );
+
+        // An UNKNOWN echo stays UNKNOWN whatever the streaks hold.
+        let (_dir, path, _mgr) = store("unknown_echo");
+        let missing = path.with_file_name("coord_bound_tenants.json");
+        assert!(matches!(
+            coord_bound_tenants_for_heal_at(&path, &missing, now),
+            CoordBoundTenantsRead::Unknown(_)
+        ));
     }
 
-    /// Finding 2 (compat): a sidecar written before `prior_tenant_ids`
-    /// existed reads as the current echo alone; a repeated set is written
-    /// once more so the prior catches up, then the restamp skip resumes.
+    /// Review of the re-scope, M1: the heartbeat records coord's echo and
+    /// reconciles against it under ONE hold of the binding-store lock, so a
+    /// heal can never read echo N+1 beside the omission streaks of pass N.
+    /// While another holder has the lock, neither the sidecar nor the streaks
+    /// move; once it is released both land together.
     #[test]
-    fn an_old_sidecar_without_a_prior_echo_reads_current_only() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn the_echo_record_and_its_reconcile_share_one_hold_of_the_lock() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let (dir, path, mgr) = store("record_and_reconcile");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
         let sidecar = dir.path().join("coord_bound_tenants.json");
         let now = chrono::Utc::now().timestamp();
-        std::fs::write(
-            &sidecar,
-            format!(r#"{{"tenant_ids":["{T_A}"],"observed_at":{now}}}"#),
-        )
-        .unwrap();
+
+        let (held_tx, held_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let p = path.clone();
+        let holder = std::thread::spawn(move || {
+            let _lock = lock_binding_reconcile(&p, RECONCILE_LOCK_WAIT).expect("lock");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let (m, p, sc) = (mgr.clone(), path.clone(), sidecar.clone());
+        let heartbeat =
+            std::thread::spawn(move || record_and_reconcile_at(&m, &p, &sc, &[ta()], now));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!heartbeat.is_finished(), "the record waits for the lock");
+        assert!(!sidecar.exists(), "no echo is recorded outside the lock");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let report = heartbeat.join().unwrap().expect("record + reconcile");
+        assert_eq!(report.held, vec![(tb(), 1)]);
         assert_eq!(
-            coord_bound_tenants_two_echo_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS),
-            known(&[ta()])
+            coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS),
+            known(&[ta()]),
+            "the echo landed"
         );
-        // Same set again: written once (prior was absent)…
         assert_eq!(
-            record_coord_bound_tenants_at(&sidecar, &[ta()], now + 1),
-            Ok(true)
-        );
-        // …then skipped: both echoes already equal it.
-        assert_eq!(
-            record_coord_bound_tenants_at(&sidecar, &[ta()], now + 2),
-            Ok(false)
+            coord_bound_tenants_for_heal_at(&path, &sidecar, now),
+            known(&[ta(), tb()]),
+            "…in the same hold as the streak that keeps B"
         );
     }
 
-    /// Finding 4: a real pairing that lands after the credentials were read
-    /// and before the write is seen by the locked recheck — the heal writes
-    /// nothing and touches neither the file nor the legacy slot.
+    /// Review of the re-scope, M2: a tenant whose ONLY credential is the
+    /// legacy `access_token` (no binding entry, no per-tenant slot) gets an
+    /// omission streak too, so one short echo does not take it out of the
+    /// heal's set — the heal keeps it as the default and its token is neither
+    /// discarded nor overwritten.
+    #[test]
+    fn a_legacy_only_tenant_survives_one_short_echo() {
+        let (dir, path, mgr) = store("legacy_only_held");
+        let jwt_a = live(T_A, USER);
+        mgr.store_tokens(&jwt_a, "").expect("legacy = A");
+        mgr.clear_tenant_device_jwt(&ta()).expect("legacy-only");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER_2))
+            .expect("slot B");
+        let sidecar = dir.path().join("coord_bound_tenants.json");
+        let now = chrono::Utc::now().timestamp();
+        let report =
+            record_and_reconcile_at(&mgr, &path, &sidecar, &[tb()], now).expect("short echo");
+        assert_eq!(report.held, vec![(ta(), 1)]);
+        let bound = coord_bound_tenants_for_heal_at(&path, &sidecar, now);
+        assert_eq!(bound, known(&[ta(), tb()]));
+        assert_eq!(
+            heal_vanished_paired_user_with(&mgr, &path, &bound),
+            PairedUserHeal::Healed {
+                cause: "absent",
+                tenants: vec![ta(), tb()],
+                default_tenant: ta(),
+            }
+        );
+        assert_eq!(mgr.get_access_token().ok().as_deref(), Some(jwt_a.as_str()));
+    }
+
+    /// Review of the re-scope, L1: an UNPARSEABLE file is reconciled like an
+    /// absent one — its slots keep their omission streaks (the heal reads
+    /// them) — and the file itself is left byte-for-byte to the heal.
+    #[test]
+    fn an_unparseable_file_keeps_the_streaks_counting_and_is_left_alone() {
+        let (_dir, path, mgr) = store("unparseable_streaks");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
+        std::fs::write(&path, b"{corrupt").unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert_eq!(r2.dropped_slots, vec![tb()]);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{corrupt".to_vec());
+    }
+
+    /// The heal and a concurrent pairing or reconcile are SERIALIZED by the
+    /// one binding-store lock: while the heal is inside its locked section, a
+    /// second thread cannot take the lock, a pairing and a reconcile both
+    /// wait for it, and both run after the heal's write — so the pairing's
+    /// binding is not discarded by the heal's rename, and the reconcile
+    /// decides against the healed file, not the gap.
+    #[test]
+    fn the_heal_and_a_concurrent_pairing_or_reconcile_are_serialized_by_the_shared_lock() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        /// Run a heal on its own thread and park it INSIDE its locked section
+        /// until `release` fires; returns once the lock is held.
+        fn park_a_heal(
+            mgr: &crate::auth::AuthManager,
+            path: &std::path::Path,
+            bound: Vec<uuid::Uuid>,
+        ) -> (
+            std::thread::JoinHandle<PairedUserHeal>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (in_lock_tx, in_lock_rx) = channel::<()>();
+            let (release_tx, release_rx) = channel::<()>();
+            let (m, p) = (mgr.clone(), path.to_path_buf());
+            let healer = std::thread::spawn(move || {
+                let while_locked = || {
+                    in_lock_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                };
+                heal_vanished_paired_user_hooked(
+                    &m,
+                    &p,
+                    &|| known(&bound),
+                    &HealHooks {
+                        before_lock: &no_heal_hook,
+                        while_locked: &while_locked,
+                        before_copy: &no_heal_hook,
+                    },
+                )
+            });
+            in_lock_rx.recv().expect("the heal reached its locked section");
+            (healer, release_tx)
+        }
+
+        // Arm 1 — a pairing for C.
+        let (_d1, path, mgr) = store("serial_pair");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        let (healer, release) = park_a_heal(&mgr, &path, vec![ta(), tc()]);
+        assert!(
+            lock_binding_reconcile(&path, Duration::from_millis(50)).is_err(),
+            "the heal holds the binding-store lock"
+        );
+        let (m, p) = (mgr.clone(), path.clone());
+        let jwt_c = live(T_C, USER);
+        let pairer =
+            std::thread::spawn(move || persist_pairing_with(&m, &p, &pair_resp_for(&jwt_c), tc()));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !pairer.is_finished(),
+            "a pairing must wait for the heal's lock, not write into its window"
+        );
+        release.send(()).unwrap();
+        let heal = healer.join().expect("heal thread");
+        assert!(
+            matches!(&heal, PairedUserHeal::Healed { tenants, .. } if tenants == &vec![ta()]),
+            "{heal:?}"
+        );
+        pairer
+            .join()
+            .expect("pair thread")
+            .expect("the pairing succeeds once the heal releases");
+        let pf = read_file(&path);
+        let by_tenant = |t: &str| pf.bindings.iter().find(|b| b.tenant_id == t).cloned();
+        assert!(by_tenant(T_A).is_some(), "the healed binding survives: {pf:?}");
+        assert!(
+            by_tenant(T_C).is_some_and(|b| b.paired_at.is_some()),
+            "the pairing's binding survives the heal's write: {pf:?}"
+        );
+
+        // Arm 2 — a reconcile.
+        let (_d2, path, mgr) = store("serial_reconcile");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        let (healer, release) = park_a_heal(&mgr, &path, vec![ta()]);
+        let (m, p) = (mgr.clone(), path.clone());
+        let reconciler =
+            std::thread::spawn(move || reconcile_paired_bindings_at(&m, &p, &[ta()], T0));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !reconciler.is_finished(),
+            "a reconcile must wait for the heal's lock"
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            healer.join().expect("heal thread"),
+            PairedUserHeal::Healed { .. }
+        ));
+        let report = reconciler
+            .join()
+            .expect("reconcile thread")
+            .expect("reconcile");
+        // Decided against the HEALED file: run in the gap, A (bound, no
+        // entry) would read coord_only.
+        assert!(report.coord_only.is_empty(), "{report:?}");
+        assert!(!report.changed(), "{report:?}");
+    }
+
+    /// Finding 4: a real pairing that lands after the heal's first (unlocked)
+    /// look and before it takes the binding-store lock is seen by the locked
+    /// re-check — the heal writes nothing and touches neither the file nor
+    /// the legacy slot.
     #[test]
     fn a_pairing_that_lands_before_the_write_is_never_overwritten() {
         let (_dir, path, mgr) = store("recheck");
@@ -7446,12 +7756,15 @@ mod vanished_paired_user_heal_tests {
         let heal = heal_vanished_paired_user_hooked(
             &mgr,
             &path,
-            &known(&[ta(), tb()]),
-            &|| {
-                persist_pairing_with(&mgr, &path, &pair_resp_for(&paired_jwt), ta())
-                    .expect("the concurrent pairing");
+            &|| known(&[ta(), tb()]),
+            &HealHooks {
+                before_lock: &|| {
+                    persist_pairing_with(&mgr, &path, &pair_resp_for(&paired_jwt), ta())
+                        .expect("the concurrent pairing");
+                },
+                while_locked: &no_heal_hook,
+                before_copy: &no_heal_hook,
             },
-            &|| {},
         );
         assert_eq!(heal, PairedUserHeal::NotNeeded);
         let pf = read_file(&path);
@@ -7470,7 +7783,7 @@ mod vanished_paired_user_heal_tests {
 
     /// Review round 3: a pairing that lands AFTER the heal wrote the file
     /// and BEFORE its credential copies is never overwritten by them — the
-    /// copies re-take the write lock and re-check first. Four arms, each on
+    /// copies re-take the binding-store lock and re-check first. Four arms, each on
     /// its own store: the same user re-pairing the healed default; a
     /// DIFFERENT user re-pairing it; the file rewritten to name another user
     /// with the legacy slot untouched; and a pairing for the tenant whose
@@ -7487,7 +7800,16 @@ mod vanished_paired_user_heal_tests {
                            path: &std::path::Path,
                            bound: &[uuid::Uuid],
                            hook: &dyn Fn()| {
-            let heal = heal_vanished_paired_user_hooked(mgr, path, &known(bound), &|| {}, hook);
+            let heal = heal_vanished_paired_user_hooked(
+                mgr,
+                path,
+                &|| known(bound),
+                &HealHooks {
+                    before_lock: &no_heal_hook,
+                    while_locked: &no_heal_hook,
+                    before_copy: hook,
+                },
+            );
             assert!(
                 matches!(&heal, PairedUserHeal::Healed { default_tenant, .. }
                     if *default_tenant == tb()),
@@ -7540,7 +7862,7 @@ mod vanished_paired_user_heal_tests {
         let (_d3, path, mgr) = store("copy_file_user_moved");
         mgr.store_tenant_device_jwt(&tb(), &old_b).expect("slot B");
         heal_b_with(&mgr, &path, &[tb()], &|| {
-            let _w = paired_user_write_lock();
+            let _lock = lock_binding_reconcile(&path, RECONCILE_LOCK_WAIT).expect("lock");
             write_paired_user_file(
                 &path,
                 &PairedUserFile {
@@ -7645,7 +7967,7 @@ mod vanished_paired_user_heal_tests {
     /// credential. One for a tenant OUTSIDE coord's known set is discarded
     /// instead: no `device_jwt:<tenant>` slot is created for an unbound
     /// tenant, since the refresher would keep it alive and it would feed the
-    /// credential posture until the next confirmed reconcile cleared it.
+    /// credential posture until reconcile's omission streak cleared it.
     #[test]
     fn a_non_qualifying_legacy_credential_is_preserved_before_it_is_replaced() {
         // Arm 1 — bound but non-qualifying (missing user_id): preserved.

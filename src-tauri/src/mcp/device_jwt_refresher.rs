@@ -3841,6 +3841,7 @@ pub(crate) fn publish_coord_credential_posture(
         signal,
         true,
         None,
+        None,
     )
 }
 
@@ -4187,6 +4188,7 @@ pub(crate) fn derive_and_publish_posture_with(
                     // every unpinned session on a box where some OTHER,
                     // unreadable slot is the one coord is refusing.
                     false,
+                    None,
                     None,
                 );
             }
@@ -5082,6 +5084,9 @@ pub(crate) fn classify_default_binding(
     match heal {
         H::NotNeeded | H::Healed { .. } => DefaultBindingVerdict::Bound,
         H::NothingToHealFrom => DefaultBindingVerdict::NoCredential,
+        // The binding-store lock was busy: nothing was looked at, so nothing
+        // is known — and an `Unknown` never overwrites a measured verdict.
+        H::Deferred(why) => DefaultBindingVerdict::Unknown(why.clone()),
         H::Refused(why) => match census {
             Some(Ok(c)) if !c.usable_tenant_slots.is_empty() || c.legacy_slot_usable => {
                 DefaultBindingVerdict::SlotWithoutBinding {
@@ -12213,6 +12218,11 @@ mod tenant_slot_refresh_tests {
         ));
         assert!(matches!(
             classify_default_binding(&refused, None),
+            DefaultBindingVerdict::Unknown(_)
+        ));
+        // A heal that could not take the binding-store lock measured nothing.
+        assert!(matches!(
+            classify_default_binding(&H::Deferred("lock busy".into()), None),
             DefaultBindingVerdict::Unknown(_)
         ));
     }
