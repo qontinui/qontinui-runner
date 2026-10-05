@@ -2315,7 +2315,9 @@ impl HeldDeviceTenants {
 /// `crate::pair::read_paired_tenant_id_from_disk`, because the two do NOT
 /// behave the same: `pair` parses into a struct whose `user_id` is required,
 /// so a file naming a default tenant without a `user_id` reads as absent
-/// there and as bound here; and `pair` answers `None` for a missing file and a
+/// there and as bound here, and so does a file whose `default_tenant_id` is
+/// not a string (`pair`'s typed parse fails; this reader falls back to the
+/// legacy `tenant_id`); and `pair` answers `None` for a missing file and a
 /// corrupt one alike, which [`default_binding_tenant_probe`] must tell apart.
 /// `minimal_reader_equivalence_tests` pins each fixture row.
 ///
@@ -3387,10 +3389,11 @@ mod minimal_reader_equivalence_tests {
     ///   for both the missing-file and the corrupt-file rows, so it cannot
     ///   stand in for the probe or for `_in`.
     /// - The collapsed [`default_binding_tenant`] agrees with the canonical
-    ///   reader on every row except a file that names a default tenant but no
-    ///   `user_id`: `pair` parses into a struct whose `user_id` is required and
-    ///   reads that file as absent, while the local reader still finds the
-    ///   tenant. Delegating it alone would also make it disagree with the probe
+    ///   reader on every row except two: a file that names a default tenant
+    ///   but no `user_id`, and a file whose `default_tenant_id` is not a
+    ///   string. `pair` parses into a struct (`user_id` required,
+    ///   `default_tenant_id: Option<String>`) and reads both as absent, while
+    ///   the local reader still finds the tenant. Delegating it alone would also make it disagree with the probe
     ///   it collapses.
     #[test]
     fn default_binding_tenant_against_the_canonical_reader() {
