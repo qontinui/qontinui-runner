@@ -5103,6 +5103,16 @@ pub(crate) fn classify_default_binding(
     }
 }
 
+/// The Pair arm's "paired_user.json missing" bail decision, as the refresher
+/// loop makes it: from the published verdict CELL
+/// ([`default_binding_verdict`]), never from one tick's raw verdict — an
+/// Unknown tick (a deferred heal, a failed join) never overwrites a measured
+/// one there, so it cannot turn "credential held, no default binding" into
+/// "no coord credential".
+pub(crate) fn unpaired_bail_progress_from_cell() -> PairProgress {
+    unpaired_bail_progress(&default_binding_verdict())
+}
+
 /// Pure: which [`PairProgress`] the Pair arm's "paired_user.json missing"
 /// bail publishes. Only a MEASURED (b) changes today's answer; (a) and every
 /// unmeasured verdict keep [`PairProgress::BailNoBearer`].
@@ -5607,10 +5617,7 @@ async fn refresher_loop(
                         // (b) a usable per-tenant slot that the heal refused
                         // to point a default binding at. Reporting (b) as (a)
                         // was the 2026-09-28 "no coord credential" misreport.
-                        // The CELL, not this tick's raw verdict: an Unknown
-                        // tick (a deferred heal) never overwrites a measured
-                        // one there.
-                        let progress = unpaired_bail_progress(&default_binding_verdict());
+                        let progress = unpaired_bail_progress_from_cell();
                         match &progress {
                             PairProgress::BailNoDefaultBinding {
                                 usable_tenants,
@@ -12443,16 +12450,18 @@ mod tenant_slot_refresh_tests {
         publish_default_binding_verdict(slot_without_binding(false));
         publish_default_binding_verdict(DefaultBindingVerdict::Unknown("join failed".into()));
         assert_eq!(default_binding_verdict(), slot_without_binding(false));
-        // A heal that could not take the binding-store lock is Unknown too: the
-        // Pair arm's bail reads the CELL, so it still says "credential held, no
-        // default binding" rather than publishing "no coord credential".
+        // A heal that could not take the binding-store lock is Unknown too, and
+        // the loop's bail decision (`unpaired_bail_progress_from_cell`, the
+        // function `refresher_loop` calls) reads the CELL, so it still says
+        // "credential held, no default binding" rather than "no coord
+        // credential".
         use qontinui_runner_lib::pair::PairedUserHeal as H;
         publish_default_binding_verdict(classify_default_binding(
             &H::Deferred("lock busy".into()),
             None,
         ));
         assert!(matches!(
-            unpaired_bail_progress(&default_binding_verdict()),
+            unpaired_bail_progress_from_cell(),
             PairProgress::BailNoDefaultBinding { .. }
         ));
         publish_default_binding_verdict(DefaultBindingVerdict::Bound);
