@@ -20,16 +20,21 @@
 //!
 //! The guard covers `AuthManager` only. This ratchet keeps the rest honest:
 //!
-//! - A new `Entry::new(` call (the `keyring` crate's only door) outside the
-//!   allowlist fails here, so whoever adds one must decide whether tests can
+//! - A new `Entry::new` call (any of the `keyring` crate's constructors —
+//!   `new`, `new_with_target`, `new_with_credential`) outside the allowlist
+//!   fails here, so whoever adds one must decide whether tests can
 //!   reach it — and give it a test seam (as `registry_creds` does with a fake
 //!   store) or route it through `AuthManager`'s guard.
-//! - A new `set_var("QONTINUI_DISABLE_KEYCHAIN"` fails here, because it means
+//! - A new mention of the `"QONTINUI_DISABLE_KEYCHAIN"` name outside the
+//!   files that legitimately own it fails here — a `set_var` of it means
 //!   someone is re-growing the per-module workaround instead of trusting the
-//!   guard.
+//!   guard, however the call is spelled or wrapped.
 //!
-//! A source scan, not a proof: it cannot see a keychain call spelled through a
-//! re-export or a macro. It makes the ordinary way of adding one impossible to
+//! A source scan, not a proof: it cannot see a keychain call spelled through an
+//! aliased import, a re-export or a macro. The load-time guard itself covers the
+//! lib and runner-bin unit-test binaries only; integration tests and the
+//! `src/bin/*` test binaries have no hook, which is why new call sites must be
+//! named here. It makes the ordinary way of adding one impossible to
 //! merge unnoticed. Plan `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
 
 use std::path::{Path, PathBuf};
@@ -59,10 +64,22 @@ const KEYRING_CALL_SITES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Files still allowed to `set_var("QONTINUI_DISABLE_KEYCHAIN", ...)`.
-/// `commands/auth.rs` `hermetic_auth_manager` is owned by open PR
-/// qontinui-runner#2001; Phase 6 of the plan removes it after that lands.
-const DISABLE_KEYCHAIN_SETTERS: &[&str] = &["commands/auth.rs"];
+/// Files allowed to name `"QONTINUI_DISABLE_KEYCHAIN"`, and why.
+/// `commands/auth.rs` `hermetic_auth_manager` still sets it; that file is owned
+/// by open PR qontinui-runner#2001, and Phase 6 of the plan removes the set
+/// after that lands.
+const DISABLE_KEYCHAIN_NAMERS: &[(&str, &str)] = &[
+    ("auth.rs", "the reader, and the guard's own regression test"),
+    (
+        "ambient.rs",
+        "the ambient-key roster IsolatedAmbient captures and restores",
+    ),
+    ("ci_node/manifest.rs", "the CI env it forwards to CI steps"),
+    (
+        "commands/auth.rs",
+        "hermetic_auth_manager, pending PR #2001",
+    ),
+];
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -112,7 +129,7 @@ fn files_containing(needle: &str) -> Vec<String> {
 #[test]
 fn every_keyring_entry_construction_is_on_the_allowlist() {
     let allowed: Vec<&str> = KEYRING_CALL_SITES.iter().map(|(path, _)| *path).collect();
-    let found = files_containing("Entry::new(");
+    let found = files_containing("Entry::new");
     let unlisted: Vec<&String> = found
         .iter()
         .filter(|path| !allowed.contains(&path.as_str()))
@@ -131,20 +148,24 @@ fn every_keyring_entry_construction_is_on_the_allowlist() {
         .collect();
     assert!(
         stale.is_empty(),
-        "KEYRING_CALL_SITES lists file(s) with no Entry::new( call: {stale:?}"
+        "KEYRING_CALL_SITES lists file(s) with no Entry::new call: {stale:?}"
     );
 }
 
 #[test]
 fn no_test_reenables_the_per_module_keychain_workaround() {
-    let found = files_containing("set_var(\"QONTINUI_DISABLE_KEYCHAIN\"");
+    let allowed: Vec<&str> = DISABLE_KEYCHAIN_NAMERS
+        .iter()
+        .map(|(path, _)| *path)
+        .collect();
+    let found = files_containing("\"QONTINUI_DISABLE_KEYCHAIN\"");
     let unlisted: Vec<&String> = found
         .iter()
-        .filter(|path| !DISABLE_KEYCHAIN_SETTERS.contains(&path.as_str()))
+        .filter(|path| !allowed.contains(&path.as_str()))
         .collect();
     assert!(
         unlisted.is_empty(),
-        "{unlisted:?} set QONTINUI_DISABLE_KEYCHAIN. A test binary already never reaches the OS \
+        "{unlisted:?} name QONTINUI_DISABLE_KEYCHAIN. A test binary already never reaches the OS \
          keychain (auth::deny_os_keychain_for_this_test_process), so the per-module workaround \
          is redundant and races sibling tests on process env — remove it."
     );

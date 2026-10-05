@@ -4715,7 +4715,13 @@ mod pair_code_hang_regression_tests {
         match rx.recv_timeout(WALL_CLOCK_BOUND) {
             Ok(Ok(())) => {} // pass: redeem + persist completed within bound
             Ok(Err(e)) => panic!("pair-code redeem + persist failed: {e}"),
-            Err(_) => panic!(
+            // The worker panicked before sending (an assert or unwrap inside
+            // the closure). Its keychain-cleanup guard ran during the unwind;
+            // this is a failure, not the hang the arm below describes.
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "pair-code redeem + persist worker thread panicked (see its panic above);                  its test keychain entries were cleaned up during the unwind"
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
                 "pair-code redeem + persist did not complete within {WALL_CLOCK_BOUND:?} — this \
                  reproduces the `qontinui_profile device pair` hang from plan \
                  2026-08-29-qontinui-profile-device-pair-never-exits (Phase 1's named blocking \
