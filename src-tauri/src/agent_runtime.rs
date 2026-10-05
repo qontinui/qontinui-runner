@@ -2358,15 +2358,11 @@ fn dispatched_gate_ids(
     DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Atomically claim a `gate_id` for dispatch. Returns `true` if THIS call was
-/// the first to claim it (caller should dispatch); `false` if it was already
-/// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
+/// Atomically claim a `gate_id` at re-delivery `attempt` (0 = first delivery)
+/// for dispatch. Returns `true` if THIS call won the claim (caller should
+/// dispatch); `false` if it must skip as a duplicate. Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
-fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
-    claim_gate_dispatch_attempt(gate_id, 0)
-}
-
-/// [`claim_gate_dispatch`] for re-delivery `attempt` (0 = first delivery).
+///
 /// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
 /// held attempt is THIS one and was released (a local skip that left the row
 /// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
@@ -2383,6 +2379,18 @@ fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
         held.insert(gate_id, (attempt, GateClaimState::Held));
     }
     wins
+}
+
+/// Test shim: [`claim_gate_dispatch_attempt`] at attempt 0 (a first delivery).
+#[cfg(test)]
+fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
+    claim_gate_dispatch_attempt(gate_id, 0)
+}
+
+/// Test shim: [`release_gate_dispatch_attempt`] at attempt 0.
+#[cfg(test)]
+fn release_gate_dispatch(gate_id: uuid::Uuid) {
+    release_gate_dispatch_attempt(gate_id, 0);
 }
 
 /// The in-process state of one gate's highest claimed attempt.
@@ -2409,7 +2417,10 @@ fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     }
 }
 
-/// Release an in-process gate-dispatch claim ([`claim_gate_dispatch`]).
+/// Release the in-process gate-dispatch claim `attempt` holds
+/// ([`claim_gate_dispatch_attempt`]) — a TOMBSTONE, and a no-op when a
+/// different (newer) attempt holds the gate or this attempt is already
+/// [`GateClaimState::Sealed`]. See [`dispatched_gate_ids`].
 ///
 /// **The load-bearing half of the delivery-stall fix.** The dedupe set's ONLY
 /// purpose is the WS+poll double-delivery race: an id must stay claimed only
@@ -2420,12 +2431,6 @@ fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
 /// the process lifetime: the backstop poll re-lists the row every tick and the
 /// dispatcher drops it at the dedupe check forever — the exact mechanism that
 /// stranded 51 continuations pending-with-null-outcomes over 2 days.
-fn release_gate_dispatch(gate_id: uuid::Uuid) {
-    release_gate_dispatch_attempt(gate_id, 0);
-}
-
-/// Release the claim attempt `attempt` holds — a TOMBSTONE, and a no-op when a
-/// different (newer) attempt holds the gate. See [`dispatched_gate_ids`].
 fn release_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
     if let Some(entry) = held.get_mut(&gate_id) {
@@ -2453,13 +2458,13 @@ fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::Hash
 /// Atomically claim a `dispatch_id` for dispatch. Returns `true` if THIS call was
 /// the first to claim it (caller should dispatch); `false` if it was already
 /// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
-/// lock, exactly like [`claim_gate_dispatch`].
+/// lock, exactly like [`claim_gate_dispatch_attempt`].
 fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
     lock_recover(dispatched_dispatch_ids(), "dispatched_dispatch_ids").insert(dispatch_id)
 }
 
 /// Release an in-process unit-dispatch claim ([`claim_dispatch_dispatch`]) —
-/// the sibling of [`release_gate_dispatch`] for the work-unit path. Load
+/// the sibling of [`release_gate_dispatch_attempt`] for the work-unit path. Load
 /// bearing for the unit contract's at-least-once promise: a failed spawn is
 /// deliberately left un-consumed so coord re-lists it, but WITHOUT this
 /// release the re-listed row would be dropped at the in-process dedupe check
@@ -2471,7 +2476,7 @@ fn release_dispatch_dispatch(dispatch_id: uuid::Uuid) {
 /// Release whichever in-process dedupe claim the dispatcher took for this
 /// continuation, per its [`ConsumeTarget`]. Called from every LOCAL-skip exit
 /// of [`run_gate_continuation_inner`] that leaves the row pending on coord
-/// (see [`release_gate_dispatch`] for the invariant). [`ConsumeTarget::None`]
+/// (see [`release_gate_dispatch_attempt`] for the invariant). [`ConsumeTarget::None`]
 /// (legacy, no id) never claimed, so there is nothing to release.
 fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
     match consume_target {
@@ -2495,7 +2500,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   superseded_by:<winner>` and left it pending and re-listed, so the loser
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
-///   for the process lifetime (see [`release_gate_dispatch`]).
+///   for the process lifetime (see [`release_gate_dispatch_attempt`]).
 /// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
 ///   IS still pending on coord, but targeted at another device — coord's
 ///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
@@ -2505,7 +2510,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   is kept for the uncommon one: a later reroute (or the offline re-target)
 ///   can pick THIS device again, and a kept claim would then drop that
 ///   re-delivery at the dedupe check for the process lifetime — the exact
-///   stranding [`release_gate_dispatch`] exists to prevent. The cost of
+///   stranding [`release_gate_dispatch_attempt`] exists to prevent. The cost of
 ///   releasing is at most one more consume claim on a stale duplicate
 ///   delivery, which coord refuses again with the same 409 — while coord is
 ///   reachable. If that later claim instead FAILS (timeout, 5xx), it lands in
@@ -2566,7 +2571,7 @@ enum ClaimOutcome {
 /// in the `SkipSuperseded` match arm, deleting **the call** — not the body of
 /// [`settle_skipped_claim`], which a test did cover — left every test green
 /// and stranded the superseded loser's gate id in
-/// [`release_gate_dispatch`]'s claim set for the process lifetime, so coord's
+/// [`release_gate_dispatch_attempt`]'s claim set for the process lifetime, so coord's
 /// re-listed row could never be re-claimed. The call site was the untested
 /// half. Here there is no such statement to delete: the log, the settle and
 /// the skip/spawn decision are one unit, and
@@ -4413,7 +4418,7 @@ enum ConsumeTarget {
 /// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
 /// 1. **Agent-registry authorization** (`agent-spawn-authorization`), then
-///    **fast-path dedupe**: [`claim_gate_dispatch`]
+///    **fast-path dedupe**: [`claim_gate_dispatch_attempt`]
 ///    against the in-process set — a duplicate delivery (same `gate_id`) is
 ///    dropped here so a continuation delivered by both transports never even
 ///    starts a second task. This is the in-process guard; the network claim
@@ -7594,19 +7599,6 @@ async fn run_condition_check_terminal(
     }
 }
 
-/// Resolve the working directory for a gate continuation. Returns
-/// `(workdir, isolated_edit_ctx, agent_id)`.
-///
-/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
-///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
-///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
-///   a non-UUID id, used only for lifecycle correlation).
-/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
-///   [`continuation_fallback_workdir`] picks (the workspace root when the
-///   repo's verified checkout is under it, else that checkout), `None`
-///   context, and a fresh correlation UUID; `Err` with a
-///   `workdir_not_a_checkout` detail when the repo has no verified checkout on
-///   this device.
 /// Derive a stable per-session UUID discriminator for a gate continuation's
 /// worktree claims (Phase 1b, plan
 /// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
@@ -7644,6 +7636,18 @@ fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uu
     }
 }
 
+/// Resolve the working directory for a gate continuation. Returns
+/// `(workdir, isolated_edit_ctx, agent_id)`.
+///
+/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
+///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
+///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
+///   a non-UUID id, used only for lifecycle correlation).
+/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
+///   [`continuation_fallback_workdir`] picks (see its doc for the per-owner
+///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
+///   refusals), `None` context, and a fresh correlation UUID.
+/// - `Err` also when acquire succeeds but returns no worktrees.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
