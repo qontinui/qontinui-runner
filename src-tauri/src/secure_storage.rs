@@ -728,6 +728,7 @@ impl SecureStorage {
     /// `cfg(test)` but WITH `debug_assertions` — the same boundary as
     /// `ambient::test_support`. A release build compiles none of it.
     #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_path(storage_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = storage_path.parent() {

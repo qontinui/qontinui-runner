@@ -10,12 +10,15 @@ use tauri::Manager;
 // (`pub(crate) use qontinui_runner_lib::X;` in `main.rs`), so each compiles
 // once and has one set of statics; `crate_roots_ratchet` (a bin test) fails
 // on any module declared in both roots outside its shrinking allowlist.
-// `auth` is the one still declared in both (plan
+// Lib code spells some lib paths `qontinui_runner_lib::…` rather than
+// `crate::…` — `auth`, `process_helpers`, `machine_identity`,
+// `secure_storage`, `env_agent`, `accessibility` and `plan_workunit_adapter`
+// all do — and this alias is what makes that spelling resolve here. For
+// `auth`, which is still declared in both roots (plan
 // `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`
-// Phase 2), and a call site inside it needs this alias to have one spelling
-// whichever crate compiles it. With it,
-// `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked` is one
-// spelling that works everywhere.
+// Phase 2), it is also what gives its call sites one spelling whichever crate
+// compiles it: `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked`
+// works in both.
 extern crate self as qontinui_runner_lib;
 
 pub mod accessibility;
@@ -82,11 +85,11 @@ pub mod auth;
 /// subscriber lane goes through.
 pub mod coord_ws;
 pub mod fs_perms;
+/// Canonical reader for `~/.qontinui/machine.json` — the machine's ONE
+/// durable `device_id`. The runner bin imports it, and `auth` must consult it
+/// before falling back to its own cache.
 pub mod machine_identity;
 pub mod secure_storage;
-/// Canonical reader for `~/.qontinui/machine.json` — the machine's ONE
-/// durable `device_id` (`machine_identity`, above). The runner bin imports
-/// it, and `auth` must consult it before falling back to its own cache.
 /// The machine's tenant pin — moved out of the bin-only `session` tree so the
 /// LIB can read it too (plan
 /// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` Phase 5a).
