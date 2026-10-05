@@ -13733,9 +13733,19 @@ mod tests {
             let indent = raw.len() - t.len();
             match skip {
                 None => {
-                    if t.starts_with("#[cfg(test)]") {
-                        skip = Some((indent, false));
-                        skip_started = i + 1;
+                    if let Some(rest) = t.strip_prefix("#[cfg(test)]") {
+                        // An attribute may share its line with the item
+                        // (`#[cfg(test)] use foo;`): judge that rest by the
+                        // same end-of-item rule, or it would swallow the next
+                        // production item.
+                        let rest = rest.trim();
+                        if rest.is_empty() {
+                            skip = Some((indent, false));
+                            skip_started = i + 1;
+                        } else if !(rest.ends_with(';') || rest.ends_with(char::from(0x7d))) {
+                            skip = Some((indent, rest.ends_with('{')));
+                            skip_started = i + 1;
+                        }
                     } else if !t.starts_with("//") {
                         out.push_str(raw);
                         out.push('\n');
@@ -13745,7 +13755,12 @@ mod tests {
                     if indent != at || t.is_empty() || t.starts_with("//") || t.starts_with("#[") {
                         continue;
                     }
-                    if t.starts_with(char::from(0x7d)) || (!opened && t.ends_with(';')) {
+                    // `}`-led closes a block; before any block opened, a line
+                    // ending in `;` or `}` is a whole one-line item
+                    // (`use x;`, `impl T for X {}`, `struct S {}`).
+                    if t.starts_with(char::from(0x7d))
+                        || (!opened && (t.ends_with(';') || t.ends_with(char::from(0x7d))))
+                    {
                         skip = None;
                     } else if t.ends_with('{') {
                         skip = Some((at, true));
@@ -13780,6 +13795,29 @@ mod tests {
     fn prod_squashed_lock_sites(squashed: &str, field: &str) -> usize {
         let name = field.trim_start_matches("self");
         squashed.matches(&format!("{name}.lock()")).count()
+    }
+
+    #[test]
+    fn production_source_ends_one_line_test_items_without_swallowing_the_next() {
+        // A one-line `#[cfg(test)]` item -- `{}`-bodied, or sharing the
+        // attribute's line -- must close its own skip; left open, the next
+        // production item's own `}` would close it and that item would vanish.
+        for src in [
+            "#[cfg(test)]\nimpl Tr for X {}\nfn prod() {\n}\n",
+            "#[cfg(test)]\nstruct S {}\nfn prod() {\n}\n",
+            "#[cfg(test)] use foo::bar;\nfn prod() {\n}\n",
+            "#[cfg(test)] mod m {}\nfn prod() {\n}\n",
+            "#[cfg(test)]\nmod t {\n    fn x() {}\n}\nfn prod() {\n}\n",
+        ] {
+            let out = production_source(src);
+            assert!(
+                out.contains("fn prod()"),
+                "production item kept for {src:?}: {out:?}"
+            );
+            assert!(
+                !out.contains("Tr for X") && !out.contains("struct S") && !out.contains("foo::bar")
+            );
+        }
     }
 
     /// Phase 1 source guard: the nonce maps have ONE owner behind ONE lock.
@@ -13848,23 +13886,24 @@ mod tests {
             ("NonceRegistry", "self.state"),
             ("AgentTokenRegistry", "self.tokens"),
         ] {
-            let impls: Vec<&str> = prod
-                .match_indices("\nimpl ")
-                .map(|(i, _)| {
-                    prod.get(i + 1..)
-                        .expect("`match_indices` is a char boundary")
-                })
-                .filter(|rest| {
-                    let header = rest.lines().next().unwrap_or_default();
-                    header
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|word| word == ty)
-                })
-                .map(|rest| {
-                    let header = rest.lines().next().unwrap_or_default();
-                    item_body(rest, header, "")
-                })
-                .collect();
+            // Any indentation (an impl nested in a module) and any generics
+            // (`impl<T> Trait for NonceRegistry`) count.
+            let mut impls: Vec<&str> = Vec::new();
+            let mut offset = 0usize;
+            for line in prod.split_inclusive('\n') {
+                let t = line.trim_start();
+                let names_ty = t
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|word| word == ty);
+                if (t.starts_with("impl ") || t.starts_with("impl<")) && names_ty {
+                    let indent = line.get(..line.len() - t.len()).unwrap_or_default();
+                    let rest = prod
+                        .get(offset..)
+                        .expect("line offsets are char boundaries");
+                    impls.push(item_body(rest, line.trim_end_matches('\n'), indent));
+                }
+                offset += line.len();
+            }
             assert!(!impls.is_empty(), "`{ty}` has a production impl block");
             let all = squash(&impls.concat());
             assert_eq!(
@@ -13883,7 +13922,7 @@ mod tests {
             assert_eq!(
                 prod_squashed_lock_sites(&squash(&prod), field),
                 1,
-                "`{field}.lock()` appears once in all of production"
+                "`{field}.lock()` appears once in coord_mcp.rs production (the file this guard reads)"
             );
         }
 
