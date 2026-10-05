@@ -1569,6 +1569,292 @@ pub struct PairBaseOrigin {
     pub remedy: String,
 }
 
+/// Which rung of [`resolve_cli_web_base`] produced the web-backend base.
+///
+/// Serves all three CLI pairing flows — `--pair-code` redemption,
+/// `--auth-token` `pair-cli`, AND the `--browser` flow's `/connect-runner`
+/// page. The rungs have DIFFERENT remediations when a request fails against
+/// the resolved host, and the URL alone does not distinguish them —
+/// `https://api.qontinui.io` looks identical whether it came from an operator
+/// export, a profile's `api_url`, or the compiled-in default. Reporting the
+/// winning arm turns "wrong host" from a guess into a one-line fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliWebBaseSource {
+    /// `$QONTINUI_WEB_BASE` was set to a non-blank value. Fix: correct or
+    /// unset that var.
+    EnvOverride,
+    /// The active profile's `api_url` in `~/.qontinui/profiles.json`
+    /// (via [`crate::profiles::api_url_with_source`]). Fix: edit that field.
+    ProfileApiUrl(crate::profiles::ApiUrlSource),
+    /// Nothing configured; the compiled-in production default. Fix: export
+    /// `$QONTINUI_WEB_BASE` or set a profile `api_url` if you are not pairing
+    /// against production (a local dev backend is `http://127.0.0.1:8000`).
+    ProdDefault,
+}
+
+impl CliWebBaseSource {
+    /// Short operator-facing label naming the arm that chose the base.
+    pub fn label(&self) -> String {
+        match self {
+            CliWebBaseSource::EnvOverride => "$QONTINUI_WEB_BASE override".to_string(),
+            CliWebBaseSource::ProfileApiUrl(src) => {
+                format!(
+                    "profile `{}` api_url (~/.qontinui/profiles.json)",
+                    src.profile
+                )
+            }
+            CliWebBaseSource::ProdDefault => {
+                "compiled-in production default (no $QONTINUI_WEB_BASE, no profile api_url)"
+                    .to_string()
+            }
+        }
+    }
+
+    /// One-line instruction for pointing the pair at a different web backend.
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            CliWebBaseSource::EnvOverride => "Unset or correct QONTINUI_WEB_BASE.",
+            CliWebBaseSource::ProfileApiUrl(_) => "Edit api_url in ~/.qontinui/profiles.json.",
+            CliWebBaseSource::ProdDefault => {
+                "Export QONTINUI_WEB_BASE or set api_url in ~/.qontinui/profiles.json \
+                 to target a different web backend."
+            }
+        }
+    }
+
+    /// The [`PairBaseOrigin`] a pair request rendered from this rung carries.
+    pub fn pair_base_origin(&self) -> PairBaseOrigin {
+        PairBaseOrigin {
+            label: self.label(),
+            remedy: self.remedy().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for CliWebBaseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+/// Resolve the qontinui-web backend base the CLI pairing flows dial, WITH the
+/// arm that produced it. The one ladder for `--pair-code`, `--auth-token` and
+/// `--browser`; three rungs, in order:
+///
+/// 1. `env` (`$QONTINUI_WEB_BASE`) — an explicit operator override.
+/// 2. `profile` — the active profile's `api_url`, as returned by
+///    [`crate::profiles::api_url_with_source`]. Callers pass it in so tests
+///    never read the developer's real `~/.qontinui/profiles.json`.
+/// 3. [`crate::profiles::PROD_API_BASE_URL`] — the fleet's production default.
+///
+/// Blank/whitespace counts as unset on both configured rungs, matching how
+/// every other rung ladder in this workspace reads an exported-but-empty
+/// value. A trailing slash is trimmed so no rung can build `<base>//api/v1/…`.
+///
+/// # Why there is no derive-from-coord rung
+///
+/// There used to be a rung that derived this base from the active profile's
+/// `coord_url`, on the assumption that web and coord co-locate. It is
+/// **never** correct, in either environment:
+///
+/// * In PRODUCTION the two are different services — coord is
+///   `coord.qontinui.io`, the web backend is `api.qontinui.io`. The derived
+///   base sent a web-backend route to coord, which answers
+///   `401 missing operator Bearer token`. Measured on a headless box
+///   2026-09-02. Coord serves no `/api/v1/devices/*` route at all.
+/// * In DEV they share a host but NOT a port, and the derivation strips the
+///   port — `http://localhost:9870` derived to `http://localhost`, i.e. port
+///   80, while the dev backend listens on 8000.
+///
+/// A rung that is never correct is worse than no rung, because it outranks
+/// the working default and makes the failure look like a client bug.
+///
+/// The canonical runner resolver (`api_config::resolve_api_base_url`, which
+/// additionally weighs `$QONTINUI_WEB_BACKEND_URL`, `$QONTINUI_API_URL` and the
+/// persisted `web_integration.backend_url`) is deliberately NOT used: it lives
+/// in the runner binary's module tree and is unreachable from the
+/// `qontinui_profile` binary. Not named `resolve_web_base` — that name belongs
+/// to `memory::tenant_sync::resolve_web_base`, a different ladder.
+///
+/// The [`CliWebBaseSource`] half is returned rather than logged here so the
+/// function stays pure and the caller owns the output surface.
+pub fn resolve_cli_web_base(
+    env: Option<&str>,
+    profile: Option<(String, crate::profiles::ApiUrlSource)>,
+) -> (String, CliWebBaseSource) {
+    fn normalize(s: &str) -> String {
+        s.trim().trim_end_matches('/').to_string()
+    }
+    if let Some(explicit) = env.filter(|s| !s.trim().is_empty()) {
+        return (normalize(explicit), CliWebBaseSource::EnvOverride);
+    }
+    if let Some((url, src)) = profile.filter(|(u, _)| !u.trim().is_empty()) {
+        return (normalize(&url), CliWebBaseSource::ProfileApiUrl(src));
+    }
+    (
+        crate::profiles::PROD_API_BASE_URL.to_string(),
+        CliWebBaseSource::ProdDefault,
+    )
+}
+
+#[cfg(test)]
+mod cli_web_base_tests {
+    use super::*;
+    use crate::profiles::{ApiUrlSource, PROD_API_BASE_URL};
+
+    fn profile(url: &str) -> Option<(String, ApiUrlSource)> {
+        Some((
+            url.to_string(),
+            ApiUrlSource {
+                profile: "staging".to_string(),
+            },
+        ))
+    }
+
+    // A fresh machine with no profiles.json and no override must still be
+    // able to pair against production, not hard-error (fleet-join 2026-08-24).
+
+    #[test]
+    fn resolve_cli_web_base_prefers_env_override_over_everything() {
+        assert_eq!(
+            resolve_cli_web_base(
+                Some("https://custom.example/"),
+                profile("https://p.example")
+            ),
+            (
+                "https://custom.example".to_string(),
+                CliWebBaseSource::EnvOverride
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_ignores_an_empty_env_override() {
+        // An empty string is not a real override — e.g. `QONTINUI_WEB_BASE=`
+        // in an env file. Falls through exactly as if unset, and must report
+        // the arm that actually won rather than the one that was skipped.
+        assert_eq!(
+            resolve_cli_web_base(Some(""), None),
+            (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault)
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_prefers_profile_api_url_over_prod_default() {
+        let (base, arm) = resolve_cli_web_base(None, profile("http://127.0.0.1:8000/"));
+        assert_eq!(base, "http://127.0.0.1:8000");
+        assert_eq!(
+            arm,
+            CliWebBaseSource::ProfileApiUrl(ApiUrlSource {
+                profile: "staging".to_string()
+            })
+        );
+        assert_eq!(
+            arm.label(),
+            "profile `staging` api_url (~/.qontinui/profiles.json)"
+        );
+        // A blank profile value is unset, like a blank env override.
+        assert_eq!(
+            resolve_cli_web_base(Some("  "), profile("   ")).1,
+            CliWebBaseSource::ProdDefault
+        );
+    }
+
+    #[test]
+    fn env_override_beats_profile_api_url() {
+        let (base, arm) =
+            resolve_cli_web_base(Some("https://env.example"), profile("https://p.example"));
+        assert_eq!(base, "https://env.example");
+        assert_eq!(arm, CliWebBaseSource::EnvOverride);
+    }
+
+    #[test]
+    fn resolve_cli_web_base_never_returns_the_coord_host() {
+        // REGRESSION. A rung used to derive this base from the active
+        // profile's coord_url. In production that sent a WEB-backend route to
+        // coord, which answers 401 (measured headless 2026-09-02); in dev it
+        // stripped the port and pointed at :80 instead of :8000. And
+        // `--auth-token` posted `pair-cli` straight to the coord base. Nothing
+        // may reintroduce a coord-derived answer: with nothing configured the
+        // ONLY permitted result is the production web base.
+        let (base, arm) = resolve_cli_web_base(None, None);
+        assert_eq!(base, PROD_API_BASE_URL);
+        assert_eq!(arm, CliWebBaseSource::ProdDefault);
+        assert!(
+            !base.contains("coord"),
+            "CLI web base must never resolve to a coord host, got {base}"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_treats_whitespace_env_as_unset() {
+        // An exported-but-blank var is how a shell says "absent"; it must not
+        // win the ladder and produce an empty base.
+        assert_eq!(
+            resolve_cli_web_base(Some("   "), None),
+            (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault)
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_trims_a_trailing_slash_from_the_override() {
+        // `QONTINUI_WEB_BASE=https://x/` would otherwise build `https://x//api/v1/...`.
+        assert_eq!(
+            resolve_cli_web_base(Some("https://custom.example/"), None),
+            (
+                "https://custom.example".to_string(),
+                CliWebBaseSource::EnvOverride
+            )
+        );
+    }
+
+    #[test]
+    fn cli_web_base_sources_have_distinct_operator_labels() {
+        // The whole point of the second return value: an operator reading the
+        // printed line must be able to tell the rungs apart, because each has
+        // a different fix. Identical labels would be worse than none.
+        let labels = [
+            CliWebBaseSource::EnvOverride.label(),
+            CliWebBaseSource::ProfileApiUrl(ApiUrlSource {
+                profile: "dev".to_string(),
+            })
+            .label(),
+            CliWebBaseSource::ProdDefault.label(),
+        ];
+        let unique: std::collections::HashSet<&String> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must be distinct: {labels:?}"
+        );
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        // Each label must name the knob the operator would turn.
+        assert!(labels[0].contains("QONTINUI_WEB_BASE"));
+        assert!(labels[1].contains("api_url"));
+        assert!(labels[2].contains("default"));
+    }
+
+    #[test]
+    fn each_rung_names_its_own_remedy() {
+        let env = CliWebBaseSource::EnvOverride.pair_base_origin();
+        assert!(env.remedy.contains("QONTINUI_WEB_BASE"));
+        let prof = CliWebBaseSource::ProfileApiUrl(ApiUrlSource {
+            profile: "dev".to_string(),
+        })
+        .pair_base_origin();
+        assert!(prof.label.contains("`dev`"));
+        assert!(prof.remedy.contains("api_url"));
+        let prod = CliWebBaseSource::ProdDefault.pair_base_origin();
+        assert!(prod.remedy.contains("QONTINUI_WEB_BASE") && prod.remedy.contains("api_url"));
+        for o in [&env, &prof, &prod] {
+            assert!(
+                !o.remedy.contains("coord_url"),
+                "a web-base remedy must not point at coord_url: {o:?}"
+            );
+        }
+    }
+}
+
 /// Replace URL userinfo (`scheme://user:pass@host`) with `scheme://***@host`
 /// wherever a URL appears in `text`, so a base carrying credentials is never
 /// echoed into an error message.
@@ -1876,19 +2162,14 @@ pub fn pair_via_browser(
     // coord's pair-complete.
     let device_id = read_device_id()?;
 
-    // Web backend URL: an explicit `$QONTINUI_WEB_BASE` override, else the
-    // fleet's production default. This deliberately does NOT derive from
-    // `coord_base`. That derivation assumed web and coord co-locate, which is
-    // false in BOTH environments — in prod they are different services
-    // (coord.qontinui.io vs api.qontinui.io), and in dev they share a host but
-    // not a port, while the derivation stripped the port. See
-    // `resolve_pair_code_base` in `bin/qontinui_profile.rs` for the full
-    // reasoning and the measured failure.
-    let web_base = std::env::var("QONTINUI_WEB_BASE")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| crate::profiles::PROD_API_BASE_URL.to_string());
+    // Web backend URL: the one CLI web-base ladder ($QONTINUI_WEB_BASE, then
+    // the active profile's api_url, then the production default). This
+    // deliberately does NOT derive from `coord_base` — see
+    // `resolve_cli_web_base` for the reasoning and the measured failure.
+    let (web_base, _) = resolve_cli_web_base(
+        std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+        crate::profiles::api_url_with_source(),
+    );
     let hostname_now = detect_hostname();
 
     // Bind a port for the callback. Use 0 to let the OS pick — then read it
