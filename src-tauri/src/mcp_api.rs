@@ -4722,6 +4722,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // nor demotes; it only releases a phase-coverage pin on a unit that already
     // has a real landed PR, disclosed as a `PHASE ATTESTED WITHOUT A PR` gap.
     "coord_work_unit_attest_phase",
+    // Plan 2026-09-18-a-work-unit-write-leaves-no-history-unless-it-changes-status
+    // Phase 4: a READ of every write to one unit (status, title, metadata and the
+    // other watched columns, with old/new values and the server-derived actor).
+    // `recent_history` on the unit row covers status changes only, so without
+    // this a proxied session cannot answer "which write removed `phases`".
+    "coord_work_unit_history",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
     "coord_work_unit_overview",
@@ -16219,6 +16225,33 @@ mod coord_mcp_body_gate_tests {
                 parsed.allowed
             );
         }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-09-18-a-work-unit-write-leaves-no-history-unless-it-changes-status`
+    /// Phase 4: the work-unit write-log read must forward, and the source-text
+    /// parser must read the entry back exactly once despite the comment above it.
+    #[test]
+    fn work_unit_history_read_is_allowed_and_parses_from_source() {
+        let tool = "coord_work_unit_history";
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+        assert!(!coord_mcp_withholding_is_deliberate(tool));
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{"slug":"x"}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+            1,
+            "the parser must read {tool} exactly once: {:?}",
+            parsed.allowed
+        );
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
