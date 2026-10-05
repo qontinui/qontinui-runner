@@ -46,9 +46,15 @@ import {
   formatUptime,
   countMatches,
   showSoloSessionInfo,
+  zoneFinishedBand,
   ZONE_HEADER_HEIGHT_PX,
   ZONE_FILTER_BAR_HEIGHT_PX,
+  ZONE_FOCUS_COLOR,
+  FINISHED_BAND_PX,
+  FINISHED_FOCUS_SHADOW,
+  finishedBorderImage,
 } from "./zone-grid";
+import { useFinishedSessions, type FinishedStates } from "./useFinishedSessions";
 import {
   useTerminalSession,
   useZoneMetadata,
@@ -92,6 +98,9 @@ function loadPromptTabs(pageId: string): Set<string> {
  * the value is now stated once and shared by both.
  */
 const MAXIMIZED_HEADER_HEIGHT_PX = 26;
+
+/** Computed once: the finished band's `border-image` never varies per zone. */
+const FINISHED_BORDER_IMAGE = finishedBorderImage();
 
 interface ZoneGridProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
@@ -216,6 +225,13 @@ function ZoneGridInner({
   const stateTracking = session;
   const sessionStates = stateTracking.sessionStates;
   const staleTabs = stateTracking.staleTabs;
+  // Which of this page's sessions are marked FINISHED (runner-local marker or
+  // coord's work axis) — drives the chequered border in `ZoneCell`.
+  const claudeSessionIds = useMemo(
+    () => tabs.flatMap((t) => (t.claudeSessionId ? [t.claudeSessionId] : [])),
+    [tabs],
+  );
+  const finishedStates = useFinishedSessions(claudeSessionIds);
   // Session-state tracking is fed by the single global `terminal-output` tap in
   // `TerminalSessionContext.PageSessionScope` (Phase 2), NOT by instance
   // `onOutput` callbacks — so tracking survives Phase 3 instance unmounting.
@@ -886,6 +902,7 @@ function ZoneGridInner({
           flashingTabs={flashingTabs}
           selectedZones={selectedZones}
           staleTabs={staleTabs}
+          finishedStates={finishedStates}
           pinnedZones={pinnedZones}
           onTogglePin={onTogglePin}
           outputSearchQuery={outputSearchQuery}
@@ -1106,6 +1123,7 @@ function ZoneCellInner({
   flashingTabs,
   selectedZones,
   staleTabs,
+  finishedStates,
   pinnedZones,
   onTogglePin,
   outputSearchQuery,
@@ -1169,6 +1187,8 @@ function ZoneCellInner({
   flashingTabs?: Set<string>;
   selectedZones?: Set<number>;
   staleTabs?: Set<string>;
+  /** Claude session id → finished state; a missing id is UNKNOWN. */
+  finishedStates?: FinishedStates;
   pinnedZones?: Set<number>;
   onTogglePin?: (zoneIndex: number) => void;
   outputSearchQuery?: string;
@@ -1303,7 +1323,7 @@ function ZoneCellInner({
   const state = (tab ? (sessionStates[tab.id as string] ?? "idle") : "idle") as SessionState;
   const borderColor = isFocused
     ? STATE_BORDER_COLORS[state] === "#2a2d3d"
-      ? "#7aa2f7"
+      ? ZONE_FOCUS_COLOR
       : STATE_BORDER_COLORS[state]
     : STATE_BORDER_COLORS[state];
 
@@ -1353,6 +1373,16 @@ function ZoneCellInner({
       : false;
   const isSwapSource = swapSource === zoneIdx;
   const isSelected = selectedZones?.has(zoneIdx);
+  // FINISHED is the work axis, not liveness: a finished session's pane is
+  // still a live terminal, so the band changes the border and nothing else.
+  const { verdict: finishedVerdict, showBand: showFinishedBand } = zoneFinishedBand({
+    claudeSessionId: tab?.claudeSessionId,
+    finishedStates,
+    isDropTarget,
+    isSwapSource,
+    isSelected,
+    searchMatch,
+  });
 
   const firstTagColor = zoneTags?.[zoneIdx]?.[0]
     ? labelColorMap?.[zoneTags[zoneIdx][0]]
@@ -1393,32 +1423,42 @@ function ZoneCellInner({
       // Ground truth for the tag filter, readable through the UI Bridge
       // without inferring anything from a computed opacity.
       data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
+      // Ground truth for the finished band: `finished` | `not_finished` |
+      // `unknown`, absent on a pane with no Claude session.
+      data-session-finished={finishedVerdict}
       style={{
         gridColumn: zone.col,
         gridRow: zone.row,
-        border: `${isFocused ? "2px" : isSwapSource ? "2px" : isSelected ? "2px" : searchMatch ? "2px" : "1px"} solid ${
-          isDropTarget
-            ? "#7aa2f7"
-            : isSwapSource
-              ? "#ff9e64"
-              : isSelected
-                ? "#bb9af7"
-                : searchMatch
-                  ? "#9ece6a"
-                  : isStale
-                    ? "#e0af68"
-                    : borderColor
-        }`,
-        borderLeftWidth: state === "needs-input" ? "3px" : "2px",
-        borderLeftColor: stateColor,
-        borderStyle: isSwapSource
-          ? "dashed"
-          : isStale && !isFocused && !searchMatch
-            ? "dashed"
-            : "solid",
-        borderLeftStyle: "solid",
+        ...(showFinishedBand
+          ? {
+              border: `${FINISHED_BAND_PX}px solid transparent`,
+              borderImage: FINISHED_BORDER_IMAGE,
+            }
+          : {
+              border: `${isFocused ? "2px" : isSwapSource ? "2px" : isSelected ? "2px" : searchMatch ? "2px" : "1px"} solid ${
+                isDropTarget
+                  ? "#7aa2f7"
+                  : isSwapSource
+                    ? "#ff9e64"
+                    : isSelected
+                      ? "#bb9af7"
+                      : searchMatch
+                        ? "#9ece6a"
+                        : isStale
+                          ? "#e0af68"
+                          : borderColor
+              }`,
+              borderLeftWidth: state === "needs-input" ? "3px" : "2px",
+              borderLeftColor: stateColor,
+              borderStyle: isSwapSource
+                ? "dashed"
+                : isStale && !isFocused && !searchMatch
+                  ? "dashed"
+                  : "solid",
+              borderLeftStyle: "solid",
+            }),
         borderRadius: "4px",
-        boxShadow: zoneShadow,
+        boxShadow: showFinishedBand && isFocused ? FINISHED_FOCUS_SHADOW : zoneShadow,
         transition: "border-color 0.2s, box-shadow 0.2s, opacity 0.3s",
         // EVERY dim lives in this one inline value, most-specific first.
         //

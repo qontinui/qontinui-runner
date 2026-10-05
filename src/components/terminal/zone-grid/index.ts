@@ -12,7 +12,12 @@ export {
   STATE_LABELS,
   STATE_BG_COLORS,
   TREND_ICONS,
+  ZONE_FOCUS_COLOR,
+  FINISHED_BAND_PX,
+  FINISHED_CHECK_COLOR,
+  FINISHED_FOCUS_SHADOW,
+  finishedBorderImage,
   ZONE_HEADER_HEIGHT_PX,
   ZONE_FILTER_BAR_HEIGHT_PX,
 } from "./constants";
-export { formatUptime, countMatches, showSoloSessionInfo } from "./utils";
+export { formatUptime, countMatches, showSoloSessionInfo, zoneFinishedBand } from "./utils";
