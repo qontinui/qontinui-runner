@@ -110,12 +110,27 @@ fn latest_cell() -> &'static Mutex<Option<BuildDriftStatus>> {
 // the end of one tick. Nothing here runs on the request path.
 // ---------------------------------------------------------------------------
 
-/// The repo-relative path of the file that declares the four consts, tried in
-/// order: the runner repo root (`candidate_repo_dir`'s first candidate), then
-/// the `src-tauri` crate root (its second).
-const TOOL_POLICY_SOURCE_PATHS: &[&str] = &["src-tauri/src/mcp_api.rs", "src/mcp_api.rs"];
+/// The repo-relative paths that may declare the four consts, tried in order.
+///
+/// The split of `mcp_api.rs` (plan
+/// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+/// D4) moves the consts to `mcp_api/coord_mcp_proxy/tool_policy.rs`, so that
+/// path is tried FIRST and the pre-split `mcp_api.rs` second: this binary must
+/// read a trunk on either side of the move. Each is spelled from the runner
+/// repo root (`candidate_repo_dir`'s first candidate) and from the `src-tauri`
+/// crate root (its second).
+///
+/// A trunk may hold BOTH files — the post-split `mcp_api.rs` still exists, just
+/// without the consts — which is why [`first_parsable_tool_policy`] selects on
+/// a successful PARSE, never on the first readable path.
+const TOOL_POLICY_SOURCE_PATHS: &[&str] = &[
+    "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+    "src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+    "src-tauri/src/mcp_api.rs",
+    "src/mcp_api.rs",
+];
 
-/// The four `&[&str]` consts parsed out of `mcp_api.rs` — the SAME four the
+/// The four `&[&str]` consts parsed out of trunk's source — the SAME four the
 /// binary compiled, read from a different commit. Pure data; see
 /// [`parse_tool_policy_consts`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +159,7 @@ impl ParsedToolPolicy {
 /// trunk commit its `cause` is measured against.
 #[derive(Debug, Clone)]
 pub struct TrunkToolPolicy {
-    /// The commit whose `mcp_api.rs` was parsed — the resolved trunk tip when
+    /// The commit whose tool-policy source was parsed — the resolved trunk tip when
     /// `git show` could reach it.
     pub trunk_sha: String,
     /// Unix millis when the read completed. Rendered as `trunkReadAt` in the
@@ -204,9 +219,10 @@ fn parse_str_slice_const(source: &str, name: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Parse the four coord-mcp tool-policy consts out of `mcp_api.rs` source
-/// text. Pure over its input, so the self-test in `mcp_api.rs` can pin it
-/// against `include_str!` of the very file it reads: a reformat that breaks
+/// Parse the four coord-mcp tool-policy consts out of source text (whichever
+/// of `TOOL_POLICY_SOURCE_PATHS` declares them). Pure over its input, so the
+/// self-test in the `mcp_api` module can pin it against that module's own
+/// source (`mcp_api_sources`), the very text it reads: a reformat that breaks
 /// this parser breaks that test, not production (production degrades to
 /// `None`, i.e. `cause: "unknown"`).
 pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
@@ -298,19 +314,31 @@ fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
     None
 }
 
-/// Read trunk's `mcp_api.rs` at an already-resolved tip and parse its tool
-/// policy. `None` when the file is unreadable at that sha or the consts do
-/// not parse — the caller keeps the sha regardless (see
-/// [`resolve_trunk_tip`]).
+/// The tool policy from the first of [`TOOL_POLICY_SOURCE_PATHS`] that is
+/// readable through `read` AND parses. `None` when no path does.
+///
+/// Selecting on readability alone was the pre-split reader, and it goes blind
+/// the moment the consts leave `mcp_api.rs`: that file stays readable, the
+/// parse fails, and the refusal's `cause` degrades to `unknown` although the
+/// policy sits one path further on. `read` is the `git show` seam, injected
+/// so the selection is testable against a fixture tree.
+fn first_parsable_tool_policy(read: impl Fn(&str) -> Option<String>) -> Option<ParsedToolPolicy> {
+    TOOL_POLICY_SOURCE_PATHS
+        .iter()
+        .find_map(|p| read(p).and_then(|text| parse_tool_policy_consts(&text)))
+}
+
+/// Read trunk's tool policy at an already-resolved tip, from whichever of
+/// [`TOOL_POLICY_SOURCE_PATHS`] declares it. `None` when no path is readable
+/// at that sha with the consts parsing — the caller keeps the sha regardless
+/// (see [`resolve_trunk_tip`]).
 fn read_trunk_tool_policy(
     repo: &Path,
     trunk_sha: &str,
     source: &'static str,
 ) -> Option<TrunkToolPolicy> {
-    let source_text = TOOL_POLICY_SOURCE_PATHS
-        .iter()
-        .find_map(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
-    let policy = parse_tool_policy_consts(&source_text)?;
+    let policy =
+        first_parsable_tool_policy(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
     Some(TrunkToolPolicy {
         trunk_sha: trunk_sha.to_string(),
         read_at: chrono::Utc::now().timestamp_millis(),
@@ -886,6 +914,115 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         assert!(parse_tool_policy_consts("nothing here").is_none());
         let truncated = SAMPLE.replace("];\nconst COORD_MCP_ALLOWED_TOOL_PREFIXES", "\nconst X");
         assert!(parse_tool_policy_consts(&truncated).is_none());
+    }
+
+    /// A fixture trunk tree: repo-relative path -> contents. Reading a path it
+    /// lacks is `None`, as `git show <sha>:<path>` is for a missing blob.
+    fn tree(files: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let files: std::collections::BTreeMap<String, String> = files
+            .iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        move |p| files.get(p).cloned()
+    }
+
+    /// The post-split trunk (plan
+    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    /// D4): the consts live ONLY in `mcp_api/coord_mcp_proxy/tool_policy.rs`,
+    /// and `mcp_api.rs` is still there without them. The pre-split reader
+    /// tried `mcp_api.rs` alone, found it readable, failed the parse and
+    /// returned `None` — `cause: unknown` on every refusal.
+    #[test]
+    fn reads_the_policy_from_the_split_tool_policy_file() {
+        for root in ["src-tauri/", ""] {
+            let read = tree(&[
+                (
+                    format!("{root}src/mcp_api.rs").as_str(),
+                    "mod coord_mcp_proxy;\n",
+                ),
+                (
+                    format!("{root}src/mcp_api/coord_mcp_proxy/tool_policy.rs").as_str(),
+                    SAMPLE,
+                ),
+            ]);
+            let p = first_parsable_tool_policy(&read).expect("the split file declares the policy");
+            assert_eq!(p.allowed, vec!["coord_alpha", "coord_beta", "coord_gamma"]);
+            assert_eq!(p.deliberate, vec!["coord_create_pr"]);
+        }
+    }
+
+    /// Selection is by PARSE SUCCESS, not readability: a readable path whose
+    /// consts do not parse must not hide a later one that does. Here the
+    /// new-layout file exists but declares nothing (a partial move), and the
+    /// policy is still in `mcp_api.rs`.
+    #[test]
+    fn a_readable_file_without_the_consts_does_not_hide_one_with_them() {
+        let read = tree(&[
+            (
+                "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+                "const COORD_MCP_ALLOWED_METHODS: &[&str] = &[\"initialize\"];\n",
+            ),
+            ("src-tauri/src/mcp_api.rs", SAMPLE),
+        ]);
+        let p = first_parsable_tool_policy(&read).expect("mcp_api.rs still declares the policy");
+        assert_eq!(p.allowed_prefixes, vec!["coord_query_"]);
+    }
+
+    /// No path parses: UNKNOWN, never a guess.
+    #[test]
+    fn no_parsable_path_is_none() {
+        assert!(first_parsable_tool_policy(tree(&[])).is_none());
+        let read = tree(&[("src/mcp_api.rs", "nothing here")]);
+        assert!(first_parsable_tool_policy(&read).is_none());
+    }
+
+    /// The same post-split shape end to end through `git show`, so the path
+    /// list is proven against a real tree and not only the injected seam.
+    #[test]
+    fn read_trunk_tool_policy_finds_the_split_file_through_git_show() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = repo.join(rel);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write fixture");
+        };
+        write("src-tauri/src/mcp_api.rs", "mod coord_mcp_proxy;\n");
+        write(
+            "src-tauri/src/mcp_api/coord_mcp_proxy/tool_policy.rs",
+            SAMPLE,
+        );
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+
+        let read = read_trunk_tool_policy(repo, &sha, "local-ref")
+            .expect("the split tool_policy.rs is read through git show");
+        assert_eq!(read.trunk_sha, sha);
+        assert_eq!(
+            read.policy.allowed,
+            vec!["coord_alpha", "coord_beta", "coord_gamma"]
+        );
     }
 
     #[test]

@@ -427,11 +427,6 @@ mod route_registration_tests {
     #[test]
     fn the_control_flags_a_family_whose_merge_was_deleted() {
         let mut sources = crate_sources();
-        let api = sources
-            .keys()
-            .find(|p| p.ends_with("mcp_api.rs"))
-            .expect("mcp_api.rs is in the tree")
-            .clone();
         // Composed at runtime on purpose. Spelled as one literal, this needle
         // would ITSELF be a `session_briefing::routes()` occurrence in this
         // file, and would mount the very family the test is trying to unmount
@@ -440,11 +435,25 @@ mod route_registration_tests {
         let family = "session_briefing";
         let merge = format!(".merge(crate::mcp::{family}::routes())");
 
-        let text = sources.get_mut(&api).expect("just found it");
+        // The file that REGISTERS the family, found by its code rather than by
+        // its name: the registration moves as `mcp_api` is split into
+        // `mcp_api/` (plan
+        // `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+        // D5), so a hardcoded `mcp_api.rs` would one day mutate a file that no
+        // longer carries it. Comment-stripped, because this module's own doc
+        // comments QUOTE the merge and must not be mistaken for it.
+        let registering: Vec<PathBuf> = sources
+            .iter()
+            .filter(|(_, text)| strip_comments(text).contains(&merge))
+            .map(|(path, _)| path.clone())
+            .collect();
         assert!(
-            text.contains(&merge),
-            "the registration this test deletes must exist to begin with"
+            registering.len() == 1,
+            "the registration this test deletes must exist to begin with, in \
+             exactly one file; found it in {registering:?}"
         );
+
+        let text = sources.get_mut(&registering[0]).expect("just found it");
         *text = text.replace(&merge, "");
 
         assert!(

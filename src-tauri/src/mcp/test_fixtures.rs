@@ -3109,21 +3109,22 @@ mod tests {
         );
     }
 
-    /// The `routes()` merge in `mcp_api.rs` must carry the matching cfg
-    /// attribute on the line immediately above it.
+    /// The `routes()` merge in the `mcp_api` module (whichever of its files
+    /// holds it — [`crate::mcp_api::mcp_api_sources`]) must carry the matching
+    /// cfg attribute on the line immediately above it.
     #[test]
     fn mcp_api_routes_merge_is_cfg_gated() {
-        let src = include_str!("../mcp_api.rs");
+        let src = crate::mcp_api::mcp_api_sources();
         let lines: Vec<&str> = src.lines().map(str::trim).collect();
         let merge_idx = lines
             .iter()
             .position(|l| l.contains("crate::mcp::test_fixtures::routes()"))
-            .expect("mcp_api.rs must merge the test-fixtures routes");
+            .expect("the mcp_api module must merge the test-fixtures routes");
         assert!(
             merge_idx > 0
                 && lines[merge_idx - 1]
                     == r#"#[cfg(any(debug_assertions, feature = "test-fixtures"))]"#,
-            "the test_fixtures::routes() merge in mcp_api.rs must be immediately preceded \
+            "the test_fixtures::routes() merge in the mcp_api module must be immediately preceded \
              by the cfg gate — without it the debug routes mount in release builds",
         );
     }
