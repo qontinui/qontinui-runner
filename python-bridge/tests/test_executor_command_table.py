@@ -1,8 +1,9 @@
 """Guards for the executor's command table (``QontinuiExecutor.COMMANDS``).
 
-The executor is read as source with ``ast`` (and Rust with a regex); nothing imports
-``qontinui_executor``, so these run without the ``qontinui`` library or any GPU
-dependency installed. Only the dependency-free ``executor_commands`` package is imported.
+The executor and its command mixins (``executor_commands/``) are read as source with
+``ast`` (and Rust with a regex); nothing imports ``qontinui_executor`` or a mixin, so
+these run without the ``qontinui`` library or any GPU dependency installed. Only the
+dependency-free ``executor_commands/_table.py`` is loaded, on its own, from its file.
 
 What the Rust-sender guard (``test_every_rust_sent_command_is_handled``) cannot see, by
 construction:
@@ -29,6 +30,8 @@ BRIDGE_DIR = Path(__file__).resolve().parent.parent
 EXECUTOR = BRIDGE_DIR / "qontinui_executor.py"
 EXTRACTION_EXECUTOR = BRIDGE_DIR / "extraction_executor.py"
 SNAPSHOT = Path(__file__).resolve().parent / "executor-commands.snapshot.txt"
+METHODS_SNAPSHOT = Path(__file__).resolve().parent / "executor-methods.snapshot.txt"
+PACKAGE_DIR = BRIDGE_DIR / "executor_commands"
 RUST_SRC = BRIDGE_DIR.parent / "src-tauri" / "src"
 
 _FOLLOW_UP = (
@@ -64,6 +67,19 @@ def _load_snapshot_script():
 
 
 snapshot_script = _load_snapshot_script()
+
+
+def _load_table_module():
+    """``executor_commands/_table.py`` alone: importing the package would run ``_shared``."""
+    path = PACKAGE_DIR / "_table.py"
+    spec = importlib.util.spec_from_file_location("executor_commands_table", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+table_module = _load_table_module()
 
 
 def _source() -> str:
@@ -265,12 +281,10 @@ def test_handle_command_stays_short():
     )
 
 
-# build_command_table (runtime; executor_commands is dependency-free) ----------
+# build_command_table (runtime; ``_table.py`` is dependency-free) -------------
 
 
 def test_build_command_table_resolves_arity():
-    import executor_commands
-
     class Core:
         COMMANDS = {"a": "_with_params", "b": "_no_args"}
 
@@ -280,26 +294,22 @@ def test_build_command_table_resolves_arity():
         def _no_args(self):
             return {}
 
-    table = executor_commands.build_command_table(Core)
+    table = table_module.build_command_table(Core, ())
     assert table == {
-        "a": executor_commands.CommandEntry("_with_params", True),
-        "b": executor_commands.CommandEntry("_no_args", False),
+        "a": table_module.CommandEntry("_with_params", True),
+        "b": table_module.CommandEntry("_no_args", False),
     }
 
 
 def test_build_command_table_rejects_missing_method():
-    import executor_commands
-
     class Core:
         COMMANDS = {"a": "_nope"}
 
     with pytest.raises(ValueError, match="does not exist"):
-        executor_commands.build_command_table(Core)
+        table_module.build_command_table(Core, ())
 
 
-def test_build_command_table_rejects_duplicate_across_mixins(monkeypatch):
-    import executor_commands
-
+def test_build_command_table_rejects_duplicate_across_mixins():
     class Mixin:
         COMMANDS = {"a": "_m"}
 
@@ -309,6 +319,164 @@ def test_build_command_table_rejects_duplicate_across_mixins(monkeypatch):
     class Core(Mixin):
         COMMANDS = {"a": "_m"}
 
-    monkeypatch.setattr(executor_commands, "COMMAND_MIXINS", (Mixin,))
     with pytest.raises(ValueError, match="declared by both Mixin and Core"):
-        executor_commands.build_command_table(Core)
+        table_module.build_command_table(Core, (Mixin,))
+
+
+def test_build_command_table_rejects_a_mixin_that_is_not_a_base():
+    class Mixin:
+        COMMANDS = {"m": "_m"}
+
+        def _m(self):
+            return {}
+
+    class Core:
+        COMMANDS: dict[str, str] = {}
+
+    with pytest.raises(TypeError, match="not a base of Core"):
+        table_module.build_command_table(Core, (Mixin,))
+
+
+# the move into per-domain mixins (AST only; no mixin is imported) --------------
+
+# ``_host.py`` declares ``ExecutorHost`` under ``if TYPE_CHECKING`` only (``object`` at
+# run time), so its method stubs are not runtime definitions and are not counted.
+PRE_MOVE_METHOD_COUNT = 165
+QONTINUI_EXECUTOR_MAX_LINES = 1700
+MIXIN_MAX_LINES = 1000
+
+
+def _mixin_modules() -> list[Path]:
+    """The per-domain mixin files: every package module whose name has no leading ``_``."""
+    return [p for p in sorted(PACKAGE_DIR.glob("*.py")) if not p.name.startswith("_")]
+
+
+def _init_tree() -> ast.Module:
+    return ast.parse((PACKAGE_DIR / "__init__.py").read_text(encoding="utf-8"))
+
+
+def _command_mixin_names() -> list[str]:
+    """The names in ``COMMAND_MIXINS = (...)``, in order."""
+    for node in _init_tree().body:
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        if isinstance(target, ast.Name) and target.id == "COMMAND_MIXINS":
+            assert isinstance(value, ast.Tuple), "COMMAND_MIXINS is not a tuple literal"
+            assert all(isinstance(e, ast.Name) for e in value.elts)
+            return [e.id for e in value.elts if isinstance(e, ast.Name)]
+    raise AssertionError("COMMAND_MIXINS not found in executor_commands/__init__.py")
+
+
+def _runtime_classes() -> dict[str, tuple[str, ast.ClassDef]]:
+    """``QontinuiExecutor`` plus every top-level class of a mixin module, by name."""
+    executor = next(
+        n
+        for n in ast.parse(_source()).body
+        if isinstance(n, ast.ClassDef) and n.name == "QontinuiExecutor"
+    )
+    classes = {"QontinuiExecutor": (EXECUTOR.name, executor)}
+    for path in _mixin_modules():
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.ClassDef):
+                assert node.name not in classes, f"class {node.name} defined twice"
+                classes[node.name] = (path.name, node)
+    return classes
+
+
+def _class_methods(cls: ast.ClassDef) -> list[str]:
+    return [n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def _executor_and_mixins() -> list[tuple[str, str, ast.ClassDef]]:
+    """(class, file, node) for QontinuiExecutor and each COMMAND_MIXINS entry."""
+    classes = _runtime_classes()
+    names = ["QontinuiExecutor", *_command_mixin_names()]
+    missing = [n for n in names if n not in classes]
+    assert not missing, f"COMMAND_MIXINS names classes no mixin module defines: {missing}"
+    return [(name, *classes[name]) for name in names]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [EXECUTOR, *sorted(PACKAGE_DIR.glob("*.py"))],
+    ids=lambda p: p.name,
+)
+def test_every_file_parses(path):
+    ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def test_method_set_equals_pre_move_set():
+    """The executor's methods, across it and its mixins, equal the pre-move class's."""
+    expected = METHODS_SNAPSHOT.read_text(encoding="utf-8").splitlines()
+    assert len(expected) == PRE_MOVE_METHOD_COUNT
+    actual = sorted(m for _name, _file, cls in _executor_and_mixins() for m in _class_methods(cls))
+    assert actual == expected, (
+        f"missing: {sorted(set(expected) - set(actual))}; "
+        f"added: {sorted(set(actual) - set(expected))}. "
+        "Update tests/executor-methods.snapshot.txt only for an intended change."
+    )
+
+
+def test_no_method_is_defined_in_two_classes():
+    """An MRO clash would silently pick one definition, so each name has one owner."""
+    owners: dict[str, list[str]] = {}
+    for name, file, cls in _executor_and_mixins():
+        for method in _class_methods(cls):
+            owners.setdefault(method, []).append(f"{file}:{name}")
+    clashes = {m: where for m, where in owners.items() if len(where) > 1}
+    assert not clashes, f"methods defined in more than one class: {clashes}"
+
+
+def test_every_mixin_module_is_registered():
+    """Each mixin module defines one class, and it is in COMMAND_MIXINS."""
+    registered = _command_mixin_names()
+    assert len(registered) == len(set(registered)), "COMMAND_MIXINS lists a mixin twice"
+    for path in _mixin_modules():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        classes = [n.name for n in tree.body if isinstance(n, ast.ClassDef)]
+        assert len(classes) == 1, f"{path.name} should define exactly one mixin: {classes}"
+        assert classes[0] in registered, f"{path.name}:{classes[0]} is not in COMMAND_MIXINS"
+    assert len(registered) == len(_mixin_modules())
+
+
+def test_every_mixin_is_imported_statically():
+    """``from .<module> import <Mixin>`` for every COMMAND_MIXINS entry (PyInstaller, D3)."""
+    imported: dict[str, str] = {}
+    for node in _init_tree().body:
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+            for alias in node.names:
+                imported[alias.asname or alias.name] = node.module
+    modules = {p.stem for p in _mixin_modules()}
+    for name in _command_mixin_names():
+        assert name in imported, f"{name} is not statically imported in __init__.py"
+        assert imported[name] in modules, f"{name} is imported from .{imported[name]}"
+    assert {imported[n] for n in _command_mixin_names()} == modules
+
+
+def test_executor_bases_are_the_command_mixins_in_order():
+    executor = _runtime_classes()["QontinuiExecutor"][1]
+    assert [ast.unparse(b) for b in executor.bases] == _command_mixin_names()
+
+
+def test_host_stub_is_object_at_run_time():
+    """``ExecutorHost`` is a class only under TYPE_CHECKING, so it adds nothing to the MRO."""
+    tree = ast.parse((PACKAGE_DIR / "_host.py").read_text(encoding="utf-8"))
+    assert not [n for n in tree.body if isinstance(n, ast.ClassDef)]
+    guard = next(n for n in tree.body if isinstance(n, ast.If))
+    assert ast.unparse(guard.test) == "TYPE_CHECKING"
+    assert [ast.unparse(s) for s in guard.orelse] == ["ExecutorHost = object"]
+
+
+def test_executor_file_stays_under_budget():
+    lines = len(_source().splitlines())
+    assert lines <= QONTINUI_EXECUTOR_MAX_LINES, f"qontinui_executor.py is {lines} lines"
+
+
+@pytest.mark.parametrize("path", _mixin_modules(), ids=lambda p: p.name)
+def test_mixin_file_stays_under_budget(path):
+    lines = len(path.read_text(encoding="utf-8").splitlines())
+    assert lines <= MIXIN_MAX_LINES, f"{path.name} is {lines} lines"
