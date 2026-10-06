@@ -201,7 +201,11 @@ impl ScrubbedCommand {
     /// value is not valid UTF-8 — such a variable does not reach a holder pane
     /// (it does reach a `LocalPty` one). Ring size and exit linger are left at
     /// the holder's defaults.
-    pub(crate) fn to_holder_spec(&self, cols: u16, rows: u16) -> qontinui_pty_holder::spec::ChildSpec {
+    pub(crate) fn to_holder_spec(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> qontinui_pty_holder::spec::ChildSpec {
         let b = &self.0;
         let mut spec = qontinui_pty_holder::spec::ChildSpec::new(if b.is_default_prog() {
             Vec::new()
