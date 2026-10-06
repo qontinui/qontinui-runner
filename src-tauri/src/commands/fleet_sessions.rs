@@ -76,8 +76,24 @@ pub struct FleetSessionsArgs {
     /// "present tenant X's credential". [`fleet_scope`] turns this into the
     /// [`TenantScope`] the request is authenticated under. Absent or blank ⇒
     /// the device's own authority order decides
-    /// ([`crate::coord_mcp::session_tenant_or_refuse`]), which on a
-    /// single-tenant or unpinned device is exactly the pre-field behaviour.
+    /// ([`crate::coord_mcp::session_tenant_or_refuse`] with no nonce), and
+    /// that is a deliberate CHANGE from the pre-field read, which always
+    /// presented the default slot ([`TenantScope::Device`]):
+    ///
+    /// - an unpinned machine (`machine.json` `Unpinned`, no admitted
+    ///   `$QONTINUI_TENANT_ID`) still presents [`TenantScope::Device`] — the
+    ///   pre-field behaviour, unchanged;
+    /// - a PINNED machine (or an admitted `$QONTINUI_TENANT_ID`) now presents
+    ///   [`TenantScope::Owned`] for that tenant, so the read lists the pinned
+    ///   tenant's fleet rather than whatever the default slot holds;
+    /// - a pin that cannot be honoured — an env tenant that fails admission,
+    ///   or an unreadable pin with no `tenant_id` claim in the device JWT to
+    ///   fall back on — REFUSES with a typed `fleet_sessions:<code>` error and
+    ///   sends no request, where the pre-field read would have silently
+    ///   presented the default slot.
+    ///
+    /// The attach and create mints resolve "no tenant" by the same rule
+    /// ([`fleet_scope`]), so a row listed under the pin is minted under it.
     ///
     /// coord fingerprints the tenant into a page cursor, so a cursor must be
     /// replayed under the SAME tenant it was minted under — the frontend keys

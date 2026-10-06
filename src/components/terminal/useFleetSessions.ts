@@ -622,9 +622,15 @@ export function mergeFleetWalks(
     failures,
     emptyReason,
     degraded: walks.some((w) => isDegraded(w.response)),
+    // In a MERGED read, a walk that failed or is re-reading has no CURRENT
+    // envelope: the one it holds belongs to a previous read (seeded, or the
+    // read the refresh failed to replace). Classified as unanswered (`unknown`)
+    // so the union cannot read `none` — complete — over a tenant that has not
+    // positively said "last page" for THIS read. A single walk keeps its own
+    // envelope, so a single-tenant view reads exactly as it always did.
     truncation: fleetUnionTruncation(
       walks.map((w) => ({
-        response: w.response,
+        response: merged && (walkFailed(w) || w.loading) ? null : w.response,
         loaded: w.walk.sessions.length,
         canAdvance: w.walk.nextCursor !== null,
       })),
@@ -797,6 +803,15 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
         }),
     );
     walkersRef.current = walkers;
+    // A TENANT-set change empties both filter catalogues NOW, not when the
+    // first page arrives: until then they would offer the previous tenants'
+    // devices and states as options no read of the new set can return — and
+    // a first page that fails would leave them standing indefinitely.
+    if (catalogTenantsRef.current !== tenantsKey) {
+      catalogTenantsRef.current = tenantsKey;
+      setDeviceCatalog([]);
+      setStateCatalog([]);
+    }
     for (const w of walkers) void w.restart();
     return () => {
       for (const w of walkers) w.dispose();
