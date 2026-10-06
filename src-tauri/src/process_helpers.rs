@@ -2876,9 +2876,12 @@ mod raw_git_guard {
                     if item == "}" || item == "};" {
                         break;
                     }
-                } else if t.contains('{') {
+                } else if t.contains('{')
+                    && !(t.ends_with(';') && t.matches('{').count() == t.matches('}').count())
+                {
                     // A head that spans lines (a multi-line fn signature)
-                    // opens its body here.
+                    // opens its body here — unless this line is a balanced,
+                    // `;`-terminated initializer, which ends the item below.
                     braced = true;
                 } else if t.ends_with(';') {
                     break;
@@ -2996,6 +2999,10 @@ mod raw_git_guard {
         // `}`, not at the first `;` in its body.
         let multi_sig = "#[cfg(test)]\nfn f(\n    a: u8,\n) {\n    let x = 1;\n    Command::new(\"git\");\n}\nfn prod() { Command::new(\"git\"); }\n";
         assert_eq!(raw_git_spawns(multi_sig), (vec![8], 0));
+        // A braceless head whose initializer line carries balanced braces
+        // and ends in `;` ends there.
+        let struct_init = "#[cfg(test)]\nstatic S: Foo =\n    Foo { a: 1 };\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(struct_init), (vec![4], 0));
         for spelling in [
             "tokio::process::Command::new(\"git\")",
             "Command::new( \"git\" )",
