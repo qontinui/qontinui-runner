@@ -907,6 +907,28 @@ async fn pump_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 mod tests {
     use super::*;
 
+    /// A CI step whose argv starts with `git` gets the runner's git posture:
+    /// every repository-local variable is removed (`get_envs` reports a
+    /// removal as `None`), so a `GIT_DIR` inherited from the runner's launcher
+    /// cannot point the step at another repo. Pins `build_step_command` to
+    /// `tokio_no_window` — a bare `Command::new(program)` fails this.
+    #[test]
+    fn a_git_step_is_scrubbed_of_the_repo_local_env() {
+        let cmd = build_step_command("git", &["status".to_string()]);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                removed.iter().any(|r| r == var),
+                "a git CI step must not inherit {var}; removed: {removed:?}"
+            );
+        }
+    }
+
     #[test]
     fn step_outcome_conclusions() {
         assert_eq!(StepOutcome::Success.as_conclusion(), "success");

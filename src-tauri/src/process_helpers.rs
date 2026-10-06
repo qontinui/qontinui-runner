@@ -2815,32 +2815,67 @@ mod raw_git_guard {
         })
     }
 
-    /// Production text only: everything up to the first `#[cfg(test)]` MODULE.
-    /// A `#[cfg(test)]` on a single helper item early in a file must not hide
-    /// the production code after it, so only an attribute directly followed by
-    /// a `mod` ends the scan.
-    fn production_text(src: &str) -> &str {
-        src.split_once("\n#[cfg(test)]\nmod ")
-            .map(|(before, _)| before)
-            .unwrap_or(src)
+    /// The production lines of `src`, as `(1-based line number, line)`.
+    ///
+    /// Skips exactly the item each column-0 `#[cfg(test)]` applies to — a
+    /// `mod` of any visibility, a helper fn, a `use` — then keeps scanning, so
+    /// a test module in the middle of a file hides neither the production
+    /// code before it nor after it. The item is the first non-attribute line
+    /// after the cfg: one ending in `;`, or opening and closing its braces on
+    /// that line, is the whole item; otherwise it runs to the next line that
+    /// is exactly `}` — rustfmt closes every top-level item that way, and
+    /// unlike brace counting this is not fooled by braces inside the string
+    /// literals source-scanning tests are full of.
+    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut lines = src.lines().enumerate();
+        while let Some((i, line)) = lines.next() {
+            if !line.starts_with("#[cfg(test)]") {
+                out.push((i + 1, line));
+                continue;
+            }
+            let mut head_seen = false;
+            for (_, item) in lines.by_ref() {
+                if !head_seen {
+                    let t = item.trim();
+                    if t.starts_with("#[") || t.is_empty() {
+                        continue;
+                    }
+                    head_seen = true;
+                    let opens = t.matches('{').count();
+                    let closes = t.matches('}').count();
+                    if (t.ends_with(';') && opens == 0) || (opens > 0 && opens == closes) {
+                        break;
+                    }
+                    continue;
+                }
+                if item == "}" {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Returns `(unmarked, marked)`: the 1-based lines of raw git spawns in
     /// `src`'s production text without a `git-env-ok:` marker, and the count
     /// of those that carry one.
     pub(super) fn raw_git_spawns(src: &str) -> (Vec<usize>, usize) {
-        let lines: Vec<&str> = production_text(src).lines().collect();
+        let lines = production_lines(src);
         let mut unmarked = Vec::new();
         let mut marked = 0;
-        for (i, line) in lines.iter().enumerate() {
+        for (idx, (n, line)) in lines.iter().enumerate() {
             if line.trim_start().starts_with("//") || !is_raw_git_spawn(line) {
                 continue;
             }
-            let start = i.saturating_sub(MARKER_WINDOW);
-            if lines[start..=i].iter().any(|l| l.contains("git-env-ok:")) {
+            let start = idx.saturating_sub(MARKER_WINDOW);
+            if lines[start..=idx]
+                .iter()
+                .any(|(_, l)| l.contains("git-env-ok:"))
+            {
                 marked += 1;
             } else {
-                unmarked.push(i + 1);
+                unmarked.push(*n);
             }
         }
         (unmarked, marked)
@@ -2909,6 +2944,16 @@ mod raw_git_guard {
         // A test-only helper ITEM does not hide the production code after it.
         let after_helper = "#[cfg(test)]\nfn helper() {}\nfn prod() { Command::new(\"git\"); }\n";
         assert_eq!(raw_git_spawns(after_helper), (vec![3], 0));
+        // Neither does a test module in the middle of a file, of any
+        // visibility — while its own raw spawns stay out of the scan.
+        let mid_file = "#[cfg(test)]\npub(crate) mod support {\n    fn g() {\n        \
+                        Command::new(\"git\");\n    }\n}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(mid_file), (vec![7], 0));
+        // A test-only `use` ends at its `;`, and an attribute between the
+        // cfg and the item does not end the skip.
+        let use_then_prod =
+            "#[cfg(test)]\n#[allow(unused)]\nuse std::fmt;\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(use_then_prod), (vec![4], 0));
         for spelling in [
             "tokio::process::Command::new(\"git\")",
             "Command::new( \"git\" )",
