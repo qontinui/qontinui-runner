@@ -400,12 +400,34 @@ rather than writing a fourth copy of the cascade here.
 COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 # 1) Resolve the device JWT. $ROOT is the workspace root resolved exactly as the
 #    Step-2 block does (`--git-common-dir`, NOT `--show-toplevel`).
-DEVICE_JWT="${COORD_DEVICE_JWT:-}"
-[ -n "$DEVICE_JWT" ] || DEVICE_JWT="$(tr -d '\r\n' < "$HOME/.qontinui/coord-device-jwt" 2>/dev/null)"
-[ -n "$DEVICE_JWT" ] || DEVICE_JWT="$(powershell -NoProfile -Command "
+#    The module owns the WHOLE cascade (both static sources included) and
+#    selects every source by its tenant_id CLAIM: the tenant is this SESSION's
+#    ($QONTINUI_TENANT_ID, else the runner session census for
+#    $QONTINUI_TERMINAL_ID, else the device's sole binding), the runner is asked
+#    for it as {"args":{"tenantId":"<uuid>"}} (a top-level key is dropped by the
+#    runner), and a token claiming ANOTHER tenant is discarded, never used. On a
+#    device proven multi-bound with no tenant it REFUSES (TENANT_REQUIRED), and
+#    so it does when no tenant resolves and the bindings are UNKNOWN
+#    (TENANT_UNKNOWN) - it never mints the default slot. The `tenant:` line goes to stderr.
+#    No PowerShell on the box (a Linux box without pwsh): the one static arm
+#    left is $COORD_DEVICE_JWT, used ONLY when it claims $QONTINUI_TENANT_ID.
+PS_BIN="$(command -v powershell || command -v pwsh)"
+if [ -z "$PS_BIN" ]; then
+  DEVICE_JWT=""
+  _claim="$(T="${COORD_DEVICE_JWT:-}" python3 -c 'import os,json,base64
+p=os.environ["T"].split(".")[1]; p+="="*(-len(p)%4)
+print(json.loads(base64.urlsafe_b64decode(p)).get("tenant_id") or "")' 2>/dev/null)"
+  if [ -n "${QONTINUI_TENANT_ID:-}" ] && [ "${_claim,,}" = "${QONTINUI_TENANT_ID,,}" ]; then DEVICE_JWT="$COORD_DEVICE_JWT"
+  else echo "no PowerShell for the tenant-checked mint, and \$COORD_DEVICE_JWT does not claim \$QONTINUI_TENANT_ID (claims '${_claim:-none}')" >&2; fi
+else
+DEVICE_JWT="$("$PS_BIN" -NoProfile -Command "
   Import-Module '$ROOT/qontinui-claude-config/scripts/lib/coord-credential.psm1' -Force
-  \$t = Get-CoordDoorTransport -Cwd (Get-Location).Path
-  if (\$t.Kind -eq 'bearer') { \$t.Jwt } else { [Console]::Error.WriteLine(\$t.FailureReport) }" 2>/dev/null | tr -d '\r\n')"
+  \$r = Resolve-QontinuiExpectedTenant -Scope Session
+  [Console]::Error.WriteLine(\$r.Line)
+  if (\$r.State -in 'required','invalid','unknown') { [Console]::Error.WriteLine(\$r.Warning); exit }
+  \$t = Get-CoordDoorTransport -Cwd (Get-Location).Path -TenantId \$r.TenantId -AllowDefaultSlot:\$r.AllowDefaultSlot
+  if (\$t.Kind -eq 'bearer') { \$t.Jwt } else { [Console]::Error.WriteLine(\$t.FailureReport) }" | tr -d '\r\n')"
+fi
 # 2) Stage it OFF argv — same rule and same reason as the Step-2 nonce. $AUTH +
 #    the EXIT trap come from the Step-2 block when you carried that shell
 #    forward; in a fresh shell the guard below creates both, and the trap MUST

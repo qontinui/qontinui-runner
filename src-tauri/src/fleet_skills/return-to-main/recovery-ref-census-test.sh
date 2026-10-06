@@ -52,6 +52,9 @@ export GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=census-test
 export GIT_CONFIG_KEY_1=user.email GIT_CONFIG_VALUE_1=census-test@example.invalid
 export RECOVERY_CENSUS_NO_MINT=0 HOME="$SANDBOX/home" USERPROFILE="$SANDBOX/home"
 unset COORD_DEVICE_JWT QONTINUI_MACHINE_ID COORD_HTTP_URL QONTINUI_TENANT_ID
+# The library's local-runner rung (127.0.0.1:9876) is not part of this fixture: a
+# suite on a dev box must never reach the live runner.
+export CTC_NO_RUNNER=1
 mkdir -p "$HOME"
 # Resolved by RUNNING it: on Windows `python3` is often the Store alias,
 # present on PATH and unable to run.

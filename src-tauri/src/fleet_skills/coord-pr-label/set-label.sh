@@ -884,14 +884,29 @@ BEARER_SRC="$(ctc_stage_for_tenant "$READ_TENANT")"
 case "$BEARER_SRC" in
   rejected*) readback_unknown "no credential for tenant $READ_TENANT could be staged (${BEARER_SRC#rejected})" ;;
 esac
-: > "$TMPD/readback.json"
-RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
-  --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
-  -H "@$(curl_path "$TMPD/bearer.hdr")" \
-  --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
-  "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+# rb_read -> RB_CODE; the read-back GET under the staged bearer.
+rb_read() {
+  : > "$TMPD/readback.json"
+  RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+    -H "@$(curl_path "$TMPD/bearer.hdr")" \
+    --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
+    "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+  RB_CODE="${RB_CODE:-000}"
+}
+rb_read
+# Coord refused the local runner's token: forget it (the library then refuses
+# the runner rung for this tenant) and re-stage ONCE, which reaches the mint --
+# the same retry the library's own walkers make.
+if [ "$RB_CODE" = 401 ] && [[ "$BEARER_SRC" == runner* ]]; then
+  ctc_drop_runner_token "$READ_TENANT" "coord answered 401 to the local runner's token for tenant $READ_TENANT"
+  RB_SRC2="$(ctc_stage_for_tenant "$READ_TENANT")"
+  case "$RB_SRC2" in
+    rejected*) BEARER_SRC="runner(401)→$RB_SRC2" ;;
+    *) BEARER_SRC="runner(401)→$RB_SRC2"; rb_read ;;
+  esac
+fi
 rm -f "$TMPD/bearer.hdr"
-RB_CODE="${RB_CODE:-000}"
 RB_BODY="$(cat "$TMPD/readback.json" 2>/dev/null || true)"
 RB_SNIP="$(printf '%s' "$RB_BODY" | head -c 300)"
 

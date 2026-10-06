@@ -207,7 +207,7 @@
 # the same call render-memory-cache.ps1 makes on every session boot.
 #
 # L4 source 4 mints its bearer through TWO runner doors, in order:
-#   invoke  POST <origin>/ui-bridge/invoke/get_coord_device_token  {"tenantId":<t>}|{}, then
+#   invoke  POST <origin>/ui-bridge/invoke/get_coord_device_token  {"args":{"tenantId":<t>}}|{}, then
 #           POST <origin>/ui-bridge/invoke/get_access_token_for_websocket  {}
 #           THE SESSION'S TENANT rides on the first (plan
 #           2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential
@@ -1871,6 +1871,7 @@ live_exit() {
   # on a multi-tenant device a LIVE that does not say whose credential it carries
   # invites exactly the wrong-tenant write this line exists to prevent.
   [ -n "${LIVE_TENANT_NOTE:-}" ] && echo "TENANT: $LIVE_TENANT_NOTE"
+  [ -n "${LIVE_TENANT_DIFFERS:-}" ] && echo "$LIVE_TENANT_DIFFERS"
   # The stamped claim, ALWAYS - a LIVE door is a measurement too, and a pasted
   # LIVE block that carries its probe time is what lets a later reader tell it
   # from a stale one. Under --floor-claim the prose NOTEs below are suppressed
@@ -3768,97 +3769,6 @@ if [ "$L2_PROBES" -eq 0 ]; then
   FAILS+=("L2 sibling-sweep@$ROOT: NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen under \$ROOT; every one was unparseable or named the door L1 already probed - the sweep ran and established that no second loopback door exists here)")
 fi
 
-# ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
-# Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
-# path this comment used to teach -- that rung refuses from inside an ordinary
-# repo checkout, which is where this skill runs. The helper's stderr flows
-# through (it names the credential source, never the token) and its exit code is
-# mapped to a typed cause.
-__resolve_fleet_script "coord-acting-bearer.sh"; AB="$__RFS_PATH"
-if [ -z "$AB" ]; then
-  echo "L3: acting-bearer -> HELPER_NOT_FOUND (coord-acting-bearer.sh: $(__fleet_script_searched "coord-acting-bearer.sh")). LOCAL fault - it says NOTHING about whether the acting-bearer door would have answered" >&2
-  FAILS+=("L3 acting-bearer: HELPER_NOT_FOUND (coord-acting-bearer.sh not found from HERE=$HERE - a LOCAL path fault, not a credential verdict)")
-else
-  OUT="$(bash "$AB")"
-  RC=$?
-  TOKEN="$(printf '%s' "$OUT" | tr -d '\r\n')"
-  if [ "$RC" = "0" ] && [ -n "$TOKEN" ]; then
-    probe_door "L3" "acting-bearer" "${COORD_URL}/mcp" "Authorization" "Bearer $TOKEN" \
-      "BEARER_UNAUTHORIZED (acting-bearer rejected - mint again or check device binding)" \
-      && live_exit "https-acting-bearer"
-  else
-    case "$RC" in
-      2)   L3V="NO_TOKEN (\$COORD_AGENT_JWT unset/empty - it is the helper's only credential source)" ;;
-      3)   L3V="MINT_FAILED (coord rejected or never answered the acting-user mint - device unknown / no bound user / coord down)" ;;
-      127) L3V="HELPER_DEPS_MISSING (coord-acting-bearer.sh: curl missing, or no working JSON reader)" ;;
-      *)   L3V="HELPER_FAILED (coord-acting-bearer.sh exit $RC)" ;;
-    esac
-    echo "L3: acting-bearer -> $L3V" >&2
-    FAILS+=("L3 acting-bearer: $L3V")
-  fi
-fi
-
-# ----- L4: device-JWT bearer, three sources in the documented order -----------
-# Sources 1 and 2 are STATIC; source 3 mints from a live runner. Independent of
-# BOTH failure modes above: none of them cares that every proxy key rotated
-# (L1/L2), and none needs $COORD_AGENT_JWT (L3).
-#
-# l4_fail <name> <verdict> — one place that logs and records an L4 cause, so a
-# new arm cannot forget half of it (the DEAD block prints FAILS; a verdict that
-# only reached stderr is invisible there).
-l4_fail() {
-  echo "L4: $1 -> $2" >&2
-  FAILS+=("L4 $1: $2")
-}
-
-# ----- L4 source 1: $COORD_DEVICE_JWT ------------------------------------------
-# A stale STATIC token is EXPECTED (they live ~4h and nothing refreshes an env
-# var), so its 401 is recorded and the cascade CONTINUES. Exiting here would
-# turn a stale credential into a false DEAD.
-if [ -n "${COORD_DEVICE_JWT:-}" ]; then
-  ENVJWT="$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"
-  if jwt_shaped "$ENVJWT"; then
-    probe_door "L4" "device-jwt@\$COORD_DEVICE_JWT" "${COORD_URL}/mcp" "Authorization" "Bearer $ENVJWT" \
-      "DEVICE_JWT_UNAUTHORIZED (coord rejected the STATIC \$COORD_DEVICE_JWT - device JWTs live ~4h so a stale env var is the normal cause; NOT terminal, falling through to the next source)" \
-      && live_exit "https-device-jwt-env" "$PARTIAL_STATIC_JWT"
-  else
-    l4_fail "device-jwt@\$COORD_DEVICE_JWT" "DEVICE_JWT_ENV_MALFORMED (\$COORD_DEVICE_JWT is set but is not JWT-shaped - a JWT is 3 dot-separated base64url parts. NOT sent: an unshaped bearer would draw a 401 this script would then report against coord)"
-  fi
-else
-  l4_fail "device-jwt@\$COORD_DEVICE_JWT" "ENV_UNSET (\$COORD_DEVICE_JWT is unset or empty - source 1 of the fleet's three-source device-JWT cascade)"
-fi
-
-# ----- L4 source 2: ~/.qontinui/coord-device-jwt -------------------------------
-# bash opens the file (no path crosses to a native binary), so no MSYS spelling
-# issue here. Whitespace is stripped whole: a JWT contains none, and a trailing
-# CR from a Windows-written file becomes an Authorization header curl cannot
-# send (exit 3 / http_code 000 -> UNREACHABLE, i.e. a false DEAD).
-#
-# $USERPROFILE is the documented fallback rather than an improvisation:
-# scripts/render-memory-cache.ps1 resolves this same "source 2" from
-# $env:USERPROFILE, and the two implementations of one documented cascade must
-# not disagree about WHERE source 2 lives. They coincide under Git Bash; they
-# need not under every shell. An unresolvable home is named as such rather than
-# reported as a missing file — the guard knows the real cause, so discarding it
-# would be a named-but-WRONG cause, which the named-cause invariant does not buy.
-# $HOME_DIR itself is resolved once, in the approval block above (this same
-# idiom); source 2 only names the file under it.
-STATIC_JWT_FILE="$HOME_DIR/.qontinui/coord-device-jwt"
-if [ -z "$HOME_DIR" ]; then
-  l4_fail "device-jwt@~/.qontinui/coord-device-jwt" "HOME_UNRESOLVED (neither \$HOME nor \$USERPROFILE is set, so source 2 of the device-JWT cascade has no path to read - a LOCAL environment fault, and it says nothing about whether the credential exists)"
-elif [ -r "$STATIC_JWT_FILE" ]; then
-  FILEJWT="$(tr -d '[:space:]' < "$STATIC_JWT_FILE" 2>/dev/null)"
-  if jwt_shaped "$FILEJWT"; then
-    probe_door "L4" "device-jwt@$STATIC_JWT_FILE" "${COORD_URL}/mcp" "Authorization" "Bearer $FILEJWT" \
-      "DEVICE_JWT_UNAUTHORIZED (coord rejected the STATIC file token - device JWTs live ~4h so a stale file is the normal cause; NOT terminal, falling through to the runner mint)" \
-      && live_exit "https-device-jwt-file" "$PARTIAL_STATIC_JWT"
-  else
-    l4_fail "device-jwt@$STATIC_JWT_FILE" "DEVICE_JWT_FILE_MALFORMED (the file is readable but its contents are not JWT-shaped - a JWT is 3 dot-separated base64url parts (a whole JSON response left in the file fails here too, by design). NOT sent)"
-  fi
-else
-  l4_fail "device-jwt@$STATIC_JWT_FILE" "FILE_ABSENT (no readable ~/.qontinui/coord-device-jwt - source 2 of the fleet's three-source device-JWT cascade)"
-fi
-
 # ----- The SESSION'S TENANT, resolved once for L4's two mints and L5's bootstrap -
 # Plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential, P3 and
 # P2/P5a. A device bound to more than one tenant can no longer be asked for "a"
@@ -4010,6 +3920,218 @@ except Exception: v=None
 print(v if isinstance(v,str) else "")' 2>/dev/null
   fi
 }
+
+# ----- WHOSE door: the acting tenant, named by slug and id ---------------------
+# Plan 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device,
+# Phase 3. A LIVE bearer door on a device bound to several tenants acts in ONE
+# of them, and a bare uuid does not tell an operator which. bearer_identity asks
+# coord itself (coord_query_identity over the very bearer the door would use,
+# read-only) for the acting tenant AND the slugs of every binding, so the expected
+# tenant can be named too. When that read fails the token's own claim is used and
+# the slug says UNKNOWN -- never guessed.
+BID_TENANT=""; BID_SLUG=""; BID_SLUGS=""; BID_REASON=""
+bearer_identity() { # <bearer>
+  local hdr="$TMPD/bid-hdr" body="$TMPD/bid-body" code ce payload out py
+  BID_TENANT=""; BID_SLUG=""; BID_SLUGS=""; BID_REASON=""
+  { printf 'Authorization: Bearer %s\n' "$1" > "$hdr"; } 2>/dev/null
+  if [ ! -s "$hdr" ]; then BID_REASON="header staging failed under $TMPD (LOCAL)"; return 0; fi
+  payload="$(build_rpc tools/call coord_query_identity '{}')"
+  : > "$body"
+  code=$(curl -sS -o "$(curl_path "$body")" -w '%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+    -X POST "${COORD_URL}/mcp" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -H "@$(curl_path "$hdr")" -d "$payload" 2>/dev/null)
+  ce=$?
+  rm -f "$hdr"
+  if [ "$ce" != "0" ] || [ "$code" != "200" ]; then
+    BID_REASON="coord_query_identity over this bearer answered curl exit $ce / HTTP ${code:-none}"; return 0
+  fi
+  case "$JSON_READER" in
+    jq) py="$(command -v python3 || command -v python || true)" ;;
+    *) py="$JSON_READER" ;;
+  esac
+  if [ -z "$py" ]; then BID_REASON="no python to read the identity answer (LOCAL)"; return 0; fi
+  # One line out: `ok <tenant> <slug|-> <uuid=slug ...>` or `reason <text>`.
+  # Slugs are kept only when they are plain words: they are printed.
+  out="$(BID_BODY="$(curl_path "$body")" "$py" -c 'import json,os,re,sys
+raw=open(os.environ["BID_BODY"],encoding="utf-8",errors="replace").read()
+m=re.search(r"^data:\s*(\{.*\})\s*$", raw, re.M)
+try: d=json.loads(m.group(1) if m else raw)
+except Exception: print("reason not JSON"); sys.exit(0)
+r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a missing result prints a named reason below, never a tenant
+if not isinstance(r,dict) or r.get("isError"): print("reason the identity call carried no usable result"); sys.exit(0)
+objs=[r.get("structuredContent")]+[c.get("text") for c in (r.get("content") or []) if isinstance(c,dict)]
+o=None
+for x in objs:
+    if isinstance(x,str):
+        try: x=json.loads(x)
+        except Exception: continue
+    if isinstance(x,dict) and isinstance(x.get("tenant_id"),str) and x.get("tenant_id"):
+        o=x; break
+if o is None: print("reason the identity answer carried no string tenant_id"); sys.exit(0)
+word=re.compile(r"[A-Za-z0-9._-]{1,64}")
+uuid=re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+def w(v): return v if isinstance(v,str) and word.fullmatch(v) else "-"
+t=o["tenant_id"]
+if not uuid.fullmatch(t): print("reason the acting tenant_id is not a uuid"); sys.exit(0)
+pairs=[]
+b=o.get("device_tenant_bindings")
+for x in ((b or {}).get("tenant_ids") or []) if isinstance(b,dict) else []:
+    if isinstance(x,dict) and isinstance(x.get("tenant_id"),str) and uuid.fullmatch(x["tenant_id"]) and w(x.get("tenant_slug"))!="-":
+        pairs.append("%s=%s" % (x["tenant_id"].lower(), x["tenant_slug"]))
+print("ok %s %s %s" % (t, w(o.get("tenant_slug")), " ".join(pairs)))' 2>/dev/null | tr -d '\r')"
+  case "$out" in
+    "ok "*)
+      out="${out#ok }"; BID_TENANT="${out%% *}"; out="${out#* }"
+      BID_SLUG="${out%% *}"; [ "$BID_SLUG" = "-" ] && BID_SLUG=""
+      case "$out" in *" "*) BID_SLUGS="${out#* }" ;; *) BID_SLUGS="" ;; esac ;;
+    "reason "*) BID_REASON="${out#reason }" ;;
+    *) BID_REASON="the identity answer could not be read (LOCAL)" ;;
+  esac
+}
+# slug_of <tenant> -> the slug coord named for it in the identity read, or nothing.
+slug_of() {
+  local want p
+  want="$(printf '%s' "$1" | tr 'A-F' 'a-f')"
+  [ -n "$want" ] || return 0
+  [ "$(printf '%s' "$BID_TENANT" | tr 'A-F' 'a-f')" = "$want" ] && [ -n "$BID_SLUG" ] && { printf '%s' "$BID_SLUG"; return 0; }
+  for p in $BID_SLUGS; do [ "${p%%=*}" = "$want" ] && { printf '%s' "${p#*=}"; return 0; }; done
+  return 0
+}
+tenant_label() { local g; g="$(slug_of "$1")"; printf '%s (%s)' "${g:-slug UNKNOWN}" "$1"; }
+tenant_label_or() { if [ -n "$1" ]; then tenant_label "$1"; else printf '%s' "$2"; fi; } # <tenant> <when-empty>
+# tenant_lines <bearer> <what-was-sent> -> LIVE_TENANT_NOTE (the TENANT: line) and
+# LIVE_TENANT_DIFFERS (a `TENANT DIFFERS from expected <slug> (<id>)` line, or
+# empty), for live_exit to print. The EXPECTED tenant is this session's
+# (resolve_session_tenant: $QONTINUI_TENANT_ID, else the runner's session census).
+LIVE_TENANT_DIFFERS=""
+tenant_lines() { # <bearer> <what-was-sent> [claim-only]
+  local tok="$1" sent="$2" acting basis claim exp_note
+  # claim-only: a door whose bearer is not spent on a coord identity read --
+  # L3's acting bearer (an agent JWT) and L6's web-host token (another host
+  # entirely). The acting tenant is the token's own claim; slugs stay as the
+  # last identity read left them (UNKNOWN when none was made).
+  if [ "${3:-}" = claim-only ]; then
+    BID_TENANT=""; BID_REASON="not read for this door (claim only)"
+  else
+    bearer_identity "$tok"
+  fi
+  claim="$(jwt_tenant_claim "$tok" | tr -d '\r\n')"
+  if [ -n "$BID_TENANT" ]; then
+    acting="$BID_TENANT"; basis="coord_query_identity over this bearer"
+  elif [ -n "$claim" ] && [ "${3:-}" = claim-only ]; then
+    acting="$claim"; basis="the token's tenant_id claim"
+  elif [ -n "$claim" ]; then
+    acting="$claim"; basis="the token's tenant_id claim; the identity read failed: $BID_REASON"
+  else
+    acting=""; basis="neither coord_query_identity ($BID_REASON) nor the token's claim named one"
+  fi
+  resolve_session_tenant
+  if [ -n "$SESSION_TENANT" ]; then
+    exp_note="expected $(tenant_label "$SESSION_TENANT") from $SESSION_TENANT_SRC"
+  else
+    exp_note="no expected tenant (${SESSION_TENANT_NOTE:-no source named one})"
+  fi
+  LIVE_TENANT_NOTE="acting tenant $(tenant_label_or "$acting" UNKNOWN) ($basis); $exp_note; $sent"
+  LIVE_TENANT_DIFFERS=""
+  if [ -n "$SESSION_TENANT" ] && [ -n "$acting" ] \
+     && [ "$(printf '%s' "$acting" | tr 'A-F' 'a-f')" != "$(printf '%s' "$SESSION_TENANT" | tr 'A-F' 'a-f')" ]; then
+    LIVE_TENANT_DIFFERS="TENANT DIFFERS from expected $(tenant_label "$SESSION_TENANT"): this door acts as $(tenant_label "$acting"), so every tenant-scoped read or write over it answers about THAT tenant. Re-run with \$COORD_DEVICE_JWT unset (or a token for the expected tenant) before trusting a tenant-scoped answer"
+  fi
+}
+
+# ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
+# Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
+# path this comment used to teach -- that rung refuses from inside an ordinary
+# repo checkout, which is where this skill runs. The helper's stderr flows
+# through (it names the credential source, never the token) and its exit code is
+# mapped to a typed cause.
+__resolve_fleet_script "coord-acting-bearer.sh"; AB="$__RFS_PATH"
+if [ -z "$AB" ]; then
+  echo "L3: acting-bearer -> HELPER_NOT_FOUND (coord-acting-bearer.sh: $(__fleet_script_searched "coord-acting-bearer.sh")). LOCAL fault - it says NOTHING about whether the acting-bearer door would have answered" >&2
+  FAILS+=("L3 acting-bearer: HELPER_NOT_FOUND (coord-acting-bearer.sh not found from HERE=$HERE - a LOCAL path fault, not a credential verdict)")
+else
+  OUT="$(bash "$AB")"
+  RC=$?
+  TOKEN="$(printf '%s' "$OUT" | tr -d '\r\n')"
+  if [ "$RC" = "0" ] && [ -n "$TOKEN" ]; then
+    probe_door "L3" "acting-bearer" "${COORD_URL}/mcp" "Authorization" "Bearer $TOKEN" \
+      "BEARER_UNAUTHORIZED (acting-bearer rejected - mint again or check device binding)" \
+      && { tenant_lines "$TOKEN" "the acting bearer is sent no tenant; it acts for whichever its own claim names" claim-only
+           live_exit "https-acting-bearer"; }
+  else
+    case "$RC" in
+      2)   L3V="NO_TOKEN (\$COORD_AGENT_JWT unset/empty - it is the helper's only credential source)" ;;
+      3)   L3V="MINT_FAILED (coord rejected or never answered the acting-user mint - device unknown / no bound user / coord down)" ;;
+      127) L3V="HELPER_DEPS_MISSING (coord-acting-bearer.sh: curl missing, or no working JSON reader)" ;;
+      *)   L3V="HELPER_FAILED (coord-acting-bearer.sh exit $RC)" ;;
+    esac
+    echo "L3: acting-bearer -> $L3V" >&2
+    FAILS+=("L3 acting-bearer: $L3V")
+  fi
+fi
+
+# ----- L4: device-JWT bearer, three sources in the documented order -----------
+# Sources 1 and 2 are STATIC; source 3 mints from a live runner. Independent of
+# BOTH failure modes above: none of them cares that every proxy key rotated
+# (L1/L2), and none needs $COORD_AGENT_JWT (L3).
+#
+# l4_fail <name> <verdict> — one place that logs and records an L4 cause, so a
+# new arm cannot forget half of it (the DEAD block prints FAILS; a verdict that
+# only reached stderr is invisible there).
+l4_fail() {
+  echo "L4: $1 -> $2" >&2
+  FAILS+=("L4 $1: $2")
+}
+
+# ----- L4 source 1: $COORD_DEVICE_JWT ------------------------------------------
+# A stale STATIC token is EXPECTED (they live ~4h and nothing refreshes an env
+# var), so its 401 is recorded and the cascade CONTINUES. Exiting here would
+# turn a stale credential into a false DEAD.
+if [ -n "${COORD_DEVICE_JWT:-}" ]; then
+  ENVJWT="$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"
+  if jwt_shaped "$ENVJWT"; then
+    probe_door "L4" "device-jwt@\$COORD_DEVICE_JWT" "${COORD_URL}/mcp" "Authorization" "Bearer $ENVJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the STATIC \$COORD_DEVICE_JWT - device JWTs live ~4h so a stale env var is the normal cause; NOT terminal, falling through to the next source)" \
+      && { tenant_lines "$ENVJWT" "a STATIC source is sent no tenant; it acts for whichever its own claim names"
+           live_exit "https-device-jwt-env" "$PARTIAL_STATIC_JWT"; }
+  else
+    l4_fail "device-jwt@\$COORD_DEVICE_JWT" "DEVICE_JWT_ENV_MALFORMED (\$COORD_DEVICE_JWT is set but is not JWT-shaped - a JWT is 3 dot-separated base64url parts. NOT sent: an unshaped bearer would draw a 401 this script would then report against coord)"
+  fi
+else
+  l4_fail "device-jwt@\$COORD_DEVICE_JWT" "ENV_UNSET (\$COORD_DEVICE_JWT is unset or empty - source 1 of the fleet's three-source device-JWT cascade)"
+fi
+
+# ----- L4 source 2: ~/.qontinui/coord-device-jwt -------------------------------
+# bash opens the file (no path crosses to a native binary), so no MSYS spelling
+# issue here. Whitespace is stripped whole: a JWT contains none, and a trailing
+# CR from a Windows-written file becomes an Authorization header curl cannot
+# send (exit 3 / http_code 000 -> UNREACHABLE, i.e. a false DEAD).
+#
+# $USERPROFILE is the documented fallback rather than an improvisation:
+# scripts/render-memory-cache.ps1 resolves this same "source 2" from
+# $env:USERPROFILE, and the two implementations of one documented cascade must
+# not disagree about WHERE source 2 lives. They coincide under Git Bash; they
+# need not under every shell. An unresolvable home is named as such rather than
+# reported as a missing file — the guard knows the real cause, so discarding it
+# would be a named-but-WRONG cause, which the named-cause invariant does not buy.
+# $HOME_DIR itself is resolved once, in the approval block above (this same
+# idiom); source 2 only names the file under it.
+STATIC_JWT_FILE="$HOME_DIR/.qontinui/coord-device-jwt"
+if [ -z "$HOME_DIR" ]; then
+  l4_fail "device-jwt@~/.qontinui/coord-device-jwt" "HOME_UNRESOLVED (neither \$HOME nor \$USERPROFILE is set, so source 2 of the device-JWT cascade has no path to read - a LOCAL environment fault, and it says nothing about whether the credential exists)"
+elif [ -r "$STATIC_JWT_FILE" ]; then
+  FILEJWT="$(tr -d '[:space:]' < "$STATIC_JWT_FILE" 2>/dev/null)"
+  if jwt_shaped "$FILEJWT"; then
+    probe_door "L4" "device-jwt@$STATIC_JWT_FILE" "${COORD_URL}/mcp" "Authorization" "Bearer $FILEJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the STATIC file token - device JWTs live ~4h so a stale file is the normal cause; NOT terminal, falling through to the runner mint)" \
+      && { tenant_lines "$FILEJWT" "a STATIC source is sent no tenant; it acts for whichever its own claim names"
+           live_exit "https-device-jwt-file" "$PARTIAL_STATIC_JWT"; }
+  else
+    l4_fail "device-jwt@$STATIC_JWT_FILE" "DEVICE_JWT_FILE_MALFORMED (the file is readable but its contents are not JWT-shaped - a JWT is 3 dot-separated base64url parts (a whole JSON response left in the file fails here too, by design). NOT sent)"
+  fi
+else
+  l4_fail "device-jwt@$STATIC_JWT_FILE" "FILE_ABSENT (no readable ~/.qontinui/coord-device-jwt - source 2 of the fleet's three-source device-JWT cascade)"
+fi
 
 # nonce_acting_tenant <proxy-url> <nonce> -> sets NACT to the tenant coord names
 # for a request carried over that nonce, or leaves it empty with NACT_REASON set
@@ -4305,6 +4427,12 @@ for origin in $RUNNER_DEFAULT_ORIGIN $RUNNER_ORIGINS; do
   for MCMD in $MINT_INVOKE_COMMANDS; do
     MINVOKE_URL="$origin/ui-bridge/invoke/$MCMD"
     MINT_URL="$MINVOKE_URL"
+    # THE ENVELOPE: the runner's InvokeRequestBody has ONE field, `args`
+    # (serde default {}), and silently DROPS every top-level key -- so
+    # {"tenantId":…} at the top level is a tenant-less call (a second 409
+    # tenant_required on a multi-slot runner, the default slot on a one-slot
+    # one). The tenant goes INSIDE args. Measured 2026-10-05 against runner
+    # b8fdb9cc2; tenant-arg-test.sh's stub models that contract.
     # Only get_coord_device_token takes the tenant. get_access_token_for_websocket
     # refuses ANY non-empty args with a 400, so it always gets `{}` - and it is
     # only ever reached on a build that does not serve the first name at all,
@@ -4312,7 +4440,7 @@ for origin in $RUNNER_DEFAULT_ORIGIN $RUNNER_ORIGINS; do
     MINVOKE_BODY='{}'
     MSENT=""
     if [ "$MCMD" = get_coord_device_token ] && [ -n "$SESSION_TENANT" ]; then
-      MINVOKE_BODY="{\"tenantId\":\"$SESSION_TENANT\"}"
+      MINVOKE_BODY="{\"args\":{\"tenantId\":\"$SESSION_TENANT\"}}"
       MSENT="$SESSION_TENANT"
     fi
     # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
@@ -4441,8 +4569,9 @@ for origin in $RUNNER_DEFAULT_ORIGIN $RUNNER_ORIGINS; do
     MTOKEN_CLAIM="$(jwt_tenant_claim "$MJWT" | tr -d '\r\n')"
     probe_door "L4" "device-jwt@$origin source=$MINT_SOURCE" "${COORD_URL}/mcp" "Authorization" "Bearer $MJWT" \
       "DEVICE_JWT_UNAUTHORIZED (coord rejected the runner-minted token - expired, or bound to another tenant)" \
-      && live_exit "https-device-jwt" "$PARTIAL_RUNNER_MINT
-PARTIAL: tenant established: the minted token's tenant_id claim is ${MTOKEN_CLAIM:-<absent - UNKNOWN>}; $(describe_sent_tenant "$MSENT")"
+      && { tenant_lines "$MJWT" "$(describe_sent_tenant "$MSENT")"
+           live_exit "https-device-jwt" "$PARTIAL_RUNNER_MINT
+PARTIAL: tenant established: the minted token's tenant_id claim is $(tenant_label_or "$MTOKEN_CLAIM" "<absent - UNKNOWN>"); $(describe_sent_tenant "$MSENT")"; }
     continue
   fi
 
@@ -4791,7 +4920,7 @@ print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
               if [ "$CTRL_CE" = "0" ] && [ "$CTRL_CODE" = "200" ]; then
                 echo "L5: bootstrap-credential -> LIVE (minted at $BOOT_URL with $(describe_session_tenant), verified by $CTRL_URL -> 200)" >&2
                 l5_count allow l5-live
-                LIVE_TENANT_NOTE="token tenant_id claim ${BOOT_CLAIM:-<absent - UNKNOWN>}; $(describe_sent_tenant "$BOOT_SENT")"
+                tenant_lines "$BOOT_TOKEN" "token tenant_id claim ${BOOT_CLAIM:-<absent - UNKNOWN>}; $(describe_sent_tenant "$BOOT_SENT")"
                 LIVE_FILE="bootstrap-credential (device_id from $DEV_ID_SRC)"
                 LIVE_URL="$BOOT_URL"
                 live_exit "https-bootstrap-agent-jwt" "$PARTIAL_BOOTSTRAP"
@@ -4932,6 +5061,7 @@ else
               echo "L6: web-host@$WEB_URL -> LIVE (GET $WEB_PROBE_URL -> 200 with the device JWT from $WEBJWT_SRC)" >&2
               LIVE_FILE="web-host (device JWT from $WEBJWT_SRC)"
               LIVE_URL="$WEB_PROBE_URL"
+              tenant_lines "$WEBJWT" "a STATIC source is sent no tenant; the web host answers for whichever tenant its claim names" claim-only
               live_exit "https-web-device-jwt" "$PARTIAL_WEB_HOST" ;;
             401)
               case "$WEB_MSG" in

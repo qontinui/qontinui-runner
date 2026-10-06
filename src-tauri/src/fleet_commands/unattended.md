@@ -1710,8 +1710,10 @@ and emits content on stdout only in state 0. A `2` here is UNKNOWN -- never
 
 **Door 3 — the deployed backend, with a coord DEVICE JWT.**
 `~/.qontinui/coord-device-jwt` carries the `user_id` claim the route requires;
-an `/agents/allocate` agent token does not. When the file token is expired,
-mint one from the runner (it holds no secret at rest):
+an `/agents/allocate` agent token does not. Use it only when its `tenant_id`
+claim is this session's tenant (the same check the snippet below applies to a
+minted token); when it is expired or claims another tenant, mint one from the
+runner (it holds no secret at rest):
 
 ```bash
 # DOOR 3a, always first: the runner's IN-PROCESS invoke mint - no WebView hop,
@@ -1725,13 +1727,34 @@ mint one from the runner (it holds no secret at rest):
 # $R holds a LIVE bearer in $AUTHFILE: `rm -rf "$R"` at the end is not optional.
 W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
 R=$(mktemp -d); AUTHFILE="$R/auth"
-S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+# THE TENANT this session reads for: $QONTINUI_TENANT_ID, else the runner
+# session census row for $QONTINUI_TERMINAL_ID (coord-revive.sh
+# resolve_session_tenant's rule). Sent ONLY as {"args":{"tenantId":...}} - the
+# runner reads `args` and drops a top-level key, which on a multi-slot runner
+# is a 409 tenant_required. Named, the older name and 3b (the DEFAULT slot,
+# which cannot be asked for a tenant) are skipped, and the token's claim is
+# checked below. A malformed value is an error, never ignored.
+TEN="${QONTINUI_TENANT_ID:-}"
+if [ -z "$TEN" ] && [ -n "${QONTINUI_TERMINAL_ID:-}" ]; then
+  curl -sS -m 10 http://127.0.0.1:9876/control/sessions/info > "$R/census" 2>/dev/null
+  TEN=$(QT="$QONTINUI_TERMINAL_ID" python3 -c 'import json,os,sys
+try: rows=json.load(open(sys.argv[1]))["data"]["sessions"]  # envelope-ok: a predicate search over the census rows; any miss prints nothing, never a default
+except Exception: sys.exit(0)
+for r in rows:
+    if isinstance(r,dict) and (r.get("identity") or {}).get("terminalId")==os.environ["QT"]:
+        t=r.get("tenancy") or {}; c=t.get("credential") or {}
+        print((t.get("row") or {}).get("tenantId") or (c.get("tenantId") if c.get("status")=="resolved" else "") or ""); break' "$R/census" 2>/dev/null)
+fi
+[ -z "$TEN" ] || [[ "$TEN" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "tenant '$TEN' is not a uuid - refusing to mint" >&2; TEN=INVALID; }
+echo "tenant: ${TEN:-UNKNOWN (none named; tenant-less mint)}" >&2
+MB='{}'; [ -n "$TEN" ] && MB="{\"args\":{\"tenantId\":\"${TEN,,}\"}}"
+S1=; [ "$TEN" = INVALID ] || S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
   http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
-  -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
+  -H 'Content-Type: application/json' -d "$MB" 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
 # The token never reaches the terminal or argv: it is read (exit 3 on
 # `data: null` = unpaired, or any other shape) straight into the header file.
 S2=""
-if [ "$S1" = 400 ] || [ "$S1" = 404 ]; then   # the older name, ONLY on 400/404
+if [ -z "$TEN" ] && { [ "$S1" = 400 ] || [ "$S1" = 404 ]; }; then   # the older name, ONLY on 400/404, ONLY with no tenant named
   S2=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
     http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
     -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint2" | tail -n 1)
@@ -1740,6 +1763,14 @@ if [ "$S1" = 400 ] || [ "$S1" = 404 ]; then   # the older name, ONLY on 400/404
 else
   echo "HTTP $S1" >&2
   T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint1")
+fi
+# CLAIM CHECK: a token claiming ANOTHER tenant is discarded, never staged - its
+# claim is printed, the token never is (it rides the environment, not argv).
+if [ -n "$T" ] && [ -n "$TEN" ]; then
+  CLAIM=$(T="$T" python3 -c 'import os,json,base64
+p=os.environ["T"].split(".")[1]; p+="="*(-len(p)%4)
+print(json.loads(base64.urlsafe_b64decode(p)).get("tenant_id") or "")' 2>/dev/null)
+  [ "${CLAIM,,}" = "${TEN,,}" ] || { echo "minted token claims tenant '${CLAIM:-none}', not $TEN - DISCARDED" >&2; T=; }
 fi
 [ -n "$T" ] && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
 
