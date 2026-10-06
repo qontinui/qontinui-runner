@@ -360,6 +360,10 @@ enum ConnState {
     EnvelopeOnly,
     /// Version >= 2 and `attach` answered: output is streaming.
     Attached(u32),
+    /// Version >= 2 and `open_input` answered: the pane's input stream. The
+    /// ONLY state that accepts input frames, so the only dispatch that can
+    /// ever wait on the pane's input queue.
+    InputOnly(u32),
 }
 
 /// What the dispatcher decided.
@@ -506,14 +510,15 @@ pub(crate) fn serve_conn_with(
         // refused the same way (only the dispatch unit tests run without one).
         let needs_pane = matches!(
             action,
-            Action::Attach(_)
-                | Action::Input(_)
-                | Action::Resize { .. }
-                | Action::Kill
+            Action::Attach(_) | Action::Input(_) | Action::Resize { .. } | Action::Kill
         );
         let pane = match (needs_pane, pane) {
             (true, None) => {
-                reject(&writer, RejectReason::VerbNotInVersion, "no pane in this holder");
+                reject(
+                    &writer,
+                    RejectReason::VerbNotInVersion,
+                    "no pane in this holder",
+                );
                 break;
             }
             (_, p) => p,
@@ -539,14 +544,14 @@ pub(crate) fn serve_conn_with(
                 state = ConnState::Attached(v);
             }
             Action::Input(bytes) => {
-                // No reply for input. The bytes go to the pane's writer thread
-                // (`crate::pty`), so this dispatch keeps serving `kill`,
-                // `resize`, `pause` and `detach` while the child is slow to
-                // read. A child that is gone takes nothing; that is not this
-                // connection's error. A queue that stays full for
-                // `params.input_queue_timeout` closes THIS connection — its
-                // thread and slot are not held hostage by a child that ignores
-                // stdin; the runner reattaches.
+                // No reply for input. Only an `open_input` connection gets
+                // here (`handle_data`), so waiting on a full input queue
+                // back-pressures that socket alone; the attached connection's
+                // dispatch never runs this arm. A child that is gone takes
+                // nothing; that is not this connection's error. A queue that
+                // stays full for `params.input_queue_timeout` closes THIS input
+                // connection — its thread and slot are not held hostage by a
+                // child that ignores stdin; the runner reopens one.
                 if let Some(pane) = pane {
                     match pane.write_input(&bytes, params.input_queue_timeout) {
                         Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
@@ -556,7 +561,11 @@ pub(crate) fn serve_conn_with(
             }
             Action::Resize { cols, rows } => {
                 if cols == 0 || rows == 0 {
-                    reject(&writer, RejectReason::Malformed, "resize to a zero dimension");
+                    reject(
+                        &writer,
+                        RejectReason::Malformed,
+                        "resize to a zero dimension",
+                    );
                     break;
                 }
                 // `ok` means accepted: a PTY whose child is gone ignores it.
@@ -730,25 +739,27 @@ fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64) 
 /// The allowlist for CONTROL frames. Every arm is a verb this build implements
 /// in that state; the final arm is the refusal.
 fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Action {
-    use ConnState::{Attached, AwaitHello, EnvelopeOnly, Negotiated};
+    use ConnState::{Attached, AwaitHello, EnvelopeOnly, InputOnly, Negotiated};
     match (*state, req) {
-        (AwaitHello, Request::Hello { versions }) => match negotiate(&versions, PROTOCOL_VERSIONS) {
-            Some(version) => {
-                *state = Negotiated(version);
-                Action::Reply(Reply::HelloAck(HelloAck {
-                    version,
-                    holder_build: holder_build(),
-                    holder_pid: info.holder_pid,
-                    child_pid: info.child_pid,
-                }))
+        (AwaitHello, Request::Hello { versions }) => {
+            match negotiate(&versions, PROTOCOL_VERSIONS) {
+                Some(version) => {
+                    *state = Negotiated(version);
+                    Action::Reply(Reply::HelloAck(HelloAck {
+                        version,
+                        holder_build: holder_build(),
+                        holder_pid: info.holder_pid,
+                        child_pid: info.child_pid,
+                    }))
+                }
+                None => {
+                    *state = EnvelopeOnly;
+                    Action::Reply(Reply::NoCommonVersion {
+                        holder_versions: PROTOCOL_VERSIONS.to_vec(),
+                    })
+                }
             }
-            None => {
-                *state = EnvelopeOnly;
-                Action::Reply(Reply::NoCommonVersion {
-                    holder_versions: PROTOCOL_VERSIONS.to_vec(),
-                })
-            }
-        },
+        }
         (AwaitHello, other) => Action::Reject(
             RejectReason::HandshakeRequired,
             format!("{:?} before hello", other.verb()),
@@ -771,28 +782,48 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
             reason: "holder upgrade is plan Phase 8; this build does not implement it".into(),
         }),
         // Version 1 verbs.
-        (Negotiated(v) | Attached(v), Request::Ping) if v >= 1 => Action::Reply(Reply::Pong),
+        (Negotiated(v) | Attached(v) | InputOnly(v), Request::Ping) if v >= 1 => {
+            Action::Reply(Reply::Pong)
+        }
         // Version 2 verbs: the data path.
         (Negotiated(v), Request::Attach { from_offset }) if v >= DATA_PATH_VERSION => {
             Action::Attach(from_offset)
         }
-        (Attached(_), Request::Attach { .. }) => Action::Reject(
+        (Attached(_), Request::Attach { .. } | Request::OpenInput) => Action::Reject(
             RejectReason::AlreadyAttached,
             "this connection is already attached".into(),
         ),
-        (Negotiated(v) | Attached(v), Request::Resize { cols, rows }) if v >= DATA_PATH_VERSION => {
+        (Negotiated(v), Request::OpenInput) if v >= DATA_PATH_VERSION => {
+            *state = InputOnly(v);
+            Action::Reply(Reply::Ok {
+                verb: "open_input".into(),
+            })
+        }
+        (InputOnly(_), Request::Attach { .. } | Request::OpenInput) => Action::Reject(
+            RejectReason::AlreadyAttached,
+            "this connection is an input stream".into(),
+        ),
+        (Negotiated(v) | Attached(v) | InputOnly(v), Request::Resize { cols, rows })
+            if v >= DATA_PATH_VERSION =>
+        {
             Action::Resize { cols, rows }
         }
         (Attached(_), Request::Pause) => Action::Flow { paused: true },
         (Attached(_), Request::Resume) => Action::Flow { paused: false },
-        (Negotiated(v), req @ (Request::Pause | Request::Resume)) if v >= DATA_PATH_VERSION => {
+        (Negotiated(v) | InputOnly(v), req @ (Request::Pause | Request::Resume))
+            if v >= DATA_PATH_VERSION =>
+        {
             Action::Reject(
                 RejectReason::NotAttached,
                 format!("{:?} needs an attached connection", req.verb()),
             )
         }
-        (Negotiated(v) | Attached(v), Request::Kill) if v >= DATA_PATH_VERSION => Action::Kill,
-        (Negotiated(v) | Attached(v), Request::Detach) if v >= DATA_PATH_VERSION => Action::Detach,
+        (Negotiated(v) | Attached(v) | InputOnly(v), Request::Kill) if v >= DATA_PATH_VERSION => {
+            Action::Kill
+        }
+        (Negotiated(v) | Attached(v) | InputOnly(v), Request::Detach) if v >= DATA_PATH_VERSION => {
+            Action::Detach
+        }
         (_, other) => Action::Reject(
             RejectReason::VerbNotInVersion,
             format!(
@@ -803,14 +834,19 @@ fn handle_request(state: &mut ConnState, req: Request, info: &HolderInfo) -> Act
     }
 }
 
-/// The allowlist for DATA frames: the pane's input, on an attached
-/// connection only.
+/// The allowlist for DATA frames: the pane's input, on an `open_input`
+/// connection only — never on the attached one, whose dispatch must stay free
+/// for `resize`/`pause`/`resume`/`detach` however slowly the child reads.
 fn handle_data(state: ConnState, payload: Vec<u8>) -> Action {
     match state {
-        ConnState::Attached(_) => Action::Input(payload),
+        ConnState::InputOnly(_) => Action::Input(payload),
+        ConnState::Attached(_) => Action::Reject(
+            RejectReason::UnexpectedDataFrame,
+            "input goes on an `open_input` connection, never on the attached one".into(),
+        ),
         ConnState::Negotiated(v) if v >= DATA_PATH_VERSION => Action::Reject(
             RejectReason::NotAttached,
-            "input frames are accepted on an attached connection only".into(),
+            "input frames are accepted on an `open_input` connection only".into(),
         ),
         _ => Action::Reject(
             RejectReason::UnexpectedDataFrame,
@@ -926,10 +962,9 @@ mod tests {
         params: ConnParams,
     ) -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<()>) {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let t =
-            std::thread::spawn(move || {
-                serve_conn_with(Conn::from_stream(server), &info(), None, params)
-            });
+        let t = std::thread::spawn(move || {
+            serve_conn_with(Conn::from_stream(server), &info(), None, params)
+        });
         (client, t)
     }
 
@@ -1020,7 +1055,13 @@ mod tests {
     fn pty_holder_dispatch_v2_data_path_allowlist() {
         let i = info();
         let mut s = ConnState::AwaitHello;
-        handle_request(&mut s, Request::Hello { versions: vec![1, 2] }, &i);
+        handle_request(
+            &mut s,
+            Request::Hello {
+                versions: vec![1, 2],
+            },
+            &i,
+        );
         assert_eq!(s, ConnState::Negotiated(2));
         // Before attach: input and flow are refused as not-attached.
         assert!(matches!(
@@ -1038,12 +1079,26 @@ mod tests {
             Action::Resize { cols: 9, rows: 3 }
         );
         assert_eq!(
-            handle_request(&mut s, Request::Attach { from_offset: Some(5) }, &i),
+            handle_request(
+                &mut s,
+                Request::Attach {
+                    from_offset: Some(5)
+                },
+                &i
+            ),
             Action::Attach(Some(5))
         );
         // The serve loop moves the state on a successful attach.
         let mut s = ConnState::Attached(2);
-        assert_eq!(handle_data(s, vec![0xFF]), Action::Input(vec![0xFF]));
+        // Input never rides the attached connection.
+        assert!(matches!(
+            handle_data(s, vec![0xFF]),
+            Action::Reject(RejectReason::UnexpectedDataFrame, _)
+        ));
+        assert!(matches!(
+            handle_request(&mut s, Request::OpenInput, &i),
+            Action::Reject(RejectReason::AlreadyAttached, _)
+        ));
         assert_eq!(
             handle_request(&mut s, Request::Pause, &i),
             Action::Flow { paused: true }
@@ -1052,7 +1107,10 @@ mod tests {
             handle_request(&mut s, Request::Resume, &i),
             Action::Flow { paused: false }
         );
-        assert_eq!(handle_request(&mut s, Request::Ping, &i), Action::Reply(Reply::Pong));
+        assert_eq!(
+            handle_request(&mut s, Request::Ping, &i),
+            Action::Reply(Reply::Pong)
+        );
         assert!(matches!(
             handle_request(&mut s, Request::Attach { from_offset: None }, &i),
             Action::Reject(RejectReason::AlreadyAttached, _)
@@ -1069,6 +1127,7 @@ mod tests {
             Request::Kill,
             Request::Detach,
             Request::Pause,
+            Request::OpenInput,
         ] {
             assert!(
                 matches!(
@@ -1087,6 +1146,58 @@ mod tests {
             handle_data(ConnState::EnvelopeOnly, vec![1]),
             Action::Reject(RejectReason::UnexpectedDataFrame, _)
         ));
+    }
+
+    /// Review round 2, F2: input is accepted ONLY on an `open_input`
+    /// connection. That connection takes input, ping, resize, kill and
+    /// detach; it can never attach or pause; and nothing else takes input —
+    /// so the attached connection's dispatch never waits on the input queue.
+    #[test]
+    fn pty_holder_dispatch_input_only_on_an_input_stream() {
+        let i = info();
+        let mut s = ConnState::AwaitHello;
+        handle_request(
+            &mut s,
+            Request::Hello {
+                versions: vec![1, 2],
+            },
+            &i,
+        );
+        assert!(matches!(
+            handle_data(s, vec![1]),
+            Action::Reject(RejectReason::NotAttached, _)
+        ));
+        assert_eq!(
+            handle_request(&mut s, Request::OpenInput, &i),
+            Action::Reply(Reply::Ok {
+                verb: "open_input".into()
+            })
+        );
+        assert_eq!(s, ConnState::InputOnly(2));
+        assert_eq!(
+            handle_data(s, vec![0x00, 0xFF]),
+            Action::Input(vec![0x00, 0xFF])
+        );
+        assert_eq!(
+            handle_request(&mut s, Request::Ping, &i),
+            Action::Reply(Reply::Pong)
+        );
+        assert_eq!(handle_request(&mut s, Request::Kill, &i), Action::Kill);
+        assert_eq!(
+            handle_request(&mut s, Request::Resize { cols: 2, rows: 2 }, &i),
+            Action::Resize { cols: 2, rows: 2 }
+        );
+        for req in [Request::Attach { from_offset: None }, Request::OpenInput] {
+            assert!(matches!(
+                handle_request(&mut s, req, &i),
+                Action::Reject(RejectReason::AlreadyAttached, _)
+            ));
+        }
+        assert!(matches!(
+            handle_request(&mut s, Request::Pause, &i),
+            Action::Reject(RejectReason::NotAttached, _)
+        ));
+        assert_eq!(handle_request(&mut s, Request::Detach, &i), Action::Detach);
     }
 
     #[test]

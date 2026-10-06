@@ -51,6 +51,7 @@ pub mod server;
 pub mod spawn;
 pub mod spec;
 pub mod startup;
+pub mod terminate;
 pub mod transport;
 
 #[cfg(test)]

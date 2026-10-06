@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use qontinui_pty_holder::client::{connect, AttachedStream, ConnectError, Event};
+use qontinui_pty_holder::client::{connect, AttachedStream, ConnectError, Event, InputStream};
 use qontinui_pty_holder::pane::PaneId;
 use qontinui_pty_holder::protocol::{ExitReply, Reply};
 use qontinui_pty_holder::spec::{write_spec, ChildSpec};
@@ -130,6 +130,14 @@ fn attach(h: &Holder, from: Option<u64>) -> AttachedStream {
         .expect("attach")
 }
 
+/// The pane's input stream (input never rides the attached connection).
+fn input_of(h: &Holder) -> InputStream {
+    connect(&h.dir, &pid("p1"), soon())
+        .expect("handshake")
+        .open_input(soon())
+        .expect("open_input")
+}
+
 /// Everything the stream yields until `done(&collected)` holds; panics after
 /// `bound`. Output must be CONTIGUOUS from `next` — a gap or an overlap is a
 /// failure, not something to paper over. Returns the bytes, the next offset,
@@ -194,17 +202,18 @@ fn pty_holder_data_path_echo_resize_and_exit_code() {
         sh("stty -echo; read line; echo \"got:$line\"; read x; stty size; read y; exit 7"),
     );
     let mut s = attach(&h, None);
+    let mut inp = input_of(&h);
     assert_eq!(s.info.child_pid, h.child_pid);
     assert_eq!((s.info.cols, s.info.rows), (80, 24));
     let start_at = s.info.start_offset;
 
-    s.writer.input(b"hello\n", soon()).unwrap();
+    inp.input(b"hello\n", soon()).unwrap();
     let c = collect_until(&mut s, start_at, Duration::from_secs(10), |c| {
         contains(&c.bytes, b"got:hello")
     });
 
     s.writer.resize(100, 40, soon()).unwrap();
-    s.writer.input(b"\n", soon()).unwrap();
+    inp.input(b"\n", soon()).unwrap();
     let c2 = collect_until(&mut s, c.next, Duration::from_secs(10), |c| {
         contains(&c.bytes, b"40 100")
     });
@@ -216,7 +225,7 @@ fn pty_holder_data_path_echo_resize_and_exit_code() {
         c2.events
     );
 
-    s.writer.input(b"\n", soon()).unwrap();
+    inp.input(b"\n", soon()).unwrap();
     let c3 = collect_until(&mut s, c2.next, Duration::from_secs(10), |c| {
         exit_of(&c.events).is_some()
     });
@@ -228,7 +237,9 @@ fn pty_holder_data_path_echo_resize_and_exit_code() {
         })
     );
     // The exit was delivered, so the holder leaves, with the child's code.
-    let status = h.exits_within(Duration::from_secs(10)).expect("holder exits");
+    let status = h
+        .exits_within(Duration::from_secs(10))
+        .expect("holder exits");
     assert_eq!(status.code(), Some(7));
     assert!(!alive(h.child_pid));
 }
@@ -262,6 +273,7 @@ fn pty_holder_data_path_byte_fidelity_all_256_and_invalid_utf8() {
     );
     let mut h = start("fid", sh(&script));
     let mut s = attach(&h, None);
+    let mut inp = input_of(&h);
     let first_offset = s.info.start_offset;
     let ready = collect_until(&mut s, first_offset, Duration::from_secs(10), |c| {
         c.bytes.ends_with(b"R")
@@ -270,7 +282,7 @@ fn pty_holder_data_path_byte_fidelity_all_256_and_invalid_utf8() {
 
     // Input direction, split across several frames on purpose.
     for chunk in payload.chunks(37) {
-        s.writer.input(chunk, soon()).unwrap();
+        inp.input(chunk, soon()).unwrap();
     }
     let rest = collect_until(&mut s, ready.next, Duration::from_secs(15), |c| {
         exit_of(&c.events).is_some()
@@ -350,9 +362,10 @@ fn pty_holder_data_path_reattach_resumes_and_gaps_are_reported() {
 
     // Second consumer resumes exactly at X, then drives part2 out.
     let mut s = attach(&h, Some(x));
+    let mut inp = input_of(&h);
     assert_eq!(s.info.start_offset, x);
     assert_eq!(s.info.end_offset, x, "nothing new while detached");
-    s.writer.input(b"\n", soon()).unwrap();
+    inp.input(b"\n", soon()).unwrap();
     let c2 = collect_until(&mut s, x, Duration::from_secs(15), |c| {
         c.bytes.len() >= part2.len()
     });
@@ -365,7 +378,7 @@ fn pty_holder_data_path_reattach_resumes_and_gaps_are_reported() {
     let y = c2.next;
 
     // Trigger part3 and leave at once: it is produced with nobody reading.
-    s.writer.input(b"\n", soon()).unwrap();
+    inp.input(b"\n", soon()).unwrap();
     drop(s);
     let total = (part1.len() + part2.len() + part3.len()) as u64;
     let end = Instant::now() + Duration::from_secs(15);
@@ -418,6 +431,7 @@ fn pty_holder_data_path_pause_gates_emission_not_reads() {
         sh("stty -echo; read x; i=0; while [ $i -lt 200 ]; do echo line-$i; i=$((i+1)); done; read y"),
     );
     let mut s = attach(&h, None);
+    let mut inp = input_of(&h);
     let next = s.info.start_offset;
     s.writer.pause(soon()).unwrap();
     let c = collect_until(&mut s, next, Duration::from_secs(5), |c| {
@@ -425,7 +439,7 @@ fn pty_holder_data_path_pause_gates_emission_not_reads() {
             verb: "pause".into(),
         }))
     });
-    s.writer.input(b"go\n", soon()).unwrap();
+    inp.input(b"go\n", soon()).unwrap();
     // While paused nothing arrives, though the child is printing.
     let quiet = s
         .reader
@@ -473,35 +487,70 @@ fn pty_holder_data_path_kill_ends_the_child() {
         "a signal death is reported as the signal, never as code 0"
     );
     assert!(!alive(h.child_pid), "the child is gone (and reaped)");
-    let status = h.exits_within(Duration::from_secs(10)).expect("holder exits");
+    let status = h
+        .exits_within(Duration::from_secs(10))
+        .expect("holder exits");
     assert_eq!(status.code(), Some(128 + libc::SIGHUP));
 }
 
-/// Review round 1, finding 2: input the child does not read never blocks the
-/// connection's dispatch. A megabyte of input to a child that never reads its
-/// stdin (far more than the PTY's input buffer) is queued to the holder's PTY
-/// writer thread; a `resize` and then a `kill` sent on the SAME connection
-/// behind it are still answered, and the child dies with the queue still full
-/// — which the writer then discards, so the holder exits.
+/// Review round 1 finding 2, round 2 F2: input the child does not read never
+/// stalls the attached connection. ~13 MiB of input to a child that never
+/// reads its stdin goes on the INPUT stream — far more than the PTY's input
+/// buffer, the holder's 64-frame input queue (`INPUT_QUEUE_FRAMES` x 64 KiB)
+/// and both socket buffers together — so the writer is still blocked after
+/// 1.5 s, which means the queue is FULL. Every control verb on the attached
+/// connection is still answered while it is: `resize`, `pause`, `resume`,
+/// then `kill`. The child dies with the queue full; the writer discards it,
+/// the blocked input returns, and the holder exits.
 #[test]
 fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
     let mut h = start("blocked", sh("exec sleep 3600"));
     let mut s = attach(&h, None);
     let first_offset = s.info.start_offset;
-    let chunk = vec![b'x'; 64 * 1024];
-    for _ in 0..16 {
-        s.writer
-            .input(&chunk, soon())
-            .expect("input is queued, not written through a full PTY");
-    }
-    s.writer.resize(100, 40, soon()).unwrap();
-    let c = collect_until(&mut s, first_offset, Duration::from_secs(5), |c| {
-        c.events.contains(&Event::Reply(Reply::Ok {
-            verb: "resize".into(),
-        }))
+    let mut inp = input_of(&h);
+    let frames = qontinui_pty_holder::pty::INPUT_QUEUE_FRAMES * 3;
+    let paster = std::thread::spawn(move || {
+        let chunk = vec![b'x'; 64 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut sent = 0;
+        for _ in 0..frames {
+            if inp.input(&chunk, deadline).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        sent
     });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !paster.is_finished(),
+        "{frames} frames of 64 KiB did not back up: the input queue is not full"
+    );
+    let mut next = first_offset;
+    for (req, verb) in [
+        (
+            qontinui_pty_holder::protocol::Request::Resize {
+                cols: 100,
+                rows: 40,
+            },
+            "resize",
+        ),
+        (qontinui_pty_holder::protocol::Request::Pause, "pause"),
+        (qontinui_pty_holder::protocol::Request::Resume, "resume"),
+    ] {
+        s.writer.request(&req, soon()).unwrap();
+        let c = collect_until(&mut s, next, Duration::from_secs(3), |c| {
+            c.events
+                .contains(&Event::Reply(Reply::Ok { verb: verb.into() }))
+        });
+        next = c.next;
+    }
+    assert!(
+        !paster.is_finished(),
+        "still blocked while control was served"
+    );
     s.writer.kill(soon()).unwrap();
-    let c2 = collect_until(&mut s, c.next, Duration::from_secs(10), |c| {
+    let c2 = collect_until(&mut s, next, Duration::from_secs(10), |c| {
         exit_of(&c.events).is_some()
     });
     assert!(c2.events.contains(&Event::Reply(Reply::Ok {
@@ -509,10 +558,66 @@ fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
     })));
     assert_eq!(exit_of(&c2.events).unwrap().signal, Some(libc::SIGHUP));
     assert!(!alive(h.child_pid));
+    let end = Instant::now() + Duration::from_secs(20);
+    while !paster.is_finished() {
+        assert!(
+            Instant::now() < end,
+            "the blocked input never returned after the kill"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = paster.join();
     assert!(
         h.exits_within(Duration::from_secs(10)).is_some(),
         "the holder exits once the exit is delivered, queued input notwithstanding"
     );
+}
+
+/// Input is refused on the attached connection: it would put the input queue
+/// in front of that connection's control verbs.
+#[test]
+fn pty_holder_data_path_input_on_the_attached_connection_is_refused() {
+    let h = start("noinput", sh("exec sleep 3600"));
+    let mut s = attach(&h, None);
+    let first_offset = s.info.start_offset;
+    // The typed API has no way to send input on an attached connection, so
+    // attach a second connection by hand and send a data frame on it.
+    let mut raw = connect(&h.dir, &pid("p1"), soon()).expect("handshake");
+    raw.send_raw_frame(
+        qontinui_pty_holder::frame::KIND_CONTROL,
+        br#"{"type":"attach","from_offset":null}"#,
+        soon(),
+    )
+    .unwrap();
+    let _attached = raw.recv_raw_frame(soon()).unwrap().expect("attached");
+    raw.send_raw_frame(qontinui_pty_holder::frame::KIND_DATA, b"x", soon())
+        .unwrap();
+    let mut rejected = false;
+    for _ in 0..8 {
+        match raw.recv_raw_frame(soon()) {
+            Ok(Some(f)) if f.kind == qontinui_pty_holder::frame::KIND_CONTROL => {
+                if let Ok(Reply::Rejected { reason, .. }) =
+                    qontinui_pty_holder::protocol::parse_reply(&f.payload)
+                {
+                    assert_eq!(
+                        reason,
+                        qontinui_pty_holder::protocol::RejectReason::UnexpectedDataFrame
+                    );
+                    rejected = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(rejected, "input on an attached connection must be rejected");
+    // The pane is unaffected: the other attached connection still works.
+    s.writer.kill(soon()).unwrap();
+    let c = collect_until(&mut s, first_offset, Duration::from_secs(10), |c| {
+        exit_of(&c.events).is_some()
+    });
+    assert!(exit_of(&c.events).is_some());
 }
 
 /// A child that ignores SIGHUP still dies: SIGKILL follows the grace.

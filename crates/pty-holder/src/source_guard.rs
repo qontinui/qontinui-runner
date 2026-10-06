@@ -35,6 +35,8 @@ const GUARDED: &[(&str, &str)] = &[
     ("spec.rs", include_str!("spec.rs")),
     ("startup.rs", include_str!("startup.rs")),
     ("spawn.rs", include_str!("spawn.rs")),
+    // Review round 2: out-of-band termination of a verified holder.
+    ("terminate.rs", include_str!("terminate.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned
