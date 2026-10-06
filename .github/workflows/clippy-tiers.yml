@@ -158,8 +158,10 @@ jobs:
 
       - name: Clippy (unscoped, all-targets)
         # No `-D warnings`: report rot, don't deny-block the world. Levels come
-        # from Cargo.toml; --all-targets adds the test-module coverage the PR
-        # gate intentionally drops. A deny-tier lint anywhere in the tree still
+        # from Cargo.toml. ci.yml's PR clippy now runs --all-targets too, so this
+        # job is the unscoped nightly backstop, not extra test-module coverage
+        # (plan 2026-10-05-coord-mcp-split-followups-...-runner-clippy-baseline,
+        # Phase 3). A deny-tier lint anywhere in the tree still
         # fails this job (by design — that's the loud signal), but this job
         # gates no PR.
         env:
