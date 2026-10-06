@@ -265,6 +265,23 @@ describe("FleetTenantWalker — refusals", () => {
     expect(w.snapshot.error).toMatch(/401/);
   });
 
+  it("seeds the previous rows WITHOUT their cursor, so no dead 'Load more' shows mid-read", () => {
+    const coord = fakeCoord();
+    const seed: FleetWalkSnapshot = {
+      ...initialFleetWalkSnapshot(A),
+      walk: { sessions: [session("kept")], nextCursor: "old-scope-cursor", pages: 1 },
+      loaded: true,
+    };
+    const w = walker({ tenant: A, fetchPage: coord.fetchPage, seed });
+    expect(w.snapshot.walk.sessions.map((s) => s.sessionId)).toEqual(["kept"]);
+    expect(w.snapshot.walk.nextCursor).toBeNull();
+    expect(w.canAdvance).toBe(false);
+    void w.restart();
+    // Still null while page one is in flight.
+    expect(w.snapshot.loading).toBe(true);
+    expect(w.snapshot.walk.nextCursor).toBeNull();
+  });
+
   it("ignores a seed from a different tenant", () => {
     const seed: FleetWalkSnapshot = {
       ...initialFleetWalkSnapshot(B),
@@ -444,6 +461,16 @@ describe("mergeFleetWalks — every count is over the union", () => {
 
   it("is complete only when every walk said last page", () => {
     expect(mergeFleetWalks([answered(A, []), answered(B, [])]).truncation.kind).toBe("none");
+  });
+
+  it("is never complete while a walk holding an OLD last-page envelope failed or is re-reading", () => {
+    // Each walk still holds a previous read's `nextCursor: null` envelope.
+    const refreshFailed = answered(A, [], { error: "coord returned 401" });
+    expect(mergeFleetWalks([refreshFailed, answered(B, [])]).truncation.kind).toBe("unknown");
+    const reloading = answered(A, [], { loading: true });
+    expect(mergeFleetWalks([reloading, answered(B, [])]).truncation.kind).toBe("unknown");
+    // A single walk keeps its own envelope — the single-tenant view is unchanged.
+    expect(mergeFleetWalks([reloading]).truncation.kind).toBe("none");
   });
 
   it("reads each row's degraded flags off its OWN tenant's envelope", () => {

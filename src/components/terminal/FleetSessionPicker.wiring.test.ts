@@ -666,6 +666,19 @@ describe("the merged view shows every tenant's rows and every tenant's failure",
     );
   });
 
+  it("offers the empty state's create PER answered tenant in a merged read, never an unchosen default", () => {
+    // The pure rule is asserted in `remoteCreate.test.ts`; this pins that the
+    // picker feeds it the ANSWERED tenants and mints under each target's own.
+    expect(SOURCE).toContain("answeredTenants: readTenants.answered,");
+    expect(SOURCE).toContain("onCreate={() => createRemote(key, pinned, label, t.tenant)}");
+    expect(SOURCE).toContain("tenantLabel={t.tenantLabel}");
+    expect(SOURCE).toContain("blockedReason={emptyCreate.disabledReason}");
+    // The retired form: a merged read sent NO tenant, so the runner's authority
+    // order picked one the operator never chose.
+    expect(codeOf(SOURCE)).not.toContain("emptyCreateTenant");
+    expect(codeOf(SOURCE)).not.toMatch(/merged \? null : \(servedTenants\[0\]/);
+  });
+
   it("counts devices, not groups, and names the tenant count of a merged read", () => {
     expect(SOURCE).toContain("devices: devicesShown,");
     expect(SOURCE).toContain("tenants: merged ? servedTenants.length : undefined,");
