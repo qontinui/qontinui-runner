@@ -327,49 +327,97 @@ fn item_source_in(files: &[(String, String)], signature: &str) -> String {
 /// Does the item declared on `line` END on that line — so the column-0 `}`
 /// [`item_source_in`] looks for belongs to some LATER item?
 ///
-/// Read from the line's CODE only: string and char literals are skipped and a
-/// trailing `//` comment is dropped, so neither a `"{"` in a literal nor a
-/// `// why` after the body can change the answer. Two shapes end on the line:
-/// a body whose braces open AND close there (`fn tiny() {} // why`,
+/// Read from the line's CODE only: string literals (plain, byte, and raw —
+/// `r"…"`, `r#"a"b"#`, `br#"…"#`), char literals and comments (`/* … */`,
+/// nested as Rust nests them, and a trailing `//`) are skipped, so neither a
+/// `"{"` in a literal, a `"` inside a raw string, a `/* { */` nor a `// why`
+/// after the body can change the answer. A literal or block comment still
+/// open at the end of the line hides the rest of that line. Two shapes end on
+/// the line: a body whose braces open AND close there (`fn tiny() {} // why`,
 /// `struct S { a: u8 }`), and a bodiless item ending in `;` (a one-line
 /// `const` / `static` / `type` / `use`). Anything else — a signature ending in
 /// `{`, `(`, `,`, or a return type whose `where` / `{` follows on the next
 /// line — continues below.
 #[cfg(test)]
 fn declaration_ends_on_its_line(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Does a token start at `i` (nothing identifier-like glued before it)?
+    let token_start = |i: usize| i == 0 || !is_ident(chars[i - 1]);
     let mut code = String::new();
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        // A raw string: `r` (or `br`) opening a token, then N `#`, then `"`;
+        // it closes at the first `"` followed by N `#`, escapes and all.
+        if c == 'r' && (token_start(i) || (i >= 1 && chars[i - 1] == 'b' && token_start(i - 1))) {
+            let hashes = chars[i + 1..].iter().take_while(|h| **h == '#').count();
+            if chars.get(i + 1 + hashes) == Some(&'"') {
+                let body = i + 2 + hashes;
+                let close = (body..chars.len()).find(|&j| {
+                    chars[j] == '"'
+                        && chars.len() - j > hashes
+                        && chars[j + 1..=j + hashes].iter().all(|h| *h == '#')
+                });
+                i = close.map_or(chars.len(), |j| j + 1 + hashes);
+                continue;
+            }
+        }
         match c {
             '"' => {
                 // A string literal: skip to its unescaped closing quote.
-                while let Some(s) = chars.next() {
-                    match s {
-                        '\\' => {
-                            chars.next();
-                        }
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 2,
                         '"' => break,
-                        _ => {}
+                        _ => i += 1,
                     }
                 }
+                i += 1;
             }
             '\'' => {
                 // A char literal (`'{'`, `'\''`) is skipped; a lifetime (`'a`)
                 // has no closing quote within two chars and is kept as code.
-                let mut ahead = chars.clone();
-                let literal_len = match ahead.next() {
-                    Some('\\') => ahead.nth(1).filter(|q| *q == '\'').map(|_| 3),
-                    Some(_) => ahead.next().filter(|q| *q == '\'').map(|_| 2),
+                let literal_len = match next {
+                    Some('\\') => (chars.get(i + 3) == Some(&'\'')).then_some(4),
+                    Some(_) => (chars.get(i + 2) == Some(&'\'')).then_some(3),
                     None => None,
                 };
-                if let Some(n) = literal_len {
-                    for _ in 0..n {
-                        chars.next();
+                match literal_len {
+                    Some(n) => i += n,
+                    None => {
+                        code.push(c);
+                        i += 1;
                     }
                 }
             }
-            '/' if chars.peek() == Some(&'/') => break,
-            _ => code.push(c),
+            '/' if next == Some('/') => break,
+            '/' if next == Some('*') => {
+                // A block comment, nested as Rust nests them.
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    match (chars[i], chars.get(i + 1)) {
+                        ('/', Some('*')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        ('*', Some('/')) => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            _ => {
+                code.push(c);
+                i += 1;
+            }
         }
     }
     let opens = code.matches('{').count();
@@ -596,6 +644,12 @@ mod mcp_api_sources_tests {
             "fn braces_in_a_literal() -> &'static str { // \"}\" is text",
             "const URL: &str = concat!(\"http://x\", {",
             "fn ch() -> char { '}' // a char literal",
+            "fn raw() -> &'static str { r#\"a\"b}\"#",
+            "fn raw() -> &'static [u8] { br#\"}\"#",
+            "fn plain_raw() -> &'static str { r\"}\"",
+            "fn commented() { /* } */",
+            "fn nested() { /* /* } */ } */",
+            "fn esc() -> char { '\\'' // }",
         ] {
             assert!(
                 !super::declaration_ends_on_its_line(line),
@@ -609,6 +663,10 @@ mod mcp_api_sources_tests {
             "const URL: &str = \"http://x\";",
             "static N: AtomicU64 = AtomicU64::new(0); // count",
             "fn ch() -> char { '{' }",
+            "fn raw() -> &'static str { r#\"a\"b{\"# }",
+            "fn commented() {} /* { */",
+            "fn tail() {} /* an open comment {",
+            "fn ident_r() -> u8 { for_r(\"{\") }",
         ] {
             assert!(
                 super::declaration_ends_on_its_line(line),

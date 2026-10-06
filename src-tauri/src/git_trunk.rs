@@ -49,21 +49,22 @@ const TRUNK_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 /// rung added here cannot silently break the probe's guarantee.
 pub(crate) const TRUNK_GIT_SUBCOMMANDS: &[&str] = &["symbolic-ref", "rev-parse"];
 
-/// git's own list of REPOSITORY-LOCAL environment variables — exactly what
-/// `git rev-parse --local-env-vars` prints (git 2.47.3), the set git itself
-/// clears when it crosses into another repository (a submodule). Any of them
-/// inherited by a child makes git read a repository, index, object store or
-/// config OTHER than the one `-C` / `current_dir` names: `-C` does not
-/// override an inherited `GIT_DIR`, so a runner started from a git hook (which
-/// exports `GIT_DIR`) or any shell that exported these would answer about the
-/// CALLER's repo. `repo_local_git_env_covers_gits_own_list` pins this against
-/// the installed git, so a git that grows the list fails a test rather than
-/// silently reopening the hole.
+/// The REPOSITORY-LOCAL git environment variables this crate scrubs: what
+/// `git rev-parse --local-env-vars` prints (git 2.47.3) MINUS
+/// [`COMMAND_SCOPE_GIT_CONFIG_ENV`] — exactly the set git itself clears when
+/// it crosses into another repository (a submodule). Any of them inherited by
+/// a child makes git read a repository, index, object store or config file
+/// OTHER than the one `-C` / `current_dir` names: `-C` does not override an
+/// inherited `GIT_DIR`, so a runner started from a git hook (which exports
+/// `GIT_DIR`) or any shell that exported these would answer about the
+/// CALLER's repo. `GIT_CONFIG` (the legacy whole-config-FILE override) stays
+/// on the list: it names a file, which is repo-locating.
+/// `repo_local_git_env_covers_gits_own_list` pins this against the installed
+/// git, so a git that grows the list fails a test rather than silently
+/// reopening the hole.
 pub(crate) const REPO_LOCAL_GIT_ENV: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
     "GIT_OBJECT_DIRECTORY",
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -77,37 +78,36 @@ pub(crate) const REPO_LOCAL_GIT_ENV: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
-/// The numbered halves of a `GIT_CONFIG_COUNT` overlay (`GIT_CONFIG_KEY_<n>` /
-/// `GIT_CONFIG_VALUE_<n>`), which git's list covers only through
-/// `GIT_CONFIG_COUNT` itself. Removed by prefix so no numbered pair outlives
-/// the count that gave it meaning.
-const GIT_CONFIG_PAIR_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+/// The names on git's `--local-env-vars` list that are NOT scrubbed, because
+/// they carry COMMAND-SCOPE config (`git -c k=v`, and the `GIT_CONFIG_COUNT`
+/// overlay with its numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+/// pairs, which are not on git's list at all) rather than a repository
+/// location. git's own submodule code (`prepare_submodule_repo_env`) keeps
+/// exactly these two when it clears the rest — measured: `GIT_CONFIG_COUNT=1
+/// GIT_CONFIG_KEY_0=foo.bar … git -c baz.q=p submodule foreach` still sees
+/// `COUNT=1` and `'baz.q'='p'` inside the submodule. Scrubbing them would drop
+/// the operator's env-injected `safe.directory` (so `rev-parse` fails with
+/// "dubious ownership" on a box that needs it) and the agent session's
+/// env-injected credential helper / proxy / CA settings
+/// (`git_posture::non_interactive_git_env`), which a runner started from such
+/// a session inherits and `build_drift`'s fetch / `ls-remote` need.
+pub(crate) const COMMAND_SCOPE_GIT_CONFIG_ENV: &[&str] =
+    &["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
 
-/// Remove every repository-local git variable from `cmd`'s child environment
-/// — [`REPO_LOCAL_GIT_ENV`] plus every `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`
-/// — whether inherited from this process or set on `cmd` earlier.
+/// Remove every [`REPO_LOCAL_GIT_ENV`] variable from `cmd`'s child
+/// environment, whether inherited from this process or set on `cmd` earlier.
+/// Command-scope config ([`COMMAND_SCOPE_GIT_CONFIG_ENV`] and the numbered
+/// `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` pairs) passes through untouched,
+/// as it does across git's own submodule boundary.
 ///
 /// The ONE scrub for runner git that must read the repo it names: this
 /// module's resolver and [`crate::build_drift`]'s probes both call it, so the
 /// list cannot drift between them. It removes no part of
 /// [`crate::process_helpers::no_window`]'s posture, which carries no
-/// `GIT_CONFIG_*` entry by construction (`git_posture::prompt_proof_git_env`
-/// filters them out).
+/// repository-local entry by construction.
 pub(crate) fn scrub_repo_local_git_env(cmd: &mut Command) {
     for var in REPO_LOCAL_GIT_ENV {
         cmd.env_remove(var);
-    }
-    let is_pair = |key: &std::ffi::OsStr| {
-        key.to_str()
-            .is_some_and(|k| GIT_CONFIG_PAIR_PREFIXES.iter().any(|p| k.starts_with(p)))
-    };
-    let pairs: Vec<std::ffi::OsString> = std::env::vars_os()
-        .map(|(key, _)| key)
-        .chain(cmd.get_envs().map(|(key, _)| key.to_os_string()))
-        .filter(|key| is_pair(key))
-        .collect();
-    for key in pairs {
-        cmd.env_remove(key);
     }
 }
 
@@ -170,6 +170,14 @@ fn host_git() -> Command {
 /// There is deliberately NO "configured trunk" rung: nothing in this repo
 /// writes such a key, and an unread config would be a rung that silently
 /// always misses while reading like coverage.
+///
+/// The repository-local scrub ([`scrub_repo_local_git_env`]) covers ONLY the
+/// git reads made here — the trunk NAME. A caller that then runs its own git
+/// in the same repo (`fleet::resolve_default_branch`'s behind-check and pull
+/// callers, `agent_worktree`'s fork-base `rev-parse`) still inherits whatever this process inherited, so under an inherited
+/// `GIT_DIR` it would act on the caller's repo with a correctly-named trunk.
+/// Scrubbing those callers' own git is a recorded follow-up, not something
+/// this function provides.
 pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
     resolve_trunk_ref_on(repo, &host_git)
 }
@@ -218,6 +226,9 @@ fn resolve_trunk_ref_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<String
 /// caller that must have *some* name should spell its own
 /// `.unwrap_or_else(|| "main".to_string())` so the guess is visible at the
 /// call site rather than buried in here.
+///
+/// As with [`resolve_trunk_ref`], the scrub fixes only this name read, not
+/// any git the caller runs afterwards.
 pub(crate) fn resolve_trunk_branch(repo: &Path) -> Option<String> {
     resolve_trunk_branch_on(repo, &host_git)
 }
@@ -381,39 +392,102 @@ mod tests {
         );
     }
 
-    /// The scrub removes every name on the list and every numbered
-    /// `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` — each reported by `get_envs`
-    /// as a removal (`None`), so neither an inherited nor an earlier-set
-    /// value reaches the child.
+    /// The scrub removes every name on the list — each reported by
+    /// `get_envs` as a removal (`None`), so neither an inherited nor an
+    /// earlier-set value reaches the child — and leaves command-scope config
+    /// (the `GIT_CONFIG_COUNT` overlay, its numbered pairs, and
+    /// `GIT_CONFIG_PARAMETERS`) exactly as set, as git's own submodule
+    /// boundary does.
     #[test]
-    fn the_scrub_removes_the_list_and_every_numbered_config_pair() {
+    fn the_scrub_removes_the_list_and_keeps_command_scope_config() {
         let mut cmd = Command::new("git");
-        cmd.env("GIT_CONFIG_KEY_0", "core.bare")
-            .env("GIT_CONFIG_VALUE_0", "true")
-            .env("GIT_CONFIG_KEY_7", "x.y")
-            .env("GIT_TERMINAL_PROMPT", "0");
-        scrub_repo_local_git_env(&mut cmd);
-        let envs: Vec<(String, bool)> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_none()))
-            .collect();
-        let removed = |name: &str| envs.iter().any(|(k, gone)| k == name && *gone);
-        for var in REPO_LOCAL_GIT_ENV.iter().chain(&[
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_0",
-            "GIT_CONFIG_KEY_7",
-        ]) {
-            assert!(removed(var), "{var} must be removed; envs: {envs:?}");
+        let kept = [
+            ("GIT_CONFIG_PARAMETERS", "'baz.q'='p'"),
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "safe.directory"),
+            ("GIT_CONFIG_VALUE_0", "*"),
+            ("GIT_CONFIG_KEY_1", "credential.helper"),
+            ("GIT_CONFIG_VALUE_1", "!gh auth git-credential"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ];
+        for (k, v) in kept {
+            cmd.env(k, v);
         }
-        assert!(
-            !removed("GIT_TERMINAL_PROMPT"),
-            "posture variables are not repo-local and must survive: {envs:?}"
+        scrub_repo_local_git_env(&mut cmd);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for var in REPO_LOCAL_GIT_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{var} must be removed; envs: {envs:?}"
+            );
+        }
+        for (k, v) in kept {
+            assert!(
+                envs.iter()
+                    .any(|(name, val)| name == k && val.as_deref() == Some(v)),
+                "{k}={v} is command-scope, not repo-local, and must survive: {envs:?}"
+            );
+        }
+    }
+
+    /// The regression the command-scope exemption exists for: on a box whose
+    /// repos need an env-injected `safe.directory` (a `GIT_CONFIG_COUNT`
+    /// overlay, or `git -c`'s `GIT_CONFIG_PARAMETERS`), the resolver must
+    /// still read the trunk. `GIT_TEST_ASSUME_DIFFERENT_OWNER` makes git
+    /// treat the fixture as foreign-owned; everything rides on the `Command`
+    /// through the seam, never on this process's shared environment.
+    #[test]
+    fn an_env_injected_safe_directory_still_resolves_the_trunk() {
+        let repo = repo_with_trunk("main");
+        let foreign = |overlay: &'static [(&'static str, &'static str)]| {
+            move || {
+                let mut cmd = host_git();
+                cmd.env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
+                for (k, v) in overlay {
+                    cmd.env(k, v);
+                }
+                cmd
+            }
+        };
+
+        // Control: foreign-owned with no overlay, git refuses the repo.
+        assert_eq!(
+            resolve_trunk_branch_on(repo.path(), &foreign(&[])),
+            None,
+            "control: a foreign-owned repo with no safe.directory must be refused, \
+             or this test proves nothing"
         );
+
+        for overlay in [
+            &[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+            ][..],
+            &[("GIT_CONFIG_PARAMETERS", "'safe.directory'='*'")][..],
+        ] {
+            assert_eq!(
+                resolve_trunk_branch_on(repo.path(), &foreign(overlay)).as_deref(),
+                Some("main"),
+                "the overlay {overlay:?} must survive the scrub"
+            );
+        }
     }
 
     /// The list is git's, not a hand-picked subset: every name the installed
-    /// git reports as repository-local is on it. Skipped only when no `git`
-    /// can be spawned at all.
+    /// git reports as repository-local is on it, except the named
+    /// command-scope exemption ([`COMMAND_SCOPE_GIT_CONFIG_ENV`] — config, not
+    /// a repository location, and kept by git's own submodule boundary), which
+    /// must itself be on git's list so it cannot exempt a name git never
+    /// reported. Skipped only when no `git` can be spawned at all.
     #[test]
     fn repo_local_git_env_covers_gits_own_list() {
         let Ok(out) = Command::new("git")
@@ -434,9 +508,22 @@ mod tests {
             names.iter().any(|n| n == "GIT_DIR"),
             "git's list must at least name GIT_DIR, or this test proves nothing: {names:?}"
         );
+        for exempt in COMMAND_SCOPE_GIT_CONFIG_ENV {
+            assert!(
+                names.iter().any(|n| n == exempt),
+                "exemption {exempt} is not on git's list: {names:?}"
+            );
+            assert!(
+                !REPO_LOCAL_GIT_ENV.contains(exempt),
+                "{exempt} is both exempt and scrubbed"
+            );
+        }
         let missing: Vec<&String> = names
             .iter()
-            .filter(|n| !REPO_LOCAL_GIT_ENV.contains(&n.as_str()))
+            .filter(|n| {
+                !REPO_LOCAL_GIT_ENV.contains(&n.as_str())
+                    && !COMMAND_SCOPE_GIT_CONFIG_ENV.contains(&n.as_str())
+            })
             .collect();
         assert!(
             missing.is_empty(),
