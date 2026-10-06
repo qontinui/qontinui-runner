@@ -11,6 +11,15 @@
 //! ([`crate::session::coord_sync`]), via
 //! [`crate::session::SessionRegistry::coord_sync`]`().outbox().record(...)`.
 //!
+//! ## Closing what was opened
+//!
+//! The `idle_at_prompt` and `permission_prompt` producers pass [`emit`] the
+//! terminal the touch was observed on, and it has
+//! [`crate::session::operator_touch_close`] remember the open — before the
+//! append — so the runner can later close it through coord's close sidecar
+//! (plan `2026-10-05-operator-touch-close-path`, Phase 3). `session_exit` is
+//! never closed by the runner.
+//!
 //! ## Why this module exists rather than three copies of the same logic
 //!
 //! coord's write route (`POST /coord/sessions/operator-touch`, plan Phase B1,
@@ -123,6 +132,12 @@ pub fn armed() -> bool {
 /// block or slow the session that triggered it (plan §2c's design
 /// constraints).
 ///
+/// `track_on_terminal` names the terminal whose input or death will CLOSE
+/// this touch (plan `2026-10-05-operator-touch-close-path` Phase 3). The open
+/// is remembered BEFORE the outbox append, so an input landing during the
+/// append's fsync still finds it; a failed append forgets it again. `None` —
+/// and `session_exit`, which the runner never closes — tracks nothing.
+///
 /// A no-op `Ok(())` when [`armed`] is false — the disabled state is silent by
 /// design, matching every other flag-gated producer in this crate.
 pub fn emit(
@@ -130,23 +145,43 @@ pub fn emit(
     coord_session_id: Uuid,
     kind: &str,
     claude_code_session_id: Option<&str>,
+    track_on_terminal: Option<&str>,
 ) -> Result<(), String> {
+    use crate::session::operator_touch_close as close;
     if !armed() {
         return Ok(());
     }
     let bucket = epoch_bucket(chrono::Utc::now().timestamp());
+    let key = idempotency_key(coord_session_id, kind, bucket);
     let payload = touch_payload(kind, coord_session_id, claude_code_session_id, bucket);
-    registry
-        .coord_sync()
-        .outbox()
-        .record(
-            registry.machine_id(),
+    let tracking = track_on_terminal.and_then(|terminal_id| {
+        close::begin_tracking(
+            registry,
+            terminal_id,
             coord_session_id,
-            SessionEventKind::OperatorTouch,
-            payload,
+            kind,
+            &key,
+            &payload,
         )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    });
+    let rec = match registry.coord_sync().outbox().record(
+        registry.machine_id(),
+        coord_session_id,
+        SessionEventKind::OperatorTouch,
+        payload,
+    ) {
+        Ok(rec) => rec,
+        Err(e) => {
+            if let Some(k) = &tracking {
+                close::abort_tracking(registry, k);
+            }
+            return Err(e.to_string());
+        }
+    };
+    if let Some(k) = &tracking {
+        close::confirm_tracking(registry, k, rec.recorded_at);
+    }
+    Ok(())
 }
 
 /// Pure predicate: is this a PROVEN non-zero exit? `None` — the waiter thread
@@ -183,6 +218,7 @@ pub fn emit_session_exit_if_nonzero(
         coord_session_id,
         KIND_SESSION_EXIT,
         claude_code_session_id,
+        None,
     ) {
         tracing::warn!(
             coord_session = %coord_session_id,

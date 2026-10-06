@@ -1090,7 +1090,21 @@ async fn operator_touch_notification(
 ) -> Json<serde_json::Value> {
     let payload: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let outcome = crate::terminal::operator_touch_watch::on_notification_signal(&id, &payload);
+    // The emit fsyncs the outbox and rewrites the open-touch store (plan
+    // 2026-10-05-operator-touch-close-path Phase 3), so it runs off the async
+    // worker. A failed join is fail-open like every other step here.
+    let key = id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::terminal::operator_touch_watch::on_notification_signal(&key, &payload)
+    })
+    .await
+    .unwrap_or_else(
+        |e| crate::terminal::operator_touch_watch::NotificationOutcome {
+            recorded: false,
+            kind: None,
+            reason: format!("notification handler task failed: {e}"),
+        },
+    );
     Json(serde_json::json!({
         "recorded": outcome.recorded,
         "kind": outcome.kind,
