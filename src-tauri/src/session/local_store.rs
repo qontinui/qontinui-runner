@@ -721,6 +721,18 @@ impl OutboxWriter {
     /// Return all not-yet-delivered records, in seq order per session. Used
     /// by [`crate::session::coord_sync`] to drive the push loop.
     ///
+    /// # Ordering contract
+    ///
+    /// The result is sorted by `(session_id, seq)` — see the `sort_by_key` at
+    /// the end of `scan_locked` — and NOT by append order. Within one session
+    /// that is append order, because `seq` is monotonic per session. Across
+    /// sessions it is `Uuid` order, and the session ids are uuid-v7, whose
+    /// sub-millisecond bits are random: two sessions registered in the same
+    /// millisecond come back in an order no caller can predict. A reader that
+    /// spans sessions must not assume the order it appended in (the transcript
+    /// tailer's restart test joins offsets by session id for exactly this
+    /// reason).
+    ///
     /// Incremental: only the bytes appended since the drain cursor are read.
     /// When nothing has been appended since the last call this costs a single
     /// `metadata` stat.

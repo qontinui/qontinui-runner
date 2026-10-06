@@ -6851,6 +6851,7 @@ mod tenant_slot_refresh_tests {
 
     #[test]
     fn plan_refreshes_stale_but_valid_and_clears_fresh_or_dead() {
+        let _serialised = health_lock();
         let now = 1_000_000_000i64;
         // Opaque/undecodable → cannot be presented; clear and re-derive.
         assert_eq!(
@@ -7210,6 +7211,7 @@ mod tenant_slot_refresh_tests {
     /// authentication rejection qualifies.
     #[test]
     fn only_401_and_403_count_as_a_credential_rejection() {
+        let _serialised = health_lock();
         assert!(slot_refresh_is_credential_rejection(401));
         assert!(slot_refresh_is_credential_rejection(403));
         for status in [400u16, 404, 408, 409, 418, 429, 500, 502, 503, 504] {
@@ -7273,6 +7275,7 @@ mod tenant_slot_refresh_tests {
     /// historical block-until-kick (`None`).
     #[test]
     fn idle_wrong_tier_waits_bounded_only_when_slots_exist() {
+        let _serialised = health_lock();
         assert_eq!(idle_wrong_tier_wait(true), Some(REFRESH_CHECK_INTERVAL));
         assert_eq!(idle_wrong_tier_wait(false), None);
     }
@@ -7343,6 +7346,7 @@ mod tenant_slot_refresh_tests {
     /// upstream input exists to catch.
     #[test]
     fn a_future_exp_slot_that_coord_401s_reads_dark_not_live() {
+        let _serialised = health_lock();
         let now = 1_700_000_000i64;
         let obs = SlotObservation {
             tenant_id: Some("t".into()),
@@ -7436,6 +7440,7 @@ mod tenant_slot_refresh_tests {
     /// tells a user their sessions are broken.
     #[test]
     fn only_a_credential_attributed_401_counts_as_an_upstream_rejection() {
+        let _serialised = health_lock();
         assert_eq!(
             classify_upstream_verdict(401, r#"{"code":"token_expired"}"#),
             UpstreamVerdict::CredentialRejected
@@ -7527,6 +7532,7 @@ mod tenant_slot_refresh_tests {
     /// `/health`'s `coordMcpForwarder.canAnswer` reads this and nothing else.
     #[test]
     fn can_answer_flips_with_the_posture() {
+        let _serialised = health_lock();
         for p in [
             CoordCredentialPosture::Live,
             CoordCredentialPosture::Expiring,
@@ -7555,6 +7561,7 @@ mod tenant_slot_refresh_tests {
     /// to a posture-keyed rule.
     #[test]
     fn posture_notification_fires_once_per_transition_and_at_boot() {
+        let _serialised = health_lock();
         use CoordCredentialPosture as P;
         // Boot into a bad state IS a transition (DD2).
         assert!(should_notify_posture(None, P::Expired));
@@ -7603,6 +7610,7 @@ mod tenant_slot_refresh_tests {
     /// never-paired case, whose sessions also have no coord access.
     #[test]
     fn a_runner_holding_nothing_reads_absent() {
+        let _serialised = health_lock();
         let now = 1_700_000_000i64;
         assert_eq!(
             derive_coord_credential_posture(
@@ -7626,6 +7634,7 @@ mod tenant_slot_refresh_tests {
     /// posture describes what the runner holds now.
     #[test]
     fn a_healed_slot_reads_live_whatever_it_held_before() {
+        let _serialised = health_lock();
         let now = 1_700_000_000i64;
         let dead_then_healed = |outcome: TenantSlotOutcome| SlotObservation {
             tenant_id: None,
@@ -7671,6 +7680,7 @@ mod tenant_slot_refresh_tests {
     /// `exp` — it is dead, not fresh.
     #[test]
     fn an_opaque_slot_value_is_expired_not_live() {
+        let _serialised = health_lock();
         let now = 1_700_000_000i64;
         assert_eq!(
             derive_coord_credential_posture(
@@ -7713,6 +7723,7 @@ mod tenant_slot_refresh_tests {
     /// The `/health` wire shape — the field names the fleet's readers key on.
     #[test]
     fn posture_json_names_state_cause_and_can_answer() {
+        let _serialised = health_lock();
         let status = CoordCredentialStatus {
             posture: CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
             tenant_id: Some("t".into()),
@@ -7755,6 +7766,7 @@ mod tenant_slot_refresh_tests {
     /// (`crates/coord/src/jwt.rs`) and `crates/coord/src/auth.rs`.
     #[test]
     fn every_coord_credential_refusal_code_classifies_as_a_credential_rejection() {
+        let _serialised = health_lock();
         for code in [
             "token_expired",
             "token_invalid",
@@ -8716,6 +8728,7 @@ mod tenant_slot_refresh_tests {
     /// green.
     #[test]
     fn the_sweep_aborts_on_any_unmeasured_input_and_only_evicts_when_fully_measured() {
+        let _serialised = health_lock();
         use crate::auth::BindingTenantRead;
         use crate::session::tenant_pin::TenantPin;
         let a = tenant(0);
@@ -9962,6 +9975,7 @@ mod tenant_slot_refresh_tests {
     /// never once-then-silent.
     #[test]
     fn a_repeating_sweep_read_failure_is_re_announced_at_a_bounded_cadence() {
+        let _serialised = health_lock();
         assert!(!should_warn_sweep_join_failure(0));
         assert!(should_warn_sweep_join_failure(1), "the first failure warns");
         for n in 2..SWEEP_JOIN_FAILURE_REWARN_EVERY {
@@ -9991,6 +10005,7 @@ mod tenant_slot_refresh_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
+        let _serialised = health_lock();
         for (file, item) in [
             ("src/commands/auth.rs", "async fn finalize_signed_in("),
             (
@@ -10101,6 +10116,7 @@ mod tenant_slot_refresh_tests {
     /// store's `Err` as UNKNOWN for the sweep.
     #[test]
     fn composed_sweep_inputs_keep_an_unreadable_slot_store_unknown() {
+        let _serialised = health_lock();
         let a = tenant(0);
         let unreadable = SweepInputs {
             tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
@@ -10139,6 +10155,7 @@ mod tenant_slot_refresh_tests {
     /// above cannot notice.
     #[test]
     fn read_sweep_inputs_measures_the_bearer_set_from_disk_without_machine_json() {
+        let _serialised = health_lock();
         use crate::session::tenant_pin::TenantPin;
         let slot = tenant(1);
         let default_binding = tenant(2);
@@ -10285,6 +10302,7 @@ mod tenant_slot_refresh_tests {
     /// `.ok()?` erased.
     #[test]
     fn the_binding_read_separates_a_missing_file_from_an_unreadable_one() {
+        let _serialised = health_lock();
         use crate::auth::{default_binding_tenant_in, BindingTenantRead};
         let dir =
             std::env::temp_dir().join(format!("qontinui_binding_probe_{}", std::process::id()));
@@ -10427,6 +10445,7 @@ mod tenant_slot_refresh_tests {
     /// (`details #>> '{coord_credential,ok}' = 'false'`) selected nothing.
     #[test]
     fn the_published_bag_derives_ok_from_the_posture_and_dates_since_in_iso8601() {
+        let _serialised = health_lock();
         let fallback = coord_credential_health(Decision::Idle, None);
         assert!(fallback.ok, "the old authority says healthy…");
 
@@ -10536,6 +10555,7 @@ mod tenant_slot_refresh_tests {
     /// silently on the other side of the wire.
     #[test]
     fn iso8601_renders_a_z_terminated_second_precision_instant() {
+        let _serialised = health_lock();
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
     }
@@ -10633,6 +10653,7 @@ mod tenant_slot_refresh_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_legacy_mint_in_this_file_retires_the_stale_rejection_streaks() {
+        let _serialised = health_lock();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/mcp/device_jwt_refresher.rs");
         let text = std::fs::read_to_string(&path).expect("read this file");
