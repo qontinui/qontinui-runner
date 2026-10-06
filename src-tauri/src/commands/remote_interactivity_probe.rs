@@ -1576,11 +1576,13 @@ impl ProbeDoors for RunnerDoors {
         session_id: Uuid,
         tenant: Option<&str>,
     ) -> Result<AttachGrantResponse, String> {
-        // The SAME tenant `fleet_page` listed the row under — the one the walk
-        // presented, or the one coord's envelope named when it presented none
-        // (`read_fleet`) — resolved by the same rule (`fleet_scope`), so a
-        // session this probe listed is one its mint can resolve. `None` only
-        // when neither named a tenant.
+        // The tenant `read_fleet` decided for the row: the one the walk
+        // presented; else, ONLY when `WalkPlan::pin_to_served` is set (a
+        // multi-bound plan), the one coord's envelope named; else `None`. A
+        // single or unpinned walk (`WalkPlan::single`, `bound_set_unknown`)
+        // therefore mints with `None` even when the envelope names a tenant —
+        // the pre-Phase-4 mint, resolved by the same no-tenant authority order
+        // (`fleet_scope(None)`) the listing used.
         let scope = super::remote_attach::grant_scope(tenant.map(str::to_string)).await?;
         super::remote_attach::mint_attach_grant(&self.coord_base, session_id, scope).await
     }

@@ -736,8 +736,10 @@ export function FleetSessionPicker() {
       // the same convention as `data-fleet-error-code`. They are told apart by
       // `data-fleet-truncation`: `fleetTruncation(null, ..)` is "unknown", and
       // `loaded` implies a non-null response (both set in one tick), so
-      // "unknown" means no successful read and anything else means coord
-      // answered without naming a tenant. NOT `data-fleet-loaded`, which reads
+      // "unknown" means no successful read OR a read in flight (a walk that is
+      // loading has its envelope hidden from the truncation check, so a
+      // re-read after a successful one also reads "unknown" until it settles),
+      // and anything else means coord answered without naming a tenant. NOT `data-fleet-loaded`, which reads
       // 0 for both in the only state this attribute is about — the empty
       // read — so it settles the question exactly where it never arises.
       //
