@@ -118,7 +118,16 @@ impl WireOs {
 }
 
 /// What a holder runs on its PTY.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `env` is the child's scrubbed environment and can still carry credentials,
+/// so `Debug` is written by hand and REDACTS it (values and names): a spec —
+/// or a `spawn::SpawnRequest` holding one — can be logged without printing
+/// it. On disk the spec lives only as `<pane-id>.spec`, mode 0600 in the 0700
+/// pane directory, from [`write_spec`] until the holder opens it
+/// ([`consume_spec`] unlinks it before parsing); the spawner unlinks it after
+/// EVERY attempt as well (`spawn::spawn_holder`), which covers a holder that
+/// never started, exited on a held lock, or failed before reading it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChildSpec {
     /// Program and arguments. Empty means the platform's default shell.
     pub argv: Vec<OsString>,
@@ -134,6 +143,23 @@ pub struct ChildSpec {
     pub ring_capacity: Option<usize>,
     /// See [`DEFAULT_EXIT_LINGER_MS`]; `None` is that default.
     pub exit_linger_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for ChildSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildSpec")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field(
+                "env",
+                &format_args!("<{} variables redacted>", self.env.len()),
+            )
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("ring_capacity", &self.ring_capacity)
+            .field("exit_linger_ms", &self.exit_linger_ms)
+            .finish()
+    }
 }
 
 impl ChildSpec {
@@ -164,7 +190,8 @@ impl ChildSpec {
 /// The spec file's JSON. Strict: the runner that writes it and the holder that
 /// reads it are the same build (the holder ships beside the runner), so an
 /// unknown field is a corrupt or foreign file, not a newer writer.
-#[derive(Debug, Serialize, Deserialize)]
+// No `Debug`: it holds the environment (see `ChildSpec`'s redacting `Debug`).
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpecWire {
     format: u32,
@@ -238,8 +265,8 @@ pub fn encode_spec(spec: &ChildSpec) -> io::Result<Vec<u8>> {
 
 /// Parse the file's bytes.
 pub fn decode_spec(bytes: &[u8]) -> io::Result<ChildSpec> {
-    let wire: SpecWire = serde_json::from_slice(bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let wire: SpecWire =
+        serde_json::from_slice(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     from_wire(wire)
 }
 
@@ -353,6 +380,29 @@ mod tests {
             ring_capacity: Some(8192),
             exit_linger_ms: Some(5),
         }
+    }
+
+    /// Review round 2, N9: `Debug` on a spec — and on a `SpawnRequest`
+    /// carrying one — never prints the environment.
+    #[test]
+    fn pty_holder_spec_debug_redacts_the_environment() {
+        let mut spec = sample();
+        spec.env
+            .push(("ANTHROPIC_API_KEY".into(), "sk-secret-value".into()));
+        let shown = format!("{spec:?}");
+        assert!(!shown.contains("sk-secret-value"), "{shown}");
+        assert!(!shown.contains("ANTHROPIC_API_KEY"), "{shown}");
+        assert!(shown.contains("2 variables redacted"), "{shown}");
+        let pane = crate::pane::PaneId::new("p").unwrap();
+        let req = crate::spawn::SpawnRequest {
+            holder_exe: std::path::Path::new("/x"),
+            pane_dir: std::path::Path::new("/y"),
+            pane_id: &pane,
+            child: &spec,
+            route: crate::spawn::RouteRequest::Auto,
+            report_timeout: std::time::Duration::from_secs(1),
+        };
+        assert!(!format!("{req:?}").contains("sk-secret-value"));
     }
 
     #[test]
