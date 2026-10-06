@@ -40,9 +40,10 @@ def lift(fn_name):
 ns = {"yaml": yaml, "hashlib": hashlib, "json": json, "os": os}
 exec(compile(lift("canon") + "\n\n" + lift("digest") + "\n\n"
              + lift("uses_yaml_aliases") + "\n\n" + lift("surface") + "\n\n"
-             + lift("token"),
+             + lift("token") + "\n\n" + lift("file_findings"),
              "lifted", "exec"), ns)
 surface, digest, token = ns["surface"], ns["digest"], ns["token"]
+file_findings = ns["file_findings"]
 uses_yaml_aliases = ns["uses_yaml_aliases"]
 
 checks = failures = 0
@@ -394,6 +395,31 @@ eq("an anchored rewrite DOES digest identically (hence the refusal)", True,
    digest(jobs_of(ANCHORED)["g"]) == digest(jobs_of(PLAIN)["g"]))
 eq("a merge-key rewrite DOES digest identically too", True,
    digest(jobs_of(MERGED)["g"]) == digest(jobs_of(PLAIN)["g"]))
+
+print("\n6. file_findings() -- the non-YAML gating path (check_untimed_subprocess.py).")
+# The defect this closes: surface() YAML-parses its input, a Python file is not
+# YAML, and a None from surface() is the hard `!PARSE` error -- so before
+# file_findings() existed, NO PR could ever edit the script and pass.
+PY_PATH = "scripts/check_untimed_subprocess.py"
+PY_BASE = 'EXPECTED_SCAN_ROOTS: tuple[str, ...] = (\n    "crates/a/src",\n)\n'
+PY_HEAD = 'EXPECTED_SCAN_ROOTS: tuple[str, ...] = (\n    "crates/a/src",\n    "crates/b/src",\n)\n'
+eq("the script is unparseable as a surface (the original deadlock)", None,
+   surface(PY_BASE + "def f():\n    return 1\n"))
+eq("the script's token strips .py", "check_untimed_subprocess#file",
+   token(PY_PATH, "file"))
+eq("an edited script is CHANGED, named <stem>#file",
+   [("CHANGED", "check_untimed_subprocess#file")],
+   file_findings(PY_PATH, PY_BASE, PY_HEAD))
+eq("a comment-only edit still counts (no structure to be cosmetic about)",
+   [("CHANGED", "check_untimed_subprocess#file")],
+   file_findings(PY_PATH, PY_BASE, PY_BASE + "# note\n"))
+eq("an unchanged script yields nothing", [],
+   file_findings(PY_PATH, PY_BASE, PY_BASE))
+eq("a deleted script is a REMOVAL",
+   [("REMOVED", "check_untimed_subprocess#file")],
+   file_findings(PY_PATH, PY_BASE, None))
+eq("a script absent at base is a new gate: additive, nothing to name", [],
+   file_findings(PY_PATH, None, PY_HEAD))
 
 print()
 if failures:
