@@ -508,11 +508,7 @@ impl Pane {
                     return;
                 }
             }
-            let _ = self
-                .killer
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .kill();
+            let _ = self.killer.lock().unwrap_or_else(|p| p.into_inner()).kill();
         }
     }
 
