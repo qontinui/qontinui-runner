@@ -441,6 +441,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/terminalTextPayload.ts",
   "components/terminal/terminalWriteResult.test.ts",
   "components/terminal/terminalWriteResult.ts",
+  "components/terminal/useFleetSessions.ts",
   "components/terminal/useKeyboardShortcuts.ts",
   "components/terminal/useMidSessionProbe.ts",
   "components/terminal/useSessionInfo.test.ts",
