@@ -348,3 +348,58 @@ export function createButtonState(group: { deviceId: string; isCallerDevice: boo
   }
   return { disabled: false, reason: null };
 }
+
+/**
+ * One "New terminal" the fleet picker's EMPTY state may offer for a device
+ * pinned by id — the create that has no device group (and so no group tenant)
+ * behind it.
+ */
+export interface EmptyCreateTarget {
+  /** The tenant the create mints its grant under — and so the tenant the new
+   * session is created in. `null` only in a single-tenant read whose envelope
+   * named none, where the runner's own authority order is the read's own. */
+  tenant: string | null;
+  /** Shown beside the button in a merged read, so the operator sees which
+   * tenant each one creates in. `null` in a single-tenant read. */
+  tenantLabel: string | null;
+}
+
+/** Why a merged empty state offers no create: no tenant answered to create in. */
+export const EMPTY_CREATE_NO_TENANT_REASON =
+  "choose a tenant to create in — no tenant's read answered, so there is none this page belongs to";
+
+/**
+ * The creates the fleet picker's empty state offers, given which tenants the
+ * read covered (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`).
+ *
+ * - A SINGLE-tenant read offers one create under the tenant its rows were
+ *   served under (`servedTenant`, possibly null) — the pre-merge behaviour.
+ * - A MERGED read has no one tenant the empty page belongs to, and sending none
+ *   would let the runner's authority order pick a tenant the operator never
+ *   chose. So it offers one create PER tenant that answered, each naming its
+ *   tenant. An answered walk whose tenant is unnamed is skipped for the same
+ *   reason. With none left, `targets` is empty and `disabledReason` says why.
+ */
+export function emptyCreateTargets(args: {
+  merged: boolean;
+  servedTenant: string | null;
+  answeredTenants: readonly (string | null)[];
+  shortTenant: (tenant: string) => string;
+}): { targets: EmptyCreateTarget[]; disabledReason: string | null } {
+  if (!args.merged) {
+    return { targets: [{ tenant: args.servedTenant, tenantLabel: null }], disabledReason: null };
+  }
+  const seen = new Set<string>();
+  const targets: EmptyCreateTarget[] = [];
+  for (const t of args.answeredTenants) {
+    const tenant = t?.trim();
+    if (!tenant || seen.has(tenant)) continue;
+    seen.add(tenant);
+    targets.push({ tenant, tenantLabel: args.shortTenant(tenant) });
+  }
+  return {
+    targets,
+    disabledReason: targets.length === 0 ? EMPTY_CREATE_NO_TENANT_REASON : null,
+  };
+}

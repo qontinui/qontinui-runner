@@ -120,17 +120,15 @@ pub fn coord_post(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwe
     // coord-tenant-scope(session-noop): this helper has SEVERAL callers -- no count is pinned
     // here, `grep coord_post(` for the live set -- and every one is a DEVICE-authorised route
     // whose tenant coord derives from the rows it names, never from the credential's claim:
-    // the attach-grant mint (`POST /coord/sessions/{id}/attach-grants`,
-    // `commands/remote_attach.rs`), the create-grant mint (`POST
-    // /coord/devices/{id}/create-grants`, `commands/remote_create.rs`), the target's
-    // create-grant consume (`POST /sessions/create-requests/{jti}/consume`,
+    // the target's create-grant consume (`POST /sessions/create-requests/{jti}/consume`,
     // `session/create.rs`) and the remote-interactivity observation door (`POST
-    // /coord/sessions/{id}/interactivity-observations`, `mcp/remote_interactivity.rs`). For the
-    // attach mint, coord takes the SOURCE device from the presented principal and the TARGET
-    // (and hence the tenant) from the `coord.sessions` row named by the path id; the
-    // observation door authorises the reporter DEVICE against the session's device or a grant
-    // coord minted. A body field could be forged, so neither end is read from one. Nothing to
-    // thread; terminal. Re-classify if a caller of a different class ever joins.
+    // /coord/sessions/{id}/interactivity-observations`, `mcp/remote_interactivity.rs`), which
+    // authorises the reporter DEVICE against the session's device or a grant coord minted. A
+    // body field could be forged, so neither end is read from one. Nothing to thread; terminal.
+    // The attach- and create-grant MINTS are no longer here: coord resolves their target WITHIN
+    // the presented principal's tenant, so they state it through [`coord_post_for`] (plan
+    // `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`
+    // Phase 2). Re-classify if a caller of a different class ever joins.
     qontinui_runner_lib::auth::attach_device_auth(client.post(url))
 }
 
@@ -200,6 +198,27 @@ pub fn coord_get_for(
     scope: crate::auth::TenantScope,
 ) -> reqwest::RequestBuilder {
     crate::auth::attach_device_auth_for(client.get(url), scope)
+}
+
+/// Tenant-STATING variant of [`coord_post`] — the write-side twin of
+/// [`coord_get_for`], with the same scope semantics, the same slot-miss posture
+/// (a tenant with no usable slot goes UNAUTHENTICATED, never with another
+/// tenant's credential) and the same reason for taking `crate::auth`'s
+/// `TenantScope` (one copy of the statics).
+///
+/// Adopters: the attach-grant mint (`POST /coord/sessions/{id}/attach-grants`,
+/// `commands/remote_attach.rs`) and the create-grant mint (`POST
+/// /coord/devices/{id}/create-grants`, `commands/remote_create.rs`). coord
+/// resolves both targets WITHIN the presented principal's tenant — a session in
+/// another tenant is `404 session_not_found` — so a row the Fleet view listed
+/// under a non-default tenant is attachable only when the mint presents THAT
+/// tenant's credential.
+pub fn coord_post_for(
+    client: &reqwest::Client,
+    url: impl reqwest::IntoUrl,
+    scope: crate::auth::TenantScope,
+) -> reqwest::RequestBuilder {
+    crate::auth::attach_device_auth_for(client.post(url), scope)
 }
 
 /// True iff a non-empty device-JWT is currently stored.

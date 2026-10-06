@@ -46,7 +46,7 @@ struct PutActiveTenant {
 
 /// GET /tenant/active
 ///
-/// `{ active_tenant_id, source, pin, candidates }` — the same view the
+/// `{ active_tenant_id, source, pin, candidates, credentials }` — the same view the
 /// `get_active_tenant` Tauri command returns.
 async fn get_active_tenant() -> Result<Json<ApiResponse<ActiveTenantView>>, HandlerError> {
     let view = spawn_blocking_tracked(active_tenant_view)
@@ -164,6 +164,9 @@ mod tests {
     /// A fixture machine with an identity, pinned to A, bound to A and B.
     fn fixture() -> (IsolatedAmbient, std::path::PathBuf) {
         let amb = IsolatedAmbient::new();
+        // The view now classifies each candidate's credential; keep that read
+        // off the operator's real OS keychain. Restored when `amb` drops.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let machine = amb.write_machine_json(&format!(
             r#"{{"device_id":"11111111-0000-4000-8000-000000000001","hostname":"box","active_tenant_id":"{TENANT_A}"}}"#
         ));
@@ -216,6 +219,20 @@ mod tests {
         assert_eq!(data["source"], "machine.json");
         assert_eq!(data["pin"], "pinned");
         assert_eq!(data["candidates"], serde_json::json!([TENANT_A, TENANT_B]));
+        // One credential entry per candidate, in candidate order — the HTTP
+        // door serves the same projection the Tauri command does.
+        let creds = data["credentials"]
+            .as_array()
+            .expect("credentials is served");
+        let tenants: Vec<&str> = creds
+            .iter()
+            .map(|c| c["tenant"].as_str().unwrap())
+            .collect();
+        assert_eq!(tenants, vec![TENANT_A, TENANT_B]);
+        for c in creds {
+            assert!(c["slot"].is_string(), "{c}");
+            assert!(c.get("can_act").is_some(), "{c}");
+        }
     }
 
     #[tokio::test]

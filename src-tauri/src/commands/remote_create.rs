@@ -564,9 +564,13 @@ pub fn classify_mint_refusal(status: u16, body: &str) -> RemoteCreateError {
 /// `POST /coord/devices/{target}/create-grants` — mint one single-use create
 /// grant. There is no request body: coord takes the source from the verified
 /// device principal and the target from the path.
+///
+/// `scope` is the tenant the create is made IN — the one the Fleet view listed
+/// the device under. The attach mint that follows presents the same one.
 async fn mint_create_grant(
     coord_base: &str,
     target_device_id: uuid::Uuid,
+    scope: crate::auth::TenantScope,
 ) -> Result<CreateGrantResponse, RemoteCreateError> {
     let Some(http) = crate::coord_http::coord_client() else {
         return Err(RemoteCreateError::mint(
@@ -579,7 +583,7 @@ async fn mint_create_grant(
         coord_base.trim_end_matches('/'),
         target_device_id
     );
-    let resp = crate::coord_http::coord_post(http, &url)
+    let resp = crate::coord_http::coord_post_for(http, &url, scope)
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -636,6 +640,7 @@ pub async fn terminal_create_remote(
     cols: Option<u16>,
     rows: Option<u16>,
     page_id: Option<String>,
+    tenant: Option<String>,
 ) -> Result<crate::terminal::types::RemoteTerminalInfo, RemoteCreateError> {
     let target = uuid::Uuid::parse_str(device_id.trim()).map_err(|e| {
         RemoteCreateError::mint(
@@ -643,12 +648,20 @@ pub async fn terminal_create_remote(
             format!("{device_id:?} is not a device uuid: {e}"),
         )
     })?;
+    // The tenant both mints present — the one the Fleet view listed the device
+    // under, by the rule that read used. Refused before any request.
+    let scope = super::remote_attach::grant_scope_or_refusal(tenant)
+        .await
+        .map_err(|e| {
+            let code = e.split(':').next().unwrap_or("tenant_refused").to_string();
+            RemoteCreateError::mint(code, e)
+        })?;
     let cols = cols.unwrap_or(120);
     let rows = rows.unwrap_or(30);
     let base = coord_base_for(&app_handle);
 
     // 1. Mint.
-    let minted = mint_create_grant(&base, target).await?;
+    let minted = mint_create_grant(&base, target, scope).await?;
     info!(
         target_device = %target,
         grant_jti = %minted.grant_jti,
@@ -740,7 +753,7 @@ pub async fn terminal_create_remote(
     // not have drained the row yet; this retries a `session_not_found` and
     // nothing else.
     let attach_grant =
-        super::remote_attach::mint_attach_grant_awaiting_session(&base, session_uuid)
+        super::remote_attach::mint_attach_grant_awaiting_session(&base, session_uuid, scope)
             .await
             .map_err(|e| RemoteCreateError {
                 stage: "attach",
@@ -822,6 +835,7 @@ pub async fn terminal_create_remote(
             device_label,
             session_label: created.title.clone(),
             working_dir: created.working_dir.clone(),
+            tenant: super::fleet_sessions::scope_tenant(scope),
         },
     )
     .await

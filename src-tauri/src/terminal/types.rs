@@ -43,6 +43,12 @@ pub struct RemoteTabIdentity {
     /// True when the target holds ring bytes OLDER than the attach seed —
     /// the "Load earlier output" affordance is offered only then.
     pub history_available: bool,
+    /// The tenant whose credential minted this tab's grant, when the opener
+    /// STATED one (the Fleet view's selected tenant); `None` when the device's
+    /// authority order chose. A reattach / restore passes it back so the fresh
+    /// grant is minted in the tenant the session lives in — coord resolves an
+    /// attach target within the presented principal's tenant only.
+    pub tenant: Option<String>,
 }
 
 /// What `terminal_attach_remote` returns: the ordinary `TerminalInfo` the

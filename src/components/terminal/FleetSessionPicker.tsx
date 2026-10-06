@@ -26,7 +26,6 @@ import {
   fleetFilteredOutMessage,
   fleetSessionActivity,
   fleetStateOptions,
-  fleetTruncation,
   filterFleetSessions,
   hasActiveFleetFilter,
   isLikelyDeviceId,
@@ -53,12 +52,24 @@ import { useInteractivityProbe } from "./useInteractivityProbe";
 import {
   createButtonState,
   describeRemoteCreateFailure,
+  emptyCreateTargets,
   fleetDeviceCreateErrorId,
   fleetDeviceCreateId,
   IDLE_DEVICE_CREATE,
   type DeviceCreateState,
 } from "./remoteCreate";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
+import { useTenant } from "@/contexts/TenantContext";
+import {
+  FleetTenantSelect,
+  FLEET_TENANT_ALL_VALUE,
+  defaultFleetTenantChoice,
+  fleetTenantCredentialNote,
+  fleetWalkTenants,
+  isAllTenants,
+  type FleetTenantChoice,
+} from "./FleetTenantSelect";
+import { shortTenantId } from "./SpawnTenantPicker";
 import { formatRelativeTime } from "../../lib/formatting";
 
 /**
@@ -142,6 +153,26 @@ export const FLEET_PICKER_LOAD_MORE_ID = "terminal.fleet-picker-load-more";
  * a driver that could not tell them apart would read "there is more" as "there
  * is a control for it". */
 export const FLEET_PICKER_UNREACHABLE_ID = "terminal.fleet-picker-unreachable";
+/**
+ * The merged view's per-tenant error strip (Phase 4): one entry per tenant whose
+ * walk failed or cannot advance, beside the rows the other tenants served. Each
+ * entry is {@link fleetTenantErrorId}.
+ */
+export const FLEET_PICKER_TENANT_ERRORS_ID = "terminal.fleet-picker-tenant-errors";
+
+/** The tenant segment of a per-tenant bridge id: the uuid, or `default` for
+ * the runner's own default (no tenant sent). */
+function tenantIdSegment(tenant: string | null): string {
+  return tenant ?? "default";
+}
+
+export function fleetTenantErrorId(requestedTenant: string | null): string {
+  return `terminal.fleet-picker-tenant-error.${tenantIdSegment(requestedTenant)}`;
+}
+
+export function fleetTenantRetryId(requestedTenant: string | null): string {
+  return `terminal.fleet-picker-tenant-retry.${tenantIdSegment(requestedTenant)}`;
+}
 
 export function fleetSessionRowId(sessionId: string): string {
   return `terminal.fleet-session.${sessionId}`;
@@ -149,6 +180,19 @@ export function fleetSessionRowId(sessionId: string): string {
 
 export function fleetDeviceGroupId(deviceId: string): string {
   return `terminal.fleet-device.${deviceId}`;
+}
+
+/**
+ * The key a device group's bridge ids and per-group state are addressed by:
+ * the device id in a single-tenant read (the ids drivers already use), and
+ * `<deviceId>.<tenant>` in a merged one, where one device can head a group per
+ * tenant and a bare device id would name two elements.
+ */
+export function fleetGroupBridgeKey(
+  g: { deviceId: string; tenantId: string | null },
+  merged: boolean,
+): string {
+  return merged ? `${g.deviceId}.${tenantIdSegment(g.tenantId)}` : g.deviceId;
 }
 
 /**
@@ -189,13 +233,29 @@ export function sessionDescription(s: FleetSession): string {
  * field was unreadable rather than rendering its absence as a fact.
  */
 export function degradedNotice(r: FleetSessionsResponse | null): string | null {
-  if (!r) return null;
-  const missing: string[] = [];
-  if (!r.sessionBridgeColumnPresent) missing.push("harness session ids");
-  if (!r.workAxisColumnsPresent) missing.push("work status");
-  if (!r.deviceIdentityColumnsPresent) missing.push("device hostnames");
-  if (missing.length === 0) return null;
-  return `coord could not read ${missing.join(", ")} — those fields are unknown, not empty.`;
+  return degradedNoticeForAll([r]);
+}
+
+/**
+ * {@link degradedNotice} over every walk of a merged read: a field is named when
+ * ANY tenant's read could not serve it, since the rows of that tenant then
+ * carry it as unknown.
+ */
+export function degradedNoticeForAll(
+  responses: Iterable<FleetSessionsResponse | null>,
+): string | null {
+  const missing = new Set<string>();
+  for (const r of responses) {
+    if (!r) continue;
+    if (!r.sessionBridgeColumnPresent) missing.add("harness session ids");
+    if (!r.workAxisColumnsPresent) missing.add("work status");
+    if (!r.deviceIdentityColumnsPresent) missing.add("device hostnames");
+  }
+  if (missing.size === 0) return null;
+  const order = ["harness session ids", "work status", "device hostnames"].filter((m) =>
+    missing.has(m),
+  );
+  return `coord could not read ${order.join(", ")} — those fields are unknown, not empty.`;
 }
 
 /** Per-row attach state: pending, or the last typed failure (kept inline). */
@@ -213,33 +273,47 @@ interface RowAttachState {
  */
 function RemoteCreateButton({
   deviceId,
+  bridgeKey,
   deviceLabel,
   isCallerDevice,
   state,
   onCreate,
   className,
+  tenantLabel,
+  blockedReason,
 }: {
   deviceId: string;
+  /** What the bridge id is keyed by — see {@link fleetGroupBridgeKey}. */
+  bridgeKey: string;
   deviceLabel: string;
   isCallerDevice: boolean;
   state: DeviceCreateState | undefined;
-  onCreate: (deviceId: string, deviceLabel: string) => Promise<void>;
+  onCreate: () => Promise<void>;
   className?: string;
+  /** The tenant this create mints under, shown on the button — set where one
+   * page offers a create per tenant (a merged empty state). */
+  tenantLabel?: string | null;
+  /** A caller-side reason the create cannot be offered at all; disables the
+   * button with that reason as its title. */
+  blockedReason?: string | null;
 }) {
-  const btn = createButtonState({ deviceId, isCallerDevice });
+  const base = createButtonState({ deviceId, isCallerDevice });
+  const btn = blockedReason ? { disabled: true, reason: blockedReason } : base;
   const pending = state?.pending === true;
   return (
     <button
       type="button"
-      data-ui-bridge-id={fleetDeviceCreateId(deviceId)}
-      onClick={() => void onCreate(deviceId, deviceLabel)}
+      data-ui-bridge-id={fleetDeviceCreateId(bridgeKey)}
+      onClick={() => void onCreate()}
       disabled={btn.disabled || pending}
       aria-disabled={btn.disabled || pending}
       title={
         btn.reason ??
         (pending
           ? "Creating — minting a grant, waiting for the remote runner to spawn, then attaching"
-          : `Open a NEW terminal on ${deviceLabel}. That machine picks the working directory ` +
+          : `Open a NEW terminal on ${deviceLabel}` +
+            (tenantLabel ? ` in tenant ${tenantLabel}` : "") +
+            `. That machine picks the working directory ` +
             `from its own allowed list; this one never sends a path.`)
       }
       className={
@@ -254,7 +328,7 @@ function RemoteCreateButton({
       ) : (
         <Plus className="w-2.5 h-2.5" />
       )}
-      {pending ? "Creating…" : "New terminal"}
+      {pending ? "Creating…" : tenantLabel ? `New terminal in ${tenantLabel}` : "New terminal"}
     </button>
   );
 }
@@ -270,11 +344,12 @@ function RemoteCreateButton({
  * is not showing.
  */
 function RemoteCreateOutcome({
-  deviceId,
+  bridgeKey,
   state,
   onRetry,
 }: {
-  deviceId: string;
+  /** What the bridge ids are keyed by — see {@link fleetGroupBridgeKey}. */
+  bridgeKey: string;
   state: DeviceCreateState | undefined;
   onRetry: () => void;
 }) {
@@ -284,7 +359,7 @@ function RemoteCreateOutcome({
     const r = state.refusal;
     return (
       <div
-        data-ui-bridge-id={fleetDeviceCreateErrorId(deviceId)}
+        data-ui-bridge-id={fleetDeviceCreateErrorId(bridgeKey)}
         data-remote-create-code={r.code}
         data-remote-create-stage={r.stage}
         role="alert"
@@ -326,7 +401,7 @@ function RemoteCreateOutcome({
   if (openedTabStillOpen(state.openedId, tabs)) {
     return (
       <div
-        data-ui-bridge-id={`terminal.fleet-device-create-open.${deviceId}`}
+        data-ui-bridge-id={`terminal.fleet-device-create-open.${bridgeKey}`}
         className="px-3 py-1 border-b border-[#2a2d3d] text-[10px] text-[#9ece6a]"
       >
         Created and attached — tab open on this page.
@@ -360,6 +435,44 @@ export function FleetSessionPicker() {
   const [deviceIdEntry, setDeviceIdEntry] = useState(false);
 
   /**
+   * The tenant(s) whose fleet this view reads. VIEW-LOCAL on purpose: never
+   * written through `set_active_tenant`, which would move the default for new
+   * sessions. Offered only on a multi-bound device.
+   *
+   * `undefined` = the operator has not picked, and the view follows
+   * {@link defaultFleetTenantChoice}: "all tenants" on an UNPINNED multi-bound
+   * device (nobody chose the default slot's tenant, so showing only it would be
+   * a fraction of the device's fleet presented as the whole), else the pin /
+   * the runner's own default — `null`, no tenant sent, exactly the
+   * pre-selector read. Derived during render rather than written by an effect,
+   * so the default follows `get_active_tenant` as it loads.
+   */
+  const {
+    showSwitcher,
+    pin: tenantPin,
+    candidates: tenantCandidates,
+    credentials: tenantCredentials,
+  } = useTenant();
+  const [fleetTenantPick, setFleetTenantPick] = useState<FleetTenantChoice | undefined>(undefined);
+  const fleetTenant: FleetTenantChoice =
+    fleetTenantPick !== undefined
+      ? fleetTenantPick
+      : defaultFleetTenantChoice(tenantPin, tenantCandidates);
+  const allTenants = isAllTenants(fleetTenant);
+  /** One independent cursor walk per entry — coord fingerprints the tenant into
+   * its cursor, so a union is N walks, never one wider one. */
+  const walkTenants = useMemo(
+    () => fleetWalkTenants(fleetTenant, tenantCandidates),
+    [fleetTenant, tenantCandidates],
+  );
+  const chooseFleetTenant = useCallback((choice: FleetTenantChoice) => {
+    setFleetTenantPick(choice);
+    // A device filter names a device of the PREVIOUS tenant; carried across it
+    // could only ever return an empty read.
+    setServer((s) => ({ ...s, deviceId: null }));
+  }, []);
+
+  /**
    * Re-render on a slow timer so the per-row relative times keep moving.
    *
    * `formatRelativeTime` is computed during render, and nothing else here
@@ -382,71 +495,71 @@ export function FleetSessionPicker() {
   }, []);
 
   const {
+    merged,
     sessions,
-    response,
+    envelopes,
     loading,
     loadingMore,
     error,
     errorCode,
     walkStalled,
+    failures,
     emptyReason,
+    truncation,
+    readTenants,
+    servedTenants,
     deviceCatalog,
     stateCatalog,
     appliedQuery,
     pagesLoaded,
-    hasMore,
     refresh,
+    refreshTenant,
     loadMore,
   } = useFleetSessions({
     deviceId: server.deviceId ?? undefined,
     state: server.state ?? undefined,
     includeClosed: server.includeClosed,
     limit: server.limit,
+    tenants: walkTenants,
   });
 
   const visible = useMemo(() => filterFleetSessions(sessions, text), [sessions, text]);
-  const groups = useMemo(() => groupByDevice(visible), [visible]);
+  // A merged read groups by device AND tenant: a device bound to two tenants
+  // heads two groups, so each group's count and "New terminal" belong to one
+  // tenant.
+  const groups = useMemo(() => groupByDevice(visible, { byTenant: merged }), [visible, merged]);
   const stateOptions = useMemo(
     () => fleetStateOptions(stateCatalog, server.state),
     [stateCatalog, server.state],
   );
-  // Both arguments come from the hook and move in the same tick as each other:
-  // `response` is the last page's envelope (which carries coord's own effective
-  // page size, so the classifier cannot be handed a limit the rows were not
-  // served under) and `sessions` is the accumulation that page landed in. The
-  // pending `server` filter is never an input here — between a filter change
-  // and its response, and permanently if that response never arrives, the two
-  // describe different queries.
-  // `hasMore` is the WALK's answer, and it is not the same fact as the last
-  // response's `nextCursor`: a cursor coord refused, or handed back unchanged,
-  // is dropped from the walk while that envelope still carries one. Without it
-  // the classifier returns `more-available` in a state where `loadMore` returns
-  // immediately — a "Load more" button that does nothing at all when clicked.
-  const truncation = fleetTruncation(response, sessions.length, hasMore);
-  const notice = degradedNotice(response);
+  // Completeness is the hook's, classified per walk and folded over the UNION
+  // (`fleetUnionTruncation`): each walk by its own last envelope — coord's own
+  // effective page size — and its ACCUMULATED count, and by `hasMore`'s source,
+  // the WALK's answer, which diverges from the envelope's `nextCursor` the
+  // moment the walk drops a cursor. A single-tenant read classifies exactly as
+  // `fleetTruncation(response, sessions.length, hasMore)` did; the pending
+  // `server` filter is never an input.
+  const notice = degradedNoticeForAll(envelopes.values());
   const filtersActive = hasActiveFleetFilter(server, text);
-  // Pass the tenant the envelope says this read covered, so an empty page names
-  // its scope instead of claiming the fleet. `fleetEmptyReadMessage` says
-  // UNKNOWN rather than guessing when it is missing: coord types it
-  // `tenant_id: Uuid`, but `fleet_sessions_list` hands the body back as an
-  // untyped `serde_json::Value`, so nothing actually checks the field.
+  // The tenants the read covered — those that ANSWERED, by the tenant their rows
+  // were served under, and those whose read FAILED — so an empty page names its
+  // scope instead of claiming the fleet, and a merged empty page does not claim
+  // the tenants it could not read. `fleetEmptyReadMessage` says UNKNOWN rather
+  // than guessing when a tenant is unnamed.
   //
-  // Completeness is coord's POSITIVE signal — `kind === "none"`, coord said
-  // this was the last page — rather than the absence of `"more-available"`,
-  // which would read `unreachable` (coord served a cursor the walk can no
-  // longer use) as a finished walk. That is defence in depth, not a live bug:
-  // wherever this message renders the accumulation is empty, so the last page
-  // was empty, so it carried no cursor (coord's `finish_page` truncates to
-  // `limit >= 1` rows before minting one) and the kind is always `"none"`.
-  // Reading the positive signal costs nothing and does not depend on that
-  // chain holding.
+  // Completeness is coord's POSITIVE signal — `kind === "none"`, every walk
+  // said it was on its last page — rather than the absence of
+  // `"more-available"`, which would read `unreachable` (or an unanswered
+  // tenant's `unknown`) as a finished read.
   const emptyRead = fleetEmptyReadMessage(
     appliedQuery ?? server,
     text,
-    response?.tenantId ?? null,
+    readTenants,
     truncation.kind === "none",
   );
   const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);
+  // Devices, not groups: a merged read has a group per (device, tenant).
+  const devicesShown = useMemo(() => new Set(visible.map((s) => s.deviceId)).size, [visible]);
   const filteredOut = fleetFilteredOutMessage(
     sessions.length,
     visible.length,
@@ -460,9 +573,13 @@ export function FleetSessionPicker() {
    * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
    * A3): loading the Fleet view probes each REMOTE device's not-fresh sessions
    * once, then re-reads so the facts it filed show. Off against a coord that
-   * serves no facts (it has no door to record them in).
+   * serves no facts (it has no door to record them in). The sweep itself walks
+   * every tenant this device can act in, so it is per DEVICE here.
    */
-  const interactivityServed = servesInteractivity(response);
+  const interactivityServed = useMemo(
+    () => [...envelopes.values()].some((r) => servesInteractivity(r)),
+    [envelopes],
+  );
   const probeDevices = useMemo(() => devicesToProbe(deviceCatalog), [deviceCatalog]);
   const refreshAfterSweep = useCallback(() => void refresh(), [refresh]);
   const { sweeping: probingDevice, errors: probeErrors } = useInteractivityProbe(
@@ -476,9 +593,23 @@ export function FleetSessionPicker() {
   /** The runner's own progress while it re-presents a grant the target has
    * not recorded yet — keyed by session id, empty when nothing is waiting. */
   const attachWaiting = useRemoteAttachWaiting();
-  /** Per-DEVICE create state. Keyed by device id: the action belongs to the
-   * group header, not to any one session row. */
+  /** Per-GROUP create state, keyed by {@link fleetGroupBridgeKey}: the action
+   * belongs to the group header, not to any one session row. */
   const [createState, setCreateState] = useState<Record<string, DeviceCreateState>>({});
+  /**
+   * The creates the empty state offers for a pasted device id — the create with
+   * no group behind it. A single read offers one, under its served tenant. A
+   * merged read has no one tenant the empty page belongs to, and sending none
+   * would let the runner's authority order pick a tenant the operator never
+   * chose, so it offers one create PER tenant that answered, each labelled;
+   * with none answered it offers a disabled button saying to choose a tenant.
+   */
+  const emptyCreate = emptyCreateTargets({
+    merged,
+    servedTenant: servedTenants[0] ?? null,
+    answeredTenants: readTenants.answered,
+    shortTenant: shortTenantId,
+  });
 
   const clearFilters = useCallback(() => {
     setServer(DEFAULT_FLEET_SERVER_FILTER);
@@ -508,6 +639,11 @@ export function FleetSessionPicker() {
           // Same routing as `createTerminal`: the tab lands on THIS page via
           // the `terminal-created` listener that claims its `pageId`.
           pageId: pageId !== "default" ? pageId : null,
+          // The tenant the ROW was served under — stamped on it by its own
+          // walk, never the selection (which in a merged view is every tenant)
+          // nor the default slot. coord resolves an attach target within the
+          // presented principal's tenant only, so any other tenant is a 404.
+          tenant: s.servedTenantId ?? null,
         });
         set({ pending: false, openedId: info.id });
         setActiveId(info.id);
@@ -529,13 +665,15 @@ export function FleetSessionPicker() {
    *
    * The caller supplies no path and no repo: those are the target's to choose,
    * and a caller-chosen working directory is the hole this plan's D2 closed.
+   * It does supply the TENANT the group was served under, which is the tenant
+   * the new session is created in.
    */
   const createRemote = useCallback(
-    async (deviceId: string, deviceLabel: string) => {
+    async (stateKey: string, deviceId: string, deviceLabel: string, tenant: string | null) => {
       const set = (patch: Partial<DeviceCreateState>) =>
         setCreateState((prev) => ({
           ...prev,
-          [deviceId]: { ...(prev[deviceId] ?? IDLE_DEVICE_CREATE), ...patch },
+          [stateKey]: { ...(prev[stateKey] ?? IDLE_DEVICE_CREATE), ...patch },
         }));
       set({ pending: true, refusal: null, openedId: null });
       try {
@@ -548,6 +686,8 @@ export function FleetSessionPicker() {
           workingDirKey: null,
           intentRepo: null,
           pageId: pageId !== "default" ? pageId : null,
+          // The tenant the device group was served under (see `attach`).
+          tenant,
         });
         set({ pending: false, openedId: info.id });
         setActiveId(info.id);
@@ -596,15 +736,36 @@ export function FleetSessionPicker() {
       // the same convention as `data-fleet-error-code`. They are told apart by
       // `data-fleet-truncation`: `fleetTruncation(null, ..)` is "unknown", and
       // `loaded` implies a non-null response (both set in one tick), so
-      // "unknown" means no successful read and anything else means coord
-      // answered without naming a tenant. NOT `data-fleet-loaded`, which reads
+      // "unknown" means no successful read OR a read in flight (a walk that is
+      // loading has its envelope hidden from the truncation check, so a
+      // re-read after a successful one also reads "unknown" until it settles),
+      // and anything else means coord answered without naming a tenant. NOT `data-fleet-loaded`, which reads
       // 0 for both in the only state this attribute is about — the empty
       // read — so it settles the question exactly where it never arises.
-      data-fleet-tenant={response?.tenantId ?? ""}
-      // coord's stable machine code for the last failed read. Projected because
-      // the banner beside it carries PROSE, which is explicitly not the
-      // contract — a driver that had to match on the sentence would break on
-      // any rewording of it.
+      //
+      // MERGED (Phase 4): the comma-joined tenants whose walks ANSWERED, in
+      // walk order — each the tenant its rows were served under. A tenant whose
+      // read failed is NOT in it (it answered nothing); it is in
+      // `data-fleet-tenant-failed`. A single read holds one tenant, exactly as
+      // before.
+      data-fleet-tenant={servedTenants.join(",")}
+      // The tenant the view ASKED for: "" = none sent (the runner's authority
+      // order chose), a uuid, or "*" = every bound tenant, merged. Beside
+      // `data-fleet-tenant`, which says which tenant(s) ANSWERED: once a read
+      // settles, a disagreement between a single non-empty request and the
+      // answer is a defect worth seeing.
+      data-fleet-tenant-requested={allTenants ? FLEET_TENANT_ALL_VALUE : (fleetTenant ?? "")}
+      // How many independent walks the view runs — 1 unless merged.
+      data-fleet-tenant-walks={walkTenants.length}
+      // The REQUESTED tenants whose read failed (not merely stalled),
+      // comma-joined; "default" stands for "no tenant sent". Empty when every
+      // walk answered. Their sessions are unknown, never absent.
+      data-fleet-tenant-failed={readTenants.failed.map(tenantIdSegment).join(",")}
+      // coord's stable machine code for the failure shown IN PLACE of the list.
+      // Projected because the banner beside it carries PROSE, which is
+      // explicitly not the contract — a driver that had to match on the
+      // sentence would break on any rewording of it. A merged view's
+      // per-tenant codes are on each `fleetTenantErrorId` entry instead.
       data-fleet-error-code={errorCode ?? ""}
       data-fleet-device-filter={appliedQuery?.deviceId ?? ""}
       data-fleet-state-filter={appliedQuery?.state ?? ""}
@@ -643,9 +804,10 @@ export function FleetSessionPicker() {
             : fleetCountSummary({
                 matched: visible.length,
                 loaded: sessions.length,
-                devices: groups.length,
+                devices: devicesShown,
                 devicesLoaded,
                 remote: remoteCount,
+                tenants: merged ? servedTenants.length : undefined,
               })}
         </span>
         <div className="flex-1" />
@@ -694,6 +856,14 @@ export function FleetSessionPicker() {
 
       {/* Server-side narrowing: these two reach past a truncated page. */}
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[#2a2d3d]">
+        <FleetTenantSelect
+          showSwitcher={showSwitcher}
+          candidates={tenantCandidates}
+          credentials={tenantCredentials}
+          selected={fleetTenant}
+          onChange={chooseFleetTenant}
+          className={SELECT_CLASS}
+        />
         {deviceIdEntry ? (
           <input
             data-ui-bridge-id={FLEET_PICKER_DEVICE_ID_ENTRY_ID}
@@ -774,6 +944,66 @@ export function FleetSessionPicker() {
           closed
         </button>
       </div>
+
+      {/*
+        The merged view's PER-TENANT failures (Phase 4). One tenant's 401, or a
+        refused tenant, must neither blank the rows the other tenants served
+        nor hide behind them: each failed or stalled walk is named here, with
+        its credential state where the runner serves one, its own machine code,
+        and a retry that re-reads THAT tenant only. A single-tenant read keeps
+        its banners below — this strip is the union's.
+      */}
+      {merged && failures.length > 0 && (
+        <div
+          data-ui-bridge-id={FLEET_PICKER_TENANT_ERRORS_ID}
+          data-fleet-tenant-error-count={failures.length}
+          role="alert"
+          className="px-3 py-1 text-[10px] bg-[#f7768e]/10 border-b border-[#2a2d3d] space-y-0.5"
+        >
+          {failures.map((f) => {
+            const who =
+              f.requestedTenant === null ? "device default" : shortTenantId(f.requestedTenant);
+            const credNote =
+              f.requestedTenant === null
+                ? null
+                : fleetTenantCredentialNote(
+                    tenantCredentials.find((c) => c.tenant === f.requestedTenant),
+                  );
+            return (
+              <div
+                key={tenantIdSegment(f.requestedTenant)}
+                data-ui-bridge-id={fleetTenantErrorId(f.requestedTenant)}
+                data-fleet-error-tenant={f.requestedTenant ?? ""}
+                data-fleet-error-code={f.errorCode ?? ""}
+                data-fleet-error-stalled={f.walkStalled ? "true" : "false"}
+                className={`flex items-center gap-1.5 ${f.walkStalled ? "text-[#e0af68]" : "text-[#f7768e]"}`}
+              >
+                <AlertTriangle className="w-3 h-3 shrink-0" />
+                <span className="truncate" title={f.error}>
+                  {/* A stalled walk ANSWERED — its rows are on screen and only
+                      its next page is out of reach — so it is not called a
+                      failed read. */}
+                  <span className="font-medium" title={f.requestedTenant ?? undefined}>
+                    {who}
+                    {credNote ? ` (${credNote})` : ""}
+                  </span>
+                  {f.walkStalled
+                    ? ` — ${f.error}`
+                    : ` — not read; its sessions are unknown, not absent. ${f.error}`}
+                </span>
+                <button
+                  data-ui-bridge-id={fleetTenantRetryId(f.requestedTenant)}
+                  onClick={() => void refreshTenant(f.requestedTenant)}
+                  className="ml-auto shrink-0 px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
+                  title="Re-read this tenant's fleet only"
+                >
+                  Retry
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/*
         Incompleteness as a CONTROL, and under a cursor walk it is no longer an
@@ -911,7 +1141,7 @@ export function FleetSessionPicker() {
           </div>
         ) : sessions.length === 0 ? (
           <div className="px-3 py-8 text-center text-[#565f89] text-xs">
-            {emptyReason !== "observed-empty" ? (
+            {emptyReason !== "observed-empty" && emptyReason !== "partial" ? (
               "Fleet sessions are unknown — no successful read yet."
             ) : (
               <>
@@ -922,24 +1152,52 @@ export function FleetSessionPicker() {
                     runner with nothing running on it yet. Offer it here. */}
                 {appliedQuery?.deviceId && isLikelyDeviceId(appliedQuery.deviceId) && (
                   <div className="mt-3 text-left">
-                    <RemoteCreateButton
-                      deviceId={appliedQuery.deviceId}
-                      deviceLabel={`device ${appliedQuery.deviceId.slice(0, 8)}`}
-                      isCallerDevice={false}
-                      state={createState[appliedQuery.deviceId]}
-                      onCreate={createRemote}
-                      className="mx-auto"
-                    />
-                    <RemoteCreateOutcome
-                      deviceId={appliedQuery.deviceId}
-                      state={createState[appliedQuery.deviceId]}
-                      onRetry={() =>
-                        void createRemote(
-                          appliedQuery.deviceId as string,
-                          `device ${(appliedQuery.deviceId as string).slice(0, 8)}`,
-                        )
+                    {(() => {
+                      const pinned = appliedQuery.deviceId as string;
+                      const label = `device ${pinned.slice(0, 8)}`;
+                      if (emptyCreate.targets.length === 0) {
+                        return (
+                          <RemoteCreateButton
+                            deviceId={pinned}
+                            bridgeKey={pinned}
+                            deviceLabel={label}
+                            isCallerDevice={false}
+                            state={undefined}
+                            onCreate={async () => {}}
+                            blockedReason={emptyCreate.disabledReason}
+                            className="mx-auto"
+                          />
+                        );
                       }
-                    />
+                      return emptyCreate.targets.map((t) => {
+                        // Keyed per tenant in a merged read, exactly as a
+                        // device group would be, so each create has its own
+                        // bridge id and its own outcome.
+                        const key = fleetGroupBridgeKey(
+                          { deviceId: pinned, tenantId: t.tenant },
+                          merged,
+                        );
+                        return (
+                          <div key={key} className="mb-1">
+                            <RemoteCreateButton
+                              deviceId={pinned}
+                              bridgeKey={key}
+                              deviceLabel={label}
+                              isCallerDevice={false}
+                              state={createState[key]}
+                              onCreate={() => createRemote(key, pinned, label, t.tenant)}
+                              tenantLabel={t.tenantLabel}
+                              className="mx-auto"
+                            />
+                            <RemoteCreateOutcome
+                              bridgeKey={key}
+                              state={createState[key]}
+                              onRetry={() => void createRemote(key, pinned, label, t.tenant)}
+                            />
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
                 )}
                 {emptyRead.offerClear && (
@@ -1016,222 +1274,247 @@ export function FleetSessionPicker() {
                 </button>
               </div>
             )}
-            {groups.map((g) => (
-              <div
-                key={g.deviceId}
-                data-page-element={FLEET_DEVICE_GROUP_ELEMENT}
-                data-ui-bridge-id={fleetDeviceGroupId(g.deviceId)}
-              >
-                <div className="flex items-center gap-1.5 px-3 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] sticky top-0">
-                  <Monitor className="w-3 h-3 text-[#565f89]" />
-                  <span className="text-[10px] font-medium text-[#c0caf5]">{g.label}</span>
-                  {g.isCallerDevice && (
-                    <span className="text-[9px] px-1 rounded bg-[#2a2d3d] text-[#565f89]">
-                      this machine
+            {groups.map((g) => {
+              const groupKey = fleetGroupBridgeKey(g, merged);
+              return (
+                <div
+                  key={g.key}
+                  data-page-element={FLEET_DEVICE_GROUP_ELEMENT}
+                  data-ui-bridge-id={fleetDeviceGroupId(groupKey)}
+                  data-fleet-group-tenant={g.tenantId ?? ""}
+                >
+                  <div className="flex items-center gap-1.5 px-3 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] sticky top-0">
+                    <Monitor className="w-3 h-3 text-[#565f89]" />
+                    <span className="text-[10px] font-medium text-[#c0caf5]">{g.label}</span>
+                    {g.isCallerDevice && (
+                      <span className="text-[9px] px-1 rounded bg-[#2a2d3d] text-[#565f89]">
+                        this machine
+                      </span>
+                    )}
+                    {merged && (
+                      <span
+                        className="text-[9px] px-1 rounded bg-[#7aa2f7]/10 text-[#7aa2f7]"
+                        title={`Served under tenant ${g.tenantId ?? "(unnamed)"} — attach and create here mint under it`}
+                      >
+                        {g.tenantId ? shortTenantId(g.tenantId) : "unnamed tenant"}
+                      </span>
+                    )}
+                    <span className="text-[10px] text-[#565f89]">
+                      {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""}
                     </span>
-                  )}
-                  <span className="text-[10px] text-[#565f89]">
-                    {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""}
-                  </span>
-                  {probingDevice === g.deviceId && (
-                    <span
-                      data-ui-bridge-id={`terminal.fleet-device-probing.${g.deviceId}`}
-                      className="text-[9px] text-[#e0af68]"
-                      role="status"
-                      title="Measuring whether this device's sessions are readable and writable from here — no byte is typed into any session"
-                    >
-                      measuring…
-                    </span>
-                  )}
-                  {probeErrors[g.deviceId] && (
-                    <span
-                      data-ui-bridge-id={`terminal.fleet-device-probe-error.${g.deviceId}`}
-                      className="text-[9px] text-[#f7768e] truncate"
-                      title={probeErrors[g.deviceId]}
-                    >
-                      measurement failed
-                    </span>
-                  )}
-                  <div className="flex-1" />
-                  {/* CREATE (Phase 5). A per-DEVICE action, so it lives on the
+                    {probingDevice === g.deviceId && (
+                      <span
+                        data-ui-bridge-id={`terminal.fleet-device-probing.${g.deviceId}`}
+                        className="text-[9px] text-[#e0af68]"
+                        role="status"
+                        title="Measuring whether this device's sessions are readable and writable from here — no byte is typed into any session"
+                      >
+                        measuring…
+                      </span>
+                    )}
+                    {probeErrors[g.deviceId] && (
+                      <span
+                        data-ui-bridge-id={`terminal.fleet-device-probe-error.${g.deviceId}`}
+                        className="text-[9px] text-[#f7768e] truncate"
+                        title={probeErrors[g.deviceId]}
+                      >
+                        measurement failed
+                      </span>
+                    )}
+                    <div className="flex-1" />
+                    {/* CREATE (Phase 5). A per-DEVICE action, so it lives on the
                       group header — the per-tab affordances belong in
                       RemoteTabControls and a per-session row cannot express
                       "make a new one here". */}
-                  <RemoteCreateButton
-                    deviceId={g.deviceId}
-                    deviceLabel={g.label}
-                    isCallerDevice={g.isCallerDevice}
-                    state={createState[g.deviceId]}
-                    onCreate={createRemote}
+                    <RemoteCreateButton
+                      deviceId={g.deviceId}
+                      bridgeKey={groupKey}
+                      deviceLabel={g.label}
+                      isCallerDevice={g.isCallerDevice}
+                      state={createState[groupKey]}
+                      onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.tenantId)}
+                    />
+                  </div>
+                  <RemoteCreateOutcome
+                    bridgeKey={groupKey}
+                    state={createState[groupKey]}
+                    onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.tenantId)}
                   />
-                </div>
-                <RemoteCreateOutcome
-                  deviceId={g.deviceId}
-                  state={createState[g.deviceId]}
-                  onRetry={() => void createRemote(g.deviceId, g.label)}
-                />
 
-                {g.sessions.map((s) => {
-                  const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
-                  const row = attachState[s.sessionId];
-                  const pending = row?.pending === true;
-                  // The attach is not a single round trip: a target that has
-                  // not recorded the grant yet is waited out, same grant
-                  // re-presented, for up to a whole catch-up poll tick.
-                  const waitingLine = attachWaitingMessage(attachWaiting[s.sessionId]);
-                  return (
-                    <div
-                      key={s.sessionId}
-                      data-page-element={FLEET_SESSION_ROW_ELEMENT}
-                      data-ui-bridge-id={fleetSessionRowId(s.sessionId)}
-                      className="px-3 py-1.5 border-b border-[#2a2d3d] hover:bg-[#1f2130] transition-colors"
-                    >
-                      <div className="flex items-baseline gap-2">
-                        <span className="text-[11px] text-[#c0caf5] truncate">
-                          {sessionDescription(s)}
-                        </span>
-                        <div className="flex-1" />
-                        <span className="text-[10px] text-[#565f89] shrink-0">
-                          {sessionStateLabel(s)}
-                        </span>
-                        {/* Attach (Phase 3c). Disabled WITH a reason for the
+                  {g.sessions.map((s) => {
+                    // The row's OWN walk's flag: in a merged read another tenant's
+                    // envelope says nothing about this row's columns.
+                    const btn = attachButtonState(
+                      s,
+                      envelopes.get(s.servedTenantId ?? null)?.deviceIdentityColumnsPresent,
+                    );
+                    const row = attachState[s.sessionId];
+                    const pending = row?.pending === true;
+                    // The attach is not a single round trip: a target that has
+                    // not recorded the grant yet is waited out, same grant
+                    // re-presented, for up to a whole catch-up poll tick.
+                    const waitingLine = attachWaitingMessage(attachWaiting[s.sessionId]);
+                    return (
+                      <div
+                        key={s.sessionId}
+                        data-page-element={FLEET_SESSION_ROW_ELEMENT}
+                        data-ui-bridge-id={fleetSessionRowId(s.sessionId)}
+                        // The tenant this row was SERVED under — the one its
+                        // attach mints under. "" when unnamed.
+                        data-fleet-row-tenant={s.servedTenantId ?? ""}
+                        className="px-3 py-1.5 border-b border-[#2a2d3d] hover:bg-[#1f2130] transition-colors"
+                      >
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-[11px] text-[#c0caf5] truncate">
+                            {sessionDescription(s)}
+                          </span>
+                          <div className="flex-1" />
+                          <span className="text-[10px] text-[#565f89] shrink-0">
+                            {sessionStateLabel(s)}
+                          </span>
+                          {/* Attach (Phase 3c). Disabled WITH a reason for the
                           caller's own device, a closed session, or a row whose
                           device id coord could not vouch for. */}
-                        <button
-                          type="button"
-                          data-ui-bridge-id={fleetSessionAttachId(s.sessionId)}
-                          onClick={() => void attach(s, g.label)}
-                          disabled={btn.disabled || pending}
-                          aria-disabled={btn.disabled || pending}
-                          title={
-                            btn.reason ??
-                            (pending
-                              ? (waitingLine ??
-                                "Attaching — minting a grant and waiting for the remote runner")
-                              : `Open a tab onto this session on ${g.label}`)
-                          }
-                          className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                        >
-                          {pending ? (
-                            <div className="w-2.5 h-2.5 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
-                          ) : (
-                            <Link2 className="w-2.5 h-2.5" />
-                          )}
-                          {pending ? (waitingLine ? "Waiting…" : "Attaching…") : "Attach"}
-                        </button>
-                      </div>
-                      {(() => {
-                        // The row's most recent OBSERVED instant, beside the
-                        // two free-text fields. `state` is a stored column a
-                        // watcher advances, so it can read `active` over a
-                        // session that last beat days ago; the heartbeat is
-                        // what an operator scanning a walked list of hundreds
-                        // actually needs. Null — coord served no parseable
-                        // timestamp — renders nothing rather than a placeholder
-                        // that would look like an answer.
-                        const activity = fleetSessionActivity(s);
-                        const free = [s.provider, s.correlationTopic].filter(
-                          (v): v is string => typeof v === "string" && v.length > 0,
-                        );
-                        if (free.length === 0 && !activity) return null;
-                        return (
-                          <div className="text-[10px] text-[#565f89] truncate">
-                            {/* Each half carries its OWN title. One tooltip over
+                          <button
+                            type="button"
+                            data-ui-bridge-id={fleetSessionAttachId(s.sessionId)}
+                            onClick={() => void attach(s, g.label)}
+                            disabled={btn.disabled || pending}
+                            aria-disabled={btn.disabled || pending}
+                            title={
+                              btn.reason ??
+                              (pending
+                                ? (waitingLine ??
+                                  "Attaching — minting a grant and waiting for the remote runner")
+                                : `Open a tab onto this session on ${g.label}`)
+                            }
+                            className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            {pending ? (
+                              <div className="w-2.5 h-2.5 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
+                            ) : (
+                              <Link2 className="w-2.5 h-2.5" />
+                            )}
+                            {pending ? (waitingLine ? "Waiting…" : "Attaching…") : "Attach"}
+                          </button>
+                        </div>
+                        {(() => {
+                          // The row's most recent OBSERVED instant, beside the
+                          // two free-text fields. `state` is a stored column a
+                          // watcher advances, so it can read `active` over a
+                          // session that last beat days ago; the heartbeat is
+                          // what an operator scanning a walked list of hundreds
+                          // actually needs. Null — coord served no parseable
+                          // timestamp — renders nothing rather than a placeholder
+                          // that would look like an answer.
+                          const activity = fleetSessionActivity(s);
+                          const free = [s.provider, s.correlationTopic].filter(
+                            (v): v is string => typeof v === "string" && v.length > 0,
+                          );
+                          if (free.length === 0 && !activity) return null;
+                          return (
+                            <div className="text-[10px] text-[#565f89] truncate">
+                              {/* Each half carries its OWN title. One tooltip over
                                 the whole line would claim to explain the free
                                 text it says nothing about — and this line is
                                 `truncate`d, so the tooltip is often the only way
                                 to read either half. */}
-                            {free.length > 0 && (
-                              <span title={free.join(" · ")}>{free.join(" · ")}</span>
-                            )}
-                            {free.length > 0 && activity && " · "}
-                            {activity && (
-                              <span
-                                // The exact instant, machine-readable, for the
-                                // same reason `data-fleet-error-code` exists: a
-                                // driver must not have to scrape a truncated,
-                                // locale-formatted span for a timestamp.
-                                data-session-activity={activity.iso}
-                                data-session-activity-kind={activity.verb}
-                                title={`${activity.verb} at ${activity.iso}`}
-                              >
-                                {activity.verb} {formatRelativeTime(activity.iso)}
-                              </span>
-                            )}
-                          </div>
-                        );
-                      })()}
-                      {interactivityServed &&
-                        (() => {
-                          // The two measured facts. An ABSENT fact (a coord
-                          // before them) renders nothing — never "failed" —
-                          // and `unknown` carries its reason, distinct from
-                          // `failed`, which carries the refusal code.
-                          const read = describeFact("read", s.readableRemotely);
-                          const write = describeFact("write", s.writableRemotely);
-                          const surface = describeSurface(s.interactiveSurface);
-                          if (!read && !write && !surface) return null;
-                          return (
-                            <div
-                              data-ui-bridge-id={`terminal.fleet-session-interactivity.${s.sessionId}`}
-                              data-read-state={read?.state}
-                              data-read-reason={read?.reason ?? undefined}
-                              data-write-state={write?.state}
-                              data-write-reason={write?.reason ?? undefined}
-                              data-surface={s.interactiveSurface}
-                              className="text-[10px] text-[#565f89] truncate"
-                            >
-                              {[read, write].map((f, i) =>
-                                f ? (
-                                  <span key={i} className={FACT_TONE_CLASS[f.tone]} title={f.title}>
-                                    {i > 0 && read ? " · " : ""}
-                                    {f.label}
-                                  </span>
-                                ) : null,
+                              {free.length > 0 && (
+                                <span title={free.join(" · ")}>{free.join(" · ")}</span>
                               )}
-                              {surface && (
-                                <span title="Whether coord classifies this session as a remote PTY">
-                                  {read || write ? " · " : ""}
-                                  {surface}
+                              {free.length > 0 && activity && " · "}
+                              {activity && (
+                                <span
+                                  // The exact instant, machine-readable, for the
+                                  // same reason `data-fleet-error-code` exists: a
+                                  // driver must not have to scrape a truncated,
+                                  // locale-formatted span for a timestamp.
+                                  data-session-activity={activity.iso}
+                                  data-session-activity-kind={activity.verb}
+                                  title={`${activity.verb} at ${activity.iso}`}
+                                >
+                                  {activity.verb} {formatRelativeTime(activity.iso)}
                                 </span>
                               )}
                             </div>
                           );
                         })()}
-                      {waitingLine && (
-                        <div
-                          data-ui-bridge-id={`terminal.fleet-session-attach-waiting.${s.sessionId}`}
-                          data-attach-wait-attempt={attachWaiting[s.sessionId]?.attempt}
-                          className="mt-0.5 text-[10px] text-[#e0af68] break-words"
-                          role="status"
-                        >
-                          {waitingLine}
-                        </div>
-                      )}
-                      {row?.error && (
-                        <div
-                          data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
-                          className="mt-0.5 text-[10px] text-[#f7768e] break-words"
-                          role="alert"
-                        >
-                          Attach failed: {row.error}
-                        </div>
-                      )}
-                      {/* Read against the live tab list, not the id alone:
+                        {interactivityServed &&
+                          (() => {
+                            // The two measured facts. An ABSENT fact (a coord
+                            // before them) renders nothing — never "failed" —
+                            // and `unknown` carries its reason, distinct from
+                            // `failed`, which carries the refusal code.
+                            const read = describeFact("read", s.readableRemotely);
+                            const write = describeFact("write", s.writableRemotely);
+                            const surface = describeSurface(s.interactiveSurface);
+                            if (!read && !write && !surface) return null;
+                            return (
+                              <div
+                                data-ui-bridge-id={`terminal.fleet-session-interactivity.${s.sessionId}`}
+                                data-read-state={read?.state}
+                                data-read-reason={read?.reason ?? undefined}
+                                data-write-state={write?.state}
+                                data-write-reason={write?.reason ?? undefined}
+                                data-surface={s.interactiveSurface}
+                                className="text-[10px] text-[#565f89] truncate"
+                              >
+                                {[read, write].map((f, i) =>
+                                  f ? (
+                                    <span
+                                      key={i}
+                                      className={FACT_TONE_CLASS[f.tone]}
+                                      title={f.title}
+                                    >
+                                      {i > 0 && read ? " · " : ""}
+                                      {f.label}
+                                    </span>
+                                  ) : null,
+                                )}
+                                {surface && (
+                                  <span title="Whether coord classifies this session as a remote PTY">
+                                    {read || write ? " · " : ""}
+                                    {surface}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
+                        {waitingLine && (
+                          <div
+                            data-ui-bridge-id={`terminal.fleet-session-attach-waiting.${s.sessionId}`}
+                            data-attach-wait-attempt={attachWaiting[s.sessionId]?.attempt}
+                            className="mt-0.5 text-[10px] text-[#e0af68] break-words"
+                            role="status"
+                          >
+                            {waitingLine}
+                          </div>
+                        )}
+                        {row?.error && (
+                          <div
+                            data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
+                            className="mt-0.5 text-[10px] text-[#f7768e] break-words"
+                            role="alert"
+                          >
+                            Attach failed: {row.error}
+                          </div>
+                        )}
+                        {/* Read against the live tab list, not the id alone:
                         the id is set once on success, so it outlives the tab. */}
-                      {openedTabStillOpen(row?.openedId, tabs) && !row?.error && !pending && (
-                        <div
-                          data-ui-bridge-id={`terminal.fleet-session-attach-open.${s.sessionId}`}
-                          className="mt-0.5 text-[10px] text-[#9ece6a]"
-                        >
-                          Attached — tab open on this page.
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
+                        {openedTabStillOpen(row?.openedId, tabs) && !row?.error && !pending && (
+                          <div
+                            data-ui-bridge-id={`terminal.fleet-session-attach-open.${s.sessionId}`}
+                            className="mt-0.5 text-[10px] text-[#9ece6a]"
+                          >
+                            Attached — tab open on this page.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
           </>
         )}
       </div>

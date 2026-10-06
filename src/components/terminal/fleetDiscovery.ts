@@ -81,6 +81,14 @@ export interface FleetScope {
   deviceId: string | null;
   state: string | null;
   includeClosed: boolean;
+  /**
+   * The tenant the read presents a credential for — `null` lets the runner's
+   * own authority order choose. coord fingerprints the tenant into the cursor
+   * (`scope_fingerprint`), so a cursor replayed across tenants is a
+   * `cursor_scope_mismatch` at best and a list mixing two tenants' rows at
+   * worst; a tenant switch must restart the walk like any other scope change.
+   */
+  tenantId: string | null;
 }
 
 /**
@@ -88,7 +96,7 @@ export interface FleetScope {
  * under the other; unequal keys mean the walk must restart with no cursor.
  */
 export function fleetScopeKey(scope: FleetScope): string {
-  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);
+  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);
 }
 
 /** True when two scopes would accept each other's cursors. */
@@ -330,6 +338,75 @@ export function fleetTruncation(
       `Load the next ${pageSize}, or narrow by device or state. The text box filters only ` +
       `what is loaded.`,
   };
+}
+
+/** One walk's inputs to {@link fleetUnionTruncation}. */
+export interface FleetWalkCompleteness {
+  /** The walk's last successful envelope, or null. */
+  response: FleetSessionsResponse | null;
+  /** Rows the walk has ACCUMULATED. */
+  loaded: number;
+  /** The walk's own answer to "can I fetch a next page" (see `fleetTruncation`). */
+  canAdvance: boolean;
+}
+
+/**
+ * Completeness over a MERGED read — one independent walk per tenant (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+ * Phase 4). coord fingerprints the tenant into its cursor, so there is no one
+ * cursor for the union and no one envelope to classify; each walk is classified
+ * by `fleetTruncation` exactly as a single read is, and the union is:
+ *
+ * - `more-available` when ANY walk can fetch a next page — the "load more"
+ *   then advances every such walk, and the message counts how many;
+ * - else `unreachable` when any walk has more that it can no longer reach;
+ * - else `unknown` when any walk has not completed a read (not loaded yet, or
+ *   failed) — an unanswered tenant is not a complete one, so the union is not
+ *   `none` until every tenant has positively said "last page";
+ * - else `none`.
+ *
+ * `shown` is the UNION's accumulated count. A single walk is returned exactly as
+ * `fleetTruncation` classifies it, so a single-tenant view reads unchanged.
+ */
+export function fleetUnionTruncation(walks: FleetWalkCompleteness[]): FleetTruncation {
+  const per = walks.map((w) => fleetTruncation(w.response, w.loaded, w.canAdvance));
+  if (per.length === 1) return per[0];
+  if (per.length === 0) return { kind: "unknown" };
+  const shown = walks.reduce((n, w) => n + w.loaded, 0);
+  const tenants = `${walks.length} tenants`;
+
+  const advancing = per.filter(
+    (t): t is Extract<FleetTruncation, { kind: "more-available" }> => t.kind === "more-available",
+  );
+  if (advancing.length > 0) {
+    const pageSize = Math.max(...advancing.map((t) => t.pageSize));
+    return {
+      kind: "more-available",
+      shown,
+      pageSize,
+      message:
+        `${shown} loaded so far across ${tenants} — coord has more matching sessions in ` +
+        `${advancing.length} of them, and they are reachable. Load the next ${pageSize} from ` +
+        `${advancing.length === 1 ? "it" : "each"}, or narrow by device or state. The text box ` +
+        `filters only what is loaded.`,
+    };
+  }
+
+  const stuck = per.filter((t) => t.kind === "unreachable").length;
+  if (stuck > 0) {
+    return {
+      kind: "unreachable",
+      shown,
+      message:
+        `${shown} loaded across ${tenants} — coord has more matching sessions in ${stuck} of ` +
+        `them, but ${stuck === 1 ? "that walk's page cursor is" : "those walks' page cursors are"} ` +
+        `no longer usable, so the next page cannot be fetched from ${stuck === 1 ? "it" : "them"}. ` +
+        `Refresh to start the walks again, or narrow by device or state.`,
+    };
+  }
+
+  if (per.some((t) => t.kind === "unknown")) return { kind: "unknown" };
+  return { kind: "none" };
 }
 
 /**
@@ -742,9 +819,18 @@ export const DEFAULT_FLEET_SERVER_FILTER: FleetServerFilter = {
   limit: FLEET_DEFAULT_LIMIT,
 };
 
-/** The scope half of a filter — what a cursor is validated against. */
-export function fleetScopeOf(server: FleetServerFilter): FleetScope {
-  return { deviceId: server.deviceId, state: server.state, includeClosed: server.includeClosed };
+/**
+ * The scope half of a filter — what a cursor is validated against. The tenant
+ * is not a FILTER (coord takes no tenant argument; it is the credential the
+ * read presents), so it is supplied beside the filter rather than inside it.
+ */
+export function fleetScopeOf(server: FleetServerFilter, tenantId: string | null): FleetScope {
+  return {
+    deviceId: server.deviceId,
+    state: server.state,
+    includeClosed: server.includeClosed,
+    tenantId,
+  };
 }
 
 /**
@@ -812,6 +898,55 @@ function fleetReadScope(tenantId: string | null): string | null {
 }
 
 /**
+ * Which tenants a (possibly merged) fleet read covered — the scope an empty
+ * message must state.
+ *
+ * `answered` holds one entry per walk that coord ANSWERED: the tenant its rows
+ * were served under, or `null` where neither the envelope nor the request named
+ * one. `failed` holds one entry per walk that did NOT answer, as the tenant it
+ * ASKED for (`null` = the runner's own default): its sessions are UNKNOWN, and a
+ * sentence about "no sessions" must not silently extend over it — the
+ * multi-tenant form of the 2026-09-28 false report, where an empty read of one
+ * tenant was presented as an empty fleet.
+ */
+export interface FleetReadTenants {
+  answered: (string | null)[];
+  failed: (string | null)[];
+}
+
+/** A single-walk read's scope — what `fleetEmptyReadMessage` accepts bare. */
+function asReadTenants(t: string | null | FleetReadTenants): FleetReadTenants {
+  if (t === null || typeof t === "string") return { answered: [t], failed: [] };
+  return t;
+}
+
+/** One tenant as a short phrase: its id, or "an unnamed tenant". */
+function tenantPhrase(t: string | null): string {
+  const scope = fleetReadScope(t);
+  return scope === null ? "an unnamed tenant" : `tenant ${scope}`;
+}
+
+/** The scope noun for the tenants that answered. */
+function answeredScopeNoun(answered: (string | null)[]): string {
+  if (answered.length === 1) return tenantPhrase(answered[0]);
+  const ids = answered.map((t) => fleetReadScope(t) ?? "unnamed");
+  return `${answered.length} tenants (${ids.join(", ")})`;
+}
+
+/**
+ * The sentence naming the tenants whose read FAILED, or "" when none did.
+ * Placed directly after the scope sentence it qualifies.
+ */
+function failedTenantsNote(failed: (string | null)[]): string {
+  if (failed.length === 0) return "";
+  const names = failed.map((t) => (t === null ? "the device default tenant" : tenantPhrase(t)));
+  const subject = failed.length === 1 ? names[0] : `${failed.length} tenants (${names.join(", ")})`;
+  const pronoun = failed.length === 1 ? "its" : "their";
+  const head = subject.charAt(0).toUpperCase() + subject.slice(1);
+  return ` ${head} could not be read, so ${pronoun} sessions are unknown — not absent.`;
+}
+
+/**
  * What to say when coord's read itself returned no rows.
  *
  * Three different facts, never merged: coord was asked with narrowing filters
@@ -872,40 +1007,53 @@ function fleetReadScope(tenantId: string | null): string | null {
 export function fleetEmptyReadMessage(
   server: FleetServerFilter,
   text: string,
-  tenantId: string | null,
+  tenants: string | null | FleetReadTenants,
   readIsComplete = false,
 ): { message: string; offerClear: boolean } {
-  const scope = fleetReadScope(tenantId);
+  const { answered, failed } = asReadTenants(tenants);
   // A short noun, because it is interpolated into three different sentence
   // shapes and into `where` below. It no longer has to avoid ending in a verb:
   // the filtered branch was rewritten verb-early, so the scope trails the verb
   // and is closed by a full stop instead of sitting between a subject and its
   // own verb. That sentence shape is the constraint, not the noun — see the
   // filtered branch.
-  const scopeNoun = scope === null ? "an unnamed tenant" : `tenant ${scope}`;
+  //
+  // MERGED reads (Phase 4 of plan
+  // `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`)
+  // name every tenant that answered, and then — directly after, where the
+  // tenant note sits — every tenant that did NOT, whose sessions are unknown.
+  // "No open sessions in 2 tenants" with a third tenant's read failed would be
+  // the same overclaim this function exists to stop, one tenant wider.
+  const scopeNoun =
+    answered.length === 0 ? "any tenant — no tenant's read succeeded" : answeredScopeNoun(answered);
   const where = readIsComplete
     ? `in ${scopeNoun}`
     : `in what has been read so far from ${scopeNoun}`;
-  const unknownNote =
-    scope === null ? " coord's response did not name the tenant this read covered." : "";
+  const unnamed = answered.some((t) => fleetReadScope(t) === null);
+  const unknownNote = !unnamed
+    ? ""
+    : answered.length === 1
+      ? " coord's response did not name the tenant this read covered."
+      : " coord's response did not name the tenant one of these reads covered.";
+  const failedNote = failedTenantsNote(failed);
   const partialTail = readIsComplete ? "" : " coord has not confirmed this is the whole list.";
 
   if (hasNarrowingServerFilter(server)) {
     // Verb-early, so the scope attaches to the SESSIONS rather than to the
     // filters, without the long-modifier garden path that noun-first produced.
     return {
-      message: `These filters matched no session ${where}.${unknownNote} This is what coord returned for them — not necessarily an empty tenant.${partialTail}`,
+      message: `These filters matched no session ${where}.${unknownNote}${failedNote} This is what coord returned for them — not necessarily an empty tenant.${partialTail}`,
       offerClear: true,
     };
   }
   if (fleetSearchTerms(text).length > 0) {
     return {
-      message: `No open sessions ${where}.${unknownNote} Your text filter is not sent to coord, so it is not what emptied this list.${partialTail}`,
+      message: `No open sessions ${where}.${unknownNote}${failedNote} Your text filter is not sent to coord, so it is not what emptied this list.${partialTail}`,
       offerClear: true,
     };
   }
   return {
-    message: `No open sessions ${where}.${unknownNote}${partialTail}`,
+    message: `No open sessions ${where}.${unknownNote}${failedNote}${partialTail}`,
     offerClear: false,
   };
 }
@@ -927,8 +1075,15 @@ export function fleetCountSummary(args: {
   /** Devices spanned by everything the walk has served. */
   devicesLoaded: number;
   remote: number;
+  /**
+   * In a MERGED read, the tenants whose walks ANSWERED. Named only when more
+   * than one: every count before it is then a count over their union, and the
+   * line must not read as one tenant's total. Tenants that FAILED are not in
+   * this number — the per-tenant error strip names them.
+   */
+  tenants?: number;
 }): string {
-  const { matched, loaded, devices, devicesLoaded, remote } = args;
+  const { matched, loaded, devices, devicesLoaded, remote, tenants } = args;
   const head =
     matched === loaded
       ? `${loaded} session${loaded === 1 ? "" : "s"}`
@@ -940,6 +1095,7 @@ export function fleetCountSummary(args: {
       ? `${devices} device${devices === 1 ? "" : "s"}`
       : `${devices} of ${devicesLoaded} devices`;
   const parts = [`${head} on ${devicePart}`];
+  if (tenants !== undefined && tenants > 1) parts.push(`${tenants} tenants`);
   if (remote > 0) parts.push(`${remote} remote`);
   return parts.join(" · ");
 }

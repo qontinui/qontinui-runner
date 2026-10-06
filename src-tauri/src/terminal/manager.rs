@@ -924,6 +924,7 @@ mod tests {
                     remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
                     grant_jti: "jti-1".into(),
                     history_available: false,
+                    tenant: None,
                 },
             );
             let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
