@@ -109,7 +109,10 @@ pub async fn ui_bridge_commands_handler() -> Json<ApiResponse<Vec<CommandDescrip
 /// - 200 + `ApiResponse::success(value)` — command resolved; `value` is
 ///   the command's return value serialized as JSON (possibly `null` for
 ///   `()` returns).
-/// - 400 — command not in the allowlist.
+/// - 400 — command not in the allowlist; or, for `get_coord_device_token`, a
+///   `tenantId` / `tenant_id` sent at the TOP level of the body instead of
+///   inside `args` (`get_coord_device_token:tenant_misplaced`, see
+///   [`misplaced_tenant_rejection`]).
 /// - 500 — frontend invoked the command but it threw; response body
 ///   includes the error string.
 /// - 503 + `code: SERVER_MODE_NO_WEBVIEW` — this runner is headless
@@ -126,12 +129,28 @@ pub async fn ui_bridge_invoke_handler(
     Query(q): Query<InvokeTimeoutQuery>,
     Json(body): Json<InvokeRequestBody>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Allowlist gate. Done before any resource allocation so the rejection
-    // path is cheap. This is the INVOKE tier — unchanged by the observe-tier
-    // work (P2). Observe has its own orthogonal gate; see the observe handler
-    // in `mcp/ui_bridge/gated_flow.rs`.
-    if !is_allowlisted(&command) {
-        return Err((
+    if let Some(rejection) = invoke_pre_dispatch_rejection(&command, &body) {
+        return Err(rejection);
+    }
+
+    let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS);
+    let value = perform_invoke_round_trip(&state, &command, &body.args, timeout_ms).await?;
+    Ok(Json(ApiResponse::success(value)))
+}
+
+/// Every refusal the invoke route makes BEFORE dispatch, in order: the
+/// allowlist gate first (its text is what callers' "older build" fallback
+/// matches on, so it must win for a command this build does not serve), then
+/// a misplaced tenant. Done before any resource allocation so the rejection
+/// path is cheap. This is the INVOKE tier — unchanged by the observe-tier work
+/// (P2); observe has its own orthogonal gate in `mcp/ui_bridge/gated_flow.rs`.
+/// One function so the handler's wiring is what the tests exercise.
+pub(crate) fn invoke_pre_dispatch_rejection(
+    command: &str,
+    body: &InvokeRequestBody,
+) -> Option<(StatusCode, Json<ApiResponse<()>>)> {
+    if !is_allowlisted(command) {
+        return Some((
             StatusCode::BAD_REQUEST,
             Json(api_error(format!(
                 "command '{}' not in UI Bridge allowlist — call GET /ui-bridge/commands to list reachable commands",
@@ -139,14 +158,7 @@ pub async fn ui_bridge_invoke_handler(
             ))),
         ));
     }
-
-    if let Some(rejection) = misplaced_tenant_rejection(&command, &body.top_level_extras) {
-        return Err(rejection);
-    }
-
-    let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS);
-    let value = perform_invoke_round_trip(&state, &command, &body.args, timeout_ms).await?;
-    Ok(Json(ApiResponse::success(value)))
+    misplaced_tenant_rejection(command, &body.top_level_extras)
 }
 
 /// The typed prefix of the 400 a `get_coord_device_token` call gets when it
@@ -1487,6 +1499,26 @@ mod misplaced_tenant_tests {
                 "names the envelope verbatim: {text}"
             );
         }
+    }
+
+    /// The handler's whole pre-dispatch path (its only refusal before the
+    /// round-trip is this one call) refuses the misplacement, and the
+    /// allowlist refusal still wins for an unknown name.
+    #[test]
+    fn the_handler_path_refuses_a_misplaced_tenant_and_keeps_allowlist_first() {
+        let misplaced = body(json!({"tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"}));
+        let (status, Json(resp)) =
+            invoke_pre_dispatch_rejection("get_coord_device_token", &misplaced)
+                .expect("the handler path refuses a top-level tenant");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(serde_json::to_string(&resp).unwrap().contains(DEVICE_TOKEN_TENANT_MISPLACED));
+        let good = body(json!({"args": {"tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"}}));
+        assert!(invoke_pre_dispatch_rejection("get_coord_device_token", &good).is_none());
+        let (_, Json(resp)) = invoke_pre_dispatch_rejection("no_such_command_xyz", &misplaced)
+            .expect("an unknown command is refused");
+        let text = serde_json::to_string(&resp).unwrap();
+        assert!(text.contains("not in UI Bridge allowlist"), "allowlist first: {text}");
+        assert!(!text.contains(DEVICE_TOKEN_TENANT_MISPLACED), "{text}");
     }
 
     #[test]
