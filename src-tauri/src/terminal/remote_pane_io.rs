@@ -10,8 +10,9 @@
 //! - **Output** arrives as `remote_terminal_output` frames on the runner's one
 //!   backend socket (`mcp/backend_relay.rs`), routed here by `grant_jti` by
 //!   [`crate::mcp::remote_terminal::RemoteAttachClient`], base64-decoded, and
-//!   queued into a channel the [`PaneIo::reader`] drains. `remote_terminal_exit`
-//!   and `remote_terminal_error` close that channel (reader EOF) and settle the
+//!   queued into the channel [`PaneIo::output`] hands the reader thread.
+//!   `remote_terminal_exit` and `remote_terminal_error` close that channel
+//!   (the receiver disconnects) and settle the
 //!   exit code [`PaneIo::wait`] returns.
 //! - **Input** goes out as `remote_terminal_input` frames through a
 //!   [`RemoteFrameSink`] the relay owns; `resize`, `set_paused`, `kill` and
@@ -36,7 +37,7 @@
 //! close as a failure. A `remote_terminal_error` settles it with
 //! [`ERROR_EXIT_CODE`] (`1`), matching `LocalPty`'s "non-zero falls back to 1".
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -560,7 +561,7 @@ impl RemotePaneIo {
     }
 
     /// Settle the exit code (first writer wins) and close the output channel
-    /// so a reader blocked in `read()` sees EOF.
+    /// so a reader blocked on the receiver sees it disconnect.
     pub fn mark_exit(&self, code: i32) {
         self.out.settle(Ok(code));
     }
@@ -711,8 +712,8 @@ impl Write for FrameWriter {
 }
 
 impl PaneIo for RemotePaneIo {
-    fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        self.out.take_reader()
+    fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+        self.out.take_output()
     }
 
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
@@ -801,10 +802,8 @@ pub(crate) mod tests {
         RemotePaneIo::new("jti-1", "term-9", "grant.jwt", dyn_sink, 100, 40, seed)
     }
 
-    fn read_to_end_blocking(mut r: Box<dyn Read + Send>) -> Vec<u8> {
-        let mut out = Vec::new();
-        r.read_to_end(&mut out).expect("read to EOF");
-        out
+    fn read_to_end_blocking(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        rx.iter().flatten().collect()
     }
 
     /// The seed ring is the first thing the reader yields, then live output
@@ -824,7 +823,7 @@ pub(crate) mod tests {
         assert_eq!(pane.remote_offset(), 105);
         assert_eq!(pane.history_range(), None);
 
-        let reader = pane.reader().expect("reader");
+        let reader = pane.output().expect("reader");
         let feeder = pane.clone();
         let t = thread::spawn(move || {
             feeder.push_output(b"hello ");
@@ -839,7 +838,7 @@ pub(crate) mod tests {
         assert_eq!(pane.wait(), Ok(7));
         assert!(pane.is_finished());
         // A second reader is refused — the first owns the channel.
-        assert!(pane.reader().is_err());
+        assert!(pane.output().is_err());
     }
 
     /// Every write becomes one `remote_terminal_input` frame carrying the
@@ -1187,7 +1186,7 @@ pub(crate) mod tests {
         assert_eq!(pane.pid(), None);
         assert_eq!(pane.credential_scrub(), CredentialScrub::NoChildEnv);
         // The reader sees EOF after release even with no exit frame.
-        let bytes = read_to_end_blocking(pane.reader().unwrap());
+        let bytes = read_to_end_blocking(pane.output().unwrap());
         assert!(bytes.is_empty());
     }
 
@@ -1313,7 +1312,7 @@ pub(crate) mod tests {
     fn remote_error_closes_reader_with_error_code() {
         let sink = Arc::new(RecordingSink::default());
         let pane = pane(&sink, AttachedRing::default());
-        let reader = pane.reader().unwrap();
+        let reader = pane.output().unwrap();
         pane.mark_error("session_not_local", "no such session here");
         assert!(read_to_end_blocking(reader).is_empty());
         assert_eq!(pane.wait(), Ok(ERROR_EXIT_CODE));
@@ -1333,7 +1332,7 @@ pub(crate) mod tests {
                 history_start: Some(0),
             },
         ));
-        let reader = pane.reader().unwrap();
+        let reader = pane.output().unwrap();
         // Ring [5, 15): we have [0, 10) → only "ABCDE" is new.
         pane.splice_replay(&AttachedRing {
             buffer: b"56789ABCDE".to_vec(),
@@ -1411,7 +1410,7 @@ pub(crate) mod tests {
                 history_start: None,
             },
         ));
-        let reader = pane.reader().unwrap();
+        let reader = pane.output().unwrap();
         pane.note_relay_lost();
         assert!(!pane.is_finished());
         assert_eq!(pane.remote_offset(), 3);

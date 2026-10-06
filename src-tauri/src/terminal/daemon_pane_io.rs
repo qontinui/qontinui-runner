@@ -63,7 +63,7 @@
 //! detach needs the reattach-on-boot sweep (plan Phase 3) — until then a
 //! detached-at-shutdown holder would be an orphan nobody adopts.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -318,56 +318,9 @@ fn spawn_holder_pane_or_fallback_blocking(
         .map_err(|e| {
             format!("PTY holder unavailable ({reason}); in-process fallback failed: {e}")
         })?;
-    Ok(Arc::new(WithNotice {
-        notice: fallback_notice(&reason),
-        inner: local,
-    }))
-}
-
-/// A [`PaneIo`] that prints `notice` before the inner pane's first byte and
-/// otherwise IS the inner pane.
-pub struct WithNotice<P> {
-    notice: Vec<u8>,
-    inner: P,
-}
-
-impl<P: PaneIo> PaneIo for WithNotice<P> {
-    fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        let inner = self.inner.reader()?;
-        Ok(Box::new(
-            std::io::Cursor::new(self.notice.clone()).chain(inner),
-        ))
-    }
-    fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
-        self.inner.writer()
-    }
-    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        self.inner.resize(cols, rows)
-    }
-    fn wait(&self) -> Result<i32, String> {
-        self.inner.wait()
-    }
-    fn kill(&self, budget: Duration) -> Result<(), String> {
-        self.inner.kill(budget)
-    }
-    fn set_paused(&self, paused: bool) -> Result<(), String> {
-        self.inner.set_paused(paused)
-    }
-    fn pid(&self) -> Option<u32> {
-        self.inner.pid()
-    }
-    fn job_enroll_pid(&self) -> Option<u32> {
-        self.inner.job_enroll_pid()
-    }
-    fn unwatched_pauses_source(&self) -> bool {
-        self.inner.unwatched_pauses_source()
-    }
-    fn credential_scrub(&self) -> CredentialScrub {
-        self.inner.credential_scrub()
-    }
-    fn release(&self, budget: Duration) -> Result<(), String> {
-        self.inner.release(budget)
-    }
+    Ok(Arc::new(
+        local.with_output_preamble(fallback_notice(&reason)),
+    ))
 }
 
 /// In-band loss notice, the holder's wording of `remote_pane_io`'s marker.
@@ -1355,8 +1308,8 @@ impl Write for HolderInputWriter {
 }
 
 impl PaneIo for DaemonPaneIo {
-    fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        self.out.take_reader()
+    fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+        self.out.take_output()
     }
 
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
@@ -1517,7 +1470,7 @@ impl PaneIo for DaemonPaneIo {
 }
 
 /// Review round 2, N3: a pane dropped WITHOUT `release` — a `spawn_with_io`
-/// step that failed after the pane was built (`reader()?`, a thread spawn) —
+/// step that failed after the pane was built (`output()?`, a thread spawn) —
 /// must not orphan its holder and child. It is killed (bounded; out of band
 /// if the holder does not answer), then every connection is closed.
 impl Drop for DaemonPaneIo {
@@ -1790,7 +1743,7 @@ mod tests {
     fn pty_holder_exit_reported_after_release_budget_is_the_real_code() {
         let (link, pane) = recorded_pane();
         let pane = Arc::new(pane);
-        let mut reader = pane.reader().unwrap();
+        let rx = pane.output().unwrap();
         pane.kill(Duration::from_millis(10)).unwrap();
         let reporter = {
             let pane = pane.clone();
@@ -1804,8 +1757,8 @@ mod tests {
             })
         };
         pane.release(Duration::from_millis(20)).unwrap();
-        let mut rest = Vec::new();
-        reader.read_to_end(&mut rest).unwrap();
+        // The output ends at release: draining it returns rather than hangs.
+        rx.iter().for_each(drop);
         assert_eq!(
             pane.wait(),
             Ok(SIGNAL_EXIT_CODE),
@@ -2027,7 +1980,7 @@ mod tests {
     fn pty_holder_failed_kill_then_release_is_not_a_detach() {
         let (link, pane) = recorded_pane();
         link.fail_kill.store(true, Ordering::SeqCst);
-        let mut reader = pane.reader().unwrap();
+        let rx = pane.output().unwrap();
         assert!(pane.kill(Duration::from_millis(10)).is_err());
         assert_eq!(
             link.terminations.load(Ordering::SeqCst),
@@ -2043,8 +1996,7 @@ mod tests {
             ),
             Ok(code) => panic!("a failed kill settled as exit code {code}"),
         }
-        let mut shown = Vec::new();
-        reader.read_to_end(&mut shown).unwrap();
+        let shown: Vec<u8> = rx.iter().flatten().collect();
         assert_eq!(shown, kill_failed_notice(100, 101));
     }
 
@@ -2112,16 +2064,12 @@ mod tests {
         )
         .expect("fallback spawns");
         assert_eq!(pane.credential_scrub(), CredentialScrub::InProcessEnv);
-        let mut reader = pane.reader().unwrap();
+        let rx = pane.output().unwrap();
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = collected.clone();
         let t = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            while let Ok(chunk) = rx.recv() {
+                sink.lock().unwrap().extend_from_slice(&chunk);
             }
         });
         assert_eq!(pane.wait(), Ok(0));
@@ -2189,18 +2137,14 @@ mod tests {
             unsafe { libc::kill(pid as i32, 0) == 0 }
         }
 
-        /// Drain a pane's reader on a thread into a shared buffer.
+        /// Drain a pane's output on a thread into a shared buffer.
         fn drain(pane: &DaemonPaneIo) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
-            let mut reader = pane.reader().expect("reader");
+            let rx = pane.output().expect("output");
             let collected = Arc::new(Mutex::new(Vec::new()));
             let sink = collected.clone();
             let t = std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                while let Ok(chunk) = rx.recv() {
+                    sink.lock().unwrap().extend_from_slice(&chunk);
                 }
             });
             (collected, t)
@@ -2237,7 +2181,7 @@ mod tests {
         }
 
         /// Input typed into a `DaemonPaneIo` reaches the holder's child, the
-        /// child's output reaches `DaemonPaneIo::reader`, and the child's real
+        /// child's output reaches `DaemonPaneIo::output`, and the child's real
         /// exit code reaches `wait`.
         #[test]
         fn pty_holder_daemon_pane_input_reaches_child_and_output_reaches_reader() {
@@ -2279,7 +2223,7 @@ mod tests {
         }
 
         /// Byte fidelity end to end: holder PTY → output frame →
-        /// `PaneOutput` → `DaemonPaneIo::reader`, for all 256 byte values and
+        /// `PaneOutput` → `DaemonPaneIo::output`, for all 256 byte values and
         /// invalid UTF-8, in raw mode (the line discipline would otherwise
         /// translate — see the holder crate's own fidelity test). The input
         /// direction travels the same way and is checked through a file.
@@ -2332,7 +2276,7 @@ mod tests {
             assert_eq!(
                 *collected.lock().unwrap(),
                 expected,
-                "the child's PTY output reached DaemonPaneIo::reader byte-identical"
+                "the child's PTY output reached DaemonPaneIo::output byte-identical"
             );
             assert_eq!(
                 std::fs::read(&got_in).unwrap(),

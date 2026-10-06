@@ -51,10 +51,28 @@
 //!
 //! Both forms read the ONE name list in `terminal/mod.rs`; nothing here restates
 //! it.
+//!
+//! # Output is a channel, not a `Read`
+//!
+//! [`PaneIo::output`] hands the session's reader thread a
+//! [`mpsc::Receiver`] of byte chunks rather than a blocking `Read`. The reader
+//! thread holds a DEC 2026 sync frame for at most `SYNC_FLUSH_TIME_CAP`
+//! (`session.rs`), and a blocking `read()` gives it no way to wake at that
+//! deadline when the pane goes quiet mid-frame — the held frame would wait for
+//! the next byte. A receiver lets the ONE reader thread `recv_timeout` until
+//! the deadline, so emission order (and the stream offsets stamped on it) stays
+//! single-threaded by construction (plan
+//! `2026-09-30-held-sync-frame-cannot-flush-during-a-blocked-pty-read`).
+//! Out-of-process panes already produced into a channel and now hand it over
+//! directly; [`LocalPty`] runs a pump thread that turns its blocking PTY reads
+//! into chunks.
 
 use std::io::{Read, Write};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
+
+use tracing::debug;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
 
@@ -92,9 +110,12 @@ pub enum CredentialScrub {
 /// The `String` error type is the session layer's own, so the seam adds no
 /// conversion at the call sites it replaced.
 pub trait PaneIo: Send + Sync {
-    /// A blocking reader over the pane's output. Called once per session;
-    /// the reader thread owns the result for the session's life.
-    fn reader(&self) -> Result<Box<dyn Read + Send>, String>;
+    /// The pane's output, as a channel of byte chunks in stream order. Called
+    /// once per session; the reader thread owns the receiver for the session's
+    /// life. The receiver DISCONNECTS (every sender dropped) when the output
+    /// ends — the pane exited, or [`Self::release`] closed it — which is the
+    /// reader thread's EOF. See the module docs for why this is a channel.
+    fn output(&self) -> Result<mpsc::Receiver<Vec<u8>>, String>;
 
     /// A writer into the pane's input. Called once per session.
     fn writer(&self) -> Result<Box<dyn Write + Send>, String>;
@@ -160,7 +181,8 @@ pub trait PaneIo: Send + Sync {
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
 
-    /// Close the underlying handles so a reader blocked in `read()` unblocks.
+    /// Close the underlying handles so the [`Self::output`] receiver
+    /// disconnects and a reader thread blocked on it unblocks.
     /// Bounded by `budget`; `Err` means the handles could not be reached in
     /// time and will be released by process exit instead.
     fn release(&self, budget: Duration) -> Result<(), String>;
@@ -250,7 +272,49 @@ impl OpenedPty {
             pid,
             master: Mutex::new(Some(pair.master)),
             child: Mutex::new(Some(child)),
+            preamble: Vec::new(),
         })
+    }
+}
+
+/// Size of one blocking PTY read in the [`LocalPty`] pump — the reader
+/// thread's buffer size before output became a channel.
+const LOCAL_READ_CHUNK: usize = 8192;
+
+/// Chunks queued between a [`LocalPty`]'s pump and the session's reader
+/// thread: at most 32 × 8 KiB = 256 KiB in flight. BOUNDED on purpose — once
+/// that much is queued, a reader thread that falls behind makes the pump block
+/// in `send`, so any further backlog stays in the kernel's PTY buffer and the
+/// child blocks on its own writes, as it did when the reader thread read the
+/// PTY itself. An unbounded channel would instead let a flooding child grow
+/// this process's memory without limit.
+const LOCAL_OUTPUT_QUEUE_CHUNKS: usize = 32;
+
+/// Turn a blocking `reader` into chunks on `tx` until it ends: `Ok(0)` (EOF),
+/// a read error (how a Windows PTY reports its child's exit), or a receiver
+/// that is gone. Returning drops `tx`, which disconnects the receiver — the
+/// reader thread's EOF. `label` attributes the log lines only.
+fn pump(mut reader: impl Read, tx: mpsc::SyncSender<Vec<u8>>, label: &str) {
+    let mut buf = vec![0u8; LOCAL_READ_CHUNK];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                debug!(terminal_id = %label, "PTY reader got EOF");
+                return;
+            }
+            Ok(n) => {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    debug!(terminal_id = %label, "PTY pump: the reader thread is gone");
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                // On Windows, the PTY reader returns an error when the child exits.
+                debug!(terminal_id = %label, error = %e, "PTY read error (likely process exit)");
+                return;
+            }
+        }
     }
 }
 
@@ -263,6 +327,9 @@ pub struct LocalPty {
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     /// `None` once the waiter thread has taken it via [`PaneIo::wait`].
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
+    /// Bytes [`PaneIo::output`] yields before the PTY's first byte — an
+    /// in-band notice (see [`Self::with_output_preamble`]). Usually empty.
+    preamble: Vec<u8>,
 }
 
 impl LocalPty {
@@ -282,20 +349,46 @@ impl LocalPty {
             pair,
         })
     }
+
+    /// Have [`PaneIo::output`] yield `preamble` before the PTY's first byte —
+    /// how a pane that fell back to an in-process PTY says so in-band.
+    pub fn with_output_preamble(mut self, preamble: Vec<u8>) -> Self {
+        self.preamble = preamble;
+        self
+    }
 }
 
 impl PaneIo for LocalPty {
-    fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|e| format!("Master lock poisoned: {}", e))?;
-        match master.as_ref() {
-            Some(m) => m
-                .try_clone_reader()
-                .map_err(|e| format!("Failed to clone PTY reader: {}", e)),
-            None => Err("PTY master already released".to_string()),
+    /// Spawns the `terminal-pump-{id}` thread, which owns a clone of the PTY
+    /// reader for the session's life (see [`pump`] for how it ends and
+    /// [`LOCAL_OUTPUT_QUEUE_CHUNKS`] for why the channel is bounded).
+    /// [`PaneIo::release`] dropping the master is what unblocks a pump parked
+    /// in `read()`, as it unblocked the reader thread before.
+    fn output(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+        let reader = {
+            let master = self
+                .master
+                .lock()
+                .map_err(|e| format!("Master lock poisoned: {}", e))?;
+            match master.as_ref() {
+                Some(m) => m
+                    .try_clone_reader()
+                    .map_err(|e| format!("Failed to clone PTY reader: {}", e))?,
+                None => return Err("PTY master already released".to_string()),
+            }
+        };
+        let (tx, rx) = mpsc::sync_channel(LOCAL_OUTPUT_QUEUE_CHUNKS);
+        if !self.preamble.is_empty() {
+            // The receiver is held right here and the queue is empty, so this
+            // neither blocks nor fails.
+            let _ = tx.send(self.preamble.clone());
         }
+        let label = self.label.clone();
+        std::thread::Builder::new()
+            .name(format!("terminal-pump-{}", label))
+            .spawn(move || pump(reader, tx, &label))
+            .map_err(|e| format!("Failed to spawn PTY pump thread: {}", e))?;
+        Ok(rx)
     }
 
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
@@ -395,9 +488,10 @@ impl PaneIo for LocalPty {
     }
 
     fn release(&self, budget: Duration) -> Result<(), String> {
-        // Dropping the master closes the OS pipe and unblocks a reader thread
-        // stuck in a blocking `read()`. Bounded: a lock held by a thread
-        // blocked on a full PTY must not park a shutdown past its slice.
+        // Dropping the master closes the OS pipe and unblocks the pump thread
+        // stuck in a blocking `read()`, which then disconnects the output.
+        // Bounded: a lock held by a thread blocked on a full PTY must not park
+        // a shutdown past its slice.
         match crate::safe_lock::lock_with_deadline(&self.master, "terminal master pty", budget) {
             Some(mut master) => {
                 drop(master.take());
@@ -412,14 +506,25 @@ impl PaneIo for LocalPty {
 }
 
 /// An inert [`PaneIo`] for session fixtures that never spawn threads: the
-/// reader is empty, the writer is a sink, everything else succeeds.
+/// output is already ended, the writer is a sink, everything else succeeds.
 #[cfg(test)]
 pub(crate) struct InertPaneIo;
 
+/// A receiver whose output is `bytes` (one chunk, when non-empty) and then
+/// immediate EOF — every sender is already dropped. For test doubles.
+#[cfg(test)]
+pub(crate) fn ended_output(bytes: &[u8]) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    if !bytes.is_empty() {
+        let _ = tx.send(bytes.to_vec());
+    }
+    rx
+}
+
 #[cfg(test)]
 impl PaneIo for InertPaneIo {
-    fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        Ok(Box::new(std::io::empty()))
+    fn output(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+        Ok(ended_output(b""))
     }
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
         Ok(Box::new(std::io::sink()))
@@ -497,8 +602,8 @@ mod tests {
     }
 
     impl PaneIo for ScriptedPaneIo {
-        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-            Ok(Box::new(std::io::Cursor::new(self.script.clone())))
+        fn output(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+            Ok(ended_output(&self.script))
         }
         fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
             Ok(Box::new(SharedWriter(self.input.clone())))
@@ -536,15 +641,11 @@ mod tests {
     fn scripted_pane_drives_the_full_lifecycle_without_a_pty() {
         let pane: Arc<dyn PaneIo> = Arc::new(ScriptedPaneIo::new(b"hello from the pane\r\n", 7));
 
-        // Read: the reader thread's loop shape, to EOF.
-        let mut reader = pane.reader().expect("reader");
+        // Read: the reader thread's loop shape, to EOF (disconnect).
+        let rx = pane.output().expect("output");
         let mut out = Vec::new();
-        let mut buf = [0u8; 8];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => out.extend_from_slice(&buf[..n]),
-            }
+        while let Ok(chunk) = rx.recv() {
+            out.extend_from_slice(&chunk);
         }
         assert_eq!(out, b"hello from the pane\r\n");
 
@@ -656,14 +757,76 @@ mod tests {
         let pane = InertPaneIo;
         pane.release(Duration::ZERO).expect("release");
         pane.resize(100, 40).expect("resize after release");
-        let mut reader = pane.reader().expect("reader");
-        let mut buf = [0u8; 4];
-        assert_eq!(reader.read(&mut buf).expect("read"), 0);
+        let rx = pane.output().expect("output");
+        assert_eq!(rx.recv(), Err(mpsc::RecvError), "already ended");
         assert_eq!(pane.credential_scrub(), CredentialScrub::NoChildEnv);
     }
 
+    /// The pump forwards every byte in order and then disconnects the
+    /// receiver at EOF — the reader thread's end-of-output.
+    #[test]
+    fn pump_forwards_a_reader_then_disconnects_at_eof() {
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (tx, rx) = mpsc::sync_channel(LOCAL_OUTPUT_QUEUE_CHUNKS);
+        let src = data.clone();
+        let t = std::thread::spawn(move || pump(std::io::Cursor::new(src), tx, "pump-eof"));
+        let got: Vec<u8> = rx.iter().flatten().collect();
+        t.join().unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// A reader that yields some bytes and then fails — how a Windows PTY
+    /// reports its child's exit.
+    struct FailsAfter(Option<Vec<u8>>);
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.take() {
+                Some(bytes) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                None => Err(std::io::Error::other("child exited")),
+            }
+        }
+    }
+
+    /// A read error ends the output exactly like EOF: what was read is
+    /// delivered, then the receiver disconnects.
+    #[test]
+    fn pump_ends_the_output_on_a_read_error() {
+        let (tx, rx) = mpsc::sync_channel(LOCAL_OUTPUT_QUEUE_CHUNKS);
+        pump(FailsAfter(Some(b"last words".to_vec())), tx, "pump-err");
+        assert_eq!(rx.recv().unwrap(), b"last words");
+        assert_eq!(rx.recv(), Err(mpsc::RecvError));
+    }
+
+    /// A pump whose receiver is gone stops instead of reading forever.
+    #[test]
+    fn pump_stops_when_the_receiver_is_gone() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        // An endless source: only the dropped receiver can end this call.
+        pump(std::io::repeat(b'x'), tx, "pump-gone");
+    }
+
+    /// A pump facing a full channel blocks rather than buffering: the queue
+    /// never holds more than its capacity.
+    #[test]
+    fn pump_blocks_on_a_full_channel_instead_of_growing() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let t = std::thread::spawn(move || pump(std::io::repeat(b'x'), tx, "pump-full"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!t.is_finished(), "the pump waits on the full channel");
+        // The queued chunks are whole reads.
+        assert_eq!(rx.try_recv().unwrap().len(), LOCAL_READ_CHUNK);
+        assert_eq!(rx.try_recv().unwrap().len(), LOCAL_READ_CHUNK);
+        drop(rx);
+        t.join().unwrap();
+    }
+
     /// A real local PTY through the seam: open, spawn a one-shot echo through
-    /// a sealed command, read its output via `reader()`, wait for exit via
+    /// a sealed command, read its output via `output()`, wait for exit via
     /// `wait()`, release. The same shape as `drive_real_pty_into` in
     /// `session.rs`, but with nothing but `dyn PaneIo` in the caller's hands.
     #[test]
@@ -695,25 +858,21 @@ mod tests {
         assert_eq!(pane.credential_scrub(), CredentialScrub::InProcessEnv);
         assert!(pane.pid().is_some(), "a spawned child has a pid");
 
-        let mut reader = pane.reader().expect("reader");
+        let rx = pane.output().expect("output");
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = collected.clone();
-        // Own thread, like production: on ConPTY `read()` keeps blocking after
-        // the child exits until the MASTER is released.
+        // Own thread, like production: on ConPTY the pump's `read()` keeps
+        // blocking after the child exits until the MASTER is released.
         let reader_thread = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
-                }
+            while let Ok(chunk) = rx.recv() {
+                sink.lock().unwrap().extend_from_slice(&chunk);
             }
         });
 
         let code = pane.wait().expect("wait");
         assert_eq!(code, 0, "echo exits cleanly");
         assert!(
-            matches!(pane.wait(), Err(_)),
+            pane.wait().is_err(),
             "a second wait has no child to wait on"
         );
 
@@ -725,7 +884,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         pane.release(Duration::from_secs(2)).expect("release");
-        let _ = reader_thread.join();
+        // Release must end the output: the pump unblocks and drops its sender,
+        // so the receiving thread finishes rather than hanging.
+        let joined = std::thread::spawn(move || reader_thread.join());
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !joined.is_finished() {
+            assert!(
+                std::time::Instant::now() < end,
+                "the output did not end after release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let text = String::from_utf8_lossy(&collected.lock().unwrap()).to_string();
         assert!(
@@ -735,8 +904,8 @@ mod tests {
         pane.resize(100, 40)
             .expect("resize after release is a successful no-op");
         assert!(
-            matches!(pane.reader(), Err(_)),
-            "no reader after the master is released"
+            pane.output().is_err(),
+            "no output after the master is released"
         );
     }
 
@@ -765,18 +934,10 @@ mod tests {
                 .spawn(ScrubbedCommand::seal(cmd))
                 .expect("spawn"),
         );
-        // Drain the reader so a full pipe can never wedge the wait — same
+        // Drain the output so a full pipe can never wedge the wait — same
         // discipline as the round-trip test above.
-        let mut reader = pane.reader().expect("reader");
-        let reader_thread = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        });
+        let rx = pane.output().expect("output");
+        let reader_thread = std::thread::spawn(move || while rx.recv().is_ok() {});
 
         let code = pane.wait().expect("wait");
         assert_eq!(
