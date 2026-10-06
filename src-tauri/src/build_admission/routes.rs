@@ -3,14 +3,13 @@
 //! | Route | Caller | Secret |
 //! |---|---|---|
 //! | `POST /build-admission/tickets` | the cargo wrappers | returns one |
+//! | `GET /build-admission/tickets/{id}?wait=N` | the wrapper that opened it | `X-Build-Admission-Secret` |
+//! | `POST /build-admission/leases/{id}/release` | the wrapper that opened it | `X-Build-Admission-Secret` |
+//! | `GET /build-admission/state` | anyone (console, `/whereami`, Phase 7 publisher) | none; secrets never appear |
 //!
 //! A ticket's `pid` is the wrapper's NATIVE OS pid. Under Git Bash / MSYS on
 //! Windows `$$` is an MSYS pid the OS does not know (the ticket would be
 //! refused as `no such process`): read the native one from `/proc/$$/winpid`.
-//!
-//! | `GET /build-admission/tickets/{id}?wait=N` | the wrapper that opened it | `X-Build-Admission-Secret` |
-//! | `POST /build-admission/leases/{id}/release` | the wrapper that opened it | `X-Build-Admission-Secret` |
-//! | `GET /build-admission/state` | anyone (console, `/whereami`, Phase 7 publisher) | none; secrets never appear |
 //!
 //! The secret travels in a header, never in a body or a URL, so it stays out
 //! of request bodies and access logs (this refines plan D4's
