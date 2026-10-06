@@ -867,10 +867,37 @@ async fn bounded_window_visible(
     }
 }
 
-/// Wall-clock ms at which the one outstanding window getter was issued; `0` =
-/// none outstanding. See [`bounded_window_visible`] for the contract.
-static WINDOW_GETTER_INFLIGHT_SINCE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// The single-flight slot for the window-visibility getter: wall-clock ms at
+/// which the one outstanding getter was issued; `0` = none outstanding. See
+/// [`bounded_window_visible`] for the contract.
+///
+/// A struct rather than a bare `static AtomicU64` so the slot has an IDENTITY:
+/// a test owns a private `WindowGetterSingleFlight::new()` and drives the `_in`
+/// functions against it, while production claims and releases the single
+/// [`WINDOW_GETTER_SINGLE_FLIGHT`] static through the one-line delegations
+/// below — the same per-test handle as [`MemoryEnrichCounters`] and
+/// [`TransportRungCounters`]. Before this, `window_getter_single_flight_tests`
+/// swapped the global out and stored it back, so two of its tests racing each
+/// other (or a `/health` test running a real probe) saw a claim they did not
+/// make. Plan
+/// `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+/// Phase 4. `the_window_getter_single_flight_api_only_delegates` pins the
+/// delegation.
+struct WindowGetterSingleFlight {
+    inflight_since_ms: std::sync::atomic::AtomicU64,
+}
+
+impl WindowGetterSingleFlight {
+    /// `const` so the static needs no lazy init.
+    const fn new() -> Self {
+        Self {
+            inflight_since_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// The process-global slot — the one every production probe claims.
+static WINDOW_GETTER_SINGLE_FLIGHT: WindowGetterSingleFlight = WindowGetterSingleFlight::new();
 
 fn window_getter_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -881,9 +908,15 @@ fn window_getter_now_ms() -> u64 {
 
 /// Claim the single-flight slot. `false` = a getter is already outstanding.
 fn window_getter_try_claim() -> bool {
+    // Pure delegation — see `WindowGetterSingleFlight` for why.
+    window_getter_try_claim_in(&WINDOW_GETTER_SINGLE_FLIGHT)
+}
+
+/// [`window_getter_try_claim`] against an explicit slot.
+fn window_getter_try_claim_in(slot: &WindowGetterSingleFlight) -> bool {
     // `.max(1)` because `0` is the free sentinel.
     let now = window_getter_now_ms().max(1);
-    WINDOW_GETTER_INFLIGHT_SINCE_MS
+    slot.inflight_since_ms
         .compare_exchange(
             0,
             now,
@@ -895,12 +928,27 @@ fn window_getter_try_claim() -> bool {
 
 /// Release the slot. Idempotent.
 fn window_getter_release() {
-    WINDOW_GETTER_INFLIGHT_SINCE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    // Pure delegation — see `WindowGetterSingleFlight` for why.
+    window_getter_release_in(&WINDOW_GETTER_SINGLE_FLIGHT)
+}
+
+/// [`window_getter_release`] against an explicit slot.
+fn window_getter_release_in(slot: &WindowGetterSingleFlight) {
+    slot.inflight_since_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// How long the outstanding getter has been in flight; zero if none is.
 fn window_getter_outstanding_for() -> std::time::Duration {
-    let since = WINDOW_GETTER_INFLIGHT_SINCE_MS.load(std::sync::atomic::Ordering::SeqCst);
+    // Pure delegation — see `WindowGetterSingleFlight` for why.
+    window_getter_outstanding_for_in(&WINDOW_GETTER_SINGLE_FLIGHT)
+}
+
+/// [`window_getter_outstanding_for`] against an explicit slot.
+fn window_getter_outstanding_for_in(slot: &WindowGetterSingleFlight) -> std::time::Duration {
+    let since = slot
+        .inflight_since_ms
+        .load(std::sync::atomic::Ordering::SeqCst);
     if since == 0 {
         return std::time::Duration::ZERO;
     }
@@ -12671,9 +12719,15 @@ mod not_found_envelope_tests {
 
 #[cfg(test)]
 mod window_getter_single_flight_tests {
+    // Every test here owns a PRIVATE `WindowGetterSingleFlight` rather than
+    // swapping the process-global slot out and storing it back: the swap/store
+    // pair let two tests of this module (or a concurrent `/health` probe)
+    // observe each other's claim between them. Plan
+    // `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+    // Phase 4.
     use super::{
-        window_getter_outstanding_for, window_getter_release, window_getter_try_claim,
-        WINDOW_GETTER_INFLIGHT_SINCE_MS,
+        window_getter_outstanding_for_in, window_getter_release_in, window_getter_try_claim_in,
+        WindowGetterSingleFlight,
     };
     use std::sync::atomic::Ordering;
 
@@ -12682,27 +12736,27 @@ mod window_getter_single_flight_tests {
     /// next poll issue another getter, which is the leak verbatim.
     #[test]
     fn at_most_one_getter_is_outstanding_and_only_its_own_completion_frees_it() {
-        let previous = WINDOW_GETTER_INFLIGHT_SINCE_MS.swap(0, Ordering::SeqCst);
+        let slot = WindowGetterSingleFlight::new();
 
-        assert!(window_getter_try_claim(), "the first caller must win");
         assert!(
-            !window_getter_try_claim(),
+            window_getter_try_claim_in(&slot),
+            "the first caller must win"
+        );
+        assert!(
+            !window_getter_try_claim_in(&slot),
             "a concurrent poller must NOT issue a second getter — that is the leak"
         );
         assert!(
-            !window_getter_try_claim(),
+            !window_getter_try_claim_in(&slot),
             "…and every poller after it, for as long as the getter is parked"
         );
 
         // Only the blocking closure's own release frees the slot.
-        window_getter_release();
+        window_getter_release_in(&slot);
         assert!(
-            window_getter_try_claim(),
+            window_getter_try_claim_in(&slot),
             "once the getter actually returned, the next poll may probe again"
         );
-
-        window_getter_release();
-        WINDOW_GETTER_INFLIGHT_SINCE_MS.store(previous, Ordering::SeqCst);
     }
 
     /// A coalescing caller must resolve to a REAL answer, never to a third
@@ -12739,10 +12793,10 @@ mod window_getter_single_flight_tests {
     /// evidence, and reporting it costs no new thread.
     #[test]
     fn the_outstanding_age_is_zero_when_free_and_grows_while_claimed() {
-        let previous = WINDOW_GETTER_INFLIGHT_SINCE_MS.swap(0, Ordering::SeqCst);
+        let slot = WindowGetterSingleFlight::new();
 
         assert_eq!(
-            window_getter_outstanding_for(),
+            window_getter_outstanding_for_in(&slot),
             std::time::Duration::ZERO,
             "no claim ⇒ no age"
         );
@@ -12754,20 +12808,22 @@ mod window_getter_single_flight_tests {
             .unwrap()
             .as_millis() as u64
             - 30_000;
-        WINDOW_GETTER_INFLIGHT_SINCE_MS.store(long_ago, Ordering::SeqCst);
+        slot.inflight_since_ms.store(long_ago, Ordering::SeqCst);
         assert!(
-            window_getter_outstanding_for() >= std::time::Duration::from_secs(29),
+            window_getter_outstanding_for_in(&slot) >= std::time::Duration::from_secs(29),
             "a claim stamped 30s ago must read as ~30s outstanding"
         );
         assert!(
-            window_getter_outstanding_for()
+            window_getter_outstanding_for_in(&slot)
                 >= crate::mcp::ui_bridge::window_probe::WINDOW_GETTER_TIMEOUT,
             "…and therefore past the bound, which is the unresponsive verdict"
         );
 
-        window_getter_release();
-        assert_eq!(window_getter_outstanding_for(), std::time::Duration::ZERO);
-        WINDOW_GETTER_INFLIGHT_SINCE_MS.store(previous, Ordering::SeqCst);
+        window_getter_release_in(&slot);
+        assert_eq!(
+            window_getter_outstanding_for_in(&slot),
+            std::time::Duration::ZERO
+        );
     }
 }
 
@@ -15539,6 +15595,157 @@ fn not_a_static() {}
              exactly 3 are allowed (the three delegating wrappers). Every other \
              site takes `counters: &TransportRungCounters` as a parameter."
         );
+    }
+
+    /// The window-getter single-flight slot, same contract (plan
+    /// `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+    /// Phase 4): three delegating wrappers, one static, no `OnceLock`, and
+    /// nothing else in the production half names the static — so
+    /// `window_getter_single_flight_tests` drives exactly the code
+    /// `bounded_window_visible` runs, against a slot of its own.
+    #[test]
+    fn the_window_getter_single_flight_api_only_delegates() {
+        const SRC: &str = include_str!("mcp_api.rs");
+        let prod = prod_part(SRC);
+        let prod = prod.as_str();
+
+        for (signature, expected) in [
+            (
+                "fn window_getter_try_claim() -> bool",
+                "window_getter_try_claim_in(&WINDOW_GETTER_SINGLE_FLIGHT)",
+            ),
+            (
+                "fn window_getter_release()",
+                "window_getter_release_in(&WINDOW_GETTER_SINGLE_FLIGHT)",
+            ),
+            (
+                "fn window_getter_outstanding_for() -> std::time::Duration",
+                "window_getter_outstanding_for_in(&WINDOW_GETTER_SINGLE_FLIGHT)",
+            ),
+        ] {
+            let (raw, body) = wrapper_body(prod, signature);
+            assert_eq!(
+                body,
+                format!("{{{expected}"),
+                "`{signature}` is no longer a pure delegation to `{expected}`. If \
+                 this is a deliberate signature change and the wrapper is STILL a \
+                 one-line delegation, update this pin's expected spelling in the \
+                 same change. Body is now:\n{raw}"
+            );
+        }
+
+        let block_start = prod
+            .find("struct WindowGetterSingleFlight {")
+            .expect("the single-flight struct must be in the production half");
+        let block_end = block_start
+            + prod
+                .get(block_start..)
+                .expect("a `find` result is a char boundary")
+                .find("\nfn window_getter_now_ms(")
+                .expect("`window_getter_now_ms` must follow the single-flight block");
+        let block = prod
+            .get(block_start..block_end)
+            .expect("both ends are `find` results");
+        let statics = declared_statics(block);
+        assert_eq!(
+            statics,
+            vec![
+                "static WINDOW_GETTER_SINGLE_FLIGHT: WindowGetterSingleFlight = WindowGetterSingleFlight::new();"
+            ],
+            "the single-flight block must declare exactly one static, \
+             `WINDOW_GETTER_SINGLE_FLIGHT`. A second one is a slot every test of this \
+             binary would share again. Found:\n{}",
+            statics.join("\n")
+        );
+        assert!(
+            !squeezed_code(block).contains("OnceLock"),
+            "`OnceLock` is back in the single-flight block — \
+             `WindowGetterSingleFlight::new` is `const`, so the static needs no lazy init"
+        );
+
+        let mentions = squeezed_code(prod)
+            .matches("&WINDOW_GETTER_SINGLE_FLIGHT")
+            .count();
+        assert_eq!(
+            mentions, 3,
+            "`&WINDOW_GETTER_SINGLE_FLIGHT` is named {mentions} times in the production \
+             half; exactly 3 are allowed (the three delegating wrappers). Every other \
+             site takes `slot: &WindowGetterSingleFlight` as a parameter."
+        );
+    }
+
+    /// The session-message push counters (`mcp/session_message_poller.rs`),
+    /// same contract, same plan and phase: `health_snapshot` is the one
+    /// delegating wrapper; `deliver_once` is the one place that hands
+    /// `PUSH_COUNTERS` to the two recorder sites (through `SurfaceCtx`); the
+    /// counter block declares one static and no `OnceLock`; and no global-bound
+    /// recorder (`record_push_miss(` / `record_push_ok(`) exists to bypass the
+    /// handle. Pinned here rather than in the poller's own test module so the
+    /// production-half stripper and the static scanner are not duplicated.
+    #[test]
+    fn the_session_message_push_counter_api_only_delegates() {
+        const SRC: &str = include_str!("mcp/session_message_poller.rs");
+        let prod = prod_part(SRC);
+        let prod = prod.as_str();
+        assert!(
+            prod.len() < SRC.len(),
+            "stripping the test module must remove something: the poller has one, so an \
+             unchanged length means the stripper matched nothing"
+        );
+
+        let (raw, body) =
+            wrapper_body(prod, "pub(crate) fn health_snapshot() -> serde_json::Value");
+        assert_eq!(
+            body, "{health_snapshot_in(&PUSH_COUNTERS)",
+            "`health_snapshot` is no longer a pure delegation to \
+             `health_snapshot_in(&PUSH_COUNTERS)`. Body is now:\n{raw}"
+        );
+
+        let block_start = prod
+            .find("struct PushCounters(")
+            .expect("the push counter struct must be in the production half");
+        let block_end = block_start
+            + prod
+                .get(block_start..)
+                .expect("a `find` result is a char boundary")
+                .find("\nfn miss_slot(")
+                .expect("`miss_slot` must follow the push counter block");
+        let block = prod
+            .get(block_start..block_end)
+            .expect("both ends are `find` results");
+        let statics = declared_statics(block);
+        assert_eq!(
+            statics,
+            vec!["static PUSH_COUNTERS: PushCounters = PushCounters::new();"],
+            "the push counter block must declare exactly one static, `PUSH_COUNTERS`. \
+             Found:\n{}",
+            statics.join("\n")
+        );
+        assert!(
+            !squeezed_code(block).contains("OnceLock"),
+            "`OnceLock` is back in the push counter block — `PushCounters::new` is \
+             `const`, so the static needs no lazy init"
+        );
+
+        let squeezed = squeezed_code(prod);
+        let mentions = squeezed.matches("&PUSH_COUNTERS").count();
+        assert_eq!(
+            mentions, 2,
+            "`&PUSH_COUNTERS` is named {mentions} times in the poller's production half; \
+             exactly 2 are allowed (the `health_snapshot` wrapper and `deliver_once`'s \
+             `SurfaceCtx`). Every recorder takes `counters: &PushCounters`."
+        );
+        for global_bound in [
+            "fnrecord_push_miss(",
+            "fnrecord_push_ok(",
+            "fnpush_counters(",
+        ] {
+            assert!(
+                !squeezed.contains(global_bound),
+                "a global-bound `{global_bound}` is back in the poller; the only recorders \
+                 are `record_push_miss_in` / `record_push_ok_in`, which take the counters"
+            );
+        }
     }
 }
 
