@@ -63,9 +63,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use qontinui_pty_holder::client::{
-    connect, probe, ConnectError, Event, Probe, ShutdownHandle, StreamReader, StreamWriter,
+    connect, probe, ConnectError, Event, InputStream, Probe, ShutdownHandle, StreamReader,
+    StreamWriter,
 };
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request};
+use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
     pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, Unprotected,
 };
@@ -91,12 +93,15 @@ pub const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 /// connection is ended and the pump reattaches, so the pane never wedges.
 pub const INPUT_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long one input write waits for the pane's input connection to open
+/// (or reopen) before it is refused.
+pub const INPUT_OPEN_WAIT: Duration = Duration::from_secs(10);
+
 /// How long `release` tries the `detach` frame before ending the connection
 /// instead (which the holder treats the same way).
 pub const DETACH_FRAME_BUDGET: Duration = Duration::from_millis(500);
 
-/// How often the control thread re-checks for a settled pane, and its backoff
-/// after a control write failed.
+/// The control thread's backoff after a control write failed.
 const CONTROL_POLL: Duration = Duration::from_millis(250);
 
 /// How long the pump keeps trying to reach a holder that still holds its
@@ -109,8 +114,18 @@ pub const RECONNECT_WINDOW: Duration = Duration::from_secs(120);
 /// Bound on one liveness probe while reconnecting.
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Pause between reconnect attempts.
+/// First pause between reconnect attempts of one outage; doubles per attempt.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Longest pause between reconnect attempts.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// A reattached connection that stays up this long ends its outage: the next
+/// drop starts a fresh one (fresh give-up clock, no backoff).
+const STABLE_AFTER: Duration = Duration::from_secs(10);
+
+/// Bound on the `kill` the pump sends when it gives up on a holder.
+const GIVE_UP_KILL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Output chunks (each at most the holder's 64 KiB frame) queued between the
 /// pump and the session's reader thread. Bounded, so an output flood the
@@ -140,6 +155,10 @@ pub const KILL_SETTLE_MAX: Duration = Duration::from_secs(
         + qontinui_pty_holder::pty::EXIT_DRAIN_GRACE.as_secs()
         + 2,
 );
+
+/// Bound on the kill a `Drop` without `release` sends, and on its wait for the
+/// exit report.
+pub const DROP_KILL_BUDGET: Duration = Duration::from_secs(2);
 
 /// `wait`'s answer for a signal death: `LocalPty`'s "non-success is 1".
 pub const SIGNAL_EXIT_CODE: i32 = 1;
@@ -215,16 +234,14 @@ pub fn spawn_holder_pane_or_fallback(
     cols: u16,
     rows: u16,
 ) -> Result<Arc<dyn PaneIo>, String> {
-    off_the_async_workers(|| {
-        spawn_holder_pane_or_fallback_in(
-            holder_exe(),
-            runner_pane_dir(),
-            terminal_id,
-            cmd,
-            cols,
-            rows,
-        )
-    })
+    spawn_holder_pane_or_fallback_in(
+        holder_exe(),
+        runner_pane_dir(),
+        terminal_id,
+        cmd,
+        cols,
+        rows,
+    )
 }
 
 /// Run `f` — which can block for the holder's ready line, its attach and a
@@ -247,7 +264,25 @@ fn off_the_async_workers<T>(f: impl FnOnce() -> T) -> T {
 /// [`spawn_holder_pane_or_fallback`] with the holder executable and pane
 /// directory supplied — the seam a test uses so it never resolves the
 /// operator's real `~/.qontinui/runner`.
+///
+/// Everything that can block — the holder's ready line, its attach, the
+/// fallback spawn — runs through [`off_the_async_workers`] HERE, at the seam a
+/// test drives, so a regression that drops it fails
+/// `pty_holder_spawn_door_does_not_park_a_tokio_worker`.
 fn spawn_holder_pane_or_fallback_in(
+    exe: Result<&Path, String>,
+    pane_dir: Result<PathBuf, String>,
+    terminal_id: &str,
+    cmd: ScrubbedCommand,
+    cols: u16,
+    rows: u16,
+) -> Result<Arc<dyn PaneIo>, String> {
+    off_the_async_workers(|| {
+        spawn_holder_pane_or_fallback_blocking(exe, pane_dir, terminal_id, cmd, cols, rows)
+    })
+}
+
+fn spawn_holder_pane_or_fallback_blocking(
     exe: Result<&Path, String>,
     pane_dir: Result<PathBuf, String>,
     terminal_id: &str,
@@ -351,9 +386,20 @@ pub fn holder_gone_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
 /// the whole reconnect window and was terminated.
 pub fn holder_terminated_notice(holder_pid: u32, how: &str) -> Vec<u8> {
     format!(
-        "\r\n\x1b[1;31m[qontinui] the PTY holder for this pane (pid {holder_pid}) stopped \
-         answering, and this tab gave up on it — terminating it: {how}. The pane has ended \
-         here and its exit code is unknown\x1b[0m\r\n"
+        "\r\n\x1b[1;31m[qontinui] the PTY holder for this pane (pid {holder_pid}) could not \
+         be reached, and this tab gave up on it — {how}. The pane has ended here and its exit \
+         code is unknown\x1b[0m\r\n"
+    )
+    .into_bytes()
+}
+
+/// In-band notice for a holder that is alive but speaks no protocol version
+/// this runner drives (plan D15): it is left running, never killed.
+pub fn holder_incompatible_notice(holder_pid: u32, holder_versions: &[u32]) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[1;33m[qontinui] this pane's PTY holder (pid {holder_pid}) speaks protocol \
+         versions {holder_versions:?}, which this runner cannot drive — it was left running, \
+         and this tab can no longer show it\x1b[0m\r\n"
     )
     .into_bytes()
 }
@@ -382,33 +428,54 @@ pub enum HolderControl {
 /// recorder in a test. The per-pane replacement for `RemoteFrameSink` (see the
 /// module docs).
 pub trait HolderLink: Send + Sync {
-    /// Raw input bytes for the child, on the attached connection.
+    /// Raw input bytes for the child, on the pane's INPUT connection — never
+    /// the attached one (the holder refuses input there, so a child slow to
+    /// read its stdin cannot queue the attached connection's control verbs).
+    /// The input connection is opened on demand and reopened after any
+    /// failure, waiting up to [`INPUT_OPEN_WAIT`] for the holder, so input is
+    /// not refused while the ATTACHED connection is between reattaches.
     fn input(&self, bytes: &[u8]) -> Result<(), String>;
     /// One control request on the attached connection (`resize`, `pause`,
     /// `resume`, `detach`), bounded by `budget`. Its `ok` arrives on the
     /// reading half and is not waited for.
     fn control(&self, op: HolderControl, budget: Duration) -> Result<(), String>;
     /// `kill`, on a FRESH connection of its own, bounded by `budget` — so a
-    /// kill never queues behind input stuck on the attached connection (a
-    /// child that does not read its stdin), and works after that connection
-    /// failed. `Ok` means the holder answered `ok {kill}`.
+    /// kill works whatever state the attached and input connections are in.
+    /// `Ok` means the holder answered `ok {kill}`.
     fn kill(&self, budget: Duration) -> Result<(), String>;
     /// End the attached connection without a frame (it may be wedged
-    /// mid-write). The holder keeps the child; the pump decides what follows.
+    /// mid-write). The input connection is untouched; the pump decides what
+    /// follows.
     fn abort_connection(&self);
+    /// End every connection this link holds (attached and input) and refuse
+    /// further input. After a detach or a settled exit.
+    fn close(&self);
+    /// End the holder process itself, only once it is verified to be the
+    /// holder `holder_pid` this pane attached to
+    /// (`qontinui_pty_holder::terminate`).
+    fn terminate(&self, holder_pid: u32) -> Termination;
 }
 
 /// The production link: the writing half of THIS pane's current attached
-/// connection (replaced on every reattach), plus the address to open fresh
-/// connections to. A failed write leaves that connection's stream position
-/// unknown, so the first failure ENDS the connection — the pump then finds the
-/// holder alive and reattaches at the last offset, or finds it gone.
+/// connection (replaced on every reattach), the pane's input connection
+/// (reopened on demand), and the address to open fresh connections to. A
+/// failed write leaves that connection's stream position unknown, so the
+/// first failure ENDS that connection — for the attached one the pump then
+/// finds the holder alive and reattaches at the last offset, or finds it gone;
+/// the input one is reopened by the next write.
 pub struct HolderConn {
     key: String,
     pane_dir: PathBuf,
     pane_id: PaneId,
     writer: Mutex<Option<StreamWriter>>,
     shutdown: Mutex<Option<ShutdownHandle>>,
+    input: Mutex<Option<InputStream>>,
+    input_shutdown: Mutex<Option<ShutdownHandle>>,
+    closed: AtomicBool,
+}
+
+fn lock_slot<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl HolderConn {
@@ -419,14 +486,17 @@ impl HolderConn {
             pane_id: pane_id.clone(),
             writer: Mutex::new(None),
             shutdown: Mutex::new(None),
+            input: Mutex::new(None),
+            input_shutdown: Mutex::new(None),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Install a newly attached connection's writing half.
     fn install(&self, writer: StreamWriter) {
         let handle = writer.shutdown_handle().ok();
-        *self.shutdown.lock().unwrap_or_else(|p| p.into_inner()) = handle;
-        *self.writer.lock().unwrap_or_else(|p| p.into_inner()) = Some(writer);
+        *lock_slot(&self.shutdown) = handle;
+        *lock_slot(&self.writer) = Some(writer);
     }
 
     fn with_writer(
@@ -462,20 +532,84 @@ impl HolderConn {
             }
         }
     }
+
+    /// Open the input connection, retrying until `deadline` — the holder may
+    /// be busy, or briefly unreachable while the attached connection is being
+    /// re-established.
+    fn open_input(&self, deadline: Instant) -> Result<InputStream, String> {
+        let mut backoff = Duration::from_millis(50);
+        loop {
+            let attempt = Instant::now() + ATTACH_DEADLINE.min(INPUT_OPEN_WAIT);
+            match connect(&self.pane_dir, &self.pane_id, attempt.min(deadline))
+                .and_then(|c| c.open_input(attempt.min(deadline)))
+            {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    if self.closed.load(Ordering::Acquire) || Instant::now() + backoff >= deadline {
+                        return Err(format!(
+                            "pty holder {}: input connection could not be opened: {e}",
+                            self.key
+                        ));
+                    }
+                }
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(1));
+        }
+    }
+
+    fn drop_input(&self) {
+        if let Some(h) = lock_slot(&self.input_shutdown).take() {
+            h.shutdown();
+        }
+        if let Ok(mut slot) = self.input.try_lock() {
+            slot.take();
+        }
+    }
 }
 
 impl HolderLink for HolderConn {
     fn input(&self, bytes: &[u8]) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("pty holder {}: pane released", self.key));
+        }
         // Waits as long as the CHILD takes to read (the holder queues input to
         // its own PTY writer thread and pushes back only when that queue is
-        // full) — the same contract as a local PTY write — but bounded, and a
-        // timeout ends this connection rather than wedging the pane.
-        self.with_writer(INPUT_DEADLINE, INPUT_DEADLINE, |w, deadline| {
-            for chunk in bytes.chunks(MAX_INPUT_CHUNK) {
-                w.input(chunk, deadline)?;
+        // full) — the same contract as a local PTY write — but bounded.
+        let deadline = Instant::now() + INPUT_DEADLINE;
+        let Some(mut slot) =
+            crate::safe_lock::lock_with_deadline(&self.input, "pty holder input", INPUT_DEADLINE)
+        else {
+            return Err(format!(
+                "pty holder {}: input busy for longer than {INPUT_DEADLINE:?}",
+                self.key
+            ));
+        };
+        if slot.is_none() {
+            let stream = self.open_input(deadline.min(Instant::now() + INPUT_OPEN_WAIT))?;
+            *lock_slot(&self.input_shutdown) = stream.shutdown_handle().ok();
+            *slot = Some(stream);
+        }
+        let Some(stream) = slot.as_mut() else {
+            return Err(format!("pty holder {}: no input connection", self.key));
+        };
+        let written = bytes
+            .chunks(MAX_INPUT_CHUNK)
+            .try_for_each(|chunk| stream.input(chunk, deadline));
+        if let Err(e) = written {
+            // Position unknown: drop it; the next write opens a fresh one.
+            *slot = None;
+            drop(slot);
+            if let Some(h) = lock_slot(&self.input_shutdown).take() {
+                h.shutdown();
             }
-            Ok(())
-        })
+            return Err(format!(
+                "pty holder {}: input write failed ({e}); the next write reopens the input \
+                 connection",
+                self.key
+            ));
+        }
+        Ok(())
     }
 
     fn control(&self, op: HolderControl, budget: Duration) -> Result<(), String> {
@@ -494,23 +628,35 @@ impl HolderLink for HolderConn {
             .map_err(|e| format!("pty holder {}: kill connection failed: {e}", self.key))?;
         match client.request(&Request::Kill, deadline) {
             Ok(Reply::Ok { .. }) => Ok(()),
-            Ok(other) => Err(format!(
-                "pty holder {}: kill answered {other:?}",
-                self.key
-            )),
+            Ok(other) => Err(format!("pty holder {}: kill answered {other:?}", self.key)),
             Err(e) => Err(format!("pty holder {}: kill failed: {e}", self.key)),
         }
     }
 
+    /// Unix: `shutdown(SHUT_RDWR)` ends the connection for every handle.
+    /// Windows: a client cannot disconnect a pipe, and the pipe lives while
+    /// ANY handle on it is open — so cancel the I/O pending on it (which
+    /// returns the pump's blocked read and any blocked write) AND drop the
+    /// handles this link holds; the pump drops the reader when its read fails.
     fn abort_connection(&self) {
-        if let Some(h) = self
-            .shutdown
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
+        if let Some(h) = lock_slot(&self.shutdown).take() {
             h.shutdown();
         }
+        // A writer blocked mid-write holds this lock; the cancel above fails
+        // its write, and its own error path empties the slot.
+        if let Ok(mut slot) = self.writer.try_lock() {
+            slot.take();
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.abort_connection();
+        self.drop_input();
+    }
+
+    fn terminate(&self, holder_pid: u32) -> Termination {
+        terminate_verified_holder(&self.pane_dir, &self.pane_id, holder_pid)
     }
 }
 
@@ -571,17 +717,19 @@ impl ControlQueue {
                     if p.resize.is_some() || p.paused.is_some() {
                         break;
                     }
-                    p = match self.cv.wait_timeout(p, CONTROL_POLL) {
-                        Ok((g, _)) => g,
-                        Err(e) => e.into_inner().0,
+                    // No timeout: every path that settles the pane also closes
+                    // this queue (the pump on exit / holder gone, `release`,
+                    // the post-kill settle, `Drop`), which wakes this wait.
+                    p = match self.cv.wait(p) {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
                     };
                 }
                 (p.resize.take(), p.paused.take())
             };
             let mut failed = false;
             if let Some((cols, rows)) = resize {
-                if let Err(e) = link.control(HolderControl::Resize { cols, rows }, WRITE_DEADLINE)
-                {
+                if let Err(e) = link.control(HolderControl::Resize { cols, rows }, WRITE_DEADLINE) {
                     debug!(pane = %key, error = %e, "pty holder: resize not delivered; retrying");
                     self.lock().resize.get_or_insert((cols, rows));
                     failed = true;
@@ -610,16 +758,22 @@ impl ControlQueue {
 
 /// A [`PaneIo`] over one pane's PTY holder. See the module docs.
 pub struct DaemonPaneIo {
-    pane_dir: PathBuf,
     pane_id: PaneId,
     holder_pid: u32,
     child_pid: u32,
     out: Arc<PaneOutput>,
     link: Arc<dyn HolderLink>,
     control: Arc<ControlQueue>,
-    /// The holder answered a `kill`: an exit that is not reported before
-    /// `release` is UNKNOWN, not a detach. Set only once the kill landed.
+    /// The holder answered a `kill` (or was verifiably terminated): an exit
+    /// that is not reported before `release` is UNKNOWN, not a detach. Set
+    /// only once the kill landed.
     killed: AtomicBool,
+    /// A `kill` was ASKED for, landed or not. A release after a kill that did
+    /// not land is never a detach with code 0: the holder and its child are
+    /// still running, and the pane says so.
+    kill_requested: AtomicBool,
+    /// `release` ran. `Drop` without it kills (see `Drop`).
+    released: AtomicBool,
     /// Set BEFORE the detach goes out, so the pump reads the holder closing
     /// the connection as the detach it is, never as a holder death, and never
     /// reattaches.
@@ -806,7 +960,6 @@ impl DaemonPaneIo {
             return Err(format!("Failed to spawn pty holder pump thread: {e}"));
         }
         Ok(Self {
-            pane_dir: pane_dir.to_path_buf(),
             pane_id: pane_id.clone(),
             holder_pid,
             child_pid,
@@ -814,6 +967,8 @@ impl DaemonPaneIo {
             link: conn,
             control,
             killed: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             detached,
             detach: Arc::new(Mutex::new(DetachOutcome::NotAttempted)),
             cols,
@@ -906,9 +1061,10 @@ impl Detacher {
         if let Err(e) = &sent {
             debug!(pane = %self.key, error = %e, "pty holder: detach frame not sent; ending the connection instead");
         }
-        // Either way the connection ends here: the frame makes the holder
-        // close it, and a wedged writer is closed under it.
-        self.link.abort_connection();
+        // Either way the connections end here: the frame makes the holder
+        // close the attached one, a wedged writer is closed under it, and the
+        // input connection goes with them.
+        self.link.close();
         *slot = DetachOutcome::Queued;
     }
 }
@@ -927,6 +1083,7 @@ fn settle_after_kill(
 ) {
     if out.wait_for(left).is_some() {
         detacher.control.close();
+        detacher.link.close();
         return;
     }
     detacher.detach_once(DETACH_FRAME_BUDGET);
@@ -934,6 +1091,36 @@ fn settle_after_kill(
         "kill sent to PTY holder pid {holder_pid} but the exit of pane process {child_pid} \
          was not reported within {left:?} of the pane's release — exit code unknown"
     )));
+}
+
+/// One outage of the attached connection: from the first drop until a
+/// reattach that STAYS up for [`STABLE_AFTER`]. A reattach that drops again
+/// sooner continues the same outage, so its give-up clock is never reset by a
+/// flapping connection and its retries back off.
+struct Outage {
+    since: Instant,
+    attempts: u32,
+}
+
+impl Outage {
+    fn new() -> Self {
+        Outage {
+            since: Instant::now(),
+            attempts: 0,
+        }
+    }
+
+    /// The pause before the next attempt: none for the first, then
+    /// [`RECONNECT_BACKOFF`] doubling up to [`RECONNECT_BACKOFF_MAX`].
+    fn backoff(&self) -> Duration {
+        if self.attempts == 0 {
+            return Duration::ZERO;
+        }
+        let shift = (self.attempts - 1).min(8);
+        RECONNECT_BACKOFF
+            .saturating_mul(1u32 << shift)
+            .min(RECONNECT_BACKOFF_MAX)
+    }
 }
 
 impl PumpCtx {
@@ -944,6 +1131,8 @@ impl PumpCtx {
     /// closes the connection, not the pane): the pump reattaches at the last
     /// offset it delivered.
     fn pump(self, mut reader: StreamReader) {
+        let mut outage: Option<Outage> = None;
+        let mut attached_at = Instant::now();
         loop {
             let ended = loop {
                 match reader.next_event(None) {
@@ -958,6 +1147,7 @@ impl PumpCtx {
                         info!(pane = %self.key, holder_pid = self.holder_pid, child_pid = self.child_pid, ?exit, "pty holder: pane process exited");
                         self.out.settle(exit_result(exit));
                         self.control.close();
+                        self.conn.close();
                         return;
                     }
                     Ok(Some(Event::Reply(Reply::Rejected { reason, detail }))) => {
@@ -969,8 +1159,15 @@ impl PumpCtx {
                 }
             };
             drop(reader);
-            match self.reconnect(&ended) {
-                Reconnect::Again(r) => reader = r,
+            if attached_at.elapsed() >= STABLE_AFTER {
+                outage = None;
+            }
+            let current = outage.get_or_insert_with(Outage::new);
+            match self.reconnect(&ended, current) {
+                Reconnect::Again(r) => {
+                    reader = r;
+                    attached_at = Instant::now();
+                }
                 Reconnect::Done => {
                     self.control.close();
                     return;
@@ -979,17 +1176,29 @@ impl PumpCtx {
         }
     }
 
+    fn done(&self) -> bool {
+        self.detached.load(Ordering::Acquire) || self.out.is_finished()
+    }
+
     /// The connection ended with no `exit`. Decide from the holder's own
     /// liveness — the answered handshake and the lock (`client::probe`) —
     /// never from the closed socket alone.
-    fn reconnect(&self, ended: &str) -> Reconnect {
-        let give_up_at = Instant::now() + RECONNECT_WINDOW;
+    fn reconnect(&self, ended: &str, outage: &mut Outage) -> Reconnect {
         let mut last = String::new();
         loop {
-            if self.detached.load(Ordering::Acquire) || self.out.is_finished() {
+            let pause = outage.backoff();
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            outage.attempts = outage.attempts.saturating_add(1);
+            if self.done() {
                 return Reconnect::Done;
             }
-            match probe(&self.pane_dir, &self.pane_id, Instant::now() + PROBE_DEADLINE) {
+            match probe(
+                &self.pane_dir,
+                &self.pane_id,
+                Instant::now() + PROBE_DEADLINE,
+            ) {
                 Probe::Healthy { .. } => {
                     let deadline = Instant::now() + ATTACH_DEADLINE;
                     let from = self.out.offset();
@@ -997,11 +1206,16 @@ impl PumpCtx {
                         .and_then(|c| c.attach(Some(from), deadline))
                     {
                         Ok(stream) => {
-                            if self.detached.load(Ordering::Acquire) {
+                            self.conn.install(stream.writer);
+                            // N4: a detach that raced this reattach must not
+                            // leave the new connection open. Checked AFTER
+                            // the install: a detach before it is seen here,
+                            // one after it closes what was installed.
+                            if self.done() {
+                                self.conn.abort_connection();
                                 return Reconnect::Done;
                             }
-                            info!(pane = %self.key, holder_pid = self.holder_pid, from, reason = %ended, "pty holder: connection ended with the holder alive — reattached");
-                            self.conn.install(stream.writer);
+                            info!(pane = %self.key, holder_pid = self.holder_pid, from, reason = %ended, attempt = outage.attempts, "pty holder: connection ended with the holder alive — reattached");
                             // A new connection starts unpaused at the holder's
                             // size: re-send what this pane last asked for.
                             self.control.resize(
@@ -1020,28 +1234,54 @@ impl PumpCtx {
                     self.settle_gone(ended, "its lock is released — the holder is dead");
                     return Reconnect::Done;
                 }
-                Probe::Unknown { reason, .. } => last = reason,
                 Probe::Incompatible { holder_versions } => {
-                    last = format!("answers but speaks {holder_versions:?}")
+                    // N12 / D15: alive, answering, and speaking none of our
+                    // versions. Reported, never killed.
+                    let why = format!(
+                        "PTY holder pid {} for pane {} answers but speaks protocol versions \
+                         {holder_versions:?}, none of which this runner drives; it was LEFT \
+                         RUNNING with pane process {}",
+                        self.holder_pid, self.key, self.child_pid
+                    );
+                    warn!(pane = %self.key, holder_pid = self.holder_pid, "pty holder: {why}");
+                    self.out.push_local(&holder_incompatible_notice(
+                        self.holder_pid,
+                        &holder_versions,
+                    ));
+                    self.out.settle(Err(why));
+                    self.conn.close();
+                    return Reconnect::Done;
                 }
+                Probe::Unknown { reason, .. } => last = reason,
             }
-            if Instant::now() >= give_up_at {
-                // Alive (it holds its lock) but unreachable for the whole
-                // window. Not "gone": end it, verifiably, then say so.
-                let how = terminate_holder(&self.pane_dir, &self.pane_id, self.holder_pid);
-                let how_text = how.describe();
-                warn!(pane = %self.key, holder_pid = self.holder_pid, last = %last, how = %how_text, "pty holder: unreachable for the reconnect window — terminating it");
-                self.out
-                    .push_local(&holder_terminated_notice(self.holder_pid, how_text));
-                self.out.settle(Err(format!(
-                    "PTY holder pid {} for pane {} stopped answering ({last}) for {:?}; \
-                     terminating it: {how_text} — exit code of pane process {} unknown",
-                    self.holder_pid, self.key, RECONNECT_WINDOW, self.child_pid
-                )));
+            if outage.since.elapsed() >= RECONNECT_WINDOW {
+                self.give_up(&last);
                 return Reconnect::Done;
             }
-            std::thread::sleep(RECONNECT_BACKOFF);
         }
+    }
+
+    /// The holder is alive (it holds its lock) but this pane could not get a
+    /// working connection to it for the whole [`RECONNECT_WINDOW`]. Ask it to
+    /// kill its child on a fresh connection; if it will not answer even that,
+    /// end the verified holder itself. Then say exactly what happened.
+    fn give_up(&self, last: &str) {
+        let how = match self.conn.kill(GIVE_UP_KILL_BUDGET) {
+            Ok(()) => "its child was killed through the holder's `kill`".to_string(),
+            Err(asked) => {
+                let t = self.conn.terminate(self.holder_pid);
+                format!("`kill` not answered ({asked}); {}", t.detail)
+            }
+        };
+        warn!(pane = %self.key, holder_pid = self.holder_pid, last = %last, how = %how, "pty holder: unreachable for the reconnect window — ending it");
+        self.out
+            .push_local(&holder_terminated_notice(self.holder_pid, &how));
+        self.out.settle(Err(format!(
+            "PTY holder pid {} for pane {} could not be reached for {:?} ({last}); ending it: \
+             {how} — exit code of pane process {} unknown",
+            self.holder_pid, self.key, RECONNECT_WINDOW, self.child_pid
+        )));
+        self.conn.close();
     }
 
     fn settle_gone(&self, ended: &str, why: &str) {
@@ -1059,97 +1299,7 @@ impl PumpCtx {
              pane process {} exited — exit code unknown",
             self.holder_pid, self.key, self.child_pid
         )));
-    }
-}
-
-/// What [`terminate_holder`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HolderTermination {
-    /// A kill was actually delivered to the verified holder.
-    signalled: bool,
-    detail: String,
-}
-
-impl HolderTermination {
-    fn not_signalled(detail: impl Into<String>) -> Self {
-        Self {
-            signalled: false,
-            detail: format!("not signalled: {}", detail.into()),
-        }
-    }
-
-    fn signalled(&self) -> bool {
-        self.signalled
-    }
-
-    fn describe(&self) -> &str {
-        &self.detail
-    }
-}
-
-/// End a holder that holds its lock but answers nothing. Signals ONLY a pid
-/// that is verified to still be this pane's holder: the pane's lock must be
-/// HELD right now (an acquirable lock is a dead holder, whose pid may already
-/// be recycled), its record must name the SAME holder pid this pane attached
-/// to, and the pid must be in the signalable range (Phase 0 hand-off:
-/// "teardown signals only verified pids"). The holder's death ends its child:
-/// the PTY hangs up (Unix), the holder's job closes (Windows).
-fn terminate_holder(pane_dir: &Path, pane_id: &PaneId, holder_pid: u32) -> HolderTermination {
-    let lock_file = qontinui_pty_holder::pane::lock_path(pane_dir, pane_id);
-    match qontinui_pty_holder::lock::PaneLock::try_acquire_existing(&lock_file) {
-        Ok(qontinui_pty_holder::lock::TryLock::Held) => {}
-        Ok(qontinui_pty_holder::lock::TryLock::Acquired(lock)) => {
-            drop(lock);
-            return HolderTermination::not_signalled("the pane's lock is free — the holder is already dead");
-        }
-        Err(e) => return HolderTermination::not_signalled(format!("lock unreadable: {e}")),
-    }
-    match qontinui_pty_holder::lock::read_record(&lock_file) {
-        Some(r) if r.holder_pid == holder_pid => {}
-        Some(r) => {
-            return HolderTermination::not_signalled(format!(
-                "the lock names holder pid {}, not {holder_pid}",
-                r.holder_pid
-            ))
-        }
-        None => return HolderTermination::not_signalled("no lock record to verify the pid against"),
-    }
-    let Some(pid) = qontinui_pty_holder::spawn::signalable_pid(holder_pid) else {
-        return HolderTermination::not_signalled(format!("pid {holder_pid} out of range"));
-    };
-    #[cfg(unix)]
-    {
-        // SAFETY: a plain signal to the pid this pane's HELD lock names.
-        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
-            HolderTermination {
-                signalled: true,
-                detail: "SIGKILL to the holder".into(),
-            }
-        } else {
-            HolderTermination::not_signalled(format!(
-                "SIGKILL failed: {}",
-                std::io::Error::last_os_error()
-            ))
-        }
-    }
-    #[cfg(windows)]
-    {
-        // `/T`: the holder's child tree goes with it (its job would end it
-        // anyway once the holder's last handle closes).
-        let mut cmd = crate::process_helpers::no_window("taskkill");
-        cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-        match crate::drain::output_with_timeout(cmd, Duration::from_secs(5)) {
-            Ok(Some(o)) if o.status.success() => HolderTermination {
-                signalled: true,
-                detail: "taskkill /F /T of the holder".into(),
-            },
-            Ok(Some(o)) => HolderTermination::not_signalled(format!(
-                "taskkill exited {:?}",
-                o.status.code()
-            )),
-            Ok(None) => HolderTermination::not_signalled("taskkill exceeded 5s"),
-            Err(e) => HolderTermination::not_signalled(format!("taskkill could not be spawned: {e}")),
-        }
+        self.conn.close();
     }
 }
 
@@ -1215,12 +1365,14 @@ impl PaneIo for DaemonPaneIo {
     }
 
     /// `kill` on a fresh connection, bounded by `budget`. `killed` is set only
-    /// once the holder answered it — a kill that never landed must not turn a
-    /// later release into "killed, exit unknown".
+    /// once the kill landed — a kill that never landed must not turn a later
+    /// release into "killed, exit unknown" — but `kill_requested` is set
+    /// first, so that release can never call it a detach either.
     fn kill(&self, budget: Duration) -> Result<(), String> {
         if self.out.is_finished() {
             return Ok(());
         }
+        self.kill_requested.store(true, Ordering::Release);
         // The holder kills its own child's tree and reports the real exit,
         // which settles `wait`; nothing is fabricated here.
         if let Err(asked) = self.link.kill(budget) {
@@ -1229,16 +1381,16 @@ impl PaneIo for DaemonPaneIo {
             // end the holder itself — only once it is verified to be the
             // holder this pane attached to — which hangs up the child's PTY
             // (Unix) or closes the job holding its tree (Windows).
-            let how = terminate_holder(&self.pane_dir, &self.pane_id, self.holder_pid);
+            let how = self.link.terminate(self.holder_pid);
             warn!(
                 pane = %self.pane_id,
                 holder_pid = self.holder_pid,
                 error = %asked,
-                how = %how.describe(),
+                how = %how.detail,
                 "pty holder: kill not answered — terminating the holder out of band"
             );
-            if !how.signalled() {
-                return Err(format!("{asked}; holder not terminated: {}", how.describe()));
+            if !how.signalled {
+                return Err(format!("{asked}; holder not terminated: {}", how.detail));
             }
         }
         self.killed.store(true, Ordering::Release);
@@ -1282,9 +1434,11 @@ impl PaneIo for DaemonPaneIo {
     }
 
     fn release(&self, budget: Duration) -> Result<(), String> {
+        self.released.store(true, Ordering::Release);
         if self.out.is_finished() {
             self.control.close();
             self.out.close_output();
+            self.link.close();
             return Ok(());
         }
         if self.killed.load(Ordering::Acquire) {
@@ -1317,10 +1471,66 @@ impl PaneIo for DaemonPaneIo {
             }
             return Ok(());
         }
+        if self.kill_requested.load(Ordering::Acquire) {
+            // The kill was asked for and did NOT land (neither the holder nor
+            // an out-of-band termination took it). The holder and its child
+            // are still running: say so in the pane and in `wait` — never a
+            // detach with code 0, which would read as "left running on
+            // purpose".
+            let why = format!(
+                "kill failed; PTY holder pid {} and pane process {} were left running",
+                self.holder_pid, self.child_pid
+            );
+            warn!(pane = %self.pane_id, holder_pid = self.holder_pid, "pty holder: {why}");
+            self.out
+                .push_local(&kill_failed_notice(self.holder_pid, self.child_pid));
+            self.detacher().detach_once(budget);
+            self.out.settle(Err(why));
+            return Err(format!(
+                "pty holder {}: released after a kill that did not land",
+                self.pane_id
+            ));
+        }
         self.detacher().detach_once(budget);
         self.out.settle(Ok(DETACH_EXIT_CODE));
         Ok(())
     }
+}
+
+/// Review round 2, N3: a pane dropped WITHOUT `release` — a `spawn_with_io`
+/// step that failed after the pane was built (`reader()?`, a thread spawn) —
+/// must not orphan its holder and child. It is killed (bounded; out of band
+/// if the holder does not answer), then every connection is closed.
+impl Drop for DaemonPaneIo {
+    fn drop(&mut self) {
+        if !self.released.load(Ordering::Acquire) && !self.out.is_finished() {
+            warn!(
+                pane = %self.pane_id,
+                holder_pid = self.holder_pid,
+                "pty holder: pane dropped without release — killing its holder's child rather \
+                 than orphaning it"
+            );
+            if let Err(e) = PaneIo::kill(self, DROP_KILL_BUDGET) {
+                warn!(pane = %self.pane_id, error = %e, "pty holder: kill on drop failed");
+            } else {
+                // Let the exit report arrive so the holder, its exit
+                // delivered, leaves now instead of lingering.
+                let _ = self.out.wait_for(DROP_KILL_BUDGET);
+            }
+        }
+        self.control.close();
+        self.link.close();
+    }
+}
+
+/// In-band notice for a pane whose `kill` did not land.
+pub fn kill_failed_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[1;31m[qontinui] closing this tab could not end its process: the PTY \
+         holder (pid {holder_pid}) did not answer the kill and could not be terminated — pane \
+         process {child_pid} may still be running\x1b[0m\r\n"
+    )
+    .into_bytes()
 }
 
 #[cfg(test)]
@@ -1333,6 +1543,8 @@ mod tests {
         input: Mutex<Vec<u8>>,
         controls: Mutex<Vec<HolderControl>>,
         aborts: std::sync::atomic::AtomicUsize,
+        closes: std::sync::atomic::AtomicUsize,
+        terminations: std::sync::atomic::AtomicUsize,
         fail_kill: AtomicBool,
     }
 
@@ -1355,6 +1567,16 @@ mod tests {
         fn abort_connection(&self) {
             self.aborts.fetch_add(1, Ordering::SeqCst);
         }
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+        fn terminate(&self, _holder_pid: u32) -> Termination {
+            self.terminations.fetch_add(1, Ordering::SeqCst);
+            Termination {
+                signalled: false,
+                detail: "not signalled: no holder in this test".into(),
+            }
+        }
     }
 
     impl RecordingLink {
@@ -1365,7 +1587,11 @@ mod tests {
         fn saw(&self, op: HolderControl) {
             let end = Instant::now() + Duration::from_secs(5);
             while !self.controls().contains(&op) {
-                assert!(Instant::now() < end, "{op:?} never sent: {:?}", self.controls());
+                assert!(
+                    Instant::now() < end,
+                    "{op:?} never sent: {:?}",
+                    self.controls()
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
@@ -1391,9 +1617,6 @@ mod tests {
             std::thread::spawn(move || control.run(link.as_ref(), &out, "t-1"));
         }
         DaemonPaneIo {
-            // Never created: a kill fallback finds no lock here and signals
-            // nothing.
-            pane_dir: std::env::temp_dir().join("qontinui-daemon-pane-io-test-no-such-dir"),
             pane_id: PaneId::new("t-1").unwrap(),
             holder_pid: 100,
             child_pid: 101,
@@ -1401,6 +1624,8 @@ mod tests {
             link,
             control,
             killed: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             detached: Arc::new(AtomicBool::new(false)),
             detach: Arc::new(Mutex::new(DetachOutcome::NotAttempted)),
             cols: Arc::new(AtomicU16::new(80)),
@@ -1485,7 +1710,10 @@ mod tests {
             1,
             "one detach"
         );
-        assert_eq!(link.aborts.load(Ordering::SeqCst), 1, "the detach ends the connection");
+        assert!(
+            link.closes.load(Ordering::SeqCst) >= 1,
+            "the detach ends every connection (attached and input); `close` is idempotent"
+        );
         assert_eq!(pane.dims(), (132, 50));
         assert_eq!(pane.wait(), Ok(DETACH_EXIT_CODE));
         assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
@@ -1523,7 +1751,10 @@ mod tests {
         );
         let started = Instant::now();
         pane.release(Duration::from_millis(20)).unwrap();
-        assert!(started.elapsed() < Duration::from_millis(150), "release does not wait out the settle window");
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "release does not wait out the settle window"
+        );
         let exit = pane.wait();
         assert!(exit.is_err(), "{exit:?}");
         assert_eq!(
@@ -1556,7 +1787,11 @@ mod tests {
         pane.release(Duration::from_millis(20)).unwrap();
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).unwrap();
-        assert_eq!(pane.wait(), Ok(SIGNAL_EXIT_CODE), "the real exit, not unknown");
+        assert_eq!(
+            pane.wait(),
+            Ok(SIGNAL_EXIT_CODE),
+            "the real exit, not unknown"
+        );
         reporter.join().unwrap();
         assert_eq!(
             link.controls(),
@@ -1587,6 +1822,13 @@ mod tests {
                 Ok(())
             }
             fn abort_connection(&self) {}
+            fn close(&self) {}
+            fn terminate(&self, _holder_pid: u32) -> Termination {
+                Termination {
+                    signalled: false,
+                    detail: "test".into(),
+                }
+            }
         }
         let link = Arc::new(WedgedLink {
             gate: Mutex::new(()),
@@ -1650,85 +1892,138 @@ mod tests {
             other.await.unwrap();
             blocking.await.unwrap()
         });
-        assert!(ran_meanwhile, "the other task waited for the blocking spawn");
+        assert!(
+            ran_meanwhile,
+            "the other task waited for the blocking spawn"
+        );
         assert_eq!(off_the_async_workers(|| 7), 7);
-        let current = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         assert_eq!(current.block_on(async { off_the_async_workers(|| 8) }), 8);
     }
 
-    /// Review finding 2: the out-of-band kill signals only a VERIFIED holder:
-    /// a free lock (dead holder, pid possibly recycled) and a lock naming a
-    /// different pid are refused; a held lock naming the pid is killed.
+    /// Review round 2, F5 — the CALL SITE: the holder spawn door itself
+    /// (`spawn_holder_pane_or_fallback_in`, which the public door is a thin
+    /// wrapper over) does not park a tokio worker. Its "holder" is a script
+    /// that sleeps and never reports ready, so the door blocks for a while
+    /// before falling back to an in-process PTY; on a ONE-worker runtime another
+    /// task must still run meanwhile. Remove the `off_the_async_workers` call
+    /// and this fails.
     #[cfg(target_os = "linux")]
     #[test]
-    fn pty_holder_terminate_signals_only_a_verified_holder() {
-        use qontinui_pty_holder::lock::{LockRecord, PaneLock, TryLock};
-        let dir = std::env::temp_dir().join(format!(
-            "qontinui-term-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        qontinui_pty_holder::pane::prepare_private_dir(&dir).unwrap();
-        let id = PaneId::new("t").unwrap();
-        let lock_file = qontinui_pty_holder::pane::lock_path(&dir, &id);
-        // A stand-in "holder" this test owns.
-        let mut victim = std::process::Command::new("sleep") // console-ok: a Linux-only test's own child process
-            .arg("30")
-            .spawn()
+    fn pty_holder_spawn_door_does_not_park_a_tokio_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("ptyf5-{}-{nanos:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("slow-holder");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 0.6\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let panes = dir.join("panes");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
             .unwrap();
-        let record = |pid: u32| LockRecord {
-            holder_pid: pid,
-            child_pid: None,
-            versions: vec![2],
-            started_at_unix_ms: 0,
-            holder_build: "test".into(),
-        };
-
-        // Lock free: the holder is dead — never signal.
-        {
-            let TryLock::Acquired(mut lock) = PaneLock::try_acquire(&lock_file).unwrap() else {
-                panic!("fresh lock");
-            };
-            lock.write_record(&record(victim.id())).unwrap();
-        }
-        let t = terminate_holder(&dir, &id, victim.id());
-        assert!(!t.signalled(), "{t:?}");
-        assert!(victim.try_wait().unwrap().is_none(), "a free lock's pid was signalled");
-
-        let TryLock::Acquired(mut lock) = PaneLock::try_acquire(&lock_file).unwrap() else {
-            panic!("lock");
-        };
-        // Held, but naming another pid.
-        lock.write_record(&record(victim.id() + 1)).unwrap();
-        let t = terminate_holder(&dir, &id, victim.id());
-        assert!(!t.signalled(), "{t:?}");
-        assert!(victim.try_wait().unwrap().is_none());
-
-        // Held and naming it: killed.
-        lock.write_record(&record(victim.id())).unwrap();
-        let t = terminate_holder(&dir, &id, victim.id());
-        assert!(t.signalled(), "{t:?}");
-        let end = Instant::now() + Duration::from_secs(5);
-        while victim.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < end, "the verified holder was not killed");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        drop(lock);
+        let (ran_meanwhile, fell_back) = rt.block_on(async {
+            let flag = Arc::new(AtomicBool::new(false));
+            let started = Arc::new(AtomicBool::new(false));
+            let (seen, began) = (flag.clone(), started.clone());
+            let (fake2, panes2) = (fake.clone(), panes.clone());
+            let door = tokio::spawn(async move {
+                began.store(true, Ordering::SeqCst);
+                let mut cmd = portable_pty::CommandBuilder::new("sh");
+                cmd.args(["-c", "true"]);
+                let pane = spawn_holder_pane_or_fallback_in(
+                    Ok(fake2.as_path()),
+                    Ok(panes2),
+                    "f5-pane",
+                    ScrubbedCommand::seal(cmd),
+                    80,
+                    24,
+                );
+                let fell_back = pane
+                    .as_ref()
+                    .is_ok_and(|p| p.credential_scrub() == CredentialScrub::InProcessEnv);
+                if let Ok(p) = pane {
+                    let _ = p.kill(Duration::from_secs(1));
+                    let _ = p.release(Duration::from_secs(1));
+                }
+                (seen.load(Ordering::SeqCst), fell_back)
+            });
+            // `block_on` runs this on the test thread, not the one worker.
+            while !started.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let other = tokio::spawn(async move {
+                flag.store(true, Ordering::SeqCst);
+            });
+            other.await.unwrap();
+            door.await.unwrap()
+        });
+        assert!(
+            fell_back,
+            "the slow fake holder never reported ready, so the door fell back"
+        );
+        assert!(ran_meanwhile, "the spawn door parked the only tokio worker");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Review finding 2: a kill that never landed does not mark the pane
-    /// killed — the release that follows is an honest detach.
+    /// Review round 2, N1: a kill that did not land — the holder did not
+    /// answer and could not be terminated — then a release (what
+    /// `TerminalSession::close_inner` does: it logs the kill's error and
+    /// releases) is NEVER a detach with code 0. The out-of-band termination
+    /// was tried, `wait` is an `Err` saying the holder was left running, and
+    /// the pane says so in-band.
     #[test]
-    fn pty_holder_failed_kill_is_not_recorded_as_sent() {
+    fn pty_holder_failed_kill_then_release_is_not_a_detach() {
         let (link, pane) = recorded_pane();
         link.fail_kill.store(true, Ordering::SeqCst);
+        let mut reader = pane.reader().unwrap();
         assert!(pane.kill(Duration::from_millis(10)).is_err());
+        assert_eq!(
+            link.terminations.load(Ordering::SeqCst),
+            1,
+            "out-of-band termination tried"
+        );
+        assert!(pane.release(Duration::from_millis(10)).is_err());
+        let exit = pane.wait();
+        match &exit {
+            Err(e) => assert!(
+                e.contains("kill failed") && e.contains("left running"),
+                "{e}"
+            ),
+            Ok(code) => panic!("a failed kill settled as exit code {code}"),
+        }
+        let mut shown = Vec::new();
+        reader.read_to_end(&mut shown).unwrap();
+        assert_eq!(shown, kill_failed_notice(100, 101));
+    }
+
+    /// Review round 2, N3: a pane dropped WITHOUT `release` (a `spawn_with_io`
+    /// step failed after it was built) kills its holder's child instead of
+    /// orphaning it, and closes its connections; a released pane's drop sends
+    /// nothing more.
+    #[test]
+    fn pty_holder_drop_without_release_kills() {
+        let (link, pane) = recorded_pane();
+        drop(pane);
+        assert_eq!(link.controls(), vec![HolderControl::Kill]);
+        assert!(link.closes.load(Ordering::SeqCst) >= 1);
+
+        let (link, pane) = recorded_pane();
         pane.release(Duration::from_millis(10)).unwrap();
-        assert_eq!(pane.wait(), Ok(DETACH_EXIT_CODE));
+        drop(pane);
+        assert!(
+            !link.controls().contains(&HolderControl::Kill),
+            "a released pane is not killed on drop: {:?}",
+            link.controls()
+        );
     }
 
     /// The exit the holder reports after a kill wins over the release.
@@ -2150,8 +2445,9 @@ mod tests {
                 "printf START; head -c 200000 /dev/zero | tr '\\0' x; printf END; : > '{}'; exec sleep 3600",
                 done.display()
             );
-            let spawned = spawn_pane_holder(&holder(), &dir, &id, &sh(&script).to_holder_spec(80, 24))
-                .expect("holder spawn");
+            let spawned =
+                spawn_pane_holder(&holder(), &dir, &id, &sh(&script).to_holder_spec(80, 24))
+                    .expect("holder spawn");
             let end = Instant::now() + Duration::from_secs(10);
             while !done.exists() {
                 assert!(Instant::now() < end, "the child never finished writing");
@@ -2160,8 +2456,7 @@ mod tests {
             // Let the holder's reader move the PTY's last bytes into its ring.
             std::thread::sleep(Duration::from_millis(300));
             let pane = Arc::new(
-                DaemonPaneIo::attach_fresh(&dir, &id, spawned.unprotected.clone())
-                    .expect("attach"),
+                DaemonPaneIo::attach_fresh(&dir, &id, spawned.unprotected.clone()).expect("attach"),
             );
             spawned.reap_in_background();
             assert_eq!(pane.out.capacity(), Some(OUTPUT_QUEUE_CHUNKS));
@@ -2173,32 +2468,23 @@ mod tests {
                 "the child's first output was dropped: {:?}",
                 String::from_utf8_lossy(&got[..got.len().min(200)])
             );
-            assert!(!contains(&got, b"were lost"), "no loss: the ring held it all");
+            assert!(
+                !contains(&got, b"were lost"),
+                "no loss: the ring held it all"
+            );
             pane.kill(Duration::from_secs(5)).unwrap();
-            assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(SIGNAL_EXIT_CODE));
+            assert_eq!(
+                wait_within(&pane, Duration::from_secs(10)),
+                Ok(SIGNAL_EXIT_CODE)
+            );
             t.join().unwrap();
             pane.release(Duration::from_secs(1)).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&files);
         }
 
-        /// Write `bytes`, retrying while the pane is between connections
-        /// (a write that lands mid-reattach reports "no live connection").
-        fn write_retrying(pane: &DaemonPaneIo, bytes: &[u8]) {
-            let end = Instant::now() + Duration::from_secs(10);
-            loop {
-                match pane.writer().unwrap().write_all(bytes) {
-                    Ok(()) => return,
-                    Err(e) => {
-                        assert!(Instant::now() < end, "input never landed: {e}");
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            }
-        }
-
-        /// Review finding 1: neither a zero-size resize nor a connection that
-        /// ends while the holder is alive ends the pane. The resize is
+        /// Review finding 1 (and round 2, N2): neither a zero-size resize nor
+        /// a connection that ends while the holder is alive ends the pane. The resize is
         /// clamped; the dropped connection is reattached at the last offset —
         /// no loss marker, no "holder gone", input still reaches the SAME
         /// child — and only a real kill ends it.
@@ -2218,21 +2504,39 @@ mod tests {
             );
             let (collected, t) = drain(&pane);
             pane.resize(0, 0).unwrap();
-            write_retrying(&pane, b"one\r");
+            pane.writer().unwrap().write_all(b"one\r").unwrap();
             until(&collected, Duration::from_secs(10), |c| contains(c, b"one"));
-            assert!(!pane.out.is_finished(), "a zero resize must not end the pane");
+            assert!(
+                !pane.out.is_finished(),
+                "a zero resize must not end the pane"
+            );
 
+            // Round 2, N2: input written the instant the attached connection
+            // drops is NOT refused — it rides the pane's own input connection,
+            // which the attached connection's reattach does not touch.
             pane.link.abort_connection();
-            write_retrying(&pane, b"two\r");
+            pane.writer()
+                .unwrap()
+                .write_all(b"two\r")
+                .expect("input is accepted while the attached connection reattaches");
             until(&collected, Duration::from_secs(15), |c| contains(c, b"two"));
-            assert!(!pane.out.is_finished(), "a dropped connection is not a holder death");
+            assert!(
+                !pane.out.is_finished(),
+                "a dropped connection is not a holder death"
+            );
             let text = String::from_utf8_lossy(&collected.lock().unwrap()).to_string();
             assert!(!text.contains("is gone"), "{text:?}");
-            assert!(!text.contains("were lost"), "a reattach at the offset loses nothing: {text:?}");
+            assert!(
+                !text.contains("were lost"),
+                "a reattach at the offset loses nothing: {text:?}"
+            );
             assert!(alive(pane.child_pid()));
 
             pane.kill(Duration::from_secs(5)).unwrap();
-            assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(SIGNAL_EXIT_CODE));
+            assert_eq!(
+                wait_within(&pane, Duration::from_secs(10)),
+                Ok(SIGNAL_EXIT_CODE)
+            );
             t.join().unwrap();
             pane.release(Duration::from_secs(1)).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
@@ -2267,17 +2571,27 @@ mod tests {
                 })
             };
             std::thread::sleep(Duration::from_millis(1500));
-            assert!(!paster.is_finished(), "the paste should be blocked on a child that never reads");
+            assert!(
+                !paster.is_finished(),
+                "the paste should be blocked on a child that never reads"
+            );
 
             let started = Instant::now();
-            pane.kill(Duration::from_secs(5)).expect("kill lands despite the blocked paste");
+            pane.kill(Duration::from_secs(5))
+                .expect("kill lands despite the blocked paste");
             assert!(started.elapsed() < Duration::from_secs(5));
-            assert_eq!(wait_within(&pane, Duration::from_secs(10)), Ok(SIGNAL_EXIT_CODE));
+            assert_eq!(
+                wait_within(&pane, Duration::from_secs(10)),
+                Ok(SIGNAL_EXIT_CODE)
+            );
             t.join().unwrap();
 
             let end = Instant::now() + Duration::from_secs(20);
             while !paster.is_finished() {
-                assert!(Instant::now() < end, "the blocked paste never returned after the kill");
+                assert!(
+                    Instant::now() < end,
+                    "the blocked paste never returned after the kill"
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
             let _ = paster.join();

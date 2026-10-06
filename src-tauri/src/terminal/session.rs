@@ -1574,6 +1574,13 @@ impl TerminalSession {
         // environment is assembled, so an `openpty` failure leaves none of
         // that side-effecting work behind; a holder pane has no PTY in this
         // process to open.
+        //
+        // Cost on the OFF path (review round 2, N10): `get_terminal_settings`
+        // is `read_settings_from_disk`, the mtime-keyed in-process settings
+        // cache — one `stat` and a clone on a hit, no file read or parse. That
+        // is the same per-spawn price this function already pays for
+        // `get_performance_settings` (the scrollback capacity, `spawn_with_io`), not a
+        // new kind of read.
         let backend = crate::terminal::daemon_pane_io::pane_backend_for(
             &crate::settings::get_terminal_settings(),
         );

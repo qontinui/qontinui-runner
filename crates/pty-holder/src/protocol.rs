@@ -39,8 +39,12 @@
 //!     the client asked for have left the holder's ring, and one final
 //!     `exit {code, signal}` once the child has exited and every byte before
 //!     the exit has been sent.
-//!   - Input is a `KIND_DATA` frame of raw bytes, accepted on an attached
-//!     connection only. It gets no reply.
+//!   - Input is a `KIND_DATA` frame of raw bytes, accepted ONLY on a
+//!     connection that sent `open_input` — never on the attached one. It gets
+//!     no reply. Keeping input off the attached connection is what lets a
+//!     child that does not read its stdin stall nothing but its input socket:
+//!     `resize`/`pause`/`resume`/`detach` on the attached connection, and
+//!     `kill` on any connection, are always read and answered.
 //!   - `resize {cols, rows}`, `pause`, `resume`, `kill` and `detach` each get
 //!     `ok {verb}`. On an attached connection that reply arrives INTERLEAVED
 //!     with the output stream, so a client reads it as one more event.
@@ -98,6 +102,7 @@ pub const REQUEST_VERBS: &[&str] = &[
     "resume",
     "kill",
     "detach",
+    "open_input",
 ];
 
 /// Runner → holder.
@@ -130,6 +135,12 @@ pub enum Request {
     /// Version 2. Close this connection; the child keeps running. Answered
     /// `ok`, then the holder closes.
     Detach,
+    /// Version 2. Make this connection the pane's INPUT stream: from now on it
+    /// accepts `KIND_DATA` frames (and `ping`, `resize`, `kill`, `detach`),
+    /// never `attach`. Answered `ok`. Input lives on its own connection so a
+    /// child that is slow to read its stdin back-pressures only this socket —
+    /// the attached connection's control verbs are never queued behind it.
+    OpenInput,
 }
 
 impl Request {
@@ -146,6 +157,7 @@ impl Request {
             Request::Resume => "resume",
             Request::Kill => "kill",
             Request::Detach => "detach",
+            Request::OpenInput => "open_input",
         }
     }
 }
@@ -238,8 +250,8 @@ pub enum RejectReason {
     Busy,
     /// A second `attach` on one connection (version 2).
     AlreadyAttached,
-    /// An attached-only verb, or an input frame, on a connection that has not
-    /// attached (version 2).
+    /// An attached-only verb on a connection that has not attached, or an
+    /// input frame on one that has not sent `open_input` (version 2).
     NotAttached,
     /// DESERIALIZE-ONLY: a reason string this build does not know — a newer
     /// holder's. The reason set is part of the frozen `rejected` shape, but it
@@ -489,6 +501,7 @@ mod tests {
             (frame_of(&Request::Resume), r#"{"type":"resume"}"#),
             (frame_of(&Request::Kill), r#"{"type":"kill"}"#),
             (frame_of(&Request::Detach), r#"{"type":"detach"}"#),
+            (frame_of(&Request::OpenInput), r#"{"type":"open_input"}"#),
             (
                 frame_of(&Reply::Attached(AttachedReply {
                     start_offset: 10,
@@ -618,6 +631,7 @@ mod tests {
                 "resume" => Request::Resume,
                 "kill" => Request::Kill,
                 "detach" => Request::Detach,
+                "open_input" => Request::OpenInput,
                 other => panic!("REQUEST_VERBS has {other:?} with no Request variant"),
             };
             assert_eq!(req.verb(), *verb);
