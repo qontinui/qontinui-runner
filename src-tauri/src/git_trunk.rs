@@ -26,6 +26,8 @@
 
 use std::path::Path;
 
+use std::process::Command;
+
 use crate::process_helpers::{run_probe, ProbeOutcome};
 
 /// Budget for a trunk-resolution git read.
@@ -47,6 +49,68 @@ const TRUNK_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 /// rung added here cannot silently break the probe's guarantee.
 pub(crate) const TRUNK_GIT_SUBCOMMANDS: &[&str] = &["symbolic-ref", "rev-parse"];
 
+/// git's own list of REPOSITORY-LOCAL environment variables — exactly what
+/// `git rev-parse --local-env-vars` prints (git 2.47.3), the set git itself
+/// clears when it crosses into another repository (a submodule). Any of them
+/// inherited by a child makes git read a repository, index, object store or
+/// config OTHER than the one `-C` / `current_dir` names: `-C` does not
+/// override an inherited `GIT_DIR`, so a runner started from a git hook (which
+/// exports `GIT_DIR`) or any shell that exported these would answer about the
+/// CALLER's repo. `repo_local_git_env_covers_gits_own_list` pins this against
+/// the installed git, so a git that grows the list fails a test rather than
+/// silently reopening the hole.
+pub(crate) const REPO_LOCAL_GIT_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// The numbered halves of a `GIT_CONFIG_COUNT` overlay (`GIT_CONFIG_KEY_<n>` /
+/// `GIT_CONFIG_VALUE_<n>`), which git's list covers only through
+/// `GIT_CONFIG_COUNT` itself. Removed by prefix so no numbered pair outlives
+/// the count that gave it meaning.
+const GIT_CONFIG_PAIR_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// Remove every repository-local git variable from `cmd`'s child environment
+/// — [`REPO_LOCAL_GIT_ENV`] plus every `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`
+/// — whether inherited from this process or set on `cmd` earlier.
+///
+/// The ONE scrub for runner git that must read the repo it names: this
+/// module's resolver and [`crate::build_drift`]'s probes both call it, so the
+/// list cannot drift between them. It removes no part of
+/// [`crate::process_helpers::no_window`]'s posture, which carries no
+/// `GIT_CONFIG_*` entry by construction (`git_posture::prompt_proof_git_env`
+/// filters them out).
+pub(crate) fn scrub_repo_local_git_env(cmd: &mut Command) {
+    for var in REPO_LOCAL_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    let is_pair = |key: &std::ffi::OsStr| {
+        key.to_str()
+            .is_some_and(|k| GIT_CONFIG_PAIR_PREFIXES.iter().any(|p| k.starts_with(p)))
+    };
+    let pairs: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(cmd.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| is_pair(key))
+        .collect();
+    for key in pairs {
+        cmd.env_remove(key);
+    }
+}
+
 /// Run a git query against `repo`, returning trimmed stdout on success.
 ///
 /// Refuses any subcommand not on [`TRUNK_GIT_SUBCOMMANDS`] — the same
@@ -54,20 +118,29 @@ pub(crate) const TRUNK_GIT_SUBCOMMANDS: &[&str] = &["symbolic-ref", "rev-parse"]
 /// constant load-bearing rather than test-only, so the containment
 /// `probe_executor` asserts is a property of the code path, not of a list
 /// that happens to sit beside it.
-fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
+///
+/// `git` is the command to build on — [`host_git`] in production — and is
+/// scrubbed here ([`scrub_repo_local_git_env`]), after anything it carries,
+/// so an inherited `GIT_DIR` cannot answer for `repo`.
+fn git_capture(git: Command, repo: &Path, args: &[&str]) -> Option<String> {
     match args.first() {
         Some(sub) if TRUNK_GIT_SUBCOMMANDS.contains(sub) => {}
         _ => return None,
     }
-    let dir = repo.to_str()?;
-    let mut full: Vec<&str> = vec!["-C", dir];
-    full.extend_from_slice(args);
-    let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(&full);
+    let mut cmd = git;
+    scrub_repo_local_git_env(&mut cmd);
+    cmd.arg("-C").arg(repo).args(args);
     let ProbeOutcome::Captured(stdout) = run_probe(cmd, TRUNK_GIT_TIMEOUT, "git_trunk: git") else {
         return None;
     };
     Some(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// The `git` every production resolution starts from: the fleet's
+/// [`crate::process_helpers::no_window`] posture, carrying whatever this
+/// process inherited — which [`git_capture`] then scrubs.
+fn host_git() -> Command {
+    crate::process_helpers::no_window("git")
 }
 
 /// Resolve the repo's trunk remote-tracking ref for `repo` — e.g.
@@ -98,8 +171,16 @@ fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
 /// writes such a key, and an unread config would be a rung that silently
 /// always misses while reading like coverage.
 pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
+    resolve_trunk_ref_on(repo, &host_git)
+}
+
+/// [`resolve_trunk_ref`] building each `git` from `git` — the seam that lets a
+/// test hand it a command carrying a decoy `GIT_DIR` without touching this
+/// process's environment, which parallel tests share.
+fn resolve_trunk_ref_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<String> {
     // (1) origin/HEAD — the remote's declared default branch.
     if let Some(head) = git_capture(
+        git(),
         repo,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     ) {
@@ -107,14 +188,20 @@ pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
         // Verify it actually resolves: a stale origin/HEAD naming a deleted
         // branch must NOT be trusted as the trunk.
         if !head.is_empty()
-            && git_capture(repo, &["rev-parse", "--verify", "--quiet", head]).is_some()
+            && git_capture(git(), repo, &["rev-parse", "--verify", "--quiet", head]).is_some()
         {
             return Some(head.to_string());
         }
     }
 
     // (2) The historical default, still verified before use.
-    if git_capture(repo, &["rev-parse", "--verify", "--quiet", "origin/main"]).is_some() {
+    if git_capture(
+        git(),
+        repo,
+        &["rev-parse", "--verify", "--quiet", "origin/main"],
+    )
+    .is_some()
+    {
         return Some("origin/main".to_string());
     }
 
@@ -132,7 +219,12 @@ pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
 /// `.unwrap_or_else(|| "main".to_string())` so the guess is visible at the
 /// call site rather than buried in here.
 pub(crate) fn resolve_trunk_branch(repo: &Path) -> Option<String> {
-    resolve_trunk_ref(repo)?
+    resolve_trunk_branch_on(repo, &host_git)
+}
+
+/// [`resolve_trunk_branch`] over [`resolve_trunk_ref_on`]'s seam.
+fn resolve_trunk_branch_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<String> {
+    resolve_trunk_ref_on(repo, git)?
         .strip_prefix("origin/")
         .map(str::to_string)
 }
@@ -140,17 +232,18 @@ pub(crate) fn resolve_trunk_branch(repo: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     /// Build a temp git repo with one commit. Returns a `git` runner bound
     /// to it.
     fn fixture(path: &Path) -> impl Fn(&[&str]) + '_ {
         let dir = path.to_str().unwrap();
         let git = move |args: &[&str]| {
-            let out = Command::new("git")
-                .args([&["-C", dir], args].concat())
-                .output()
-                .unwrap();
+            let mut cmd = Command::new("git");
+            cmd.args([&["-C", dir], args].concat());
+            // Under a git hook these would point the fixture at the CALLER's
+            // repo — the same scrub production applies.
+            scrub_repo_local_git_env(&mut cmd);
+            let out = cmd.output().unwrap();
             assert!(out.status.success(), "git {args:?} failed");
         };
         git(&["init", "-q"]);
@@ -170,7 +263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = fixture(path);
-        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        let head = git_capture(host_git(), path, &["rev-parse", "HEAD"]).unwrap();
         git(&["update-ref", "refs/remotes/origin/master", &head]);
         git(&[
             "symbolic-ref",
@@ -180,7 +273,12 @@ mod tests {
 
         // Guard the premise: no stray origin/main can be carrying the pass.
         assert!(
-            git_capture(path, &["rev-parse", "--verify", "--quiet", "origin/main"]).is_none(),
+            git_capture(
+                host_git(),
+                path,
+                &["rev-parse", "--verify", "--quiet", "origin/main"]
+            )
+            .is_none(),
             "fixture must NOT have an origin/main, or the test proves nothing"
         );
 
@@ -197,7 +295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = fixture(path);
-        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        let head = git_capture(host_git(), path, &["rev-parse", "HEAD"]).unwrap();
         git(&[
             "symbolic-ref",
             "refs/remotes/origin/HEAD",
@@ -229,5 +327,120 @@ mod tests {
         let path = dir.path().join("not-a-repo");
         std::fs::create_dir_all(&path).unwrap();
         assert!(resolve_trunk_ref(&path).is_none());
+    }
+    /// A fixture whose `origin/HEAD` names `origin/<trunk>`.
+    fn repo_with_trunk(trunk: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let git = fixture(dir.path());
+            let head = git_capture(host_git(), dir.path(), &["rev-parse", "HEAD"]).unwrap();
+            git(&["update-ref", &format!("refs/remotes/origin/{trunk}"), &head]);
+            git(&[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{trunk}"),
+            ]);
+        }
+        dir
+    }
+
+    /// An inherited `GIT_DIR` naming a DECOY repo does not decide the trunk:
+    /// the runner repo's trunk is `main`, the decoy's `master`, and the
+    /// resolver answers `main`. Every `build_drift` / `fleet` /
+    /// `agent_worktree` caller turns this name into a refspec, an
+    /// `ls-remote` argument or a fork base in the REAL repo, so the decoy's
+    /// answer would act there. The decoy rides on the `Command`, never on this
+    /// process's environment, which parallel tests share.
+    #[test]
+    fn an_inherited_git_dir_does_not_decide_the_trunk() {
+        let runner = repo_with_trunk("main");
+        let decoy = repo_with_trunk("master");
+        let decoy_git_dir = decoy.path().join(".git");
+        let with_decoy = || {
+            let mut cmd = host_git();
+            cmd.env("GIT_DIR", &decoy_git_dir);
+            cmd
+        };
+
+        // Control: unscrubbed, `-C <runner>` loses to the inherited GIT_DIR.
+        let out = with_decoy()
+            .arg("-C")
+            .arg(runner.path())
+            .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "origin/master",
+            "control: an inherited GIT_DIR must win over -C, or this test proves nothing"
+        );
+
+        assert_eq!(
+            resolve_trunk_branch_on(runner.path(), &with_decoy).as_deref(),
+            Some("main")
+        );
+    }
+
+    /// The scrub removes every name on the list and every numbered
+    /// `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` — each reported by `get_envs`
+    /// as a removal (`None`), so neither an inherited nor an earlier-set
+    /// value reaches the child.
+    #[test]
+    fn the_scrub_removes_the_list_and_every_numbered_config_pair() {
+        let mut cmd = Command::new("git");
+        cmd.env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .env("GIT_CONFIG_KEY_7", "x.y")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        scrub_repo_local_git_env(&mut cmd);
+        let envs: Vec<(String, bool)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_none()))
+            .collect();
+        let removed = |name: &str| envs.iter().any(|(k, gone)| k == name && *gone);
+        for var in REPO_LOCAL_GIT_ENV.iter().chain(&[
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_7",
+        ]) {
+            assert!(removed(var), "{var} must be removed; envs: {envs:?}");
+        }
+        assert!(
+            !removed("GIT_TERMINAL_PROMPT"),
+            "posture variables are not repo-local and must survive: {envs:?}"
+        );
+    }
+
+    /// The list is git's, not a hand-picked subset: every name the installed
+    /// git reports as repository-local is on it. Skipped only when no `git`
+    /// can be spawned at all.
+    #[test]
+    fn repo_local_git_env_covers_gits_own_list() {
+        let Ok(out) = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+        else {
+            eprintln!("git is not installed; skipping");
+            return;
+        };
+        assert!(out.status.success(), "{out:?}");
+        let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "GIT_DIR"),
+            "git's list must at least name GIT_DIR, or this test proves nothing: {names:?}"
+        );
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|n| !REPO_LOCAL_GIT_ENV.contains(&n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "REPO_LOCAL_GIT_ENV is missing git's {missing:?}"
+        );
     }
 }
