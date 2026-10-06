@@ -1582,7 +1582,7 @@ fn host_capabilities() -> Vec<String> {
 /// read.
 ///
 /// Reuses the shipped, once-per-process `resource_guard::host_capacity` probe
-/// (`ci_node::host_sizing::probe` behind a `OnceLock`) rather than adding a
+/// (`qontinui_ci_exec::host_sizing::probe` behind a `OnceLock`) rather than adding a
 /// third sysinfo reader, so the heartbeat's tiers and the resource guard judge
 /// the same `MemTotal`. Total memory does not change under a live process, so
 /// the process-lifetime cache costs nothing a TTL would buy back.
