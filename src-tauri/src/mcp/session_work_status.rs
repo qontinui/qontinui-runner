@@ -108,6 +108,10 @@ struct WireRow {
     /// RFC 3339. Absent on a coord that predates the field.
     #[serde(default)]
     since: Option<String>,
+    /// WHICH `coord.sessions` row answered (the latest for the harness id —
+    /// the key is not unique). Absent on a coord that predates the field.
+    #[serde(default)]
+    coord_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,20 +300,11 @@ fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
 // The read
 // ---------------------------------------------------------------------------
 
-/// Bulk-read the coord work axis for `ids`. **Never fails** — see module docs.
-pub async fn fetch(ids: &[String]) -> StatusFetch {
-    if ids.is_empty() {
-        return StatusFetch {
-            by_session_id: HashMap::new(),
-            finished_at_by_session_id: HashMap::new(),
-            source: "not_needed",
-            degraded: false,
-            note: String::new(),
-            requested: 0,
-            resolved: 0,
-        };
-    }
-
+/// One raw coord read: the decoded body plus the clamp note, or the note of
+/// whatever degraded it. Shared by [`fetch`] (the work axis) and
+/// [`resolve_coord_rows`] (which row answered) so there is ONE credential /
+/// timeout / decode path.
+async fn fetch_wire(ids: &[String]) -> Result<(WireResponse, String), String> {
     let requested = ids.len();
     let clamped: Vec<&String> = ids.iter().take(MAX_IDS).collect();
     let clamp_note = if requested > MAX_IDS {
@@ -339,34 +334,22 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     let (base, jwt) = match parts {
         Ok(Ok(Ok(p))) => p,
         Ok(Ok(Err(e))) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: no credential ({e}){clamp_note}"),
-            )
+            return Err(format!("coord work-status: no credential ({e}){clamp_note}"))
         }
         Ok(Err(e)) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: credential resolution panicked ({e}){clamp_note}"),
-            )
+            return Err(format!("coord work-status: credential resolution panicked ({e}){clamp_note}"))
         }
         Err(_) => {
-            return StatusFetch::degraded(
-                requested,
-                format!(
+            return Err(format!(
                     "coord work-status: credential resolution timed out after {}s{clamp_note}",
                     CREDENTIAL_TIMEOUT.as_secs()
-                ),
-            )
+                ))
         }
     };
     let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: client build failed ({e}){clamp_note}"),
-            )
+            return Err(format!("coord work-status: client build failed ({e}){clamp_note}"))
         }
     };
 
@@ -385,27 +368,40 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
             } else {
                 format!("request failed ({e})")
             };
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: {what}{clamp_note}"),
-            );
+            return Err(format!("coord work-status: {what}{clamp_note}"));
         }
     };
     let status = resp.status();
     if !status.is_success() {
-        return StatusFetch::degraded(
-            requested,
-            format!("coord work-status: HTTP {}{clamp_note}", status.as_u16()),
-        );
+        return Err(format!("coord work-status: HTTP {}{clamp_note}", status.as_u16()));
     }
     let body: WireResponse = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: undecodable 2xx body ({e}){clamp_note}"),
-            )
+            return Err(format!("coord work-status: undecodable 2xx body ({e}){clamp_note}"))
         }
+    };
+    Ok((body, clamp_note))
+}
+
+/// Bulk-read the coord work axis for `ids`. **Never fails** — see module docs.
+pub async fn fetch(ids: &[String]) -> StatusFetch {
+    if ids.is_empty() {
+        return StatusFetch {
+            by_session_id: HashMap::new(),
+            finished_at_by_session_id: HashMap::new(),
+            source: "not_needed",
+            degraded: false,
+            note: String::new(),
+            requested: 0,
+            resolved: 0,
+        };
+    }
+
+    let requested = ids.len();
+    let (body, clamp_note) = match fetch_wire(ids).await {
+        Ok(x) => x,
+        Err(note) => return StatusFetch::degraded(requested, note),
     };
 
     let (by_session_id, mut note) = map_from_body(&body);
@@ -442,6 +438,64 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
 }
 
 // ---------------------------------------------------------------------------
+// Which coord row answers for a harness session id
+// ---------------------------------------------------------------------------
+
+/// What coord said about ONE harness session id — the three negative answers
+/// are kept apart because only one of them licenses minting a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowResolution {
+    /// coord has a row for this id; this is the latest one (adopt it).
+    Existing(uuid::Uuid),
+    /// coord resolved NO session for this id in this tenant — the one answer
+    /// that licenses minting a fresh row.
+    Unknown,
+    /// coord could not be asked, or its answer does not settle the question
+    /// (degraded read, bridge column absent, id absent from every bucket, an
+    /// unparseable row id). Never mint on this: a second row beside an
+    /// existing one is the duplicate-row defect.
+    Unresolved(String),
+}
+
+/// Pure: settle `csid` against a decoded body.
+fn resolution_from_body(body: &WireResponse, csid: &str) -> RowResolution {
+    if !body.session_bridge_column_present {
+        return RowResolution::Unresolved(
+            "coord reported sessionBridgeColumnPresent: false".to_string(),
+        );
+    }
+    if let Some(row) = body.statuses.get(csid) {
+        return match row
+            .coord_session_id
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        {
+            Some(id) => RowResolution::Existing(id),
+            None => RowResolution::Unresolved(
+                "coord answered a row without a parseable coord_session_id \
+                 (a coord that predates the field)"
+                    .to_string(),
+            ),
+        };
+    }
+    if body.unknown.iter().any(|u| u == csid) {
+        return RowResolution::Unknown;
+    }
+    RowResolution::Unresolved(
+        "coord named the id in neither `statuses` nor `unknown`".to_string(),
+    )
+}
+
+/// Ask coord which `coord.sessions` row answers for the harness session id
+/// `csid`. Never errors — see [`RowResolution`].
+pub async fn resolve_coord_row(csid: &str) -> RowResolution {
+    match fetch_wire(&[csid.to_string()]).await {
+        Ok((body, _)) => resolution_from_body(&body, csid),
+        Err(note) => RowResolution::Unresolved(note),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -451,6 +505,59 @@ mod tests {
 
     fn body(json: serde_json::Value) -> WireResponse {
         serde_json::from_value(json).expect("decode")
+    }
+
+    const ROW: &str = "01a11324-7598-7e22-82e3-7ed378f59c62";
+
+    #[test]
+    fn resolution_adopts_the_row_coord_names() {
+        let b = body(serde_json::json!({
+            "statuses": {"sid": {"session_status": null, "coord_session_id": ROW}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(
+            resolution_from_body(&b, "sid"),
+            RowResolution::Existing(uuid::Uuid::parse_str(ROW).unwrap())
+        );
+    }
+
+    #[test]
+    fn resolution_mints_only_on_an_explicit_unknown() {
+        let unknown = body(serde_json::json!({
+            "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
+            "truncated": false, "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(resolution_from_body(&unknown, "sid"), RowResolution::Unknown);
+
+        // In neither bucket: coord did not settle it — must NOT read as mintable.
+        let silent = body(serde_json::json!({
+            "statuses": {}, "unknown": [], "invalid": [], "accepted": 1,
+            "truncated": false, "sessionBridgeColumnPresent": true
+        }));
+        assert!(matches!(
+            resolution_from_body(&silent, "sid"),
+            RowResolution::Unresolved(_)
+        ));
+        // Bridge column absent: even an `unknown` entry is meaningless.
+        let no_bridge = body(serde_json::json!({
+            "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
+            "truncated": false, "sessionBridgeColumnPresent": false
+        }));
+        assert!(matches!(
+            resolution_from_body(&no_bridge, "sid"),
+            RowResolution::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn resolution_refuses_a_row_without_a_parseable_id() {
+        let b = body(serde_json::json!({
+            "statuses": {"sid": {"session_status": "working"}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert!(matches!(resolution_from_body(&b, "sid"), RowResolution::Unresolved(_)));
     }
 
     #[test]

@@ -1232,7 +1232,11 @@ pub(crate) async fn transcript_bind_core(
         tailer.bind_and_replay(
             &session_key,
             &path,
-            BindRequest { adopt, tenant },
+            BindRequest {
+                adopt,
+                tenant,
+                ..BindRequest::default()
+            },
             sync_enabled,
         )
     })
