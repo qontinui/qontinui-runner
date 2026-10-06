@@ -2141,11 +2141,34 @@ fn restore_graced_nonces(
                     // Restored VERBATIM when settled (never re-resolved, F2),
                     // pending otherwise — no settle hook: a graced key is never
                     // re-persisted by its own resolution.
-                    expected: match g.expected_tenant.clone() {
-                        Some(cwd) => {
-                            crate::coord_mcp_tenant::SessionExpectation::known(cwd, None)
+                    expected: {
+                        // The caller-named half, recomputed exactly as the live
+                        // restore does (only a STORED `explicit` names the
+                        // tenant), or a superseded key of an explicitly pinned
+                        // session would report a false TENANT MISMATCH.
+                        let named_origin = match g.session_tenant_origin {
+                            Some(crate::secure_storage::StoredPinOrigin::Explicit) => {
+                                PinOrigin::Explicit
+                            }
+                            _ => PinOrigin::MachineSampled,
+                        };
+                        let caller_named = caller_named_tenant(
+                            g.session_tenant
+                                .map(crate::session::tenant_pin::TenantPin::Pinned)
+                                .unwrap_or(crate::session::tenant_pin::TenantPin::Unpinned),
+                            named_origin,
+                            &ProxyPrincipal::Device,
+                            &normalize_binding_workdir(&g.workdir),
+                        );
+                        match g.expected_tenant.clone() {
+                            Some(cwd) => crate::coord_mcp_tenant::SessionExpectation::known(
+                                cwd,
+                                caller_named,
+                            ),
+                            None => {
+                                crate::coord_mcp_tenant::SessionExpectation::pending(caller_named)
+                            }
                         }
-                        None => crate::coord_mcp_tenant::SessionExpectation::pending(None),
                     },
                 },
             );
@@ -8079,6 +8102,29 @@ mod session_tenant_resolution_tests {
         );
     }
 
+    /// Review of the review: eviction must hand the binding's ESTABLISHED
+    /// expectation to the grace entry (a `Default::default()` there would pass
+    /// the hand-seeded graced tests above while real evictions lose it), and a
+    /// spawn that NAMED a tenant must not reuse a machine-sampled key.
+    #[tokio::test]
+    async fn eviction_hands_the_established_expectation_to_the_grace_entry() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = std::env::temp_dir().join(format!("p5-2029-evict-{}", Uuid::now_v7()));
+        let wd = dir.to_string_lossy().to_string(); // never created: a standing UNKNOWN
+        let first = register_proxy_nonce(&wd, None, None);
+        establish_session_expectation(&first).await;
+        let (live, _) = session_expectation_for_nonce(&first).expect("live binding");
+        assert!(live.current().is_some(), "precondition: established");
+        // A second terminal-less persistent mint into the same workdir evicts
+        // the first into grace.
+        let _second = register_proxy_nonce(&wd, None, None);
+        let graced = live_graced_nonce(&first).expect("the evicted key is graced");
+        assert!(
+            graced.expected.current().is_some(),
+            "the graced entry must carry the binding's established expectation"
+        );
+    }
+
     /// Blocker 2. A machine-SAMPLED pin is not "pinned to this tenant" for the
     /// seam's cwd-declared admission; only a CHOSEN one is.
     #[test]
@@ -8934,7 +8980,8 @@ struct ReusableInCwdNonce {
 /// reuse is byte-identical to the accept set before it.
 ///
 /// **A spawn that chose its tenant reuses only that tenant's key.** With
-/// `session_tenant: Some(t)` the binding must be `Pinned(t)`: handing a
+/// `session_tenant: Some(t)` the binding must be `Pinned(t)` and CHOSEN
+/// ([`PinOrigin::Explicit`]): handing a
 /// tenant-B session the file's machine-pinned key is exactly the
 /// labelled-B-writes-A defect plan
 /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` closes.
@@ -8955,16 +9002,20 @@ fn reusable_in_cwd_device_nonce(
     let path = Path::new(workdir).join(".mcp.json");
     {
         use crate::session::tenant_pin::TenantPin;
-        // A `Pinned(t)` pin NAMES `t` only when the caller chose it
-        // ([`PinOrigin::Explicit`]); a machine-SAMPLED pin is outranked by the
-        // workspace and repo tiers (rows 1a-1d), so "pinned to t" no longer
-        // means "resolves to t". Ask the authority order itself.
-        let resolves_to = || binding_resolved_tenant(&binding, workdir);
+        // A spawn that NAMED `t` reuses only a key whose pin the caller CHOSE
+        // ([`PinOrigin::Explicit`]) for `t`: a machine-sampled `Pinned(t)` is
+        // decided by rows 1a-1e, so it can later resolve elsewhere (its repo
+        // settles to another tenant, a declaration appears) and the session
+        // that named `t` would be answered as that other tenant. A tenant-less
+        // spawn compares against the machine pin only: a fresh mint into this
+        // same cwd would see the same workspace and repo tiers, so the key
+        // resolves exactly as a re-mint would, without the eviction churn.
         let admissible = match (session_tenant, binding.session_pin) {
-            (Some(t), pin) => pin == TenantPin::Pinned(t) && resolves_to() == Some(t),
+            (Some(t), pin) => {
+                pin == TenantPin::Pinned(t) && binding.pin_origin == PinOrigin::Explicit
+            }
             (None, TenantPin::Pinned(t)) => {
                 crate::session::tenant_pin::resolve_tenant_pin() == TenantPin::Pinned(t)
-                    && resolves_to() == Some(t)
             }
             (None, _) => true,
         };
@@ -8977,31 +9028,6 @@ fn reusable_in_cwd_device_nonce(
         terminal_id: binding.terminal_id,
         needs_header_upgrade: !read_static_authorization_presence(&path),
     })
-}
-
-/// The tenant a live DEVICE binding's session would be answered as RIGHT NOW,
-/// by the proxy's own authority order ([`decide_session_tenant`]) over the
-/// binding's frozen pin, its workspace and its already-established repo
-/// expectation. `None` when the order refuses or selects the default slot —
-/// neither is "resolves to a named tenant".
-fn binding_resolved_tenant(binding: &NonceBinding, workdir: &str) -> Option<Uuid> {
-    let decision = decide_session_tenant(
-        binding.session_pin,
-        binding.pin_origin,
-        || crate::session::workspace_tenant::read_workspace_declaration(Some(workdir)),
-        || binding.expected.current(),
-        crate::session::tenant_pin::resolve_tenant_pin(),
-        device_jwt_claim_tenant,
-        validate_spawn_tenant,
-    );
-    match decision {
-        SessionTenantDecision::BindingPin { tenant, .. }
-        | SessionTenantDecision::Declared { tenant, .. }
-        | SessionTenantDecision::RepoDerived { tenant, .. }
-        | SessionTenantDecision::LivePin(tenant)
-        | SessionTenantDecision::JwtClaim(tenant) => Some(tenant),
-        _ => None,
-    }
 }
 
 /// The key in `<workdir>/.mcp.json`, IF it is one a session in that cwd can
@@ -22640,6 +22666,22 @@ pub(crate) mod doctor {
             device_jwt_claim_tenant,
             validate_spawn_tenant,
         );
+        // The proxy's retryable "repo not settled yet" guard applies to a
+        // SESSION report too, or this door would call healthy what the data
+        // plane refuses. (The doctor does not itself await the first
+        // resolution, so a never-called session reads as not-yet-settled.)
+        let decision = repo_unsettled_refusal(
+            &SessionDecisionInputs {
+                binding_pin,
+                binding_origin,
+                workdir: workspace.clone(),
+                repo: repo.clone(),
+                repo_steers: nonce_resolved == Some(true),
+            },
+            &decision,
+            device_is_multi_bound,
+        )
+        .unwrap_or(decision);
         let resolution = resolution_view(&decision);
 
         // The view: NOT EVALUATED only when the repo/path-map tiers were never
