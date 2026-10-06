@@ -227,6 +227,86 @@ pub(crate) fn destination_is_source(dst: &Path, src: &Path) -> Option<String> {
     })
 }
 
+/// `Some(why)` when `cwd` sits inside a git work tree of the same repository as
+/// the checkout at `checkout` — the same repository, not merely the same path:
+/// both git COMMON dirs canonicalize to one directory. Both sides go through the
+/// same resolver, so a `checkout` whose own `.git` is a FILE (itself a linked
+/// worktree, or a `--separate-git-dir` checkout) is still recognised.
+///
+/// The walk-up from `cwd` finds its NEAREST `.git`, so the stand-down
+/// deliberately covers any cwd nested anywhere inside a work tree of that
+/// repository, not only its top level: a `.claude/` written into a
+/// subdirectory of the canonical repo is untracked litter there as well.
+///
+/// Why identity and not only [`destination_is_source`]: a linked worktree OF the
+/// canonical checkout (`agent-worktrees/<id>/qontinui-claude-config`) has a real
+/// `.claude/` directory at a path that is not the canonical one, so the path
+/// compare misses and no symlink stands it down. The only protection left would
+/// be [`TrackedPaths`], which is fail-soft by design — a probe that errors or
+/// exceeds [`PROBE_TIMEOUT`] reads "nothing tracked" and WRITES, replacing the
+/// canonical sources in that worktree with the binary's embedded copies, a diff
+/// an agent working there can commit. Every worktree of a repository shares its
+/// common dir, so this catches the whole family with nothing to fail soft.
+///
+/// Plain file I/O, no `git` process: see [`git_common_dir`]. `None` when either
+/// side cannot be resolved — `cwd` in no repository, or no `.git` directly at
+/// `checkout` (it is NOT walked up from: a missing canonical checkout must not
+/// resolve to whatever repository happens to enclose it) — which leaves the
+/// decision to the other guards.
+pub(crate) fn same_repository(cwd: &Path, checkout: &Path) -> Option<String> {
+    let common = std::fs::canonicalize(git_common_dir(cwd)?).ok()?;
+    let canonical = std::fs::canonicalize(common_dir_at(checkout)?).ok()?;
+    (common == canonical).then(|| {
+        format!(
+            "{} is a work tree of the repository at {} (git common dir {}), \
+             which is the source its assets would be copied from",
+            cwd.display(),
+            checkout.display(),
+            common.display()
+        )
+    })
+}
+
+/// The git common dir of the nearest enclosing repository of `start`, found by
+/// walking up to the first `.git`:
+///
+/// - a `.git` DIRECTORY is the common dir itself (a primary checkout);
+/// - a `.git` FILE reads `gitdir: <path>` (relative paths resolve against the
+///   directory holding the file). For a linked worktree that path is
+///   `<common>/worktrees/<name>`, whose `commondir` file names the common dir
+///   (relative to the gitdir); when it has none, the parent of a `worktrees`
+///   directory is taken. Any other gitdir (a submodule's `modules/<name>`, a
+///   `--separate-git-dir`) is its own common dir — taking its grandparent would
+///   misattribute a submodule to its superproject.
+///
+/// `None` when no `.git` is found or a `.git` file is unreadable or malformed.
+fn git_common_dir(start: &Path) -> Option<PathBuf> {
+    common_dir_at(start.ancestors().find(|dir| dir.join(".git").exists())?)
+}
+
+/// [`git_common_dir`] for the `.git` directly at `holder`, with no walk-up.
+fn common_dir_at(holder: &Path) -> Option<PathBuf> {
+    let dot_git = holder.join(".git");
+    if !dot_git.exists() {
+        return None;
+    }
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = holder.join(contents.lines().next()?.strip_prefix("gitdir:")?.trim());
+    if let Ok(commondir) = std::fs::read_to_string(gitdir.join("commondir")) {
+        return Some(gitdir.join(commondir.trim()));
+    }
+    // A heuristic, only for a gitdir with no `commondir` file: git itself
+    // writes one for every linked worktree, so this arm is a fallback.
+    let parent = gitdir.parent()?;
+    if parent.file_name().is_some_and(|n| n == "worktrees") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    Some(gitdir)
+}
+
 /// `std::fs::canonicalize` for a path that may not exist yet: canonicalize its
 /// nearest existing ancestor and re-append the missing tail. `None` when no
 /// ancestor resolves, or the tail holds a component with no file name (`..`).
@@ -288,6 +368,29 @@ pub(crate) mod test_support {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    /// A `git -C <dir>` command isolated from the environment the test runs in,
+    /// mirroring the production probe: the repo-selecting variables are
+    /// removed, so a `cargo test` run under a git hook or `git rebase -x` (which
+    /// export `GIT_DIR`) cannot make a fixture's `add`/`commit` land in the
+    /// OUTER repository; and no hook or commit signing configured for the user
+    /// runs against a tempdir fixture.
+    pub(crate) fn git(dir: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .arg("-C")
+            .arg(dir);
+        cmd
+    }
+
     /// Initialise a real repo in `dir` (quiet, no global config dependence).
     pub(crate) fn git_init(dir: &Path) {
         for args in [
@@ -295,9 +398,7 @@ pub(crate) mod test_support {
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(dir)
+            let ok = git(dir)
                 .args(&args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -309,9 +410,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn git_add(dir: &Path, path: &Path) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let ok = git(dir)
             .arg("add")
             .arg("--")
             .arg(path)
@@ -330,9 +429,7 @@ pub(crate) mod test_support {
     /// decay into a duplicate of the untracked-file test and still pass, leaving
     /// the arm it names unverified.
     pub(crate) fn assert_not_in_any_repo(dir: &Path) {
-        let inside = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let inside = git(dir)
             .arg("rev-parse")
             .arg("--is-inside-work-tree")
             .stdout(Stdio::null())
@@ -416,6 +513,112 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let tracked = TrackedPaths::probe(&tmp.path().join("does-not-exist"));
         assert!(!tracked.contains(Path::new("anything.md")));
+    }
+
+    /// Lay out a linked worktree's gitdir by hand: `<common>/worktrees/<name>`,
+    /// with a `commondir` file when `commondir` is true, and `<wt>/.git` naming
+    /// it via `gitdir_line`.
+    fn fake_worktree(common: &Path, wt: &Path, gitdir_line: &str, commondir: bool) {
+        let gitdir = common.join("worktrees").join(wt.file_name().unwrap());
+        std::fs::create_dir_all(&gitdir).unwrap();
+        if commondir {
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        }
+        std::fs::create_dir_all(wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {gitdir_line}\n")).unwrap();
+    }
+
+    fn real(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap()
+    }
+
+    /// A RELATIVE `gitdir:` resolves against the directory holding the `.git`
+    /// file, and both the `commondir` file and its absence (the parent of the
+    /// `worktrees` directory) land on the same common dir.
+    #[test]
+    fn a_relative_gitdir_resolves_to_the_common_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let common = tmp.path().join("repo").join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        for (name, commondir) in [("wt-a", true), ("wt-b", false)] {
+            let wt = tmp.path().join(name);
+            fake_worktree(
+                &common,
+                &wt,
+                &format!("../repo/.git/worktrees/{name}"),
+                commondir,
+            );
+            assert_eq!(
+                git_common_dir(&wt.join("nested")).map(|p| real(&p)),
+                Some(real(&common)),
+                "{name}"
+            );
+        }
+    }
+
+    /// A submodule's `.git` FILE points at `<super>/.git/modules/<name>`, which
+    /// is its own common dir. Taking the gitdir's grandparent would answer
+    /// `<super>/.git` and misattribute the submodule to its superproject.
+    #[test]
+    fn a_submodule_is_not_attributed_to_its_superproject() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let superproject = tmp.path().join("super");
+        let modules = superproject.join(".git").join("modules").join("sub");
+        std::fs::create_dir_all(&modules).unwrap();
+        let sub = superproject.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+
+        assert_eq!(git_common_dir(&sub).map(|p| real(&p)), Some(real(&modules)));
+        assert_eq!(same_repository(&sub, &superproject), None);
+    }
+
+    /// The canonical checkout may itself be a linked worktree, its `.git` a
+    /// FILE: a sibling worktree of the same repository is still the same
+    /// repository. Comparing against `canonicalize(<checkout>/.git)` — the file
+    /// itself — silently switched the guard off here.
+    #[test]
+    fn a_checkout_whose_git_is_a_file_is_still_recognised() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let common = tmp.path().join("main").join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        let checkout = tmp.path().join("checkout");
+        let sibling = tmp.path().join("sibling");
+        for wt in [&checkout, &sibling] {
+            let name = wt.file_name().unwrap().to_string_lossy();
+            let line = common.join("worktrees").join(&*name);
+            fake_worktree(&common, wt, &line.to_string_lossy(), true);
+        }
+
+        assert!(same_repository(&sibling, &checkout).is_some());
+    }
+
+    /// A worktree of an UNRELATED repository is not the checkout's repository,
+    /// so a mutation that made the identity check always answer "same" goes red
+    /// here rather than silently standing every session down.
+    #[test]
+    fn a_worktree_of_another_repository_is_not_the_same_repository() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = tmp.path().join("config");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        let other = tmp.path().join("other").join(".git");
+        std::fs::create_dir_all(&other).unwrap();
+        let wt = tmp.path().join("wt");
+        fake_worktree(&other, &wt, "../other/.git/worktrees/wt", true);
+
+        assert!(git_common_dir(&wt).is_some());
+        assert_eq!(same_repository(&wt, &checkout), None);
+    }
+
+    /// A `.git` file with no `gitdir:` line resolves to nothing — and so to no
+    /// stand-down — rather than to a guessed directory.
+    #[test]
+    fn a_malformed_git_file_resolves_to_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".git"), "not a gitdir line\n").unwrap();
+        assert_eq!(git_common_dir(tmp.path()), None);
+        std::fs::write(tmp.path().join(".git"), "").unwrap();
+        assert_eq!(git_common_dir(tmp.path()), None);
     }
 
     /// `should_skip` requires BOTH halves: a tracked path whose file has been

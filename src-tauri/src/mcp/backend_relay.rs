@@ -4011,7 +4011,10 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
                 // helper logs, writes a degraded breadcrumb, and the session
                 // still answers (just without twin tools).
                 let bound_port = Some(crate::mcp::types::runner_api_port(&bg_state.app_state));
-                crate::coord_mcp::provision_coord_mcp_for_session(&dir, bound_port, None);
+                crate::coord_mcp::provision_coord_mcp_for_session_off_runtime(
+                    &dir, bound_port, None,
+                )
+                .await;
                 dir
             }
             // Legacy fallback (no home dir / create failed): the runner's own

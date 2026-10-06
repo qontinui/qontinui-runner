@@ -1887,21 +1887,23 @@ pub async fn resume_ai_sessions(
         // transcript-keyed `--resume` lossless AND keeps the session's coord
         // digital-twin tools: re-provision coord-mcp there (re-mint evicts the
         // stale nonce and rewrites `.mcp.json` for the respawned CLI).
-        let working_dir = workdir_override.clone().unwrap_or_else(|| {
-            match crate::mcp::backend_relay::existing_relay_session_workdir(&task_run_id) {
+        let working_dir = match workdir_override.clone() {
+            Some(dir) => dir,
+            None => match crate::mcp::backend_relay::existing_relay_session_workdir(&task_run_id) {
                 Some(relay_dir) => {
-                    crate::coord_mcp::provision_coord_mcp_for_session(
+                    crate::coord_mcp::provision_coord_mcp_for_session_off_runtime(
                         &relay_dir,
                         Some(my_port),
                         None,
-                    );
+                    )
+                    .await;
                     relay_dir
                 }
                 None => std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| ".".to_string()),
-            }
-        });
+            },
+        };
 
         // ── (B) Prefer lossless `--resume`; honestly label the summary ─────
         // The chat path pins the CLI session id to the task_run_id, so an

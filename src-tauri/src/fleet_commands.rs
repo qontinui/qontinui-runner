@@ -715,8 +715,10 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// PROJECT-scoped slash commands — even on a device with no
 /// `~/.claude/commands`.
 ///
-/// The set written is [`crate::agent_commands::resolve_registry`]'s output:
-/// the account's overrides where it has any, the embedded defaults otherwise.
+/// The set written is `registry` — in production
+/// [`crate::agent_commands::resolve_registry`]'s output, resolved once per spawn
+/// by `session_assets`: the account's overrides where it has any, the embedded
+/// defaults otherwise.
 ///
 /// Fail-soft (mirrors `coord_mcp::provision_coord_mcp_for_session`): any IO
 /// error is logged via `tracing::warn!` and swallowed — a provisioning failure
@@ -729,25 +731,17 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// destination is already tracked by the enclosing git repository, which is
 /// skipped (see [`provision_fleet_commands_into`] and
 /// [`crate::provision_guard`]).
-pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
-    let registry = crate::agent_commands::resolve_registry();
+pub(crate) fn provision_fleet_commands_for_session(
+    workdir: &str,
+    registry: &crate::agent_commands::AgentCommandRegistry,
+) {
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
 
-    // The registry's own row: WHICH of `resolve_registry`'s three arms answered.
     // Recorded before the write, because it is a fact about resolution rather
     // than about provisioning and holds even if every write below is skipped.
-    let arm = registry.resolution_arm();
-    crate::capability_manifest::record_observation(
-        "agent_commands_registry",
-        CapabilityObservation::from_command_source(arm).with_detail(format!(
-            "CommandSource::{} — {} override(s) over {} embedded default(s)",
-            arm.as_str(),
-            registry.override_count(),
-            registry.builtin_count(),
-        )),
-    );
+    observe_commands_registry(registry);
 
-    match provision_fleet_commands_into(&commands_dir, &registry) {
+    match provision_fleet_commands_into(&commands_dir, registry) {
         Ok(report) => crate::capability_manifest::record_provision(workdir, report),
         Err(e) => {
             // The destination directory itself could not be created, so no unit
@@ -771,6 +765,25 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
             crate::capability_manifest::record_provision(workdir, report);
         }
     }
+}
+
+/// Record the registry's own capability row, `agent_commands_registry`: WHICH of
+/// [`crate::agent_commands::resolve_registry`]'s three arms answered. Takes the
+/// already-resolved registry so a provisioning pass resolves it once. Also
+/// reached through `session_assets::observe_registries` from the two arms that
+/// write no command but have still resolved the registry: `session_assets`'
+/// canonical-source arm and `isolated_edit::skip_repo_authored_claude_tree`.
+pub(crate) fn observe_commands_registry(registry: &crate::agent_commands::AgentCommandRegistry) {
+    let arm = registry.resolution_arm();
+    crate::capability_manifest::record_observation(
+        "agent_commands_registry",
+        CapabilityObservation::from_command_source(arm).with_detail(format!(
+            "CommandSource::{} — {} override(s) over {} embedded default(s)",
+            arm.as_str(),
+            registry.override_count(),
+            registry.builtin_count(),
+        )),
+    );
 }
 
 /// Core of [`provision_fleet_commands_for_session`]: create `commands_dir` and
