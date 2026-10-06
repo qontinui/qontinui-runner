@@ -5706,6 +5706,30 @@ mod converge_retains_every_absorbed_copy_tests {
         );
     }
 
+    /// The canonical named among the "others" is skipped, not folded against
+    /// itself and not reported as an absorbed copy. Unreachable in production
+    /// (`binding_store_candidate_paths_with` dedups), pinned so the skip stays.
+    #[test]
+    fn the_canonical_listed_as_an_other_is_skipped_not_retained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("paired_user.json");
+        let body = format!(
+            r#"{{"user_id": "{USER}", "tenant_id": "{T_DEFAULT}", "bindings": [{{"tenant_id": "{T_DEFAULT}", "user_id": "{USER}", "paired_at": "2026-09-23T19:53:19Z"}}], "default_tenant_id": "{T_DEFAULT}"}}"#
+        );
+        std::fs::write(&canonical, &body).unwrap();
+        let before = std::fs::read(&canonical).unwrap();
+
+        let report = converge_binding_store_with(
+            &canonical,
+            &[canonical.clone()],
+            &|_t: &uuid::Uuid, _d: bool| Some(true),
+        );
+
+        assert!(report.retained.is_empty(), "{:?}", report.retained);
+        assert!(!report.wrote_canonical);
+        assert_eq!(std::fs::read(&canonical).unwrap(), before);
+    }
+
     /// The absent-canonical branch used to return an all-empty report whose
     /// caller logged nothing at all. `superseded_siblings` is what gives that
     /// warning its evidence, newest first.
