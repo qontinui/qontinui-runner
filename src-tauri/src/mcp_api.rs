@@ -269,10 +269,11 @@ fn strip_visibility(line: &str) -> &str {
 ///
 /// Two shapes the line-based scan cannot bound, stated so nobody relies on
 /// them:
-/// - a declaration whose signature line already closes its body (a one-line
-///   `fn x() {}`) has no column-0 `}` of its own, so the body would run on
+/// - a declaration that ENDS on its signature line (a one-line `fn x() {}`,
+///   with or without a trailing comment, or a one-line `const` / `static`
+///   ending in `;`) has no column-0 `}` of its own, so the body would run on
 ///   into the next item — it is REFUSED with a panic naming the line rather
-///   than returned wrong;
+///   than returned wrong ([`declaration_ends_on_its_line`]);
 /// - a raw string (or any literal) inside a `#[cfg(test)]` span that holds a
 ///   line consisting of exactly `}` ends that span's skip early, so the test
 ///   text after it would read as production code. Nothing in the module does
@@ -295,7 +296,7 @@ fn item_source_in(files: &[(String, String)], signature: &str) -> String {
                 continue;
             }
             assert!(
-                !line.trim_end().ends_with('}'),
+                !declaration_ends_on_its_line(line),
                 "`{signature}` in {rel}:{} is declared on one line (`{line}`); its \
                  body has no column-0 `}}` of its own, so this scan would run on \
                  into the next item — spread the item over several lines",
@@ -321,6 +322,59 @@ fn item_source_in(files: &[(String, String)], signature: &str) -> String {
         .pop()
         .map(|(_, body)| body)
         .expect("exactly one, asserted above")
+}
+
+/// Does the item declared on `line` END on that line — so the column-0 `}`
+/// [`item_source_in`] looks for belongs to some LATER item?
+///
+/// Read from the line's CODE only: string and char literals are skipped and a
+/// trailing `//` comment is dropped, so neither a `"{"` in a literal nor a
+/// `// why` after the body can change the answer. Two shapes end on the line:
+/// a body whose braces open AND close there (`fn tiny() {} // why`,
+/// `struct S { a: u8 }`), and a bodiless item ending in `;` (a one-line
+/// `const` / `static` / `type` / `use`). Anything else — a signature ending in
+/// `{`, `(`, `,`, or a return type whose `where` / `{` follows on the next
+/// line — continues below.
+#[cfg(test)]
+fn declaration_ends_on_its_line(line: &str) -> bool {
+    let mut code = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                // A string literal: skip to its unescaped closing quote.
+                while let Some(s) = chars.next() {
+                    match s {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '\'' => {
+                // A char literal (`'{'`, `'\''`) is skipped; a lifetime (`'a`)
+                // has no closing quote within two chars and is kept as code.
+                let mut ahead = chars.clone();
+                let literal_len = match ahead.next() {
+                    Some('\\') => ahead.nth(1).filter(|q| *q == '\'').map(|_| 3),
+                    Some(_) => ahead.next().filter(|q| *q == '\'').map(|_| 2),
+                    None => None,
+                };
+                if let Some(n) = literal_len {
+                    for _ in 0..n {
+                        chars.next();
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => break,
+            _ => code.push(c),
+        }
+    }
+    let opens = code.matches('{').count();
+    let closes = code.matches('}').count();
+    (opens > 0 && opens == closes) || code.trim_end().ends_with(';')
 }
 
 #[cfg(test)]
@@ -499,6 +553,68 @@ mod mcp_api_sources_tests {
             )],
             "fn tiny(",
         );
+    }
+
+    /// The same one-line body with a trailing comment: `// why` must not hide
+    /// the `}` that already closed it.
+    #[test]
+    #[should_panic(expected = "`fn tiny(` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_declaration_with_a_trailing_comment() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "fn tiny() {} // why\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "fn tiny(",
+        );
+    }
+
+    /// A one-line `const` has no braces at all and ends in `;` — it too would
+    /// run on into the next item's body.
+    #[test]
+    #[should_panic(expected = "`const LIMIT:` in mcp_api.rs:1 is declared on one line")]
+    fn item_source_refuses_a_one_line_const() {
+        super::item_source_in(
+            &[(
+                "mcp_api.rs".to_string(),
+                "const LIMIT: usize = 4;\nfn later() {\n    LATER();\n}\n".to_string(),
+            )],
+            "const LIMIT:",
+        );
+    }
+
+    /// What the refusal must NOT catch: a signature line that continues — an
+    /// opening `{`, a split parameter list, a return type whose `{` is on the
+    /// next line — and literals or comments that only LOOK like a close.
+    #[test]
+    fn a_continuing_signature_line_is_not_a_one_line_declaration() {
+        for line in [
+            "async fn health(State(s): State<S>) -> Json<Value> {",
+            "async fn coord_mcp_proxy_handler(",
+            "fn split(a: A,",
+            "fn returns() -> impl Fn() -> u8",
+            "fn braces_in_a_literal() -> &'static str { // \"}\" is text",
+            "const URL: &str = concat!(\"http://x\", {",
+            "fn ch() -> char { '}' // a char literal",
+        ] {
+            assert!(
+                !super::declaration_ends_on_its_line(line),
+                "{line:?} continues on the next line"
+            );
+        }
+        for line in [
+            "fn tiny() {}",
+            "fn tiny() {} // why",
+            "struct S { a: u8 }",
+            "const URL: &str = \"http://x\";",
+            "static N: AtomicU64 = AtomicU64::new(0); // count",
+            "fn ch() -> char { '{' }",
+        ] {
+            assert!(
+                super::declaration_ends_on_its_line(line),
+                "{line:?} ends on its own line"
+            );
+        }
     }
 
     /// The real module: the handler the source-scan pins read is found once.

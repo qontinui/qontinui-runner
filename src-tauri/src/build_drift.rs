@@ -257,10 +257,14 @@ const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
 /// [`parse_tool_policy_consts`] plans for; it must degrade `cause` to
 /// `unknown`, not blank `commitsBehind` on every box in the fleet.
 ///
-/// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]), built by
-/// [`drift_git`], and so inherits the fleet's single-source credential
-/// posture from [`crate::process_helpers::no_window`] — never a second copy
-/// here — with the repo-locating environment scrubbed.
+/// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]) and
+/// starts from the fleet's single-source credential posture
+/// ([`crate::process_helpers::no_window`] — never a second copy here) with the
+/// repository-local environment scrubbed by ONE shared function,
+/// [`crate::git_trunk::scrub_repo_local_git_env`]: this module's own calls are
+/// built by [`drift_git`], and the trunk-name read
+/// ([`crate::git_trunk::resolve_trunk_branch`]) applies the same scrub inside
+/// its resolver.
 /// `--no-write-fetch-head` keeps the fetch from rewriting the source
 /// checkout's per-worktree `FETCH_HEAD` (git writes it even for a refspec
 /// with a destination ref, and a peer mid-`git pull` there would otherwise
@@ -435,33 +439,16 @@ fn candidate_repo_dir() -> Option<PathBuf> {
         .find(|dir| dir.join(".git").exists())
 }
 
-/// The environment variables that make git read a repository OTHER than the
-/// one `current_dir` names. `git -C` / `current_dir` do not override an
-/// inherited `GIT_DIR`, so a runner started from a git hook (or any shell
-/// that exported these) would measure drift — and read the tool policy — from
-/// the caller's repo and index instead of [`candidate_repo_dir`].
-const REPO_LOCATING_GIT_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-];
-
-/// Remove [`REPO_LOCATING_GIT_ENV`] from `cmd`'s child environment — both an
-/// inherited value and one set on `cmd` earlier.
-fn scrub_repo_locating_env(cmd: &mut std::process::Command) {
-    for var in REPO_LOCATING_GIT_ENV {
-        cmd.env_remove(var);
-    }
-}
-
 /// The one `git` command every drift probe starts from:
-/// [`crate::process_helpers::no_window`]'s posture, repo-locating env scrubbed.
+/// [`crate::process_helpers::no_window`]'s posture with the repository-local
+/// environment scrubbed ([`crate::git_trunk::scrub_repo_local_git_env`], the
+/// same scrub the trunk resolver applies). `git -C` / `current_dir` do not
+/// override an inherited `GIT_DIR`, so without it a runner started from a git
+/// hook would measure drift — and read the tool policy — from the caller's
+/// repo instead of [`candidate_repo_dir`].
 fn drift_git() -> std::process::Command {
     let mut cmd = crate::process_helpers::no_window("git");
-    scrub_repo_locating_env(&mut cmd);
+    crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
     cmd
 }
 
@@ -1067,7 +1054,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             // Run under a git hook (or any caller that exported them), these
             // would point the fixture's git at the CALLER's repo and index
             // instead of the tempdir — the same scrub production applies.
-            scrub_repo_locating_env(&mut cmd);
+            crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
             let out = cmd.output().expect("git runs");
             assert!(out.status.success(), "git {args:?}: {out:?}");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -1175,18 +1162,20 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         );
     }
 
-    /// Every drift probe's `git` drops the repo-locating variables: each is
-    /// REMOVED on the command (`get_envs` reports a removal as `None`), so an
-    /// inherited value never reaches the child.
+    /// Every drift probe's `git` carries the shared scrub: each
+    /// repository-local variable is REMOVED on the command (`get_envs`
+    /// reports a removal as `None`), so an inherited value never reaches the
+    /// child. That the list is git's own is pinned beside it
+    /// (`git_trunk`'s `repo_local_git_env_covers_gits_own_list`).
     #[test]
-    fn drift_git_removes_every_repo_locating_variable() {
+    fn drift_git_removes_every_repo_local_variable() {
         let cmd = drift_git();
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, value)| value.is_none())
             .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect();
-        for var in REPO_LOCATING_GIT_ENV {
+        for var in crate::git_trunk::REPO_LOCAL_GIT_ENV {
             assert!(
                 removed.iter().any(|r| r == var),
                 "drift_git must remove {var}; removed: {removed:?}"
@@ -1209,7 +1198,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
                 .current_dir(target.path())
                 .env("GIT_DIR", decoy.path().join(".git"));
             if scrub {
-                scrub_repo_locating_env(&mut cmd);
+                crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
             }
             let out = cmd.output().expect("git runs");
             assert!(out.status.success(), "{out:?}");
