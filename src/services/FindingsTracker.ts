@@ -28,7 +28,6 @@ import {
   VerificationPendingMarker,
   VerificationCompletedMarker,
   VerificationFailedMarker,
-  RunnerRestartMarker,
 } from "./VerificationService";
 
 // Import from refactored modules
@@ -85,13 +84,12 @@ const OPTIONS_PATTERN = /^Options:\s*(.+)$/m;
 const RESOLUTION_PATTERN = /^Resolution:\s*(.+)$/m;
 
 /**
- * Verification and Runner marker patterns
+ * Verification marker patterns
  * (These are not findings, but control flow markers)
  */
 const VERIFICATION_PENDING_PATTERN = /\[VERIFICATION:PENDING\]\s*(\{[\s\S]*?\})/;
 const VERIFICATION_COMPLETED_PATTERN = /\[VERIFICATION:COMPLETED\]\s*(\{[\s\S]*?\})/;
 const VERIFICATION_FAILED_PATTERN = /\[VERIFICATION:FAILED\]\s*(\{[\s\S]*?\})/;
-const RUNNER_RESTART_PATTERN = /\[RUNNER:RESTART\]\s*(\{[\s\S]*?\})/;
 
 /**
  * Parse severity string to typed severity
@@ -319,19 +317,6 @@ export class FindingsTracker {
         verificationService.handleVerificationFailed(payload);
       } catch (error) {
         console.error("[FindingsTracker] Failed to parse VERIFICATION:FAILED:", error);
-      }
-      return null;
-    }
-
-    // Check for [RUNNER:RESTART] - AI wants to restart the runner
-    const restartMatch = line.match(RUNNER_RESTART_PATTERN);
-    if (restartMatch) {
-      try {
-        const payload = JSON.parse(restartMatch[1]) as RunnerRestartMarker;
-        logger.info("Runner restart requested:", payload.reason);
-        verificationService.triggerRestart(payload);
-      } catch (error) {
-        console.error("[FindingsTracker] Failed to parse RUNNER:RESTART:", error);
       }
       return null;
     }

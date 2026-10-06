@@ -56,19 +56,9 @@ export interface VerificationFailedMarker {
 }
 
 /**
- * Runner restart marker parsed from AI output
- * AI outputs: [RUNNER:RESTART] {"reason":"Applied fix",...}
- */
-export interface RunnerRestartMarker {
-  reason: string;
-  delay_seconds?: number;
-}
-
-/**
  * Union type for all verification-related markers
  */
 export type VerificationMarker =
   | { type: "pending"; data: VerificationPendingMarker }
   | { type: "completed"; data: VerificationCompletedMarker }
-  | { type: "failed"; data: VerificationFailedMarker }
-  | { type: "restart"; data: RunnerRestartMarker };
+  | { type: "failed"; data: VerificationFailedMarker };
