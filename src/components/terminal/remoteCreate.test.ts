@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   createButtonState,
   describeRemoteCreateFailure,
+  EMPTY_CREATE_NO_TENANT_REASON,
+  emptyCreateTargets,
   fleetDeviceCreateId,
   type RemoteCreateErrorWire,
 } from "./remoteCreate";
@@ -267,5 +269,56 @@ describe("createButtonState", () => {
 describe("fleetDeviceCreateId", () => {
   it("is per-device so two groups are not one control", () => {
     expect(fleetDeviceCreateId("a")).not.toBe(fleetDeviceCreateId("b"));
+  });
+});
+
+describe("emptyCreateTargets — a merged empty state never creates under an unchosen tenant", () => {
+  const A = "aaaaaaaa-0000-4000-8000-00000000000a";
+  const B = "bbbbbbbb-0000-4000-8000-00000000000b";
+  const short = (t: string) => t.slice(0, 8);
+
+  it("offers ONE create under the served tenant in a single-tenant read, as before", () => {
+    expect(
+      emptyCreateTargets({
+        merged: false,
+        servedTenant: A,
+        answeredTenants: [A],
+        shortTenant: short,
+      }),
+    ).toEqual({ targets: [{ tenant: A, tenantLabel: null }], disabledReason: null });
+    expect(
+      emptyCreateTargets({
+        merged: false,
+        servedTenant: null,
+        answeredTenants: [],
+        shortTenant: short,
+      }).targets,
+    ).toEqual([{ tenant: null, tenantLabel: null }]);
+  });
+
+  it("offers one create PER answered tenant in a merged read, each naming its tenant", () => {
+    const out = emptyCreateTargets({
+      merged: true,
+      servedTenant: A,
+      answeredTenants: [A, B, A],
+      shortTenant: short,
+    });
+    expect(out.targets).toEqual([
+      { tenant: A, tenantLabel: "aaaaaaaa" },
+      { tenant: B, tenantLabel: "bbbbbbbb" },
+    ]);
+    expect(out.disabledReason).toBeNull();
+  });
+
+  it("never sends null in a merged read — an unnamed or absent tenant is skipped, then disabled with a reason", () => {
+    const out = emptyCreateTargets({
+      merged: true,
+      servedTenant: null,
+      answeredTenants: [null, "  "],
+      shortTenant: short,
+    });
+    expect(out.targets).toEqual([]);
+    expect(out.disabledReason).toBe(EMPTY_CREATE_NO_TENANT_REASON);
+    expect(out.disabledReason).toMatch(/^choose a tenant to create in/);
   });
 });
