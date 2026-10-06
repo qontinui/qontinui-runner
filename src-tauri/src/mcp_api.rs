@@ -12481,6 +12481,9 @@ pub fn create_router(
         // and never reclaimable. Read-only, and deliberately not gated on any
         // of the conditions that gate deletion (INV-D1).
         .merge(crate::mcp::disk_reclaim::routes())
+        // The build-admission broker's loopback routes (observe-only; plan
+        // 2026-10-06-builds-are-admitted-per-invocation-against-measured-host-memory).
+        .merge(crate::build_admission::routes::routes())
         .merge(crate::mcp::agent_tokens::routes())
         .merge(crate::install_effects_producer::routes())
         .merge(crate::mcp::token_analytics::routes())

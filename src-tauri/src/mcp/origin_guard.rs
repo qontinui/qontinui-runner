@@ -226,6 +226,14 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/executor/restart",
     "/install-effects/run",
     "/ui-bridge/control/page/*",
+    // The build-admission broker (plan 2026-10-06-builds-are-admitted-per-
+    // invocation-against-measured-host-memory, D13): opening, polling and
+    // releasing a ticket decide whose build runs when, and the poll carries a
+    // per-ticket secret. Callers are the cargo wrappers (curl, no Origin);
+    // no browser origin may reach them. `GET /build-admission/state` is a
+    // read with no secret in it and stays open.
+    "POST /build-admission/*",
+    "GET /build-admission/tickets/{id}",
     // --- Phase 0 route census ---
     "GET /backup",
     "POST /restore",
