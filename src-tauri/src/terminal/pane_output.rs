@@ -37,23 +37,39 @@ pub type LossMarker = fn(u64) -> Vec<u8>;
 
 /// The sending half: unbounded (`RemotePaneIo`, whose producer is the relay's
 /// async routing loop and must never block) or bounded (`DaemonPaneIo`, whose
-/// producer is its own pump thread and SHOULD block, so a flood backs up into
+/// producer is its own pump thread and SHOULD wait, so a flood backs up into
 /// the holder's ring rather than into this process's memory).
-#[derive(Clone)]
 enum OutputTx {
     Unbounded(mpsc::Sender<Vec<u8>>),
     Bounded(mpsc::SyncSender<Vec<u8>>),
 }
 
+/// Why a non-blocking send did not queue.
+enum NotSent {
+    /// A bounded channel is full; the chunk comes back for a retry.
+    Full(Vec<u8>),
+    /// The reader is gone.
+    Closed,
+}
+
 impl OutputTx {
-    /// Blocks while a bounded channel is full; `Err` once the reader is gone.
-    fn send(&self, chunk: Vec<u8>) -> Result<(), ()> {
+    /// NEVER blocks, so it can run under the `output_tx` lock — which is what
+    /// makes "nothing is delivered after `close_output`" hold (see
+    /// [`PaneOutput::deliver`]).
+    fn try_send(&self, chunk: Vec<u8>) -> Result<(), NotSent> {
         match self {
-            OutputTx::Unbounded(tx) => tx.send(chunk).map_err(|_| ()),
-            OutputTx::Bounded(tx) => tx.send(chunk).map_err(|_| ()),
+            OutputTx::Unbounded(tx) => tx.send(chunk).map_err(|_| NotSent::Closed),
+            OutputTx::Bounded(tx) => tx.try_send(chunk).map_err(|e| match e {
+                mpsc::TrySendError::Full(c) => NotSent::Full(c),
+                mpsc::TrySendError::Disconnected(_) => NotSent::Closed,
+            }),
         }
     }
 }
+
+/// How long a producer facing a FULL bounded channel waits before retrying,
+/// with the lock released.
+const FULL_CHANNEL_POLL: Duration = Duration::from_millis(2);
 
 /// See the module docs.
 pub struct PaneOutput {
@@ -104,9 +120,9 @@ impl PaneOutput {
 
     /// An empty channel holding at most `capacity` chunks, beginning at
     /// absolute source offset `start_offset`. [`Self::push_output`] and
-    /// [`Self::push_local`] BLOCK while it is full — call them only from a
-    /// thread whose blocking is the backpressure you want (a pump), never
-    /// from an async task.
+    /// [`Self::push_local`] WAIT while it is full (until the reader makes room
+    /// or the channel is closed) — call them only from a thread whose waiting
+    /// is the backpressure you want (a pump), never from an async task.
     pub fn new_bounded(
         key: impl Into<String>,
         start_offset: u64,
@@ -133,11 +149,38 @@ impl PaneOutput {
         self.capacity
     }
 
-    /// A clone of the live sender, taken OUT of the lock so a send that blocks
-    /// on a full bounded channel never holds it (a concurrent `close_output`
-    /// must not queue behind it).
-    fn sender(&self) -> Option<OutputTx> {
-        self.output_tx.lock().ok().and_then(|tx| tx.clone())
+    /// Queue `chunk`; when `advance`, move the offset by its length. Every
+    /// attempt is a NON-blocking send made UNDER the `output_tx` lock, and the
+    /// offset moves under it too, so a chunk is either in the channel before
+    /// `close_output` / `settle` takes that lock, or never delivered at all —
+    /// RemotePaneIo's ordering guarantee ("nothing after exit"), kept with a
+    /// bounded channel. A full bounded channel is retried with the lock
+    /// RELEASED, so `close_output` never waits behind a slow reader; once it
+    /// has run, the retry finds the slot empty and drops the chunk.
+    fn deliver(&self, chunk: Vec<u8>, advance: bool) -> bool {
+        let len = chunk.len() as u64;
+        let mut chunk = chunk;
+        loop {
+            {
+                let Ok(guard) = self.output_tx.lock() else {
+                    return false;
+                };
+                let Some(tx) = guard.as_ref() else {
+                    return false;
+                };
+                match tx.try_send(chunk) {
+                    Ok(()) => {
+                        if advance {
+                            self.offset.fetch_add(len, Ordering::AcqRel);
+                        }
+                        return true;
+                    }
+                    Err(NotSent::Closed) => return false,
+                    Err(NotSent::Full(back)) => chunk = back,
+                }
+            }
+            std::thread::sleep(FULL_CHANNEL_POLL);
+        }
     }
 
     pub fn key(&self) -> &str {
@@ -175,13 +218,7 @@ impl PaneOutput {
         if bytes.is_empty() {
             return false;
         }
-        match self.sender() {
-            Some(tx) if tx.send(bytes.to_vec()).is_ok() => {
-                self.offset.fetch_add(bytes.len() as u64, Ordering::AcqRel);
-                true
-            }
-            _ => false,
-        }
+        self.deliver(bytes.to_vec(), true)
     }
 
     /// True while the channel is open — false once the pane exited or was
@@ -199,9 +236,7 @@ impl PaneOutput {
         if bytes.is_empty() {
             return;
         }
-        if let Some(tx) = self.sender() {
-            let _ = tx.send(bytes.to_vec());
-        }
+        self.deliver(bytes.to_vec(), false);
     }
 
     /// Splice `buffer`, which begins at absolute source offset `start`: bytes
@@ -397,6 +432,33 @@ mod tests {
 
     /// A bounded channel blocks its producer while full and releases it as the
     /// reader drains; nothing is dropped and the offset counts every byte.
+    /// Review round 2, N8: nothing is delivered after `settle` /
+    /// `close_output` — not even a chunk whose producer was already waiting on
+    /// a full channel when the close happened. The reader gets what was queued
+    /// before the close, then EOF; the waiting push reports "not delivered" and
+    /// the offset does not count it.
+    #[test]
+    fn pty_holder_nothing_is_delivered_after_close() {
+        let out = std::sync::Arc::new(PaneOutput::new_bounded("k", 0, marker, 1));
+        assert!(out.push_output(b"first"));
+        let producer = {
+            let out = out.clone();
+            std::thread::spawn(move || out.push_output(b"late"))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !producer.is_finished(),
+            "the second push waits on the full channel"
+        );
+        out.settle(Ok(0));
+        assert_eq!(drain(&out), b"first", "nothing after the close");
+        assert!(
+            !producer.join().unwrap(),
+            "the waiting push was not delivered"
+        );
+        assert_eq!(out.offset(), 5);
+    }
+
     #[test]
     fn pty_holder_bounded_output_blocks_the_producer_instead_of_growing() {
         let out = std::sync::Arc::new(PaneOutput::new_bounded("k", 0, marker, 2));
@@ -409,7 +471,10 @@ mod tests {
             })
         };
         std::thread::sleep(Duration::from_millis(100));
-        assert!(out.offset() <= 30, "the producer ran ahead of a full channel");
+        assert!(
+            out.offset() <= 30,
+            "the producer ran ahead of a full channel"
+        );
         let mut r = out.take_reader().unwrap();
         let mut buf = [0u8; 100];
         let mut got = 0;
