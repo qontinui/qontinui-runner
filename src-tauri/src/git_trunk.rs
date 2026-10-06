@@ -172,12 +172,13 @@ fn host_git() -> Command {
 /// always misses while reading like coverage.
 ///
 /// The repository-local scrub ([`scrub_repo_local_git_env`]) covers ONLY the
-/// git reads made here — the trunk NAME. A caller that then runs its own git
-/// in the same repo (`fleet::resolve_default_branch`'s behind-check and pull
-/// callers, `agent_worktree`'s fork-base `rev-parse`) still inherits whatever this process inherited, so under an inherited
-/// `GIT_DIR` it would act on the caller's repo with a correctly-named trunk.
-/// Scrubbing those callers' own git is a recorded follow-up, not something
-/// this function provides.
+/// git reads made here — the trunk NAME. This function's callers
+/// (`census::compute_landed_in_main` and its sibling census reads) then run
+/// their own git in the same repo, which still inherits whatever this process
+/// inherited, so under an inherited `GIT_DIR` they would act on the caller's
+/// repo with a correctly-named trunk. Scrubbing those callers' own git is not
+/// done here; it is recorded as coord finding
+/// `f110e194-7178-40ff-8952-906e238ba3aa`.
 pub(crate) fn resolve_trunk_ref(repo: &Path) -> Option<String> {
     resolve_trunk_ref_on(repo, &host_git)
 }
@@ -228,7 +229,10 @@ fn resolve_trunk_ref_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<String
 /// call site rather than buried in here.
 ///
 /// As with [`resolve_trunk_ref`], the scrub fixes only this name read, not
-/// any git the caller runs afterwards.
+/// any git the caller runs afterwards: `fleet::resolve_default_branch`'s
+/// behind-check and pull callers and `agent_worktree`'s fork-base `rev-parse`
+/// still inherit this process's git environment (coord finding
+/// `f110e194-7178-40ff-8952-906e238ba3aa`).
 pub(crate) fn resolve_trunk_branch(repo: &Path) -> Option<String> {
     resolve_trunk_branch_on(repo, &host_git)
 }
@@ -447,9 +451,21 @@ mod tests {
     #[test]
     fn an_env_injected_safe_directory_still_resolves_the_trunk() {
         let repo = repo_with_trunk("main");
+        // Both arms run against a KNOWN config: an empty global file, no
+        // system file, and none of the box's own command-scope overlay (which
+        // the scrub now passes through). A CI image with `safe.directory=*`
+        // in its global or system config would otherwise satisfy the control.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let empty_global = cfg_dir.path().join("empty-global.gitconfig");
+        std::fs::write(&empty_global, "").unwrap();
         let foreign = |overlay: &'static [(&'static str, &'static str)]| {
+            let empty_global = empty_global.clone();
             move || {
                 let mut cmd = host_git();
+                cmd.env("GIT_CONFIG_GLOBAL", &empty_global)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env_remove("GIT_CONFIG_PARAMETERS")
+                    .env_remove("GIT_CONFIG_COUNT");
                 cmd.env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
                 for (k, v) in overlay {
                     cmd.env(k, v);
