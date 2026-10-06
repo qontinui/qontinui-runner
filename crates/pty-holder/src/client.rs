@@ -23,8 +23,10 @@
 //! [`Client::attach`] (protocol version 2) turns a connection into the pane's
 //! data path, split in two so one thread can read while another writes:
 //! [`StreamReader::next_event`] yields output (with its absolute offset), loss
-//! reports, replies and the final exit; [`StreamWriter`] sends input, resize,
-//! pause/resume, kill and detach. Its requests are fire-and-forget on the
+//! reports, replies and the final exit; [`StreamWriter`] sends resize,
+//! pause/resume, kill and detach. Input goes on a SECOND connection,
+//! [`Client::open_input`] → [`InputStream`], so input the child is slow to read
+//! never queues the attached connection's control verbs. Its requests are fire-and-forget on the
 //! writer side; their `ok` replies arrive on the reader as [`Event::Reply`].
 //!
 //! DATA-PATH module: `source_guard` bans text decoding here.
@@ -34,7 +36,9 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::frame::{parse_output, read_frame, write_frame, Frame, KIND_CONTROL, KIND_DATA, KIND_OUTPUT};
+use crate::frame::{
+    parse_output, read_frame, write_frame, Frame, KIND_CONTROL, KIND_DATA, KIND_OUTPUT,
+};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
 use crate::protocol::{
@@ -414,12 +418,6 @@ pub struct StreamWriter {
 }
 
 impl StreamWriter {
-    /// Raw input bytes for the child. No reply.
-    pub fn input(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), ConnectError> {
-        write_frame(&mut DeadlineIo::new(&mut self.conn, deadline), KIND_DATA, bytes)?;
-        Ok(())
-    }
-
     /// Send a request; its reply arrives on the [`StreamReader`].
     pub fn request(&mut self, req: &Request, deadline: Instant) -> Result<(), ConnectError> {
         send(&mut self.conn, req, deadline)?;
@@ -447,10 +445,10 @@ impl StreamWriter {
         self.request(&Request::Detach, deadline)
     }
 
-    /// A second handle on this connection that can end it while this writer
-    /// is blocked mid-write (a full socket behind a child that does not read
-    /// its stdin). Ending the connection is itself a detach: the holder keeps
-    /// the child.
+    /// A second handle on this connection that can end it while a writer or
+    /// reader on it is blocked. Ending the connection is itself a detach: the
+    /// holder keeps the child. See [`ShutdownHandle::shutdown`] for what that
+    /// takes on each platform.
     pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
         Ok(ShutdownHandle {
             conn: self.conn.try_clone()?,
@@ -458,16 +456,80 @@ impl StreamWriter {
     }
 }
 
-/// See [`StreamWriter::shutdown_handle`].
+/// See [`StreamWriter::shutdown_handle`] / [`InputStream::shutdown_handle`].
 #[derive(Debug)]
 pub struct ShutdownHandle {
     conn: Conn,
 }
 
 impl ShutdownHandle {
-    /// End the connection in both directions, for every handle on it.
-    pub fn shutdown(&self) {
+    /// Unblock every handle on this connection, and end it.
+    ///
+    /// - **Unix:** `shutdown(SHUT_RDWR)` on the socket — every handle on it
+    ///   sees EOF / `EPIPE` at once and the holder reads EOF.
+    /// - **Windows:** a client cannot disconnect a named pipe, and the pipe
+    ///   stays open while ANY handle on it is open. `CancelIoEx` on this
+    ///   handle cancels the I/O pending on the pipe's file object — the
+    ///   reader's and the writer's included, since `try_clone` duplicates the
+    ///   handle onto the same file object — so their calls fail and return.
+    ///   The holder sees the connection end only once every handle (reader,
+    ///   writer and this one) has been DROPPED; the caller must drop them.
+    ///   (UNRUN on Windows: type-checked only.)
+    ///
+    /// Consumes the handle so it cannot be the one that keeps a Windows pipe
+    /// alive.
+    pub fn shutdown(self) {
         self.conn.shutdown();
+    }
+}
+
+impl Client {
+    /// Make this connection the pane's INPUT stream (protocol version 2): send
+    /// `open_input` and read `ok`. Consumes the client. Input never rides the
+    /// attached connection, so a child slow to read its stdin back-pressures
+    /// only this stream, never the attached one's control verbs.
+    pub fn open_input(mut self, deadline: Instant) -> Result<InputStream, ConnectError> {
+        self.check()?;
+        if self.ack.version < DATA_PATH_VERSION {
+            return Err(ConnectError::Protocol(format!(
+                "holder negotiated version {}; input needs {DATA_PATH_VERSION}",
+                self.ack.version
+            )));
+        }
+        match self.request(&Request::OpenInput, deadline)? {
+            Reply::Ok { verb } if verb == "open_input" => Ok(InputStream { conn: self.conn }),
+            other => Err(ConnectError::Protocol(format!(
+                "expected ok {{open_input}}, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// A pane's input stream. See [`Client::open_input`]. Drop it to close it; the
+/// child keeps running.
+#[derive(Debug)]
+pub struct InputStream {
+    conn: Conn,
+}
+
+impl InputStream {
+    /// Raw input bytes for the child. No reply. Bounded by `deadline`; waits
+    /// while the child is slow to read (the holder's input queue is full).
+    /// Any failure leaves the stream position unknown: drop it and reopen.
+    pub fn input(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), ConnectError> {
+        write_frame(
+            &mut DeadlineIo::new(&mut self.conn, deadline),
+            KIND_DATA,
+            bytes,
+        )?;
+        Ok(())
+    }
+
+    /// See [`StreamWriter::shutdown_handle`].
+    pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
+        Ok(ShutdownHandle {
+            conn: self.conn.try_clone()?,
+        })
     }
 }
 
