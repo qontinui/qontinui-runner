@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TerminalExitEvent, TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
+import type { ResumeNotTypedReason } from "./resumeVerification";
 import {
   buildSessionCloseArgs,
   type FrontendSessionCloseReason,
@@ -45,6 +46,14 @@ export interface TerminalTab {
    * restore-pending marker so the liveness poll can't flip it `poll-dead`.
    */
   resumeFailed?: boolean;
+  /**
+   * Set beside `resumeFailed` when the resume command was deliberately NOT
+   * typed — the pane already runs a claude that is not provably this session,
+   * or its process table could not be read (see `ResumeNotTypedReason`).
+   * Absent means the command was typed and no handshake appeared. Lets the
+   * banner say which happened, and what the operator must do before Retry can work.
+   */
+  resumeFailedReason?: ResumeNotTypedReason;
   /**
    * True when a boot-restore re-created this tab for a record that restores
    * TERMINAL-ONLY (Phase 5 honest tiers): the terminal + cwd are back but the
@@ -1523,6 +1532,7 @@ export function useTerminalManager(
           | "claudeConfigDir"
           | "isReconnecting"
           | "resumeFailed"
+          | "resumeFailedReason"
           | "restoreTerminalOnly"
         >
       >,

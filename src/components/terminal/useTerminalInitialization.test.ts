@@ -389,15 +389,57 @@ describe("runVerifiedResume", () => {
     });
     expect(out).toBe("failed");
     expect(writes).toEqual([]);
+    // The reason rides onto the tab so the banner can say nothing was typed,
+    // and that Retry will refuse again until that claude exits.
     expect(updateTab).toHaveBeenCalledWith("tab-1", {
       isReconnecting: false,
       resumeFailed: true,
+      resumeFailedReason: "pane-occupied",
     });
     expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith(
       "terminal_session_clear_restore_pending",
       expect.anything(),
     );
+  });
+
+  it("an unreadable pane → resumeFailedReason pane-unreadable, and a caller onNotTyped still fires", async () => {
+    const updateTab = vi.fn();
+    const onNotTyped = vi.fn();
+    await runVerifiedResume({
+      terminalRefs: refsWithHandle([]),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 5,
+        intervalMs: 1,
+        readTail: async () => "",
+        probeClaude: async () => ({ state: "unknown", sessionIds: [] }),
+        onNotTyped,
+      },
+    });
+    expect(onNotTyped).toHaveBeenCalledWith("pane-unreadable");
+    expect(updateTab).toHaveBeenCalledWith("tab-1", {
+      isReconnecting: false,
+      resumeFailed: true,
+      resumeFailedReason: "pane-unreadable",
+    });
+  });
+
+  it("a typed resume whose handshake never appears carries NO reason", async () => {
+    const updateTab = vi.fn();
+    await runVerifiedResume({
+      terminalRefs: refsWithHandle([]),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      verifyOptions: { settleMs: 1, timeoutMs: 5, intervalMs: 1, readTail: async () => "$ " },
+    });
+    const last = updateTab.mock.calls.at(-1)?.[1];
+    expect(last).toMatchObject({ resumeFailed: true });
+    expect(last.resumeFailedReason).toBeUndefined();
   });
 
   it("verified handshake → clears isReconnecting AND the backend restore-pending marker", async () => {
