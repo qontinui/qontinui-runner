@@ -9,8 +9,8 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
 | `repo_layout` | 56 | 69 | 56 | 0 | 0 | 0 |
-| `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
-| `supervisor_dependency` | 50 | 50 | 0 | 40 | 4 | 6 |
+| `dev_ports` | 26 | 26 | 26 | 0 | 0 | 0 |
+| `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
 | `os_bound_tooling` | 102 | 103 | 102 | 0 | 0 | 0 |
@@ -77,13 +77,12 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workspace_paths.rs` | `persist_resolved_workspace_root` | `'paths.workspace_root' was left unset. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | `workspace_root` |
 
-## `dev_ports` (27 rows)
+## `dev_ports` (26 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"http://localhost:3001",` | 1 | unreviewed |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"http://localhost:9875",` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue...` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `generate_mcp_tool_context` | `{"tool": "mcp__qontinui__sdk_connect", "url": "http://localhost:3001"}` | 1 | unreviewed |
 | `src/mcp/backend_relay.rs` | `relay_loop` | `http://127.0.0.1:8000 on a DEBUG build) and that it is up.` | 1 | unreviewed |
 | `src/mcp/origin_guard.rs` | `const DEFAULT_TRUSTED_ORIGINS` | `"http://127.0.0.1:3001",` | 1 | unreviewed |
@@ -109,7 +108,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
-## `supervisor_dependency` (50 rows)
+## `supervisor_dependency` (57 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -126,11 +125,18 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/config_report_cmd.rs` | `supervisor_injected_reading` | `pub(crate) fn supervisor_injected_reading(` | 1 | fallback_correct — Reports which supervisor-injected env names are present in THIS process's env; never contacts the supervisor. '0 present' is the correct reading on an operator box. |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"http://localhost:9875",` | 1 | dev_only_surface — Registered only when <workspace-root>/qontinui-supervisor/frontend exists, i.e. only on a developer workspace. |
 | `src/env_agent/collectors.rs` | `const KNOWN_DEV_PORTS` | `("supervisor", 9875),` | 1 | dev_only_surface — Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box. |
-| `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `**Supervisor API (port 9875):**` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
-| `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"rebuild": true, "trig...` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
-| `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue...` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
-| `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervi...` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `**About '"rebuild": true':** it compiles a fresh 'origin/main', NOT your unmerged change; the runner is down for the whole build (it can ...` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `**Supervisor API ({{supervisor_base}}):**` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer 'cargo ...` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "rebuild": true}'` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true}'` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `reject_legacy_supervisor_body` | `fn reject_legacy_supervisor_body(` | 1 | fallback_correct — Refuses a served ai-session-rules body that still carries the legacy supervisor recipe, so the supervisor-available arm renders only the gated compiled-in addendum. |
 | `src/mcp/ai_session.rs` | `run_prompt` | `spawn_blocking_tracked(super::auto_continue::check_supervisor_available)` | 1 | fallback_correct — Runs check_supervisor_available on a blocking thread and passes == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent, unknown (None) or a failed join selects the supervisor-DOWN rules block. |
+| `src/mcp/ai_session.rs` | `runner_rules_prefix` | `let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);` | 1 | fallback_correct — Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone. |
+| `src/mcp/ai_session.rs` | `runner_rules_prefix` | `let served = reject_legacy_supervisor_body(` | 1 | fallback_correct — Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone. |
+| `src/mcp/ai_session.rs` | `supervisor_restart_recipe` | `.replace("{{supervisor_base}}", supervisor_base.trim_end_matches('/'))` | 1 | fallback_correct — Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm. |
+| `src/mcp/ai_session.rs` | `supervisor_restart_recipe` | `pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {` | 1 | fallback_correct — Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm. |
 | `src/mcp/app_discovery.rs` | `desktop_ports_merged` | `let (supervisor, user) = tokio::join!(observed_supervisor_port(), user_discovery_ports());` | 1 | fallback_correct — Adds the supervisor's port to the desktop scan only when the observation reports observed=true; no supervisor port is hard-coded (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B2). |
 | `src/mcp/app_discovery.rs` | `observed_supervisor_port` | `async fn observed_supervisor_port() -> Option<u16> {` | 1 | fallback_correct — Runs the one supervisor probe off the async runtime; a failed join or a not-observed/unknown verdict yields None, so nothing extra is scanned. |
 | `src/mcp/app_discovery.rs` | `observed_supervisor_port` | `let obs = spawn_blocking_tracked(crate::mcp::auto_continue::observe_supervisor)` | 1 | fallback_correct — Runs the one supervisor probe off the async runtime; a failed join or a not-observed/unknown verdict yields None, so nothing extra is scanned. |
@@ -260,7 +266,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `copy_exe_stub` | `cfg(windows)-only fn 'copy_exe_stub' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `exe_shadow_needed` | `cfg(windows)-only fn 'exe_shadow_needed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `locate_stub_exe` | `cfg(windows)-only fn 'locate_stub_exe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `'''powershell` | 1 | unreviewed |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `From Windows PowerShell spell it 'curl.exe' (bare 'curl' there is an alias of 'Invoke-WebRequest'), or use 'Invoke-RestMethod -Method Pos...` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `Err(e) => error!("Shutdown: failed to taskkill PID {pid}: {e}"),` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `Shutdown: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `let mut cmd = crate::process_helpers::no_window("taskkill");` | 1 | unreviewed |
