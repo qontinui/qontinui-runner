@@ -671,13 +671,6 @@ mod tests {
         assert!(r.present.is_none());
     }
 
-    /// `probe_git_branch_state` resolves the trunk through
-    /// [`crate::git_trunk`], which runs git OUTSIDE this module's
-    /// [`READ_ONLY_GIT`] gate. The module's contract is that a probe never
-    /// writes, so every subcommand the resolver can run must be one this
-    /// allowlist already permits. Pin that containment here: adding a rung
-    /// over there which runs, say, `fetch` would otherwise silently break
-    /// the guarantee the module header states.
     const UNPUSHED_TARGET_ENV: &str = "QONTINUI_TEST_UNPUSHED_TARGET";
 
     /// The `has_unpushed` reading of a `git cherry` answer, exactly as
@@ -746,6 +739,13 @@ mod tests {
         );
     }
 
+    /// `probe_git_branch_state` resolves the trunk through
+    /// [`crate::git_trunk`], which runs git OUTSIDE this module's
+    /// [`READ_ONLY_GIT`] gate. The module's contract is that a probe never
+    /// writes, so every subcommand the resolver can run must be one this
+    /// allowlist already permits. Pin that containment here: adding a rung
+    /// over there which runs, say, `fetch` would otherwise silently break
+    /// the guarantee the module header states.
     #[test]
     fn trunk_subcommands_are_read_only() {
         for sub in crate::git_trunk::TRUNK_GIT_SUBCOMMANDS {

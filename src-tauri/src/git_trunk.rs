@@ -53,9 +53,7 @@ pub(crate) const TRUNK_GIT_SUBCOMMANDS: &[&str] = &["symbolic-ref", "rev-parse"]
 // `qontinui_runner_lib::git_posture`, because `process_helpers::no_window`
 // (compiled into both crates) applies the same scrub to every git the runner
 // starts.
-use qontinui_runner_lib::git_posture::{
-    scrub_repo_local_git_env, COMMAND_SCOPE_GIT_CONFIG_ENV, REPO_LOCAL_GIT_ENV,
-};
+use qontinui_runner_lib::git_posture::scrub_repo_local_git_env;
 
 /// Run a git query against `repo`, returning trimmed stdout on success.
 ///
@@ -314,9 +312,9 @@ pub(crate) mod inherited_git_dir_reexec {
             "--nocapture",
             "--test-threads=1",
         ]);
-        for var in super::REPO_LOCAL_GIT_ENV
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV
             .iter()
-            .chain(super::COMMAND_SCOPE_GIT_CONFIG_ENV)
+            .chain(qontinui_runner_lib::git_posture::COMMAND_SCOPE_GIT_CONFIG_ENV)
         {
             cmd.env_remove(var);
         }
