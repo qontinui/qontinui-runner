@@ -277,10 +277,11 @@ const SESSION_VISIBILITY_ATTEMPTS: u32 = 10;
 pub(crate) async fn mint_attach_grant_awaiting_session(
     coord_base: &str,
     session_id: uuid::Uuid,
+    scope: crate::auth::TenantScope,
 ) -> Result<AttachGrantResponse, String> {
     let mut last = String::new();
     for attempt in 0..SESSION_VISIBILITY_ATTEMPTS {
-        match mint_attach_grant(coord_base, session_id).await {
+        match mint_attach_grant(coord_base, session_id, scope).await {
             Ok(minted) => return Ok(minted),
             Err(e) if e.starts_with("remote_attach:session_not_found") => {
                 last = e;
@@ -297,9 +298,16 @@ pub(crate) async fn mint_attach_grant_awaiting_session(
     ))
 }
 
+/// `POST /coord/sessions/{id}/attach-grants`, presenting `scope`'s credential.
+///
+/// coord resolves the session WITHIN the presented principal's tenant — a
+/// session in another tenant is `404 session_not_found` — so the scope must be
+/// the tenant the row was LISTED under. Callers resolve it with
+/// [`super::fleet_sessions::fleet_scope`], the same rule the Fleet read uses.
 pub(crate) async fn mint_attach_grant(
     coord_base: &str,
     session_id: uuid::Uuid,
+    scope: crate::auth::TenantScope,
 ) -> Result<AttachGrantResponse, String> {
     let Some(http) = crate::coord_http::coord_client() else {
         return Err(
@@ -312,7 +320,7 @@ pub(crate) async fn mint_attach_grant(
         coord_base.trim_end_matches('/'),
         session_id
     );
-    let resp = crate::coord_http::coord_post(http, &url)
+    let resp = crate::coord_http::coord_post_for(http, &url, scope)
         .timeout(Duration::from_secs(15))
         .json(&json!({ "terminal_id": null }))
         .send()
@@ -404,16 +412,18 @@ pub async fn terminal_attach_remote(
     device_label: Option<String>,
     session_label: Option<String>,
     working_dir: Option<String>,
+    tenant: Option<String>,
 ) -> Result<RemoteTerminalInfo, String> {
     let session_uuid = uuid::Uuid::parse_str(session_id.trim()).map_err(|e| {
         format!("remote_attach:invalid_session_id: {session_id:?} is not a session uuid: {e}")
     })?;
+    let scope = grant_scope(tenant).await?;
     let cols = cols.unwrap_or(120);
     let rows = rows.unwrap_or(30);
 
     let base = coord_base_for(&app_handle);
     crate::mcp::remote_interactivity::set_coord_base(&base);
-    let minted = mint_attach_grant(&base, session_uuid).await?;
+    let minted = mint_attach_grant(&base, session_uuid, scope).await?;
     if !coord_places_session_on(&device_id, minted.target_device_id.as_deref()) {
         let target = minted.target_device_id.as_deref().unwrap_or("<unreported>");
         let asked = device_id.trim();
@@ -443,9 +453,39 @@ pub async fn terminal_attach_remote(
             device_label,
             session_label,
             working_dir,
+            tenant: super::fleet_sessions::scope_tenant(scope),
         },
     )
     .await
+}
+
+/// The tenant a grant mint presents, decided by
+/// [`super::fleet_sessions::fleet_scope`] — the rule the Fleet read that listed
+/// the row used — off the async runtime (it reads machine.json and the
+/// credential store). Refusals keep `fleet_scope`'s `<code>: <detail>` shape
+/// with the `fleet_sessions:` prefix stripped, so each caller re-prefixes them
+/// in its own voice.
+pub(crate) async fn grant_scope_or_refusal(
+    tenant: Option<String>,
+) -> Result<crate::auth::TenantScope, String> {
+    spawn_blocking_tracked(move || super::fleet_sessions::fleet_scope(tenant.as_deref()))
+        .await
+        .map_err(|e| format!("tenant_resolution_failed: {e}"))?
+        .map_err(|e| {
+            e.strip_prefix("fleet_sessions:")
+                .map(str::to_string)
+                .unwrap_or(e)
+        })
+}
+
+/// [`grant_scope_or_refusal`] in this module's `remote_attach:<code>:` voice,
+/// so the picker's `attachErrorMessage` can lift the code.
+pub(crate) async fn grant_scope(
+    tenant: Option<String>,
+) -> Result<crate::auth::TenantScope, String> {
+    grant_scope_or_refusal(tenant)
+        .await
+        .map_err(|e| format!("remote_attach:{e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +754,10 @@ pub(crate) struct OpenRemoteTab {
     pub device_label: Option<String>,
     pub session_label: Option<String>,
     pub working_dir: Option<String>,
+    /// The tenant the grant was minted under, when one was STATED (`None` ⇒
+    /// the authority order chose). Carried on the tab's identity so a reattach
+    /// mints under the same tenant rather than the device default.
+    pub tenant: Option<String>,
 }
 
 /// Present a minted ATTACH grant through the relay and open the tab around the
@@ -735,6 +779,7 @@ pub(crate) async fn open_remote_tab(
         device_label,
         session_label,
         working_dir,
+        tenant,
     } = req;
     let session_id = session_uuid.to_string();
     // The target learns this grant from coord's push or its own catch-up poll,
@@ -833,6 +878,7 @@ pub(crate) async fn open_remote_tab(
         remote_terminal_id: attached.terminal_id.clone(),
         grant_jti: minted.grant_jti.clone(),
         history_available: pane.history_range().is_some(),
+        tenant,
     };
 
     let io: Arc<dyn PaneIo> = pane.clone();
@@ -1431,6 +1477,7 @@ mod remote_close_tests {
             remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
             grant_jti: "01a0905e".into(),
             history_available: false,
+            tenant: None,
         }
     }
 
@@ -1819,6 +1866,7 @@ mod interactivity_command_tests {
             remote_terminal_id: "rt-1".into(),
             grant_jti: "jti-1".into(),
             history_available: false,
+            tenant: None,
         }
     }
 

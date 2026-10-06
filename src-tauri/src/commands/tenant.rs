@@ -422,6 +422,60 @@ pub(crate) struct ActiveTenantView {
     /// the set [`apply_active_tenant`] validates against. Local file read, no
     /// coord round-trip.
     pub candidates: Vec<String>,
+    /// Per-candidate credential state, one entry per `candidates` member in the
+    /// same order: can this device ACT in that tenant, by
+    /// [`crate::auth::credential_state`] — the rule pinned to agree with
+    /// `select_device_bearer`. A bound tenant can have no usable credential
+    /// (never paired here, or its slot expired), and a selector offering it
+    /// without saying so would hide the 401 its read is going to get.
+    pub credentials: Vec<CandidateCredential>,
+}
+
+/// One bound tenant's credential state — a serializable projection of
+/// [`crate::auth::TenantCredential`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CandidateCredential {
+    pub tenant: String,
+    /// `Some(true)` the selector hands out a bearer; `Some(false)` it refuses;
+    /// `None` UNKNOWN (a store read failed) — never defaulted to a "no".
+    pub can_act: Option<bool>,
+    /// The tenant's OWN slot: `"usable"` | `"present-but-dead"` | `"absent"` |
+    /// `"unreadable"` ([`crate::auth::SlotState::label`]).
+    pub slot: &'static str,
+    /// True when `can_act` rests on the legacy DEFAULT slot rather than the
+    /// tenant's own — it works; re-pairing it is not owed.
+    pub via_default_slot: bool,
+}
+
+/// Classify every candidate against one credential store, by the shared rule.
+/// The legacy default slot is read once, and only the default tenant may lean
+/// on it — exactly as `pair::reconcile_paired_bindings_with` and the selector do.
+pub(crate) fn candidate_credentials(
+    am: &crate::auth::AuthManager,
+    candidates: &[uuid::Uuid],
+    default_tenant: Option<uuid::Uuid>,
+) -> Vec<CandidateCredential> {
+    let legacy = crate::auth::read_legacy_slot(am);
+    let default_slot = legacy.state();
+    let default_slot_serves =
+        crate::auth::legacy_slot_serves_default_tenant(am, &legacy, default_tenant.as_ref());
+    candidates
+        .iter()
+        .map(|t| {
+            let cred = crate::auth::credential_state(
+                crate::auth::read_tenant_slot(am, t).state(),
+                default_tenant.as_ref() == Some(t),
+                default_slot,
+                default_slot_serves,
+            );
+            CandidateCredential {
+                tenant: t.to_string(),
+                can_act: cred.can_act(),
+                slot: cred.slot.label(),
+                via_default_slot: cred.via_default_slot,
+            }
+        })
+        .collect()
 }
 
 fn pin_label(pin: qontinui_runner_lib::tenant_pin::TenantPin) -> &'static str {
@@ -452,16 +506,20 @@ pub(crate) fn active_tenant_view() -> Result<ActiveTenantView, String> {
 
     // The device's bound tenants live locally in `paired_user.json` v2 — the
     // switcher must render OFFLINE, so this is a local read, not a coord query.
-    let candidates: Vec<String> = qontinui_runner_lib::pair::read_paired_binding_tenant_ids()
-        .into_iter()
-        .map(|t| t.to_string())
-        .collect();
+    let bound = qontinui_runner_lib::pair::read_paired_binding_tenant_ids();
+    let candidates: Vec<String> = bound.iter().map(|t| t.to_string()).collect();
+    // The DEFAULT binding (not the pin): it is the one the legacy slot serves.
+    let default_tenant = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk()
+        .and_then(|t| uuid::Uuid::parse_str(t.trim()).ok());
+    let credentials =
+        candidate_credentials(&crate::auth::AuthManager::new(), &bound, default_tenant);
 
     Ok(ActiveTenantView {
         active_tenant_id: tenant,
         source,
         pin: pin_label(qontinui_runner_lib::tenant_pin::resolve_tenant_pin()),
         candidates,
+        credentials,
     })
 }
 
@@ -608,7 +666,7 @@ pub(crate) fn current_machine_pin() -> Option<String> {
 /// new sessions and device-level surfaces (Phase 8b semantics; existing
 /// sessions keep their own recorded tenant). See [`active_tenant_view`].
 ///
-/// Returns `{ active_tenant_id, source, pin, candidates }`. The frontend
+/// Returns `{ active_tenant_id, source, pin, candidates, credentials }`. The frontend
 /// treats `candidates.length <= 1` as "operator is in exactly one tenant" and
 /// elides the switcher accordingly.
 #[tauri::command]
@@ -638,6 +696,67 @@ pub fn set_active_tenant(tenant_id: String) -> Result<CommandResponse, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// An unsigned JWT with only `exp` — enough for the slot classifier, which
+    /// reads expiry and nothing else for a per-tenant slot.
+    fn jwt_expiring(offset_secs: i64) -> String {
+        use base64::Engine as _;
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let exp = chrono::Utc::now().timestamp() + offset_secs;
+        format!(
+            "{}.{}.sig",
+            enc(br#"{"alg":"none","typ":"JWT"}"#),
+            enc(format!(r#"{{"sub":"t","exp":{exp}}}"#).as_bytes())
+        )
+    }
+
+    /// The Fleet view's selector renders each bound tenant's credential state,
+    /// so the projection must say live / expired / never-paired apart — and in
+    /// `candidates` order, which is how the frontend zips the two.
+    #[test]
+    fn candidate_credentials_tell_live_expired_and_absent_apart() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let dir = tempdir().unwrap();
+        let am = crate::auth::AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(dir.path().join("creds.enc")).unwrap(),
+        );
+        let live = uuid::Uuid::from_u128(0xA1);
+        let dead = uuid::Uuid::from_u128(0xB1);
+        let absent = uuid::Uuid::from_u128(0xC1);
+        am.store_tenant_device_jwt(&live, &jwt_expiring(3 * 3600))
+            .unwrap();
+        am.store_tenant_device_jwt(&dead, &jwt_expiring(-3600))
+            .unwrap();
+
+        let got = candidate_credentials(&am, &[live, dead, absent], Some(absent));
+        let view: Vec<(String, Option<bool>, &str)> = got
+            .iter()
+            .map(|c| (c.tenant.clone(), c.can_act, c.slot))
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                (live.to_string(), Some(true), "usable"),
+                (dead.to_string(), Some(false), "present-but-dead"),
+                // The default tenant, with no legacy token to fall back on:
+                // a measured "cannot act", not an unknown.
+                (absent.to_string(), Some(false), "absent"),
+            ]
+        );
+        assert!(got.iter().all(|c| !c.via_default_slot));
+        // Serialized the way `GetActiveTenantResponse.credentials` reads it.
+        let json = serde_json::to_value(&got[1]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "tenant": dead.to_string(),
+                "can_act": false,
+                "slot": "present-but-dead",
+                "via_default_slot": false,
+            })
+        );
+    }
 
     #[test]
     fn write_then_read_round_trips() {
