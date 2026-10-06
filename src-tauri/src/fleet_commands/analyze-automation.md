@@ -257,9 +257,12 @@ $PWD/qontinui-claude-config/scripts/restart-services.sh backend
 # ONLY if frontend code (qontinui-web/frontend) was changed:
 $PWD/qontinui-claude-config/scripts/restart-services.sh frontend clean
 
-# ONLY if qontinui-runner Rust code (src-tauri/) was changed - requires full restart:
-powershell.exe -Command "Stop-Process -Name qontinui-runner -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; cd '$PWD\qontinui-runner'; Start-Process -FilePath 'npm.cmd' -ArgumentList 'run','tauri','dev' -WindowStyle Normal"
-# IMPORTANT: After runner restart, restore config/workflow/monitor by calling:
+# ONLY if qontinui-runner Rust code (src-tauri/) was changed - a restart is the OPERATOR's:
+# Never restart, kill or rebuild a running runner (served policy production-and-cost
+# runner-lifecycle): READ whether a restart is safe, report it, the operator restarts.
+curl -sS --max-time 15 http://127.0.0.1:9876/restart-readiness
+# Report safe_to_restart, terminal_sessions.count, ai_sessions.count, reason; a failed read is UNKNOWN.
+# IMPORTANT: After the operator restarts the runner, restore config/workflow/monitor by calling:
 python $PWD/qontinui-claude-config/scripts/qontinui-http.py load-last-config
 ```
 
