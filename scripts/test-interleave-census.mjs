@@ -20,6 +20,12 @@
 //
 //   SUITE-ONLY           red ≥ 1 time in the suite, 0 solo failures — shares
 //                        process state with a concurrent test. THE CLASS.
+//   CROSS-PROCESS        (`--processes N` only) red ≥ 1 time in the N-process
+//                        arm, green in every 1-process suite run, 0 solo
+//                        failures — shares ON-DISK state with a concurrent test
+//                        PROCESS. A test red in BOTH the N-process arm and the
+//                        1-process suite stays SUITE-ONLY: the in-process race
+//                        already explains it.
 //   SOLO-RED             fails alone every time — a real defect or an ambient
 //                        read; not this class.
 //   BOTH-FLAKY           fails in both arms, nondeterministically — timing (the
@@ -90,6 +96,31 @@
 //   directory is named `deps` (see `snapshotExecutables`) — and runs the
 //   copies, which removes the race instead of detecting it.
 //
+// THE CROSS-PROCESS ARM (`--processes N`, default 1)
+//
+//   Plan `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+//   Phase 4. With N > 1, every suite run of every executable is followed by
+//   N copies of that SAME executable run CONCURRENTLY, and every red is still
+//   re-run alone. A test that only reds when another PROCESS of the suite is
+//   running beside it — a fixed temp path, a well-known port, a file under
+//   `$HOME` — is invisible to the 1-process census, because libtest's threads
+//   share the process the race would have to cross. That is the shape agent
+//   boxes hit, where several sessions run the same test binary at once.
+//
+//   EACH process — every concurrent copy, and with N > 1 also the 1-process
+//   suite run and every solo re-run, so the arms differ ONLY in concurrency —
+//   runs with its own env equivalent to `cargo-guard.sh`'s per-process config
+//   sandbox: a fresh temp root with `QONTINUI_CONFIG_DIR=<root>/qontinui`,
+//   `QONTINUI_SECURE_STORAGE_DIR=<root>/secure` and, off Windows,
+//   `XDG_CONFIG_HOME=<root>/xdg` (`sandboxEnvFor`), removed after the run. So
+//   the state this arm finds is state cargo-guard does NOT isolate — which is
+//   the residue worth finding. With N = 1 (the default) nothing is sandboxed
+//   and the behaviour is byte-for-byte the census it always was.
+//
+//   THE NIGHTLY CI CENSUS DOES NOT USE THIS ARM. CI runs one process per leg
+//   on a fresh runner, so there is no concurrent process to share disk with;
+//   `flake-escalation.yml` runs the default N = 1. The arm is for agent boxes.
+//
 // HOW A RUN IS PARSED
 //
 //   With `parseTestOutcomes` from `ci-flake-analyze.mjs` — the one parser this
@@ -106,18 +137,20 @@
 //        [--cargo cargo] [--exe-list <file>] [--budget-seconds N]
 //        [--format pretty|json] [--out <path>]
 //        [--run-timeout-seconds 1800] [--solo-timeout-seconds 300]
-//        [--snapshot-dir <dir>]
+//        [--snapshot-dir <dir>] [--processes N]
 //   node scripts/test-interleave-census.mjs --classify-from-log <log> …
 //
 // The json (`--format json`, or `--out <path>`) is the inventory artifact:
 // header {tree_sha, hostname, runs, solo_runs, started_at, finished_at,
 // executables[], unparsed[], …} and per test id {suite_runs, suite_failures,
-// solo_runs, solo_failures, label, reason, sample_panic, executable}.
+// solo_runs, solo_failures, label, reason, sample_panic, executable}; with
+// `--processes N` > 1 the header carries `processes` and each test also
+// `process_runs` / `process_failures` (one run = one concurrent copy).
 
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { hostname as osHostname } from "node:os";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { hostname as osHostname, tmpdir as osTmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs as nodeParseArgs } from "node:util";
@@ -136,6 +169,7 @@ import {
 
 export const LABEL = Object.freeze({
   SUITE_ONLY: "SUITE-ONLY",
+  CROSS_PROCESS: "CROSS-PROCESS",
   SOLO_RED: "SOLO-RED",
   BOTH_FLAKY: "BOTH-FLAKY",
   UNRESOLVED: "UNRESOLVED",
@@ -148,6 +182,7 @@ export const LABEL = Object.freeze({
 /** The one-line meaning printed beside each label. */
 export const LABEL_SENTENCE = Object.freeze({
   [LABEL.SUITE_ONLY]: "shares process state with a concurrent test",
+  [LABEL.CROSS_PROCESS]: "shares on-disk state with a concurrent test PROCESS",
   [LABEL.SOLO_RED]:
     "fails alone — a real defect or an ambient read, not the shared-state class",
   [LABEL.BOTH_FLAKY]: "fails in both arms — timing, not the shared-state class",
@@ -168,6 +203,11 @@ export const DOSSIER_SLUG = "runner-tests-share-in-process-mutable-state";
  * token; every non-answer (UNRESOLVED, UNRESOLVED (budget), UNPARSED, GREEN,
  * or a label this build does not know) is `null`, so a downstream reader can
  * never mistake "could not classify" for a class.
+ *
+ * CROSS-PROCESS deliberately has no token yet: it is minted only by the
+ * `--processes N` arm, which the nightly CI census — the producer the ingest
+ * reads — never runs, so a token would name a class no row can carry. Mint one
+ * together with the first consumer.
  */
 export const CLASSIFICATION_TOKEN = Object.freeze({
   [LABEL.SUITE_ONLY]: "suite_only",
@@ -518,7 +558,13 @@ export function diffFailureSets(runs) {
 /**
  * The label matrix. Total over its inputs; every arm names its reason.
  *
- * @param {{suiteRuns: number, suiteFailures: number, soloRuns: number, soloFailures: number, soloUnparsed?: number, unresolvedReason?: string|null, budgetExhausted?: boolean}} rec
+ * `processRuns` / `processFailures` are the `--processes N` arm's counts (one
+ * run = one concurrent copy); both 0 when the arm did not run, and then every
+ * label and reason is exactly what it was before the arm existed. A test red
+ * ONLY in that arm and green alone is CROSS-PROCESS; red in the 1-process
+ * suite as well it stays SUITE-ONLY.
+ *
+ * @param {{suiteRuns: number, suiteFailures: number, soloRuns: number, soloFailures: number, soloUnparsed?: number, unresolvedReason?: string|null, budgetExhausted?: boolean, processRuns?: number, processFailures?: number}} rec
  * @returns {{label: string, reason: string}}
  */
 export function labelFor({
@@ -529,15 +575,20 @@ export function labelFor({
   soloUnparsed = 0,
   unresolvedReason = null,
   budgetExhausted = false,
+  processRuns = 0,
+  processFailures = 0,
 }) {
-  if (suiteFailures === 0) {
-    return { label: LABEL.GREEN, reason: `green in ${suiteRuns}/${suiteRuns} suite run(s)` };
+  // Appended to every count-bearing reason when the arm ran, so a reason
+  // still names every count it was derived from.
+  const procNote = processRuns > 0 ? `, red ${processFailures}/${processRuns} across concurrent processes` : "";
+  if (suiteFailures === 0 && processFailures === 0) {
+    return { label: LABEL.GREEN, reason: `green in ${suiteRuns}/${suiteRuns} suite run(s)${procNote}` };
   }
   if (unresolvedReason) return { label: LABEL.UNRESOLVED, reason: unresolvedReason };
   if (budgetExhausted) {
     return {
       label: LABEL.UNRESOLVED_BUDGET,
-      reason: `red ${suiteFailures}/${suiteRuns} in the suite; the --budget-seconds deadline passed before a solo re-run was made`,
+      reason: `red ${suiteFailures}/${suiteRuns} in the suite${procNote}; the --budget-seconds deadline passed before a solo re-run was made`,
     };
   }
   if (soloUnparsed > 0) {
@@ -549,24 +600,30 @@ export function labelFor({
   if (soloRuns === 0) {
     return {
       label: LABEL.UNRESOLVED,
-      reason: `red ${suiteFailures}/${suiteRuns} in the suite; no solo re-run was made`,
+      reason: `red ${suiteFailures}/${suiteRuns} in the suite${procNote}; no solo re-run was made`,
     };
   }
   if (soloFailures === 0) {
+    if (suiteFailures === 0) {
+      return {
+        label: LABEL.CROSS_PROCESS,
+        reason: `red ${processFailures}/${processRuns} across concurrent processes, green ${suiteRuns}/${suiteRuns} in the 1-process suite, green ${soloRuns}/${soloRuns} alone`,
+      };
+    }
     return {
       label: LABEL.SUITE_ONLY,
-      reason: `red ${suiteFailures}/${suiteRuns} in the suite, green ${soloRuns}/${soloRuns} alone`,
+      reason: `red ${suiteFailures}/${suiteRuns} in the suite${procNote}, green ${soloRuns}/${soloRuns} alone`,
     };
   }
   if (soloFailures === soloRuns) {
     return {
       label: LABEL.SOLO_RED,
-      reason: `red ${suiteFailures}/${suiteRuns} in the suite, red ${soloFailures}/${soloRuns} alone`,
+      reason: `red ${suiteFailures}/${suiteRuns} in the suite${procNote}, red ${soloFailures}/${soloRuns} alone`,
     };
   }
   return {
     label: LABEL.BOTH_FLAKY,
-    reason: `red ${suiteFailures}/${suiteRuns} in the suite, red ${soloFailures}/${soloRuns} alone`,
+    reason: `red ${suiteFailures}/${suiteRuns} in the suite${procNote}, red ${soloFailures}/${soloRuns} alone`,
   };
 }
 
@@ -586,7 +643,8 @@ export function isByDesignNonAnswer(reason) {
 }
 
 /**
- * Census-mode exit code. 2 takes precedence over 1 (SUITE-ONLY), because a
+ * Census-mode exit code. 2 takes precedence over 1 (SUITE-ONLY, or
+ * CROSS-PROCESS — the same class across a process boundary), because a
  * non-answer can hide either answer. FAIL-CLOSED: 2 on any unparsed run or
  * re-run, on the budget passing before a re-run (`UNRESOLVED (budget)`, or
  * `header.budget_exhausted` — the header flag covers a budget that ran out
@@ -603,7 +661,7 @@ export function exitCodeFor(report) {
   if (report.header.unparsed.length > 0 || labels.includes(LABEL.UNPARSED)) return 2;
   if (report.header.budget_exhausted === true || labels.includes(LABEL.UNRESOLVED_BUDGET)) return 2;
   if (recs.some((t) => t.label === LABEL.UNRESOLVED && !isByDesignNonAnswer(t.reason))) return 2;
-  if (labels.includes(LABEL.SUITE_ONLY)) return 1;
+  if (labels.includes(LABEL.SUITE_ONLY) || labels.includes(LABEL.CROSS_PROCESS)) return 1;
   return 0;
 }
 
@@ -665,6 +723,10 @@ export function formatAnnotation(testId, rec) {
       level = "error";
       body = `${testId} shares process state with a concurrent test — passes alone ${K - rec.solo_failures}/${K}; see dossier ${DOSSIER_SLUG}${panic}`;
       break;
+    case LABEL.CROSS_PROCESS:
+      level = "error";
+      body = `${testId} shares on-disk state with a concurrent test PROCESS — red ${rec.process_failures}/${rec.process_runs} across concurrent processes, green in the 1-process suite, passes alone ${K - rec.solo_failures}/${K}; see dossier ${DOSSIER_SLUG}${panic}`;
+      break;
     case LABEL.SOLO_RED:
       level = "warning";
       body = `${testId} fails alone ${rec.solo_failures}/${K} — a real defect or an ambient read, not the shared-state class${panic}`;
@@ -695,6 +757,9 @@ export function formatTestBlock(testId, rec) {
     `  reason      ${rec.reason}`,
     `  executable  ${rec.executable ?? "<none>"}`,
   ];
+  if (rec.process_runs > 0) {
+    lines.splice(3, 0, `  processes   red ${rec.process_failures}/${rec.process_runs} (concurrent copies)`);
+  }
   if (rec.sample_panic) {
     lines.push("  panic:");
     for (const l of rec.sample_panic.split("\n")) lines.push(`    ${l}`);
@@ -710,7 +775,7 @@ export function formatPretty(report) {
   const h = report.header;
   const out = [];
   out.push(`test-interleave-census — mode ${h.mode}`);
-  out.push(`  tree ${h.tree_sha ?? "<unknown>"}  box ${h.hostname}  runs ${h.runs}  solo-runs ${h.solo_runs}`);
+  out.push(`  tree ${h.tree_sha ?? "<unknown>"}  box ${h.hostname}  runs ${h.runs}  solo-runs ${h.solo_runs}${h.processes > 1 ? `  processes ${h.processes} (each run also ${h.processes} concurrent copies, every process config-sandboxed)` : ""}`);
   out.push(`  started ${h.started_at}  finished ${h.finished_at}`);
   out.push(`  executables ${h.executables.length}${h.skipped_executables.length ? `  (skipped ${h.skipped_executables.length}: ${h.skipped_executables.map((s) => s.executable).join(", ")})` : ""}`);
   if (h.collisions.length) {
@@ -720,7 +785,7 @@ export function formatPretty(report) {
   if (h.unparsed.length) {
     out.push("");
     out.push(`UNPARSED suite runs (fail-closed — never read as green): ${h.unparsed.length}`);
-    for (const u of h.unparsed) out.push(`  run ${u.run}  ${u.executable}  ${u.reason}`);
+    for (const u of h.unparsed) out.push(`  run ${u.run}${u.copy ? ` copy ${u.copy}` : ""}  ${u.executable}  ${u.reason}`);
   }
   out.push("");
   const ids = Object.keys(report.tests).sort();
@@ -921,6 +986,71 @@ function envForExecutable(entry, baseEnv) {
 }
 
 /**
+ * The env overlay `cargo-guard.sh` gives every `test` run (its "config
+ * sandbox"), rooted at `root`: `QONTINUI_CONFIG_DIR=<root>/qontinui`,
+ * `QONTINUI_SECURE_STORAGE_DIR=<root>/secure`, and — off Windows, where
+ * cargo-guard skips it too — `XDG_CONFIG_HOME=<root>/xdg`. Pure.
+ *
+ * @param {string} root
+ * @param {string} [platform]
+ * @returns {Record<string, string>}
+ */
+export function sandboxEnvFor(root, platform = process.platform) {
+  const env = {
+    QONTINUI_CONFIG_DIR: join(root, "qontinui"),
+    QONTINUI_SECURE_STORAGE_DIR: join(root, "secure"),
+  };
+  if (platform !== "win32") env.XDG_CONFIG_HOME = join(root, "xdg");
+  return env;
+}
+
+/**
+ * One fresh per-process config sandbox: a new temp root with the
+ * `sandboxEnvFor` directories created, and a `cleanup` that removes it
+ * (best-effort — a leftover temp dir must not turn a verdict into a crash).
+ * Injectable io so the tests need no filesystem.
+ *
+ * @param {{platform?: string, tmp?: string, mkdtemp?: (prefix: string) => string, mkdir?: (dir: string) => void, rm?: (dir: string) => void}} [io]
+ * @returns {{root: string, env: Record<string, string>, cleanup: () => void}}
+ */
+export function makeProcessSandbox({
+  platform = process.platform,
+  tmp = osTmpdir(),
+  mkdtemp = (prefix) => mkdtempSync(prefix),
+  mkdir = (d) => mkdirSync(d, { recursive: true }),
+  rm = (d) => rmSync(d, { recursive: true, force: true }),
+} = {}) {
+  const root = mkdtemp(join(tmp, "census-config-"));
+  const env = sandboxEnvFor(root, platform);
+  for (const d of Object.values(env)) mkdir(d);
+  return {
+    root,
+    env,
+    cleanup: () => {
+      try {
+        rm(root);
+      } catch {
+        /* best-effort */
+      }
+    },
+  };
+}
+
+/**
+ * Spawn one run, inside a fresh sandbox when `makeSandbox` is given (the
+ * `--processes N` > 1 arm), else exactly as before. The sandbox is removed
+ * once the run settles.
+ */
+async function spawnMaybeSandboxed(spawn, executable, args, { cwd, env, timeoutMs, makeSandbox }) {
+  const box = makeSandbox ? makeSandbox() : null;
+  try {
+    return await spawn(executable, args, { cwd, env: box ? { ...env, ...box.env } : env, timeoutMs });
+  } finally {
+    box?.cleanup();
+  }
+}
+
+/**
  * sha256 of a file — the default `fingerprint` the runner layer takes.
  * @param {string} path
  * @returns {string}
@@ -1037,7 +1167,7 @@ export function buildReport({ header, tests }) {
  * @param {NodeJS.ProcessEnv} p.env
  * @returns {Promise<{tests: Record<string, object>, budgetExhausted: boolean}>}
  */
-export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlineMs, now, timeoutMs, log, env, digests = null, fingerprint = null }) {
+export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlineMs, now, timeoutMs, log, env, digests = null, fingerprint = null, makeSandbox = null }) {
   const tests = {};
   let budgetExhausted = false;
   const driftReason = (executable) => {
@@ -1054,10 +1184,14 @@ export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlin
   };
   for (const c of candidates) {
     const resolved = resolveTestId(c.testId, index);
+    // The `--processes N` arm's counts, carried into every `labelFor` call
+    // below; absent (both 0) when the arm did not run.
+    const proc = { processRuns: c.processRuns ?? 0, processFailures: c.processFailures ?? 0 };
     const rec = {
       suite_runs: c.suiteRuns,
       suite_failures: c.suiteFailures,
       failed_in_runs: c.failedInRuns,
+      ...(c.processRuns > 0 ? { process_runs: c.processRuns, process_failures: c.processFailures } : {}),
       solo_runs: 0,
       solo_failures: 0,
       solo_unparsed: 0,
@@ -1067,14 +1201,14 @@ export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlin
       executable: resolved.executable,
     };
     if (resolved.unresolvedReason) {
-      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, unresolvedReason: resolved.unresolvedReason }));
+      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, unresolvedReason: resolved.unresolvedReason, ...proc }));
       tests[c.testId] = rec;
       log(`solo  ${c.testId}: ${rec.label} — ${rec.reason}`);
       continue;
     }
     if (deadlineMs !== null && now() >= deadlineMs) {
       budgetExhausted = true;
-      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, budgetExhausted: true }));
+      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, budgetExhausted: true, ...proc }));
       tests[c.testId] = rec;
       log(`solo  ${c.testId}: ${rec.label}`);
       continue;
@@ -1097,10 +1231,11 @@ export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlin
         break;
       }
       const entry = { cwd: current.cwd };
-      const result = await spawn(current.executable, [resolved.name, "--exact", "--test-threads=1"], {
+      const result = await spawnMaybeSandboxed(spawn, current.executable, [resolved.name, "--exact", "--test-threads=1"], {
         cwd: current.cwd,
         env: envForExecutable(entry, env),
         timeoutMs,
+        makeSandbox,
       });
       rec.solo_runs += 1;
       const folded = foldRunResult(current.executable, result);
@@ -1137,11 +1272,11 @@ export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlin
       }
     }
     if (unresolvedReason) {
-      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, unresolvedReason }));
+      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, unresolvedReason, ...proc }));
     } else if (rec.solo_runs < soloRuns && budgetExhausted && rec.solo_runs === 0) {
-      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, budgetExhausted: true }));
+      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: 0, soloFailures: 0, budgetExhausted: true, ...proc }));
     } else {
-      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: rec.solo_runs, soloFailures: rec.solo_failures, soloUnparsed: rec.solo_unparsed }));
+      Object.assign(rec, labelFor({ suiteRuns: rec.suite_runs, suiteFailures: rec.suite_failures, soloRuns: rec.solo_runs, soloFailures: rec.solo_failures, soloUnparsed: rec.solo_unparsed, ...proc }));
       if (rec.solo_runs < soloRuns && budgetExhausted) {
         rec.reason += ` (only ${rec.solo_runs}/${soloRuns} solo re-runs fit the budget)`;
       }
@@ -1169,6 +1304,10 @@ export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlin
  * @param {string|null} [p.treeSha]
  * @param {string} [p.hostname]
  * @param {NodeJS.ProcessEnv} [p.env]
+ * @param {number} [p.processes] the `--processes N` arm: N > 1 runs N concurrent
+ *   copies of each executable after every 1-process suite run, and sandboxes
+ *   every process (see the header); 1 (default) is the census unchanged.
+ * @param {typeof makeProcessSandbox} [p.makeSandbox] injectable for the tests
  * @returns {Promise<ReturnType<typeof buildReport>>}
  */
 export async function runCensus({
@@ -1186,12 +1325,20 @@ export async function runCensus({
   hostname = osHostname(),
   env = process.env,
   fingerprint = sha256File,
+  processes = 1,
+  makeSandbox = makeProcessSandbox,
 }) {
   const startedMs = now();
   const deadlineMs = budgetSeconds != null ? startedMs + budgetSeconds * 1000 : null;
   const index = buildExecutableIndex(executables);
   const unparsed = [];
   const runMaps = [];
+  // One Map per CONCURRENT COPY (per executable, per run) — so a test's
+  // `seen` in `diffFailureSets` is its number of copy-runs. Ids carry their
+  // `<binary>::` prefix, so maps from different executables never collide.
+  const processMaps = [];
+  // With N = 1 nothing is sandboxed: the default census is unchanged.
+  const sandbox = processes > 1 ? makeSandbox : null;
   const firstPanic = new Map();
   const digests = new Map();
   for (const e of executables) {
@@ -1232,22 +1379,10 @@ export async function runCensus({
         log(`run ${r}/${runs}  ${e.executable}: UNPARSED — ${reason}`);
         continue;
       }
-      const result = await spawn(e.executable, [], {
-        cwd: e.cwd,
-        env: envForExecutable(e, env),
-        timeoutMs: runTimeoutMs,
-      });
-      const folded = foldRunResult(e.executable, result);
-      if (folded.outcomes === null) {
-        unparsed.push({ run: r, executable: e.executable, reason: folded.reason });
-        log(`run ${r}/${runs}  ${e.executable}: UNPARSED — ${folded.reason}`);
-        continue;
-      }
-      anyParsed = true;
-      let reds = 0;
-      for (const [testId, outcome] of folded.outcomes) {
-        merged.set(testId, outcome);
-        if (outcome === "fail") {
+      const notePanics = (folded) => {
+        let reds = 0;
+        for (const [testId, outcome] of folded.outcomes) {
+          if (outcome !== "fail") continue;
           reds += 1;
           if (!firstPanic.has(testId)) {
             // `exactNameFor`: libtest's `---- <name> stdout ----` header carries
@@ -1255,24 +1390,78 @@ export async function runCensus({
             firstPanic.set(testId, extractPanicText(folded.text, exactNameFor(splitTestId(testId).name)));
           }
         }
+        return reds;
+      };
+      const result = await spawnMaybeSandboxed(spawn, e.executable, [], {
+        cwd: e.cwd,
+        env: envForExecutable(e, env),
+        timeoutMs: runTimeoutMs,
+        makeSandbox: sandbox,
+      });
+      const folded = foldRunResult(e.executable, result);
+      if (folded.outcomes === null) {
+        unparsed.push({ run: r, executable: e.executable, reason: folded.reason });
+        log(`run ${r}/${runs}  ${e.executable}: UNPARSED — ${folded.reason}`);
+      } else {
+        anyParsed = true;
+        for (const [testId, outcome] of folded.outcomes) merged.set(testId, outcome);
+        const reds = notePanics(folded);
+        log(`run ${r}/${runs}  ${e.executable}: ${folded.outcomes.size} tests, ${reds} red`);
       }
-      log(`run ${r}/${runs}  ${e.executable}: ${folded.outcomes.size} tests, ${reds} red`);
+      if (!sandbox) continue;
+      // The N-process arm: N copies of the same executable at once, each in
+      // its own sandbox. A copy that does not parse is a non-answer exactly
+      // like a suite run that does not (→ exit 2), never read as green.
+      if (deadlineMs !== null && now() >= deadlineMs) {
+        const reason = "budget passed before the concurrent-process batch";
+        unparsed.push({ run: r, executable: e.executable, arm: "processes", reason });
+        log(`run ${r}/${runs}  ${e.executable} x${processes}: UNPARSED — ${reason}`);
+        continue;
+      }
+      log(`run ${r}/${runs}  ${e.executable} x${processes} concurrent`);
+      const copies = await Promise.all(
+        Array.from({ length: processes }, () =>
+          spawnMaybeSandboxed(spawn, e.executable, [], {
+            cwd: e.cwd,
+            env: envForExecutable(e, env),
+            timeoutMs: runTimeoutMs,
+            makeSandbox: sandbox,
+          }),
+        ),
+      );
+      copies.forEach((copyResult, i) => {
+        const copy = i + 1;
+        const cf = foldRunResult(e.executable, copyResult);
+        if (cf.outcomes === null) {
+          unparsed.push({ run: r, executable: e.executable, arm: "processes", copy, reason: cf.reason });
+          log(`run ${r}/${runs}  ${e.executable} copy ${copy}/${processes}: UNPARSED — ${cf.reason}`);
+          return;
+        }
+        processMaps.push(cf.outcomes);
+        const reds = notePanics(cf);
+        log(`run ${r}/${runs}  ${e.executable} copy ${copy}/${processes}: ${cf.outcomes.size} tests, ${reds} red`);
+      });
     }
     runMaps.push(anyParsed ? merged : null);
   }
 
   const diff = diffFailureSets(runMaps);
-  const candidates = diff.everRed.map((testId) => {
-    const rec = diff.perTest.get(testId);
+  const procDiff = diffFailureSets(processMaps);
+  const everRed = [...new Set([...diff.everRed, ...procDiff.everRed])].sort();
+  const candidates = everRed.map((testId) => {
+    const rec = diff.perTest.get(testId) ?? { seen: 0, failures: 0, failedInRuns: [] };
+    const prec = procDiff.perTest.get(testId) ?? { seen: 0, failures: 0 };
     return {
       testId,
       suiteRuns: rec.seen,
       suiteFailures: rec.failures,
       failedInRuns: rec.failedInRuns,
+      processRuns: prec.seen,
+      processFailures: prec.failures,
       samplePanic: firstPanic.get(testId) ?? null,
     };
   });
-  log(`suite: ${candidates.length} test(s) red at least once (${diff.intermittent.length} intermittent, ${diff.always.length} every run); re-running each alone ${soloRuns}x`);
+  log(`suite: ${candidates.length} test(s) red at least once (${diff.intermittent.length} intermittent, ${diff.always.length} every run${sandbox ? `, ${procDiff.everRed.length} red across ${processes} concurrent processes` : ""}); re-running each alone ${soloRuns}x`);
 
   const { tests, budgetExhausted } = await soloRerunAll({
     candidates,
@@ -1286,6 +1475,7 @@ export async function runCensus({
     env,
     digests,
     fingerprint,
+    makeSandbox: sandbox,
   });
 
   const header = {
@@ -1294,6 +1484,7 @@ export async function runCensus({
     hostname,
     runs,
     solo_runs: soloRuns,
+    processes,
     started_at: new Date(startedMs).toISOString(),
     finished_at: nowIso(now),
     budget_seconds: budgetSeconds,
@@ -1442,9 +1633,12 @@ function printUsage(stream) {
       "         [--cargo <cmd>] [--exe-list <file>] [--budget-seconds N]",
       "         [--format pretty|json] [--out <path>]",
       "         [--run-timeout-seconds N] [--solo-timeout-seconds N] [--snapshot-dir <dir>]",
+      "         [--processes N]   (census only; N > 1 adds N concurrent config-sandboxed",
+      "                            copies per run and the CROSS-PROCESS label; CI does not use it)",
       "       node scripts/test-interleave-census.mjs --classify-from-log <log> [same flags]",
       "",
-      "exit (census): 0 no SUITE-ONLY and no non-answers; 1 any SUITE-ONLY; 2 any non-answer",
+      "exit (census): 0 no SUITE-ONLY/CROSS-PROCESS and no non-answers; 1 any SUITE-ONLY or",
+      "               CROSS-PROCESS; 2 any non-answer",
       "               (unparsed, budget passed, or an executable that could not be resolved)",
       "exit (--classify-from-log): always 0; usage error 64",
       "",
@@ -1475,6 +1669,7 @@ export function parseCliArgs(argv) {
       "solo-timeout-seconds": { type: "string", default: "300" },
       "workspace-root": { type: "string" },
       "snapshot-dir": { type: "string" },
+      processes: { type: "string", default: "1" },
       help: { type: "boolean", default: false },
     },
   });
@@ -1496,6 +1691,7 @@ export function parseCliArgs(argv) {
     soloTimeoutMs: positiveInt(values["solo-timeout-seconds"], "solo-timeout-seconds") * 1000,
     workspaceRoot: values["workspace-root"] ?? null,
     snapshotDir: values["snapshot-dir"] ?? null,
+    processes: positiveInt(values.processes, "processes"),
   };
 }
 
@@ -1552,7 +1748,7 @@ export async function main(argv) {
       process.stderr.write("test-interleave-census: no test executables resolved — nothing to run (fail-closed: exit 2)\n");
       return 2;
     }
-    report = await runCensus({ ...common, runs: args.runs, runTimeoutMs: args.runTimeoutMs });
+    report = await runCensus({ ...common, runs: args.runs, runTimeoutMs: args.runTimeoutMs, processes: args.processes });
   }
 
   const json = JSON.stringify(report, null, 2);

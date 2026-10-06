@@ -43,12 +43,14 @@ import {
   formatPretty,
   isDoctestName,
   labelFor,
+  makeProcessSandbox,
   parseCargoBuildMessages,
   parseCliArgs,
   parseExeList,
   parseExecutableOutput,
   resolveTestId,
   runCensus,
+  sandboxEnvFor,
   snapshotExecutables,
   splitTestId,
   synthesiseAnnouncement,
@@ -575,6 +577,7 @@ test("runCensus: a name red in run 2 only, green alone, is SUITE-ONLY and exit 1
   assert.deepEqual(report.header.unparsed, []);
   assert.deepEqual(report.summary, {
     "SUITE-ONLY": 1,
+    "CROSS-PROCESS": 0,
     "SOLO-RED": 0,
     "BOTH-FLAKY": 0,
     UNRESOLVED: 0,
@@ -1161,6 +1164,9 @@ test("parseCliArgs: defaults and the documented flags", () => {
   assert.equal(c.out, "/tmp/o.json");
   assert.equal(c.classifyFromLog, "/tmp/l");
   assert.equal(parseCliArgs(["--snapshot-dir", "/tmp/snap"]).snapshotDir, "/tmp/snap");
+  assert.equal(d.processes, 1, "the CROSS-PROCESS arm is off by default — the nightly CI census never runs it");
+  assert.equal(parseCliArgs(["--processes", "4"]).processes, 4);
+  assert.throws(() => parseCliArgs(["--processes", "0"]), /--processes must be a positive integer/);
   assert.throws(() => parseCliArgs(["--runs", "0"]), /--runs must be a positive integer/);
   assert.throws(() => parseCliArgs(["--format", "xml"]), /--format must be pretty or json/);
 });
@@ -1223,4 +1229,235 @@ test("classificationsFromReport reads what classifyFromLog wrote (the two ends a
     ],
     "the doctest's UNRESOLVED is omitted, not mapped",
   );
+});
+
+// ---------------------------------------------------------------------------
+// The CROSS-PROCESS arm (`--processes N`) — plan
+// `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+// Phase 4
+// ---------------------------------------------------------------------------
+
+test("labelFor: CROSS-PROCESS is red only across processes and green alone; red in the 1-process suite too stays SUITE-ONLY", () => {
+  const L = (o) => labelFor({ suiteRuns: 5, suiteFailures: 0, soloRuns: 3, soloFailures: 0, processRuns: 15, processFailures: 2, ...o });
+  assert.equal(L({}).label, "CROSS-PROCESS");
+  assert.equal(
+    L({}).reason,
+    "red 2/15 across concurrent processes, green 5/5 in the 1-process suite, green 3/3 alone",
+  );
+  assert.equal(L({ suiteFailures: 1 }).label, "SUITE-ONLY", "red in BOTH arms is the in-process class");
+  assert.equal(
+    L({ suiteFailures: 1 }).reason,
+    "red 1/5 in the suite, red 2/15 across concurrent processes, green 3/3 alone",
+  );
+  assert.equal(L({ soloFailures: 3 }).label, "SOLO-RED", "red alone is never CROSS-PROCESS");
+  assert.equal(L({ soloFailures: 1 }).label, "BOTH-FLAKY");
+  assert.equal(L({ processFailures: 0 }).label, "GREEN");
+  assert.equal(L({ processFailures: 0 }).reason, "green in 5/5 suite run(s), red 0/15 across concurrent processes");
+  assert.equal(L({ soloUnparsed: 1 }).label, "UNPARSED", "fail-closed beats CROSS-PROCESS too");
+  assert.equal(L({ soloRuns: 0, budgetExhausted: true }).label, "UNRESOLVED (budget)");
+  // Without the arm the reason is byte-identical to the pre-arm census.
+  assert.equal(
+    labelFor({ suiteRuns: 10, suiteFailures: 2, soloRuns: 3, soloFailures: 0 }).reason,
+    "red 2/10 in the suite, green 3/3 alone",
+  );
+});
+
+test("exitCodeFor: CROSS-PROCESS is exit 1 like SUITE-ONLY, and a non-answer still beats it", () => {
+  const rep = (tests, unparsed = []) => ({ header: { unparsed }, tests });
+  assert.equal(exitCodeFor(rep({ a: { label: "CROSS-PROCESS" } })), 1);
+  assert.equal(exitCodeFor(rep({ a: { label: "CROSS-PROCESS" }, b: { label: "SOLO-RED" } })), 1);
+  assert.equal(exitCodeFor(rep({ a: { label: "CROSS-PROCESS" } }, [{ run: 1, executable: LIB_EXE, reason: "x" }])), 2);
+});
+
+test("formatAnnotation: CROSS-PROCESS is an ::error naming the on-disk class and both arms' counts", () => {
+  const a = formatAnnotation(RING_ID, {
+    label: "CROSS-PROCESS",
+    solo_runs: 3,
+    solo_failures: 0,
+    process_runs: 15,
+    process_failures: 2,
+    reason: "r",
+    sample_panic: null,
+  });
+  assert.equal(
+    a,
+    `::error title=CROSS-PROCESS::${RING_ID} shares on-disk state with a concurrent test PROCESS — red 2/15 across concurrent processes, green in the 1-process suite, passes alone 3/3; see dossier runner-tests-share-in-process-mutable-state`,
+  );
+});
+
+test("classificationTokenFor: CROSS-PROCESS has no wire token yet (no CI producer)", () => {
+  assert.equal(classificationTokenFor("CROSS-PROCESS"), null);
+});
+
+test("sandboxEnvFor mirrors cargo-guard's config sandbox: XDG_CONFIG_HOME off Windows only", () => {
+  assert.deepEqual(sandboxEnvFor("/t/r", "linux"), {
+    QONTINUI_CONFIG_DIR: join("/t/r", "qontinui"),
+    QONTINUI_SECURE_STORAGE_DIR: join("/t/r", "secure"),
+    XDG_CONFIG_HOME: join("/t/r", "xdg"),
+  });
+  assert.deepEqual(sandboxEnvFor("/t/r", "win32"), {
+    QONTINUI_CONFIG_DIR: join("/t/r", "qontinui"),
+    QONTINUI_SECURE_STORAGE_DIR: join("/t/r", "secure"),
+  });
+});
+
+test("makeProcessSandbox makes a fresh root with every directory and removes it on cleanup", () => {
+  const made = [];
+  const removed = [];
+  let n = 0;
+  const box = makeProcessSandbox({
+    platform: "linux",
+    tmp: "/tmpx",
+    mkdtemp: (prefix) => `${prefix}${++n}`,
+    mkdir: (d) => made.push(d),
+    rm: (d) => removed.push(d),
+  });
+  assert.equal(box.root, join("/tmpx", "census-config-") + "1");
+  assert.deepEqual(made, [join(box.root, "qontinui"), join(box.root, "secure"), join(box.root, "xdg")]);
+  assert.equal(box.env.QONTINUI_CONFIG_DIR, join(box.root, "qontinui"));
+  box.cleanup();
+  assert.deepEqual(removed, [box.root]);
+  // A failing removal is swallowed — a leftover temp dir is not a verdict.
+  makeProcessSandbox({ tmp: "/tmpx", mkdtemp: () => "/r", mkdir: () => {}, rm: () => { throw new Error("EBUSY"); } }).cleanup();
+});
+
+/** A sandbox factory that records every box it hands out and every cleanup. */
+function fakeSandboxes() {
+  const boxes = [];
+  const cleaned = [];
+  const makeSandbox = () => {
+    const root = `/sbx/${boxes.length + 1}`;
+    const box = { root, env: sandboxEnvFor(root, "linux"), cleanup: () => cleaned.push(root) };
+    boxes.push(box);
+    return box;
+  };
+  return { makeSandbox, boxes, cleaned };
+}
+
+/**
+ * Spawn stub for the N-process arm: suite-shaped calls (no args) answer from
+ * `suite(exe, k)` where k counts that executable's suite-shaped calls in
+ * order — per run, call 1 is the 1-process suite run and calls 2..N+1 the
+ * concurrent copies. Solo calls answer from `solo`.
+ */
+function processStub({ suite, solo }) {
+  const calls = [];
+  const count = {};
+  const spawn = async (exe, args, opts) => {
+    calls.push({ exe, args, opts });
+    if (args.length === 0) {
+      count[exe] = (count[exe] ?? 0) + 1;
+      return suite(exe, count[exe]);
+    }
+    return solo(exe, args[0]);
+  };
+  return { spawn, calls };
+}
+
+test("runCensus --processes 3: red only in a concurrent copy, green in the suite and alone, is CROSS-PROCESS, exit 1, every process sandboxed", async () => {
+  const sb = fakeSandboxes();
+  // 2 runs; per run per exe: call 1 = 1-process suite, calls 2-4 = copies.
+  // LIB's copy 2 of run 2 (call 7) is the one red.
+  const { spawn, calls } = processStub({
+    suite: (exe, k) => (exe === LIB_EXE ? (k === 7 ? RED_LIB() : GREEN_LIB()) : GREEN_BIN()),
+    solo: soloPass,
+  });
+  const report = await runCensus({
+    fingerprint: FP,
+    executables: EXES,
+    runs: 2,
+    soloRuns: 3,
+    spawn,
+    now: () => 0,
+    hostname: "h",
+    processes: 3,
+    makeSandbox: sb.makeSandbox,
+  });
+  assert.equal(report.exit_code, 1);
+  assert.deepEqual(Object.keys(report.tests), [RING_ID]);
+  const rec = report.tests[RING_ID];
+  assert.equal(rec.label, "CROSS-PROCESS");
+  assert.equal(rec.suite_runs, 2);
+  assert.equal(rec.suite_failures, 0);
+  assert.equal(rec.process_runs, 6);
+  assert.equal(rec.process_failures, 1);
+  assert.equal(rec.solo_runs, 3);
+  assert.equal(rec.solo_failures, 0);
+  assert.match(rec.sample_panic, /panicked at src-tauri\/src\/outbound_trace.rs:200:9/);
+  assert.equal(report.header.processes, 3);
+  assert.equal(report.summary["CROSS-PROCESS"], 1);
+  // 2 runs x 2 exes x (1 + 3) suite-shaped spawns + 3 solo = 19, and EVERY
+  // one ran in its own sandbox, each cleaned up.
+  assert.equal(calls.length, 19);
+  assert.equal(sb.boxes.length, 19);
+  assert.deepEqual([...sb.cleaned].sort(), sb.boxes.map((b) => b.root).sort());
+  const configDirs = calls.map((c) => c.opts.env.QONTINUI_CONFIG_DIR);
+  assert.equal(new Set(configDirs).size, 19, "no two processes share a config dir");
+  for (const c of calls) {
+    assert.match(c.opts.env.QONTINUI_SECURE_STORAGE_DIR, /^\/sbx\/\d+\/secure$/);
+    assert.match(c.opts.env.XDG_CONFIG_HOME, /^\/sbx\/\d+\/xdg$/);
+    assert.equal(c.opts.env.CARGO_MANIFEST_DIR, "/home/box/qontinui-runner/src-tauri");
+  }
+  const pretty = formatPretty(report);
+  assert.match(pretty, /CROSS-PROCESS — shares on-disk state with a concurrent test PROCESS/);
+  assert.match(pretty, /processes {3}red 1\/6 \(concurrent copies\)/);
+  assert.match(pretty, /processes 3 \(each run also 3 concurrent copies/);
+  assert.match(pretty, /exit 1$/);
+  const json = JSON.parse(JSON.stringify(report));
+  assert.equal(json.tests[RING_ID].label, "CROSS-PROCESS");
+  assert.equal(json.tests[RING_ID].process_failures, 1);
+});
+
+test("runCensus --processes 3: red in the 1-process suite AND across processes stays SUITE-ONLY", async () => {
+  const sb = fakeSandboxes();
+  const { spawn } = processStub({
+    // Call 1 (1-process suite, run 1) and call 3 (a copy) are red.
+    suite: (exe, k) => (exe === LIB_EXE ? (k === 1 || k === 3 ? RED_LIB() : GREEN_LIB()) : GREEN_BIN()),
+    solo: soloPass,
+  });
+  const report = await runCensus({
+    fingerprint: FP, executables: EXES, runs: 1, soloRuns: 2, spawn, now: () => 0, hostname: "h",
+    processes: 3, makeSandbox: sb.makeSandbox,
+  });
+  const rec = report.tests[RING_ID];
+  assert.equal(rec.label, "SUITE-ONLY");
+  assert.equal(rec.reason, "red 1/1 in the suite, red 1/3 across concurrent processes, green 2/2 alone");
+  assert.equal(report.exit_code, 1);
+});
+
+test("runCensus --processes 3: a concurrent copy that does not parse is a non-answer, exit 2", async () => {
+  const sb = fakeSandboxes();
+  const { spawn } = processStub({
+    suite: (exe, k) => (exe === LIB_EXE && k === 2 ? result("garbage", { code: 101 }) : exe === LIB_EXE ? GREEN_LIB() : GREEN_BIN()),
+    solo: soloPass,
+  });
+  const report = await runCensus({
+    fingerprint: FP, executables: EXES, runs: 1, soloRuns: 1, spawn, now: () => 0, hostname: "h",
+    processes: 3, makeSandbox: sb.makeSandbox,
+  });
+  assert.equal(report.exit_code, 2);
+  assert.equal(report.header.unparsed.length, 1);
+  assert.equal(report.header.unparsed[0].arm, "processes");
+  assert.equal(report.header.unparsed[0].copy, 1);
+  assert.match(formatPretty(report), /run 1 copy 1 {2}/);
+});
+
+test("runCensus without --processes is unchanged: no sandbox, no copies, the caller's env", async () => {
+  const { spawn, calls } = stubSpawn({
+    suiteByRun: { [LIB_EXE]: [GREEN_LIB()], [BIN_EXE]: [GREEN_BIN()] },
+    solo: () => {
+      throw new Error("must not be called");
+    },
+  });
+  const report = await runCensus({
+    fingerprint: FP, executables: EXES, runs: 1, soloRuns: 3, spawn, now: () => 0, hostname: "h",
+    env: { QONTINUI_CONFIG_DIR: "/caller/cfg" },
+    makeSandbox: () => {
+      throw new Error("the default census must not sandbox");
+    },
+  });
+  assert.equal(report.exit_code, 0);
+  assert.equal(report.header.processes, 1);
+  assert.equal(calls.length, 2);
+  for (const c of calls) assert.equal(c.opts.env.QONTINUI_CONFIG_DIR, "/caller/cfg");
 });

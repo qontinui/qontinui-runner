@@ -375,18 +375,41 @@ impl DeliveredArm {
     }
 }
 
-/// Slot layout of [`push_counters`]: `push_ok`, one per [`BlockReason`], one
+/// Slot layout of [`PushCounters`]: `push_ok`, one per [`BlockReason`], one
 /// per [`DeliveredArm`].
 const PUSH_OK_SLOT: usize = 0;
 const PUSH_MISS_SLOT_BASE: usize = 1;
 const DELIVERED_ARM_SLOT_BASE: usize = PUSH_MISS_SLOT_BASE + BlockReason::ALL.len();
 const PUSH_COUNTER_SLOTS: usize = DELIVERED_ARM_SLOT_BASE + DeliveredArm::ALL.len();
 
-fn push_counters() -> &'static [std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS]> =
-        std::sync::OnceLock::new();
-    COUNTERS.get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+/// The push counter family.
+///
+/// A struct rather than a fn-local `OnceLock` array so the counters have an
+/// IDENTITY: a test owns a private `PushCounters::new()` and drives
+/// [`surface_blocked_delivery`] / [`record_push_ok_in`] /
+/// [`health_snapshot_in`] against it, while production charges every miss and
+/// every inject to the single [`PUSH_COUNTERS`] static — threaded to the two
+/// recorder sites through [`SurfaceCtx::counters`], which [`deliver_once`]
+/// builds. The same per-test handle as `MemoryEnrichCounters` /
+/// `TransportRungCounters` in `mcp_api.rs`. Before this the module's two
+/// exact-delta tests serialised on an opt-in `COUNTER_TEST_LOCK` that the
+/// other ~40 tests of the module did not take (an `opt_in_serializer_guard`
+/// allowlist entry). Plan
+/// `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+/// Phase 4; `mcp_api::counter_handle_pins` pins the delegation.
+struct PushCounters([std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS]);
+
+impl PushCounters {
+    /// `const` so the static needs no lazy init (an inline-`const` element
+    /// repeated is the spelling — see `MemoryEnrichCounters::new`).
+    const fn new() -> Self {
+        Self([const { std::sync::atomic::AtomicU64::new(0) }; PUSH_COUNTER_SLOTS])
+    }
 }
+
+/// The process-global push counters — the ones every production miss and
+/// inject is charged to.
+static PUSH_COUNTERS: PushCounters = PushCounters::new();
 
 fn miss_slot(reason: BlockReason) -> usize {
     PUSH_MISS_SLOT_BASE
@@ -405,15 +428,15 @@ fn arm_slot(arm: DeliveredArm) -> usize {
 }
 
 /// One more tick on which a message could not be pushed, for `reason`.
-fn record_push_miss(reason: BlockReason) {
-    push_counters()[miss_slot(reason)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn record_push_miss_in(counters: &PushCounters, reason: BlockReason) {
+    counters.0[miss_slot(reason)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One more successful inject, through `arm`. Bumps `push_ok` and the arm's
 /// own series.
-fn record_push_ok(arm: DeliveredArm) {
-    push_counters()[PUSH_OK_SLOT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    push_counters()[arm_slot(arm)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn record_push_ok_in(counters: &PushCounters, arm: DeliveredArm) {
+    counters.0[PUSH_OK_SLOT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    counters.0[arm_slot(arm)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The `data.sessionMessages` block of `GET /health`:
@@ -427,24 +450,29 @@ fn record_push_ok(arm: DeliveredArm) {
 /// Every series is present even at zero — an absent key would read as "this
 /// never happens", which is the ambiguity the family exists to remove.
 pub(crate) fn health_snapshot() -> serde_json::Value {
+    // Pure delegation — see `PushCounters` for why.
+    health_snapshot_in(&PUSH_COUNTERS)
+}
+
+/// [`health_snapshot`] against an explicit counter set.
+fn health_snapshot_in(counters: &PushCounters) -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
-    let counters = push_counters();
     let mut push_miss = serde_json::Map::new();
     for reason in BlockReason::ALL {
         push_miss.insert(
             reason.as_str().to_string(),
-            serde_json::json!(counters[miss_slot(reason)].load(Relaxed)),
+            serde_json::json!(counters.0[miss_slot(reason)].load(Relaxed)),
         );
     }
     let mut delivered_arm = serde_json::Map::new();
     for arm in DeliveredArm::ALL {
         delivered_arm.insert(
             arm.as_str().to_string(),
-            serde_json::json!(counters[arm_slot(arm)].load(Relaxed)),
+            serde_json::json!(counters.0[arm_slot(arm)].load(Relaxed)),
         );
     }
     serde_json::json!({
-        "push_ok": counters[PUSH_OK_SLOT].load(Relaxed),
+        "push_ok": counters.0[PUSH_OK_SLOT].load(Relaxed),
         "push_miss": serde_json::Value::Object(push_miss),
         "delivered_arm": serde_json::Value::Object(delivered_arm),
     })
@@ -626,6 +654,9 @@ struct SurfaceCtx<'a> {
     client: &'a reqwest::Client,
     base: &'a str,
     token: &'a str,
+    /// The push counters this tick is charged to — [`PUSH_COUNTERS`] in
+    /// production, a private set in a test (see [`PushCounters`]).
+    counters: &'a PushCounters,
 }
 
 /// Does this miss warrant coord's durable delivery-blocked alert, or only the
@@ -668,7 +699,7 @@ async fn surface_blocked_delivery(
     detail: &str,
     now: Instant,
 ) {
-    record_push_miss(reason);
+    record_push_miss_in(ctx.counters, reason);
     let message_id = msg.message_id.as_str();
     let verdict = tracker.note_blocked(
         message_id,
@@ -1412,6 +1443,7 @@ async fn deliver_once(
         client: &client,
         base: &base,
         token: &token,
+        counters: &PUSH_COUNTERS,
     };
 
     // 1. Pull undelivered messages for this device's sessions (device from JWT).
@@ -1583,7 +1615,7 @@ async fn deliver_once(
                 continue;
             }
         };
-        record_push_ok(arm);
+        record_push_ok_in(ctx.counters, arm);
 
         // 4. Mark delivered. Record locally FIRST (cooldown + delivered-set)
         // so even if the ack POST fails we won't re-inject within the TTL.
@@ -2465,19 +2497,6 @@ mod tests {
         assert!(should_log(Some(t0), t0 + THRESH, THRESH));
     }
 
-    /// The push counters are process-global statics. Every test that bumps
-    /// or asserts an exact delta on them takes this lock, so the parallel
-    /// test runner cannot interleave two bumps between one test's
-    /// `before` and `after` reads. Poison-tolerant: a failed test must not
-    /// cascade into the next one's lock.
-    static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     #[tokio::test]
     async fn normal_priority_miss_reaches_surfacing_and_the_counter() {
         // Defect 2's controlled contrast: a `normal` message used to produce
@@ -2485,12 +2504,18 @@ mod tests {
         // delivery loop makes for every miss tracks it, and bumps the
         // push-miss counter, regardless of priority. Below the threshold no
         // POST is attempted, so this needs no coord.
-        let _serial = counter_test_guard();
+        //
+        // A PRIVATE counter set, so the delta below is exact with no lock —
+        // no other test can bump it (plan
+        // `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`,
+        // Phase 4).
+        let counters = PushCounters::new();
         let client = reqwest::Client::new();
         let ctx = SurfaceCtx {
             client: &client,
             base: "http://127.0.0.1:9",
             token: "test-token",
+            counters: &counters,
         };
         let mut tracker = SurfacingTracker::default();
         let msg = PendingMessage {
@@ -2501,7 +2526,7 @@ mod tests {
             priority: "normal".to_string(),
             body: "hello".to_string(),
         };
-        let before = health_snapshot()["push_miss"]["target_not_live"]
+        let before = health_snapshot_in(&counters)["push_miss"]["target_not_live"]
             .as_u64()
             .expect("counter is a u64");
         surface_blocked_delivery(
@@ -2520,7 +2545,7 @@ mod tests {
                 .contains_key(&("m-normal".to_string(), BlockReason::TargetNotLive)),
             "a normal-priority miss must be tracked like a blocking one"
         );
-        let after = health_snapshot()["push_miss"]["target_not_live"]
+        let after = health_snapshot_in(&counters)["push_miss"]["target_not_live"]
             .as_u64()
             .expect("counter is a u64");
         assert_eq!(
@@ -2589,14 +2614,14 @@ mod tests {
         );
         assert_eq!(keys(&snap["delivered_arm"]), ["sdk", "terminal"]);
 
-        // A bump moves exactly its own series. Exact deltas on a
-        // process-global counter are only sound under the serial lock —
-        // every test that bumps a counter takes it.
-        let _serial = counter_test_guard();
-        let before = health_snapshot();
-        record_push_miss(BlockReason::PtyNeverIdle);
-        record_push_ok(DeliveredArm::Terminal);
-        let after = health_snapshot();
+        // A bump moves exactly its own series. The bumps go to a PRIVATE
+        // counter set, so the deltas are exact with no lock: no other test of
+        // the binary can reach it.
+        let counters = PushCounters::new();
+        let before = health_snapshot_in(&counters);
+        record_push_miss_in(&counters, BlockReason::PtyNeverIdle);
+        record_push_ok_in(&counters, DeliveredArm::Terminal);
+        let after = health_snapshot_in(&counters);
         let u = |v: &serde_json::Value, path: &[&str]| -> u64 {
             let mut cur = v;
             for p in path {
