@@ -430,8 +430,6 @@ mod tests {
         assert_eq!(drain(&out), b"abc<lost 7>");
     }
 
-    /// A bounded channel blocks its producer while full and releases it as the
-    /// reader drains; nothing is dropped and the offset counts every byte.
     /// Review round 2, N8: nothing is delivered after `settle` /
     /// `close_output` — not even a chunk whose producer was already waiting on
     /// a full channel when the close happened. The reader gets what was queued
@@ -459,6 +457,8 @@ mod tests {
         assert_eq!(out.offset(), 5);
     }
 
+    /// A bounded channel blocks its producer while full and releases it as the
+    /// reader drains; nothing is dropped and the offset counts every byte.
     #[test]
     fn pty_holder_bounded_output_blocks_the_producer_instead_of_growing() {
         let out = std::sync::Arc::new(PaneOutput::new_bounded("k", 0, marker, 2));
