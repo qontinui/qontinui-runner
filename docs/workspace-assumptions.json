@@ -1914,10 +1914,10 @@
       "class": "repo_layout",
       "file": "src/session_assets.rs",
       "symbol": "provision_session_assets_from_root",
-      "excerpt": "&r.join(\"qontinui-claude-config\").join(\".claude\"),",
+      "excerpt": "let checkout = r.join(\"qontinui-claude-config\");",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Only when a root resolves: compares the session's <workdir>/.claude against <root>/qontinui-claude-config/.claude to detect a cwd whose .claude IS the canonical source (the workspace-root symlink), and then writes nothing and records CanonicalSource rows. With no root the check is skipped and the ordinary arm runs, so the embedded floors are provisioned without a checkout."
+      "note": "Only when a root resolves: compares the session's <workdir>/.claude against <root>/qontinui-claude-config/.claude (a path compare, following symlinks) and asks whether the cwd is a work tree of that same repository (same git common dir — a linked worktree of the config repo has a real .claude/ at another path), and in either case writes nothing and records CanonicalSource rows. With no root the check is skipped and the ordinary arm runs, so the embedded floors are provisioned without a checkout."
     },
     {
       "class": "repo_layout",
