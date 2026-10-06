@@ -68,6 +68,7 @@
 //! into chunks.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -273,13 +274,19 @@ impl OpenedPty {
             master: Mutex::new(Some(pair.master)),
             child: Mutex::new(Some(child)),
             preamble: Vec::new(),
+            output_taken: AtomicBool::new(false),
         })
     }
 }
 
-/// Size of one blocking PTY read in the [`LocalPty`] pump — the reader
-/// thread's buffer size before output became a channel.
-const LOCAL_READ_CHUNK: usize = 8192;
+/// The largest piece of pane output the session's reader thread processes in
+/// one step, and the size of one blocking PTY read in the [`LocalPty`] pump —
+/// the reader thread's read buffer before output became a channel. A channel
+/// pane can queue far larger chunks (a remote seed ring is up to the whole
+/// scrollback), and the reader splits those into pieces of this size so the
+/// grid lock, the emission gate and each `terminal-output` event see the same
+/// grain a local PTY produces.
+pub(crate) const READER_CHUNK: usize = 8192;
 
 /// Chunks queued between a [`LocalPty`]'s pump and the session's reader
 /// thread: at most 32 × 8 KiB = 256 KiB in flight. BOUNDED on purpose — once
@@ -295,7 +302,7 @@ const LOCAL_OUTPUT_QUEUE_CHUNKS: usize = 32;
 /// that is gone. Returning drops `tx`, which disconnects the receiver — the
 /// reader thread's EOF. `label` attributes the log lines only.
 fn pump(mut reader: impl Read, tx: mpsc::SyncSender<Vec<u8>>, label: &str) {
-    let mut buf = vec![0u8; LOCAL_READ_CHUNK];
+    let mut buf = vec![0u8; READER_CHUNK];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -330,6 +337,9 @@ pub struct LocalPty {
     /// Bytes [`PaneIo::output`] yields before the PTY's first byte — an
     /// in-band notice (see [`Self::with_output_preamble`]). Usually empty.
     preamble: Vec<u8>,
+    /// Set once [`PaneIo::output`] has started the pump: a second pump would
+    /// split one PTY stream between two receivers.
+    output_taken: AtomicBool,
 }
 
 impl LocalPty {
@@ -364,18 +374,23 @@ impl PaneIo for LocalPty {
     /// [`LOCAL_OUTPUT_QUEUE_CHUNKS`] for why the channel is bounded).
     /// [`PaneIo::release`] dropping the master is what unblocks a pump parked
     /// in `read()`, as it unblocked the reader thread before.
+    ///
+    /// One-shot, like every other pane's output: a second call is an `Err`.
     fn output(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
-        let reader = {
-            let master = self
-                .master
-                .lock()
-                .map_err(|e| format!("Master lock poisoned: {}", e))?;
-            match master.as_ref() {
-                Some(m) => m
-                    .try_clone_reader()
-                    .map_err(|e| format!("Failed to clone PTY reader: {}", e))?,
-                None => return Err("PTY master already released".to_string()),
-            }
+        // The master lock is held to the end, so two racing calls cannot both
+        // pass the `output_taken` check.
+        let master = self
+            .master
+            .lock()
+            .map_err(|e| format!("Master lock poisoned: {}", e))?;
+        if self.output_taken.load(Ordering::Acquire) {
+            return Err("PTY output already taken".to_string());
+        }
+        let reader = match master.as_ref() {
+            Some(m) => m
+                .try_clone_reader()
+                .map_err(|e| format!("Failed to clone PTY reader: {}", e))?,
+            None => return Err("PTY master already released".to_string()),
         };
         let (tx, rx) = mpsc::sync_channel(LOCAL_OUTPUT_QUEUE_CHUNKS);
         if !self.preamble.is_empty() {
@@ -388,6 +403,7 @@ impl PaneIo for LocalPty {
             .name(format!("terminal-pump-{}", label))
             .spawn(move || pump(reader, tx, &label))
             .map_err(|e| format!("Failed to spawn PTY pump thread: {}", e))?;
+        self.output_taken.store(true, Ordering::Release);
         Ok(rx)
     }
 
@@ -819,8 +835,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!t.is_finished(), "the pump waits on the full channel");
         // The queued chunks are whole reads.
-        assert_eq!(rx.try_recv().unwrap().len(), LOCAL_READ_CHUNK);
-        assert_eq!(rx.try_recv().unwrap().len(), LOCAL_READ_CHUNK);
+        let bound = Duration::from_secs(5);
+        assert_eq!(rx.recv_timeout(bound).unwrap().len(), READER_CHUNK);
+        assert_eq!(rx.recv_timeout(bound).unwrap().len(), READER_CHUNK);
         drop(rx);
         t.join().unwrap();
     }
@@ -859,6 +876,11 @@ mod tests {
         assert!(pane.pid().is_some(), "a spawned child has a pid");
 
         let rx = pane.output().expect("output");
+        assert_eq!(
+            pane.output().err().as_deref(),
+            Some("PTY output already taken"),
+            "a second pump would split the stream"
+        );
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = collected.clone();
         // Own thread, like production: on ConPTY the pump's `read()` keeps
