@@ -728,9 +728,12 @@ type RawReadResult = Result<(StatusCode, HeaderMap, Bytes), (StatusCode, Json<Ap
 /// request structs' docs (which point here rather than retype it) — is rendered
 /// from [`EdgeRelation::ALL`], so outside the tests the set is spelled once,
 /// in [`EdgeRelation::as_str`].
-/// The cross-repo drift alarm is the LITERAL list in
-/// `closed_vocabularies_match_the_web_literals`: a widening on the
-/// web side that is not carried here goes red there.
+/// `closed_vocabularies_match_the_web_literals` pins this set against a
+/// LITERAL copy of the web `Literal`, held in this repo. That catches a
+/// runner-side edit (a variant added or dropped here); it does NOT catch a
+/// widening on the web side, because the literal does not move when
+/// `qontinui-web` does. Cross-repo parity is re-established by hand when the
+/// web vocabulary changes (finding `f1c9b8bd`).
 ///
 /// Serializes to the snake_case wire string (`rename_all`), so the JSON
 /// forwarded upstream is byte-identical to what the untyped `String` sent.
@@ -2964,14 +2967,17 @@ mod tests {
         }
     }
 
-    /// The cross-repo drift alarm. The loopback's relation vocabulary now has
+    /// A runner-side drift alarm. The loopback's relation vocabulary now has
     /// ONE source (`EdgeRelation::ALL`, from which the refusal text and
     /// `writeVocabulary.relation` are rendered), and `kind`'s is
     /// `ArtifactKind::ALL`. The sets are spelled out as LITERALS here (not
-    /// built from a constant) and mirror the web `Literal`s
+    /// built from a constant), copied from the web `Literal`s
     /// (`WorkArtifactRelation`, `WorkArtifactKind` in
-    /// `qontinui-web/backend/app/schemas/plan_library.py`), so a widening on
-    /// the web side that is not carried here goes red.
+    /// `qontinui-web/backend/app/schemas/plan_library.py`). So an edit to the
+    /// runner's sets that does not update these literals goes red. A widening
+    /// on the WEB side does not: these literals live in this repo and do not
+    /// move when `qontinui-web` does. When the web vocabulary changes, update
+    /// the literals and the enums together (finding `f1c9b8bd`).
     #[test]
     fn closed_vocabularies_match_the_web_literals() {
         const VOCABULARY: [&str; 7] = [
