@@ -52,7 +52,8 @@ pub struct TicketRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub worktree: Option<String>,
-    /// The wrapper's pid: the lease's liveness and the root of its build tree.
+    /// The wrapper's NATIVE OS pid: the lease's liveness and the root of its
+    /// build tree. (Git Bash on Windows: `/proc/$$/winpid`, not `$$`.)
     pub pid: u32,
     /// `owner/repo#n` for a merge-class request.
     #[serde(default)]
@@ -155,6 +156,8 @@ pub enum OpenError {
 
 /// Most tickets that may be open (non-terminal) at once.
 pub const MAX_OPEN: usize = 256;
+/// A lease older than this is reaped as `lost` whatever its pid says.
+pub const MAX_LEASE_S: u64 = 24 * 3600;
 
 /// How a wrapper ended its lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -350,15 +353,30 @@ impl Broker {
 
     /// Record this tick's sampled anonymous memory per running lease (by
     /// wrapper pid). A lease with no process below it this tick samples 0.
-    pub fn observe_usage(&mut self, per_lease: &std::collections::HashMap<u32, u64>) {
+    /// Record this tick's sampled memory per running lease (by wrapper pid).
+    /// `building` names the leases whose tree held a cargo/rustc/clippy
+    /// process this tick: only those samples can raise the peak, so a tick
+    /// taken before cargo started (or after it ended) never records a ~0
+    /// "peak". Returns whether any peak rose (worth persisting).
+    pub fn observe_usage(
+        &mut self,
+        per_lease: &std::collections::HashMap<u32, u64>,
+        building: &HashSet<u32>,
+    ) -> bool {
+        let mut rose = false;
         for r in self.records.values_mut() {
             if r.state != RecordState::Running {
                 continue;
             }
             let now = per_lease.get(&r.request.pid).copied().unwrap_or(0);
             r.current_anon_bytes = Some(now);
-            r.max_sampled_anon_bytes = Some(r.max_sampled_anon_bytes.unwrap_or(0).max(now));
+            if building.contains(&r.request.pid) && r.max_sampled_anon_bytes.is_none_or(|m| now > m)
+            {
+                r.max_sampled_anon_bytes = Some(now);
+                rose = true;
+            }
         }
+        rose
     }
 
     /// The facts the SHADOW decides on. In observe every ticket really runs,
@@ -390,10 +408,14 @@ impl Broker {
     }
 
     /// Mark every running lease whose wrapper is gone as `lost`.
+    /// Mark every running lease whose wrapper is gone — or that has run past
+    /// [`MAX_LEASE_S`], which no build does (a long-lived pid such as a shell
+    /// was named) — as `lost`.
     pub fn reap(&mut self, alive: impl Fn(u32, Option<u64>) -> bool, now_s: u64) -> usize {
         let mut n = 0;
         for r in self.records.values_mut() {
-            if r.state == RecordState::Running && !alive(r.request.pid, r.pid_start) {
+            let too_old = now_s.saturating_sub(r.queued_at_s) > MAX_LEASE_S;
+            if r.state == RecordState::Running && (too_old || !alive(r.request.pid, r.pid_start)) {
                 r.state = RecordState::Lost;
                 Self::end(r, now_s);
                 n += 1;
@@ -719,7 +741,10 @@ mod tests {
         open(&mut b, "b", "d2", 2, &f, 0);
         // The broker samples the trees: 5 GiB, then 7 GiB at peak, then 2.
         for gib in [5, 7, 2] {
-            b.observe_usage(&std::collections::HashMap::from([(1, gib * GIB), (2, GIB)]));
+            b.observe_usage(
+                &std::collections::HashMap::from([(1, gib * GIB), (2, GIB)]),
+                &HashSet::from([1, 2]),
+            );
         }
         assert_eq!(b.records["a"].current_anon_bytes, Some(2 * GIB));
         b.release(
@@ -810,15 +835,58 @@ mod tests {
         f.mem_available_bytes = Fact::Measured(40 * GIB);
         open(&mut b, "a", "same", 1, &f, 0);
         open(&mut b, "b", "same", 2, &f, 0); // held by the target check
-        b.observe_usage(&std::collections::HashMap::from([
-            (1, 10 * GIB),
-            (2, 25 * GIB),
-        ]));
+        b.observe_usage(
+            &std::collections::HashMap::from([(1, 10 * GIB), (2, 25 * GIB)]),
+            &HashSet::from([1, 2]),
+        );
         let sf = b.shadow_facts(&f);
         assert_eq!(sf.mem_available_bytes, Fact::Measured(65 * GIB));
         // Unknown memory stays unknown.
         f.mem_available_bytes = Fact::Unknown;
         assert_eq!(b.shadow_facts(&f).mem_available_bytes, Fact::Unknown);
+    }
+
+    #[test]
+    fn a_tick_with_no_build_running_never_sets_a_peak() {
+        let mut b = seeded(GIB);
+        open(&mut b, "a", "d", 1, &facts(), 0);
+        let none = HashSet::new();
+        assert!(!b.observe_usage(&std::collections::HashMap::from([(1, 3)]), &none));
+        assert_eq!(b.records["a"].max_sampled_anon_bytes, None);
+        assert_eq!(b.records["a"].current_anon_bytes, Some(3));
+        assert!(b.observe_usage(
+            &std::collections::HashMap::from([(1, 9 * GIB)]),
+            &HashSet::from([1])
+        ));
+        assert!(!b.observe_usage(
+            &std::collections::HashMap::from([(1, 2 * GIB)]),
+            &HashSet::from([1])
+        ));
+        assert_eq!(b.records["a"].max_sampled_anon_bytes, Some(9 * GIB));
+        // A build that never showed a cargo/rustc sample leaves no history row.
+        open(&mut b, "z", "dz", 2, &facts(), 0);
+        b.release(
+            "z",
+            "z",
+            ReleaseReason::Exit,
+            Some(0),
+            None,
+            16,
+            &facts(),
+            &Policy::default(),
+            5,
+        )
+        .unwrap();
+        assert!(b.history.is_empty());
+    }
+
+    #[test]
+    fn a_lease_older_than_a_day_is_reaped_whatever_its_pid() {
+        let mut b = seeded(GIB);
+        open(&mut b, "a", "d", 1, &facts(), 0);
+        assert_eq!(b.reap(|_, _| true, MAX_LEASE_S), 0);
+        assert_eq!(b.reap(|_, _| true, MAX_LEASE_S + 1), 1);
+        assert_eq!(b.records["a"].state, RecordState::Lost);
     }
 
     #[test]

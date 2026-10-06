@@ -107,6 +107,10 @@ pub struct CiMeasure {
 }
 
 impl CiMeasure {
+    pub fn not_supported() -> Self {
+        Self::uniform(Fact::NotSupported, CiSource::NotSupported)
+    }
+
     fn uniform(f: Fact<u64>, source: CiSource) -> Self {
         CiMeasure {
             reservation: f,
