@@ -351,8 +351,6 @@ impl Broker {
         Ok(&self.records[id])
     }
 
-    /// Record this tick's sampled anonymous memory per running lease (by
-    /// wrapper pid). A lease with no process below it this tick samples 0.
     /// Record this tick's sampled memory per running lease (by wrapper pid).
     /// `building` names the leases whose tree held a cargo/rustc/clippy
     /// process this tick: only those samples can raise the peak, so a tick
@@ -407,7 +405,6 @@ impl Broker {
         r.shadow = Shadow::Done;
     }
 
-    /// Mark every running lease whose wrapper is gone as `lost`.
     /// Mark every running lease whose wrapper is gone — or that has run past
     /// [`MAX_LEASE_S`], which no build does (a long-lived pid such as a shell
     /// was named) — as `lost`.
