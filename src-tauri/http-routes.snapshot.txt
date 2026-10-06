@@ -837,7 +837,7 @@ GET /wrappers/{id}/status wrapper_status
 GET /ws/events ws_events_handler
 GET <ROUTE_PATH> get_github_budget
 GET,POST /ui-bridge/ai/page-summary ui_bridge_page_summary_handler
-MERGE <expr>
+MERGE <if: trace_api::routes | Router::new>
 MERGE accessibility::routes
 MERGE agent_tokens::routes
 MERGE agent_worktrees::routes
