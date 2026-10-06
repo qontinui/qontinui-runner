@@ -508,6 +508,33 @@ pub fn terminal_set_title(
     })
 }
 
+/// Move a terminal onto a different terminal page, keeping its PTY alive.
+///
+/// The IPC twin of `POST /terminals/{id}/move` (`mcp/terminals.rs`): both
+/// delegate to [`TerminalManager::set_page`], which mutates the session, flushes
+/// the move into the durable lifecycle registry and emits
+/// `terminal-page-changed`, so the source page evicts the tab and the target
+/// page adopts it. The frontend `/regroup` command moves sessions between
+/// pages through this rather than close-and-recreate, which would end an AI
+/// session running in the PTY.
+#[tauri::command]
+pub fn terminal_set_page(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    app_handle: tauri::AppHandle,
+    terminal_id: String,
+    page_id: String,
+) -> Result<CommandResponse, String> {
+    if page_id.is_empty() {
+        return Err("pageId is required and must be non-empty".to_string());
+    }
+    terminal_manager.set_page(&terminal_id, page_id, &app_handle)?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// Resize a terminal's PTY dimensions.
 #[tauri::command]
 pub fn terminal_resize(
@@ -2753,6 +2780,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_write,
             terminal_resize,
             terminal_set_title,
+            terminal_set_page,
             terminal_close,
             terminal_list,
             terminal_ack,

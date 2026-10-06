@@ -416,6 +416,9 @@ async function build(): Promise<RealRegistryHarness> {
     sharedSessionIds: () => new Set(),
   }));
   vi.doMock("../contexts", () => ({
+    // `/regroup` reads every page through this. No pages and no page ops: the
+    // handler's executor refuses rather than inventing a roster.
+    useAllTerminalSessions: () => ({ getPages: () => ({}), pageOps: null }),
     useTerminalSession: () => ({
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
       activeId: "tab-a",
@@ -459,6 +462,7 @@ async function build(): Promise<RealRegistryHarness> {
         toggleMaximize: rec("zone.toggleMaximize", undefined),
         setLayoutId: rec("zone.setLayoutId", undefined),
         assignTabToZone: rec("zone.assignTabToZone", undefined),
+        requestCompaction: rec("zone.requestCompaction", undefined),
       },
       workflowGen: {
         generatedWorkflow: null,
