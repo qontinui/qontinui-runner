@@ -72,7 +72,9 @@
 #   * Any change to an EXISTING gate surface needs `ci:gate-change=alters-a-gate`
 #     AND a line in the PR body naming each altered item —
 #     `Gate-Change: <stem>#<job-key>` or `Gate-Removal: <stem>#<job-key>`, and
-#     `<stem>#workflow` for a change outside `jobs:`. Matched
+#     `<stem>#workflow` for a change outside `jobs:`, and `<stem>#file` for the
+#     one non-YAML gating path (`check_untimed_subprocess#file`, compared as a
+#     whole file, so any edit to it counts). Matched
 #     WHOLE-LINE, so a body cannot satisfy it by containing the token inside a
 #     longer name, an HTML comment, or a pasted CI log.
 #
@@ -499,7 +501,7 @@ jobs:
               80-char truncation made distinct long names collide, so a single body line
               could authorise two different gate changes."""
               stem = os.path.basename(path)
-              for ext in (".yml", ".yaml"):
+              for ext in (".yml", ".yaml", ".py"):
                   if stem.endswith(ext):
                       stem = stem[: -len(ext)]
               # A composite action is <dir>/action.yml; its directory is the name.
@@ -509,9 +511,40 @@ jobs:
               # lines in the posted record.
               leaf = " ".join(str(leaf).split())[:120]
               return f"{stem}#{leaf}"
+          def file_findings(path, base_text, head_text):
+              """[(kind, token)] for a gating path that is NOT a YAML document.
+
+              `scripts/check_untimed_subprocess.py` is gating (it IS
+              forbid-untimed-subprocess.yml's whole verdict), but it is Python, so
+              surface() cannot parse it -- and a None from surface() is the hard
+              `!PARSE` error. Until this helper existed that made the script
+              UNCHANGEABLE: every PR touching it went red with "An unverifiable gate
+              cannot be declared away", whatever it declared, while the script itself
+              FAILS any PR that links a new crate without adding it to
+              EXPECTED_SCAN_ROOTS. The two gates deadlocked every such PR.
+
+              The whole file is the gate surface, compared byte for byte -- there is
+              no structure to be cosmetic about, so ANY edit (a comment included) is
+              an alteration and needs `alters-a-gate` plus `Gate-Change: <stem>#file`.
+              Absent at base is a brand-new gate (additive, nothing to name); absent
+              at head is `Gate-Removal: <stem>#file`."""
+              if base_text is None:
+                  return []
+              if head_text is None:
+                  return [("REMOVED", token(path, "file"))]
+              if base_text != head_text:
+                  return [("CHANGED", token(path, "file"))]
+              return []
           for path in [p for p in os.environ["HIT_PATHS"].splitlines() if p.strip()]:
-              b = surface(content_at(path, os.environ["MERGE_BASE"]))
+              base_text = content_at(path, os.environ["MERGE_BASE"])
               head_text = content_at(path, os.environ["HEAD_SHA"])
+              # Only a YAML document has a surface to parse. The one non-YAML
+              # gating path is compared as a whole file (see file_findings).
+              if not path.endswith((".yml", ".yaml")):
+                  for kind, tok in file_findings(path, base_text, head_text):
+                      print(f"{kind}{TAB}{' '.join(str(path).split())}{TAB}{tok}")
+                  continue
+              b = surface(base_text)
               h = surface(head_text)
               # A tab or newline in a path would forge a column or a row in this TSV.
               path = " ".join(str(path).split())
