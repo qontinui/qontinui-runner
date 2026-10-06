@@ -446,6 +446,29 @@ impl StreamWriter {
     pub fn detach(&mut self, deadline: Instant) -> Result<(), ConnectError> {
         self.request(&Request::Detach, deadline)
     }
+
+    /// A second handle on this connection that can end it while this writer
+    /// is blocked mid-write (a full socket behind a child that does not read
+    /// its stdin). Ending the connection is itself a detach: the holder keeps
+    /// the child.
+    pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
+        Ok(ShutdownHandle {
+            conn: self.conn.try_clone()?,
+        })
+    }
+}
+
+/// See [`StreamWriter::shutdown_handle`].
+#[derive(Debug)]
+pub struct ShutdownHandle {
+    conn: Conn,
+}
+
+impl ShutdownHandle {
+    /// End the connection in both directions, for every handle on it.
+    pub fn shutdown(&self) {
+        self.conn.shutdown();
+    }
 }
 
 /// Open a connection WITHOUT the handshake, for tests that must speak first
