@@ -2825,7 +2825,12 @@ mod raw_git_guard {
     /// that line, is the whole item; otherwise it runs to the next line that
     /// is exactly `}` — rustfmt closes every top-level item that way, and
     /// unlike brace counting this is not fooled by braces inside the string
-    /// literals source-scanning tests are full of.
+    /// literals source-scanning tests are full of. A head line with no brace
+    /// (a multi-line `static`, `use a::{..};`) ends at its first `;` line, and
+    /// a multi-line attribute is skipped by bracket depth. Only a column-0
+    /// `#[cfg(test)]` starts a skip: an indented one, or `cfg(all(test, ..))`,
+    /// is scanned as production — which can only fail loudly, never hide a
+    /// spawn.
     fn production_lines(src: &str) -> Vec<(usize, &str)> {
         let mut out = Vec::new();
         let mut lines = src.lines().enumerate();
@@ -2834,22 +2839,44 @@ mod raw_git_guard {
                 out.push((i + 1, line));
                 continue;
             }
+            // `attr_depth` > 0 while inside a multi-line attribute; `braced`
+            // once the item's head line opened a brace (it then ends at the
+            // next column-0 `}` / `};`), else the item ends at its first
+            // line ending in `;` (a multi-line `static`, `use a::{..};`).
+            let mut attr_depth: i64 = 0;
             let mut head_seen = false;
+            let mut braced = false;
             for (_, item) in lines.by_ref() {
+                let t = item.trim();
                 if !head_seen {
-                    let t = item.trim();
-                    if t.starts_with("#[") || t.is_empty() {
+                    if attr_depth > 0 || t.starts_with("#[") {
+                        attr_depth += t.matches('[').count() as i64;
+                        attr_depth -= t.matches(']').count() as i64;
+                        continue;
+                    }
+                    if t.is_empty() {
                         continue;
                     }
                     head_seen = true;
                     let opens = t.matches('{').count();
                     let closes = t.matches('}').count();
-                    if (t.ends_with(';') && opens == 0) || (opens > 0 && opens == closes) {
+                    if opens == 0 {
+                        if t.ends_with(';') {
+                            break;
+                        }
+                        continue;
+                    }
+                    if opens == closes {
                         break;
                     }
+                    braced = true;
                     continue;
                 }
-                if item == "}" {
+                if braced {
+                    if item == "}" || item == "};" {
+                        break;
+                    }
+                } else if t.ends_with(';') {
                     break;
                 }
             }
@@ -2954,6 +2981,13 @@ mod raw_git_guard {
         let use_then_prod =
             "#[cfg(test)]\n#[allow(unused)]\nuse std::fmt;\nfn prod() { Command::new(\"git\"); }\n";
         assert_eq!(raw_git_spawns(use_then_prod), (vec![4], 0));
+        // A multi-line test-only `static` ends at its `;` — the production
+        // code after it is scanned.
+        let static_then_prod = "#[cfg(test)]\nstatic S: Vec<u8> =\n    Vec::new();\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(static_then_prod), (vec![4], 0));
+        // A multi-line attribute is not mistaken for the item's head.
+        let multi_attr = "#[cfg(test)]\n#[expect(\n    clippy::x,\n    reason = \"r\"\n)]\nstatic S: u8 =\n    0;\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(multi_attr), (vec![8], 0));
         for spelling in [
             "tokio::process::Command::new(\"git\")",
             "Command::new( \"git\" )",
