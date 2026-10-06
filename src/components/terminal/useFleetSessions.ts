@@ -163,6 +163,13 @@ export interface FleetSessionsQuery {
   includeClosed?: boolean;
   /** Page size for each page of the walk, NOT a reachability control. */
   limit?: number;
+  /**
+   * The tenant whose fleet to read, sent as the command's `tenant` arg. Absent
+   * or null ⇒ the runner's own authority order picks (the machine pin, else the
+   * default credential slot). It is the CREDENTIAL the read presents, not a
+   * query parameter — coord scopes rows to the principal's tenant only.
+   */
+  tenantId?: string | null;
 }
 
 /**
@@ -439,7 +446,8 @@ export function deviceLabel(s: FleetSession): string {
  * or ADVANCES it (`nextCursor` re-sent verbatim, page appended). A restart is
  * what happens on mount, on `refresh`, and whenever the SCOPE changes —
  * `deviceId` / `state` / `includeClosed`, the three coord validates a cursor
- * against. `limit` is deliberately not one of them: coord's cursor survives a
+ * against, and `tenantId`, which coord fingerprints in from the principal.
+ * `limit` is deliberately not one of them: coord's cursor survives a
  * changed page size, so resizing a page must not throw away pages already
  * loaded.
  *
@@ -485,6 +493,14 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const state = opts?.state ?? null;
   const includeClosed = opts?.includeClosed ?? false;
   const limit = opts?.limit ?? FLEET_DEFAULT_LIMIT;
+  const tenantId = opts?.tenantId ?? null;
+  /**
+   * The tenant the device/state catalogues were accumulated under. The
+   * catalogues deliberately survive a filter change — but not a TENANT change:
+   * offering another tenant's devices as filter options would name devices this
+   * read can never return.
+   */
+  const catalogTenantRef = useRef<string | null>(tenantId);
   /**
    * The walk's scope, as one comparable string, named EXPLICITLY in the restart
    * effect's dependencies.
@@ -502,7 +518,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
    * is still named beside it — the two move together, so the effect needs no
    * lint suppression and no claim that one replaces the other.
    */
-  const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });
+  const scopeKey = fleetScopeKey({ deviceId, state, includeClosed, tenantId });
 
   /**
    * The page size as of the CALL, not as of the render that built the callback.
@@ -546,9 +562,14 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
         // is the honest failure — including 401/403, which means "this runner is
         // not paired", NOT "the fleet is empty".
         const result = await invoke<FleetSessionsResponse>("fleet_sessions_list", {
-          args: { deviceId, state, includeClosed, limit, cursor },
+          args: { deviceId, state, includeClosed, limit, cursor, tenant: tenantId },
         });
         if (generationRef.current !== generation) return;
+        if (catalogTenantRef.current !== tenantId) {
+          catalogTenantRef.current = tenantId;
+          setDeviceCatalog([]);
+          setStateCatalog([]);
+        }
 
         const next = normalizeFleetCursor(result.nextCursor);
         // A keyset cursor encodes the page just served, so coord handing back
@@ -618,7 +639,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
         }
       }
     },
-    [deviceId, state, includeClosed],
+    [deviceId, state, includeClosed, tenantId],
   );
 
   // Runs on mount, whenever the SCOPE changes (a new device/state/include-closed
@@ -631,7 +652,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   // fetched picks the new size up through `limitRef`.
   //
   // `scopeKey` and `fetchPage` move together by construction — both derive from
-  // exactly `deviceId` / `state` / `includeClosed` — so naming both is honest
+  // exactly `deviceId` / `state` / `includeClosed` / `tenantId` — so naming both is honest
   // rather than redundant-and-suppressed, and it keeps the trigger readable
   // without an eslint directive standing in for the explanation.
   useEffect(() => {
