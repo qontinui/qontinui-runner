@@ -12,9 +12,7 @@ import type {
   VerificationPendingMarker,
   VerificationCompletedMarker,
   VerificationFailedMarker,
-  RunnerRestartMarker,
 } from "../types/verification";
-import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Re-export types for convenience
 export type {
@@ -22,15 +20,13 @@ export type {
   VerificationPendingMarker,
   VerificationCompletedMarker,
   VerificationFailedMarker,
-  RunnerRestartMarker,
 };
 
 type VerificationEventType =
   | "verification_pending"
   | "verification_started"
   | "verification_completed"
-  | "verification_failed"
-  | "restart_requested";
+  | "verification_failed";
 
 interface VerificationEvent {
   type: VerificationEventType;
@@ -265,31 +261,6 @@ class VerificationService {
    */
   private emit(event: VerificationEvent): void {
     this.listeners.forEach((listener) => listener(event));
-  }
-
-  /**
-   * Trigger a runner restart
-   */
-  async triggerRestart(marker: RunnerRestartMarker): Promise<boolean> {
-    logger.info("Triggering runner restart:", marker.reason);
-    this.emit({ type: "restart_requested" });
-
-    try {
-      const response = await tracedFetch(`${getApiBase()}/restart-runner`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          reason: marker.reason,
-          delay_seconds: marker.delay_seconds || 3,
-        }),
-      });
-
-      const result = await response.json();
-      return result.success === true;
-    } catch (error) {
-      console.error("[VerificationService] Failed to trigger restart:", error);
-      return false;
-    }
   }
 }
 
