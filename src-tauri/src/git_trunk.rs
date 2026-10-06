@@ -281,8 +281,11 @@ pub(crate) mod inherited_git_dir_reexec {
         Some(std::env::var(name).unwrap_or_else(|_| panic!("the parent must set {name}")))
     }
 
-    /// The child's own inherited `GIT_DIR`, asserted to be the decoy the
-    /// parent named — the first half of the in-child control.
+    /// Asserts the child's own `GIT_DIR` is set to `decoy_git_dir`. Callers pass
+    /// the value they read back from the child's environment, so this proves
+    /// only that `GIT_DIR` is SET in the child; that it is the decoy — and
+    /// takes effect — is proven by the control that follows it (unscrubbed git
+    /// answering with the decoy's repo).
     pub(crate) fn assert_inherited_git_dir(decoy_git_dir: &str) {
         assert_eq!(
             std::env::var("GIT_DIR").ok().as_deref(),
@@ -367,6 +370,14 @@ mod tests {
         let dir = path.to_str().unwrap();
         let git = move |args: &[&str]| {
             let mut cmd = Command::new("git");
+            // Hermetic commits whatever the box's global config says (the
+            // same overrides build_drift's `fixture_git` uses).
+            cmd.args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ]);
             cmd.args([&["-C", dir], args].concat());
             // Under a git hook these would point the fixture at the CALLER's
             // repo — the same scrub production applies.
