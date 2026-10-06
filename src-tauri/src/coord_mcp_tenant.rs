@@ -525,6 +525,11 @@ pub(crate) fn tenant_verdict(
 /// The `structuredContent` key a verdict notice is written under — the
 /// `io.qontinui/` reverse-DNS namespace coord's `_meta["io.qontinui/answered_by"]`
 /// stamp already uses, so it cannot collide with a field any coord tool emits.
+///
+/// Caveat: a tool that declares an `outputSchema` with
+/// `additionalProperties: false` would make a strict client reject this extra
+/// key. Whether any coord tool does is UNMEASURED here; if one does, this key
+/// must move into `_meta` for that tool instead.
 pub(crate) const TENANT_NOTICE_KEY: &str = "io.qontinui/tenant_notice";
 
 /// The text block appended for a verdict, or `None` for one that is silent.
