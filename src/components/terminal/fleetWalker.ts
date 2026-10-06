@@ -182,7 +182,11 @@ export class FleetTenantWalker {
     this.snap = seed
       ? {
           ...initialFleetWalkSnapshot(tenant),
-          walk: seed.walk,
+          // The seed's cursor belongs to the PREVIOUS scope's walk: a cursor
+          // is valid only in the scope that minted it, and this walker never
+          // replays it. Dropped, so a seeded snapshot cannot offer a
+          // "Load more" that returns at once.
+          walk: fleetWalkDropCursor(seed.walk),
           response: seed.response,
           loaded: seed.loaded,
           appliedQuery: seed.appliedQuery,

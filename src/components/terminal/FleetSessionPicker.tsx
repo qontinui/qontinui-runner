@@ -52,6 +52,7 @@ import { useInteractivityProbe } from "./useInteractivityProbe";
 import {
   createButtonState,
   describeRemoteCreateFailure,
+  emptyCreateTargets,
   fleetDeviceCreateErrorId,
   fleetDeviceCreateId,
   IDLE_DEVICE_CREATE,
@@ -278,6 +279,8 @@ function RemoteCreateButton({
   state,
   onCreate,
   className,
+  tenantLabel,
+  blockedReason,
 }: {
   deviceId: string;
   /** What the bridge id is keyed by — see {@link fleetGroupBridgeKey}. */
@@ -287,8 +290,15 @@ function RemoteCreateButton({
   state: DeviceCreateState | undefined;
   onCreate: () => Promise<void>;
   className?: string;
+  /** The tenant this create mints under, shown on the button — set where one
+   * page offers a create per tenant (a merged empty state). */
+  tenantLabel?: string | null;
+  /** A caller-side reason the create cannot be offered at all; disables the
+   * button with that reason as its title. */
+  blockedReason?: string | null;
 }) {
-  const btn = createButtonState({ deviceId, isCallerDevice });
+  const base = createButtonState({ deviceId, isCallerDevice });
+  const btn = blockedReason ? { disabled: true, reason: blockedReason } : base;
   const pending = state?.pending === true;
   return (
     <button
@@ -301,7 +311,9 @@ function RemoteCreateButton({
         btn.reason ??
         (pending
           ? "Creating — minting a grant, waiting for the remote runner to spawn, then attaching"
-          : `Open a NEW terminal on ${deviceLabel}. That machine picks the working directory ` +
+          : `Open a NEW terminal on ${deviceLabel}` +
+            (tenantLabel ? ` in tenant ${tenantLabel}` : "") +
+            `. That machine picks the working directory ` +
             `from its own allowed list; this one never sends a path.`)
       }
       className={
@@ -316,7 +328,7 @@ function RemoteCreateButton({
       ) : (
         <Plus className="w-2.5 h-2.5" />
       )}
-      {pending ? "Creating…" : "New terminal"}
+      {pending ? "Creating…" : tenantLabel ? `New terminal in ${tenantLabel}` : "New terminal"}
     </button>
   );
 }
@@ -585,12 +597,19 @@ export function FleetSessionPicker() {
    * belongs to the group header, not to any one session row. */
   const [createState, setCreateState] = useState<Record<string, DeviceCreateState>>({});
   /**
-   * The tenant a create with no group behind it mints under — the empty state's
-   * pasted-device create. A single read's served tenant; in a merged read there
-   * is no one tenant the empty page belongs to, so none is sent and the
-   * runner's own authority order decides (the title says so).
+   * The creates the empty state offers for a pasted device id — the create with
+   * no group behind it. A single read offers one, under its served tenant. A
+   * merged read has no one tenant the empty page belongs to, and sending none
+   * would let the runner's authority order pick a tenant the operator never
+   * chose, so it offers one create PER tenant that answered, each labelled;
+   * with none answered it offers a disabled button saying to choose a tenant.
    */
-  const emptyCreateTenant = merged ? null : (servedTenants[0] ?? null);
+  const emptyCreate = emptyCreateTargets({
+    merged,
+    servedTenant: servedTenants[0] ?? null,
+    answeredTenants: readTenants.answered,
+    shortTenant: shortTenantId,
+  });
 
   const clearFilters = useCallback(() => {
     setServer(DEFAULT_FLEET_SERVER_FILTER);
@@ -1131,34 +1150,52 @@ export function FleetSessionPicker() {
                     runner with nothing running on it yet. Offer it here. */}
                 {appliedQuery?.deviceId && isLikelyDeviceId(appliedQuery.deviceId) && (
                   <div className="mt-3 text-left">
-                    <RemoteCreateButton
-                      deviceId={appliedQuery.deviceId}
-                      bridgeKey={appliedQuery.deviceId}
-                      deviceLabel={`device ${appliedQuery.deviceId.slice(0, 8)}`}
-                      isCallerDevice={false}
-                      state={createState[appliedQuery.deviceId]}
-                      onCreate={() =>
-                        createRemote(
-                          appliedQuery.deviceId as string,
-                          appliedQuery.deviceId as string,
-                          `device ${(appliedQuery.deviceId as string).slice(0, 8)}`,
-                          emptyCreateTenant,
-                        )
+                    {(() => {
+                      const pinned = appliedQuery.deviceId as string;
+                      const label = `device ${pinned.slice(0, 8)}`;
+                      if (emptyCreate.targets.length === 0) {
+                        return (
+                          <RemoteCreateButton
+                            deviceId={pinned}
+                            bridgeKey={pinned}
+                            deviceLabel={label}
+                            isCallerDevice={false}
+                            state={undefined}
+                            onCreate={async () => {}}
+                            blockedReason={emptyCreate.disabledReason}
+                            className="mx-auto"
+                          />
+                        );
                       }
-                      className="mx-auto"
-                    />
-                    <RemoteCreateOutcome
-                      bridgeKey={appliedQuery.deviceId}
-                      state={createState[appliedQuery.deviceId]}
-                      onRetry={() =>
-                        void createRemote(
-                          appliedQuery.deviceId as string,
-                          appliedQuery.deviceId as string,
-                          `device ${(appliedQuery.deviceId as string).slice(0, 8)}`,
-                          emptyCreateTenant,
-                        )
-                      }
-                    />
+                      return emptyCreate.targets.map((t) => {
+                        // Keyed per tenant in a merged read, exactly as a
+                        // device group would be, so each create has its own
+                        // bridge id and its own outcome.
+                        const key = fleetGroupBridgeKey(
+                          { deviceId: pinned, tenantId: t.tenant },
+                          merged,
+                        );
+                        return (
+                          <div key={key} className="mb-1">
+                            <RemoteCreateButton
+                              deviceId={pinned}
+                              bridgeKey={key}
+                              deviceLabel={label}
+                              isCallerDevice={false}
+                              state={createState[key]}
+                              onCreate={() => createRemote(key, pinned, label, t.tenant)}
+                              tenantLabel={t.tenantLabel}
+                              className="mx-auto"
+                            />
+                            <RemoteCreateOutcome
+                              bridgeKey={key}
+                              state={createState[key]}
+                              onRetry={() => void createRemote(key, pinned, label, t.tenant)}
+                            />
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
                 )}
                 {emptyRead.offerClear && (
