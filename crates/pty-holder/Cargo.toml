@@ -57,8 +57,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     # CreateNamedPipeW, ConnectNamedPipe, WaitNamedPipeW, GetNamedPipeServerProcessId.
     "Win32_System_Pipes",
-    # CreateEventW, WaitForSingleObject, OpenProcessToken, GetCurrentProcess.
+    # CreateEventW, WaitForSingleObject, OpenProcessToken, GetCurrentProcess,
+    # OpenProcess.
     "Win32_System_Threading",
+    # The holder-owned KILL_ON_JOB_CLOSE job that holds a pane's child tree.
+    "Win32_System_JobObjects",
 ] }
 
 # The same tiered policy as src-tauri/Cargo.toml [lints] (plan
