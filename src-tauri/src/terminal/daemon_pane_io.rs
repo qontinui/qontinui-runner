@@ -17,13 +17,17 @@
 //!   spliced at the absolute offset the holder stamped on it, so a gap (the
 //!   holder's ring rolled past bytes before this connection read them) is
 //!   written into the pane as a marker, never silently.
-//! - **A new per-connection sink** ([`HolderFrameSink`] / [`HolderConnSink`])
-//!   in place of `RemoteFrameSink`, which is `try_send` onto a PROCESS-WIDE
-//!   singleton (`OnceLock<RemoteAttachClient>`) drained by the relay's pump,
-//!   and which carries JSON with base64 input. The trait shape is kept — the
-//!   pane talks only to a sink, a test hands it a recorder — but the client is
-//!   this pane's OWN attached holder connection, and input travels as raw
-//!   bytes (plan Phase 1: raw bytes on hot paths).
+//! - **A new per-pane link** ([`HolderLink`] / [`HolderConn`]) in place of
+//!   `RemoteFrameSink`, which is `try_send` onto a PROCESS-WIDE singleton
+//!   (`OnceLock<RemoteAttachClient>`) drained by the relay's pump, and which
+//!   carries JSON with base64 input. The pane talks only to the link, and a
+//!   test hands it a recorder. The production link holds this pane's OWN
+//!   connections to its holder: the ATTACHED one (output plus
+//!   `resize`/`pause`/`resume`/`detach`, re-established by the pump after a
+//!   drop) and a separate INPUT one (`open_input`, raw bytes — plan Phase 1:
+//!   raw bytes on hot paths — reopened on demand). Input never rides the
+//!   attached connection, so a child slow to read its stdin cannot stall the
+//!   control verbs; `kill` goes on a fresh connection of its own.
 //! - **The local correlation key** is the pane id (the terminal id): it keys
 //!   the holder's lock/endpoint/spec files, the [`PaneOutput`] log
 //!   attribution, and every log line here — the positions `RemotePaneIo` keys
@@ -38,11 +42,14 @@
 //! | `exit {code: None, signal: None}` | `Err(..)` — UNKNOWN; the session records `None`, never a number |
 //! | the holder connection ends with no `exit` (holder SIGKILLed / crashed) | `Err(..)` naming the holder pid, plus an in-band notice in the tab — never `DETACH_EXIT_CODE`, never a fabricated child exit |
 //! | local detach (`release` without `kill`) | `Ok(DETACH_EXIT_CODE)` — the child is still running, as for `RemotePaneIo` |
-//! | `kill` sent, then `release` before the holder reported the exit | `Err(..)` — killed, exit unobserved: UNKNOWN |
+//! | `kill` landed, then `release` before the holder reported the exit | the real code if it is reported within [`KILL_SETTLE_MAX`] (the reader ends at release); else `Err(..)` — killed, exit unobserved: UNKNOWN |
+//! | `kill` did NOT land (holder unanswering and not terminable), then `release` | `Err("kill failed; … left running")` plus an in-band notice — never `DETACH_EXIT_CODE`; `release` itself returns `Err` |
+//! | the holder answers but speaks no protocol version this runner drives | `Err(..)` plus an in-band notice; the holder is LEFT RUNNING (plan D15), never killed |
+//! | the holder holds its lock but cannot be reached for [`RECONNECT_WINDOW`] | `Err(..)` naming what was done — its child killed via `kill`, or the verified holder terminated — plus an in-band notice |
 //!
-//! Holder death is detected by the attached socket reaching EOF, which the
-//! kernel produces the moment the holder's descriptors close — so `wait`
-//! settles promptly on a SIGKILL without polling.
+//! A connection that ends without an `exit` is NOT taken as holder death by
+//! itself: the pump probes the holder (handshake, then lock). A dead holder
+//! (lock free) settles at once; a live one is reattached at the last offset.
 //!
 //! # Close semantics
 //!
@@ -83,14 +90,15 @@ use crate::settings::TerminalSettings;
 pub const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Bound on one control write (`resize`, `pause`, `resume`) by the pane's
-/// control thread. The holder's dispatch never blocks on the PTY (its writer
-/// thread does), so this long means a wedged holder or a connection jammed
-/// behind input.
+/// control thread. Input never rides the attached connection and the holder's
+/// dispatch for it never waits on the PTY, so this long means a wedged holder.
 pub const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Bound on one input write. Input waits as long as the CHILD is slow to read
-/// (backpressure, as for a local PTY), but not forever: past this the
-/// connection is ended and the pump reattaches, so the pane never wedges.
+/// (backpressure, as for a local PTY), but not forever: past this the write
+/// fails and the INPUT connection is ended; the next write opens a fresh one,
+/// which supersedes it in the holder (whatever of the old connection's bytes
+/// were not yet queued is discarded, never delivered after the new one's).
 pub const INPUT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long one input write waits for the pane's input connection to open
@@ -589,6 +597,17 @@ impl HolderLink for HolderConn {
             let stream = self.open_input(deadline.min(Instant::now() + INPUT_OPEN_WAIT))?;
             *lock_slot(&self.input_shutdown) = stream.shutdown_handle().ok();
             *slot = Some(stream);
+            // Round 3, L1: a `close` that ran while this connection was being
+            // opened could not reach it (it was not installed yet, and this
+            // call holds the slot). Re-check AFTER installing, as the pump
+            // does for a reattach, and end it rather than leak it.
+            if self.closed.load(Ordering::Acquire) {
+                slot.take();
+                if let Some(h) = lock_slot(&self.input_shutdown).take() {
+                    h.shutdown();
+                }
+                return Err(format!("pty holder {}: pane released", self.key));
+            }
         }
         let Some(stream) = slot.as_mut() else {
             return Err(format!("pty holder {}: no input connection", self.key));
@@ -1972,6 +1991,30 @@ mod tests {
         );
         assert!(ran_meanwhile, "the spawn door parked the only tokio worker");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 2, N5: one outage's retries back off — none before the
+    /// first attempt, then 250 ms doubling, capped at 8 s.
+    #[test]
+    fn pty_holder_outage_backoff_grows_and_is_capped() {
+        let mut o = Outage::new();
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.push(o.backoff());
+            o.attempts += 1;
+        }
+        assert_eq!(seen[0], Duration::ZERO);
+        assert_eq!(seen[1], Duration::from_millis(250));
+        assert_eq!(seen[2], Duration::from_millis(500));
+        assert_eq!(seen[3], Duration::from_secs(1));
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+        assert_eq!(*seen.last().unwrap(), RECONNECT_BACKOFF_MAX);
+        o.attempts = u32::MAX;
+        assert_eq!(
+            o.backoff(),
+            RECONNECT_BACKOFF_MAX,
+            "no overflow at the extreme"
+        );
     }
 
     /// Review round 2, N1: a kill that did not land — the holder did not

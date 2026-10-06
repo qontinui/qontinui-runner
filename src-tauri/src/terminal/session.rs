@@ -4592,12 +4592,15 @@ impl TerminalSession {
         // Release the pane's handles — for a local PTY this closes the OS pipe
         // and unblocks the reader thread which may be stuck in a blocking
         // read() call. Bounded for the same reason as the writer above.
+        // `release` can fail for more than a spent budget — a holder pane
+        // released after a kill that did not land says so in its error — so
+        // the log carries the pane's own reason rather than assuming one.
         if let Err(e) = self.io.release(lock_budget) {
             warn!(
                 terminal_id = %self.id,
                 error = %e,
-                "Could not release the pane within the shutdown budget — the \
-                 handle will be released by process exit"
+                "pane release reported an error (see `error`); any handle it \
+                 could not release is released by process exit"
             );
         }
 
