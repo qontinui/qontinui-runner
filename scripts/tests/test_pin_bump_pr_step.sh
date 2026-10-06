@@ -476,8 +476,8 @@ if [ -z "${PIN_BUMP_STEP_MUTANT:-}" ]; then
     '$0 == "          if [ \"$DRIFT\" = \"false\" ]; then" { $0 = "          if true; then" } { print }' \
     "move night + conflicting PR: no flag -> not closed"
   mutate closed-lookup-reintroduced \
-    '$0 == "          if [ -n \"$existing_num\" ]; then" && !done { print "          [ -n \"$existing_num\" ] || existing_num=\"$(gh pr list --repo \"$REPO\" --head \"$BRANCH\" --base main --state closed --json number --jq .)\""; done = 1 } { print }' \
-    "closed-only history: closed PRs never listed"
+    '$0 == "          if [ -n \"$existing_num\" ]; then" && ++seen == 2 { print "          [ -n \"$existing_num\" ] || { existing_num=\"$(gh pr list --repo \"$REPO\" --head \"$BRANCH\" --base main --state closed --json number --jq .)\"; [ -z \"$existing_num\" ] || gh pr reopen \"$existing_num\" --repo \"$REPO\"; }" } { print }' \
+    "closed-only history: never reopened"
   mutate expect-head-dropped \
     '{ sub(/ --expect-head "\$pushed_sha"/, "") } { print }' \
     "ready call pins the pushed head"
