@@ -1206,7 +1206,8 @@ async fn spawn_looping_agent_terminal(
             // hammer a starved machine with new `claude` processes indefinitely —
             // the exact shape of the 2026-08-06→07 incident.
             false,
-        )?;
+        )
+        .map_err(String::from)?;
     Ok((terminal_id, pinned_session_id))
 }
 

@@ -1497,6 +1497,94 @@ pub struct IdleQuiescence {
     pub lines: Vec<String>,
 }
 
+/// A failed [`TerminalSession::spawn`]: the text every caller has always
+/// read, plus — for the two refusals an unattended caller may want to RETRY
+/// rather than record as a failure — the typed cause behind it.
+///
+/// Why a struct beside the text rather than a parsed string: the two causes
+/// are produced by runner code at this seam (the resource gate's CRITICAL
+/// refusal, and an exec whose program `access(X_OK)` rejects), so they can be
+/// carried structurally. Grepping the message back apart would couple every
+/// classifier to operator-facing wording, and the wording itself is a wire
+/// value coord's re-drive classifier reads (qontinui-coord #2674) — so the
+/// message is never reworded here, only accompanied. Plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`, D5.
+///
+/// Every `?` on a `String` error inside the seam converts through
+/// [`From<String>`] with no cause, and every caller that wants only the text
+/// converts back through [`From<TerminalSpawnError> for String`], which is
+/// exactly the message — so no observable string changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalSpawnError {
+    pub(crate) message: String,
+    pub(crate) cause: Option<SpawnSeamCause>,
+}
+
+/// The typed cause of a [`TerminalSpawnError`], when the seam knows one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnSeamCause {
+    /// [`crate::resource_guard::admit_spawn_observed`] refused at CRITICAL.
+    ResourceGuard {
+        severity: &'static str,
+        observation: crate::resource_guard::GateObservation,
+    },
+    /// The PTY child's ABSOLUTE program failed the exec seam's own predicate
+    /// ([`super::pane_io::probe_launchable`]) after the spawn failed.
+    ProgramUnlaunchable {
+        program: String,
+        fault: super::pane_io::ExecFault,
+    },
+}
+
+impl From<String> for TerminalSpawnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            cause: None,
+        }
+    }
+}
+
+impl From<TerminalSpawnError> for String {
+    fn from(e: TerminalSpawnError) -> Self {
+        e.message
+    }
+}
+
+impl std::fmt::Display for TerminalSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Classify an exec failure at the PTY seam. PURE over the injected probe so
+/// both arms are unit-testable without a real file.
+///
+/// Only an ABSOLUTE program is classified: that is the branch of
+/// `portable-pty`'s `search_path` that runs `access(X_OK)` and bails, and
+/// re-running the same predicate here names the SAME fault. A relative or
+/// bare program is searched on the child's PATH by the seam, so a failed
+/// probe of it relative to this process's cwd would name the wrong file —
+/// it keeps no cause. A probe that now PASSES (the file came back between the
+/// spawn and here) also keeps no cause: the failure is then unexplained, and
+/// an unexplained failure is recorded as one.
+pub(crate) fn exec_failure_cause(
+    program: Option<&str>,
+    probe: &dyn Fn(&std::path::Path) -> Result<(), super::pane_io::ExecFault>,
+) -> Option<SpawnSeamCause> {
+    let program = program?;
+    let path = std::path::Path::new(program);
+    if !path.is_absolute() {
+        return None;
+    }
+    probe(path)
+        .err()
+        .map(|fault| SpawnSeamCause::ProgramUnlaunchable {
+            program: program.to_string(),
+            fault,
+        })
+}
+
 impl TerminalSession {
     /// Spawn a new terminal session with a shell process.
     ///
@@ -1525,8 +1613,11 @@ impl TerminalSession {
     /// child process is spawned; the PTY pair already opened is dropped with the
     /// error — when that tenant cannot be presented (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
+    ///
+    /// Errors are [`TerminalSpawnError`]: the same text as ever, plus a typed
+    /// cause for the resource gate's refusal and for an unlaunchable program.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
+    pub(crate) fn spawn(
         id: TerminalId,
         title: String,
         working_dir: String,
@@ -1539,18 +1630,25 @@ impl TerminalSession {
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, TerminalSpawnError> {
         // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
         // leaves no half-built session behind and nothing already running is
         // touched. Below the warn floor this emits a notice and returns
         // `Ok(())`; below the critical floor it returns the typed refusal that
         // `src/lib/resourceGuard.ts` turns into the "Start anyway" dialog. Any
         // unreadable sensor proceeds silently.
-        crate::resource_guard::admit_spawn(
+        crate::resource_guard::admit_spawn_observed(
             "terminal session",
             resource_override,
             Some(&app_handle),
-        )?;
+        )
+        .map_err(|refusal| TerminalSpawnError {
+            message: refusal.message,
+            cause: Some(SpawnSeamCause::ResourceGuard {
+                severity: "critical",
+                observation: refusal.observation,
+            }),
+        })?;
 
         let opened = LocalPty::open(&id, cols, rows)?;
 
@@ -1559,6 +1657,8 @@ impl TerminalSession {
         // IS the shell is kept: only a shell pane gets a composed spawn-prompt
         // file below — a direct exec's argv already settled its own carrier.
         let is_shell_pane = command.as_ref().is_none_or(|parts| parts.is_empty());
+        // The override's program, kept to classify an exec failure below.
+        let program: Option<String> = command.as_ref().and_then(|parts| parts.first().cloned());
         let mut cmd = Self::build_command_from(command);
 
         // Set working directory
@@ -1722,9 +1822,22 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
-        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
+        // An exec failure keeps its text verbatim and gains a typed cause only
+        // when the seam's own predicate names one (see `exec_failure_cause`).
+        let io: Arc<dyn PaneIo> = match opened.spawn(ScrubbedCommand::seal(cmd)) {
+            Ok(pane) => Arc::new(pane),
+            Err(message) => {
+                return Err(TerminalSpawnError {
+                    message,
+                    cause: exec_failure_cause(
+                        program.as_deref(),
+                        &super::pane_io::probe_launchable,
+                    ),
+                })
+            }
+        };
 
-        Self::spawn_with_io(
+        Ok(Self::spawn_with_io(
             id,
             title,
             cwd,
@@ -1735,7 +1848,7 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )
+        )?)
     }
 
     /// Build a live session around an already-constructed [`PaneIo`].

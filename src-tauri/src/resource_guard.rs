@@ -2307,8 +2307,8 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
     )
 }
 
-/// The thread lane's live verdict, folded and evaluated. Shared by
-/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+/// The thread lane's live verdict, folded and evaluated — [`probe_for_spawn`]'s
+/// thread half.
 ///
 /// **The single call site of
 /// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
@@ -2344,40 +2344,30 @@ fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     verdict
 }
 
-/// The thread lane's verdict on its own, live — **the entry point for callers
-/// that are not a spawn.**
+/// Live verdict: read the limits, take one reading per lane, evaluate both,
+/// report the heavier.
 ///
-/// Phase 1 of `2026-08-30-load-aware-spawn-admission-control` calls this from
-/// `agent_runtime::evaluate_continuation_guard`, and it needs a DIFFERENT
-/// threshold from the one [`admit_spawn`] enforces. The asymmetry is deliberate
-/// and belongs to the caller, which is why this returns the whole
-/// [`SpawnGate`] rather than a bool:
+/// **Also the entry point for the unattended admission guards** —
+/// `agent_runtime::evaluate_continuation_guard` and `admit_launch` inject this
+/// function, so the queue and the seam cannot disagree about which lanes count
+/// (a thread-lane-only `thread_pressure` used to sit there, and on Windows let
+/// the memory lane refuse at the seam after a check that never consulted it —
+/// plan `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
+/// D1). Those callers act on a DIFFERENT severity from [`admit_spawn`], which
+/// is why this returns the whole [`SpawnGate`] rather than a bool:
 ///
-/// - A **gate continuation** may defer at [`SpawnGate::Warn`]. It can wait and
-///   be re-delivered, nobody is sitting in front of it, and back-pressure that
-///   arrives early is the entire point of a queue — so the cheap verdict is the
-///   right one to act on.
+/// - A **gate continuation** (or coord launch) defers at [`SpawnGate::Warn`].
+///   It can wait and be re-delivered, nobody is sitting in front of it, and
+///   back-pressure that arrives early is the entire point of a queue.
 /// - An **operator's own spawn** is refused only at [`SpawnGate::Critical`], and
 ///   even then overridably ([`admit_spawn`]). Refusing a human's terminal on a
 ///   soft signal is the false positive this module's doctrine ranks worst.
 ///
 /// So: match on the verdict, act at the severity your caller's cost of waiting
 /// justifies. Do not invent a second set of thresholds — the numbers are folded
-/// once, from settings and the fleet, by [`effective_thread_ceilings`].
-///
-/// Short-circuits on a disabled guard before touching the sensor, exactly as
-/// [`probe_for_spawn`] does: a machine owner who turned the guard off pays
-/// nothing.
-pub(crate) fn thread_pressure() -> SpawnGate {
-    let local = crate::settings::get_session_guard_settings();
-    if !local.enabled {
-        return SpawnGate::Proceed;
-    }
-    thread_lane_verdict(&local)
-}
-
-/// Live verdict: read the limits, take one reading per lane, evaluate both,
-/// report the heavier.
+/// once, from settings and the fleet. Side effects are logs only (the
+/// shadowed-lane `warn!` below and [`note_graded_trip`]'s edge-triggered one);
+/// the webview notice is [`admit_spawn`]'s alone.
 ///
 /// The settings read happens FIRST and short-circuits when the guard is
 /// disabled, so a machine owner who turned the guard off pays nothing at all —
@@ -2508,6 +2498,31 @@ pub(crate) fn admit_spawn(
     resource_override: bool,
     app: Option<&AppHandle>,
 ) -> Result<(), String> {
+    admit_spawn_observed(what, resource_override, app).map_err(|refusal| refusal.message)
+}
+
+/// An un-overridden CRITICAL refusal from [`admit_spawn_observed`]: the exact
+/// text [`admit_spawn`] returns, beside the observation that produced it.
+///
+/// The observation travels with the text so an unattended caller can classify
+/// the refusal STRUCTURALLY — which lane, what reading, against what limit —
+/// instead of parsing the operator-facing sentence back apart (plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`, D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CriticalRefusal {
+    /// [`CRITICAL_REFUSAL_PREFIX`]-tagged, byte-identical to [`admit_spawn`]'s.
+    pub(crate) message: String,
+    pub(crate) observation: GateObservation,
+}
+
+/// [`admit_spawn`] with the refusal kept typed. Same verdict, same notices,
+/// same log lines — `admit_spawn` is this function with the observation
+/// dropped.
+pub(crate) fn admit_spawn_observed(
+    what: &str,
+    resource_override: bool,
+    app: Option<&AppHandle>,
+) -> Result<(), CriticalRefusal> {
     match probe_for_spawn() {
         SpawnGate::Proceed => Ok(()),
         SpawnGate::Warn(observation) => {
@@ -2552,7 +2567,10 @@ pub(crate) fn admit_spawn(
                 what = %what,
                 "resource_guard: refusing to spawn past the session critical limit"
             );
-            Err(critical_refusal(what, &observation))
+            Err(CriticalRefusal {
+                message: critical_refusal(what, &observation),
+                observation,
+            })
         }
     }
 }

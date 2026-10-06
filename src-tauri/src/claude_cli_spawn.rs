@@ -39,7 +39,7 @@ pub(crate) const RETRY_DELAYS: [Duration; 3] = [
 ];
 
 /// The head every exhausted transient failure carries, followed by the kind
-/// token. It matches the token the pending pre-claim deferral
+/// token. It matches the token the pre-claim deferral
 /// (qontinui-runner#1925) uses, `claude_cli_unavailable:<kind>`, so the runner
 /// has one word for "the CLI could not be launched".
 ///
