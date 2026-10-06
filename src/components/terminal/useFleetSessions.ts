@@ -622,15 +622,18 @@ export function mergeFleetWalks(
     failures,
     emptyReason,
     degraded: walks.some((w) => isDegraded(w.response)),
-    // In a MERGED read, a walk that failed or is re-reading has no CURRENT
-    // envelope: the one it holds belongs to a previous read (seeded, or the
-    // read the refresh failed to replace). Classified as unanswered (`unknown`)
-    // so the union cannot read `none` — complete — over a tenant that has not
-    // positively said "last page" for THIS read. A single walk keeps its own
-    // envelope, so a single-tenant view reads exactly as it always did.
+    // A walk that is re-reading has no CURRENT envelope — single or merged:
+    // the one it holds belongs to a previous read (a seeded walker carries the
+    // old scope's envelope with its cursor dropped, so classifying it would
+    // read `unreachable` and show a "cursor is no longer usable" banner during
+    // an ordinary scope change). It reads `unknown` while any read is in
+    // flight. In a MERGED read, a walk that FAILED is likewise unanswered, so
+    // the union cannot read `none` — complete — over a tenant that has not
+    // positively said "last page" for THIS read. A single walk that failed and
+    // is NOT loading keeps its own envelope, as it always did.
     truncation: fleetUnionTruncation(
       walks.map((w) => ({
-        response: merged && (walkFailed(w) || w.loading) ? null : w.response,
+        response: w.loading || (merged && walkFailed(w)) ? null : w.response,
         loaded: w.walk.sessions.length,
         canAdvance: w.walk.nextCursor !== null,
       })),
