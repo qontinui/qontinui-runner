@@ -19,9 +19,13 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 import type { TenantCandidateCredential } from "@/contexts/TenantContext";
 import {
   FLEET_PICKER_TENANT_SELECT_ID,
+  FLEET_TENANT_ALL_VALUE,
   FleetTenantSelect,
+  defaultFleetTenantChoice,
   fleetTenantCredentialNote,
   fleetTenantOptions,
+  fleetWalkTenants,
+  isAllTenants,
 } from "./FleetTenantSelect";
 
 const A = "aaaaaaaa-0000-4000-8000-00000000000a";
@@ -54,11 +58,13 @@ describe("FleetTenantSelect", () => {
     expect(render(false)).toBe("");
   });
 
-  it("renders one option per bound tenant plus the device default", () => {
+  it("renders one option per bound tenant plus all-tenants and the device default", () => {
     const html = render(true);
     expect(html).toContain(`data-ui-bridge-id="${FLEET_PICKER_TENANT_SELECT_ID}"`);
     expect(html).toContain("device default");
-    expect(html.match(/<option/g)?.length).toBe(4);
+    expect(html).toContain(`value="${FLEET_TENANT_ALL_VALUE}"`);
+    expect(html).toContain("all tenants (3)");
+    expect(html.match(/<option/g)?.length).toBe(5);
     for (const t of [A, B, C]) expect(html).toContain(`value="${t}"`);
   });
 
@@ -91,5 +97,35 @@ describe("fleetTenantCredentialNote", () => {
   it("matches credentials to candidates by tenant, not by position", () => {
     const opts = fleetTenantOptions([A, B], [cred(B, false, "absent"), cred(A, true, "usable")]);
     expect(opts.map((o) => o.note)).toEqual([null, "pair this tenant"]);
+  });
+});
+
+describe("the merged choice (Phase 4)", () => {
+  it("opens on all tenants only when UNPINNED and bound to more than one", () => {
+    expect(defaultFleetTenantChoice("unpinned", [A, B])).toBe(FLEET_TENANT_ALL_VALUE);
+    // A pin is a choice someone made; it wins.
+    expect(defaultFleetTenantChoice("pinned", [A, B])).toBeNull();
+    // Unresolvable, an unserved posture, and N<=1 keep Phase 3's default.
+    expect(defaultFleetTenantChoice("unresolvable", [A, B])).toBeNull();
+    expect(defaultFleetTenantChoice(null, [A, B])).toBeNull();
+    expect(defaultFleetTenantChoice("unpinned", [A])).toBeNull();
+    expect(defaultFleetTenantChoice("unpinned", [])).toBeNull();
+  });
+
+  it("walks one tenant per candidate for all, and exactly the choice otherwise", () => {
+    expect(fleetWalkTenants(FLEET_TENANT_ALL_VALUE, [A, B, C])).toEqual([A, B, C]);
+    expect(fleetWalkTenants(A, [A, B])).toEqual([A]);
+    expect(fleetWalkTenants(null, [A, B])).toEqual([null]);
+  });
+
+  it("degrades all-with-no-candidates to the runner's default, never to zero walks", () => {
+    expect(fleetWalkTenants(FLEET_TENANT_ALL_VALUE, [])).toEqual([null]);
+  });
+
+  it("marks the merged option selected when chosen", () => {
+    expect(render(true, FLEET_TENANT_ALL_VALUE)).toMatch(/<option value="\*"[^>]*selected=""/);
+    expect(isAllTenants(FLEET_TENANT_ALL_VALUE)).toBe(true);
+    expect(isAllTenants(A)).toBe(false);
+    expect(isAllTenants(null)).toBe(false);
   });
 });

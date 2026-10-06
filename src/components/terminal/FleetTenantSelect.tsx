@@ -17,12 +17,70 @@ import { shortTenantId } from "./SpawnTenantPicker";
  * Rendered only when the device is bound to more than one tenant
  * (`useTenant().showSwitcher`): at N=1 there is nothing to choose and nothing
  * new is shown.
+ *
+ * Phase 4 adds "all tenants": one independent walk per bound tenant, merged
+ * ({@link FLEET_TENANT_ALL_VALUE}); it is the opening choice on an UNPINNED
+ * multi-bound device ({@link defaultFleetTenantChoice}).
  */
 
 export const FLEET_PICKER_TENANT_SELECT_ID = "terminal.fleet-picker.tenant";
 
 /** The `<select>` value standing for "no tenant sent — the runner decides". */
 export const FLEET_TENANT_DEFAULT_VALUE = "";
+
+/**
+ * The `<select>` value — and the view's choice — standing for "every bound
+ * tenant, merged" (Phase 4). `*` can never collide with a tenant uuid. It is
+ * also what the picker projects as `data-fleet-tenant-requested`, so a UI
+ * Bridge driver asserts the merged view by that one value.
+ */
+export const FLEET_TENANT_ALL_VALUE = "*";
+
+/**
+ * The view's tenant choice: a tenant uuid (read that one), `null` (send none —
+ * the runner's own authority order picks), or {@link FLEET_TENANT_ALL_VALUE}
+ * (one walk per bound tenant, merged).
+ */
+export type FleetTenantChoice = string | null;
+
+export function isAllTenants(choice: FleetTenantChoice): boolean {
+  return choice === FLEET_TENANT_ALL_VALUE;
+}
+
+/**
+ * The choice the view OPENS on, before the operator picks anything.
+ *
+ * "All tenants" only on a device that is UNPINNED and bound to more than one
+ * tenant: there the "device default" is merely whichever binding the default
+ * credential slot names — nobody chose it — so opening on it shows a fraction
+ * of the device's own fleet as if it were the whole (the 2026-09-28 report).
+ * A PINNED device opens on its pin, which `TenantPin`'s contract already
+ * settles: someone chose that tenant. `unresolvable`, an absent `pin` (a
+ * runner build that serves none) and N≤1 all keep Phase 3's default — no
+ * tenant sent — so a single-tenant device behaves exactly as before.
+ */
+export function defaultFleetTenantChoice(
+  pin: string | null,
+  candidates: readonly string[],
+): FleetTenantChoice {
+  return pin === "unpinned" && candidates.length > 1 ? FLEET_TENANT_ALL_VALUE : null;
+}
+
+/**
+ * The tenants to walk for a choice — one independent cursor walk each, because
+ * coord fingerprints the tenant into its cursor. `null` in the result means
+ * "send no tenant". "All tenants" with no known candidates (a list still
+ * loading, or an unreadable `paired_user.json`) degrades to the runner's own
+ * default rather than to zero walks: an empty walk set would render as an
+ * empty fleet.
+ */
+export function fleetWalkTenants(
+  choice: FleetTenantChoice,
+  candidates: readonly string[],
+): (string | null)[] {
+  if (!isAllTenants(choice)) return [choice];
+  return candidates.length > 0 ? [...candidates] : [null];
+}
 
 /**
  * Why a bound tenant's read is expected to fail, or `null` when its credential
@@ -73,9 +131,10 @@ interface FleetTenantSelectProps {
   showSwitcher: boolean;
   candidates: string[];
   credentials: TenantCandidateCredential[];
-  /** The selected tenant, or null for the runner's own default. */
-  selected: string | null;
-  onChange: (tenantId: string | null) => void;
+  /** The selected tenant, `null` for the runner's own default, or
+   * {@link FLEET_TENANT_ALL_VALUE} for every bound tenant. */
+  selected: FleetTenantChoice;
+  onChange: (choice: FleetTenantChoice) => void;
   className?: string;
 }
 
@@ -97,9 +156,12 @@ export function FleetTenantSelect({
       onChange={(e) =>
         onChange(e.target.value === FLEET_TENANT_DEFAULT_VALUE ? null : e.target.value)
       }
-      title="Which tenant's fleet to read. coord shows only the sessions of the tenant whose credential this runner presents, so a device bound to several tenants reads one at a time. Affects this view only — it does not change the default tenant for new sessions."
+      title="Which tenant's fleet to read. coord shows only the sessions of the tenant whose credential this runner presents, so “all tenants” reads each bound tenant separately and merges the rows — each row keeps the tenant it was served under. Affects this view only — it does not change the default tenant for new sessions."
       className={className}
     >
+      <option value={FLEET_TENANT_ALL_VALUE} title="One read per bound tenant, merged">
+        all tenants ({candidates.length})
+      </option>
       <option value={FLEET_TENANT_DEFAULT_VALUE}>device default</option>
       {options.map((o) => (
         <option key={o.value} value={o.value} title={o.value}>

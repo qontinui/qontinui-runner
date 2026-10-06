@@ -83,9 +83,21 @@ export interface TenantCandidateCredential {
   via_default_slot: boolean;
 }
 
+/**
+ * The machine pin's posture, as `get_active_tenant` serves it (Rust
+ * `commands::tenant::ActiveTenantView.pin`): `pinned` (an operator chose a
+ * tenant), `unpinned` (readable, no pin — the paired DEFAULT binding applies,
+ * which nobody chose), `unresolvable` (unreadable or malformed — the runner
+ * refuses rather than guess).
+ */
+export type TenantPinPosture = "pinned" | "unpinned" | "unresolvable";
+
 interface GetActiveTenantResponse {
   active_tenant_id: string | null;
   source: "machine.json" | "paired_user.json" | null;
+  /** How `machine.json` classifies (`tenant_pin::TenantPin`). Absent from a
+   * runner build that predates it — read as UNKNOWN, never as "unpinned". */
+  pin?: TenantPinPosture;
   candidates: string[];
   /** One per candidate, in candidate order. Absent from a runner build that
    * predates it — read as UNKNOWN per tenant, never as "usable". */
@@ -120,6 +132,12 @@ export interface TenantContextValue {
   /** Where the default tenant was resolved from. Diagnostic surface for
    * the settings panel. */
   source: "machine.json" | "paired_user.json" | null;
+  /**
+   * The machine pin's posture, or `null` while loading / against a runner build
+   * that serves none — UNKNOWN, never "unpinned". The Fleet view opens on "all
+   * tenants" only when this reads `unpinned` on a multi-bound device.
+   */
+  pin: TenantPinPosture | null;
   /**
    * Tenants this device is bound to, as raw UUID strings — there is no display
    * name on this wire, by design (resolving one needs a coord round-trip and a
@@ -190,6 +208,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
     null,
   );
   const [source, setSource] = useState<TenantContextValue["source"]>(null);
+  const [pin, setPin] = useState<TenantPinPosture | null>(null);
   const [candidates, setCandidates] = useState<string[]>([]);
   const [credentials, setCredentials] = useState<TenantCandidateCredential[]>([]);
   const [spawnTenantId, setSpawnTenantId] = useState<string | null>(null);
@@ -200,6 +219,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
       const data = resp?.data;
       setDefaultTenantIdForNewSessions(data?.active_tenant_id ?? null);
       setSource(data?.source ?? null);
+      setPin(data?.pin ?? null);
       setCandidates(data?.candidates ?? []);
       setCredentials(data?.credentials ?? []);
     } catch (e) {
@@ -261,6 +281,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
     () => ({
       defaultTenantIdForNewSessions,
       source,
+      pin,
       candidates,
       credentials,
       showSwitcher,
@@ -272,6 +293,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
     [
       defaultTenantIdForNewSessions,
       source,
+      pin,
       candidates,
       credentials,
       showSwitcher,
