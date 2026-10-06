@@ -63,6 +63,12 @@ impl From<&ProxyableCommand> for CommandDescriptor {
 pub struct InvokeRequestBody {
     #[serde(default = "default_args")]
     pub args: Value,
+    /// Every OTHER top-level key of the body. Never forwarded anywhere -- the
+    /// body's only field is `args` -- and captured solely so a misplaced arg
+    /// can be REFUSED by name instead of silently dropped (see
+    /// [`misplaced_tenant_rejection`]).
+    #[serde(flatten)]
+    pub top_level_extras: serde_json::Map<String, Value>,
 }
 
 fn default_args() -> Value {
@@ -134,9 +140,53 @@ pub async fn ui_bridge_invoke_handler(
         ));
     }
 
+    if let Some(rejection) = misplaced_tenant_rejection(&command, &body.top_level_extras) {
+        return Err(rejection);
+    }
+
     let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS);
     let value = perform_invoke_round_trip(&state, &command, &body.args, timeout_ms).await?;
     Ok(Json(ApiResponse::success(value)))
+}
+
+/// The typed prefix of the 400 a `get_coord_device_token` call gets when it
+/// names its tenant at the TOP level of the body instead of inside `args`.
+pub(crate) const DEVICE_TOKEN_TENANT_MISPLACED: &str = "get_coord_device_token:tenant_misplaced";
+
+/// Refuse a `get_coord_device_token` body that carries `tenantId` /
+/// `tenant_id` at the TOP level (plan
+/// `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+/// D5).
+///
+/// [`InvokeRequestBody`] reads `args` alone, so such a key used to be dropped
+/// SILENTLY and the call arrived tenant-less: a 409 `tenant_required` on a
+/// runner holding several tenant slots, which names the wrong fault, and on a
+/// single-slot runner the DEFAULT slot's token, whatever tenant the caller
+/// meant. Every fleet caller that made this misplacement is fixed in the same
+/// change that carries their bundled copies, so the refusal can only meet a
+/// stale copy -- and then it says exactly what to send.
+///
+/// Scoped to this one command: it is the only one whose args name a tenant,
+/// and the extras of every other command stay ignored as before.
+pub(crate) fn misplaced_tenant_rejection(
+    command: &str,
+    top_level_extras: &serde_json::Map<String, Value>,
+) -> Option<(StatusCode, Json<ApiResponse<()>>)> {
+    if command != "get_coord_device_token" {
+        return None;
+    }
+    let key = ["tenantId", "tenant_id"]
+        .into_iter()
+        .find(|k| top_level_extras.contains_key(*k))?;
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(api_error(format!(
+            "{DEVICE_TOKEN_TENANT_MISPLACED}: `{key}` was sent at the TOP level of the \
+             request body, where this route ignores it (the body's only field is `args`), \
+             so the call would have named no tenant. Send it inside args: \
+             POST /ui-bridge/invoke/get_coord_device_token {{\"args\":{{\"tenantId\":\"<uuid>\"}}}}"
+        ))),
+    ))
 }
 
 /// Machine-readable `code` on the headless-runner rejection.
@@ -1404,5 +1454,53 @@ mod coord_device_token_arg_tests {
         assert!(parse(&json!({"tenantId": 7})).is_err());
         assert!(parse(&json!({"tenant": "t1"})).is_err());
         assert!(parse(&json!("t1")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod misplaced_tenant_tests {
+    use super::*;
+    use serde_json::json;
+
+    const TEST_TENANT: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn body(v: Value) -> InvokeRequestBody {
+        serde_json::from_value(v).expect("an object body deserializes")
+    }
+
+    #[test]
+    fn a_top_level_tenant_is_refused_naming_the_envelope() {
+        // A placeholder tenant: gitleaks' generic-api-key rule reads a uuid
+        // literal beside a variable called `key` as a credential.
+        for field in ["tenantId", "tenant_id"] {
+            let b = body(json!({ field: TEST_TENANT }));
+            assert_eq!(b.args, json!({}), "the misplaced key never reaches args");
+            let (status, Json(resp)) =
+                misplaced_tenant_rejection("get_coord_device_token", &b.top_level_extras)
+                    .expect("a top-level tenant is refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let text = serde_json::to_string(&resp).unwrap();
+            assert!(text.contains(DEVICE_TOKEN_TENANT_MISPLACED), "{text}");
+            assert!(text.contains(field), "names the key it refused: {text}");
+            assert!(
+                text.contains(r#"{\"args\":{\"tenantId\":\"<uuid>\"}}"#),
+                "names the envelope verbatim: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_args_envelope_and_other_commands_are_untouched() {
+        let good = body(json!({"args": {"tenantId": "t"}}));
+        assert!(good.top_level_extras.is_empty());
+        assert!(misplaced_tenant_rejection("get_coord_device_token", &good.top_level_extras).is_none());
+        let empty = body(json!({}));
+        assert!(misplaced_tenant_rejection("get_coord_device_token", &empty.top_level_extras).is_none());
+        // Another top-level key is still ignored, as before.
+        let other_key = body(json!({"args": {}, "timeoutMs": 5}));
+        assert!(misplaced_tenant_rejection("get_coord_device_token", &other_key.top_level_extras).is_none());
+        // Only this command names a tenant; others keep ignoring extras.
+        let elsewhere = body(json!({"tenantId": "t"}));
+        assert!(misplaced_tenant_rejection("get_access_token_for_websocket", &elsewhere.top_level_extras).is_none());
     }
 }
