@@ -494,7 +494,7 @@ fn pty_holder_data_path_kill_ends_the_child() {
 }
 
 /// Review round 1 finding 2, round 2 F2: input the child does not read never
-/// stalls the attached connection. ~13 MiB of input to a child that never
+/// stalls the attached connection. 12 MiB of input to a child that never
 /// reads its stdin goes on the INPUT stream — far more than the PTY's input
 /// buffer, the holder's 64-frame input queue (`INPUT_QUEUE_FRAMES` x 64 KiB)
 /// and both socket buffers together — so the writer is still blocked after
@@ -571,6 +571,86 @@ fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
         h.exits_within(Duration::from_secs(10)).is_some(),
         "the holder exits once the exit is delivered, queued input notwithstanding"
     );
+}
+
+/// Review round 3, M1: a newer input connection SUPERSEDES an older one. A
+/// paste is blocked on input connection #1 (the child is not reading yet, the
+/// queue is full); the runner gives up on it and opens #2, which sends a
+/// marker. Once the child starts reading, every byte of #2 arrives, and NO
+/// byte of #1 arrives after any byte of #2 — #1's in-hand and still-buffered
+/// frames are discarded, not raced into the queue behind #2's.
+#[test]
+fn pty_holder_data_path_a_new_input_connection_supersedes_the_old_one() {
+    let files = pane_dir("supf");
+    std::fs::create_dir_all(&files).unwrap();
+    let go = files.join("go");
+    let out = files.join("out");
+    let script = format!(
+        "stty raw -echo; printf R; while [ ! -e '{}' ]; do sleep 0.05; done; exec cat > '{}'",
+        go.display(),
+        out.display()
+    );
+    let h = start("sup", sh(&script));
+    let mut s = attach(&h, None);
+    let first_offset = s.info.start_offset;
+    collect_until(&mut s, first_offset, Duration::from_secs(10), |c| {
+        c.bytes.ends_with(b"R")
+    });
+    let mut one = input_of(&h);
+    let frames = qontinui_pty_holder::pty::INPUT_QUEUE_FRAMES * 3;
+    let paster = std::thread::spawn(move || {
+        let chunk = vec![b'A'; 64 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for _ in 0..frames {
+            if one.input(&chunk, deadline).is_err() {
+                return false;
+            }
+        }
+        true
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !paster.is_finished(),
+        "connection #1's paste is not blocked"
+    );
+
+    let marker = vec![b'B'; 1000];
+    let mut two = input_of(&h);
+    let sender =
+        std::thread::spawn(move || two.input(&marker, Instant::now() + Duration::from_secs(60)));
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&go, b"").unwrap();
+
+    let end = Instant::now() + Duration::from_secs(30);
+    let got = loop {
+        let got = std::fs::read(&out).unwrap_or_default();
+        if got.iter().filter(|b| **b == b'B').count() >= 1000 {
+            break got;
+        }
+        assert!(
+            Instant::now() < end,
+            "connection #2's input never fully arrived"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    sender
+        .join()
+        .unwrap()
+        .expect("connection #2's input was accepted");
+    // Give any straggler from #1 the chance to show up before judging.
+    std::thread::sleep(Duration::from_millis(500));
+    let got = std::fs::read(&out).unwrap_or(got);
+    let first_b = got.iter().position(|b| *b == b'B').unwrap();
+    assert!(
+        !got[first_b..].contains(&b'A'),
+        "bytes of the superseded connection #1 arrived after connection #2's"
+    );
+    assert!(
+        !paster.join().unwrap(),
+        "connection #1 was closed when superseded, not served to completion"
+    );
+    s.writer.kill(soon()).unwrap();
+    let _ = std::fs::remove_dir_all(&files);
 }
 
 /// Input is refused on the attached connection: it would put the input queue

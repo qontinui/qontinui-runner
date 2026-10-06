@@ -480,6 +480,8 @@ pub(crate) fn serve_conn_with(
 
     let handshake_deadline = Instant::now() + params.handshake_timeout;
     let mut state = ConnState::AwaitHello;
+    // This connection's input generation, once it became the input stream.
+    let mut input_gen: Option<u64> = None;
     loop {
         let read = if state == ConnState::AwaitHello {
             // One deadline for the whole first frame (DeadlineIo re-arms it
@@ -525,6 +527,13 @@ pub(crate) fn serve_conn_with(
         };
         match action {
             Action::Reply(reply) => {
+                // `open_input` just made this connection the input stream:
+                // supersede every older input connection BEFORE answering, so
+                // nothing the client sends after the `ok` can be overtaken by
+                // an older connection's input.
+                if matches!(state, ConnState::InputOnly(_)) && input_gen.is_none() {
+                    input_gen = pane.map(|p| p.supersede_input());
+                }
                 if send_reply(&writer, &reply).is_err() {
                     break;
                 }
@@ -552,9 +561,19 @@ pub(crate) fn serve_conn_with(
                 // stays full for `params.input_queue_timeout` closes THIS input
                 // connection — its thread and slot are not held hostage by a
                 // child that ignores stdin; the runner reopens one.
-                if let Some(pane) = pane {
-                    match pane.write_input(&bytes, params.input_queue_timeout) {
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
+                // A SUPERSEDED connection (a newer `open_input` exists) has
+                // its input discarded and is closed: its bytes must never
+                // follow the newer connection's.
+                if let (Some(pane), Some(generation)) = (pane, input_gen) {
+                    match pane.write_input(&bytes, params.input_queue_timeout, generation) {
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut | io::ErrorKind::Other
+                            ) =>
+                        {
+                            break
+                        }
                         _ => {}
                     }
                 }
