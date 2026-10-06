@@ -138,8 +138,22 @@ lto = false
 # Upstream, open and unfixed in every released version:
 #   https://github.com/tauri-apps/tauri/issues/15408
 #
+# LINUX has the same race through a different field: tao's Linux
+# `EventLoopWindowTarget` is `#[derive(Clone)]` and carries
+# `windows: Rc<RefCell<HashSet<WindowId>>>`, reached by the same off-main-thread
+# clones and drops. There it surfaces as glibc heap-corruption SIGABRTs
+# (`malloc(): unaligned tcache chunk detected`, `corrupted double-linked list`,
+# `malloc(): unsorted double linked list corrupted`) -- 12 on the Linux primary
+# between 2026-09-13 and 2026-10-01 per investigation-results/2026-10-01-runner-
+# heap-corruption-aborts.md (qontinui-dev-notes), while only the Windows half
+# was patched.
+# Plan `2026-10-01-linux-runner-heap-corruption-tao-windows-rc-race`.
+#
 # The vendored copy is byte-identical to the crates.io 0.35.0 source except for
-# a 2-line semantic change (`Rc` -> `Arc` on that one alias and its constructor);
+# three changes: `Rc` -> `Arc` on the Windows `EventLoopRunnerShared` alias and
+# on the Linux `EventLoopWindowTarget::windows` field (each with its
+# constructor), and the Windows `execute_in_thread` PostMessage-failure fix
+# (d7e1ede77);
 # `vendor/tao-0.35.0/QONTINUI-PATCH.md` records the delta. Only the REFCOUNT
 # becomes atomic -- the pointee is still only ever dereferenced on the main
 # thread, so this adds no new soundness assumption, it only removes a data race.
