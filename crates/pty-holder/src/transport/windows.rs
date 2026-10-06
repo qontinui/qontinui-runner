@@ -97,20 +97,16 @@ pub struct Conn {
     write_event: Handle,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
-    /// The holder's end of the pipe (from `Listener::accept`), as opposed to
-    /// the runner's (from `connect`). Decides what [`Conn::shutdown`] can do.
-    server: bool,
 }
 
 impl Conn {
-    fn from_handle(handle: Handle, server: bool) -> io::Result<Conn> {
+    fn from_handle(handle: Handle) -> io::Result<Conn> {
         Ok(Conn {
             handle,
             read_event: new_event()?,
             write_event: new_event()?,
             read_timeout: None,
             write_timeout: None,
-            server,
         })
     }
 
@@ -156,7 +152,7 @@ impl Conn {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        Conn::from_handle(Handle(dup), self.server)
+        Conn::from_handle(Handle(dup))
     }
 
     /// Block until the peer has read everything written so far
@@ -186,18 +182,28 @@ impl Conn {
         Ok(pid)
     }
 
-    /// End the connection now, for EVERY handle on it: cancel this handle's
-    /// pending I/O and, on the holder's side, disconnect the pipe instance so
-    /// a read blocked on a [`Conn::try_clone`] of it fails instead of waiting
-    /// for a client that has stopped talking. (Dropping the last handle does
-    /// the rest.)
+    /// Unblock every thread doing I/O on this connection, and let it end.
+    ///
+    /// `CancelIoEx` with a null `OVERLAPPED` cancels the I/O pending on the
+    /// pipe's FILE OBJECT — every [`Conn::try_clone`] duplicates the handle onto
+    /// that same object, so a read blocked on the dispatch's handle and a write
+    /// blocked on the pump's both fail and return. The connection then ends
+    /// when the last handle is DROPPED (`CloseHandle`), which — unlike
+    /// `DisconnectNamedPipe` — keeps everything already written readable by
+    /// the client.
+    ///
+    /// Review round 4 (first Windows execution of Phase 2): this used to call
+    /// `DisconnectNamedPipe` on the holder's side, and `DisconnectNamedPipe`
+    /// DISCARDS data the client has not read yet. Every `rejected` frame is
+    /// written immediately before a shutdown, so the client read EOF in the
+    /// middle of it ("failed to fill whole buffer") — four transport tests that
+    /// passed in Phase 1, when this method was a no-op and the handles were
+    /// simply dropped. Closing by drop is that Phase 1 behaviour.
+    /// (Type-checked here; executed on the `holder-crates (windows-latest)`
+    /// CI leg.)
     pub fn shutdown(&self) {
         // SAFETY: a valid handle; a null OVERLAPPED cancels all of its I/O.
         unsafe { CancelIoEx(self.handle.0, null()) };
-        if self.server {
-            // SAFETY: a valid server-side pipe handle.
-            unsafe { DisconnectNamedPipe(self.handle.0) };
-        }
     }
 
     /// Run one overlapped operation to completion or timeout.
@@ -556,7 +562,7 @@ impl Listener {
                     st.stuck = 0;
                     st.stuck_since = None;
                     drop(st);
-                    Conn::from_handle(h, true)
+                    Conn::from_handle(h)
                 }
                 Err(e) => {
                     // No replacement: this client cannot be served without
@@ -633,7 +639,7 @@ pub fn connect(name: &str, deadline: Instant) -> io::Result<Conn> {
             )
         };
         if h != INVALID_HANDLE_VALUE {
-            return Conn::from_handle(Handle(h), false);
+            return Conn::from_handle(Handle(h));
         }
         match last_error() {
             ERROR_PIPE_BUSY => {
