@@ -1,29 +1,27 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import type { InteractiveSurface, InteractivityFact } from "./remoteInteractivityFacts";
 import {
-  EMPTY_FLEET_WALK,
-  FLEET_CURSOR_STALLED_MESSAGE,
   FLEET_DEFAULT_LIMIT,
-  fleetCursorStalled,
-  fleetErrorCode,
-  fleetErrorInvalidatesCursor,
-  fleetErrorIsRestart,
-  fleetErrorMessage,
   fleetScopeKey,
-  fleetWalkAccept,
-  fleetWalkDropCursor,
+  fleetUnionTruncation,
   mergeDeviceCatalog,
   mergeStateCatalog,
-  normalizeFleetCursor,
   statesSeenIn,
   type FleetDeviceOption,
   type FleetErrorCode,
+  type FleetReadTenants,
   type FleetServerFilter,
-  type FleetWalk,
-  type FleetWalkMode,
+  type FleetTruncation,
 } from "./fleetDiscovery";
+import {
+  FleetTenantWalker,
+  initialFleetWalkSnapshot,
+  servedTenantOf,
+  type FleetPageFetcher,
+  type FleetWalkSnapshot,
+} from "./fleetWalker";
 
 /**
  * One session somewhere on the fleet, as coord's `GET /coord/sessions/fleet`
@@ -104,6 +102,15 @@ export interface FleetSession {
   /** Whether this session is a remote PTY surface at all. Absent on an older
    * coord. */
   interactiveSurface?: InteractiveSurface;
+  /**
+   * The tenant this row was SERVED under — stamped by the walk
+   * (`stampServedTenant` in `fleetWalker.ts`), never on coord's wire. In a
+   * merged multi-tenant view rows from different tenants sit side by side, and
+   * attach / create must mint under THIS tenant: coord resolves a target within
+   * the presented principal's tenant only. `null` when neither the envelope nor
+   * the request named one (the runner's authority order then decides again).
+   */
+  servedTenantId?: string | null;
 }
 
 /**
@@ -161,15 +168,20 @@ export interface FleetSessionsQuery {
   deviceId?: string;
   state?: string;
   includeClosed?: boolean;
-  /** Page size for each page of the walk, NOT a reachability control. */
+  /** Page size for each page of each walk, NOT a reachability control. */
   limit?: number;
   /**
-   * The tenant whose fleet to read, sent as the command's `tenant` arg. Absent
-   * or null ⇒ the runner's own authority order picks (the machine pin, else the
-   * default credential slot). It is the CREDENTIAL the read presents, not a
-   * query parameter — coord scopes rows to the principal's tenant only.
+   * The tenants whose fleets to read — ONE independent cursor walk each, merged
+   * (plan
+   * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+   * Phase 4). Each entry is sent as the command's `tenant` arg; `null` sends
+   * none and the runner's own authority order picks (the machine pin, else the
+   * default credential slot). It is the CREDENTIAL a read presents, not a query
+   * parameter — coord scopes rows to the principal's tenant only, and
+   * fingerprints it into the cursor, which is why a union is N walks rather than
+   * one wider one. Absent ⇒ `[null]`, the single pre-selector read.
    */
-  tenantId?: string | null;
+  tenants?: readonly (string | null)[];
 }
 
 /**
@@ -179,51 +191,88 @@ export interface FleetSessionsQuery {
  */
 export type FleetEmptyReason =
   | "not-loaded" // no read has completed yet
-  | "error" // the read failed; `error` carries the reason
+  | "error" // the read failed (every tenant's, in a merged view); `error` carries the reason
+  | "partial" // merged: some tenants answered with zero rows, others FAILED — unknown for those
   | "observed-empty"; // coord answered, with zero rows and no degradation
 
+/**
+ * One tenant whose walk carries an error — a failed read, or a walk that cannot
+ * advance (`walkStalled`). Listed per tenant so one tenant's 401 never blanks,
+ * or hides behind, another's rows.
+ */
+export interface FleetTenantFailure {
+  /** The tenant the walk ASKED for (`null` = the runner's own default). */
+  requestedTenant: string | null;
+  error: string;
+  errorCode: FleetErrorCode | null;
+  /** The walk answered and only its next page is out of reach. */
+  walkStalled: boolean;
+}
+
 export interface UseFleetSessionsResult {
+  /** True when more than one tenant is walked — the union rules apply. */
+  merged: boolean;
   /**
-   * Every row the walk has served for the CURRENT scope, accumulated across
-   * pages and deduplicated by `sessionId`. A restart replaces this wholesale —
-   * carrying rows across a scope change would build a list no filter set
-   * describes.
+   * Every row the walks have served for the CURRENT scope, accumulated across
+   * pages, deduplicated by `sessionId`, and stamped with `servedTenantId`. A
+   * restart replaces a walk's rows wholesale — carrying rows across a scope
+   * change would build a list no filter set describes.
    */
   sessions: FleetSession[];
-  /** The full envelope of the last successful page, or null. */
-  response: FleetSessionsResponse | null;
-  /** A page-ONE read is in flight — the list may be blank or stale. */
+  /** Each walk's own state, in the order `tenants` asked for them. */
+  walks: FleetWalkSnapshot[];
+  /**
+   * The envelope of each walk's last successful page, keyed by the tenant its
+   * rows were served under — what a row's own degraded flags are read from.
+   */
+  envelopes: ReadonlyMap<string | null, FleetSessionsResponse>;
+  /** A page-ONE read is in flight on some walk — the list may be blank or stale. */
   loading: boolean;
   /** A SUBSEQUENT page is in flight — the rows on screen stay valid. */
   loadingMore: boolean;
+  /**
+   * The failure to show IN PLACE OF the list. Single walk: its error. Merged:
+   * set only when EVERY tenant's read failed — a partial failure is in
+   * `failures`, beside the rows the other tenants served, never in place of
+   * them.
+   */
   error: string | null;
   /**
-   * coord's stable machine code for the last failed read, or null when the
-   * failure carried none (a transport error) or there was no failure.
-   * `cursor_scope_mismatch` never reaches here: it is a restart, not an error.
+   * coord's stable machine code for that failure, or null when it carried none
+   * (a transport error), there was none, or the view is merged (each failure's
+   * code is on its own `failures` entry). `cursor_scope_mismatch` never reaches
+   * here: it is a restart, not an error.
    */
   errorCode: FleetErrorCode | null;
   /**
    * True when `error` describes a walk that cannot ADVANCE rather than a read
    * that FAILED — coord answered, the rows are current, and only the next page
-   * is out of reach. The two must not share a banner: "last refresh failed" over
-   * a successful read is a false claim in the other direction.
+   * is out of reach. The two must not share a banner. Always false when merged.
    */
   walkStalled: boolean;
+  /** Every walk carrying an error, per tenant. The merged view's error strip. */
+  failures: FleetTenantFailure[];
   /**
    * Set when `sessions` is empty, saying WHY. `observed-empty` is the only
-   * value that licenses the words "no sessions"; the others are UNKNOWN.
+   * value that licenses the words "no sessions" unqualified; `partial` licenses
+   * them only scoped to the tenants that answered and naming those that did
+   * not; the others are UNKNOWN.
    */
   emptyReason: FleetEmptyReason | null;
   /**
-   * True when coord served at least one field degraded. A caller must not
-   * present a degraded FIELD (device names, work-axis status, bridge ids) as
-   * observed while this is set; the row count itself is unaffected by column
-   * degradation and may be shown.
+   * True when coord served at least one field degraded on any walk. A caller
+   * must not present a degraded FIELD as observed while this is set.
    */
   degraded: boolean;
+  /** Completeness over the union (`fleetUnionTruncation`). */
+  truncation: FleetTruncation;
+  /** Which tenants answered and which failed — the empty message's scope. */
+  readTenants: FleetReadTenants;
+  /** Distinct tenants the served rows were scoped to, in walk order. */
+  servedTenants: string[];
   /**
-   * Every device seen across the reads this hook has made, accumulated.
+   * Every device seen across the reads this hook has made, accumulated across
+   * every tenant of the current tenant set.
    *
    * The picker's device filter is served from this rather than from the latest
    * response: selecting a device sends `device_id` to coord, whose next
@@ -238,30 +287,32 @@ export interface UseFleetSessionsResult {
    */
   stateCatalog: string[];
   /**
-   * The query `response` was actually served for, or null before any read
-   * completed.
+   * The query the served rows were actually served for, or null before any
+   * read completed.
    *
    * This exists because the caller's filter state and the last response are
    * INDEPENDENT: the moment a filter changes, the component's own filter object
-   * describes a request in flight while `response` still holds the previous
+   * describes a request in flight while the rows still belong to the previous
    * one. A caller that reported "coord truncated this read at {its own limit}"
    * would then be stating something false — and a failed refetch makes that
-   * permanent, since the old `response` is deliberately kept and `loading`
-   * returns to false. Anything said ABOUT the served rows must be said with
-   * this, never with the caller's pending filters.
+   * permanent, since the old rows are deliberately kept and `loading` returns to
+   * false. Anything said ABOUT the served rows must be said with this, never
+   * with the caller's pending filters. Every walk shares one filter set.
    */
   appliedQuery: FleetServerFilter | null;
-  /** Pages accepted since the last restart. 0 before any read completes. */
+  /** Pages accepted since the last restart, summed over walks. */
   pagesLoaded: number;
   /**
-   * True when coord handed back a cursor on the last page — i.e. more rows are
+   * True when some walk holds a cursor coord handed back — more rows are
    * genuinely REACHABLE, not merely unserved. False is only ever "complete as
-   * of that read".
+   * of those reads".
    */
   hasMore: boolean;
-  /** Restart the walk from coord's first page, with no cursor. */
+  /** Restart every walk from coord's first page, with no cursor. */
   refresh: () => Promise<void>;
-  /** Fetch the next page with the cursor. A no-op when there is none. */
+  /** Restart ONE tenant's walk — the per-tenant retry. */
+  refreshTenant: (requestedTenant: string | null) => Promise<void>;
+  /** Fetch the next page of every walk that has a cursor. A no-op when none does. */
   loadMore: () => Promise<void>;
 }
 
@@ -345,7 +396,18 @@ export function emptyReasonFor(
  * the remainder legible as "everywhere else".
  */
 export interface FleetDeviceGroup {
+  /**
+   * The group's identity: the device id, or — when grouping by tenant too —
+   * `<deviceId>|<tenant>`. Stable across reads; use it as the React key.
+   */
+  key: string;
   deviceId: string;
+  /**
+   * The tenant this group's rows were served under (their `servedTenantId`).
+   * When grouping by tenant every row shares it; otherwise it is the first
+   * row's, which in a single-tenant read is every row's.
+   */
+  tenantId: string | null;
   /** Best available human label, falling back to the id. */
   label: string;
   isCallerDevice: boolean;
@@ -393,19 +455,32 @@ function byActivityDesc(a: FleetSession, b: FleetSession): number {
   return a.sessionId < b.sessionId ? -1 : 1;
 }
 
-export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
-  const byDevice = new Map<string, FleetSession[]>();
+/**
+ * `byTenant` splits a device's rows by the tenant they were served under — the
+ * MERGED view's grouping (Phase 4). A device bound to two tenants then shows as
+ * two groups, so a group's "New terminal" names one tenant to mint under and
+ * its count is one tenant's, never a sum the header does not explain.
+ */
+export function groupByDevice(
+  sessions: FleetSession[],
+  opts?: { byTenant?: boolean },
+): FleetDeviceGroup[] {
+  const byTenant = opts?.byTenant === true;
+  const byKey = new Map<string, FleetSession[]>();
   for (const s of sessions) {
-    const list = byDevice.get(s.deviceId);
+    const key = byTenant ? `${s.deviceId}|${s.servedTenantId ?? ""}` : s.deviceId;
+    const list = byKey.get(key);
     if (list) list.push(s);
-    else byDevice.set(s.deviceId, [s]);
+    else byKey.set(key, [s]);
   }
 
   const groups: FleetDeviceGroup[] = [];
-  for (const [deviceId, rows] of byDevice) {
+  for (const [key, rows] of byKey) {
     const first = rows[0];
     groups.push({
-      deviceId,
+      key,
+      deviceId: first.deviceId,
+      tenantId: first.servedTenantId ?? null,
       label: deviceLabel(first),
       isCallerDevice: first.isCallerDevice,
       sessions: [...rows].sort(byActivityDesc),
@@ -413,10 +488,11 @@ export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
   }
 
   // Caller's device first, then by label so the order is stable across reads
-  // (device ids are opaque, so sorting by them would look arbitrary).
+  // (device ids are opaque, so sorting by them would look arbitrary), then by
+  // tenant so one device's tenant groups sit together in a fixed order.
   groups.sort((a, b) => {
     if (a.isCallerDevice !== b.isCallerDevice) return a.isCallerDevice ? -1 : 1;
-    return a.label.localeCompare(b.label);
+    return a.label.localeCompare(b.label) || (a.tenantId ?? "").localeCompare(b.tenantId ?? "");
   });
   return groups;
 }
@@ -435,249 +511,323 @@ export function deviceLabel(s: FleetSession): string {
   return `device ${s.deviceId.slice(0, 8)}`;
 }
 
+/** Rows of several walks as one list, first occurrence of a `sessionId` wins.
+ * A session lives in exactly one tenant, so a repeat is a guard, not a merge. */
+function unionSessions(walks: readonly FleetWalkSnapshot[]): FleetSession[] {
+  if (walks.length === 1) return walks[0].walk.sessions;
+  const seen = new Set<string>();
+  const out: FleetSession[] = [];
+  for (const w of walks) {
+    for (const s of w.walk.sessions) {
+      if (seen.has(s.sessionId)) continue;
+      seen.add(s.sessionId);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** A walk that FAILED (not merely stalled) and so answered nothing current. */
+function walkFailed(w: FleetWalkSnapshot): boolean {
+  return w.error !== null && !w.walkStalled;
+}
+
 /**
- * Read-only discovery of the fleet's sessions, walked page by page with coord's
- * keyset cursor. No attach, no keystrokes — those are Phases 3-5 and are gated
- * on the authorization-grain work this phase does not touch.
+ * Fold N walk snapshots into what the picker renders — every count, flag and
+ * completeness claim re-derived over the UNION (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+ * Phase 4).
  *
- * ## The walk
+ * Pure and exported because the honesty rules are the point: one tenant's
+ * failure must not blank the others (`error` stays null until EVERY walk
+ * failed), and must not let an empty union read as an empty fleet
+ * (`emptyReason` is `partial`, never `observed-empty`, while any tenant is
+ * unanswered). A single walk folds to exactly what that walk alone says, so a
+ * single-tenant view is unchanged.
+ */
+export function mergeFleetWalks(
+  walks: readonly FleetWalkSnapshot[],
+): Omit<
+  UseFleetSessionsResult,
+  "deviceCatalog" | "stateCatalog" | "refresh" | "refreshTenant" | "loadMore"
+> {
+  const merged = walks.length > 1;
+  const sessions = unionSessions(walks);
+  const single = walks.length === 1 ? walks[0] : null;
+
+  const envelopes = new Map<string | null, FleetSessionsResponse>();
+  const servedTenants: string[] = [];
+  for (const w of walks) {
+    if (!w.response) continue;
+    const served = servedTenantOf(w.response, w.requestedTenant);
+    envelopes.set(served, w.response);
+    if (served !== null && !servedTenants.includes(served)) servedTenants.push(served);
+  }
+
+  const failures: FleetTenantFailure[] = walks
+    .filter((w) => w.error !== null)
+    .map((w) => ({
+      requestedTenant: w.requestedTenant,
+      error: w.error as string,
+      errorCode: w.errorCode,
+      walkStalled: w.walkStalled,
+    }));
+
+  const allFailed = walks.length > 0 && walks.every(walkFailed);
+  let error: string | null;
+  let errorCode: FleetErrorCode | null;
+  let walkStalled: boolean;
+  if (single) {
+    ({ error, errorCode, walkStalled } = single);
+  } else {
+    error = allFailed
+      ? `No tenant's fleet read succeeded — each of the ${walks.length} tenants' errors is listed above.`
+      : null;
+    errorCode = null;
+    walkStalled = false;
+  }
+
+  let emptyReason: FleetEmptyReason | null;
+  if (single) {
+    emptyReason = emptyReasonFor(single.loaded, single.error, sessions);
+  } else if (sessions.length > 0) {
+    emptyReason = null;
+  } else if (allFailed) {
+    emptyReason = "error";
+  } else if (walks.some((w) => !w.loaded && !walkFailed(w))) {
+    emptyReason = "not-loaded";
+  } else if (walks.some(walkFailed)) {
+    emptyReason = "partial";
+  } else {
+    emptyReason = "observed-empty";
+  }
+
+  const readTenants: FleetReadTenants = {
+    answered: walks
+      .filter((w) => w.response !== null && !walkFailed(w))
+      .map((w) => servedTenantOf(w.response, w.requestedTenant)),
+    failed: walks.filter(walkFailed).map((w) => w.requestedTenant),
+  };
+
+  return {
+    merged,
+    sessions,
+    walks: [...walks],
+    envelopes,
+    loading: walks.some((w) => w.loading),
+    loadingMore: walks.some((w) => w.loadingMore),
+    error,
+    errorCode,
+    walkStalled,
+    failures,
+    emptyReason,
+    degraded: walks.some((w) => isDegraded(w.response)),
+    truncation: fleetUnionTruncation(
+      walks.map((w) => ({
+        response: w.response,
+        loaded: w.walk.sessions.length,
+        canAdvance: w.walk.nextCursor !== null,
+      })),
+    ),
+    readTenants,
+    servedTenants,
+    appliedQuery: walks.find((w) => w.appliedQuery !== null)?.appliedQuery ?? null,
+    pagesLoaded: walks.reduce((n, w) => n + w.walk.pages, 0),
+    hasMore: walks.some((w) => w.walk.nextCursor !== null),
+  };
+}
+
+/** The production page fetch: the `fleet_sessions_list` command. */
+const invokeFleetPage: FleetPageFetcher = (req) =>
+  invoke<FleetSessionsResponse>("fleet_sessions_list", {
+    args: {
+      deviceId: req.deviceId,
+      state: req.state,
+      includeClosed: req.includeClosed,
+      limit: req.limit,
+      cursor: req.cursor,
+      tenant: req.tenant,
+    },
+  });
+
+/** The default tenant set: one read, no tenant sent. */
+const DEFAULT_TENANTS: readonly (string | null)[] = [null];
+
+/** The walk snapshots of ONE scope, tagged with that scope's key. */
+interface ScopedSnapshots {
+  key: string;
+  list: FleetWalkSnapshot[];
+}
+
+/**
+ * Read-only discovery of the fleet's sessions: one {@link FleetTenantWalker}
+ * per requested tenant, folded by {@link mergeFleetWalks}.
  *
- * A read either RESTARTS the walk (no cursor, page one, accumulation replaced)
- * or ADVANCES it (`nextCursor` re-sent verbatim, page appended). A restart is
- * what happens on mount, on `refresh`, and whenever the SCOPE changes —
+ * ## The walks
+ *
+ * Every walk RESTARTS on mount, on `refresh`, and whenever the SCOPE changes —
  * `deviceId` / `state` / `includeClosed`, the three coord validates a cursor
- * against, and `tenantId`, which coord fingerprints in from the principal.
- * `limit` is deliberately not one of them: coord's cursor survives a
+ * against, and the tenant SET, since coord fingerprints the tenant in from the
+ * principal. `limit` is deliberately not one of them: coord's cursor survives a
  * changed page size, so resizing a page must not throw away pages already
- * loaded.
+ * loaded; each walker reads the size through `limitRef` at call time.
  *
- * Two things keep the accumulation honest. A monotonic generation stamps every
- * request, and a response whose generation has been superseded is DISCARDED
- * rather than merged — otherwise a page from the previous scope lands in the
- * new scope's list. And `cursor_scope_mismatch`, which coord answers when a
- * page in flight carries a cursor from a scope the caller has since changed, is
- * handled by restarting rather than by showing an error: changing a filter
- * mid-walk is ordinary use, not a fault the operator should read about.
+ * A scope change builds NEW walkers and disposes the old ones, so a response
+ * still in flight for the previous scope is discarded rather than merged. Each
+ * new walker is SEEDED with its tenant's previous rows: a filter change keeps
+ * the list on screen while it re-reads (the picker says so), and a tenant no
+ * longer requested drops out at once.
  */
 export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsResult {
-  const [walk, setWalk] = useState<FleetWalk>(EMPTY_FLEET_WALK);
-  const [response, setResponse] = useState<FleetSessionsResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [errorCode, setErrorCode] = useState<FleetErrorCode | null>(null);
-  const [walkStalled, setWalkStalled] = useState(false);
-  const [loaded, setLoaded] = useState(false);
-  const [deviceCatalog, setDeviceCatalog] = useState<FleetDeviceOption[]>([]);
-  const [stateCatalog, setStateCatalog] = useState<string[]>([]);
-  const [appliedQuery, setAppliedQuery] = useState<FleetServerFilter | null>(null);
-  /** Bumped to re-run the walk without a scope change — the scope-mismatch restart. */
-  const [restartToken, setRestartToken] = useState(0);
-
-  /**
-   * The cursor the next page must carry.
-   *
-   * Held in a ref as well as in `walk` because `loadMore` has to read the value
-   * as of the CLICK, not as of the render that created the callback — a stale
-   * closure here would re-request a page already accumulated.
-   */
-  const cursorRef = useRef<string | null>(null);
-  /**
-   * Monotonic request id. Only the newest request may write state: a response
-   * that lost the race belongs to a superseded scope, and merging it would mix
-   * two queries' rows into one list.
-   */
-  const generationRef = useRef(0);
-
   const deviceId = opts?.deviceId ?? null;
   const state = opts?.state ?? null;
   const includeClosed = opts?.includeClosed ?? false;
   const limit = opts?.limit ?? FLEET_DEFAULT_LIMIT;
-  const tenantId = opts?.tenantId ?? null;
+  const tenants = opts?.tenants ?? DEFAULT_TENANTS;
+  /** The tenant set as one comparable string — callers pass fresh arrays. */
+  const tenantsKey = JSON.stringify(tenants);
   /**
-   * The tenant the device/state catalogues were accumulated under. The
-   * catalogues deliberately survive a filter change — but not a TENANT change:
-   * offering another tenant's devices as filter options would name devices this
-   * read can never return.
+   * The walks' scope, as one comparable string, named EXPLICITLY in the
+   * restart effect's dependencies: every per-tenant cursor scope, in order.
    */
-  const catalogTenantRef = useRef<string | null>(tenantId);
+  const scopeKey = JSON.stringify(
+    tenants.map((tenantId) => fleetScopeKey({ deviceId, state, includeClosed, tenantId })),
+  );
+
+  const [snapshots, setSnapshots] = useState<ScopedSnapshots>(() => ({
+    key: scopeKey,
+    list: tenants.map(initialFleetWalkSnapshot),
+  }));
+  const [deviceCatalog, setDeviceCatalog] = useState<FleetDeviceOption[]>([]);
+  const [stateCatalog, setStateCatalog] = useState<string[]>([]);
+
+  /** The live walkers, for `refresh` / `loadMore` (event handlers, not render). */
+  const walkersRef = useRef<FleetTenantWalker[]>([]);
+  /** The snapshots as of the last commit — what a new scope's walkers seed from. */
+  const snapshotsRef = useRef(snapshots);
   /**
-   * The walk's scope, as one comparable string, named EXPLICITLY in the restart
-   * effect's dependencies.
-   *
-   * What actually fixed the page-resize restart is one line below this: `limit`
-   * came out of `fetchPage`'s dependency list. While it was in, `fetchPage` got
-   * a new identity on every resize, the restart effect keyed on that identity,
-   * and every accumulated page was discarded and re-fetched — the opposite of
-   * this module's contract, since coord's cursor survives a changed page size.
-   *
-   * This key does not do that work and is not load-bearing for it. It is here
-   * because the restart trigger should SAY what it is: keying only on a
-   * callback's identity makes the trigger an implicit consequence of that
-   * callback's dependency list, which is exactly how `limit` got in. `fetchPage`
-   * is still named beside it — the two move together, so the effect needs no
-   * lint suppression and no claim that one replaces the other.
+   * The tenant set the catalogues were accumulated under. They deliberately
+   * survive a filter change — but not a TENANT change: offering another
+   * tenant's devices as filter options would name devices no read can return.
    */
-  const scopeKey = fleetScopeKey({ deviceId, state, includeClosed, tenantId });
+  const catalogTenantsRef = useRef(tenantsKey);
 
   /**
-   * The page size as of the CALL, not as of the render that built the callback.
-   *
-   * `limit` is read through a ref for the same reason `cursorRef` exists: it
-   * must not enter `fetchPage`'s dependency list, because everything in that
-   * list restarts the walk through the effect below.
+   * The page size as of the CALL. Synced in an effect declared ABOVE the
+   * restart effect: React runs effects in declaration order, so a commit that
+   * changes the page size and the scope together syncs this first and the
+   * restart reads the new size.
    */
   const limitRef = useRef(limit);
-  // Synced in an effect rather than during render: a render-phase ref write is
-  // what `react-hooks/refs` flags, and nothing reads this before an effect or a
-  // click handler runs — `useRef(limit)` already seeds the mount read.
-  //
-  // This effect MUST stay declared above the restart effect below. React runs
-  // effects in declaration order, so a commit that changes the page size and the
-  // scope together syncs the ref here first and the restart then reads the new
-  // size. Reordering the two would leave that one commit fetching page one at
-  // the previous size, silently and only in that case.
   useEffect(() => {
     limitRef.current = limit;
   }, [limit]);
+  useEffect(() => {
+    snapshotsRef.current = snapshots;
+  }, [snapshots]);
+  /**
+   * The tenant set as of the last commit, read by the restart effect below. The
+   * effect is keyed on `tenantsKey` (callers pass a fresh array each render, so
+   * the array's identity is no trigger); this ref hands it the array itself.
+   * Declared above the restart effect for the same ordering reason as `limitRef`.
+   */
+  const tenantsRef = useRef(tenants);
+  useEffect(() => {
+    tenantsRef.current = tenants;
+  }, [tenants]);
 
-  const fetchPage = useCallback(
-    async (mode: FleetWalkMode) => {
-      const limit = limitRef.current;
-      const cursor = mode === "more" ? cursorRef.current : null;
-      // Nothing to walk. Not an error and not a read: coord said this was the
-      // last page, and asking again with no cursor would silently restart.
-      if (mode === "more" && cursor === null) return;
-      const generation = generationRef.current + 1;
-      generationRef.current = generation;
-      if (mode === "restart") cursorRef.current = null;
-      setLoading(mode === "restart");
-      setLoadingMore(mode === "more");
-      setError(null);
-      setErrorCode(null);
-      setWalkStalled(false);
-      try {
-        // The Rust command returns coord's body directly (no CommandResponse
-        // envelope) and rejects on transport or non-2xx, so a thrown value here
-        // is the honest failure — including 401/403, which means "this runner is
-        // not paired", NOT "the fleet is empty".
-        const result = await invoke<FleetSessionsResponse>("fleet_sessions_list", {
-          args: { deviceId, state, includeClosed, limit, cursor, tenant: tenantId },
-        });
-        if (generationRef.current !== generation) return;
-        if (catalogTenantRef.current !== tenantId) {
-          catalogTenantRef.current = tenantId;
-          setDeviceCatalog([]);
-          setStateCatalog([]);
-        }
-
-        const next = normalizeFleetCursor(result.nextCursor);
-        // A keyset cursor encodes the page just served, so coord handing back
-        // the cursor it was GIVEN means the parameter never reached it. Stop
-        // rather than re-serve page one for ever, and say so.
-        const stalled = fleetCursorStalled(cursor, next);
-        cursorRef.current = stalled ? null : next;
-
-        setWalk((prev) => {
-          const accepted = fleetWalkAccept(prev, result, mode);
-          return stalled ? fleetWalkDropCursor(accepted) : accepted;
-        });
-        setResponse(result);
-        setLoaded(true);
-        // Recorded in the SAME tick as the response it belongs to, so no
-        // consumer can pair these rows with a filter set they were not served
-        // for. The limit is coord's OWN effective, post-clamp value where it
-        // served one — the requested number is only the fallback, and a null
-        // would leave a consumer guessing what a page is.
-        setAppliedQuery({
-          deviceId,
-          state,
-          includeClosed,
-          limit: typeof result.limit === "number" && result.limit > 0 ? result.limit : limit,
-        });
-        if (stalled) {
-          // coord ANSWERED — the rows below are current and the read did not
-          // fail. Only the next page is out of reach, and the banner has to say
-          // that rather than borrow the failed-read wording.
-          setError(FLEET_CURSOR_STALLED_MESSAGE);
-          setWalkStalled(true);
-        }
-        // Accumulate here — in the fetch, which is an event — rather than in an
-        // effect over `response`: an effect that calls setState costs a cascading
-        // render per read, and the catalogues are a property of the read SEQUENCE,
-        // which is this hook's to own.
-        const rows = result.sessions ?? [];
-        const seen = devicesSeenIn(rows);
-        if (seen.length > 0) setDeviceCatalog((prev) => mergeDeviceCatalog(prev, seen));
-        const states = statesSeenIn(rows);
-        if (states.length > 0) setStateCatalog((prev) => mergeStateCatalog(prev, states));
-      } catch (err) {
-        if (generationRef.current !== generation) return;
-        const code = fleetErrorCode(err);
-        if (fleetErrorIsRestart(code)) {
-          // The scope moved under a page already in flight. Ordinary use — walk
-          // again from page one and show the operator nothing.
-          cursorRef.current = null;
-          setRestartToken((t) => t + 1);
-          return;
-        }
-        if (fleetErrorInvalidatesCursor(code)) {
-          // The cursor is unusable. Keep the pages already accumulated, but stop
-          // offering a control that can only fail again — the message below is
-          // what stops that from reading as a complete list.
-          cursorRef.current = null;
-          setWalk(fleetWalkDropCursor);
-        }
-        // Keep the previous rows rather than clearing them: a failed page must
-        // not silently empty a list the operator is reading.
-        setErrorCode(code);
-        setError(fleetErrorMessage(code, err));
-      } finally {
-        if (generationRef.current === generation) {
-          setLoading(false);
-          setLoadingMore(false);
-        }
-      }
+  /** One walker's change, folded into the snapshot list of ITS scope. The
+   * first change of a new scope replaces the previous scope's list. */
+  const publish = useCallback(
+    (
+      key: string,
+      scopeTenants: readonly (string | null)[],
+      index: number,
+      snap: FleetWalkSnapshot,
+    ) => {
+      setSnapshots((prev) => {
+        const base =
+          prev.key === key
+            ? prev.list
+            : scopeTenants.map(
+                (t) =>
+                  prev.list.find((s) => s.requestedTenant === t) ?? initialFleetWalkSnapshot(t),
+              );
+        const list = base.slice();
+        list[index] = snap;
+        return { key, list };
+      });
     },
-    [deviceId, state, includeClosed, tenantId],
+    [],
   );
 
-  // Runs on mount, whenever the SCOPE changes (a new device/state/include-closed
-  // must restart the walk — a cursor is only valid within its scope), and when a
-  // scope-mismatch restart bumps the token.
-  //
-  // A page RESIZE is deliberately absent from that list: it changes the slice,
-  // not the sequence, and coord's cursor survives it, so resizing re-uses the
-  // walk rather than throwing away the pages already loaded. The next page
-  // fetched picks the new size up through `limitRef`.
-  //
-  // `scopeKey` and `fetchPage` move together by construction — both derive from
-  // exactly `deviceId` / `state` / `includeClosed` / `tenantId` — so naming both is honest
-  // rather than redundant-and-suppressed, and it keeps the trigger readable
-  // without an eslint directive standing in for the explanation.
-  useEffect(() => {
-    void fetchPage("restart");
-  }, [fetchPage, scopeKey, restartToken]);
+  /**
+   * Accumulate the catalogues here — on a page, which is an event — rather than
+   * in an effect over the snapshots: the catalogues are a property of the read
+   * SEQUENCE, which this hook owns.
+   */
+  const acceptRows = useCallback((key: string, rows: FleetSession[]) => {
+    const fresh = catalogTenantsRef.current !== key;
+    catalogTenantsRef.current = key;
+    const seen = devicesSeenIn(rows);
+    if (fresh || seen.length > 0) {
+      setDeviceCatalog((prev) => mergeDeviceCatalog(fresh ? [] : prev, seen));
+    }
+    const states = statesSeenIn(rows);
+    if (fresh || states.length > 0) {
+      setStateCatalog((prev) => mergeStateCatalog(fresh ? [] : prev, states));
+    }
+  }, []);
 
-  const refresh = useCallback(() => fetchPage("restart"), [fetchPage]);
-  const loadMore = useCallback(() => fetchPage("more"), [fetchPage]);
+  // Runs on mount and whenever the SCOPE changes. `scopeKey` covers every
+  // input below; they are named as well so the trigger needs no lint
+  // suppression, and they move together by construction.
+  useEffect(() => {
+    const scopeTenants = [...tenantsRef.current];
+    const previous = snapshotsRef.current.list;
+    const walkers = scopeTenants.map(
+      (tenantId, index) =>
+        new FleetTenantWalker({
+          scope: { deviceId, state, includeClosed, tenantId },
+          seed: previous.find((s) => s.requestedTenant === tenantId),
+          fetchPage: invokeFleetPage,
+          pageSize: () => limitRef.current,
+          onChange: (snap) => publish(scopeKey, scopeTenants, index, snap),
+          onRows: (rows) => acceptRows(tenantsKey, rows),
+        }),
+    );
+    walkersRef.current = walkers;
+    for (const w of walkers) void w.restart();
+    return () => {
+      for (const w of walkers) w.dispose();
+    };
+  }, [scopeKey, tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);
+
+  const refresh = useCallback(async () => {
+    await Promise.all(walkersRef.current.map((w) => w.restart()));
+  }, []);
+  const refreshTenant = useCallback(async (requestedTenant: string | null) => {
+    await Promise.all(
+      walkersRef.current
+        .filter((w) => w.snapshot.requestedTenant === requestedTenant)
+        .map((w) => w.restart()),
+    );
+  }, []);
+  const loadMore = useCallback(async () => {
+    await Promise.all(walkersRef.current.filter((w) => w.canAdvance).map((w) => w.loadMore()));
+  }, []);
+
+  // Until the new scope's first walker reports, the list is still the previous
+  // scope's — exactly the rows the previous read served, which is what the
+  // picker's "re-reading" banner describes once `loading` is set.
+  const folded = useMemo(() => mergeFleetWalks(snapshots.list), [snapshots]);
 
   return {
-    sessions: walk.sessions,
-    response,
-    loading,
-    loadingMore,
-    error,
-    errorCode,
-    walkStalled,
-    emptyReason: emptyReasonFor(loaded, error, walk.sessions),
-    degraded: isDegraded(response),
+    ...folded,
     deviceCatalog,
     stateCatalog,
-    appliedQuery,
-    pagesLoaded: walk.pages,
-    hasMore: walk.nextCursor !== null,
     refresh,
+    refreshTenant,
     loadMore,
   };
 }
