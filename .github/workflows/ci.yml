@@ -556,9 +556,12 @@ jobs:
         # are `deny` there, so a correctness lint still exits non-zero and fails
         # this required check; T3 style/complexity/perf stay `warn` (emitted,
         # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+        # `--all-targets` lints test code too, so a deny-tier lint in a test
+        # fails the PR that adds it (it used to surface only in the nightly
+        # clippy-tiers.yml job, where the baseline rotted unnoticed).
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
       # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
       #
@@ -1488,7 +1491,7 @@ jobs:
         # correctness lint fails this check.
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.

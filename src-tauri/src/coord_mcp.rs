@@ -6331,11 +6331,15 @@ mod session_tenant_resolution_tests {
         let start = text
             .find("async fn session_bearer_and_tenant_or_refuse(")
             .expect("session_bearer_and_tenant_or_refuse exists");
-        let end = text[start..]
+        let end = text
+            .get(start..)
+            .expect("`find` returns a char boundary")
             .find("\n}\n")
             .map(|i| start + i)
             .expect("its body ends");
-        let code: String = text[start..end]
+        let code: String = text
+            .get(start..end)
+            .expect("`find` returns char boundaries")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
