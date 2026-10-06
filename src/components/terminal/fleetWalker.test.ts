@@ -469,8 +469,23 @@ describe("mergeFleetWalks — every count is over the union", () => {
     expect(mergeFleetWalks([refreshFailed, answered(B, [])]).truncation.kind).toBe("unknown");
     const reloading = answered(A, [], { loading: true });
     expect(mergeFleetWalks([reloading, answered(B, [])]).truncation.kind).toBe("unknown");
-    // A single walk keeps its own envelope — the single-tenant view is unchanged.
-    expect(mergeFleetWalks([reloading]).truncation.kind).toBe("none");
+    // A single walk that failed and is NOT re-reading keeps its own envelope.
+    expect(mergeFleetWalks([refreshFailed]).truncation.kind).toBe("none");
+    // A single walk that IS re-reading has no current envelope either.
+    expect(mergeFleetWalks([reloading]).truncation.kind).toBe("unknown");
+  });
+
+  it("reads `unknown`, not `unreachable`, while a seeded single walk is loading", () => {
+    // A walker seeded across a scope change: the old scope's envelope said
+    // "more", but its cursor was dropped, so the walk cannot advance. Until
+    // the new scope's first page lands, that is no statement about THIS read.
+    const seeded = answered(A, [session("a1")], { loading: true }, { nextCursor: "old-scope" });
+    seeded.walk = { ...seeded.walk, nextCursor: null };
+    const m = mergeFleetWalks([seeded]);
+    expect(m.truncation.kind).toBe("unknown");
+    // Once the read settles (not loading), the same snapshot is classified by
+    // its envelope as before.
+    expect(mergeFleetWalks([{ ...seeded, loading: false }]).truncation.kind).toBe("unreachable");
   });
 
   it("reads each row's degraded flags off its OWN tenant's envelope", () => {

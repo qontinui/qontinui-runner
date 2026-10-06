@@ -287,6 +287,24 @@ pub(crate) struct WalkPlan {
     /// Report entries for the bound tenants NOT walked (or one synthetic
     /// entry when the bound set itself is unknown).
     pub not_walked: Vec<TenantWalk>,
+    /// Whether a walk that presented NO tenant mints its rows under the tenant
+    /// coord's envelope says it served them under (`true`), or with no tenant
+    /// named — the device's own authority order, as the pre-Phase-4 sweep did
+    /// (`false`).
+    ///
+    /// `true` only when the device is KNOWN to be multi-bound
+    /// ([`probe_walk_tenants`]'s none-can-act fallback): there the authority
+    /// order at mint time may resolve to a different tenant than the one that
+    /// listed the row, so the mint is pinned to the served tenant. `false` for
+    /// [`WalkPlan::single`], whose mint must stay exactly as before (the legacy
+    /// device slot, as-is — pinning would route it through the owned-tenant
+    /// checks and could refuse a mint that always worked), and for
+    /// [`WalkPlan::bound_set_unknown`]: with the bound set unread there is no
+    /// evidence the device is multi-bound at all, and the overwhelmingly common
+    /// device behind an unreadable store is a single-binding one, so today's
+    /// unpinned mint is the safer reading. A walk that NAMED a tenant mints
+    /// under it regardless.
+    pub pin_to_served: bool,
 }
 
 impl WalkPlan {
@@ -295,6 +313,7 @@ impl WalkPlan {
         Self {
             walk: vec![None],
             not_walked: Vec::new(),
+            pin_to_served: false,
         }
     }
 
@@ -312,6 +331,9 @@ impl WalkPlan {
                 )),
                 ..Default::default()
             }],
+            // Not known to be multi-bound: keep the pre-Phase-4 mint — see
+            // [`WalkPlan::pin_to_served`].
+            pin_to_served: false,
         }
     }
 }
@@ -807,11 +829,17 @@ async fn read_fleet(
                     flags = Some(read.first_page);
                 }
                 // The tenant each row is MINTED under: the one this walk
-                // presented, else — when it named none — the one coord's
-                // envelope says it served the rows under. Minting with no
-                // tenant would re-run the authority order at mint time, which
-                // may not resolve to the tenant that listed the row.
-                let row_tenant = tenant.clone().or(read.served_tenant);
+                // presented, else — when it named none on a device KNOWN to be
+                // multi-bound — the one coord's envelope says it served the
+                // rows under, since re-running the authority order at mint time
+                // may not resolve to the tenant that listed the row. A single
+                // or unpinned device mints with no tenant, exactly as before
+                // ([`WalkPlan::pin_to_served`]).
+                let row_tenant = match tenant {
+                    Some(t) => Some(t.clone()),
+                    None if plan.pin_to_served => read.served_tenant,
+                    None => None,
+                };
                 for row in read.rows {
                     // A session lives in one tenant; the set is a guard.
                     let id = row
@@ -1435,12 +1463,18 @@ pub(crate) fn recent_fleet_view_devices(
 ///   call itself complete over rows it never read.
 /// - Bound to several, none able to act ⇒ walk `[None]`: the authority order
 ///   still decides, and its failure is the sweep's honest error. Every bound
-///   tenant is reported as not walked under its own credential.
+///   tenant is reported as not walked under its own credential, and the
+///   rows that walk lists are minted under the tenant coord served them under
+///   ([`WalkPlan::pin_to_served`]), since the device is known to be
+///   multi-bound.
 pub(crate) fn probe_walk_tenants(credentials: &[super::tenant::CandidateCredential]) -> WalkPlan {
     if credentials.len() <= 1 {
         return WalkPlan::single();
     }
-    let mut plan = WalkPlan::default();
+    let mut plan = WalkPlan {
+        pin_to_served: true,
+        ..WalkPlan::default()
+    };
     for c in credentials {
         let why = match c.can_act {
             Some(true) => {
@@ -2871,6 +2905,7 @@ mod tests {
         );
         assert_eq!(WalkPlan::single().walk, vec![None]);
         assert!(WalkPlan::single().not_walked.is_empty());
+        assert!(!WalkPlan::single().pin_to_served);
     }
 
     #[test]
@@ -2888,6 +2923,7 @@ mod tests {
                     not_walked(T2, NOT_WALKED_CANNOT_ACT),
                     not_walked(T4, NOT_WALKED_UNKNOWN),
                 ],
+                pin_to_served: true,
             }
         );
         // None able to act: the authority order still decides, and every bound
@@ -2900,6 +2936,7 @@ mod tests {
                     not_walked(T1, NOT_WALKED_CANNOT_ACT),
                     not_walked(T2, NOT_WALKED_UNKNOWN),
                 ],
+                pin_to_served: true,
             }
         );
     }
@@ -2908,6 +2945,8 @@ mod tests {
     fn an_unreadable_bound_set_walks_the_authority_order_and_says_so() {
         let plan = WalkPlan::bound_set_unknown("could not read the bound tenants (io)");
         assert_eq!(plan.walk, vec![None]);
+        // Not known to be multi-bound: the mint stays unpinned, as before.
+        assert!(!plan.pin_to_served);
         assert_eq!(plan.not_walked.len(), 1);
         let entry = &plan.not_walked[0];
         assert_eq!(entry.tenant, None);
@@ -2937,6 +2976,7 @@ mod tests {
             self.plan.clone().unwrap_or(WalkPlan {
                 walk: vec![Some(T1.into()), Some(T2.into()), Some(T3.into())],
                 not_walked: Vec::new(),
+                pin_to_served: true,
             })
         }
         async fn fleet_page(
@@ -3075,6 +3115,7 @@ mod tests {
             plan: Some(WalkPlan {
                 walk: vec![Some(T1.into())],
                 not_walked: vec![not_walked(T2, NOT_WALKED_CANNOT_ACT)],
+                pin_to_served: true,
             }),
             ..Default::default()
         };
@@ -3110,12 +3151,17 @@ mod tests {
         assert!(!report.flags.complete);
     }
 
-    /// A walk that presented NO tenant mints every row under the tenant coord's
-    /// envelope says it served the rows under — never re-resolving at mint.
+    /// On a device KNOWN to be multi-bound whose tenants all cannot act, the
+    /// fallback walk presents NO tenant and mints every row under the tenant
+    /// coord's envelope says it served the rows under — never re-resolving at
+    /// mint.
     #[tokio::test]
     async fn a_walk_naming_no_tenant_mints_under_the_envelopes_tenant() {
+        let plan = probe_walk_tenants(&[cred(T1, Some(false)), cred(T3, None)]);
+        assert_eq!(plan.walk, vec![None]);
+        assert!(plan.pin_to_served);
         let target = MultiTenant {
-            plan: Some(WalkPlan::single()),
+            plan: Some(plan),
             ..Default::default()
         };
         let report = run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
@@ -3126,7 +3172,36 @@ mod tests {
         assert_eq!(report.outcomes[0].tenant.as_deref(), Some(T2));
         // The walk itself is reported as presented: no tenant named.
         assert_eq!(report.flags.tenants[0].tenant, None);
+        // The bound tenants it could not walk keep the sweep incomplete.
+        assert!(!report.flags.complete);
+    }
+
+    /// A single-binding / unpinned device mints with NO tenant named — the
+    /// device's own authority order, exactly the pre-Phase-4 mint — even when
+    /// coord's envelope names the tenant it served the rows under.
+    #[tokio::test]
+    async fn a_single_walk_mints_with_no_tenant_as_before() {
+        let target = MultiTenant {
+            plan: Some(WalkPlan::single()),
+            ..Default::default()
+        };
+        let report = run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
+        assert_eq!(*target.minted_under.lock().unwrap(), vec![(sid(4), None)]);
+        assert_eq!(report.outcomes[0].tenant, None);
+        assert_eq!(report.flags.tenants[0].tenant, None);
         assert!(report.flags.complete);
+    }
+
+    /// An unreadable bound set is not evidence of a multi-bound device: its
+    /// authority-order walk mints unpinned too.
+    #[tokio::test]
+    async fn an_unreadable_bound_set_mints_with_no_tenant() {
+        let target = MultiTenant {
+            plan: Some(WalkPlan::bound_set_unknown("store read failed")),
+            ..Default::default()
+        };
+        run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
+        assert_eq!(*target.minted_under.lock().unwrap(), vec![(sid(4), None)]);
     }
 
     #[tokio::test]
