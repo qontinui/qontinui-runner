@@ -32,6 +32,22 @@
 //! binding); a relay refusal because another source holds the terminal is
 //! `unknown/held_by_other_source`, never a failure.
 //!
+//! # Tenants
+//!
+//! coord scopes a fleet read to the PRESENTED credential's tenant and resolves
+//! an attach target within it, so a device bound to several tenants sees — and
+//! can mint for — one tenant per read. The sweep therefore walks once per
+//! tenant this device can ACT in ([`ProbeDoors::walk_tenants`], derived from
+//! the same `get_active_tenant` view the Fleet view's selector renders), each
+//! walk with its own cursor (coord fingerprints the tenant into it), and mints
+//! every row's grant under the tenant that row was listed under. One tenant's
+//! read failing is recorded in [`FleetFlags::tenants`] and does not stop the
+//! others. A single-tenant or unpinned-single-binding device walks once with
+//! no tenant named — the device's own authority order — exactly as before
+//! (plan
+//! `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+//! Phase 4).
+//!
 //! # Scheduling
 //!
 //! (a) the Fleet view runs it for each remote device it loads (trigger
@@ -150,10 +166,28 @@ impl RemoteFrameSink for ProbeFrameSink {
 /// recorder target in tests.
 #[async_trait]
 pub(crate) trait ProbeDoors: Send + Sync {
-    /// One page of `GET /coord/sessions/fleet?device_id=…`.
-    async fn fleet_page(&self, device_id: &str, cursor: Option<String>) -> Result<Value, String>;
-    /// `POST /coord/sessions/{id}/attach-grants`.
-    async fn mint(&self, session_id: Uuid) -> Result<AttachGrantResponse, String>;
+    /// The tenants to walk, one independent fleet walk each: `None` = present
+    /// no tenant (the device's own authority order), `Some(t)` = present
+    /// tenant `t`'s credential. The default is the single pre-Phase-4 walk.
+    async fn walk_tenants(&self) -> Vec<Option<String>> {
+        vec![None]
+    }
+    /// One page of `GET /coord/sessions/fleet?device_id=…`, authenticated as
+    /// `tenant` (see [`ProbeDoors::walk_tenants`]).
+    async fn fleet_page(
+        &self,
+        device_id: &str,
+        tenant: Option<&str>,
+        cursor: Option<String>,
+    ) -> Result<Value, String>;
+    /// `POST /coord/sessions/{id}/attach-grants`, minted under `tenant` — the
+    /// tenant the row was LISTED under, since coord resolves the target within
+    /// the presented principal's tenant only.
+    async fn mint(
+        &self,
+        session_id: Uuid,
+        tenant: Option<&str>,
+    ) -> Result<AttachGrantResponse, String>;
     /// Present the grant through the relay; the target's ring or a typed refusal.
     async fn attach(&self, grant: &str, cols: u16, rows: u16)
         -> Result<AttachedReply, AttachError>;
@@ -201,10 +235,30 @@ pub struct FleetFlags {
     pub fresh_for_secs: i64,
     pub fresh_for_secs_served: bool,
     pub caller_device_id: Option<String>,
+    /// Rows read, summed over every tenant walk.
+    pub rows_read: usize,
+    /// Pages read, summed over every tenant walk.
+    pub pages: usize,
+    /// `false` when any walk stopped at [`MAX_FLEET_PAGES`] with a cursor left,
+    /// or failed — a tenant whose read failed was not read completely.
+    pub complete: bool,
+    /// One entry per tenant walked, in walk order.
+    pub tenants: Vec<TenantWalk>,
+}
+
+/// One tenant's fleet walk within a sweep.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantWalk {
+    /// The tenant presented; `None` = the device's own authority order.
+    pub tenant: Option<String>,
     pub rows_read: usize,
     pub pages: usize,
-    /// `false` when the walk stopped at [`MAX_FLEET_PAGES`] with a cursor left.
     pub complete: bool,
+    /// Why this tenant's read failed. Its rows are UNKNOWN to this sweep —
+    /// neither probed nor reported as absent — and the other tenants' walks
+    /// carry on.
+    pub error: Option<String>,
 }
 
 /// One half's outcome for one row.
@@ -238,6 +292,9 @@ impl HalfOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct RowOutcome {
     pub session_id: String,
+    /// The tenant the row was listed — and so minted — under (`None` = the
+    /// device's own authority order).
+    pub tenant: Option<String>,
     /// `probed` or `skipped`.
     pub decision: String,
     pub skip_reason: Option<String>,
@@ -570,31 +627,37 @@ pub(crate) fn write_capability(
 // The sweep
 // ---------------------------------------------------------------------------
 
-/// Walk the device's fleet rows and return them with the flags.
-async fn read_fleet(
+/// One fleet row and the tenant it was listed under.
+struct ListedRow {
+    tenant: Option<String>,
+    row: Value,
+}
+
+/// What one tenant's walk produced: its rows and the envelope flags of its
+/// first page.
+struct TenantRead {
+    rows: Vec<Value>,
+    first_page: FleetFlags,
+    walk: TenantWalk,
+}
+
+/// Walk ONE tenant's fleet rows for the device, with its own cursor.
+async fn read_fleet_tenant(
     doors: &dyn ProbeDoors,
     device_id: &str,
-) -> Result<(FleetFlags, Vec<Value>), ProbeSweepError> {
+    tenant: Option<&str>,
+) -> Result<TenantRead, String> {
     let mut flags = FleetFlags {
         fresh_for_secs: FRESH_FOR_SECS,
-        complete: true,
         ..Default::default()
     };
     let mut rows = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut pages = 0;
     for page in 0..MAX_FLEET_PAGES {
-        let body = doors
-            .fleet_page(device_id, cursor.clone())
-            .await
-            .map_err(|message| ProbeSweepError {
-                door: "coord_fleet",
-                message,
-            })?;
+        let body = doors.fleet_page(device_id, tenant, cursor.clone()).await?;
         let Some(sessions) = body.get("sessions").and_then(|v| v.as_array()) else {
-            return Err(ProbeSweepError {
-                door: "coord_fleet",
-                message: "the fleet response carries no `sessions` array".to_string(),
-            });
+            return Err("the fleet response carries no `sessions` array".to_string());
         };
         if page == 0 {
             flags.interactivity_events_present = body
@@ -609,7 +672,7 @@ async fn read_fleet(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
         }
-        flags.pages = page + 1;
+        pages = page + 1;
         rows.extend(
             sessions
                 .iter()
@@ -634,10 +697,93 @@ async fn read_fleet(
             }
         }
     }
-    if cursor.is_some() {
-        flags.complete = false;
+    let walk = TenantWalk {
+        tenant: tenant.map(str::to_string),
+        rows_read: rows.len(),
+        pages,
+        complete: cursor.is_none(),
+        error: None,
+    };
+    Ok(TenantRead {
+        rows,
+        first_page: flags,
+        walk,
+    })
+}
+
+/// Walk the device's fleet rows under every tenant [`ProbeDoors::walk_tenants`]
+/// names and return them, each tagged with its tenant, with the flags.
+///
+/// The envelope flags (`interactivityEventsPresent`, `freshForSecs`,
+/// `callerDeviceId`) are coord's and the same on every tenant's read, so they
+/// are taken from the first walk that answered. A walk that fails is recorded
+/// and skipped; only when EVERY walk failed is the sweep an error — with one
+/// walk that is exactly the pre-Phase-4 error, message and all.
+async fn read_fleet(
+    doors: &dyn ProbeDoors,
+    device_id: &str,
+) -> Result<(FleetFlags, Vec<ListedRow>), ProbeSweepError> {
+    let tenants = doors.walk_tenants().await;
+    let tenants = if tenants.is_empty() {
+        vec![None]
+    } else {
+        tenants
+    };
+    let mut flags: Option<FleetFlags> = None;
+    let mut walks = Vec::with_capacity(tenants.len());
+    let mut rows: Vec<ListedRow> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut failures: Vec<String> = Vec::new();
+    for tenant in &tenants {
+        match read_fleet_tenant(doors, device_id, tenant.as_deref()).await {
+            Ok(read) => {
+                if flags.is_none() {
+                    flags = Some(read.first_page);
+                }
+                for row in read.rows {
+                    // A session lives in one tenant; the set is a guard.
+                    let id = row
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if !id.is_empty() && !seen.insert(id) {
+                        continue;
+                    }
+                    rows.push(ListedRow {
+                        tenant: tenant.clone(),
+                        row,
+                    });
+                }
+                walks.push(read.walk);
+            }
+            Err(message) => {
+                failures.push(match tenant {
+                    Some(t) => format!("tenant {t}: {message}"),
+                    None => message.clone(),
+                });
+                walks.push(TenantWalk {
+                    tenant: tenant.clone(),
+                    error: Some(message),
+                    ..Default::default()
+                });
+            }
+        }
     }
+    let Some(mut flags) = flags else {
+        return Err(ProbeSweepError {
+            door: "coord_fleet",
+            message: if failures.len() == 1 {
+                failures.remove(0)
+            } else {
+                format!("every tenant's fleet read failed — {}", failures.join("; "))
+            },
+        });
+    };
     flags.rows_read = rows.len();
+    flags.pages = walks.iter().map(|w| w.pages).sum();
+    flags.complete = walks.iter().all(|w| w.complete && w.error.is_none());
+    flags.tenants = walks;
     Ok((flags, rows))
 }
 
@@ -664,7 +810,7 @@ pub(crate) async fn run_probe_sweep(
     let started_utc = Utc::now();
     let (flags, rows) = read_fleet(doors, device_id).await?;
     let mut outcomes = Vec::with_capacity(rows.len());
-    for row in &rows {
+    for ListedRow { tenant, row } in &rows {
         let session_id = row
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -675,6 +821,7 @@ pub(crate) async fn run_probe_sweep(
             // into either: probing would spend grants to file nothing.
             outcomes.push(RowOutcome {
                 session_id,
+                tenant: tenant.clone(),
                 decision: "skipped".into(),
                 skip_reason: Some("coord_predates_interactivity".into()),
                 ..Default::default()
@@ -703,13 +850,14 @@ pub(crate) async fn run_probe_sweep(
         if let Some(reason) = reason {
             outcomes.push(RowOutcome {
                 session_id,
+                tenant: tenant.clone(),
                 decision: "skipped".into(),
                 skip_reason: Some(reason.into()),
                 ..Default::default()
             });
             continue;
         }
-        outcomes.push(probe_row(doors, device_id, &session_id, started).await);
+        outcomes.push(probe_row(doors, device_id, tenant.as_deref(), &session_id, started).await);
     }
     Ok(ProbeSweepReport {
         device_id: device_id.to_string(),
@@ -753,11 +901,13 @@ fn refusal_half(
 async fn probe_row(
     doors: &dyn ProbeDoors,
     device_id: &str,
+    tenant: Option<&str>,
     session_id: &str,
     sweep_started: std::time::Instant,
 ) -> RowOutcome {
     let mut out = RowOutcome {
         session_id: session_id.to_string(),
+        tenant: tenant.map(str::to_string),
         decision: "probed".into(),
         ..Default::default()
     };
@@ -766,8 +916,8 @@ async fn probe_row(
         return out;
     };
 
-    // 1. mint
-    let minted = match doors.mint(session).await {
+    // 1. mint — under the tenant the row was listed under.
+    let minted = match doors.mint(session, tenant).await {
         Ok(m) => m,
         Err(e) => {
             out.mint_error = Some(e);
@@ -1195,6 +1345,35 @@ pub(crate) fn recent_fleet_view_devices(
         .collect()
 }
 
+/// The tenants a sweep walks, from the per-candidate credential states
+/// `get_active_tenant` serves (`commands::tenant::candidate_credentials`).
+///
+/// - Bound to at most one tenant ⇒ `[None]`: no tenant named, the device's own
+///   authority order — byte-for-byte the pre-Phase-4 sweep.
+/// - Bound to several ⇒ `Some(t)` for every tenant whose credential CAN ACT
+///   (`can_act == Some(true)`). A tenant that cannot act would only 401 —
+///   reading its fleet is impossible, and minting under it more so — and an
+///   UNKNOWN one (a store read failed) is not assumed able to.
+/// - Bound to several, none able to act ⇒ `[None]`: the authority order still
+///   decides, and its failure is the sweep's honest error.
+pub(crate) fn probe_walk_tenants(
+    credentials: &[super::tenant::CandidateCredential],
+) -> Vec<Option<String>> {
+    if credentials.len() <= 1 {
+        return vec![None];
+    }
+    let acting: Vec<Option<String>> = credentials
+        .iter()
+        .filter(|c| c.can_act == Some(true))
+        .map(|c| Some(c.tenant.clone()))
+        .collect();
+    if acting.is_empty() {
+        vec![None]
+    } else {
+        acting
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Production doors, the command body and the scheduler
 // ---------------------------------------------------------------------------
@@ -1230,26 +1409,52 @@ impl RunnerDoors {
 
 #[async_trait]
 impl ProbeDoors for RunnerDoors {
-    async fn fleet_page(&self, device_id: &str, cursor: Option<String>) -> Result<Value, String> {
+    async fn walk_tenants(&self) -> Vec<Option<String>> {
+        // The same view `get_active_tenant` serves the Fleet view's selector:
+        // a local file read plus the credential store, so off the runtime.
+        match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+            super::tenant::active_tenant_view,
+        )
+        .await
+        {
+            Ok(Ok(view)) => probe_walk_tenants(&view.credentials),
+            Ok(Err(e)) => {
+                warn!(error = %e, "remote interactivity probe: could not read the bound tenants — walking under the device's own authority order");
+                vec![None]
+            }
+            Err(e) => {
+                warn!(error = %e, "remote interactivity probe: bound-tenant read did not complete — walking under the device's own authority order");
+                vec![None]
+            }
+        }
+    }
+
+    async fn fleet_page(
+        &self,
+        device_id: &str,
+        tenant: Option<&str>,
+        cursor: Option<String>,
+    ) -> Result<Value, String> {
         super::fleet_sessions::fleet_sessions_list(super::fleet_sessions::FleetSessionsArgs {
             device_id: Some(device_id.to_string()),
             state: None,
             include_closed: false,
             limit: Some(FLEET_PAGE_LIMIT),
             cursor,
-            // The device's own authority order picks the tenant, exactly as
-            // before the field existed. A walk over EVERY bound tenant is plan
-            // `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`
-            // Phase 4.
-            tenant: None,
+            tenant: tenant.map(str::to_string),
         })
         .await
     }
 
-    async fn mint(&self, session_id: Uuid) -> Result<AttachGrantResponse, String> {
-        // The SAME tenant `fleet_page` read under (`tenant: None` there too),
-        // so a session this probe listed is one its mint can resolve.
-        let scope = super::remote_attach::grant_scope(None).await?;
+    async fn mint(
+        &self,
+        session_id: Uuid,
+        tenant: Option<&str>,
+    ) -> Result<AttachGrantResponse, String> {
+        // The SAME tenant `fleet_page` listed the row under, resolved by the
+        // same rule (`fleet_scope`), so a session this probe listed is one its
+        // mint can resolve.
+        let scope = super::remote_attach::grant_scope(tenant.map(str::to_string)).await?;
         super::remote_attach::mint_attach_grant(&self.coord_base, session_id, scope).await
     }
 
@@ -1648,9 +1853,12 @@ mod tests {
         async fn fleet_page(
             &self,
             device_id: &str,
+            tenant: Option<&str>,
             cursor: Option<String>,
         ) -> Result<Value, String> {
             assert_eq!(device_id, DEVICE);
+            // The default `walk_tenants`: one walk, no tenant named.
+            assert!(tenant.is_none());
             assert!(cursor.is_none());
             // Serve what coord would: each row's facts are the newest
             // observation filed for its session and half.
@@ -1685,7 +1893,12 @@ mod tests {
             Ok(body)
         }
 
-        async fn mint(&self, session_id: Uuid) -> Result<AttachGrantResponse, String> {
+        async fn mint(
+            &self,
+            session_id: Uuid,
+            tenant: Option<&str>,
+        ) -> Result<AttachGrantResponse, String> {
+            assert!(tenant.is_none());
             if let Some((s, d)) = &self.mint_delay {
                 if *s == session_id.to_string() {
                     tokio::time::sleep(*d).await;
@@ -2475,10 +2688,15 @@ mod tests {
         struct Down;
         #[async_trait]
         impl ProbeDoors for Down {
-            async fn fleet_page(&self, _: &str, _: Option<String>) -> Result<Value, String> {
+            async fn fleet_page(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<String>,
+            ) -> Result<Value, String> {
                 Err("GET /coord/sessions/fleet returned 503".into())
             }
-            async fn mint(&self, _: Uuid) -> Result<AttachGrantResponse, String> {
+            async fn mint(&self, _: Uuid, _: Option<&str>) -> Result<AttachGrantResponse, String> {
                 unreachable!()
             }
             async fn attach(&self, _: &str, _: u16, _: u16) -> Result<AttachedReply, AttachError> {
@@ -2515,6 +2733,200 @@ mod tests {
         assert!(e
             .to_string()
             .starts_with("remote_interactivity_probe:coord_fleet:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4: one walk per tenant this device can act in
+    // -----------------------------------------------------------------------
+
+    const T1: &str = "a1a1a1a1-0000-4000-8000-0000000000a1";
+    const T2: &str = "b2b2b2b2-0000-4000-8000-0000000000b2";
+    const T3: &str = "c3c3c3c3-0000-4000-8000-0000000000c3";
+
+    fn cred(tenant: &str, can_act: Option<bool>) -> crate::commands::tenant::CandidateCredential {
+        crate::commands::tenant::CandidateCredential {
+            tenant: tenant.to_string(),
+            can_act,
+            slot: "usable",
+            via_default_slot: false,
+        }
+    }
+
+    #[test]
+    fn walk_tenants_keep_a_single_binding_on_the_authority_order() {
+        assert_eq!(probe_walk_tenants(&[]), vec![None]);
+        assert_eq!(probe_walk_tenants(&[cred(T1, Some(true))]), vec![None]);
+    }
+
+    #[test]
+    fn walk_tenants_name_every_bound_tenant_that_can_act() {
+        assert_eq!(
+            probe_walk_tenants(&[
+                cred(T1, Some(true)),
+                cred(T2, Some(false)),
+                cred(T3, Some(true)),
+                cred("d4d4d4d4-0000-4000-8000-0000000000d4", None),
+            ]),
+            vec![Some(T1.to_string()), Some(T3.to_string())]
+        );
+        // None able to act: the authority order still decides.
+        assert_eq!(
+            probe_walk_tenants(&[cred(T1, Some(false)), cred(T2, None)]),
+            vec![None]
+        );
+    }
+
+    /// A target bound to three tenants: T1 serves two pages, T2's read is
+    /// refused, T3 serves one row (plus T1's first row again, as a guard).
+    /// Every mint is refused so the sweep stops at the mint and records the
+    /// tenant it was asked under.
+    #[derive(Default)]
+    struct MultiTenant {
+        all_fail: bool,
+        pages: Mutex<Vec<(Option<String>, Option<String>)>>,
+        minted_under: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ProbeDoors for MultiTenant {
+        async fn walk_tenants(&self) -> Vec<Option<String>> {
+            vec![Some(T1.into()), Some(T2.into()), Some(T3.into())]
+        }
+        async fn fleet_page(
+            &self,
+            device_id: &str,
+            tenant: Option<&str>,
+            cursor: Option<String>,
+        ) -> Result<Value, String> {
+            assert_eq!(device_id, DEVICE);
+            self.pages
+                .lock()
+                .unwrap()
+                .push((tenant.map(str::to_string), cursor.clone()));
+            if self.all_fail {
+                return Err(format!("401 for {tenant:?}"));
+            }
+            let page = |rows: Vec<Value>, next: Option<&str>| {
+                json!({
+                    "sessions": rows,
+                    "callerDeviceId": ME,
+                    "nextCursor": next,
+                    "interactivityEventsPresent": true,
+                    "freshForSecs": 1800,
+                })
+            };
+            match (tenant, cursor.as_deref()) {
+                (Some(T1), None) => Ok(page(vec![row(1, json!({}))], Some("t1-c1"))),
+                (Some(T1), Some("t1-c1")) => Ok(page(vec![row(2, json!({}))], None)),
+                (Some(T2), _) => Err("fleet_sessions:tenant_refused: no usable credential".into()),
+                (Some(T3), None) => Ok(page(vec![row(3, json!({})), row(1, json!({}))], None)),
+                other => panic!("unexpected page request {other:?}"),
+            }
+        }
+        async fn mint(
+            &self,
+            session_id: Uuid,
+            tenant: Option<&str>,
+        ) -> Result<AttachGrantResponse, String> {
+            self.minted_under
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), tenant.map(str::to_string)));
+            Err("remote_attach:coord_unreachable: test".into())
+        }
+        async fn attach(&self, _: &str, _: u16, _: u16) -> Result<AttachedReply, AttachError> {
+            unreachable!("every mint is refused")
+        }
+        fn sink(&self) -> Arc<dyn RemoteFrameSink> {
+            unreachable!()
+        }
+        fn register(&self, _: Arc<RemotePaneIo>) {}
+        async fn read_probe(&self, _: &RemotePaneIo, _: u64) -> Result<AttachedReply, AttachError> {
+            unreachable!()
+        }
+        fn forget(&self, _: &str) {}
+        fn report(&self, _: Observation) {}
+        fn local_device_id(&self) -> Option<Uuid> {
+            Uuid::parse_str(ME).ok()
+        }
+        fn live_tab_here(&self, _: &str) -> bool {
+            false
+        }
+        fn relay_connected(&self) -> bool {
+            true
+        }
+        fn attempts(&self) -> &ProbeAttempts {
+            unreachable!("a manual sweep consults no attempt memory")
+        }
+    }
+
+    /// Each tenant is walked with its OWN cursor, one tenant's failure does not
+    /// stop the others, and every row is minted under the tenant it was listed
+    /// under.
+    #[tokio::test]
+    async fn a_multi_bound_device_walks_and_mints_per_tenant() {
+        let target = MultiTenant::default();
+        let report = run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
+
+        let pages = target.pages.lock().unwrap().clone();
+        assert_eq!(
+            pages,
+            vec![
+                (Some(T1.into()), None),
+                // T1's cursor is replayed under T1 only.
+                (Some(T1.into()), Some("t1-c1".into())),
+                (Some(T2.into()), None),
+                (Some(T3.into()), None),
+            ]
+        );
+
+        let rows: Vec<(String, Option<String>)> = report
+            .outcomes
+            .iter()
+            .map(|o| (o.session_id.clone(), o.tenant.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (sid(1), Some(T1.into())),
+                (sid(2), Some(T1.into())),
+                // sid(1) again under T3 is the dedupe guard, not a second row.
+                (sid(3), Some(T3.into())),
+            ]
+        );
+        assert_eq!(*target.minted_under.lock().unwrap(), rows);
+
+        let walks = &report.flags.tenants;
+        assert_eq!(walks.len(), 3);
+        assert_eq!(walks[0].rows_read, 2);
+        assert_eq!(walks[0].pages, 2);
+        assert!(walks[0].complete);
+        assert!(walks[1]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("tenant_refused")));
+        assert!(!walks[1].complete);
+        assert_eq!(report.flags.rows_read, 3);
+        assert_eq!(report.flags.pages, 3);
+        // A tenant that could not be read was not read completely.
+        assert!(!report.flags.complete);
+        assert_eq!(report.flags.interactivity_events_present, Some(true));
+    }
+
+    #[tokio::test]
+    async fn every_tenant_failing_is_the_sweeps_error_naming_each() {
+        let target = MultiTenant {
+            all_fail: true,
+            ..Default::default()
+        };
+        let e = run_probe_sweep(&target, DEVICE, "manual")
+            .await
+            .unwrap_err();
+        assert_eq!(e.door, "coord_fleet");
+        assert!(e.message.starts_with("every tenant's fleet read failed"));
+        for t in [T1, T2, T3] {
+            assert!(e.message.contains(t), "{} names {t}", e.message);
+        }
     }
 
     /// The probe sink refuses any input with bytes, or without the probe flag.
