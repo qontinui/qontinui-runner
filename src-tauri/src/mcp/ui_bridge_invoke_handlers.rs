@@ -1511,13 +1511,18 @@ mod misplaced_tenant_tests {
             invoke_pre_dispatch_rejection("get_coord_device_token", &misplaced)
                 .expect("the handler path refuses a top-level tenant");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(serde_json::to_string(&resp).unwrap().contains(DEVICE_TOKEN_TENANT_MISPLACED));
+        assert!(serde_json::to_string(&resp)
+            .unwrap()
+            .contains(DEVICE_TOKEN_TENANT_MISPLACED));
         let good = body(json!({"args": {"tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"}}));
         assert!(invoke_pre_dispatch_rejection("get_coord_device_token", &good).is_none());
         let (_, Json(resp)) = invoke_pre_dispatch_rejection("no_such_command_xyz", &misplaced)
             .expect("an unknown command is refused");
         let text = serde_json::to_string(&resp).unwrap();
-        assert!(text.contains("not in UI Bridge allowlist"), "allowlist first: {text}");
+        assert!(
+            text.contains("not in UI Bridge allowlist"),
+            "allowlist first: {text}"
+        );
         assert!(!text.contains(DEVICE_TOKEN_TENANT_MISPLACED), "{text}");
     }
 
@@ -1525,14 +1530,25 @@ mod misplaced_tenant_tests {
     fn the_args_envelope_and_other_commands_are_untouched() {
         let good = body(json!({"args": {"tenantId": "t"}}));
         assert!(good.top_level_extras.is_empty());
-        assert!(misplaced_tenant_rejection("get_coord_device_token", &good.top_level_extras).is_none());
+        assert!(
+            misplaced_tenant_rejection("get_coord_device_token", &good.top_level_extras).is_none()
+        );
         let empty = body(json!({}));
-        assert!(misplaced_tenant_rejection("get_coord_device_token", &empty.top_level_extras).is_none());
+        assert!(
+            misplaced_tenant_rejection("get_coord_device_token", &empty.top_level_extras).is_none()
+        );
         // Another top-level key is still ignored, as before.
         let other_key = body(json!({"args": {}, "timeoutMs": 5}));
-        assert!(misplaced_tenant_rejection("get_coord_device_token", &other_key.top_level_extras).is_none());
+        assert!(
+            misplaced_tenant_rejection("get_coord_device_token", &other_key.top_level_extras)
+                .is_none()
+        );
         // Only this command names a tenant; others keep ignoring extras.
         let elsewhere = body(json!({"tenantId": "t"}));
-        assert!(misplaced_tenant_rejection("get_access_token_for_websocket", &elsewhere.top_level_extras).is_none());
+        assert!(misplaced_tenant_rejection(
+            "get_access_token_for_websocket",
+            &elsewhere.top_level_extras
+        )
+        .is_none());
     }
 }
