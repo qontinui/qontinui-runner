@@ -151,3 +151,163 @@ pub fn prompt_proof_git_env() -> Vec<(String, String)> {
         .filter(|(k, _)| !k.starts_with("GIT_CONFIG_"))
         .collect()
 }
+
+/// The REPOSITORY-LOCAL git environment variables the runner scrubs from every
+/// git child it starts: what `git rev-parse --local-env-vars` prints (git
+/// 2.47.3) MINUS [`COMMAND_SCOPE_GIT_CONFIG_ENV`] — exactly the set git itself
+/// clears when it crosses into another repository (a submodule). Any of them
+/// inherited by a child makes git read a repository, index, object store or
+/// config file OTHER than the one `-C` / `current_dir` names: `-C` does not
+/// override an inherited `GIT_DIR`, so a runner started from a git hook (which
+/// exports `GIT_DIR`) or any shell that exported these would answer — and
+/// write — about the CALLER's repo. `GIT_CONFIG` (the legacy whole-config-FILE
+/// override) stays on the list: it names a file, which is repo-locating.
+/// `repo_local_git_env_covers_gits_own_list` pins this against the installed
+/// git, so a git that grows the list fails a test rather than silently
+/// reopening the hole.
+///
+/// Lives here, beside the credential posture, because it has consumers on both
+/// sides of the lib/bin split: [`crate::process_helpers::no_window`] /
+/// [`crate::process_helpers::tokio_no_window`] (compiled into BOTH crates)
+/// apply it to every git subprocess the runner starts, and the bin-only
+/// `git_trunk` resolver applies it to the commands its seam tests hand it.
+pub const REPO_LOCAL_GIT_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// The names on git's `--local-env-vars` list that are NOT scrubbed, because
+/// they carry COMMAND-SCOPE config (`git -c k=v`, and the `GIT_CONFIG_COUNT`
+/// overlay with its numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+/// pairs, which are not on git's list at all) rather than a repository
+/// location. git's own submodule code (`prepare_submodule_repo_env`) keeps
+/// exactly these two when it clears the rest — measured: `GIT_CONFIG_COUNT=1
+/// GIT_CONFIG_KEY_0=foo.bar … git -c baz.q=p submodule foreach` still sees
+/// `COUNT=1` and `'baz.q'='p'` inside the submodule. Scrubbing them would drop
+/// the operator's env-injected `safe.directory` (so `rev-parse` fails with
+/// "dubious ownership" on a box that needs it) and the agent session's
+/// env-injected credential helper / proxy / CA settings
+/// ([`non_interactive_git_env`]), which a runner started from such a session
+/// inherits and the drift probe's fetch / `ls-remote` need.
+pub const COMMAND_SCOPE_GIT_CONFIG_ENV: &[&str] = &["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+
+/// Remove every [`REPO_LOCAL_GIT_ENV`] variable from `cmd`'s child
+/// environment, whether inherited from this process or set on `cmd` earlier.
+/// Command-scope config ([`COMMAND_SCOPE_GIT_CONFIG_ENV`] and the numbered
+/// `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` pairs) passes through untouched,
+/// as it does across git's own submodule boundary.
+///
+/// [`crate::process_helpers::no_window`] already applies this to every git it
+/// builds; call it directly only on a command built some other way. A caller
+/// that deliberately points git elsewhere sets the variable AFTER construction
+/// (a later `.env` wins over this removal).
+pub fn scrub_repo_local_git_env(cmd: &mut std::process::Command) {
+    for var in REPO_LOCAL_GIT_ENV {
+        cmd.env_remove(var);
+    }
+}
+
+#[cfg(test)]
+mod repo_local_env_tests {
+    use super::*;
+
+    #[test]
+    fn the_scrub_removes_the_list_and_keeps_command_scope_config() {
+        let mut cmd = std::process::Command::new("git");
+        let kept = [
+            ("GIT_CONFIG_PARAMETERS", "'baz.q'='p'"),
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "safe.directory"),
+            ("GIT_CONFIG_VALUE_0", "*"),
+            ("GIT_CONFIG_KEY_1", "credential.helper"),
+            ("GIT_CONFIG_VALUE_1", "!gh auth git-credential"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ];
+        for (k, v) in kept {
+            cmd.env(k, v);
+        }
+        scrub_repo_local_git_env(&mut cmd);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for var in REPO_LOCAL_GIT_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{var} must be removed; envs: {envs:?}"
+            );
+        }
+        for (k, v) in kept {
+            assert!(
+                envs.iter()
+                    .any(|(name, val)| name == k && val.as_deref() == Some(v)),
+                "{k}={v} is command-scope, not repo-local, and must survive: {envs:?}"
+            );
+        }
+    }
+
+    /// The list is git's, not a hand-picked subset: every name the installed
+    /// git reports as repository-local is on it, except the named
+    /// command-scope exemption ([`COMMAND_SCOPE_GIT_CONFIG_ENV`] — config, not
+    /// a repository location, and kept by git's own submodule boundary), which
+    /// must itself be on git's list so it cannot exempt a name git never
+    /// reported. Skipped only when no `git` can be spawned at all.
+    #[test]
+    fn repo_local_git_env_covers_gits_own_list() {
+        let Ok(out) = std::process::Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+        else {
+            eprintln!("git is not installed; skipping");
+            return;
+        };
+        assert!(out.status.success(), "{out:?}");
+        let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "GIT_DIR"),
+            "git's list must at least name GIT_DIR, or this test proves nothing: {names:?}"
+        );
+        for exempt in COMMAND_SCOPE_GIT_CONFIG_ENV {
+            assert!(
+                names.iter().any(|n| n == exempt),
+                "exemption {exempt} is not on git's list: {names:?}"
+            );
+            assert!(
+                !REPO_LOCAL_GIT_ENV.contains(exempt),
+                "{exempt} is both exempt and scrubbed"
+            );
+        }
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|n| {
+                !REPO_LOCAL_GIT_ENV.contains(&n.as_str())
+                    && !COMMAND_SCOPE_GIT_CONFIG_ENV.contains(&n.as_str())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "REPO_LOCAL_GIT_ENV is missing git's {missing:?}"
+        );
+    }
+}
