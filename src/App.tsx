@@ -1,4 +1,12 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useState,
+  useCallback,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ApolloProvider } from "@apollo/client/react";
 
@@ -287,6 +295,28 @@ function AppContent() {
   } = useAppNavigation();
 
   const terminalPages = useTerminalPages();
+  // Page-roster operations for cross-page terminal actions (`/regroup`),
+  // handed to the session provider rather than drilled through TerminalPage.
+  // A page-pinned pop-out gets none: it shows one page, so a regroup there
+  // would mint pages it never mounts and move sessions out of sight.
+  const terminalPageOps = useMemo(
+    () =>
+      terminalPages.isPinned
+        ? undefined
+        : {
+            visiblePages: terminalPages.visiblePages,
+            addPage: terminalPages.addPage,
+            removePage: terminalPages.removePage,
+            setActivePageId: terminalPages.setActivePageId,
+          },
+    [
+      terminalPages.isPinned,
+      terminalPages.visiblePages,
+      terminalPages.addPage,
+      terminalPages.removePage,
+      terminalPages.setActivePageId,
+    ],
+  );
   // Projects-dashboard §7.2 steps 1–3: bind an activated project to its
   // Terminal page, pin that page's cwd to the project root, and reinstate its
   // zone profile. Mounted HERE — not in the Projects tab — because the page
@@ -910,6 +940,7 @@ function AppContent() {
                           activePageId={terminalPages.activePageId}
                           onNavigateToBuilder={navigateToBuilder}
                           onNavigateToActive={navigateToActive}
+                          pageOps={terminalPageOps}
                         >
                           <TerminalPageProvider value={terminalPages.activePageId}>
                             <TerminalPage

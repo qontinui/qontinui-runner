@@ -3,6 +3,7 @@ import { Sparkles } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 
 import { useTerminalSession } from "./contexts";
+import { applyPrunePlan } from "./pruneTerminals";
 import { usePrunePlan } from "./usePrunePlan";
 
 const CONFIRM_TIMEOUT_MS = 4000;
@@ -47,9 +48,7 @@ export function PruneTerminalsButton() {
       return;
     }
     setArmed(false);
-    // Request first: the compaction waits for these ids to leave the tab list.
-    requestCompaction(plan.keepIds, plan.closeIds);
-    for (const id of plan.closeIds) closeTerminal(id);
+    applyPrunePlan(plan, { requestCompaction, closeTerminal });
   }, [closeCount, armed, plan, requestCompaction, closeTerminal]);
 
   if (!actionable) return null;

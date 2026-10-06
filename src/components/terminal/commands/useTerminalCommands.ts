@@ -56,7 +56,14 @@ import {
   sharedSessionIds,
   type LiveClaudeSession,
 } from "../liveClaudeSessions";
-import { computeAutoGrowLayoutId, FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
+import {
+  computeAutoGrowLayoutId,
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  resolveLayout,
+} from "../useZoneLayout";
+import { applyPrunePlan, isPruneActionable, planPrune } from "../pruneTerminals";
+import { useRegroupTabs } from "../useRegroupTabs";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
@@ -226,6 +233,7 @@ const SCHEMA = {
   layout: { preset: `string — one of ${LAYOUT_IDS.join(", ")}` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
+  regroup: { perTab: "number (windows per tab, 1-24)" },
 } as const;
 
 /**
@@ -2006,6 +2014,85 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         },
       });
       return copied ? ok({ count: n }) : fail("clipboard-failed", "clipboard write failed");
+    },
+  });
+
+  // 37. /keep-ai — the status strip's "Keep AI" button, as a command
+  useCommandAction({
+    id: "terminal.keep-ai",
+    slash: "/keep-ai",
+    aliases: ["/prune"],
+    label: "Keep only AI sessions",
+    description:
+      "Close every window on this tab that has no AI session (plain shells, plan " +
+      "viewers) and shrink the grid to the smallest layout that fits the AI " +
+      "sessions left. Same as the Keep AI button in the status strip.",
+    // Closes live PTYs — never a Tier-2 reroute target (`rank.ts::safeToReroute`).
+    destructive: true,
+    paramSchema: SCHEMA.empty,
+    patterns: [/^keep\s+(?:only\s+)?ai(?:\s+sessions)?$/i],
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const plan = planPrune(tabs, zoneLayout.assignments, { sessionStates, now: Date.now() });
+      const zones = resolveLayout(plan.layoutId, plan.keepIds.length).zones.length;
+      // Same gate as the button: a grid that is already AI-only and compact is
+      // left alone rather than re-dealt.
+      if (!isPruneActionable(plan, zoneLayout.layout.zones.length, zones, zoneLayout.assignments)) {
+        return ok(effect("closed", "window", 0, { detail: "grid already holds only AI sessions" }));
+      }
+      applyPrunePlan(plan, { requestCompaction: zoneLayout.requestCompaction, closeTerminal });
+      const kept = plan.keepIds.length;
+      return ok(
+        effect("closed", "window", plan.closeIds.length, {
+          detail: `${kept} AI session${kept === 1 ? "" : "s"} in a ${zones}-zone grid`,
+        }),
+      );
+    },
+  });
+
+  // 38. /regroup <per-tab> — repack every tab's sessions, N per tab
+  const regroupTabs = useRegroupTabs();
+  useCommandAction({
+    id: "terminal.regroup",
+    slash: "/regroup",
+    label: "Regroup sessions into tabs",
+    description:
+      "Take the windows from every tab, close plain terminals with an empty " +
+      "screen, and repack the rest in order into tabs of at most <perTab> " +
+      "windows each. Empty tabs are removed; tabs are added when needed. " +
+      "Sessions are moved live, never restarted.",
+    destructive: true,
+    paramSchema: SCHEMA.regroup,
+    patterns: [/^regroup\s+(?<perTab>\d+)(?:\s+per\s+tab)?$/i],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
+      const read = readCountArg(args, "perTab");
+      if (read.kind === "absent") return fail("invalid-count", "usage: /regroup <windows per tab>");
+      if (read.kind === "invalid") return fail("invalid-count", `"${read.raw}" is not a count`);
+      const perTab = read.count;
+      if (perTab < 1 || perTab > MAX_SPAWN_COUNT) {
+        return fail("invalid-count", `windows per tab must be 1-${MAX_SPAWN_COUNT}`);
+      }
+      if (!regroupTabs) {
+        return fail("unavailable", "this window has no tab strip to regroup");
+      }
+      const r = await regroupTabs(perTab);
+      const parts = [
+        `${r.tabs} tab${r.tabs === 1 ? "" : "s"} of <= ${perTab}`,
+        `closed ${r.closed} empty terminal${r.closed === 1 ? "" : "s"}`,
+      ];
+      if (r.pagesCreated) parts.push(`added ${r.pagesCreated}`);
+      if (r.pagesRemoved) parts.push(`removed ${r.pagesRemoved}`);
+      // Partial outcomes are failures the operator has to see, not footnotes.
+      const problems = [];
+      if (r.failedMoves.length) problems.push(`could not move ${r.failedMoves.join(", ")}`);
+      if (r.pagesKept)
+        problems.push(
+          `${r.pagesKept} emptied tab(s) kept: the runner still lists a terminal there`,
+        );
+      if (!r.settled)
+        problems.push("some moved windows had not arrived when the grids were compacted");
+      if (problems.length)
+        return fail("regroup-partial", `${parts.join(" · ")} — ${problems.join("; ")}`);
+      return ok(effect("moved", "window", r.moved, { detail: parts.join(" · ") }));
     },
   });
 

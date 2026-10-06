@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 2696
+# tier: golden   inputs: 2860
 
 /analyze	literal	terminal.analyze	[]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 /analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
@@ -489,6 +489,56 @@
 /implement 1 gmail fix the bug --tenant	literal	terminal.plan-implement	[]	unbound	-
 /implement 3 best	literal	terminal.plan-implement	[]	unbound	-
 /implement 3 best --tenant	literal	terminal.plan-implement	[]	unbound	-
+/keep ai	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+/keep ai "1 gmail fix the bug"	none	-	null	none	-
+/keep ai "1 gmail fix the bug" --tenant	none	-	null	none	-
+/keep ai "3 best"	none	-	null	none	-
+/keep ai "3 best" --tenant	none	-	null	none	-
+/keep ai --tenant	none	-	null	none	-
+/keep ai 1 gmail fix the bug	none	-	null	none	-
+/keep ai 1 gmail fix the bug --tenant	none	-	null	none	-
+/keep ai 3 best	none	-	null	none	-
+/keep ai 3 best --tenant	none	-	null	none	-
+/keep ai sessions	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+/keep ai sessions "1 gmail fix the bug"	none	-	null	none	-
+/keep ai sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
+/keep ai sessions "3 best"	none	-	null	none	-
+/keep ai sessions "3 best" --tenant	none	-	null	none	-
+/keep ai sessions --tenant	none	-	null	none	-
+/keep ai sessions 1 gmail fix the bug	none	-	null	none	-
+/keep ai sessions 1 gmail fix the bug --tenant	none	-	null	none	-
+/keep ai sessions 3 best	none	-	null	none	-
+/keep ai sessions 3 best --tenant	none	-	null	none	-
+/keep only ai	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+/keep only ai "1 gmail fix the bug"	none	-	null	none	-
+/keep only ai "1 gmail fix the bug" --tenant	none	-	null	none	-
+/keep only ai "3 best"	none	-	null	none	-
+/keep only ai "3 best" --tenant	none	-	null	none	-
+/keep only ai --tenant	none	-	null	none	-
+/keep only ai 1 gmail fix the bug	none	-	null	none	-
+/keep only ai 1 gmail fix the bug --tenant	none	-	null	none	-
+/keep only ai 3 best	none	-	null	none	-
+/keep only ai 3 best --tenant	none	-	null	none	-
+/keep only ai sessions	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+/keep only ai sessions "1 gmail fix the bug"	none	-	null	none	-
+/keep only ai sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
+/keep only ai sessions "3 best"	none	-	null	none	-
+/keep only ai sessions "3 best" --tenant	none	-	null	none	-
+/keep only ai sessions --tenant	none	-	null	none	-
+/keep only ai sessions 1 gmail fix the bug	none	-	null	none	-
+/keep only ai sessions 1 gmail fix the bug --tenant	none	-	null	none	-
+/keep only ai sessions 3 best	none	-	null	none	-
+/keep only ai sessions 3 best --tenant	none	-	null	none	-
+/keep-ai	literal	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+/keep-ai "1 gmail fix the bug"	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai "1 gmail fix the bug" --tenant	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai "3 best"	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai "3 best" --tenant	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai --tenant	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai 1 gmail fix the bug	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai 1 gmail fix the bug --tenant	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai 3 best	literal	terminal.keep-ai	[]	unbound	-
+/keep-ai 3 best --tenant	literal	terminal.keep-ai	[]	unbound	-
 /keys	pattern	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
 /keys "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound	-
 /keys "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound	-
@@ -663,6 +713,16 @@
 /prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 /prompts 3 best	literal	terminal.prompt	[]	unbound	-
 /prompts 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+/prune	literal	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+/prune "1 gmail fix the bug"	literal	terminal.keep-ai	[]	unbound	-
+/prune "1 gmail fix the bug" --tenant	literal	terminal.keep-ai	[]	unbound	-
+/prune "3 best"	literal	terminal.keep-ai	[]	unbound	-
+/prune "3 best" --tenant	literal	terminal.keep-ai	[]	unbound	-
+/prune --tenant	literal	terminal.keep-ai	[]	unbound	-
+/prune 1 gmail fix the bug	literal	terminal.keep-ai	[]	unbound	-
+/prune 1 gmail fix the bug --tenant	literal	terminal.keep-ai	[]	unbound	-
+/prune 3 best	literal	terminal.keep-ai	[]	unbound	-
+/prune 3 best --tenant	literal	terminal.keep-ai	[]	unbound	-
 /quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 /quad layout --tenant	none	-	null	none	-
 /refresh plan	pattern	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
@@ -685,6 +745,20 @@
 /refresh-plan 1 gmail fix the bug --tenant	literal	terminal.plan-refresh	[]	unbound	-
 /refresh-plan 3 best	literal	terminal.plan-refresh	[]	unbound	-
 /refresh-plan 3 best --tenant	literal	terminal.plan-refresh	[]	unbound	-
+/regroup	literal	terminal.regroup	[]	error:invalid-count	error /regroup: usage: /regroup <windows per tab>
+/regroup "1 gmail fix the bug"	literal	terminal.regroup	[["perTab","1 gmail fix the bug"]]	error:invalid-count	error /regroup: "1 gmail fix the bug" is not a count
+/regroup "1 gmail fix the bug" --tenant	literal	terminal.regroup	[["perTab","1 gmail fix the bug --tenant"]]	error:invalid-count	error /regroup: "1 gmail fix the bug --tenant" is not a count
+/regroup "3 best"	literal	terminal.regroup	[["perTab","3 best"]]	error:invalid-count	error /regroup: "3 best" is not a count
+/regroup "3 best" --tenant	literal	terminal.regroup	[["perTab","3 best --tenant"]]	error:invalid-count	error /regroup: "3 best --tenant" is not a count
+/regroup --tenant	literal	terminal.regroup	[["perTab","--tenant"]]	error:invalid-count	error /regroup: "--tenant" is not a count
+/regroup 1 gmail fix the bug	literal	terminal.regroup	[["perTab","1 gmail fix the bug"]]	error:invalid-count	error /regroup: "1 gmail fix the bug" is not a count
+/regroup 1 gmail fix the bug --tenant	literal	terminal.regroup	[["perTab","1 gmail fix the bug --tenant"]]	error:invalid-count	error /regroup: "1 gmail fix the bug --tenant" is not a count
+/regroup 3	pattern	terminal.regroup	[["perTab",3]]	error:unavailable	error /regroup: this window has no tab strip to regroup
+/regroup 3 --tenant	literal	terminal.regroup	[["perTab","3 --tenant"]]	error:invalid-count	error /regroup: "3 --tenant" is not a count
+/regroup 3 best	literal	terminal.regroup	[["perTab","3 best"]]	error:invalid-count	error /regroup: "3 best" is not a count
+/regroup 3 best --tenant	literal	terminal.regroup	[["perTab","3 best --tenant"]]	error:invalid-count	error /regroup: "3 best --tenant" is not a count
+/regroup 3 per tab	pattern	terminal.regroup	[["perTab",3]]	error:unavailable	error /regroup: this window has no tab strip to regroup
+/regroup 3 per tab --tenant	literal	terminal.regroup	[["perTab","3 per tab --tenant"]]	error:invalid-count	error /regroup: "3 per tab --tenant" is not a count
 /restart	pattern	terminal.restart	[]	error:not-restartable	error /restart: session state is needs-input
 /restart "1 gmail fix the bug"	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /restart: "1 gmail fix the bug" is not a zone number
 /restart "1 gmail fix the bug" --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /restart: "1 gmail fix the bug --tenant" is not a zone number
@@ -1677,6 +1751,56 @@ implement 1 gmail fix the bug	literal	terminal.plan-implement	[]	unbound	-
 implement 1 gmail fix the bug --tenant	literal	terminal.plan-implement	[]	unbound	-
 implement 3 best	literal	terminal.plan-implement	[]	unbound	-
 implement 3 best --tenant	literal	terminal.plan-implement	[]	unbound	-
+keep ai	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+keep ai "1 gmail fix the bug"	none	-	null	none	-
+keep ai "1 gmail fix the bug" --tenant	none	-	null	none	-
+keep ai "3 best"	none	-	null	none	-
+keep ai "3 best" --tenant	none	-	null	none	-
+keep ai --tenant	none	-	null	none	-
+keep ai 1 gmail fix the bug	none	-	null	none	-
+keep ai 1 gmail fix the bug --tenant	none	-	null	none	-
+keep ai 3 best	none	-	null	none	-
+keep ai 3 best --tenant	none	-	null	none	-
+keep ai sessions	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+keep ai sessions "1 gmail fix the bug"	none	-	null	none	-
+keep ai sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
+keep ai sessions "3 best"	none	-	null	none	-
+keep ai sessions "3 best" --tenant	none	-	null	none	-
+keep ai sessions --tenant	none	-	null	none	-
+keep ai sessions 1 gmail fix the bug	none	-	null	none	-
+keep ai sessions 1 gmail fix the bug --tenant	none	-	null	none	-
+keep ai sessions 3 best	none	-	null	none	-
+keep ai sessions 3 best --tenant	none	-	null	none	-
+keep only ai	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+keep only ai "1 gmail fix the bug"	none	-	null	none	-
+keep only ai "1 gmail fix the bug" --tenant	none	-	null	none	-
+keep only ai "3 best"	none	-	null	none	-
+keep only ai "3 best" --tenant	none	-	null	none	-
+keep only ai --tenant	none	-	null	none	-
+keep only ai 1 gmail fix the bug	none	-	null	none	-
+keep only ai 1 gmail fix the bug --tenant	none	-	null	none	-
+keep only ai 3 best	none	-	null	none	-
+keep only ai 3 best --tenant	none	-	null	none	-
+keep only ai sessions	pattern	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+keep only ai sessions "1 gmail fix the bug"	none	-	null	none	-
+keep only ai sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
+keep only ai sessions "3 best"	none	-	null	none	-
+keep only ai sessions "3 best" --tenant	none	-	null	none	-
+keep only ai sessions --tenant	none	-	null	none	-
+keep only ai sessions 1 gmail fix the bug	none	-	null	none	-
+keep only ai sessions 1 gmail fix the bug --tenant	none	-	null	none	-
+keep only ai sessions 3 best	none	-	null	none	-
+keep only ai sessions 3 best --tenant	none	-	null	none	-
+keep-ai	literal	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+keep-ai "1 gmail fix the bug"	literal	terminal.keep-ai	[]	unbound	-
+keep-ai "1 gmail fix the bug" --tenant	literal	terminal.keep-ai	[]	unbound	-
+keep-ai "3 best"	literal	terminal.keep-ai	[]	unbound	-
+keep-ai "3 best" --tenant	literal	terminal.keep-ai	[]	unbound	-
+keep-ai --tenant	literal	terminal.keep-ai	[]	unbound	-
+keep-ai 1 gmail fix the bug	literal	terminal.keep-ai	[]	unbound	-
+keep-ai 1 gmail fix the bug --tenant	literal	terminal.keep-ai	[]	unbound	-
+keep-ai 3 best	literal	terminal.keep-ai	[]	unbound	-
+keep-ai 3 best --tenant	literal	terminal.keep-ai	[]	unbound	-
 keys	pattern	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
 keys "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound	-
 keys "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound	-
@@ -1851,6 +1975,16 @@ prompts 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
 prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 prompts 3 best	literal	terminal.prompt	[]	unbound	-
 prompts 3 best --tenant	literal	terminal.prompt	[]	unbound	-
+prune	literal	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+prune "1 gmail fix the bug"	literal	terminal.keep-ai	[]	unbound	-
+prune "1 gmail fix the bug" --tenant	literal	terminal.keep-ai	[]	unbound	-
+prune "3 best"	literal	terminal.keep-ai	[]	unbound	-
+prune "3 best" --tenant	literal	terminal.keep-ai	[]	unbound	-
+prune --tenant	literal	terminal.keep-ai	[]	unbound	-
+prune 1 gmail fix the bug	literal	terminal.keep-ai	[]	unbound	-
+prune 1 gmail fix the bug --tenant	literal	terminal.keep-ai	[]	unbound	-
+prune 3 best	literal	terminal.keep-ai	[]	unbound	-
+prune 3 best --tenant	literal	terminal.keep-ai	[]	unbound	-
 quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 quad layout --tenant	none	-	null	none	-
 refresh plan	pattern	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
@@ -1873,6 +2007,20 @@ refresh-plan 1 gmail fix the bug	literal	terminal.plan-refresh	[]	unbound	-
 refresh-plan 1 gmail fix the bug --tenant	literal	terminal.plan-refresh	[]	unbound	-
 refresh-plan 3 best	literal	terminal.plan-refresh	[]	unbound	-
 refresh-plan 3 best --tenant	literal	terminal.plan-refresh	[]	unbound	-
+regroup	literal	terminal.regroup	[]	error:invalid-count	error /regroup: usage: /regroup <windows per tab>
+regroup "1 gmail fix the bug"	literal	terminal.regroup	[["perTab","1 gmail fix the bug"]]	error:invalid-count	error /regroup: "1 gmail fix the bug" is not a count
+regroup "1 gmail fix the bug" --tenant	literal	terminal.regroup	[["perTab","1 gmail fix the bug --tenant"]]	error:invalid-count	error /regroup: "1 gmail fix the bug --tenant" is not a count
+regroup "3 best"	literal	terminal.regroup	[["perTab","3 best"]]	error:invalid-count	error /regroup: "3 best" is not a count
+regroup "3 best" --tenant	literal	terminal.regroup	[["perTab","3 best --tenant"]]	error:invalid-count	error /regroup: "3 best --tenant" is not a count
+regroup --tenant	literal	terminal.regroup	[["perTab","--tenant"]]	error:invalid-count	error /regroup: "--tenant" is not a count
+regroup 1 gmail fix the bug	literal	terminal.regroup	[["perTab","1 gmail fix the bug"]]	error:invalid-count	error /regroup: "1 gmail fix the bug" is not a count
+regroup 1 gmail fix the bug --tenant	literal	terminal.regroup	[["perTab","1 gmail fix the bug --tenant"]]	error:invalid-count	error /regroup: "1 gmail fix the bug --tenant" is not a count
+regroup 3	pattern	terminal.regroup	[["perTab",3]]	error:unavailable	error /regroup: this window has no tab strip to regroup
+regroup 3 --tenant	literal	terminal.regroup	[["perTab","3 --tenant"]]	error:invalid-count	error /regroup: "3 --tenant" is not a count
+regroup 3 best	literal	terminal.regroup	[["perTab","3 best"]]	error:invalid-count	error /regroup: "3 best" is not a count
+regroup 3 best --tenant	literal	terminal.regroup	[["perTab","3 best --tenant"]]	error:invalid-count	error /regroup: "3 best --tenant" is not a count
+regroup 3 per tab	pattern	terminal.regroup	[["perTab",3]]	error:unavailable	error /regroup: this window has no tab strip to regroup
+regroup 3 per tab --tenant	literal	terminal.regroup	[["perTab","3 per tab --tenant"]]	error:invalid-count	error /regroup: "3 per tab --tenant" is not a count
 restart	pattern	terminal.restart	[]	error:not-restartable	error /restart: session state is needs-input
 restart "1 gmail fix the bug"	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /restart: "1 gmail fix the bug" is not a zone number
 restart "1 gmail fix the bug" --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /restart: "1 gmail fix the bug --tenant" is not a zone number
@@ -2449,6 +2597,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.history [bool] do the thing	ai	terminal.history	[]	refused	error /history: "count" must be text or a number (got true/false)
 «ai» terminal.history [empty] do the thing	ai	terminal.history	[]	ok	noop /history · no events showed
 «ai» terminal.history [valid] do the thing	ai	terminal.history	[]	ok	noop /history · no events showed
+«ai» terminal.keep-ai [alien] do the thing	ai	terminal.keep-ai	[["nonsense","x"]]	refused	error /keep-ai: takes no arguments (got "nonsense")
+«ai» terminal.keep-ai [bool] do the thing	ai	terminal.keep-ai	[]	refused	error /keep-ai: "count" must be text or a number (got true/false)
+«ai» terminal.keep-ai [empty] do the thing	ai	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+«ai» terminal.keep-ai [valid] do the thing	ai	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
 «ai» terminal.layout [alien] do the thing	ai	terminal.layout	[["nonsense","x"]]	refused	error /layout: takes no argument named "nonsense"
 «ai» terminal.layout [bool] do the thing	ai	terminal.layout	[]	refused	error /layout: "preset" must be text or a number (got true/false)
 «ai» terminal.layout [empty] do the thing	ai	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
@@ -2485,6 +2637,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.prompt [bool] do the thing	ai	terminal.prompt	[]	refused	error /prompt: "count" must be text or a number (got true/false)
 «ai» terminal.prompt [empty] do the thing	ai	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
 «ai» terminal.prompt [valid] do the thing	ai	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
+«ai» terminal.regroup [alien] do the thing	ai	terminal.regroup	[["nonsense","x"]]	refused	error /regroup: takes no argument named "nonsense"
+«ai» terminal.regroup [bool] do the thing	ai	terminal.regroup	[]	refused	error /regroup: "perTab" must be text or a number (got true/false)
+«ai» terminal.regroup [empty] do the thing	ai	terminal.regroup	[]	error:invalid-count	error /regroup: usage: /regroup <windows per tab>
+«ai» terminal.regroup [valid] do the thing	ai	terminal.regroup	[["perTab",6]]	error:unavailable	error /regroup: this window has no tab strip to regroup
 «ai» terminal.restart [alien] do the thing	ai	terminal.restart	[["nonsense","x"]]	refused	error /restart: takes no argument named "nonsense"
 «ai» terminal.restart [bool] do the thing	ai	terminal.restart	[]	refused	error /restart: "zone" must be text or a number (got true/false)
 «ai» terminal.restart [empty] do the thing	ai	terminal.restart	[]	error:not-restartable	error /restart: session state is needs-input
@@ -2609,6 +2765,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.history [bool]	direct	terminal.history	[["count",true]]	threw	error /history: "count" must be text or a number (got true/false)
 «direct» terminal.history [empty]	direct	terminal.history	[]	ok	noop /history · no events showed
 «direct» terminal.history [valid]	direct	terminal.history	[]	ok	noop /history · no events showed
+«direct» terminal.keep-ai [alien]	direct	terminal.keep-ai	[["nonsense","x"]]	threw	error /keep-ai: takes no arguments (got "nonsense")
+«direct» terminal.keep-ai [bool]	direct	terminal.keep-ai	[["count",true]]	threw	error /keep-ai: "count" must be text or a number (got true/false)
+«direct» terminal.keep-ai [empty]	direct	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
+«direct» terminal.keep-ai [valid]	direct	terminal.keep-ai	[]	ok	ok /keep-ai ✓ closed 1 window — 1 AI session in a 1-zone grid
 «direct» terminal.layout [alien]	direct	terminal.layout	[["nonsense","x"]]	threw	error /layout: takes no argument named "nonsense"
 «direct» terminal.layout [bool]	direct	terminal.layout	[["preset",true]]	threw	error /layout: "preset" must be text or a number (got true/false)
 «direct» terminal.layout [empty]	direct	terminal.layout	[]	threw	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
@@ -2645,6 +2805,10 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.prompt [bool]	direct	terminal.prompt	[["count",true]]	threw	error /prompt: "count" must be text or a number (got true/false)
 «direct» terminal.prompt [empty]	direct	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
 «direct» terminal.prompt [valid]	direct	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
+«direct» terminal.regroup [alien]	direct	terminal.regroup	[["nonsense","x"]]	threw	error /regroup: takes no argument named "nonsense"
+«direct» terminal.regroup [bool]	direct	terminal.regroup	[["perTab",true]]	threw	error /regroup: "perTab" must be text or a number (got true/false)
+«direct» terminal.regroup [empty]	direct	terminal.regroup	[]	threw	error /regroup: usage: /regroup <windows per tab>
+«direct» terminal.regroup [valid]	direct	terminal.regroup	[["perTab",6]]	threw	error /regroup: this window has no tab strip to regroup
 «direct» terminal.restart [alien]	direct	terminal.restart	[["nonsense","x"]]	threw	error /restart: takes no argument named "nonsense"
 «direct» terminal.restart [bool]	direct	terminal.restart	[["zone",true]]	threw	error /restart: "zone" must be text or a number (got true/false)
 «direct» terminal.restart [empty]	direct	terminal.restart	[]	threw	error /restart: session state is needs-input

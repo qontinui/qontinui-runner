@@ -1103,11 +1103,23 @@ export function useTerminalManager(
             const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
             const info = terminals.find((t) => t.id === id);
             if (!info) return;
+            // The same response carries the durable session-id index. Apply it
+            // here rather than waiting for the 30s reconcile sweep: a moved AI
+            // session that arrives WITHOUT its `claudeSessionId` reads as a
+            // plain shell, and the Keep AI action would close it.
+            const sessionIds =
+              (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal })
+                .sessionIdsByTerminal ?? {};
             const pendingBypass = pendingBypassMarks.current.has(id);
             if (pendingBypass) pendingBypassMarks.current.delete(id);
             const pendingRemote = pendingRemoteMarks.current.get(id);
             if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
-            setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
+            setTabs((prev) =>
+              backfillClaudeSessionIds(
+                reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
+                { [id]: sessionIds[id] },
+              ),
+            );
             ingestedIds.current.add(id);
             setActiveId(id);
             logger.info(`Terminal ${id} moved onto page ${pageId}`);

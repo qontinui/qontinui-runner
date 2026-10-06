@@ -91,39 +91,69 @@ export interface PrunePlan {
 }
 
 /**
+ * A page's tabs in GRID order: assigned tabs by ascending zone index, then
+ * unassigned (hidden) tabs in tab order. Synthetic fixture tabs are never
+ * rendered and are dropped. Every compaction and regroup reads tabs in this
+ * order, so a session's place relative to its neighbours survives.
+ */
+export function orderTabsByZone<T extends { id: string; __synthetic?: boolean }>(
+  tabs: readonly T[],
+  assignments: ZoneAssignments,
+): T[] {
+  const zoneOf = new Map<string, number>();
+  for (const [z, id] of Object.entries(assignments)) {
+    if (id) zoneOf.set(id, Number(z));
+  }
+  return tabs
+    .map((tab, order) => ({ tab, order, zone: zoneOf.get(tab.id) ?? Number.POSITIVE_INFINITY }))
+    .filter(({ tab }) => !tab.__synthetic)
+    .sort((a, b) => a.zone - b.zone || a.order - b.order)
+    .map(({ tab }) => tab);
+}
+
+/**
  * Split the page's tabs into close / keep and pick the compacted layout.
  *
- * Kept tabs keep their RELATIVE grid order: assigned tabs by ascending zone
- * index, then unassigned (hidden) AI tabs in tab order — so compaction pulls a
- * hidden session onto the grid rather than leaving it off-screen. Synthetic
- * fixture tabs are never rendered and are ignored entirely.
+ * Kept tabs keep their grid order ({@link orderTabsByZone}), so compaction
+ * pulls a hidden AI session onto the grid rather than leaving it off-screen.
  */
 export function planPrune(
   tabs: readonly PruneTab[],
   assignments: ZoneAssignments,
   signals: PruneSignals = {},
 ): PrunePlan {
-  const zoneOf = new Map<string, number>();
-  for (const [z, id] of Object.entries(assignments)) {
-    if (id) zoneOf.set(id, Number(z));
-  }
-
   const closeIds: string[] = [];
   const closeTitles: string[] = [];
-  const keep: { id: string; order: number; zone: number }[] = [];
-  tabs.forEach((tab, order) => {
-    if (tab.__synthetic) return;
-    if (hasAiSession(tab, signals)) {
-      keep.push({ id: tab.id, order, zone: zoneOf.get(tab.id) ?? Number.POSITIVE_INFINITY });
-    } else {
-      closeIds.push(tab.id);
-      closeTitles.push(tab.title);
-    }
-  });
-  keep.sort((a, b) => a.zone - b.zone || a.order - b.order);
-  const keepIds = keep.map((k) => k.id);
-
+  const keepIds: string[] = [];
+  // Close lists stay in tab order (what the operator reads in the confirm);
+  // keep lists are in grid order (what the compaction lays out).
+  for (const tab of tabs) {
+    if (tab.__synthetic || hasAiSession(tab, signals)) continue;
+    closeIds.push(tab.id);
+    closeTitles.push(tab.title);
+  }
+  for (const tab of orderTabsByZone(tabs, assignments)) {
+    if (hasAiSession(tab, signals)) keepIds.push(tab.id);
+  }
   return { closeIds, closeTitles, keepIds, layoutId: pickLayout(keepIds.length) };
+}
+
+/**
+ * Carry out a prune plan on one page. The button (after its confirm) and the
+ * `/keep-ai` command both come through here, so the one ordering that matters
+ * cannot drift between them: the compaction is REQUESTED before the closes,
+ * because it waits for these ids to leave the tab list (see
+ * `useZoneLayout.requestCompaction`).
+ */
+export function applyPrunePlan(
+  plan: Pick<PrunePlan, "keepIds" | "closeIds">,
+  ops: {
+    requestCompaction: (order: string[], closing: string[]) => void;
+    closeTerminal: (id: string) => void;
+  },
+): void {
+  ops.requestCompaction(plan.keepIds, plan.closeIds);
+  for (const id of plan.closeIds) ops.closeTerminal(id);
 }
 
 /**

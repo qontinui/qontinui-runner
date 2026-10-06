@@ -44,6 +44,8 @@ terminal.generate-workflow	canonical	[]	error:no-session	workflow.generate	true	
 terminal.generate-workflow	empty	[]	error:no-session	workflow.generate	true	-	error
 terminal.history	canonical	[]	ok	ctx.showCard	false	showed 0 event	noop
 terminal.history	empty	[]	ok	ctx.showCard	false	showed 0 event	noop
+terminal.keep-ai	canonical	[]	ok	zone.requestCompaction,session.closeTerminal	false	closed 1 window	ok
+terminal.keep-ai	empty	[]	ok	zone.requestCompaction,session.closeTerminal	false	closed 1 window	ok
 terminal.layout	alternate	[["preset","single"]]	ok	zone.setLayoutId	false	changed 1 layout	ok
 terminal.layout	canonical	[["preset","quad"]]	ok	zone.setLayoutId	false	changed 0 layout	noop
 terminal.layout	empty	[]	error:invalid-preset	-	false	-	error
@@ -63,6 +65,8 @@ terminal.plan-verify	canonical	[]	error:no-plan	-	false	-	error
 terminal.plan-verify	empty	[]	error:no-plan	-	false	-	error
 terminal.prompt	canonical	[]	ok	ctx.openPromptModal	true	opened 1 the prompt library [state]	ok
 terminal.prompt	empty	[]	ok	ctx.openPromptModal	true	opened 1 the prompt library [state]	ok
+terminal.regroup	canonical	[["perTab","x"]]	error:invalid-count	-	false	-	error
+terminal.regroup	empty	[]	error:invalid-count	-	false	-	error
 terminal.restart	canonical	[["zone",1]]	error:not-restartable	-	false	-	error
 terminal.restart	empty	[]	error:not-restartable	-	false	-	error
 terminal.resume	canonical	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok

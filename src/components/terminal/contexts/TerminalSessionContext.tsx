@@ -191,6 +191,33 @@ export interface TerminalSessionContextValue extends TerminalManagerReturn, Stat
 
 export const TerminalSessionContext = createContext<TerminalSessionContextValue | null>(null);
 
+/**
+ * Page-roster operations, owned by `useTerminalPages` in `App.tsx` and handed
+ * to the provider so a cross-page action (`/regroup`) can reach them without
+ * prop-drilling through `TerminalPage`.
+ */
+export interface TerminalPageOps {
+  /** The tab strip, in display order (`useTerminalPages().visiblePages`). */
+  visiblePages: ReadonlyArray<{ id: string; name: string }>;
+  /** Create a page; returns its id. Also makes it the active page. */
+  addPage: (name: string) => string;
+  /** Remove a page — closes EVERY PTY the runner still lists on it. */
+  removePage: (id: string) => Promise<void>;
+  setActivePageId: (id: string) => void;
+}
+
+/**
+ * Every page's session value, not just the active one. `getPages()` reads a
+ * ref, so a long-running action (which must wait for moved tabs to arrive)
+ * always sees the latest values rather than the ones it closed over.
+ */
+export interface AllTerminalSessionsValue {
+  getPages: () => Readonly<Record<string, TerminalSessionContextValue | null>>;
+  pageOps: TerminalPageOps | null;
+}
+
+const AllTerminalSessionsContext = createContext<AllTerminalSessionsValue | null>(null);
+
 interface PageSessionScopeProps {
   pageId: string;
   /**
@@ -954,6 +981,8 @@ interface TerminalSessionProviderProps {
   activePageId: string;
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
+  /** Page-roster operations for cross-page actions; see {@link TerminalPageOps}. */
+  pageOps?: TerminalPageOps;
   children: ReactNode;
 }
 
@@ -977,9 +1006,20 @@ export function TerminalSessionProvider({
   activePageId,
   onNavigateToBuilder,
   onNavigateToActive,
+  pageOps,
   children,
 }: TerminalSessionProviderProps) {
   const [values, setValues] = useState<Record<string, TerminalSessionContextValue | null>>({});
+
+  const valuesRef = useRef(values);
+  useEffect(() => {
+    valuesRef.current = values;
+  }, [values]);
+  const getPages = useCallback(() => valuesRef.current, []);
+  const allSessions = useMemo<AllTerminalSessionsValue>(
+    () => ({ getPages, pageOps: pageOps ?? null }),
+    [getPages, pageOps],
+  );
 
   const register = useCallback((pageId: string, value: TerminalSessionContextValue | null) => {
     setValues((prev) => {
@@ -1026,9 +1066,11 @@ export function TerminalSessionProvider({
           throw in `useTerminalSession()`. The window is sub-frame; show the
           same spinner TerminalPage uses while not `initialized`. */}
       {activeValue ? (
-        <TerminalSessionContext.Provider value={activeValue}>
-          {children}
-        </TerminalSessionContext.Provider>
+        <AllTerminalSessionsContext.Provider value={allSessions}>
+          <TerminalSessionContext.Provider value={activeValue}>
+            {children}
+          </TerminalSessionContext.Provider>
+        </AllTerminalSessionsContext.Provider>
       ) : (
         <div className="h-full flex items-center justify-center bg-[#1a1b26]">
           <div className="flex flex-col items-center gap-3">
@@ -1039,6 +1081,18 @@ export function TerminalSessionProvider({
       )}
     </>
   );
+}
+
+/**
+ * Every page's session value plus the page-roster operations — for actions
+ * that work across pages (`/regroup`). Throws outside the provider.
+ */
+export function useAllTerminalSessions(): AllTerminalSessionsValue {
+  const ctx = useContext(AllTerminalSessionsContext);
+  if (!ctx) {
+    throw new Error("useAllTerminalSessions must be used within a TerminalSessionProvider");
+  }
+  return ctx;
 }
 
 /**
