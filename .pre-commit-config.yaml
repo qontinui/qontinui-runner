@@ -160,6 +160,18 @@ repos:
         files: '^(\.pre-commit-hooks/(lib/crate-inputs\.sh|crate-inputs-test\.sh)|src-tauri/build\.rs|src-tauri/Cargo\.toml|Cargo\.toml)$'
         pass_filenames: false
 
+      # `lib/scratch-cleanup.sh` keeps a read-only baseline snapshot (the
+      # SHA-keyed sibling store) from turning gen-events-drift's EXIT-trap
+      # cleanup into a failed push after a passing drift check (finding 51901722).
+      - id: scratch-cleanup-test
+        name: hook scratch-tree cleanup — tests
+        entry: bash .pre-commit-hooks/scratch-cleanup-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/scratch-cleanup\.sh|scratch-cleanup-test\.sh|gen-events-drift\.sh)$'
+        pass_filenames: false
+
       # `lib/shared-target.sh` is what makes BOTH pre-push hooks build into the
       # shared cargo target instead of a cold per-worktree one. It also covers
       # `generate_types.sh`'s QONTINUI_SCHEMAS_JSON override, which is what keeps
