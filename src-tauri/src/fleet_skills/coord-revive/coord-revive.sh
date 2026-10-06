@@ -4432,7 +4432,10 @@ for origin in $RUNNER_DEFAULT_ORIGIN $RUNNER_ORIGINS; do
     # {"tenantId":…} at the top level is a tenant-less call (a second 409
     # tenant_required on a multi-slot runner, the default slot on a one-slot
     # one). The tenant goes INSIDE args. Measured 2026-10-05 against runner
-    # b8fdb9cc2; tenant-arg-test.sh's stub models that contract.
+    # b8fdb9cc2; tenant-arg-test.sh's stub models that contract. A runner
+    # carrying that plan's Phase 7 REFUSES a top-level tenantId/tenant_id with
+    # 400 get_coord_device_token:tenant_misplaced instead of dropping it -
+    # still not a token, so this script's outcome for that shape is the same.
     # Only get_coord_device_token takes the tenant. get_access_token_for_websocket
     # refuses ANY non-empty args with a 400, so it always gets `{}` - and it is
     # only ever reached on a build that does not serve the first name at all,

@@ -59,7 +59,10 @@
 # THE RUNNER CONTRACT, modelled rather than assumed (plan
 # 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device
 # Phase 3). qontinui-runner's InvokeRequestBody has ONE field, `args` (serde
-# default {}), and DROPS every top-level key. This stub reads the tenant ONLY
+# default {}), and DROPS every top-level key (a runner carrying that plan's
+# Phase 7 refuses a top-level tenantId with 400 tenant_misplaced instead; this
+# stub models the older, dropping runner, which is the harder case for a
+# caller - a wrong-slot token rather than a refusal). This stub reads the tenant ONLY
 # from body["args"] -- (k0) proves it does -- so a script that sends
 # {"tenantId":…} at the top level makes a tenant-less call here exactly as it
 # does against the real runner. The previous stub read the top-level key and was

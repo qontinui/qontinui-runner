@@ -403,7 +403,9 @@ whose:
   is load-bearing:** the invoke route's request body (`InvokeRequestBody`) has ONE
   field, `args`, defaulted to `{}`, and silently drops every top-level key — so
   `{"tenantId": "<uuid>"}` at the top level is a TENANT-LESS call (a second `409
-  tenant_required` on a multi-slot runner, the default slot on a one-slot one).
+  tenant_required` on a multi-slot runner, the default slot on a one-slot one;
+  a runner carrying that plan's Phase 7 refuses it instead, with `400
+  get_coord_device_token:tenant_misplaced` naming the envelope).
   This script sent exactly that until plan
   `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
   Phase 3, and its test stub read the top-level key, so the suite was green
