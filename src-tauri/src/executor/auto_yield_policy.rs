@@ -64,20 +64,6 @@ pub fn should_yield(
     true
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Spawn the auto-yield policy task. Returns immediately; the task
 /// runs in the background for the lifetime of the runtime.
 ///
@@ -132,8 +118,8 @@ async fn run_policy_loop(
             continue;
         }
 
-        let now_s = now_secs();
-        let now_ms = now_millis();
+        let now_s = crate::util::time::now_secs();
+        let now_ms = crate::util::time::now_ms();
 
         for entry in infos {
             // Skip uncontested locks — auto-yield is only relevant

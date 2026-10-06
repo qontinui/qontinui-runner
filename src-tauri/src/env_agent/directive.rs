@@ -264,17 +264,11 @@ fn enroll_ws_url() -> Option<String> {
     ))
 }
 
-/// This machine's coord device_id (uuid) from `~/.qontinui/machine.json`, reusing
-/// the shared identity reader. `None` when absent/unparseable.
-fn load_local_device_id() -> Option<uuid::Uuid> {
-    enroll::local_machine_identity().coord_device_id
-}
-
 /// Spawn the enroll-directive subscriber on the ambient tokio runtime. A no-op
 /// (logs + returns) when there's no local device identity or no `coord_url`.
 /// Wire in `main.rs` next to `spawn_env_capture()`.
 pub fn spawn_enroll_directive_subscriber() {
-    let device_id = match load_local_device_id() {
+    let device_id = match qontinui_runner_lib::ambient::read_machine_json().device_uuid() {
         Some(d) => d,
         None => {
             info!(
@@ -306,9 +300,18 @@ pub fn spawn_enroll_directive_subscriber() {
                 ),
             }
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(BACKOFF_MAX_MS);
+            backoff_ms = next_backoff_ms(backoff_ms);
         }
     });
+}
+
+/// Reconnect delay after `current_ms`: doubled, capped at [`BACKOFF_MAX_MS`].
+fn next_backoff_ms(current_ms: u64) -> u64 {
+    crate::util::backoff::next_doubled(
+        Duration::from_millis(current_ms),
+        Duration::from_millis(BACKOFF_MAX_MS),
+    )
+    .as_millis() as u64
 }
 
 /// Single connect-and-pump iteration: opens the WS, keepalive-pings, and
@@ -367,6 +370,22 @@ async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vector pinned from the pre-`util::backoff` expression
+    /// `(backoff_ms * 2).min(BACKOFF_MAX_MS)` starting at `BACKOFF_BASE_MS`.
+    #[test]
+    fn reconnect_backoff_doubles_from_base_then_caps() {
+        let mut cur = BACKOFF_BASE_MS;
+        let mut got = vec![cur];
+        for _ in 0..8 {
+            cur = next_backoff_ms(cur);
+            got.push(cur);
+        }
+        assert_eq!(
+            got,
+            vec![2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000, 60_000]
+        );
+    }
 
     fn dev() -> uuid::Uuid {
         uuid::Uuid::parse_str("c79a07d5-7e40-49b4-87fa-554c749f9644").unwrap()

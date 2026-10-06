@@ -989,10 +989,7 @@ fn record_timestamp_ms(record: &serde_json::Value) -> u64 {
             }
         }
     }
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::util::time::now_ms()
 }
 
 /// Walk `content[]` of an `{type:"assistant"}` record and emit a TouchedFile

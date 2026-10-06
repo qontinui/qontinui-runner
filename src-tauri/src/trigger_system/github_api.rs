@@ -73,10 +73,7 @@ pub(crate) fn cached_link_next(url: &str) -> Option<String> {
 
 /// Unix seconds, saturating to 0 on a clock before the epoch.
 pub(crate) fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::util::time::now_secs() as i64
 }
 
 /// How long to sleep before the single retry of a rate-limited response, or

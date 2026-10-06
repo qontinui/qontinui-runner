@@ -50,11 +50,6 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::CommandResponse;
 
-/// Path of `~/.qontinui/machine.json`, through the ambient seam.
-fn machine_file_path() -> Option<PathBuf> {
-    qontinui_runner_lib::ambient::machine_json_path()
-}
-
 /// The raw JSON object — the WRITER's shape, so sibling fields (`device_id`,
 /// `hostname`, `name`) round-trip verbatim through [`write_active_tenant_id`].
 fn read_machine_file(path: &Path) -> Option<serde_json::Value> {
@@ -439,7 +434,7 @@ fn pin_label(pin: qontinui_runner_lib::tenant_pin::TenantPin) -> &'static str {
 /// 2. Cached pair file (`paired_user.json`) → default binding (fallback so
 ///    the UI has something to render before the operator pins)
 pub(crate) fn active_tenant_view() -> Result<ActiveTenantView, String> {
-    let machine_path = machine_file_path()
+    let machine_path = qontinui_runner_lib::ambient::machine_json_path()
         .ok_or_else(|| "tenant: no home directory; cannot read machine.json".to_string())?;
 
     let (tenant, source) = if let Some(t) = read_active_tenant_id(&machine_path) {
@@ -554,7 +549,8 @@ pub(crate) fn apply_active_tenant(tenant_id: &str) -> Result<String, SetActiveTe
         });
     }
 
-    let machine_path = machine_file_path().ok_or(SetActiveTenantError::NoHome)?;
+    let machine_path =
+        qontinui_runner_lib::ambient::machine_json_path().ok_or(SetActiveTenantError::NoHome)?;
     let canonical = tenant.to_string();
     write_active_tenant_id(&machine_path, &canonical).map_err(|e| match e {
         MachineJsonWriteError::Refused(m) => SetActiveTenantError::WriteRefused(m),
@@ -601,7 +597,7 @@ pub(crate) fn applied_payload(
 /// The `machine.json` pin before a write, for the response's
 /// `previous_active_tenant_id`. `None` when unpinned or unreadable.
 pub(crate) fn current_machine_pin() -> Option<String> {
-    machine_file_path().and_then(|p| read_active_tenant_id(&p))
+    qontinui_runner_lib::ambient::machine_json_path().and_then(|p| read_active_tenant_id(&p))
 }
 
 /// Return the active tenant id for this machine — the DEFAULT binding for

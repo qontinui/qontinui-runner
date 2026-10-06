@@ -102,13 +102,6 @@ fn tab_key(headers: &HeaderMap) -> Option<&str> {
     headers.get(TAB_KEY_HEADER).and_then(|v| v.to_str().ok())
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// Command frame as delivered over the SSE stream. Field names match the
 /// relay client's `QueuedCommand` (camelCase on the wire).
 #[derive(Debug, Clone, Serialize)]
@@ -293,7 +286,7 @@ impl RelayRegistry {
     ) -> Result<(u64, tokio::sync::mpsc::UnboundedReceiver<QueuedCommand>), Refusal> {
         let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let now = now_ms();
+        let now = crate::util::time::now_ms();
         let mut inner = self.lock();
         evict_stale(&mut inner, now);
         Self::claim(&mut inner, binding, principal, ROUTE_STREAM, tab_id, now)?;
@@ -318,7 +311,7 @@ impl RelayRegistry {
                 .is_some_and(|l| l.conn_id == conn_id)
             {
                 record.listener = None;
-                record.last_seen_ms = now_ms();
+                record.last_seen_ms = crate::util::time::now_ms();
             }
         }
     }
@@ -333,7 +326,7 @@ impl RelayRegistry {
         tab_id: &str,
         body: &serde_json::Value,
     ) -> Result<bool, Refusal> {
-        let now = now_ms();
+        let now = crate::util::time::now_ms();
         let mut inner = self.lock();
         evict_stale(&mut inner, now);
         Self::claim(&mut inner, binding, principal, ROUTE_HEARTBEAT, tab_id, now)?;
@@ -375,7 +368,7 @@ impl RelayRegistry {
     /// NOT that quantity and is null for a tab that only ever held a stream,
     /// so a caller reading the bound needs this field to use it.
     pub fn list_tabs(&self) -> Vec<serde_json::Value> {
-        let now = now_ms();
+        let now = crate::util::time::now_ms();
         let mut inner = self.lock();
         evict_stale(&mut inner, now);
         let primary = inner
@@ -429,7 +422,7 @@ impl RelayRegistry {
     /// Ids of tabs that currently hold a live SSE listener.
     pub fn connected_tab_ids(&self) -> Vec<String> {
         let mut inner = self.lock();
-        evict_stale(&mut inner, now_ms());
+        evict_stale(&mut inner, crate::util::time::now_ms());
         let mut ids: Vec<String> = inner
             .tabs
             .iter()
@@ -502,7 +495,7 @@ impl RelayRegistry {
         // Resolve the target + enqueue while holding the lock; await outside.
         let target = {
             let mut inner = self.lock();
-            evict_stale(&mut inner, now_ms());
+            evict_stale(&mut inner, crate::util::time::now_ms());
             let target = match tab_id {
                 Some(id) => {
                     let record = inner
@@ -515,7 +508,7 @@ impl RelayRegistry {
                     id.to_string()
                 }
                 None => {
-                    let now = now_ms();
+                    let now = crate::util::time::now_ms();
                     let connected: Vec<&String> = inner
                         .tabs
                         .iter()
@@ -600,7 +593,7 @@ impl RelayRegistry {
                 command_id: command_id.clone(),
                 action: action.to_string(),
                 payload,
-                timestamp: now_ms(),
+                timestamp: crate::util::time::now_ms(),
             };
             let record = inner
                 .tabs
@@ -1529,7 +1522,7 @@ mod tests {
             .unwrap();
         let (_conn_id, _rx) = registry.connect_stream(&b(), &op(), "tab-live").unwrap();
 
-        registry.evict_stale_at(now_ms() + STALE_TAB_EVICT_MS + 1);
+        registry.evict_stale_at(crate::util::time::now_ms() + STALE_TAB_EVICT_MS + 1);
         let tabs = registry.list_tabs();
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0]["tabId"], "tab-live");

@@ -43,7 +43,7 @@ impl QueryRoot {
             .app_state
             .ui_bridge_last_pong
             .load(std::sync::atomic::Ordering::Relaxed);
-        let now_ms = now_epoch_ms();
+        let now_ms = crate::util::time::now_ms();
         let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
         let pending_count = pending_count_with_timeout(state).await;
         let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
@@ -733,7 +733,7 @@ pub(crate) async fn build_health_snapshot(state: &Arc<ApiState>) -> UiBridgeHeal
         .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
-    let now_ms = now_epoch_ms();
+    let now_ms = crate::util::time::now_ms();
     let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
     let responsive = last_pong > 0 && pong_age_ms < 15000;
     let pending_count = pending_count_with_timeout(state).await;
@@ -750,13 +750,6 @@ pub(crate) async fn build_health_snapshot(state: &Arc<ApiState>) -> UiBridgeHeal
         circuit_breaker,
         semaphore_available,
     }
-}
-
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 async fn pending_count_with_timeout(state: &Arc<ApiState>) -> i32 {

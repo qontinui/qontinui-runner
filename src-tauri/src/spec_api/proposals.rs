@@ -865,7 +865,7 @@ pub async fn post_sweep_pending(
                                 page_id: spec_id.clone(),
                                 consecutive_greens: new_greens.max(0) as u32,
                                 snapshot_id: green_result.snapshot_id.clone(),
-                                at_ms: events::now_ms(),
+                                at_ms: crate::util::time::now_ms(),
                             });
                             info!(
                                 "post_sweep_pending: promoted {} (spec_id={})",
@@ -934,7 +934,7 @@ pub async fn post_sweep_pending(
                     failing_assertion_id,
                     failing_state_id,
                     snapshot_id: red_snapshot_id,
-                    at_ms: events::now_ms(),
+                    at_ms: crate::util::time::now_ms(),
                 });
                 info!(
                     "post_sweep_pending: demoted {} (spec_id={}): {}",

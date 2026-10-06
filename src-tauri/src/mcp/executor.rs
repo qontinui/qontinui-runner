@@ -351,10 +351,7 @@ async fn reset_default_lifecycle_to_initializing(manager: &Arc<crate::executor::
     };
 
     if let Some(lc) = lifecycle {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts = crate::util::time::now_ms();
         let res = lc
             .read()
             .await

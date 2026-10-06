@@ -16,3 +16,6 @@
 pub mod egress_context;
 pub mod error_chain;
 pub mod path_extraction;
+// Lib-only helpers, re-exported so both crates spell `crate::util::time` /
+// `crate::util::backoff` without a second compiled copy.
+pub use qontinui_runner_lib::util::{backoff, time};

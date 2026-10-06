@@ -19,9 +19,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::process_helpers::{no_window, run_probe, ProbeOutcome};
+// One-PR re-export: `mcp::ai_session` (hot file, converted after its split)
+// still imports `git_status_subset::now_ms`.
+pub use crate::util::time::now_ms;
 
 /// Budget for every `git` invocation in this module.
 ///
@@ -80,15 +82,6 @@ impl CommitState {
             generated_at_ms: now_ms(),
         }
     }
-}
-
-/// Wall-clock millis since UNIX epoch, saturating to 0 on the (impossible)
-/// pre-epoch case so this is panic-free.
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Group an arbitrary list of absolute file paths by their enclosing git

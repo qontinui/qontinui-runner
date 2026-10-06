@@ -142,15 +142,7 @@ impl InstanceManager {
             return existing.id.clone();
         }
 
-        let id = format!(
-            "ext-{}-{}",
-            port,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                % 100000
-        );
+        let id = format!("ext-{}-{}", port, crate::util::time::now_ms() % 100000);
         let now = chrono::Utc::now();
         let inst = RegisteredInstance {
             id: id.clone(),

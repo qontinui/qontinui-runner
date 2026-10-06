@@ -174,8 +174,17 @@ pub(crate) async fn subscribe_loop(device_id: uuid::Uuid) {
             }
         }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(CI_BACKOFF_MAX_MS);
+        backoff_ms = next_backoff_ms(backoff_ms);
     }
+}
+
+/// Reconnect delay after `current_ms`: doubled, capped at [`CI_BACKOFF_MAX_MS`].
+fn next_backoff_ms(current_ms: u64) -> u64 {
+    crate::util::backoff::next_doubled(
+        Duration::from_millis(current_ms),
+        Duration::from_millis(CI_BACKOFF_MAX_MS),
+    )
+    .as_millis() as u64
 }
 
 /// One connect-and-pump iteration — same keepalive/recv discipline as
@@ -270,6 +279,22 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vector pinned from the pre-`util::backoff` expression
+    /// `(backoff_ms * 2).min(CI_BACKOFF_MAX_MS)` starting at `CI_BACKOFF_BASE_MS`.
+    #[test]
+    fn reconnect_backoff_doubles_from_base_then_caps() {
+        let mut cur = CI_BACKOFF_BASE_MS;
+        let mut got = vec![cur];
+        for _ in 0..8 {
+            cur = next_backoff_ms(cur);
+            got.push(cur);
+        }
+        assert_eq!(
+            got,
+            vec![2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000, 60_000]
+        );
+    }
 
     /// REGRESSION (P2a review #2): `spawn_ci_node_runtime` gates on
     /// `connected_coord_base().is_none()`, so `ci_ws_url` must resolve from the

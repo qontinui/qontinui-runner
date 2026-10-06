@@ -1416,7 +1416,12 @@ const SSE_BACKOFF_INITIAL_SECS: u64 = 1;
 const SSE_BACKOFF_MAX_SECS: u64 = 30;
 
 fn next_backoff(current: u64) -> u64 {
-    (current.saturating_mul(2)).min(SSE_BACKOFF_MAX_SECS)
+    use std::time::Duration;
+    qontinui_runner_lib::util::backoff::next_doubled(
+        Duration::from_secs(current),
+        Duration::from_secs(SSE_BACKOFF_MAX_SECS),
+    )
+    .as_secs()
 }
 
 /// Long-polls `<base>/wrappers/events`. On every `data:` line received,

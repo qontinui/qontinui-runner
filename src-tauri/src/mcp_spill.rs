@@ -510,7 +510,7 @@ impl SpillStore {
             content_type: truncate_on_char_boundary(content_type, MAX_CONTENT_TYPE_LEN)
                 .into_owned(),
             byte_len: body.len() as u64,
-            created_at_ms: now_ms(),
+            created_at_ms: crate::util::time::now_ms_i64(),
             is_error,
         };
 
@@ -1327,13 +1327,6 @@ fn max_own_bytes_from_env() -> u64 {
         },
         _ => DEFAULT_MAX_OWN_BYTES,
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

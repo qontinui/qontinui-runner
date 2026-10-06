@@ -791,7 +791,7 @@ pub(crate) fn build_author_response(
         app_id: app_id.to_string(),
         page_id: doc.id.clone(),
         kind: "ir-and-projection".to_string(),
-        at_ms: events::now_ms(),
+        at_ms: crate::util::time::now_ms(),
     }));
     (
         StatusCode::OK,

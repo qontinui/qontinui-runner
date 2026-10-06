@@ -37,7 +37,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::response::Json;
@@ -63,13 +63,6 @@ static WEDGE_RELEASED_AT_MS: AtomicU64 = AtomicU64::new(0);
 /// Unix-ms at which the most recent wedge was requested (HTTP thread).
 static WEDGE_REQUESTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct WedgeQuery {
     /// Milliseconds to block the UI thread for. Clamped to [`MAX_WEDGE_MS`].
@@ -91,7 +84,7 @@ async fn wedge_ui_thread_handler(
     let ms = requested.min(MAX_WEDGE_MS);
     let clamped = ms != requested;
 
-    let requested_at = now_ms();
+    let requested_at = crate::util::time::now_ms();
     WEDGE_REQUESTED_AT_MS.store(requested_at, Ordering::SeqCst);
     WEDGE_ENTERED_AT_MS.store(0, Ordering::SeqCst);
     WEDGE_RELEASED_AT_MS.store(0, Ordering::SeqCst);
@@ -102,9 +95,9 @@ async fn wedge_ui_thread_handler(
     );
 
     let enqueued = state.app_handle.run_on_main_thread(move || {
-        WEDGE_ENTERED_AT_MS.store(now_ms(), Ordering::SeqCst);
+        WEDGE_ENTERED_AT_MS.store(crate::util::time::now_ms(), Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(ms));
-        WEDGE_RELEASED_AT_MS.store(now_ms(), Ordering::SeqCst);
+        WEDGE_RELEASED_AT_MS.store(crate::util::time::now_ms(), Ordering::SeqCst);
     });
 
     match enqueued {
@@ -149,7 +142,7 @@ async fn wedge_status_handler() -> Json<Value> {
         } else {
             None
         },
-        "nowMs": now_ms(),
+        "nowMs": crate::util::time::now_ms(),
     }))
 }
 

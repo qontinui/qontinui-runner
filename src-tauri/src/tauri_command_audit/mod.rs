@@ -59,10 +59,7 @@ static BUFFER: Mutex<VecDeque<CommandFireEvent>> = Mutex::new(VecDeque::new());
 /// drops the entry so a panicked test in another module never wedges the
 /// production IPC dispatch closure.
 pub fn record(command: &str) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now = crate::util::time::now_ms();
     let event = CommandFireEvent {
         command: command.to_string(),
         fired_at_unix_ms: now,

@@ -85,7 +85,7 @@ impl FileRegistryManager {
         holder_name: &str,
         worktree_id: Option<String>,
     ) -> Vec<FileConflict> {
-        let now = now_millis();
+        let now = crate::util::time::now_ms();
         let mut conflicts = Vec::new();
         let mut state = self.state.write().await;
 
@@ -435,13 +435,6 @@ pub(crate) fn normalize_path(path: &str) -> String {
     normalized
 }
 
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 // =============================================================================
 // FileLockManager — exclusive per-file locks with blocking
 // =============================================================================
@@ -554,7 +547,7 @@ impl FileLockManager {
                             .push(FileLockWaiter {
                                 task_run_id: task_run_id.to_string(),
                                 holder_name: holder_name.to_string(),
-                                waiting_since_ms: now_millis(),
+                                waiting_since_ms: crate::util::time::now_ms(),
                             });
                         registered_waiter = true;
                     }
@@ -567,7 +560,7 @@ impl FileLockManager {
                         FileLockEntry {
                             holder_task_run_id: task_run_id.to_string(),
                             holder_name: holder_name.to_string(),
-                            acquired_at: now_millis(),
+                            acquired_at: crate::util::time::now_ms(),
                         },
                     );
                     Self::remove_waiter_locked(&mut state, &normalized, task_run_id);

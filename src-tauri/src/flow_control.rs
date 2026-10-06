@@ -150,7 +150,7 @@ impl FlowControlEnforcer {
         workflow_id: &str,
         flow_control: &FlowControl,
     ) -> FlowControlDecision {
-        let now_ms = current_time_ms();
+        let now_ms = crate::util::time::now_ms();
 
         // 1. Check concurrency limit
         if let Some(ref concurrency) = flow_control.concurrency {
@@ -270,7 +270,7 @@ impl FlowControlEnforcer {
     pub async fn record_debounce_trigger(&self, workflow_id: &str, debounce_key: Option<&str>) {
         let key = self.make_key(workflow_id, debounce_key);
         let mut timers = self.debounce_timers.lock().await;
-        timers.insert(key, current_time_ms());
+        timers.insert(key, crate::util::time::now_ms());
     }
 
     /// Build a scoping key from workflow_id and optional scope key.
@@ -285,13 +285,6 @@ impl FlowControlEnforcer {
 // =============================================================================
 // Helpers
 // =============================================================================
-
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 // =============================================================================
 // Global Singleton

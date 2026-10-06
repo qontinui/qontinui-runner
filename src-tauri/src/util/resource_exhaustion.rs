@@ -115,7 +115,7 @@ pub fn is_fd_exhaustion_code(code: i32) -> bool {
 pub fn note_fd_exhaustion(e: &std::io::Error) -> bool {
     match e.raw_os_error() {
         Some(code) if is_fd_exhaustion_code(code) => {
-            FD_EXHAUSTED_MS.store(now_ms(), Ordering::Relaxed);
+            FD_EXHAUSTED_MS.store(crate::util::time::now_ms(), Ordering::Relaxed);
             FD_EXHAUSTED_COUNT.fetch_add(1, Ordering::Relaxed);
             true
         }
@@ -458,7 +458,7 @@ pub fn note_memory_reading(r: MemoryReading) {
     LAST_FREE_COMMIT.store(r.free_commit, Ordering::Relaxed);
     LAST_COMMIT_LIMIT.store(r.commit_limit, Ordering::Relaxed);
     LAST_FREE_PHYS.store(r.free_phys, Ordering::Relaxed);
-    LAST_READING_AT_SECS.store(now_ms() / 1000, Ordering::Relaxed);
+    LAST_READING_AT_SECS.store(crate::util::time::now_ms() / 1000, Ordering::Relaxed);
 }
 
 /// The last recorded reading and the unix second it was taken at, or `None`
@@ -497,7 +497,8 @@ fn reading_for_event() -> Option<(MemoryReading, u64)> {
     if let Some(r) = MEMORY_READER.get().and_then(|read| read()) {
         return Some((r, 0));
     }
-    last_memory_reading().map(|(r, at)| (r, (now_ms() / 1000).saturating_sub(at)))
+    last_memory_reading()
+        .map(|(r, at)| (r, (crate::util::time::now_ms() / 1000).saturating_sub(at)))
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +699,7 @@ pub fn report_exhaustion(
     os_code: Option<i32>,
     caller: &str,
 ) -> FailureTransition {
-    let now = now_ms();
+    let now = crate::util::time::now_ms();
     let transition = {
         let mut book = BOOK.lock().unwrap_or_else(|p| p.into_inner());
         let t = book.on_failure(kind, evidence, now);
@@ -730,7 +731,7 @@ pub fn note_spawn_succeeded() {
     if !ANY_OPEN.load(Ordering::Relaxed) {
         return;
     }
-    let now = now_ms();
+    let now = crate::util::time::now_ms();
     let mut closed = Vec::new();
     {
         let mut book = BOOK.lock().unwrap_or_else(|p| p.into_inner());
@@ -833,13 +834,6 @@ fn emit_closed(kind: ExhaustionKind, evidence: Evidence, c: ClosedEpisode, ended
             ),
         );
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

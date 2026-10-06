@@ -59,10 +59,7 @@ impl UiBridgeCircuitBreaker {
                 let last_failure = self
                     .last_failure_time
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now = crate::util::time::now_ms();
                 if now - last_failure >= self.cooldown_ms {
                     *state = CircuitBreakerState::HalfOpen;
                     info!("UI Bridge circuit breaker: Open -> HalfOpen (cooldown elapsed)");
@@ -99,10 +96,7 @@ impl UiBridgeCircuitBreaker {
     /// Uses a rolling window: only failures within the last `window_ms` count
     /// towards the threshold.
     pub async fn record_failure(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = crate::util::time::now_ms();
         self.last_failure_time
             .store(now, std::sync::atomic::Ordering::Relaxed);
 
@@ -139,10 +133,7 @@ impl UiBridgeCircuitBreaker {
             .recovery_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = crate::util::time::now_ms();
         self.last_recovery_time
             .store(now, std::sync::atomic::Ordering::Relaxed);
 
@@ -190,10 +181,7 @@ impl UiBridgeCircuitBreaker {
 
     /// Get failure count within the rolling window
     pub async fn get_failure_count(&self) -> u32 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = crate::util::time::now_ms();
         let timestamps = self.failure_timestamps.lock().await;
         let cutoff = now.saturating_sub(self.window_ms);
         timestamps.iter().filter(|&&ts| ts >= cutoff).count() as u32

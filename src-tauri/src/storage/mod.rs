@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,10 +108,7 @@ impl LocalStorage {
     /// Save a video to disk
     pub fn save_video(&self, session_id: &str, data: &[u8]) -> Result<PathBuf> {
         // Create file path with timestamp
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp = crate::util::time::now_secs();
         let file_path = self
             .config
             .video_path

@@ -184,17 +184,13 @@ pub fn poller_health() -> PollerHealth {
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Record a successful pull.
 fn note_poll_success() {
     POLLER_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
-    POLLER_LAST_SUCCESS_UNIX.store(now_unix(), std::sync::atomic::Ordering::Relaxed);
+    POLLER_LAST_SUCCESS_UNIX.store(
+        crate::util::time::now_secs(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if let Ok(mut g) = POLLER_LAST_ERROR.lock() {
         *g = None;
     }
@@ -211,7 +207,10 @@ fn note_poll_failure(err: &str) {
     if streak >= RECLAIM_FAILURE_ESCALATION_STREAK {
         let since = match POLLER_LAST_SUCCESS_UNIX.load(std::sync::atomic::Ordering::Relaxed) {
             0 => "never succeeded this process".to_string(),
-            t => format!("last success {}s ago", now_unix().saturating_sub(t)),
+            t => format!(
+                "last success {}s ago",
+                crate::util::time::now_secs().saturating_sub(t)
+            ),
         };
         tracing::error!(
             "worktree_reclaim: RECLAIM POLLER DOWN — {streak} consecutive failed pulls \

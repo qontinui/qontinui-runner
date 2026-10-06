@@ -43,7 +43,7 @@ fn invoke_emit(app_id: &str, snapshot_id: &str, page_ids: Vec<String>, invoked_v
         snapshot_id: snapshot_id.to_string(),
         page_ids,
         invoked_via: invoked_via.to_string(),
-        at_ms: events::now_ms(),
+        at_ms: crate::util::time::now_ms(),
     });
 }
 
@@ -516,7 +516,7 @@ pub async fn post_spec_check(
     // Stream D: emit on the request's `app_id` channel so per-app subscribers
     // see only events for the app they registered for.
     invoke_emit(&req.app_id, &snapshot_id, vec![req.page_id.clone()], "http");
-    let started_ms = events::now_ms();
+    let started_ms = crate::util::time::now_ms();
 
     // Evaluate — pure crate call, no logic here. Thread the real fingerprint
     // + snapshot identity (minted by fetch_fresh_snapshot or synthesized on
@@ -561,7 +561,7 @@ pub async fn post_spec_check(
     // body stays out of the broadcast (subscribers join by snapshot_id).
     // Stream D: emit on the request's `app_id` channel.
     let (perfect, partial, no_match, eval_error, overall_rate) = completion_counts(&[&result], 1);
-    let completed_ms = events::now_ms();
+    let completed_ms = crate::util::time::now_ms();
     events::emit(SpecApiEvent::SpecCheckCompleted {
         app_id: req.app_id.clone(),
         snapshot_id: snapshot_id.clone(),
@@ -742,7 +742,7 @@ pub async fn post_spec_check_batch(
     let input_page_count = req.pages.len();
     let page_ids: Vec<String> = req.pages.iter().map(|p| p.page_id.clone()).collect();
     invoke_emit(&req.app_id, &snapshot_id, page_ids, "http");
-    let batch_started_ms = events::now_ms();
+    let batch_started_ms = crate::util::time::now_ms();
 
     // Fetch app once for threshold application across all batch elements
     let app_option = match state.app_state.pg_db.get_app(&req.app_id).await {
@@ -829,7 +829,7 @@ pub async fn post_spec_check_batch(
         .collect();
     let (perfect, partial, no_match, eval_error, overall_rate) =
         completion_counts(&ok_results, input_page_count);
-    let completed_ms = events::now_ms();
+    let completed_ms = crate::util::time::now_ms();
     events::emit(SpecApiEvent::SpecCheckCompleted {
         app_id: req.app_id.clone(),
         snapshot_id: snapshot_id.clone(),
@@ -1036,7 +1036,7 @@ async fn stream_batch_results(
     // exhausted). The `started_ms` is captured outside the unfold so it's
     // consistent with the Invoked emit in the caller.
     let input_page_count = pages.len();
-    let started_ms = events::now_ms();
+    let started_ms = crate::util::time::now_ms();
     let snapshot_id_for_completion = snapshot_id.clone();
     struct StreamState {
         iter: std::vec::IntoIter<BatchPageEntry>,
@@ -1078,7 +1078,7 @@ async fn stream_batch_results(
                         } else {
                             st.rate_sum / st.ok_count as f32
                         };
-                        let completed_ms = events::now_ms();
+                        let completed_ms = crate::util::time::now_ms();
                         events::emit(SpecApiEvent::SpecCheckCompleted {
                             // Stream D: emit on the batch request's `app_id`.
                             app_id: app_id.clone(),

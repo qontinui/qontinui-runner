@@ -211,10 +211,7 @@ pub async fn ui_bridge_diagnostics_handler(
         .load(std::sync::atomic::Ordering::Relaxed);
     let process_uptime_ms = state.started_at.elapsed().as_millis() as u64;
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::util::time::now_ms();
     // `saturating_sub`, not `-`: `last_pong` is a wall-clock stamp, so a
     // backwards clock step (NTP, sleep/resume) can leave it ahead of `now_ms`
     // and a plain subtraction underflows and panics. A "future" pong reads as
@@ -331,10 +328,7 @@ pub async fn ui_bridge_readiness_handler(
     // boundary while its pong loop kept running. 503 is the correct answer on
     // that path, and the 503 body carries `uiError` + the crash hint.
     if diag.sdk_connected {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = crate::util::time::now_ms();
         let age_ms = now_ms.saturating_sub(last_pong);
         (
             StatusCode::OK,

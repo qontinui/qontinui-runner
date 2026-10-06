@@ -68,11 +68,13 @@ fn retry_backoff(hard_failures: u32) -> Duration {
     if hard_failures == 0 {
         return REFRESH_RETRY_BACKOFF;
     }
-    let factor = 1u32.checked_shl(hard_failures.min(16)).unwrap_or(u32::MAX);
-    REFRESH_RETRY_BACKOFF
-        .checked_mul(factor)
-        .unwrap_or(REFRESH_HARD_FAIL_BACKOFF_CAP)
-        .min(REFRESH_HARD_FAIL_BACKOFF_CAP)
+    // `n` consecutive hard failures sit one rung above the flat spacing, so the
+    // ladder is `capped_doubling` over `n + 1` (60s -> 2m -> 4m ... -> cap).
+    crate::util::backoff::capped_doubling(
+        REFRESH_RETRY_BACKOFF,
+        hard_failures.saturating_add(1),
+        REFRESH_HARD_FAIL_BACKOFF_CAP,
+    )
 }
 
 /// Stable fingerprint of a refresh token. Only ever compared against another
@@ -392,10 +394,7 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
     clear_hard_failure(creds_path);
 
     let expires_in_secs = token_response["expires_in"].as_i64().unwrap_or(86400);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms = crate::util::time::now_ms_i64();
     let new_expires_at_ms = now_ms + expires_in_secs * 1000;
 
     json["claudeAiOauth"]["accessToken"] = serde_json::Value::String(new_access_token.clone());
@@ -445,7 +444,7 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
 pub(crate) fn try_ensure_valid_credentials(config_dir: Option<&str>) {
     if let Some(path) = find_creds_path(config_dir) {
         let snap = read_creds_snapshot(&path);
-        if snap.needs_refresh(now_ms()) && snap.refreshable(&path) {
+        if snap.needs_refresh(crate::util::time::now_ms_i64()) && snap.refreshable(&path) {
             debug!("OAuth token expiring — requesting background refresh (spawn is not blocked)");
             request_background_refresh(&path);
         }
@@ -559,7 +558,7 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
         return false;
     }
     let snap = read_creds_snapshot(creds_path);
-    let now = now_ms();
+    let now = crate::util::time::now_ms_i64();
     let refreshable = snap.refreshable(creds_path);
     if snap.needs_refresh(now) && refreshable {
         request_background_refresh(creds_path);
@@ -619,13 +618,6 @@ fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
         has_refresh_token: refresh_token_fp != 0,
         refresh_token_fp,
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn find_creds_path(config_dir: Option<&str>) -> Option<PathBuf> {
@@ -772,7 +764,7 @@ mod tests {
     fn near_expiry_token_is_valid_and_queues_a_proactive_refresh() {
         let _log = refresh_log_guard();
         let _ = taken_refresh_requests();
-        let soon = now_ms() + REFRESH_LEAD_MS / 2;
+        let soon = crate::util::time::now_ms_i64() + REFRESH_LEAD_MS / 2;
         let (guard, path) = dir_with_creds(soon, "rt-present");
         assert!(has_valid_credentials(&path));
         assert_eq!(

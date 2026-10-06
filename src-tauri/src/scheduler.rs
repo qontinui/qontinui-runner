@@ -309,13 +309,13 @@ impl ScheduledTaskExt for ScheduledTask {
         if base == 0 {
             return None;
         }
-        // Compute base * 2^(failures - 1) with saturating semantics.
-        // Using u32 for the shift amount keeps us inside `<<` rules; we
-        // cap the exponent at 63 first so the shift can't UB.
-        let exponent = (failures - 1).min(63) as u32;
-        let multiplier: u64 = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
-        let raw = base.saturating_mul(multiplier);
-        let capped = raw.min(MAX_BACKOFF_SECS);
+        // base * 2^(failures - 1), saturating, capped at 24h.
+        let capped = crate::util::backoff::capped_doubling(
+            std::time::Duration::from_secs(base),
+            failures,
+            std::time::Duration::from_secs(MAX_BACKOFF_SECS),
+        )
+        .as_secs();
         Some(chrono::Duration::seconds(capped as i64))
     }
 }

@@ -26,13 +26,6 @@ use crate::spec_api::storage::RUNNER_APP_ID;
 
 use super::PgDb;
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Resolve an incoming optional command into the `(touch, value)` pair the
 /// UPDATE binds, applying the fleet-wide **blank-means-clear** contract.
 ///
@@ -208,7 +201,7 @@ impl PgDb {
             });
         }
 
-        let now = now_ms();
+        let now = crate::util::time::now_ms_i64();
         // Normalize on the registration door too, so a blank command cannot
         // enter the table by either route (see `normalize_command`).
         let (_, insert_build_command) = normalize_command(req.build_command.as_deref());
@@ -364,7 +357,7 @@ impl PgDb {
                 return;
             }
         };
-        let now = now_ms();
+        let now = crate::util::time::now_ms_i64();
         if let Err(e) = conn
             .execute(
                 "UPDATE project.apps SET last_seen_at_ms = $2 WHERE app_id = $1",

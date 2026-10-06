@@ -696,10 +696,7 @@ async fn request_yield(
         holder_task_run_id,
     } = req;
 
-    let requested_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let requested_at_ms = crate::util::time::now_ms();
 
     use tauri::Emitter;
     let payload = serde_json::json!({
@@ -743,10 +740,7 @@ async fn signal_long_wait(
         estimated_remaining_ms,
     } = req;
 
-    let signaled_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let signaled_at_ms = crate::util::time::now_ms();
 
     use tauri::Emitter;
     let payload = serde_json::json!({
@@ -1812,10 +1806,7 @@ mod tests {
         requester_name: &str,
         holder_task_run_id: &str,
     ) -> bool {
-        let requested_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let requested_at_ms = crate::util::time::now_ms();
 
         let payload = serde_json::json!({
             "type": "file-lock-yield-requested",
@@ -1839,10 +1830,7 @@ mod tests {
         holder_name: &str,
         estimated_remaining_ms: Option<u64>,
     ) -> bool {
-        let signaled_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let signaled_at_ms = crate::util::time::now_ms();
 
         let payload = serde_json::json!({
             "type": "file-lock-long-wait-signaled",

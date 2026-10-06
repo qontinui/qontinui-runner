@@ -556,15 +556,6 @@ fn tracked_panes(
         .collect()
 }
 
-/// Wall-clock now, in unix millis — the same base `TerminalInfo::created_at`
-/// is stamped from, so the two subtract to a pane's age.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// How many direct children does the pane's own root process have? `None` when
 /// the question cannot be answered — a remote pane with no local pid, or an
 /// unreadable table.
@@ -630,10 +621,15 @@ fn find_running_steward_in(
     kind: &str,
     snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
 ) -> Option<TerminalInfo> {
-    tracked_panes(terminal_manager, kind, snapshot, now_ms())
-        .into_iter()
-        .find(|pane| steward_pane_is_running(&pane.evidence))
-        .map(|pane| pane.info)
+    tracked_panes(
+        terminal_manager,
+        kind,
+        snapshot,
+        crate::util::time::now_ms(),
+    )
+    .into_iter()
+    .find(|pane| steward_pane_is_running(&pane.evidence))
+    .map(|pane| pane.info)
 }
 
 /// Close the tracked panes of this kind that have been EMPTIED — see
@@ -676,11 +672,16 @@ async fn reap_emptied_panes(
     kind: &str,
     snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
 ) -> usize {
-    let emptied: Vec<String> = tracked_panes(terminal_manager, kind, snapshot, now_ms())
-        .into_iter()
-        .filter(|pane| steward_pane_is_emptied(&pane.evidence))
-        .map(|pane| pane.info.id)
-        .collect();
+    let emptied: Vec<String> = tracked_panes(
+        terminal_manager,
+        kind,
+        snapshot,
+        crate::util::time::now_ms(),
+    )
+    .into_iter()
+    .filter(|pane| steward_pane_is_emptied(&pane.evidence))
+    .map(|pane| pane.info.id)
+    .collect();
 
     let mut closed = 0usize;
     for id in emptied {

@@ -143,7 +143,7 @@ pub(crate) fn repo_slug_is_safe(repo: &str) -> bool {
 /// opt-in gets flipped from qontinui-web and a disabled device holding no
 /// socket could never receive it. See `subscription`'s module doc.
 pub fn spawn_ci_node_runtime() {
-    let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
+    let Some(device_id) = qontinui_runner_lib::ambient::read_machine_json().device_uuid() else {
         info!(
             "ci_node: ~/.qontinui/machine.json missing or device_id unparseable — \
              CI-node runtime disabled. Skipping."

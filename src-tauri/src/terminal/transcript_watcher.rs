@@ -300,11 +300,7 @@ impl CohortWakeDetector {
 fn record_cohort_wake(wake: &CohortWake) {
     LAST_COHORT_WAKE_COUNT.store(wake.count, Ordering::Relaxed);
     if wake.newly_crossed {
-        let ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-            .max(1);
+        let ms = crate::util::time::now_ms().max(1);
         LAST_COHORT_WAKE_UNIX_MS.store(ms, Ordering::Relaxed);
         info!(
             count = wake.count,

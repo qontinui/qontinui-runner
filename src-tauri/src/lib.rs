@@ -138,6 +138,11 @@ pub mod util {
     // `util/mod.rs` must NOT declare it (a second declaration is a second,
     // half-blind static).
     pub mod resource_exhaustion;
+    // Wall-clock reads and capped-doubling backoff arithmetic — the one home
+    // (plan `2026-10-04-runner-time-backoff-and-http-client-helpers-are-re-rolled-per-module`).
+    // LIB-only like `resource_exhaustion`; the bin's `util/mod.rs` re-exports both.
+    pub mod backoff;
+    pub mod time;
 }
 
 // The allocation-failure breadcrumb (plan

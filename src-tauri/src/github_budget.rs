@@ -57,7 +57,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -901,10 +900,7 @@ fn etag_cache() -> &'static Mutex<EtagCache> {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::util::time::now_secs() as i64
 }
 
 /// Fold one GitHub response into the process-global meter.

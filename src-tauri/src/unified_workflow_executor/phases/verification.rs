@@ -105,10 +105,7 @@ impl VerificationExecutor {
         clear_console_errors().await;
 
         // Record verification start time for browser event filtering
-        let verification_start_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let verification_start_ms = crate::util::time::now_ms();
 
         if steps.is_empty() {
             info!(
