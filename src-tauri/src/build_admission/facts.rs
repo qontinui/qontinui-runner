@@ -7,9 +7,9 @@
 //! conjunct, plan D3) — never `unknown`.
 //!
 //! Frozen state is read from a scope's `cgroup.events` (`frozen 1`), never from
-//! `ps`: measured on merytshost (plan Progress, Phase 0), a task frozen through
-//! `cgroup.freeze` still shows state `S`, so `ps` cannot tell a frozen build
-//! from a sleeping one.
+//! `ps`: a task frozen through `cgroup.freeze` still shows state `S` (measured
+//! on merytshost 2026-10-06, recorded in the plan's Progress block and coord
+//! finding `bed01ee9`), so `ps` cannot tell a frozen build from a sleeping one.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -17,16 +17,20 @@ use std::path::{Path, PathBuf};
 use qontinui_types::build_admission::{estimate::nearest_rank, Fact, HostFacts};
 use serde::Serialize;
 
-use super::ci_reservation::{self, CiSource};
+use super::ci_reservation::{self, CiMeasure};
 
 /// The comm names that are build work (plan D4: attributed build trees).
 pub const BUILD_COMMS: &[&str] = &["rustc", "clippy-driver"];
 
-/// Where the readers look. Injected so tests never read the real host.
+/// Where the readers look, and whether they are Linux files. Injected so tests
+/// never read the real host.
 #[derive(Debug, Clone)]
 pub struct Roots {
     pub proc: PathBuf,
     pub cgroup: PathBuf,
+    /// `/proc` and cgroupfs exist (Linux). Off Linux memory comes from the
+    /// runner's commit-available accessor and PSI is `not_supported`.
+    pub linux: bool,
 }
 
 impl Roots {
@@ -34,6 +38,7 @@ impl Roots {
         Roots {
             proc: PathBuf::from("/proc"),
             cgroup: PathBuf::from("/sys/fs/cgroup"),
+            linux: cfg!(target_os = "linux"),
         }
     }
 }
@@ -164,39 +169,53 @@ pub fn read_proc_table(proc_root: &Path, uid: u32) -> HashMap<u32, Proc> {
 }
 
 /// Build memory split by whether a lease owns it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BuildRss {
     pub leased_bytes: u64,
     pub unleased_bytes: u64,
     pub build_procs: u32,
+    /// Anonymous bytes under each leased wrapper pid (every process at every
+    /// depth below it: cargo, rustc, linkers, build scripts).
+    #[serde(skip)]
+    pub per_lease: HashMap<u32, u64>,
 }
 
-/// Attribute every build process (`rustc`, `clippy-driver`) to a lease when
-/// any ancestor at any depth is a leased wrapper pid, else to `unleased`.
+/// Attribute memory to builds. A process with a leased wrapper pid among its
+/// ancestors (or itself) belongs to that lease, whatever it is. Anything else
+/// in a cargo tree (an ancestor-or-self named `cargo`), and any orphan
+/// `rustc`/`clippy-driver`, is UNLEASED build memory (plan D4). Everything
+/// else is not build memory at all.
 pub fn attribute(table: &HashMap<u32, Proc>, lease_pids: &HashSet<u32>) -> BuildRss {
     let mut out = BuildRss::default();
     for (pid, p) in table {
-        if !BUILD_COMMS.contains(&p.comm.as_str()) {
-            continue;
-        }
-        out.build_procs += 1;
         let mut seen = HashSet::new();
         let mut cur = Some(*pid);
-        let mut leased = false;
+        let mut lease = None;
+        let mut in_cargo_tree = false;
         while let Some(c) = cur {
             if !seen.insert(c) {
                 break;
             }
             if lease_pids.contains(&c) {
-                leased = true;
+                lease = Some(c);
                 break;
             }
-            cur = table.get(&c).map(|x| x.ppid);
+            let Some(node) = table.get(&c) else { break };
+            in_cargo_tree |= node.comm == "cargo";
+            cur = Some(node.ppid);
         }
-        if leased {
-            out.leased_bytes += p.anon_bytes;
-        } else {
-            out.unleased_bytes += p.anon_bytes;
+        if BUILD_COMMS.contains(&p.comm.as_str()) {
+            out.build_procs += 1;
+        }
+        match lease {
+            Some(l) => {
+                out.leased_bytes += p.anon_bytes;
+                *out.per_lease.entry(l).or_default() += p.anon_bytes;
+            }
+            None if in_cargo_tree || BUILD_COMMS.contains(&p.comm.as_str()) => {
+                out.unleased_bytes += p.anon_bytes;
+            }
+            None => {}
         }
     }
     out
@@ -256,9 +275,51 @@ fn sysinfo_total_memory() -> Option<u64> {
 pub struct FactsDetail {
     pub facts: HostFacts,
     pub psi_mem_full_avg300: Option<f64>,
-    pub ci_source: CiSource,
+    pub ci: CiMeasure,
     pub build_rss: Option<BuildRss>,
     pub measured_at_s: u64,
+}
+
+/// Memory PSI from `/proc/pressure/memory`. A kernel without PSI (no
+/// `pressure` directory, or a read refused with EOPNOTSUPP under `psi=0`)
+/// cannot provide it: `not_supported`, which drops the conjunct. Any other
+/// failure is `unknown`, which withholds.
+fn read_psi(roots: &Roots) -> (Fact<f64>, Option<f64>) {
+    if !roots.linux {
+        return (Fact::NotSupported, None);
+    }
+    let dir = roots.proc.join("pressure");
+    if !dir.exists() {
+        return (Fact::NotSupported, None);
+    }
+    match std::fs::read_to_string(dir.join("memory")) {
+        Ok(t) => (
+            parse_psi_full_avg10(&t).map_or(Fact::Unknown, Fact::Measured),
+            parse_psi_full_avg300(&t),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported || e.raw_os_error() == Some(95) => {
+            (Fact::NotSupported, None)
+        }
+        Err(_) => (Fact::Unknown, None),
+    }
+}
+
+/// Non-build used memory for one sample, or `None` when a term is unknown.
+/// A term the platform cannot provide subtracts nothing (D3).
+pub fn non_build_sample(
+    mem_total: Option<u64>,
+    mem_available: Option<u64>,
+    build: Option<&BuildRss>,
+    ci_usage: Fact<u64>,
+) -> Option<u64> {
+    let used = mem_total?.saturating_sub(mem_available?);
+    let builds = build.map_or(0, |b| b.leased_bytes + b.unleased_bytes);
+    let ci = match ci_usage.resolve() {
+        qontinui_types::build_admission::Resolved::Value(v) => v,
+        qontinui_types::build_admission::Resolved::Dropped => 0,
+        qontinui_types::build_admission::Resolved::Unknown => return None,
+    };
+    Some(used.saturating_sub(builds).saturating_sub(ci))
 }
 
 /// Collect one tick's facts. `lease_pids` are the live wrapper pids.
@@ -270,45 +331,38 @@ pub fn collect(
     admissions_paused: bool,
     now_s: u64,
 ) -> FactsDetail {
-    let linux = cfg!(target_os = "linux") || roots.proc != PathBuf::from("/proc");
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
-    let meminfo = std::fs::read_to_string(roots.proc.join("meminfo")).ok();
-    let (total, avail) = meminfo
-        .as_deref()
-        .map(parse_meminfo)
-        .unwrap_or((None, None));
-    let (mem_total, mem_available) = if linux {
-        (total, avail)
+    let (mem_total, mem_available) = if roots.linux {
+        std::fs::read_to_string(roots.proc.join("meminfo"))
+            .ok()
+            .map(|t| parse_meminfo(&t))
+            .unwrap_or((None, None))
     } else {
         (
             sysinfo_total_memory(),
             crate::fleet::resource_sample::available_commit_bytes(),
         )
     };
-    let psi_text = std::fs::read_to_string(roots.proc.join("pressure").join("memory")).ok();
-    let psi10 = match (&psi_text, linux) {
-        (Some(t), _) => parse_psi_full_avg10(t).map_or(Fact::Unknown, Fact::Measured),
-        // A Linux kernel built without PSI cannot provide it: not supported.
-        (None, true) if !roots.proc.join("pressure").exists() => Fact::NotSupported,
-        (None, true) => Fact::Unknown,
-        (None, false) => Fact::NotSupported,
+    let (psi10, psi300) = read_psi(roots);
+    let ci = if roots.linux {
+        ci_reservation::measure(&roots.cgroup)
+    } else {
+        ci_reservation::measure(Path::new(""))
     };
-    let psi300 = psi_text.as_deref().and_then(parse_psi_full_avg300);
-    let (ci, ci_source) = ci_reservation::measure(&roots.cgroup);
-
-    let build = match (linux, uid) {
+    // Build-tree attribution needs /proc; off Linux it is not supported and
+    // subtracts nothing from non-build use (counted as non-build: conservative).
+    let build = match (roots.linux, uid) {
         (true, Some(u)) => Some(attribute(&read_proc_table(&roots.proc, u), lease_pids)),
         _ => None,
     };
-    let unleased = build.map_or(Fact::NotSupported, |b| Fact::Measured(b.unleased_bytes));
-    if let (Some(t), Some(a), Some(b), Some(c)) = (mem_total, mem_available, build, ci.value()) {
-        let used = t.saturating_sub(a);
-        let nb = used
-            .saturating_sub(b.leased_bytes)
-            .saturating_sub(b.unleased_bytes)
-            .saturating_sub(c.min(used));
+    let unleased = match (&build, roots.linux) {
+        (Some(b), _) => Fact::Measured(b.unleased_bytes),
+        (None, true) => Fact::Unknown,
+        (None, false) => Fact::NotSupported,
+    };
+    if let Some(nb) = non_build_sample(mem_total, mem_available, build.as_ref(), ci.usage) {
         tracker.push(now_s, nb);
     }
     FactsDetail {
@@ -317,17 +371,13 @@ pub fn collect(
             cpus,
             mem_available_bytes: mem_available.map_or(Fact::Unknown, Fact::Measured),
             psi_mem_full_avg10: psi10,
-            non_build_p95_bytes: if build.is_some() || !linux {
-                tracker.fact()
-            } else {
-                Fact::Unknown
-            },
-            ci_reservation_bytes: ci,
+            non_build_p95_bytes: tracker.fact(),
+            ci_reservation_bytes: ci.reservation,
             unleased_build_rss_bytes: unleased,
             admissions_paused,
         },
         psi_mem_full_avg300: psi300,
-        ci_source,
+        ci,
         build_rss: build,
         measured_at_s: now_s,
     }
@@ -386,18 +436,19 @@ mod tests {
         t.insert(11, p(10, "cargo", 5));
         t.insert(12, p(11, "clippy-driver", 100));
         t.insert(13, p(12, "rustc", 200)); // depth 3 below the wrapper
-        t.insert(20, p(1, "cargo", 5)); // an unleased build
+        t.insert(14, p(13, "ld", 50)); // a linker counts for its lease
+        t.insert(20, p(1, "cargo", 5)); // an unleased build tree
         t.insert(21, p(20, "rustc", 30));
-        t.insert(30, p(30, "rustc", 7)); // a self-parented cycle terminates
+        t.insert(22, p(20, "cc", 4)); // its linker is build memory too
+        t.insert(30, p(30, "rustc", 7)); // a self-parented orphan rustc
+        t.insert(40, p(1, "node", 999)); // not build memory at all
         let lease = HashSet::from([10]);
+        let b = attribute(&t, &lease);
         assert_eq!(
-            attribute(&t, &lease),
-            BuildRss {
-                leased_bytes: 300,
-                unleased_bytes: 37,
-                build_procs: 4
-            }
+            (b.leased_bytes, b.unleased_bytes, b.build_procs),
+            (1 + 5 + 100 + 200 + 50, 5 + 30 + 4 + 7, 4)
         );
+        assert_eq!(b.per_lease[&10], 356);
     }
 
     #[test]
@@ -445,7 +496,40 @@ mod tests {
     }
 
     #[test]
-    fn collect_on_a_fixture_host() {
+    fn non_build_subtracts_ci_usage_never_its_reservation() {
+        const G: u64 = 1 << 30;
+        let b = BuildRss {
+            leased_bytes: 10 * G,
+            unleased_bytes: 20 * G,
+            ..Default::default()
+        };
+        // merytshost-like: 368 total, 150 available, CI holding 43 (it may
+        // take 148.5 — that is not used memory).
+        assert_eq!(
+            non_build_sample(
+                Some(368 * G),
+                Some(150 * G),
+                Some(&b),
+                Fact::Measured(43 * G)
+            ),
+            Some((368 - 150 - 30 - 43) * G)
+        );
+        // No cgroup v2 and no attribution (Windows): terms drop, not withhold.
+        assert_eq!(
+            non_build_sample(Some(64 * G), Some(40 * G), None, Fact::NotSupported),
+            Some(24 * G)
+        );
+        assert_eq!(
+            non_build_sample(Some(64 * G), Some(40 * G), None, Fact::Unknown),
+            None
+        );
+        assert_eq!(
+            non_build_sample(None, Some(40 * G), None, Fact::NotSupported),
+            None
+        );
+    }
+
+    fn fixture_host() -> (tempfile::TempDir, Roots) {
         let d = tempfile::tempdir().unwrap();
         let proc = d.path().join("proc");
         let cg = d.path().join("cg");
@@ -462,19 +546,44 @@ mod tests {
         )
         .unwrap();
         std::fs::write(cg.join("cgroup.controllers"), "memory\n").unwrap();
-        let roots = Roots { proc, cgroup: cg };
+        let roots = Roots {
+            proc,
+            cgroup: cg,
+            linux: true,
+        };
+        (d, roots)
+    }
+
+    #[test]
+    fn collect_on_a_fixture_host() {
+        let (_d, roots) = fixture_host();
         let mut tr = NonBuildTracker::default();
         let f = collect(&roots, Some(4242), &HashSet::new(), &mut tr, false, 100);
         assert_eq!(f.facts.mem_total_bytes, 1 << 30);
         assert_eq!(f.facts.mem_available_bytes, Fact::Measured(1 << 29));
         assert_eq!(f.facts.psi_mem_full_avg10, Fact::Measured(1.5));
         assert_eq!(f.psi_mem_full_avg300, Some(0.25));
-        assert_eq!(f.ci_source, CiSource::NoCiSlice);
+        assert_eq!(
+            f.ci.source,
+            super::super::ci_reservation::CiSource::NoCiSlice
+        );
         assert_eq!(f.facts.unleased_build_rss_bytes, Fact::Measured(0));
         assert_eq!(f.facts.non_build_p95_bytes, Fact::LiveOnly(1 << 29));
-        // No pressure directory at all on Linux: the kernel lacks PSI.
+        // No pressure directory on Linux: the kernel lacks PSI.
         std::fs::remove_dir_all(roots.proc.join("pressure")).unwrap();
         let f = collect(&roots, Some(4242), &HashSet::new(), &mut tr, false, 200);
         assert_eq!(f.facts.psi_mem_full_avg10, Fact::NotSupported);
+    }
+
+    #[test]
+    fn off_linux_psi_and_attribution_are_not_supported() {
+        let (_d, mut roots) = fixture_host();
+        roots.linux = false;
+        let mut tr = NonBuildTracker::default();
+        let f = collect(&roots, Some(4242), &HashSet::new(), &mut tr, false, 100);
+        assert_eq!(f.facts.psi_mem_full_avg10, Fact::NotSupported);
+        assert_eq!(f.facts.unleased_build_rss_bytes, Fact::NotSupported);
+        assert_eq!(f.facts.ci_reservation_bytes, Fact::NotSupported);
+        assert!(f.build_rss.is_none());
     }
 }
