@@ -4376,11 +4376,15 @@ mod commit_state_limiter_tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    fn rt() -> tokio::runtime::Runtime {
+    /// Run `fut` to completion on a fresh current-thread runtime. The runtime
+    /// is built and dropped here, on a plain `#[test]` thread, so no owned
+    /// runtime is ever dropped from an async context.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap()
+            .block_on(fut)
     }
 
     /// A probe that counts itself; the FIRST call signals `started` and then
@@ -4470,7 +4474,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4506,7 +4510,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4531,7 +4535,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4558,7 +4562,7 @@ mod commit_state_limiter_tests {
     #[test]
     fn a_panicking_probe_does_not_wedge_the_session() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let driver = tokio::spawn(async move {
@@ -4576,7 +4580,7 @@ mod commit_state_limiter_tests {
         // And the permit came back: a cap-1 limiter still admits a probe.
         let one = CommitStateLimiter::new(1);
         let ran = Arc::new(AtomicUsize::new(0));
-        rt().block_on(async {
+        block_on(async {
             let one = Arc::new(one);
             assert!(one.claim("a", false));
             let o = one.clone();
@@ -4613,8 +4617,8 @@ mod commit_state_limiter_tests {
             decide_commit_state_emit(&test_skip_verdict(), &limiter, "s", now),
             EmitDecision::Shed
         );
-        assert!(limiter.book().last_start.get("s").is_none());
-        assert!(limiter.book().slots.get("s").is_none());
+        assert!(!limiter.book().last_start.contains_key("s"));
+        assert!(!limiter.book().slots.contains_key("s"));
         assert_eq!(
             decide_commit_state_emit(&BackgroundWork::Run, &limiter, "s", now),
             EmitDecision::Start(None)
@@ -4660,12 +4664,14 @@ mod commit_state_limiter_tests {
         }
     }
 
-    fn paused_rt() -> tokio::runtime::Runtime {
+    /// [`block_on`] on a runtime whose clock starts paused.
+    fn block_on_paused<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
             .build()
             .unwrap()
+            .block_on(fut)
     }
 
     /// W2 end to end, on a paused clock so the timing is exact: a burst inside
@@ -4675,7 +4681,7 @@ mod commit_state_limiter_tests {
     fn a_burst_gets_exactly_one_trailing_probe() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             let t0 = Instant::now();
             let mut drivers = Vec::new();
             for _ in 0..6 {
@@ -4716,7 +4722,7 @@ mod commit_state_limiter_tests {
     fn a_forced_claim_wakes_a_sleeping_driver() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             let t0 = Instant::now();
             assert!(limiter.claim("s", false));
             let (l, st) = (limiter.clone(), starts.clone());
@@ -4751,7 +4757,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        paused_rt().block_on(async {
+        block_on_paused(async {
             let t0 = Instant::now();
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
@@ -4780,7 +4786,7 @@ mod commit_state_limiter_tests {
     fn a_deferred_probe_is_shed_if_the_verdict_went_skip_while_waiting() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let probes = Arc::new(AtomicUsize::new(0));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             assert!(limiter.claim("s", false));
             let (l, p) = (limiter.clone(), probes.clone());
             l.drive(
@@ -4808,7 +4814,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        paused_rt().block_on(async {
+        block_on_paused(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4835,7 +4841,7 @@ mod commit_state_limiter_tests {
     #[test]
     fn release_prunes_stale_pacing_entries() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             limiter.record_start("gone", Instant::now());
             tokio::time::advance(COMMIT_STATE_MAX_WINDOW + Duration::from_millis(1)).await;
             assert!(limiter.claim("live", false));

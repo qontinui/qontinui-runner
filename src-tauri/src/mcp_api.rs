@@ -13706,11 +13706,14 @@ mod transport_rung_counter_tests {
         let start = text
             .find(name_with_paren)
             .unwrap_or_else(|| panic!("{name_with_paren} exists"));
-        let end = text[start..]
+        let end = text
+            .get(start..)
+            .expect("`find` returns a char boundary")
             .find("\n}\n")
             .map(|i| start + i)
             .expect("its body ends");
-        text[start..end]
+        text.get(start..end)
+            .expect("`find` returns char boundaries")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -13735,7 +13738,9 @@ mod transport_rung_counter_tests {
             record < forward,
             "the rung row must be written BEFORE the upstream forward"
         );
-        let call = &code[record..forward];
+        let call = code
+            .get(record..forward)
+            .expect("`find` returns char boundaries");
         assert!(
             call.contains("OPERATION_WRITE"),
             "the forwarder's row must say `write`, not a body-classified operation"
@@ -13758,7 +13763,10 @@ mod transport_rung_counter_tests {
             .find(") -> axum::response::Response")
             .expect("signature ends");
         assert!(
-            !code[..sig_end].contains("HeaderMap"),
+            !code
+                .get(..sig_end)
+                .expect("`find` returns a char boundary")
+                .contains("HeaderMap"),
             "forward_coord_write must not take the caller's request headers"
         );
         assert!(
@@ -13773,7 +13781,9 @@ mod transport_rung_counter_tests {
         }
         // …and the handler hands the leg no header map either.
         let handler = fn_body("async fn coord_write_proxy_handler(");
-        let call = &handler[handler.find("forward_coord_write(").unwrap()..];
+        let call = handler
+            .get(handler.find("forward_coord_write(").unwrap()..)
+            .expect("`find` returns a char boundary");
         assert!(
             !call.contains("&headers") && !call.contains("headers,"),
             "the handler must not pass request headers to the upstream leg"

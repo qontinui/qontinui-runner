@@ -548,7 +548,7 @@ jobs:
         # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
       # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
       #
@@ -1478,7 +1478,7 @@ jobs:
         # correctness lint fails this check.
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.
