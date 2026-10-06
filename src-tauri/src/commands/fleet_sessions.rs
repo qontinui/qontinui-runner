@@ -29,7 +29,12 @@
 
 use std::time::Duration;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Deserialize;
+use uuid::Uuid;
+
+use crate::auth::TenantScope;
+use crate::coord_mcp::{ProxyRefusal, SpawnTenantRefusal};
 
 /// Filters the picker may apply. All optional — the default is "live sessions
 /// across the whole tenant, most recently STARTED first". That is coord's walk
@@ -62,6 +67,23 @@ pub struct FleetSessionsArgs {
     /// unchanged and let coord adjudicate. `limit` is deliberately NOT part of
     /// that fingerprint — resizing a page changes the slice, not the sequence.
     pub cursor: Option<String>,
+    /// The tenant whose fleet to read, as a UUID string — the Fleet view's
+    /// tenant selector (plan
+    /// `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`).
+    ///
+    /// NOT a query parameter: coord's route takes no tenant argument and scopes
+    /// every row to the PRINCIPAL's tenant, so "read tenant X" is spelled
+    /// "present tenant X's credential". [`fleet_scope`] turns this into the
+    /// [`TenantScope`] the request is authenticated under. Absent or blank ⇒
+    /// the device's own authority order decides
+    /// ([`crate::coord_mcp::session_tenant_or_refuse`]), which on a
+    /// single-tenant or unpinned device is exactly the pre-field behaviour.
+    ///
+    /// coord fingerprints the tenant into a page cursor, so a cursor must be
+    /// replayed under the SAME tenant it was minted under — the frontend keys
+    /// its walk on this field for that reason.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// Per-request deadline. Discovery is a foreground read behind a picker, so a
@@ -121,6 +143,76 @@ fn build_fleet_url(base: &str, args: &FleetSessionsArgs) -> String {
     format!("{url}?{qs}")
 }
 
+/// Which tenant's credential the fleet read presents — the ONE place the Fleet
+/// view's tenant is decided, run BEFORE any request is built.
+///
+/// - **An explicit tenant** wins for THIS READ only. It must parse as a UUID and
+///   be admitted by [`crate::coord_mcp::validate_spawn_tenant`] — the rule
+///   spawns already use for "may this runner act as that tenant?" — and a
+///   refusal is a typed error, never a fallback to another tenant: a fallback
+///   would answer with the wrong tenant's sessions under the asked tenant's
+///   label. It moves no session's tenant and writes no pin; it is a
+///   session-less, device-level read.
+/// - **No tenant** consults [`crate::coord_mcp::session_tenant_or_refuse`] with
+///   no nonce — the authority order, not a second copy of it: `Some(t)` ⇒
+///   `Owned(t)`, `None` ⇒ `Device` (the default slot, which is the
+///   single-tenant / unpinned operator's normal state), a refusal ⇒ this error.
+///
+/// The attach- and create-grant mints resolve their tenant through THIS
+/// function too, so "no tenant" means the same tenant on the read that listed a
+/// row and on the mint that opens it — a probe that lists under the pin and
+/// mints under the default slot would 404 every non-default row.
+pub(crate) fn fleet_scope(arg: Option<&str>) -> Result<TenantScope, String> {
+    fleet_scope_with(arg, crate::coord_mcp::validate_spawn_tenant, || {
+        crate::coord_mcp::session_tenant_or_refuse(None)
+    })
+}
+
+/// The tenant a resolved scope names, for a tab's reattach: `Owned(t)` ⇒ `t`;
+/// `Device` (and `Unresolved`, which [`fleet_scope`] never returns) ⇒ `None`,
+/// i.e. "let the authority order decide again".
+pub(crate) fn scope_tenant(scope: TenantScope) -> Option<String> {
+    match scope {
+        TenantScope::Owned(t) => Some(t.to_string()),
+        TenantScope::Device | TenantScope::Unresolved => None,
+    }
+}
+
+/// Pure-over-injected-parts core of [`fleet_scope`], so the admission rule and
+/// the default arm are unit-testable without a credential store. `admit` and
+/// `default_authority` are each called at most once, and only on their arm.
+fn fleet_scope_with(
+    arg: Option<&str>,
+    admit: impl FnOnce(Uuid) -> Result<(), SpawnTenantRefusal>,
+    default_authority: impl FnOnce() -> Result<Option<Uuid>, ProxyRefusal>,
+) -> Result<TenantScope, String> {
+    match arg.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(raw) => {
+            let tenant = Uuid::parse_str(raw).map_err(|e| {
+                format!(
+                    "fleet_sessions:tenant_invalid: {raw:?} is not a tenant uuid ({e}) — no \
+                     request was sent"
+                )
+            })?;
+            admit(tenant).map_err(|refusal| {
+                format!(
+                    "fleet_sessions:tenant_refused: {refusal} (no request was sent; no other \
+                     tenant's credential is substituted)"
+                )
+            })?;
+            Ok(TenantScope::Owned(tenant))
+        }
+        None => match default_authority() {
+            Ok(Some(tenant)) => Ok(TenantScope::Owned(tenant)),
+            Ok(None) => Ok(TenantScope::Device),
+            Err(refusal) => Err(format!(
+                "fleet_sessions:{}: {} (no request was sent)",
+                refusal.code, refusal.message
+            )),
+        },
+    }
+}
+
 /// `fleet_sessions_list` — wrapper around coord's
 /// `GET /coord/sessions/fleet`.
 ///
@@ -130,13 +222,21 @@ fn build_fleet_url(base: &str, args: &FleetSessionsArgs) -> String {
 /// not answer" is the failure this phase's UNKNOWN discipline exists to prevent.
 #[tauri::command]
 pub async fn fleet_sessions_list(args: FleetSessionsArgs) -> Result<serde_json::Value, String> {
+    // Decided first, so a malformed or unbound tenant is refused before any
+    // request exists — never sent anonymously, never sent as another tenant.
+    // Off the async runtime: the resolver reads machine.json and the credential
+    // store, as the coord-mcp proxy's own call of it does.
+    let tenant = args.tenant.clone();
+    let scope = spawn_blocking_tracked(move || fleet_scope(tenant.as_deref()))
+        .await
+        .map_err(|e| format!("fleet_sessions:tenant_resolution_failed: {e}"))??;
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = build_fleet_url(&base, &args);
 
     let client =
         crate::coord_http::coord_client().ok_or_else(|| "build http client".to_string())?;
 
-    let resp = crate::coord_http::coord_get(client, &url)
+    let resp = crate::coord_http::coord_get_for(client, &url, scope)
         .timeout(DISCOVERY_TIMEOUT)
         .send()
         .await
@@ -194,6 +294,7 @@ mod tests {
                 include_closed: false,
                 limit: None,
                 cursor: None,
+                tenant: None,
             },
         );
         assert_eq!(url, "https://coord.example.test/coord/sessions/fleet");
@@ -212,6 +313,7 @@ mod tests {
                 include_closed: true,
                 limit: Some(25),
                 cursor: None,
+                tenant: None,
             },
         );
         assert!(url.contains("device_id=abc-123"));
@@ -326,6 +428,7 @@ mod tests {
                 include_closed: true,
                 limit: Some(100),
                 cursor: Some("tok".to_string()),
+                tenant: None,
             },
         );
         for expected in [
@@ -337,5 +440,177 @@ mod tests {
         ] {
             assert!(url.contains(expected), "missing {expected} in {url}");
         }
+    }
+
+    // ---- Tenant selection (plan 2026-09-29-fleet-view-reads-one-unchosen-tenant…, Phase 2) ----
+
+    const TENANT: &str = "c231d9da-0000-4000-8000-000000000001";
+
+    fn tenant() -> Uuid {
+        Uuid::parse_str(TENANT).unwrap()
+    }
+
+    fn admit_ok(_: Uuid) -> Result<(), SpawnTenantRefusal> {
+        Ok(())
+    }
+
+    fn default_unreachable() -> Result<Option<Uuid>, ProxyRefusal> {
+        panic!("an explicit tenant must never consult the default authority")
+    }
+
+    /// coord's route takes NO tenant argument (`FleetSessionsQuery` has none,
+    /// and the tenant is positional `$1` from the principal), so the tenant
+    /// must never leak into the query string — it travels as the credential.
+    #[test]
+    fn the_tenant_is_never_a_query_parameter() {
+        let url = build_fleet_url(
+            BASE,
+            &FleetSessionsArgs {
+                tenant: Some(TENANT.to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(url, "https://coord.example.test/coord/sessions/fleet");
+        assert!(!url.contains("tenant"));
+    }
+
+    /// The picker sends `tenant` in the invoke args; a silent serde drop here is
+    /// the cursor bug of 2026-09-11 over again (the read succeeds, under the
+    /// wrong tenant).
+    #[test]
+    fn the_tenant_arg_deserializes_from_the_invoke_payload() {
+        let args: FleetSessionsArgs = serde_json::from_value(serde_json::json!({
+            "deviceId": "dev-1",
+            "tenant": TENANT,
+        }))
+        .unwrap();
+        assert_eq!(args.tenant.as_deref(), Some(TENANT));
+        let absent: FleetSessionsArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(absent.tenant, None);
+    }
+
+    /// An explicit, admitted tenant is presented as THAT tenant's credential.
+    #[test]
+    fn an_admitted_tenant_is_owned() {
+        let scope = fleet_scope_with(Some(TENANT), admit_ok, default_unreachable).unwrap();
+        assert_eq!(scope, TenantScope::Owned(tenant()));
+        // Trimmed like every other filter.
+        let padded = format!("  {TENANT}  ");
+        let scope = fleet_scope_with(Some(&padded), admit_ok, default_unreachable).unwrap();
+        assert_eq!(scope, TenantScope::Owned(tenant()));
+    }
+
+    /// A malformed tenant is refused before admission is even asked, and before
+    /// any request: the refusal is typed and says nothing was sent.
+    #[test]
+    fn a_malformed_tenant_is_refused_before_any_request() {
+        let err = fleet_scope_with(
+            Some("not-a-uuid"),
+            |_| panic!("a malformed tenant must not reach admission"),
+            default_unreachable,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("fleet_sessions:tenant_invalid:"), "{err}");
+        assert!(err.contains("no request was sent"), "{err}");
+    }
+
+    /// An UNBOUND tenant is refused — never downgraded to the default slot,
+    /// which would list another tenant's sessions under this tenant's label.
+    #[test]
+    fn an_unbound_tenant_is_refused_not_downgraded() {
+        for refusal in [
+            SpawnTenantRefusal::NotPaired { tenant: tenant() },
+            SpawnTenantRefusal::CredentialStoreUnreadable {
+                tenant: tenant(),
+                error: "io".to_string(),
+            },
+        ] {
+            let code = refusal.code();
+            let err =
+                fleet_scope_with(Some(TENANT), |_| Err(refusal), default_unreachable).unwrap_err();
+            assert!(err.starts_with("fleet_sessions:tenant_refused:"), "{err}");
+            assert!(err.contains(code), "the admission code must survive: {err}");
+        }
+    }
+
+    /// No tenant ⇒ the device's ONE authority order, arm for arm.
+    #[test]
+    fn no_tenant_follows_the_session_authority_order() {
+        let never_admit = |_| -> Result<(), SpawnTenantRefusal> {
+            panic!("the default arm is admitted by the authority itself")
+        };
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                fleet_scope_with(blank, never_admit, || Ok(Some(tenant()))).unwrap(),
+                TenantScope::Owned(tenant())
+            );
+            assert_eq!(
+                fleet_scope_with(blank, never_admit, || Ok(None)).unwrap(),
+                TenantScope::Device,
+                "an unpinned single-tenant device keeps today's default slot"
+            );
+            let err = fleet_scope_with(blank, never_admit, || {
+                Err(ProxyRefusal {
+                    status: 503,
+                    code: "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
+                    retryable: false,
+                    message: "machine.json is unreadable".to_string(),
+                })
+            })
+            .unwrap_err();
+            assert!(
+                err.contains("COORD_MCP_PROXY_TENANT_UNRESOLVABLE")
+                    && err.contains("machine.json is unreadable"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The REAL admission, against an isolated store holding no credential for
+    /// the tenant: refused. Never touches the operator's `~/.qontinui`.
+    #[test]
+    fn the_real_admission_refuses_a_tenant_this_device_does_not_hold() {
+        let _amb = crate::test_env::isolated_ambient();
+        // The fixture restores this on drop; it keeps the legacy-slot read off
+        // the operator's real OS keychain.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let err = fleet_scope(Some(TENANT)).unwrap_err();
+        assert!(err.starts_with("fleet_sessions:tenant_refused:"), "{err}");
+        let err = fleet_scope(Some("zzz")).unwrap_err();
+        assert!(err.starts_with("fleet_sessions:tenant_invalid:"), "{err}");
+    }
+
+    /// The body of `fleet_sessions_list`, for the source guard below.
+    fn fleet_sessions_list_body() -> &'static str {
+        let src = include_str!("fleet_sessions.rs");
+        // Assembled at runtime: a literal here would appear in `src` itself.
+        let needle = format!("pub async fn {}(", "fleet_sessions_list");
+        assert_eq!(src.matches(needle.as_str()).count(), 1);
+        let (_, after) = src.split_once(needle.as_str()).unwrap();
+        after.split_once("\n}\n").unwrap().0
+    }
+
+    /// SOURCE GUARD — the read states its tenant. The defect this plan fixes was
+    /// a CALL-SITE choice: `coord_get` asserts `TenantScope::Device`, so the
+    /// view showed whichever tenant the default slot named. The cross-tenant
+    /// slot-miss posture beneath `coord_get_for` is pinned separately by
+    /// `auth::unknown_tenant_slot_miss_sends_unauthenticated`.
+    #[test]
+    fn fleet_sessions_list_presents_the_tenant_it_reads() {
+        let body = fleet_sessions_list_body();
+        let scope_at = body
+            .find("fleet_scope(")
+            .unwrap_or_else(|| panic!("the read must decide its tenant via fleet_scope:\n{body}"));
+        let get_at = body
+            .find("coord_get_for(")
+            .unwrap_or_else(|| panic!("the read must use the tenant-stating seam:\n{body}"));
+        assert!(
+            scope_at < get_at,
+            "the tenant must be decided BEFORE the request is built:\n{body}"
+        );
+        assert!(
+            !body.contains("coord_http::coord_get("),
+            "the defaulting coord_get presents the default slot whatever tenant was asked:\n{body}"
+        );
     }
 }

@@ -1237,12 +1237,20 @@ impl ProbeDoors for RunnerDoors {
             include_closed: false,
             limit: Some(FLEET_PAGE_LIMIT),
             cursor,
+            // The device's own authority order picks the tenant, exactly as
+            // before the field existed. A walk over EVERY bound tenant is plan
+            // `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`
+            // Phase 4.
+            tenant: None,
         })
         .await
     }
 
     async fn mint(&self, session_id: Uuid) -> Result<AttachGrantResponse, String> {
-        super::remote_attach::mint_attach_grant(&self.coord_base, session_id).await
+        // The SAME tenant `fleet_page` read under (`tenant: None` there too),
+        // so a session this probe listed is one its mint can resolve.
+        let scope = super::remote_attach::grant_scope(None).await?;
+        super::remote_attach::mint_attach_grant(&self.coord_base, session_id, scope).await
     }
 
     async fn attach(
