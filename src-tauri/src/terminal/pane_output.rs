@@ -24,7 +24,6 @@
 //! exit code is UNKNOWN (the session layer records `None`, never a fabricated
 //! number). First writer wins.
 
-use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -78,7 +77,7 @@ pub struct PaneOutput {
     /// Sender half of the output channel. `None` once closed — the reader
     /// sees EOF when the last sender drops.
     output_tx: Mutex<Option<OutputTx>>,
-    /// Receiver half, taken exactly once by [`Self::take_reader`].
+    /// Receiver half, taken exactly once by [`Self::take_output`].
     output_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     /// The settled exit; `wait` parks on the condvar until it is `Some`.
     exit: Mutex<Option<Result<i32, String>>>,
@@ -192,19 +191,15 @@ impl PaneOutput {
         self.offset.load(Ordering::Acquire)
     }
 
-    /// The blocking reader, handed out once.
-    pub fn take_reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        let rx = self
-            .output_rx
+    /// The output channel's receiver, handed out once — the
+    /// [`super::pane_io::PaneIo::output`] contract. It disconnects once every
+    /// sender is gone (the pane exited or was released).
+    pub fn take_output(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+        self.output_rx
             .lock()
-            .map_err(|e| format!("pane output reader lock poisoned: {e}"))?
+            .map_err(|e| format!("pane output receiver lock poisoned: {e}"))?
             .take()
-            .ok_or_else(|| "pane output reader already taken".to_string())?;
-        Ok(Box::new(ChannelReader {
-            rx,
-            pending: Vec::new(),
-            pos: 0,
-        }))
+            .ok_or_else(|| "pane output receiver already taken".to_string())
     }
 
     /// Queue one chunk of SOURCE bytes, advancing the offset. Silently dropped
@@ -302,7 +297,7 @@ impl PaneOutput {
     }
 
     /// Settle the exit (first writer wins) and close the channel so a reader
-    /// blocked in `read()` sees EOF.
+    /// blocked on the receiver sees it disconnect.
     pub fn settle(&self, exit: Result<i32, String>) {
         if let Ok(mut slot) = self.exit.lock() {
             if slot.is_none() {
@@ -360,36 +355,6 @@ impl PaneOutput {
     }
 }
 
-/// Blocking `Read` over the output channel: yields queued chunks in order,
-/// EOF once every sender is gone.
-struct ChannelReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    pending: Vec<u8>,
-    pos: usize,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.pos >= self.pending.len() {
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.pending = chunk;
-                    self.pos = 0;
-                }
-                // Every sender dropped: the pane exited or was released.
-                Err(mpsc::RecvError) => return Ok(0),
-            }
-        }
-        let n = (self.pending.len() - self.pos).min(buf.len());
-        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,10 +364,7 @@ mod tests {
     }
 
     fn drain(out: &PaneOutput) -> Vec<u8> {
-        let mut r = out.take_reader().unwrap();
-        let mut v = Vec::new();
-        r.read_to_end(&mut v).unwrap();
-        v
+        out.take_output().unwrap().iter().flatten().collect()
     }
 
     /// `note_lost` marks only the unseen part, moves the offset to the end of
@@ -475,14 +437,21 @@ mod tests {
             out.offset() <= 30,
             "the producer ran ahead of a full channel"
         );
-        let mut r = out.take_reader().unwrap();
-        let mut buf = [0u8; 100];
+        let rx = out.take_output().unwrap();
         let mut got = 0;
         while got < 100 {
-            got += r.read(&mut buf).unwrap();
+            got += rx.recv().unwrap().len();
         }
         producer.join().unwrap();
         assert_eq!(out.offset(), 100);
+    }
+
+    /// The receiver is handed out exactly once.
+    #[test]
+    fn take_output_is_one_shot() {
+        let out = PaneOutput::new("k", Vec::new(), 0, marker);
+        assert!(out.take_output().is_ok());
+        assert!(out.take_output().is_err());
     }
 
     /// `wait_for` is bounded and sees a later settle; first settle wins.

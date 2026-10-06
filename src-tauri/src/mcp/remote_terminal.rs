@@ -4553,7 +4553,7 @@ mod tests {
         ));
         client.register_pane(pane.clone());
         assert_eq!(client.live_pane_count(), 1);
-        let reader = pane.reader().unwrap();
+        let reader = pane.output().unwrap();
 
         assert!(client.handle_inbound(
             "remote_terminal_output",
@@ -4567,14 +4567,10 @@ mod tests {
             "remote_terminal_exit",
             &json!({"grant_jti": "jti-1", "terminal_id": "remote-term", "exit_code": 3})
         ));
-        let bytes = tokio::task::spawn_blocking(move || {
-            let mut r = reader;
-            let mut out = Vec::new();
-            r.read_to_end(&mut out).unwrap();
-            out
-        })
-        .await
-        .unwrap();
+        let bytes =
+            tokio::task::spawn_blocking(move || reader.iter().flatten().collect::<Vec<u8>>())
+                .await
+                .unwrap();
         assert_eq!(bytes, b"abc", "another jti's output must not leak in");
         assert_eq!(pane.wait(), Ok(3));
         assert!(client.pane("jti-1").is_none(), "exit unregisters the pane");
@@ -4623,7 +4619,7 @@ mod tests {
             },
         ));
         client.register_pane(pane.clone());
-        let reader = pane.reader().unwrap();
+        let reader = pane.output().unwrap();
 
         client.on_relay_connected();
         let frame = client.lock_outbound().await.try_recv().unwrap();
@@ -4636,14 +4632,10 @@ mod tests {
             &attached_frame("reattach:jti-1", "jti-1", b"56789ABCDE", 5)
         ));
         pane.mark_exit(0);
-        let bytes = tokio::task::spawn_blocking(move || {
-            let mut r = reader;
-            let mut out = Vec::new();
-            r.read_to_end(&mut out).unwrap();
-            out
-        })
-        .await
-        .unwrap();
+        let bytes =
+            tokio::task::spawn_blocking(move || reader.iter().flatten().collect::<Vec<u8>>())
+                .await
+                .unwrap();
         assert_eq!(bytes, b"0123456789ABCDE");
     }
 
@@ -4948,10 +4940,7 @@ mod tests {
     }
 
     fn read_all(pane: &Arc<RemotePaneIo>) -> Vec<u8> {
-        let mut r = pane.reader().unwrap();
-        let mut out = Vec::new();
-        r.read_to_end(&mut out).unwrap();
-        out
+        pane.output().unwrap().iter().flatten().collect()
     }
 
     /// Finding 2 — output that arrives between the `remote_terminal_attached`
@@ -5136,13 +5125,9 @@ mod tests {
         );
     }
 
-    /// Drain a settled pane's reader to EOF.
+    /// Drain a settled pane's output to its end.
     fn read_pane_to_end(pane: &Arc<RemotePaneIo>) -> Vec<u8> {
-        use std::io::Read;
-        let mut r = pane.reader().expect("reader");
-        let mut out = Vec::new();
-        let _ = r.read_to_end(&mut out);
-        out
+        pane.output().expect("output").iter().flatten().collect()
     }
 
     /// R1: a reattach must ship from where the source actually stopped, not a

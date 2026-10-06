@@ -5,9 +5,9 @@
 //! for output and exit.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
-use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
+use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand, READER_CHUNK};
 use super::types::{TerminalId, TerminalInfo};
 use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
@@ -468,7 +468,10 @@ fn digest_is_owed(tier: VisibilityTier, unwatched_interval: Option<Duration>) ->
 /// arrived, so a runaway/never-closed `?2026h` block can't buffer unbounded.
 const SYNC_FLUSH_BYTE_CAP: usize = 256 * 1024;
 /// Time cap for a held sync frame: flush once the block has been open this
-/// long, so a slow producer mid-frame can't stall output past ~one frame.
+/// long, so a slow producer mid-frame can't stall output past ~one frame. The
+/// reader thread waits on the pane's output channel no later than
+/// [`SyncFrameCoalescer::deadline`], so the cap fires even while the pane is
+/// silent (see [`next_reader_event`]).
 const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Synchronized-output (DEC 2026) frame coalescer for the reader thread.
@@ -510,8 +513,10 @@ impl SyncFrameCoalescer {
     fn feed<F: FnMut(&[u8], u64)>(&mut self, data: &[u8], offset: u64, in_sync: bool, mut emit: F) {
         if in_sync {
             // Mid-frame: hold this chunk. Stamp the held frame's offset on the
-            // FIRST held byte (a correct replay boundary).
-            if self.pending.is_empty() {
+            // FIRST held byte (a correct replay boundary). An empty chunk (an
+            // interceptor holding back a partial sequence) holds nothing, so
+            // it starts no frame and no time cap.
+            if self.pending.is_empty() && !data.is_empty() {
                 self.pending_offset = offset;
                 self.started_at = Some(std::time::Instant::now());
             }
@@ -536,26 +541,191 @@ impl SyncFrameCoalescer {
         }
     }
 
-    /// Flush a held frame if it has been open at least [`SYNC_FLUSH_TIME_CAP`].
-    /// Called before each (blocking) read so a slow producer mid-frame still
-    /// flushes within ~one frame rather than waiting for the next byte.
-    fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
-        if let Some(started) = self.started_at {
-            if started.elapsed() >= SYNC_FLUSH_TIME_CAP && !self.pending.is_empty() {
-                emit(&self.pending, self.pending_offset);
-                self.pending.clear();
-                self.started_at = None;
-            }
+    /// When the held frame's [`SYNC_FLUSH_TIME_CAP`] runs out — `None` while
+    /// nothing is held. The reader thread waits for output no later than this
+    /// and then ships the frame with [`Self::flush_remaining`], so a producer
+    /// that goes quiet mid-frame is flushed at the cap, not at its next byte.
+    /// Never `Some` with nothing held: a flush must clear it, or the reader
+    /// would wake on a past deadline forever.
+    fn deadline(&self) -> Option<Instant> {
+        if self.pending.is_empty() {
+            return None;
         }
+        self.started_at.map(|started| started + SYNC_FLUSH_TIME_CAP)
     }
 
-    /// Flush any remaining held frame (reader exit on EOF / read error) so the
-    /// last frame of a never-closed block isn't lost.
+    /// Flush any remaining held frame — at its time cap (see
+    /// [`Self::deadline`]), or on reader exit so the last frame of a
+    /// never-closed block isn't lost.
     fn flush_remaining<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
         if !self.pending.is_empty() {
             emit(&self.pending, self.pending_offset);
             self.pending.clear();
             self.started_at = None;
+        }
+    }
+}
+
+/// What the reader thread's wait on the pane's output produced.
+#[derive(Debug, PartialEq, Eq)]
+enum ReaderEvent {
+    /// The next chunk of pane output.
+    Chunk(Vec<u8>),
+    /// The held sync frame's deadline passed with no output.
+    DeadlinePassed,
+    /// The output ended: every sender is gone (the pane exited or was
+    /// released) — or, after the session ended, the exit drain's grace ran
+    /// out (see [`exit_drain_event`]).
+    Closed,
+}
+
+/// Wait for the next pane-output event, but no later than `deadline` (the
+/// held sync frame's [`SyncFrameCoalescer::deadline`]). Without a deadline it
+/// blocks until output arrives or ends.
+///
+/// A deadline already past returns [`ReaderEvent::DeadlinePassed`] at once,
+/// EVEN when chunks are queued: a reader that has fallen behind must still
+/// ship the held frame at its cap rather than keep growing it from the
+/// backlog. The held bytes precede every queued chunk, so flushing first keeps
+/// the order. The flush clears the deadline, so this never spins.
+fn next_reader_event(rx: &mpsc::Receiver<Vec<u8>>, deadline: Option<Instant>) -> ReaderEvent {
+    match deadline {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return ReaderEvent::DeadlinePassed;
+            }
+            match rx.recv_timeout(left) {
+                Ok(chunk) => ReaderEvent::Chunk(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => ReaderEvent::DeadlinePassed,
+                Err(mpsc::RecvTimeoutError::Disconnected) => ReaderEvent::Closed,
+            }
+        }
+        None => match rx.recv() {
+            Ok(chunk) => ReaderEvent::Chunk(chunk),
+            Err(mpsc::RecvError) => ReaderEvent::Closed,
+        },
+    }
+}
+
+/// How long the reader thread keeps taking pane output once the session has
+/// ended. See [`exit_drain_event`].
+const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(50);
+
+/// The reader thread's wait once the session has ENDED (`is_alive` cleared —
+/// the child exited, or the session is closing): keep taking output until
+/// `until` (the end of [`EXIT_DRAIN_GRACE`], counted from the moment the end
+/// was seen), and stop at once when the output disconnects.
+///
+/// The child's last words can still be in flight when the waiter clears
+/// `is_alive` — queued, or not yet forwarded by a [`LocalPty`]'s pump — and
+/// stopping at once would drop them. The grace is the bound: past `until`
+/// this returns [`ReaderEvent::Closed`] whatever is queued, so a producer that
+/// outlives the session (or an unbounded remote queue) cannot keep the thread
+/// draining, and the work after `until` is at most the chunk in hand.
+fn exit_drain_event(rx: &mpsc::Receiver<Vec<u8>>, until: Instant) -> ReaderEvent {
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return ReaderEvent::Closed;
+    }
+    match rx.recv_timeout(left) {
+        Ok(chunk) => ReaderEvent::Chunk(chunk),
+        Err(_) => ReaderEvent::Closed,
+    }
+}
+
+/// The reader thread's per-chunk pipeline: interceptor → scrollback tee →
+/// grid (with the OSC 9999 sideband) → sync-frame coalescer. Borrowed from the
+/// reader thread's own state; extracted so a test drives the very step the
+/// thread runs.
+struct ReaderPipeline<'a> {
+    terminal_id: &'a str,
+    interceptor: &'a OutputInterceptor,
+    scrollback: &'a Arc<Mutex<VecDeque<u8>>>,
+    total_bytes: &'a Arc<AtomicU64>,
+    scrollback_capacity: usize,
+    grid: &'a Arc<Mutex<Grid>>,
+    grid_generation: &'a Arc<AtomicU64>,
+}
+
+impl ReaderPipeline<'_> {
+    /// Run one [`ReaderEvent::Chunk`] through the pipeline in pieces of at most
+    /// [`READER_CHUNK`] bytes. A channel pane can queue one huge chunk (a
+    /// remote seed ring is up to the whole scrollback); piecing it keeps each
+    /// grid-lock hold, each emission-gate check and each `terminal-output`
+    /// event at a local PTY read's grain, so flow control can pause after the
+    /// high watermark instead of letting the whole chunk through.
+    /// `on_sideband` receives each OSC 9999 payload; `emit` is the reader's
+    /// gated emitter.
+    fn feed_chunk<E: Fn(&[u8], u64)>(
+        &self,
+        bytes: &[u8],
+        parser: &mut vte::Parser,
+        coalescer: &mut SyncFrameCoalescer,
+        mut on_sideband: impl FnMut(String),
+        emit: &E,
+    ) {
+        for piece in bytes.chunks(READER_CHUNK) {
+            let data = self.interceptor.process(self.terminal_id, piece);
+
+            // Tee processed output into the per-session scrollback ring buffer
+            // + byte counter. Shared with the distinct-buffers regression test
+            // so both drive the identical teeing path. The returned start
+            // offset is stamped onto the event below for replay dedup.
+            let chunk_offset = tee_into_scrollback(
+                self.scrollback,
+                self.total_bytes,
+                &data,
+                self.scrollback_capacity,
+            );
+
+            // Tee through the VT parser into the per-session cell grid.
+            //
+            // The OSC 9999 agent-status sideband (plan
+            // `2026-08-11-coord-hook-sourced-agent-status` Channel 2) uses a
+            // before/after shape: read the monotonic sideband seq here, compare
+            // it after the advance, and only clone/drain the payload when it
+            // actually moved. The common case — no sideband in this chunk —
+            // costs one extra `u64` read inside a lock we were already taking,
+            // and no allocation.
+            let sideband_seq_before = self
+                .grid
+                .lock()
+                .ok()
+                .map(|g| g.agent_status_sideband_seq())
+                .unwrap_or(0);
+            advance_grid(self.grid, self.grid_generation, parser, &data);
+
+            // Sync-output-aware emit (Phase 4). Read the live DEC-2026 state
+            // straight after the advance above: if a `?2026h` is still open
+            // we're mid-frame, so accumulate and defer the emit; otherwise
+            // flush (any held prefix + this chunk) as one event. The
+            // sideband's "after" read piggybacks on this same lock so the
+            // no-sideband path takes no extra one.
+            let (in_sync, sideband_seq_after) = self
+                .grid
+                .lock()
+                .ok()
+                .map(|g| (g.sync_output(), g.agent_status_sideband_seq()))
+                .unwrap_or((false, sideband_seq_before));
+
+            // OSC 9999 agent-status sideband — drain + forward. Only reached
+            // when a payload actually arrived in this chunk.
+            if sideband_seq_after != sideband_seq_before {
+                let payload = self
+                    .grid
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take_agent_status_sideband());
+                if let Some(payload) = payload {
+                    on_sideband(payload);
+                }
+            }
+
+            // Coalesce sync-output frames (Phase 4). The scrollback ring +
+            // total counter were already fed per-piece above, so total-byte
+            // accounting stays correct whether or not the coalescer holds.
+            coalescer.feed(&data, chunk_offset, in_sync, emit);
         }
     }
 }
@@ -1853,8 +2023,8 @@ impl TerminalSession {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        // Get an output reader from the pane
-        let mut reader = io.reader()?;
+        // Take the pane's output channel
+        let output_rx = io.output()?;
 
         // Coord mirror identity, populated by `terminal_create` after
         // `register_external` returns. Declared HERE (ahead of the reader
@@ -1897,7 +2067,6 @@ impl TerminalSession {
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
                 let mut parser = vte::Parser::new();
-                let mut buf = [0u8; 8192];
                 // Phase 4 — sync-output (DEC 2026) frame coalescing. While the
                 // VT parser is inside a `?2026h … ?2026l` block (Claude's TUI
                 // brackets each full-frame redraw this way), accumulate the
@@ -2034,9 +2203,7 @@ impl TerminalSession {
                                 reader_background_flush_interval,
                                 reader_unwatched_flush_interval,
                             );
-                            if let Some((window, window_offset)) =
-                                hold.take_if_due(now, interval)
-                            {
+                            if let Some((window, window_offset)) = hold.take_if_due(now, interval) {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
@@ -2070,115 +2237,66 @@ impl TerminalSession {
                 };
                 let emit_chunk = |payload: &[u8], offset: u64| emit_impl(payload, offset, true);
 
+                let pipeline = ReaderPipeline {
+                    terminal_id: &reader_id,
+                    interceptor: &interceptor,
+                    scrollback: &reader_scrollback,
+                    total_bytes: &reader_total_bytes,
+                    scrollback_capacity,
+                    grid: &reader_grid,
+                    grid_generation: &reader_grid_generation,
+                };
+                let mut exit_drain_until: Option<Instant> = None;
                 loop {
-                    if !reader_alive.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    // Time-cap a held sync block: if the block has been open ≥
-                    // SYNC_FLUSH_TIME_CAP, flush it now rather than waiting for
-                    // the next read to return. (The read below blocks, so a
-                    // slow PTY mid-frame could otherwise hold a frame past one
-                    // frame interval until the next byte arrives.)
-                    coalescer.flush_if_timed_out(&emit_chunk);
-
-                    match reader.read(&mut buf) {
-                        Ok(0) => {
-                            debug!(terminal_id = %reader_id, "PTY reader got EOF");
+                    // Wait for output, but while a sync frame is held only
+                    // until its SYNC_FLUSH_TIME_CAP deadline — so a producer
+                    // that goes quiet mid-frame is flushed at the cap rather
+                    // than at its next byte. Once the session has ended, keep
+                    // taking output only for EXIT_DRAIN_GRACE.
+                    let event = if reader_alive.load(Ordering::Relaxed) {
+                        next_reader_event(&output_rx, coalescer.deadline())
+                    } else {
+                        let until = *exit_drain_until
+                            .get_or_insert_with(|| Instant::now() + EXIT_DRAIN_GRACE);
+                        exit_drain_event(&output_rx, until)
+                    };
+                    match event {
+                        ReaderEvent::Closed => {
+                            // The pane's output ended (EOF, a read error on
+                            // child exit, or release; the source logged
+                            // which), or the exit drain's grace ran out.
+                            debug!(terminal_id = %reader_id, "pane output closed");
                             break;
                         }
-                        Ok(n) => {
-                            let data = interceptor.process(&reader_id, &buf[..n]);
-
-                            // Tee processed output into the per-session
-                            // scrollback ring buffer + byte counter. Shared
-                            // with the distinct-buffers regression test so
-                            // both drive the identical teeing path. The
-                            // returned start offset is stamped onto the
-                            // event below for replay dedup.
-                            let chunk_offset =
-                                tee_into_scrollback(
-                                    &reader_scrollback,
-                                    &reader_total_bytes,
-                                    &data,
-                                    scrollback_capacity,
-                                );
-
-                            // Tee through the VT parser into the per-session cell grid.
-                            //
-                            // The OSC 9999 agent-status sideband (plan
-                            // `2026-08-11-coord-hook-sourced-agent-status`
-                            // Channel 2) uses a before/after shape: read
-                            // the monotonic sideband seq here, compare it after
-                            // the advance, and only clone/drain the payload when
-                            // it actually moved. The common case — no sideband in
-                            // this chunk — costs one extra `u64` read inside a
-                            // lock we were already taking, and no allocation.
-                            let sideband_seq_before = reader_grid
-                                .lock()
-                                .ok()
-                                .map(|g| g.agent_status_sideband_seq())
-                                .unwrap_or(0);
-                            advance_grid(
-                                &reader_grid,
-                                &reader_grid_generation,
-                                &mut parser,
-                                &data,
-                            );
-
-                            // Sync-output-aware emit (Phase 4). Read the live
-                            // DEC-2026 state straight after the advance above:
-                            // if a `?2026h` is still open we're mid-frame, so
-                            // accumulate and defer the emit; otherwise flush
-                            // (any held prefix + this chunk) as one event.
-                            // The sideband's "after" read piggybacks on this
-                            // same lock so the no-sideband path takes no extra
-                            // one.
-                            let (in_sync, sideband_seq_after) = reader_grid
-                                .lock()
-                                .ok()
-                                .map(|g| (g.sync_output(), g.agent_status_sideband_seq()))
-                                .unwrap_or((false, sideband_seq_before));
-
-                            // OSC 9999 agent-status sideband — drain + forward.
-                            // Only reached when a payload actually arrived in
-                            // this chunk. `dispatch` parses in-thread (cheap,
-                            // panic-free, never logs the raw payload) and hands
-                            // everything past the rate limiter to the async
-                            // runtime, so the PTY hot path is never stalled by a
-                            // coord write.
-                            if sideband_seq_after != sideband_seq_before {
-                                let payload = reader_grid
-                                    .lock()
-                                    .ok()
-                                    .and_then(|mut g| g.take_agent_status_sideband());
-                                if let Some(payload) = payload {
-                                    crate::terminal::agent_status_sideband::dispatch(
-                                        &reader_id,
-                                        &reader_coord_session_id,
-                                        &reader_agent_status_last,
-                                        &reader_agent_status_limiter,
-                                        payload,
-                                    );
-                                }
-                            }
-
-                            // Coalesce sync-output frames (Phase 4). The
-                            // scrollback ring + total counter were already fed
-                            // per-read above, so total-byte accounting stays
-                            // correct whether or not the coalescer holds.
-                            coalescer.feed(&data, chunk_offset, in_sync, &emit_chunk);
+                        ReaderEvent::DeadlinePassed => {
+                            // Time-cap a held sync block: it has been open
+                            // SYNC_FLUSH_TIME_CAP with nothing more arriving.
+                            coalescer.flush_remaining(&emit_chunk);
                         }
-                        Err(e) => {
-                            // On Windows, the PTY reader returns an error when the child exits
-                            debug!(terminal_id = %reader_id, error = %e, "PTY read error (likely process exit)");
-                            break;
-                        }
+                        // `dispatch` parses in-thread (cheap, panic-free,
+                        // never logs the raw payload) and hands everything
+                        // past the rate limiter to the async runtime, so the
+                        // PTY hot path is never stalled by a coord write.
+                        ReaderEvent::Chunk(bytes) => pipeline.feed_chunk(
+                            &bytes,
+                            &mut parser,
+                            &mut coalescer,
+                            |payload| {
+                                crate::terminal::agent_status_sideband::dispatch(
+                                    &reader_id,
+                                    &reader_coord_session_id,
+                                    &reader_agent_status_last,
+                                    &reader_agent_status_limiter,
+                                    payload,
+                                )
+                            },
+                            &emit_chunk,
+                        ),
                     }
                 }
                 // Flush any frame still held in a never-closed sync block so
-                // the last frame isn't lost when the reader exits (EOF / read
-                // error on child exit). Ungated: after exit no further chunk
+                // the last frame isn't lost when the reader exits (the pane's
+                // output closed on child exit or release). Ungated: after exit no further chunk
                 // can reveal an emission gap, so the final frame must reach
                 // the webview even when the gate is paused (bounded by
                 // SYNC_FLUSH_BYTE_CAP).
@@ -3869,8 +3987,9 @@ impl TerminalSession {
     /// Flush the held window if its configured spacing has elapsed (or its
     /// byte cap tripped). Driven by the visibility sweeper so the tail of a
     /// burst still lands when the session goes quiet mid-window — the reader
-    /// thread is parked in a blocking `read()` at exactly that moment and could
-    /// only act on the next byte, which may never come.
+    /// thread is parked waiting on the pane's output at exactly that moment
+    /// (it wakes early only for a held sync frame's deadline, not for this
+    /// window) and could only act on the next byte, which may never come.
     pub fn flush_background_window_if_due(&self) {
         self.flush_background_window(false);
     }
@@ -4549,9 +4668,10 @@ impl TerminalSession {
             ),
         }
 
-        // Release the pane's handles — for a local PTY this closes the OS pipe
-        // and unblocks the reader thread which may be stuck in a blocking
-        // read() call. Bounded for the same reason as the writer above.
+        // Release the pane's handles — for a local PTY this closes the OS pipe,
+        // which unblocks its pump thread's read and so ends the output the
+        // reader thread waits on. Bounded for the same reason as the writer
+        // above.
         // `release` can fail for more than a spent budget — a holder pane
         // released after a kill that did not land says so in its error — so
         // the log carries the pane's own reason rather than assuming one.
@@ -4845,8 +4965,8 @@ pub(crate) mod tests {
     }
 
     impl crate::terminal::pane_io::PaneIo for AliveAtKillPaneIo {
-        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-            Ok(Box::new(std::io::empty()))
+        fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+            Ok(crate::terminal::pane_io::ended_output(b""))
         }
         fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
             Ok(Box::new(std::io::sink()))
@@ -5348,8 +5468,8 @@ pub(crate) mod tests {
     }
 
     impl crate::terminal::pane_io::PaneIo for KillCountingPaneIo {
-        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-            Ok(Box::new(std::io::empty()))
+        fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+            Ok(crate::terminal::pane_io::ended_output(b""))
         }
         fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
             Ok(Box::new(std::io::sink()))
@@ -5897,12 +6017,17 @@ pub(crate) mod tests {
         // The TUI opens a frame and dies mid-frame: held, as designed.
         read(b"\x1b[?2026hHALF A FRAME", 0, &mut coalescer);
         assert!(emitted.lock().unwrap().is_empty(), "an open frame is held");
-        // Ship the orphaned half frame. This stands in for the pre-read time
-        // cap (`flush_if_timed_out`), which in the real loop can only fire once
-        // another read returns — a held frame cannot flush while the read is
-        // blocked. That gap is separate from the expiry pinned here.
+        // The orphaned half frame ships at its time cap, as in the reader
+        // loop: the wait on the (still open, silent) output ends at the held
+        // frame's deadline, and the gated flush follows.
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        assert_eq!(
+            next_reader_event(&rx, coalescer.deadline()),
+            ReaderEvent::DeadlinePassed
+        );
         coalescer.flush_remaining(|p, o| emitted.lock().unwrap().push((p.to_vec(), o)));
         assert_eq!(emitted.lock().unwrap().len(), 1);
+        assert_eq!(coalescer.deadline(), None, "nothing held after the flush");
 
         // The block is now older than the sync timeout.
         grid.lock()
@@ -6175,6 +6300,235 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 1, "byte cap must force a flush");
         assert_eq!(events[0].1, 0, "flush keeps the first held byte's offset");
         assert!(events[0].0.len() >= SYNC_FLUSH_BYTE_CAP);
+    }
+
+    /// The wait yields queued output, ends with `Closed` once every sender is
+    /// gone, and — with no deadline — blocks rather than inventing one.
+    #[test]
+    fn next_reader_event_yields_chunks_then_closed() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"data".to_vec()).unwrap();
+        assert_eq!(
+            next_reader_event(&rx, None),
+            ReaderEvent::Chunk(b"data".to_vec())
+        );
+        // A passed deadline wins over a queued chunk, so a backlog cannot
+        // keep a held frame growing past its cap; the chunk is still there.
+        tx.send(b"more".to_vec()).unwrap();
+        assert_eq!(
+            next_reader_event(&rx, Some(Instant::now() - Duration::from_millis(5))),
+            ReaderEvent::DeadlinePassed
+        );
+        assert_eq!(
+            next_reader_event(&rx, None),
+            ReaderEvent::Chunk(b"more".to_vec())
+        );
+        drop(tx);
+        assert_eq!(next_reader_event(&rx, None), ReaderEvent::Closed);
+        assert_eq!(
+            next_reader_event(&rx, Some(Instant::now() + Duration::from_secs(5))),
+            ReaderEvent::Closed,
+            "a closed output is not a deadline"
+        );
+    }
+
+    /// Nothing held means no deadline — not even after an empty in-sync chunk
+    /// (an interceptor holding back a partial sequence) or a flush. A deadline
+    /// with nothing to flush would wake the reader on a past deadline forever.
+    #[test]
+    fn sync_coalescer_has_no_deadline_while_nothing_is_held() {
+        let mut c = SyncFrameCoalescer::new();
+        let mut emitted = 0;
+        c.feed(b"", 0, true, |_, _| emitted += 1);
+        assert_eq!(c.deadline(), None, "an empty in-sync chunk holds nothing");
+        c.feed(b"\x1b[?2026hA", 0, true, |_, _| emitted += 1);
+        assert!(c.deadline().is_some(), "a held frame has a deadline");
+        c.flush_remaining(|_, _| emitted += 1);
+        assert_eq!(c.deadline(), None, "the flush clears it");
+        c.feed(b"\x1b[?2026l", 11, false, |_, _| emitted += 1);
+        assert_eq!(c.deadline(), None);
+        assert_eq!(emitted, 2);
+    }
+
+    /// After the session ends the reader keeps taking output for the grace —
+    /// including a chunk that arrives late, as a pump forwarding the child's
+    /// last kernel-buffered bytes does — and then stops.
+    #[test]
+    fn exit_drain_takes_late_output_within_the_grace_then_stops() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"queued".to_vec()).unwrap();
+        let late = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                tx.send(b"late".to_vec()).unwrap();
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            exit_drain_event(&rx, until),
+            ReaderEvent::Chunk(b"queued".to_vec())
+        );
+        assert_eq!(
+            exit_drain_event(&rx, until),
+            ReaderEvent::Chunk(b"late".to_vec())
+        );
+        late.join().unwrap();
+        // Past the grace it stops even with output still queued.
+        tx.send(b"after the grace".to_vec()).unwrap();
+        assert_eq!(
+            exit_drain_event(&rx, Instant::now() - Duration::from_millis(1)),
+            ReaderEvent::Closed
+        );
+    }
+
+    /// The exit drain stops at once on a disconnect, not at the grace.
+    #[test]
+    fn exit_drain_stops_at_once_when_the_output_disconnects() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        drop(tx);
+        let started = Instant::now();
+        assert_eq!(
+            exit_drain_event(&rx, started + Duration::from_secs(30)),
+            ReaderEvent::Closed
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A pipeline over fresh session state, with a pass-through interceptor.
+    struct PipelineFixture {
+        interceptor: OutputInterceptor,
+        scrollback: Arc<Mutex<VecDeque<u8>>>,
+        total_bytes: Arc<AtomicU64>,
+        grid: Arc<Mutex<Grid>>,
+        grid_generation: Arc<AtomicU64>,
+    }
+
+    impl PipelineFixture {
+        fn new() -> Self {
+            Self {
+                interceptor: OutputInterceptor::new(),
+                scrollback: Arc::new(Mutex::new(VecDeque::new())),
+                total_bytes: Arc::new(AtomicU64::new(0)),
+                grid: Arc::new(Mutex::new(Grid::new(80, 24))),
+                grid_generation: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn pipeline(&self) -> ReaderPipeline<'_> {
+            ReaderPipeline {
+                terminal_id: "pipeline-test",
+                interceptor: &self.interceptor,
+                scrollback: &self.scrollback,
+                total_bytes: &self.total_bytes,
+                scrollback_capacity: SCROLLBACK_CAPACITY,
+                grid: &self.grid,
+                grid_generation: &self.grid_generation,
+            }
+        }
+    }
+
+    /// A chunk far larger than one read (a remote seed ring) goes through the
+    /// pipeline in pieces of at most `READER_CHUNK`: each piece is its own
+    /// event at its own offset, so the emission gate sees the local grain.
+    #[test]
+    fn a_large_chunk_is_fed_in_reader_chunk_pieces() {
+        let fixture = PipelineFixture::new();
+        let mut parser = vte::Parser::new();
+        let mut coalescer = SyncFrameCoalescer::new();
+        let big = vec![b'x'; 3 * READER_CHUNK + 100];
+        let events = std::cell::RefCell::new(Vec::<(usize, u64)>::new());
+        fixture.pipeline().feed_chunk(
+            &big,
+            &mut parser,
+            &mut coalescer,
+            |_| panic!("no sideband in plain text"),
+            &|p: &[u8], o: u64| events.borrow_mut().push((p.len(), o)),
+        );
+        let n = READER_CHUNK as u64;
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                (READER_CHUNK, 0),
+                (READER_CHUNK, n),
+                (READER_CHUNK, 2 * n),
+                (100, 3 * n)
+            ]
+        );
+        assert_eq!(
+            fixture.total_bytes.load(Ordering::Relaxed),
+            big.len() as u64
+        );
+    }
+
+    /// A deadline already in the past returns at once instead of blocking.
+    #[test]
+    fn next_reader_event_with_a_past_deadline_does_not_block() {
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let started = Instant::now();
+        assert_eq!(
+            next_reader_event(&rx, Some(started - Duration::from_millis(5))),
+            ReaderEvent::DeadlinePassed
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Plan `2026-09-30-held-sync-frame-cannot-flush-during-a-blocked-pty-read`.
+    /// A sync frame held while the pane goes SILENT — its output still open,
+    /// nothing more arriving — is emitted at its time cap, not at the pane's
+    /// next byte. Runs the reader loop's own steps (`next_reader_event`, then
+    /// the real `ReaderPipeline::feed_chunk` or the deadline flush) against a
+    /// channel whose sender the test keeps alive, so the wait genuinely blocks.
+    #[test]
+    fn held_sync_frame_flushes_at_its_cap_while_the_output_is_silent() {
+        let fixture = PipelineFixture::new();
+        let pipeline = fixture.pipeline();
+        let mut parser = vte::Parser::new();
+        let mut coalescer = SyncFrameCoalescer::new();
+        let emitted = std::cell::RefCell::new(Vec::<(Vec<u8>, u64, Instant)>::new());
+        let emit = |p: &[u8], o: u64| {
+            emitted.borrow_mut().push((p.to_vec(), o, Instant::now()));
+        };
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        tx.send(b"\x1b[?2026hHALF".to_vec()).unwrap();
+        let started = Instant::now();
+        while emitted.borrow().is_empty() {
+            assert!(
+                started.elapsed() < SYNC_FLUSH_TIME_CAP + Duration::from_secs(5),
+                "the reader loop never flushed the held frame"
+            );
+            match next_reader_event(&rx, coalescer.deadline()) {
+                ReaderEvent::Chunk(bytes) => pipeline.feed_chunk(
+                    &bytes,
+                    &mut parser,
+                    &mut coalescer,
+                    |_| panic!("no sideband"),
+                    &emit,
+                ),
+                ReaderEvent::DeadlinePassed => coalescer.flush_remaining(&emit),
+                ReaderEvent::Closed => panic!("the sender is still alive"),
+            }
+        }
+        let emitted = emitted.into_inner();
+
+        let events = emitted;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, b"\x1b[?2026hHALF");
+        assert_eq!(events[0].1, 0);
+        let waited = events[0].2.duration_since(started);
+        assert!(
+            waited >= SYNC_FLUSH_TIME_CAP,
+            "flushed before the cap: {waited:?}"
+        );
+        // Generous for a loaded CI box, and still far short of "waited for a
+        // next byte that never comes" (which would trip the 5 s guard above).
+        assert!(
+            waited <= SYNC_FLUSH_TIME_CAP + Duration::from_secs(1),
+            "the held frame waited {waited:?}, past its {SYNC_FLUSH_TIME_CAP:?} cap"
+        );
+        // The output is still open: the flush came from the deadline, not EOF.
+        drop(tx);
     }
 
     #[test]
@@ -6486,8 +6840,8 @@ pub(crate) mod tests {
     struct PauseRecorder(Mutex<Vec<bool>>);
 
     impl PaneIo for PauseRecorder {
-        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-            Ok(Box::new(std::io::empty()))
+        fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+            Ok(crate::terminal::pane_io::ended_output(b""))
         }
         fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
             Ok(Box::new(std::io::sink()))
@@ -6557,8 +6911,8 @@ pub(crate) mod tests {
     fn wire_flow_last_frame_matches_the_final_state_under_concurrency() {
         struct SlowSink(Mutex<Vec<bool>>, std::sync::mpsc::Sender<()>);
         impl PaneIo for SlowSink {
-            fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-                Ok(Box::new(std::io::empty()))
+            fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+                Ok(crate::terminal::pane_io::ended_output(b""))
             }
             fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
                 Ok(Box::new(std::io::sink()))
@@ -6648,8 +7002,8 @@ pub(crate) mod tests {
         }
         type StdAtomicBool2 = std::sync::atomic::AtomicBool;
         impl PaneIo for FailingSink {
-            fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-                Ok(Box::new(std::io::empty()))
+            fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+                Ok(crate::terminal::pane_io::ended_output(b""))
             }
             fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
                 Ok(Box::new(std::io::sink()))
@@ -8430,8 +8784,8 @@ pub(crate) mod tests {
             killed: AtomicU64,
         }
         impl PaneIo for CountingPane {
-            fn reader(&self) -> Result<Box<dyn std::io::Read + Send>, String> {
-                Ok(Box::new(std::io::empty()))
+            fn output(&self) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+                Ok(crate::terminal::pane_io::ended_output(b""))
             }
             fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
                 Ok(Box::new(std::io::sink()))
