@@ -173,7 +173,9 @@ fn host_git() -> Command {
 ///
 /// The repository-local scrub ([`scrub_repo_local_git_env`]) covers ONLY the
 /// git reads made here — the trunk NAME. This function's callers
-/// (`census::compute_landed_in_main` and its sibling census reads) then run
+/// (`census::compute_landed_in_main` and its sibling census reads, and
+/// `mcp::probe_executor`'s worktree-state probe — `ahead`/`behind` and
+/// `has_unpushed`, which gates reclaim) then run
 /// their own git in the same repo, which still inherits whatever this process
 /// inherited, so under an inherited `GIT_DIR` they would act on the caller's
 /// repo with a correctly-named trunk. Scrubbing those callers' own git is not
