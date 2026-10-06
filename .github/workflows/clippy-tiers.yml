@@ -20,6 +20,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege (zizmor excessive-permissions): with no block every job got
+# the repository's default token scope.
+# `clippy-diff` widens its own scope for its PR annotations.
+permissions:
+  contents: read
+
 jobs:
   # Nightly UNSCOPED clippy sweep. The per-PR `Clippy check` step in ci.yml runs
   # plain `cargo clippy` (default target only, levels from Cargo.toml) so it
@@ -36,7 +42,9 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # Same sibling checkouts the matrix `test` job needs: qontinui-schemas
       # for the `qontinui-types` path dep, and (for --all-targets test compile)
@@ -52,19 +60,19 @@ jobs:
         shell: bash
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
@@ -94,7 +102,7 @@ jobs:
             at-spi2-core
 
       - name: Free disk space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main
         with:
           tool-cache: false
           android: true
@@ -137,7 +145,7 @@ jobs:
       # `gh api repos/qontinui/qontinui-runner/actions/cache/usage` shows real
       # headroom.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
           workspaces: ". -> target"
@@ -194,7 +202,9 @@ jobs:
       checks: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Check out sibling qontinui-schemas
         uses: ./.github/actions/checkout-sibling
@@ -207,25 +217,25 @@ jobs:
         shell: bash
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "20"
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
       - name: Setup reviewdog
-        uses: reviewdog/action-setup@v1
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
         with:
           reviewdog_version: latest
 
@@ -254,7 +264,7 @@ jobs:
             at-spi2-core
 
       - name: Free disk space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main
         with:
           tool-cache: false
           android: true
@@ -279,7 +289,7 @@ jobs:
       # so this job never adds a save against the 10 GB repo cache cap. That is
       # PR #792's policy applied here: restore unrestricted, save from main only.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ". -> target"
           shared-key: clippy-tiers

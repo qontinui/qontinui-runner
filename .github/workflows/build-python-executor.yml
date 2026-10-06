@@ -29,6 +29,11 @@ on:
 env:
   PYTHON_VERSION: "3.12"
 
+# Least privilege (zizmor excessive-permissions): with no block every job got
+# the repository's default token scope.
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -52,22 +57,24 @@ jobs:
       artifact-name: python-executors
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Poetry
-        uses: snok/install-poetry@v1
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
         with:
           version: 1.8.3
           virtualenvs-create: true
           virtualenvs-in-project: true
 
       - name: Cache Poetry dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: python-bridge/.venv
           key: poetry-${{ matrix.platform }}-${{ hashFiles('python-bridge/poetry.lock') }}
@@ -86,8 +93,9 @@ jobs:
 
       # Install qontinui library
       - name: Clone qontinui library
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           repository: qontinui/qontinui
           path: qontinui-lib
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -159,7 +167,7 @@ jobs:
 
       # Upload as artifact
       - name: Upload Python executor artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-executor-${{ matrix.name }}
           path: binaries/
@@ -172,7 +180,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: all-executors
           pattern: python-executor-*
@@ -184,7 +192,7 @@ jobs:
           ls -la all-executors/
 
       - name: Upload combined artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-executors
           path: all-executors/

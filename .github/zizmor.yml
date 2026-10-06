@@ -1,0 +1,84 @@
+# zizmor configuration — read by the `workflow-lint` job
+# (`zizmor --config .github/zizmor.yml .github/workflows`) and by the
+# pre-commit hook. Plan: 2026-10-04-adopt-self-hosted-ci-scout-improvements,
+# Phase 1. zizmor is pinned at 1.30.1; a version bump re-baselines here in the
+# same PR.
+#
+# Every entry below is ONE rule on NAMED files, each with the reason it is
+# accepted. No audit is disabled outright: a new file, or a new finding of a
+# different rule in a listed file, still reports. Add an entry only with a
+# reason that would convince a reviewer who has not read this thread; a true
+# positive is fixed, not listed.
+#
+# Pinning decision (`unpinned-uses`): every `uses:` is pinned to a full commit
+# SHA with a `# <version>` comment, and nothing here suppresses that audit.
+# Tags are mutable, so a tag pin is not a pin (engineering-priorities
+# design-tradeoff-ranking#3). Local `./` actions are exempt by construction.
+rules:
+  # Workspace-relative `uses: ./.github/actions/checkout-sibling` (and the
+  # reusable `./.github/workflows/build-python-executor.yml`) instead of the
+  # July-2026 `uses: $/...` self-repository syntax. Not adopted yet, because:
+  #  1. actionlint 1.7.12, which runs in the same job, REJECTS `$/...` as an
+  #     invalid action reference (measured 2026-10-04: "specifying action
+  #     "$/.github/actions/foo" in invalid format because ref is missing"), so
+  #     migrating would trade 23 low-severity notes for 23 actionlint errors;
+  #  2. several call sites resolve the action from a checkout at a NON-default
+  #     path on purpose (`./qontinui-runner/...`, and `./main/...` in
+  #     schemas-pair-follow.yml, which deliberately runs main's copy of the
+  #     action), so the rewrite is a semantic change per site, not a spelling
+  #     change, and belongs in its own reviewed PR.
+  # Revisit when actionlint accepts the syntax.
+  self-repository:
+    ignore:
+      - atlas-schema-check.yml
+      - ci.yml
+      - clippy-tiers.yml
+      - clorinde-bindings-fresh.yml
+      - onboarding-doc-fresh.yml
+      - published-parity.yml
+      - qontinui-types-drift.yml
+      - release.yml
+      - reproducibility-gate.yml
+      - schema-pg-sql-fresh.yml
+      - schema-pg-sql-freshness-nightly.yml
+      - schemas-pair-follow.yml
+      - sibling-pin-bump.yml
+      - stacked-pr-fastlane.yml
+
+  dangerous-triggers:
+    ignore:
+      # `pull_request_target` is the POINT of this guard: GitHub runs the BASE
+      # branch's copy of the file, so a PR cannot neuter the check by editing
+      # it. The job never checks out or executes PR code — it reads the PR's
+      # changed-file list and file CONTENTS through the API and parses them
+      # with `yaml.safe_load` as data — and every event value reaches the
+      # script through `env:`. See the file's header ("WHY
+      # pull_request_target").
+      - ci-integrity.yml
+      # `workflow_run` is restricted to `workflows: [CI]` on
+      # `branches: [main]`, the escalate step is further gated on the
+      # triggering run's event being `push`, the checkout is the default
+      # (trusted main) ref, and the run's id/conclusion/attempt reach the
+      # script through `env:`. No PR-controlled code or text is executed.
+      - flake-escalation.yml
+
+  cache-poisoning:
+    ignore:
+      # A nightly / on-release VERIFICATION job: it installs the already
+      # published installer and compares it with a local build. It publishes
+      # nothing and signs nothing, so a poisoned cache can at worst make the
+      # comparison fail, which is the visible outcome. Its Rust cache is
+      # restore-only (`save-if: "false"`) from ci.yml's `test` key on purpose
+      # — without it every nightly ran cold (see the comment at the
+      # rust-cache step). The release BUILD itself (release.yml) no longer
+      # restores any cache.
+      - published-parity.yml
+
+  superfluous-actions:
+    ignore:
+      # softprops/action-gh-release creates the draft release and uploads the
+      # per-platform assets, including from the Windows leg, where replacing
+      # it with `gh release upload` means re-implementing glob expansion and
+      # retry in PowerShell/bash for a release path with no test harness.
+      # Informational only; the action is SHA-pinned.
+      - release.yml

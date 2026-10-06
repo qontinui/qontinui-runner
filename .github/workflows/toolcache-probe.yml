@@ -91,7 +91,7 @@ jobs:
           ls -la "${RUNNER_TOOL_CACHE}" || true
           ls -la "${RUNNER_TOOL_CACHE}/Python" 2>/dev/null || echo "(no Python/ subtree)"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: setup
         with:
           python-version: ${{ inputs.python-version || '3.12' }}
@@ -103,10 +103,15 @@ jobs:
         # download would also have to work on Debian 13, which is exactly the
         # thing that broke on 2026-08-24 — so a pass here is the positive
         # evidence that the 2026-08-24 precondition is now met on this host.
+        # Step outputs via env, not spliced into the script (zizmor
+        # template-injection).
+        env:
+          RESOLVED_PYTHON: ${{ steps.setup.outputs.python-path }}
+          REPORTED_VERSION: ${{ steps.setup.outputs.python-version }}
         run: |
-          resolved="${{ steps.setup.outputs.python-path }}"
+          resolved="${RESOLVED_PYTHON}"
           echo "resolved interpreter: ${resolved}"
-          echo "reported version    : ${{ steps.setup.outputs.python-version }}"
+          echo "reported version    : ${REPORTED_VERSION}"
 
           case "${resolved}" in
             "${RUNNER_TOOL_CACHE}"/*)

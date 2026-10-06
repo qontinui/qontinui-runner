@@ -177,8 +177,11 @@ jobs:
       # PAT is withheld on `pull_request` entirely, so a PR run — including one
       # from a fork — never gets a token stronger than GITHUB_TOKEN. (Modelled
       # on the since-retired atlas-exclude-fresh.yml checkout.)
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          # Explicitly persisted: a later step in this job pushes from this
+          # checkout with this step's token (zizmor artipacked: deliberate).
+          persist-credentials: true
           token: ${{ (github.event_name != 'pull_request' && secrets.CLORINDE_AUTOCOMMIT_TOKEN) || secrets.GITHUB_TOKEN }}
 
       # PR-time selftest of the `Open or update the pin bump PR` step's shipped
