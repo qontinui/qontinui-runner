@@ -170,8 +170,27 @@ fn collect_until(
         );
         match s.reader.next_event(Some(end)).expect("stream read") {
             None => break,
+            // A reported loss is the holder being honest (its ring rolled past
+            // bytes this connection had not been sent): the stream continues
+            // at `to_offset`. It must start exactly where we are — a loss
+            // report is itself part of the contiguity contract.
+            Some(Event::Lost {
+                from_offset,
+                to_offset,
+            }) => {
+                assert_eq!(from_offset, next, "a loss report must start at our offset");
+                next = to_offset;
+                c.next = next;
+                c.events.push(Event::Lost {
+                    from_offset,
+                    to_offset,
+                });
+            }
             Some(Event::Output { offset, bytes }) => {
-                assert_eq!(offset, next, "output must be contiguous");
+                assert_eq!(
+                    offset, next,
+                    "output must be contiguous (or a loss reported first)"
+                );
                 next += bytes.len() as u64;
                 c.bytes.extend_from_slice(&bytes);
                 c.next = next;
@@ -504,7 +523,16 @@ fn pty_holder_data_path_kill_ends_the_child() {
 /// the blocked input returns, and the holder exits.
 #[test]
 fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
-    let mut h = start("blocked", sh("exec sleep 3600"));
+    // `raw -echo`, both halves deliberate:
+    // - `-echo`: with echo on, the line discipline echoes the paste, and that
+    //   output (larger than the 2 MiB ring while this test is not reading, or
+    //   is paused) rolls the ring — honest `output_lost`, but noise unrelated
+    //   to what is under test. CI hit exactly that.
+    // - `raw`: in CANONICAL mode a full line buffer DISCARDS further input
+    //   rather than pushing back, so the PTY write never blocks and the queue
+    //   never fills; non-canonical input throttles, which is the backpressure
+    //   under test.
+    let mut h = start("blocked", sh("stty raw -echo; exec sleep 3600"));
     let mut s = attach(&h, None);
     let first_offset = s.info.start_offset;
     let mut inp = input_of(&h);
