@@ -730,15 +730,15 @@ fn pump(pane: &Arc<Pane>, writer: &Mutex<Conn>, flow: &ConnFlow, mut next: u64) 
                 )
             }
             PumpStep::Exit(exit) => {
+                // The flush (Windows: wait for the peer to read the frame)
+                // runs on a handle of the pump's own, OUTSIDE the writer lock:
+                // a runner that keeps the pipe open but stops reading must pin
+                // this pump at most, never a dispatch reply or the teardown.
                 let sent = to_payload(&Reply::Exit(exit))
                     .map_err(io::Error::other)
                     .and_then(|p| send_frame(writer, KIND_CONTROL, &p, PUMP_WRITE_TIMEOUT))
-                    .and_then(|()| {
-                        writer
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .flush_to_peer()
-                    });
+                    .and_then(|()| writer.lock().unwrap_or_else(|p| p.into_inner()).try_clone())
+                    .and_then(|own| own.flush_to_peer());
                 if sent.is_ok() {
                     pane.mark_exit_delivered();
                 }

@@ -42,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-use super::remaining;
+use super::{remaining, ShutFlag};
 
 const PIPE_BUFFER: u32 = 64 * 1024;
 
@@ -97,16 +97,20 @@ pub struct Conn {
     write_event: Handle,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
+    /// Shared by every [`Conn::try_clone`] of this connection; see
+    /// [`ShutFlag`] and [`Conn::shutdown`].
+    shut: ShutFlag,
 }
 
 impl Conn {
-    fn from_handle(handle: Handle) -> io::Result<Conn> {
+    fn from_handle(handle: Handle, shut: ShutFlag) -> io::Result<Conn> {
         Ok(Conn {
             handle,
             read_event: new_event()?,
             write_event: new_event()?,
             read_timeout: None,
             write_timeout: None,
+            shut,
         })
     }
 
@@ -152,16 +156,18 @@ impl Conn {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        Conn::from_handle(Handle(dup))
+        Conn::from_handle(Handle(dup), self.shut.clone())
     }
 
     /// Block until the peer has read everything written so far
     /// (`FlushFileBuffers`). A pipe server that exits right after its last
     /// write can otherwise lose the unread tail; the holder calls this after
     /// the `exit` frame and before it exits. UNBOUNDED by itself — a peer that
-    /// never reads pins the caller — so the holder only ever calls it from a
-    /// connection's own pump thread, never from a thread anything waits on
-    /// without a deadline.
+    /// never reads pins the caller. The holder calls it only from a
+    /// connection's own pump thread, on a handle of its own and OUTSIDE the
+    /// connection's writer lock, so a peer that stops reading pins that pump
+    /// alone (the holder still exits at its exit linger), never the dispatch
+    /// thread's replies or teardown.
     pub fn flush_to_peer(&self) -> io::Result<()> {
         // SAFETY: a valid pipe handle.
         if unsafe { FlushFileBuffers(self.handle.0) } == 0 {
@@ -182,26 +188,33 @@ impl Conn {
         Ok(pid)
     }
 
-    /// Unblock every thread doing I/O on this connection, and let it end.
+    /// Shut the connection down, permanently, for EVERY handle on it.
     ///
-    /// `CancelIoEx` with a null `OVERLAPPED` cancels the I/O pending on the
-    /// pipe's FILE OBJECT — every [`Conn::try_clone`] duplicates the handle onto
-    /// that same object, so a read blocked on the dispatch's handle and a write
-    /// blocked on the pump's both fail and return. The connection then ends
-    /// when the last handle is DROPPED (`CloseHandle`), which — unlike
-    /// `DisconnectNamedPipe` — keeps everything already written readable by
-    /// the client.
+    /// What it guarantees:
+    /// 1. **Permanent.** It sets the connection's shared [`ShutFlag`] first.
+    ///    Every later read on any `try_clone` of this connection returns EOF
+    ///    and every later write fails `BrokenPipe` without touching the pipe —
+    ///    the Unix `SHUT_RDWR` contract. `overlapped` checks the flag before it
+    ///    issues an operation and again right after, cancelling its own I/O if
+    ///    the flag went up in between, so no operation can slip past a
+    ///    shutdown.
+    /// 2. **Unblocks.** It then cancels the I/O pending on the pipe's FILE
+    ///    OBJECT (`CancelIoEx` with a null `OVERLAPPED`; every `try_clone`
+    ///    duplicates the handle onto that object), so a blocked read and a
+    ///    blocked write both return.
+    /// 3. **Delivers what was written.** It does NOT disconnect the pipe: the
+    ///    connection ends when the last handle is dropped (`CloseHandle`),
+    ///    and data already written stays readable by the peer.
+    ///    `DisconnectNamedPipe` discards it — which is why every `rejected`
+    ///    frame (written immediately before a shutdown) used to reach the
+    ///    client as EOF mid-frame (round 4: four transport tests on the first
+    ///    Windows run of Phase 2).
     ///
-    /// Review round 4 (first Windows execution of Phase 2): this used to call
-    /// `DisconnectNamedPipe` on the holder's side, and `DisconnectNamedPipe`
-    /// DISCARDS data the client has not read yet. Every `rejected` frame is
-    /// written immediately before a shutdown, so the client read EOF in the
-    /// middle of it ("failed to fill whole buffer") — four transport tests that
-    /// passed in Phase 1, when this method was a no-op and the handles were
-    /// simply dropped. Closing by drop is that Phase 1 behaviour.
-    /// (Type-checked here; executed on the `holder-crates (windows-latest)`
-    /// CI leg.)
+    /// It does NOT reach the PEER's handles: the peer sees the connection end
+    /// only when this side's last handle is dropped. (Type-checked here;
+    /// executed on the `holder-crates (windows-latest)` CI leg.)
     pub fn shutdown(&self) {
+        self.shut.shut();
         // SAFETY: a valid handle; a null OVERLAPPED cancels all of its I/O.
         unsafe { CancelIoEx(self.handle.0, null()) };
     }
@@ -216,6 +229,10 @@ impl Conn {
         is_read: bool,
         start: impl FnOnce(*mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
+        // A shut connection does no more I/O (see `Conn::shutdown`).
+        if self.shut.is_shut() {
+            return ShutFlag::result(is_read);
+        }
         // SAFETY: OVERLAPPED is plain data; zeroed is its initial state.
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         ov.hEvent = event.0;
@@ -224,6 +241,23 @@ impl Conn {
             let e = last_error();
             if e != ERROR_IO_PENDING {
                 return self.map_err(e, is_read);
+            }
+            // Issued and pending. A `shutdown` that landed between the check
+            // above and the issue cancelled nothing of ours (it ran first), so
+            // look again now and cancel this operation ourselves. Bytes it
+            // already moved are still reported.
+            if self.shut.is_shut() {
+                let mut n = 0u32;
+                // SAFETY: cancel exactly this operation, then WAIT for it so
+                // `ov` is not freed while the kernel still references it.
+                unsafe {
+                    CancelIoEx(self.handle.0, &ov);
+                    GetOverlappedResult(self.handle.0, &ov, &mut n, 1);
+                }
+                if n > 0 {
+                    return Ok(n as usize);
+                }
+                return ShutFlag::result(is_read);
             }
         }
         // SAFETY: a valid event handle.
@@ -562,7 +596,7 @@ impl Listener {
                     st.stuck = 0;
                     st.stuck_since = None;
                     drop(st);
-                    Conn::from_handle(h)
+                    Conn::from_handle(h, ShutFlag::default())
                 }
                 Err(e) => {
                     // No replacement: this client cannot be served without
@@ -639,7 +673,7 @@ pub fn connect(name: &str, deadline: Instant) -> io::Result<Conn> {
             )
         };
         if h != INVALID_HANDLE_VALUE {
-            return Conn::from_handle(Handle(h));
+            return Conn::from_handle(Handle(h), ShutFlag::default());
         }
         match last_error() {
             ERROR_PIPE_BUSY => {

@@ -145,9 +145,73 @@ pub fn peer_authorized(peer_uid: u32, own_uid: u32) -> bool {
     peer_uid == own_uid
 }
 
+/// A connection's PERMANENT "shut down" mark, shared by every handle on it.
+///
+/// Unix gets this from the kernel: after `shutdown(SHUT_RDWR)` every later
+/// read on the socket returns EOF and every write fails, whichever duplicate
+/// it comes from. A Windows pipe has no such state — `CancelIoEx` cancels
+/// only the I/O pending at that instant, and a `ReadFile`/`WriteFile` issued a
+/// moment later proceeds as if nothing happened. So the Windows `Conn` carries
+/// one of these, cloned into every `try_clone`: `shutdown` sets it and then
+/// cancels, and every operation checks it before it starts and again after it
+/// is issued (closing the check-then-issue race). Platform-independent so the
+/// contract is unit-tested on every OS.
+#[derive(Debug, Clone, Default)]
+pub struct ShutFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ShutFlag {
+    /// Mark the connection shut, for every handle sharing this flag. Call it
+    /// BEFORE cancelling pending I/O, so an operation issued after the cancel
+    /// sees it on its post-issue check.
+    pub fn shut(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_shut(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// What an operation on a shut connection returns — the Unix
+    /// `SHUT_RDWR` answer: EOF for a read, `BrokenPipe` for a write.
+    pub fn result(is_read: bool) -> io::Result<usize> {
+        if is_read {
+            Ok(0)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection was shut down",
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review round 4: shutting a connection is PERMANENT and shared — a
+    /// clone made before or after sees it, reads then read EOF and writes
+    /// fail, exactly as a Unix socket after `SHUT_RDWR`.
+    #[test]
+    fn pty_holder_shut_flag_is_shared_and_permanent() {
+        let a = ShutFlag::default();
+        let before = a.clone();
+        assert!(!a.is_shut() && !before.is_shut());
+        a.shut();
+        let after = a.clone();
+        assert!(before.is_shut() && after.is_shut());
+        assert_eq!(
+            ShutFlag::result(true).unwrap(),
+            0,
+            "a read on a shut connection is EOF"
+        );
+        assert_eq!(
+            ShutFlag::result(false).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        a.shut();
+        assert!(before.is_shut(), "idempotent, never cleared");
+    }
 
     #[test]
     fn pty_holder_peer_authorization_is_same_uid_only() {

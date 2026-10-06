@@ -467,14 +467,14 @@ impl ShutdownHandle {
     ///
     /// - **Unix:** `shutdown(SHUT_RDWR)` on the socket — every handle on it
     ///   sees EOF / `EPIPE` at once and the holder reads EOF.
-    /// - **Windows:** a client cannot disconnect a named pipe, and the pipe
-    ///   stays open while ANY handle on it is open. `CancelIoEx` on this
-    ///   handle cancels the I/O pending on the pipe's file object — the
-    ///   reader's and the writer's included, since `try_clone` duplicates the
-    ///   handle onto the same file object — so their calls fail and return.
-    ///   The holder sees the connection end only once every handle (reader,
-    ///   writer and this one) has been DROPPED; the caller must drop them.
-    ///   (UNRUN on Windows: type-checked only.)
+    /// - **Windows:** `Conn::shutdown` marks the connection's shared shut
+    ///   flag — so every later read on the reader or writer returns EOF and
+    ///   every later write fails, as after `SHUT_RDWR` — and then cancels the
+    ///   I/O pending on the pipe's file object, so blocked calls return. A
+    ///   client cannot disconnect a named pipe, though: the HOLDER sees the
+    ///   connection end only once every handle (reader, writer and this one)
+    ///   has been DROPPED; the caller must drop them. (Executed only on the
+    ///   Windows CI leg.)
     ///
     /// Consumes the handle so it cannot be the one that keeps a Windows pipe
     /// alive.
