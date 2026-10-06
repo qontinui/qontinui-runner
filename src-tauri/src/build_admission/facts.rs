@@ -178,6 +178,9 @@ pub struct BuildRss {
     /// depth below it: cargo, rustc, linkers, build scripts).
     #[serde(skip)]
     pub per_lease: HashMap<u32, u64>,
+    /// Leases whose tree held a cargo / rustc / clippy-driver this sample.
+    #[serde(skip)]
+    pub building: HashSet<u32>,
 }
 
 /// Attribute memory to builds. A process with a leased wrapper pid among its
@@ -211,6 +214,9 @@ pub fn attribute(table: &HashMap<u32, Proc>, lease_pids: &HashSet<u32>) -> Build
             Some(l) => {
                 out.leased_bytes += p.anon_bytes;
                 *out.per_lease.entry(l).or_default() += p.anon_bytes;
+                if p.comm == "cargo" || BUILD_COMMS.contains(&p.comm.as_str()) {
+                    out.building.insert(l);
+                }
             }
             None if in_cargo_tree || BUILD_COMMS.contains(&p.comm.as_str()) => {
                 out.unleased_bytes += p.anon_bytes;
@@ -262,6 +268,37 @@ impl NonBuildTracker {
         let vals: Vec<u64> = self.samples.iter().map(|(_, b)| *b).collect();
         nearest_rank(&vals, 0.95).map_or(Fact::Unknown, Fact::Measured)
     }
+}
+
+/// Off Linux: each lease's whole process tree, RSS from the process table.
+fn sysinfo_lease_rss(lease_pids: &HashSet<u32>) -> BuildRss {
+    let mut out = BuildRss::default();
+    if lease_pids.is_empty() {
+        return out;
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let table: HashMap<u32, Proc> = sys
+        .processes()
+        .iter()
+        .map(|(pid, p)| {
+            let name = p.name().to_string_lossy().to_lowercase();
+            let comm = name.trim_end_matches(".exe").to_owned();
+            (
+                pid.as_u32(),
+                Proc {
+                    ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
+                    comm,
+                    anon_bytes: p.memory(),
+                    start: p.start_time(),
+                },
+            )
+        })
+        .collect();
+    let mut a = attribute(&table, lease_pids);
+    // Only the leased trees are measured here.
+    a.unleased_bytes = 0;
+    a
 }
 
 fn sysinfo_total_memory() -> Option<u64> {
@@ -349,18 +386,20 @@ pub fn collect(
     let ci = if roots.linux {
         ci_reservation::measure(&roots.cgroup)
     } else {
-        ci_reservation::measure(Path::new(""))
+        CiMeasure::not_supported()
     };
-    // Build-tree attribution needs /proc; off Linux it is not supported and
-    // subtracts nothing from non-build use (counted as non-build: conservative).
+    // Linux attributes every process from /proc (anon). Elsewhere the leased
+    // trees are sampled from the process table (RSS, D2's `rss_sample`), and
+    // unleased build memory is not supported.
     let build = match (roots.linux, uid) {
         (true, Some(u)) => Some(attribute(&read_proc_table(&roots.proc, u), lease_pids)),
-        _ => None,
+        (true, None) => None,
+        (false, _) => Some(sysinfo_lease_rss(lease_pids)),
     };
     let unleased = match (&build, roots.linux) {
-        (Some(b), _) => Fact::Measured(b.unleased_bytes),
+        (Some(b), true) => Fact::Measured(b.unleased_bytes),
         (None, true) => Fact::Unknown,
-        (None, false) => Fact::NotSupported,
+        (_, false) => Fact::NotSupported,
     };
     if let Some(nb) = non_build_sample(mem_total, mem_available, build.as_ref(), ci.usage) {
         tracker.push(now_s, nb);
@@ -584,6 +623,7 @@ mod tests {
         assert_eq!(f.facts.psi_mem_full_avg10, Fact::NotSupported);
         assert_eq!(f.facts.unleased_build_rss_bytes, Fact::NotSupported);
         assert_eq!(f.facts.ci_reservation_bytes, Fact::NotSupported);
-        assert!(f.build_rss.is_none());
+        // Leased trees come from the process table off Linux; none open here.
+        assert_eq!(f.build_rss.map(|b| b.leased_bytes), Some(0));
     }
 }

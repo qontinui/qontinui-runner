@@ -199,7 +199,9 @@ pub fn resolve_layers(
 }
 
 /// Resolve from file texts (`None` = absent). An unparseable layer is skipped
-/// with a note — never treated as `off`.
+/// with a note — never treated as `off`. (Tests; the broker keeps last-known
+/// layers through [`resolve_layers`].)
+#[cfg(test)]
 pub fn resolve(
     env: Option<&str>,
     overrides_toml: Option<&str>,

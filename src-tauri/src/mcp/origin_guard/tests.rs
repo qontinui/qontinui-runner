@@ -1823,6 +1823,12 @@ async fn build_admission_doors_refuse_browser_origins_and_admit_the_wrappers() {
             StatusCode::FORBIDDEN,
             "{m} {uri}"
         );
+        // The trusted web dev frontend is a browser origin too.
+        assert_eq!(
+            status(m, uri, Some(WEB)).await,
+            StatusCode::FORBIDDEN,
+            "{m} {uri} from {WEB}"
+        );
         assert_eq!(
             status(m, uri, None).await,
             StatusCode::OK,

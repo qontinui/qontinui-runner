@@ -26,6 +26,11 @@ pub fn dir() -> Option<PathBuf> {
     qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("build-admission"))
 }
 
+/// Atomic, owner-only write (creates the directory).
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write(path, bytes)
+}
+
 fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
@@ -33,7 +38,9 @@ fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     crate::fs_atomic::atomic_write_owner_only(path, bytes)
 }
 
-/// Persist the ledger.
+/// Persist the ledger (the tick serialises under its lock and writes with
+/// [`write_bytes`]; this is the one-call form).
+#[cfg(test)]
 pub fn save_state(dir: &Path, broker: &Broker) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(broker).map_err(std::io::Error::other)?;
     write(&dir.join("state.json"), &bytes)
@@ -129,11 +136,6 @@ pub fn estimates(broker: &Broker, policy: &Policy) -> Vec<EstimateRow> {
             }
         })
         .collect()
-}
-
-pub fn save_estimates(dir: &Path, file: &EstimatesFile) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
-    write(&dir.join("estimates.json"), &bytes)
 }
 
 /// A config file read: absent is a fact (`Ok(None)`); any other failure is an

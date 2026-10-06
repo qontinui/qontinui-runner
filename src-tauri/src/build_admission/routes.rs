@@ -3,6 +3,11 @@
 //! | Route | Caller | Secret |
 //! |---|---|---|
 //! | `POST /build-admission/tickets` | the cargo wrappers | returns one |
+//!
+//! A ticket's `pid` is the wrapper's NATIVE OS pid. Under Git Bash / MSYS on
+//! Windows `$$` is an MSYS pid the OS does not know (the ticket would be
+//! refused as `no such process`): read the native one from `/proc/$$/winpid`.
+//!
 //! | `GET /build-admission/tickets/{id}?wait=N` | the wrapper that opened it | `X-Build-Admission-Secret` |
 //! | `POST /build-admission/leases/{id}/release` | the wrapper that opened it | `X-Build-Admission-Secret` |
 //! | `GET /build-admission/state` | anyone (console, `/whereami`, Phase 7 publisher) | none; secrets never appear |
@@ -121,6 +126,7 @@ fn shared() -> &'static Shared {
     })
 }
 
+/// Seeds at start-up (the tick reloads them outside the lock afterwards).
 fn reload_seeds(broker: &mut Broker, notes: &mut Vec<String>) {
     if let Some(d) = persist::dir() {
         let (seeds, note) = persist::load_seeds(&d);
@@ -277,10 +283,17 @@ pub fn pid_refusal(
 
 /// One tick: re-read the policy and seeds, measure the host, sample the
 /// leased trees, reap dead wrappers, run the shadow scheduler, persist when
-/// anything changed.
+/// anything changed. Every file read and write happens OUTSIDE the ledger
+/// lock, so a host stalling on fsync never stalls a request.
 fn tick_once() {
     let s = shared();
     let resolved = current_policy(&mut lock(&s.last_known));
+    let mut seed_notes = Vec::new();
+    let seeds = persist::dir().map(|d| {
+        let (seeds, note) = persist::load_seeds(&d);
+        seed_notes.extend(note);
+        seeds
+    });
     let lease_pids = lock(&s.broker).lease_pids();
     let now = now_s();
     let detail = facts::collect(
@@ -293,13 +306,13 @@ fn tick_once() {
         false,
         now,
     );
-    let mut seed_notes = Vec::new();
-    {
+    let snapshot = {
         let mut b = lock(&s.broker);
-        reload_seeds(&mut b, &mut seed_notes);
-        if let Some(per) = detail.build_rss.as_ref().map(|r| &r.per_lease) {
-            if !b.lease_pids().is_empty() {
-                b.observe_usage(per);
+        if let Some(seeds) = seeds {
+            b.seeds = seeds;
+        }
+        if let Some(rss) = detail.build_rss.as_ref() {
+            if b.observe_usage(&rss.per_lease, &rss.building) {
                 s.dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -309,9 +322,12 @@ fn tick_once() {
         if b.shadow_step(&detail.facts, &resolved.policy, now) > 0 {
             s.dirty.store(true, Ordering::Relaxed);
         }
-        if s.dirty.swap(false, Ordering::Relaxed) {
-            persist_all(&b, &resolved, &detail, now);
-        }
+        s.dirty
+            .swap(false, Ordering::Relaxed)
+            .then(|| snapshot_files(&b, &resolved, &detail, now))
+    };
+    if let Some((state, estimates)) = snapshot {
+        write_files(&state, &estimates);
     }
     {
         let mut n = lock(&s.notes);
@@ -322,18 +338,34 @@ fn tick_once() {
     *lock(&s.policy) = resolved;
 }
 
-fn persist_all(b: &Broker, resolved: &Resolved, detail: &FactsDetail, now: u64) {
-    let Some(d) = persist::dir() else { return };
-    if let Err(e) = persist::save_state(&d, b) {
-        tracing::warn!(error = %e, "build admission: state.json write failed");
-    }
+/// Serialise both files under the lock (memory only).
+fn snapshot_files(
+    b: &Broker,
+    resolved: &Resolved,
+    detail: &FactsDetail,
+    now: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let state = serde_json::to_vec_pretty(b).unwrap_or_default();
     let file = persist::EstimatesFile {
         written_at_s: now,
         non_build_p95_bytes: detail.facts.non_build_p95_bytes,
         estimates: persist::estimates(b, &resolved.policy),
     };
-    if let Err(e) = persist::save_estimates(&d, &file) {
-        tracing::warn!(error = %e, "build admission: estimates.json write failed");
+    (state, serde_json::to_vec_pretty(&file).unwrap_or_default())
+}
+
+/// Write the serialised files (no lock held).
+fn write_files(state: &[u8], estimates: &[u8]) {
+    let Some(d) = persist::dir() else { return };
+    if state.is_empty() {
+        tracing::warn!("build admission: state serialisation failed; not written");
+    } else if let Err(e) = persist::write_bytes(&d.join("state.json"), state) {
+        tracing::warn!(error = %e, "build admission: state.json write failed");
+    }
+    if !estimates.is_empty() {
+        if let Err(e) = persist::write_bytes(&d.join("estimates.json"), estimates) {
+            tracing::warn!(error = %e, "build admission: estimates.json write failed");
+        }
     }
 }
 
