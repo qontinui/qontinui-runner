@@ -317,9 +317,13 @@ describe("the retired `truncated` contract is gone from every layer", () => {
 });
 
 describe("the walk sends the cursor, and only within its own scope", () => {
-  it("puts the cursor on the wire beside the three scope parameters", () => {
+  it("puts the cursor on the wire beside the scope parameters and the tenant", () => {
     expect(HOOK).toContain('invoke<FleetSessionsResponse>("fleet_sessions_list"');
-    expect(HOOK).toContain("args: { deviceId, state, includeClosed, limit, cursor }");
+    // `tenant` is the Rust arg name (`FleetSessionsArgs.tenant`); a misspelled
+    // key is dropped by serde in silence and the read runs under the default.
+    expect(HOOK).toContain(
+      "args: { deviceId, state, includeClosed, limit, cursor, tenant: tenantId }",
+    );
   });
 
   it("sends a cursor ONLY when advancing, never on a restart", () => {
@@ -497,7 +501,9 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
     // so the trigger SAYS what it is. Keying only on a callback's identity makes
     // the trigger an implicit consequence of that callback's dependency list,
     // which is exactly how `limit` got in.
-    expect(HOOK).toContain("const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });");
+    expect(HOOK).toContain(
+      "const scopeKey = fleetScopeKey({ deviceId, state, includeClosed, tenantId });",
+    );
     expect(HOOK).toContain("}, [fetchPage, scopeKey, restartToken]);");
     // And it needs no suppression: both are real dependencies of the effect.
     expect(HOOK).not.toContain("eslint-disable-next-line react-hooks/exhaustive-deps");
@@ -513,8 +519,8 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
   });
 
   it("keeps `limit` out of the dependency list that restarts the walk", () => {
-    expect(HOOK).toContain("[deviceId, state, includeClosed],");
-    expect(HOOK).not.toContain("[deviceId, state, includeClosed, limit],");
+    expect(HOOK).toContain("[deviceId, state, includeClosed, tenantId],");
+    expect(HOOK).not.toMatch(/\[deviceId, state, includeClosed,[^\]]*\blimit\b[^\]]*\],/);
   });
 
   it("reads the page size through a ref so the next page uses the new one", () => {
@@ -526,7 +532,7 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
 
   it("leaves `limit` out of the scope fingerprint itself", () => {
     expect(DISCOVERY).toContain(
-      "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+      "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
     );
   });
 });
@@ -576,5 +582,36 @@ describe("the 'tab open on this page' notices follow the live tab list", () => {
     expect(code).toMatch(/openedTabStillOpen\(state\.openedId, tabs\)/);
     expect(code).not.toMatch(/\{\s*row\?\.openedId\s*&&/);
     expect(code).not.toMatch(/if \(state\.openedId\)/);
+  });
+});
+
+/**
+ * The Fleet view's tenant (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+ * Phase 3). coord scopes the read to the PRESENTED credential's tenant, so the
+ * tenant is chosen here, stays view-local, and follows a row into its attach.
+ */
+describe("the tenant selector reads, and attaches, the tenant it names", () => {
+  it("restarts the walk on a tenant change — the fetch closes over it", () => {
+    expect(HOOK).toContain("[deviceId, state, includeClosed, tenantId],");
+  });
+
+  it("hands the selection to the hook and never to set_active_tenant", () => {
+    expect(SOURCE).toContain("tenantId: fleetTenant,");
+    // Moving the device default for new sessions is not this view's to do.
+    expect(codeOf(SOURCE)).not.toContain("set_active_tenant");
+    expect(codeOf(SOURCE)).not.toContain("setDefaultTenantForNewSessions");
+  });
+
+  it("projects the requested tenant beside the one that answered", () => {
+    expect(SOURCE).toContain('data-fleet-tenant={response?.tenantId ?? ""}');
+    expect(SOURCE).toContain('data-fleet-tenant-requested={fleetTenant ?? ""}');
+  });
+
+  it("mints attach and create grants under the tenant the rows were SERVED for", () => {
+    // The envelope's tenant, not the pending selection: between a switch and
+    // its answer the rows on screen still belong to the previous tenant.
+    expect(SOURCE).toContain("const rowsTenant = response?.tenantId ?? null;");
+    expect(SOURCE.match(/tenant: rowsTenant,/g)?.length).toBe(2);
   });
 });

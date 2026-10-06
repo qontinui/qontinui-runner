@@ -326,12 +326,15 @@ describe("the cursor is OPAQUE — re-sent verbatim, never interpreted", () => {
 });
 
 describe("fleetScopeKey — what a cursor is valid within", () => {
-  const base = { deviceId: null, state: null, includeClosed: false };
+  const base = { deviceId: null, state: null, includeClosed: false, tenantId: null };
 
   it.each([
     ["device", { ...base, deviceId: "a" }],
     ["state", { ...base, state: "active" }],
     ["closed", { ...base, includeClosed: true }],
+    // coord fingerprints the principal's tenant into the cursor, so a tenant
+    // switch must restart the walk rather than replay a cursor across tenants.
+    ["tenant", { ...base, tenantId: "c231d9da-0000-4000-8000-000000000001" }],
   ])("a changed %s invalidates the cursor", (_name, changed) => {
     expect(fleetScopesEqual(base, changed)).toBe(false);
   });
@@ -340,8 +343,11 @@ describe("fleetScopeKey — what a cursor is valid within", () => {
     // coord leaves `limit` out of the scope fingerprint on purpose: resizing a
     // page changes the slice, not the sequence. Including it here would restart
     // a walk that did not need restarting and silently re-fetch every page.
-    const small = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_DEFAULT_LIMIT });
-    const large = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_MAX_LIMIT });
+    const small = fleetScopeOf(
+      { ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_DEFAULT_LIMIT },
+      null,
+    );
+    const large = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_MAX_LIMIT }, null);
     expect(fleetScopesEqual(small, large)).toBe(true);
     expect(fleetScopeKey(small)).not.toMatch(String(FLEET_MAX_LIMIT));
     expect(fleetScopeKey(small)).not.toMatch(String(FLEET_DEFAULT_LIMIT));
@@ -349,6 +355,17 @@ describe("fleetScopeKey — what a cursor is valid within", () => {
 
   it("distinguishes a null filter from the empty string", () => {
     expect(fleetScopesEqual(base, { ...base, state: "" })).toBe(false);
+  });
+
+  it("carries the tenant supplied beside the filter into the scope", () => {
+    const t = "c231d9da-0000-4000-8000-000000000001";
+    expect(fleetScopeOf(DEFAULT_FLEET_SERVER_FILTER, t).tenantId).toBe(t);
+    expect(
+      fleetScopesEqual(
+        fleetScopeOf(DEFAULT_FLEET_SERVER_FILTER, t),
+        fleetScopeOf(DEFAULT_FLEET_SERVER_FILTER, null),
+      ),
+    ).toBe(false);
   });
 });
 
