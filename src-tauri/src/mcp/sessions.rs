@@ -1088,7 +1088,11 @@ pub(crate) async fn transcript_bind_core(
         );
     };
 
-    // 4. The caller's tenant.
+    // 4. The caller's tenant. Establish the session's repo expectation FIRST
+    // (row 1d decides from what the binding has already established): without
+    // this the bind could stamp the machine tenant on a session whose coord
+    // calls go to its repo's tenant.
+    crate::coord_mcp::establish_session_expectation(&nonce).await;
     let tenant = match (env.session_tenant)(&nonce) {
         Ok(t) => t,
         Err(refusal) => {

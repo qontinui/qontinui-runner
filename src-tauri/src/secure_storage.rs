@@ -467,6 +467,19 @@ pub struct StoredGracedNonce {
     /// The pin's provenance — see [`StoredNonceBinding::session_tenant_origin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant_origin: Option<StoredPinOrigin>,
+    /// The evicted binding's SETTLED repo expectation — see
+    /// [`StoredNonceBinding::expected_tenant`]. A superseded key is still
+    /// presented by a live session for the grace window, and row 1d of the
+    /// session-tenant authority order needs the same repo answer the live key
+    /// was served by, or one session gets two tenants. `None` for an entry
+    /// written before the field, or evicted before its resolution settled; the
+    /// restore reads that as PENDING and re-resolves from `workdir`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_expected_tenant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -3013,6 +3026,7 @@ mod tests {
                 grace_until_unix: 1_700_021_600,
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         )]);
         storage
