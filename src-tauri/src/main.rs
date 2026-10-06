@@ -4492,7 +4492,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::time::Duration;
 
                     use session::session_lifecycle_store::{
-                        classify, close_reason_for_dead_shell, PollAction, WorkerPlane,
+                        boot_restore_phase, classify, close_reason_for_dead_shell,
+                        hold_for_withheld_boot_restore, match_live_terminal,
+                        withheld_boot_restore_candidate, PollAction, WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -4702,6 +4704,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let session_mgr = poll_app_handle
                             .try_state::<Arc<crate::claude_session::SessionManager>>();
 
+                        // Withheld-boot-restore hold (plan
+                        // `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
+                        // While a coord drain withholds the boot restore, the
+                        // prior boot's records match no terminal BY DESIGN —
+                        // they are waiting to be restored, not orphaned — and
+                        // closing them `no-terminal` strands them for good.
+                        // Read once per tick: the boot instant, the restore
+                        // path's own phase latch, and the drain gate (`drain_gate`,
+                        // not `_for_work` — the poll defers no work).
+                        let tick_boot_at_ms = session::shutdown_marker::boot_classification()
+                            .map(|c| c.booted_at_ms);
+                        let tick_restore_phase = boot_restore_phase();
+                        let tick_drain_defers_boot_resume = !crate::coord_drain_state::drain_gate(
+                            crate::coord_drain_state::SpawnOrigin::BootResume,
+                        )
+                        .allows();
+                        let mut held_for_restore: usize = 0;
+
                         let mut live_by_id: StdHashMap<&str, &_> =
                             StdHashMap::with_capacity(live.len());
                         let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
@@ -4730,18 +4750,32 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     .update_identity(&rec.claude_session_id, update);
                             }
 
+                            // Is this a prior-boot record whose boot restore
+                            // is being withheld? Decided BEFORE matching: such a
+                            // record gets the id match only (see
+                            // `match_live_terminal`).
+                            let held = withheld_boot_restore_candidate(
+                                rec.last_seen_at,
+                                tick_boot_at_ms,
+                                tick_restore_phase,
+                                tick_drain_defers_boot_resume,
+                            );
+
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
-                            let info = live_by_id
-                                .get(rec.terminal_id.as_str())
-                                .copied()
-                                .or_else(|| {
-                                    let title = rec.title.as_deref()?;
-                                    let working_dir = rec.working_dir.as_deref()?;
-                                    live_by_triple
-                                        .get(&(rec.page_id.as_str(), title, working_dir))
-                                        .copied()
-                                });
+                            let triple = match (rec.title.as_deref(), rec.working_dir.as_deref()) {
+                                (Some(title), Some(working_dir)) => {
+                                    Some((rec.page_id.as_str(), title, working_dir))
+                                }
+                                _ => None,
+                            };
+                            let info = match_live_terminal(
+                                rec.terminal_id.as_str(),
+                                triple,
+                                &live_by_id,
+                                &live_by_triple,
+                                held,
+                            );
 
                             let (live_is_alive, claude_present, snapshot_ok) = match info {
                                 // No matching terminal — orphan detection is
@@ -4826,16 +4860,27 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                 },
                             };
-                            let action = classify(
-                                live_is_alive,
-                                claude_present,
-                                prior,
-                                prior_no_match,
-                                snapshot_ok,
-                                restore_pending,
-                                confirmed,
-                                worker_plane,
+                            let action = hold_for_withheld_boot_restore(
+                                classify(
+                                    live_is_alive,
+                                    claude_present,
+                                    prior,
+                                    prior_no_match,
+                                    snapshot_ok,
+                                    restore_pending,
+                                    confirmed,
+                                    worker_plane,
+                                ),
+                                held,
                             );
+                            if held && action == PollAction::Skip {
+                                held_for_restore += 1;
+                                // A held record is waiting, not missing: any
+                                // no-match streak it built before the hold is
+                                // void, so the orphan debounce restarts from
+                                // zero once the restore has run.
+                                consecutive_no_match.remove(&rec.claude_session_id);
+                            }
 
                             match action {
                                 PollAction::KeepAlive => {
@@ -4934,6 +4979,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // Uncertain — do NOT touch the counters.
                                 }
                             }
+                        }
+
+                        if held_for_restore > 0 {
+                            tracing::debug!(
+                                held = held_for_restore,
+                                phase = ?tick_restore_phase,
+                                "session lifecycle poll: holding prior-boot records open — their boot restore is withheld"
+                            );
                         }
 
                         // Continuous, claude-process-anchored session binder
