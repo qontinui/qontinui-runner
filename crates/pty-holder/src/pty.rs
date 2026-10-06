@@ -93,6 +93,12 @@ pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// Input for the writer thread (see the module docs).
     input_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// The generation of the CURRENT input connection. `open_input` on a new
+    /// connection bumps it ([`Pane::supersede_input`]); every enqueue checks
+    /// its own generation against it UNDER this lock, so once a newer input
+    /// connection exists an older one can enqueue nothing more — its bytes can
+    /// never land after (or interleave with) the newer connection's.
+    input_gen: Mutex<u64>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     /// Windows: a holder-owned `KILL_ON_JOB_CLOSE` job holding the child, so
@@ -191,6 +197,7 @@ impl Pane {
             changed: Condvar::new(),
             master: Mutex::new(master),
             input_tx,
+            input_gen: Mutex::new(0),
             #[cfg(windows)]
             killer: Mutex::new(killer),
             #[cfg(windows)]
@@ -376,14 +383,29 @@ impl Pane {
     /// `TimedOut`: the caller closes that connection rather than holding its
     /// thread and its connection slot for as long as the child ignores stdin
     /// (the runner reattaches, and kills on a connection of its own).
-    pub fn write_input(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+    ///
+    /// `generation` is the caller's from [`Pane::supersede_input`]. A caller
+    /// that has been superseded gets `ErrorKind::Other` ("superseded") and
+    /// its bytes are DISCARDED, never enqueued: the generation check and the
+    /// (non-blocking) enqueue happen under one lock, so no older connection's
+    /// frame can be queued after a newer connection exists.
+    pub fn write_input(&self, bytes: &[u8], timeout: Duration, generation: u64) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let deadline = Instant::now() + timeout;
         let mut chunk = bytes.to_vec();
         loop {
-            match self.input_tx.try_send(chunk) {
+            let sent = {
+                let current = self.input_gen.lock().unwrap_or_else(|p| p.into_inner());
+                if *current != generation {
+                    return Err(io::Error::other(
+                        "superseded: a newer input connection replaced this one",
+                    ));
+                }
+                self.input_tx.try_send(chunk)
+            };
+            match sent {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(io::Error::new(
@@ -421,6 +443,17 @@ impl Pane {
                 broken = true;
             }
         }
+    }
+
+    /// Make the caller the pane's CURRENT input connection and return its
+    /// generation. Every older input connection is superseded from this
+    /// instant: its pending and future input is discarded (see
+    /// [`Pane::write_input`]). Bytes it had already enqueued stay queued —
+    /// they precede everything the new connection sends.
+    pub fn supersede_input(&self) -> u64 {
+        let mut current = self.input_gen.lock().unwrap_or_else(|p| p.into_inner());
+        *current = current.wrapping_add(1);
+        *current
     }
 
     /// Resize the PTY (the child gets `SIGWINCH` on Unix).

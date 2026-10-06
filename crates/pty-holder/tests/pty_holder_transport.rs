@@ -293,14 +293,11 @@ fn pty_holder_refusals_before_and_after_handshake() {
     r.send_frame(KIND_CONTROL, &[0xC3, 0x28], soon()).unwrap();
     expect_rejected(r.recv_frame(soon()).unwrap(), RejectReason::Malformed);
 
-    // A data frame after a good handshake, before attach: input is
-    // accepted on an attached connection only.
+    // A data frame after a good handshake, before `open_input`: input is
+    // accepted on an `open_input` connection only.
     let mut c = connect(&dir, &pane, soon()).unwrap();
     c.send_raw_frame(KIND_DATA, b"x", soon()).unwrap();
-    expect_rejected(
-        c.recv_raw_frame(soon()).unwrap(),
-        RejectReason::NotAttached,
-    );
+    expect_rejected(c.recv_raw_frame(soon()).unwrap(), RejectReason::NotAttached);
     // …and on a version-1 connection a data frame is not a thing at all.
     let mut c = connect_with_versions(&dir, &pane, soon(), &[1]).unwrap();
     c.send_raw_frame(KIND_DATA, b"x", soon()).unwrap();
