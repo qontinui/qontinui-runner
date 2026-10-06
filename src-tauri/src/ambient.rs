@@ -1186,11 +1186,19 @@ pub mod test_support {
     }
 
     fn prune_stale_scratch(root: &Path, own_pid: &str) {
+        // The temp dir is world-writable on Unix: never follow a root that is
+        // not a real directory (a planted symlink would aim the prune at
+        // someone else's tree), and only ever touch `<pid>`-named entries.
+        let root_is_real_dir = std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir());
+        if !root_is_real_dir {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(root) else {
             return;
         };
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy() == own_pid {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == own_pid || name.parse::<u32>().is_err() {
                 continue;
             }
             let stale = entry

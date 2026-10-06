@@ -1845,7 +1845,6 @@ impl Default for SecureStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     /// Create an isolated storage instance for testing.
     /// Each test gets its own unique storage file to avoid test interference.

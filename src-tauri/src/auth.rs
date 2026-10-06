@@ -3777,7 +3777,6 @@ mod tenant_device_jwt_tests {
 #[cfg(test)]
 mod bearer_selection_tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
