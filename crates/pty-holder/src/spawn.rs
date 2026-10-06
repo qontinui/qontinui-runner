@@ -466,7 +466,10 @@ pub enum SpawnError {
     /// a spawn.
     NeedsWmiFallback(String),
     /// The holder printed nothing within the report deadline.
-    Silent { route: ResolvedRoute, reason: String },
+    Silent {
+        route: ResolvedRoute,
+        reason: String,
+    },
     /// The holder reported `holder_error=<kind> …`.
     HolderFailed { line: String, status: String },
     /// A success line whose `holder_pid` is not the process spawned: none of
@@ -729,12 +732,18 @@ fn attempt(req: &SpawnRequest<'_>, route: ResolvedRoute) -> Result<SpawnedHolder
     let Some(ready) = parse_ready_line(&line) else {
         let status = failure_reason(&mut process);
         abandon(&mut process, unit.as_deref(), None);
-        return Err(AttemptError::Other(SpawnError::HolderFailed { line, status }));
+        return Err(AttemptError::Other(SpawnError::HolderFailed {
+            line,
+            status,
+        }));
     };
     if signalable_pid(process.id()) != Some(ready.holder_pid) {
         let spawned_pid = process.id();
         abandon(&mut process, unit.as_deref(), None);
-        return Err(AttemptError::Other(SpawnError::NotOurHolder { line, spawned_pid }));
+        return Err(AttemptError::Other(SpawnError::NotOurHolder {
+            line,
+            spawned_pid,
+        }));
     }
     Ok(SpawnedHolder {
         holder_pid: ready.holder_pid as u32,
@@ -924,7 +933,10 @@ mod tests {
         .unwrap();
         assert_eq!((r.holder_pid, r.child_pid), (100, 200));
         assert_eq!(r.pane_id, "p1");
-        assert_eq!(r.endpoint, "/tmp/a b/p1.sock", "the endpoint may hold spaces");
+        assert_eq!(
+            r.endpoint, "/tmp/a b/p1.sock",
+            "the endpoint may hold spaces"
+        );
         // An error line never yields pids, whatever it embeds.
         assert_eq!(
             parse_ready_line(

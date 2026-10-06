@@ -91,14 +91,16 @@ impl<'a> DeadlineIo<'a> {
 // would re-arm the other half's (see `Conn::set_read_timeout`).
 impl io::Read for DeadlineIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.conn.set_read_timeout(Some(remaining(self.deadline)?))?;
+        self.conn
+            .set_read_timeout(Some(remaining(self.deadline)?))?;
         self.conn.read(buf)
     }
 }
 
 impl io::Write for DeadlineIo<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.conn.set_write_timeout(Some(remaining(self.deadline)?))?;
+        self.conn
+            .set_write_timeout(Some(remaining(self.deadline)?))?;
         self.conn.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
