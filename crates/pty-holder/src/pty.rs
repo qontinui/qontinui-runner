@@ -17,6 +17,14 @@
 //!   grace bounds that.) On Unix it waits with `waitid(WNOWAIT)` first and
 //!   reaps only under the state lock, so [`Pane::kill`] can never signal a pid
 //!   that was reaped and recycled.
+//! - **writer** — the ONLY thread that writes the PTY master. Input from
+//!   every connection is queued to it ([`INPUT_QUEUE_FRAMES`] frames, bounded),
+//!   so a child that is not reading its stdin blocks THIS thread and never a
+//!   connection's dispatch: `kill`, `resize`, `pause` and `detach` keep being
+//!   served while a big paste waits for the child. Only once the queue itself
+//!   is full does the dispatch wait (backpressure to the runner); a `kill` on
+//!   any connection still lands, and once the child is gone the writer
+//!   DISCARDS what is queued, which unblocks everything behind it.
 //! - the per-connection **pumps** in `server` read the ring; they live there.
 //!
 //! **When the holder exits** ([`Pane::wait_for_end`], called by `main`): never
@@ -31,6 +39,7 @@
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
 use std::io::{self, Read, Write};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -49,6 +58,14 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// One PTY read.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Input frames queued to the PTY writer thread before a dispatch thread
+/// waits. The runner sends input in chunks of at most 64 KiB, so this is a few
+/// MiB of paste in flight, which no interactive use reaches.
+pub const INPUT_QUEUE_FRAMES: usize = 64;
+
+/// How often a dispatch waiting on a full input queue re-tries it.
+const INPUT_QUEUE_POLL: Duration = Duration::from_millis(10);
 
 /// Everything the threads share, under one lock with one condvar.
 #[derive(Debug)]
@@ -74,9 +91,16 @@ pub struct Pane {
     state: Mutex<PaneState>,
     changed: Condvar,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// Input for the writer thread (see the module docs).
+    input_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    /// Windows: a holder-owned `KILL_ON_JOB_CLOSE` job holding the child, so
+    /// `kill` ends the child's whole TREE (`TerminateJobObject`), not the child
+    /// alone. `None` when the child could not be assigned (then `kill` falls
+    /// back to terminating the child only, and says so in the holder log).
+    #[cfg(windows)]
+    job: Option<win_job::Job>,
     exit_linger: Duration,
 }
 
@@ -144,6 +168,15 @@ impl Pane {
             .map_err(|e| other(format!("master writer: {e}")))?;
         #[cfg(windows)]
         let killer = child.clone_killer();
+        #[cfg(windows)]
+        let job = match win_job::Job::for_child(child_pid) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!("pty-holder: child {child_pid} not placed in a job ({e}); kill ends the child only");
+                None
+            }
+        };
+        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_FRAMES);
 
         let pane = Arc::new(Pane {
             child_pid,
@@ -157,9 +190,11 @@ impl Pane {
             }),
             changed: Condvar::new(),
             master: Mutex::new(master),
-            writer: Mutex::new(writer),
+            input_tx,
             #[cfg(windows)]
             killer: Mutex::new(killer),
+            #[cfg(windows)]
+            job,
             exit_linger: spec.exit_linger(),
         });
 
@@ -167,6 +202,10 @@ impl Pane {
         std::thread::Builder::new()
             .name("pty-holder-reader".into())
             .spawn(move || p.read_loop(reader))?;
+        let p = Arc::clone(&pane);
+        std::thread::Builder::new()
+            .name("pty-holder-writer".into())
+            .spawn(move || p.write_loop(writer, input_rx))?;
         let p = Arc::clone(&pane);
         std::thread::Builder::new()
             .name("pty-holder-waiter".into())
@@ -329,12 +368,59 @@ impl Pane {
         self.settle(exit);
     }
 
-    /// Write input to the child. Blocks while the PTY's input buffer is full
-    /// (the child is not reading) — that is the pane's own backpressure.
-    pub fn write_input(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        w.write_all(bytes)?;
-        w.flush()
+    /// Queue input for the child. Returns as soon as the bytes are queued;
+    /// waits only while [`INPUT_QUEUE_FRAMES`] frames are already queued (the
+    /// child has not read the last few MiB) — the pane's backpressure, felt by
+    /// one connection's dispatch and never by the writer of a `kill` on
+    /// another connection — and at most `timeout`. A wait that runs out is
+    /// `TimedOut`: the caller closes that connection rather than holding its
+    /// thread and its connection slot for as long as the child ignores stdin
+    /// (the runner reattaches, and kills on a connection of its own).
+    pub fn write_input(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut chunk = bytes.to_vec();
+        loop {
+            match self.input_tx.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "pty writer is gone",
+                    ))
+                }
+                Err(TrySendError::Full(back)) => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the child has not read its input queue within the bound",
+                        ));
+                    }
+                    chunk = back;
+                    // A full queue means the child is not reading: a short
+                    // poll costs nothing it is not already waiting for.
+                    std::thread::sleep(INPUT_QUEUE_POLL);
+                }
+            }
+        }
+    }
+
+    /// The writer thread: the only writer of the PTY master. Once a write
+    /// fails or the child is gone, everything still queued is DISCARDED
+    /// (there is no reader for it), which is what unblocks a dispatch waiting
+    /// on a full queue.
+    fn write_loop(&self, mut w: Box<dyn Write + Send>, rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+        let mut broken = false;
+        while let Ok(bytes) = rx.recv() {
+            if broken || self.lock_state().child_gone {
+                continue;
+            }
+            if w.write_all(&bytes).and_then(|()| w.flush()).is_err() {
+                broken = true;
+            }
+        }
     }
 
     /// Resize the PTY (the child gets `SIGWINCH` on Unix).
@@ -415,6 +501,13 @@ impl Pane {
             if self.lock_state().child_gone {
                 return;
             }
+            // The whole tree when the child is in our job; the child alone
+            // otherwise.
+            if let Some(job) = &self.job {
+                if job.terminate().is_ok() {
+                    return;
+                }
+            }
             let _ = self
                 .killer
                 .lock()
@@ -458,5 +551,89 @@ pub fn holder_exit_code(exit: &ExitReply) -> u8 {
         (Some(c), _) => (c & 0xFF) as u8,
         (None, Some(s)) => (128 + (s & 0x7F)) as u8,
         (None, None) => 1,
+    }
+}
+
+/// Windows: the holder-owned job that holds a pane's child tree.
+#[cfg(windows)]
+mod win_job {
+    use std::io;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// An owned job handle. `KILL_ON_JOB_CLOSE`: when the holder exits (its
+    /// last handle closes) whatever is still in the job ends too — the same
+    /// outcome as a holder death hanging up the PTY on Unix.
+    pub struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel object handle, usable from any thread.
+    unsafe impl Send for Job {}
+    // SAFETY: as above; the only operations are thread-safe Win32 calls.
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        /// Create the job and put `child_pid` in it. Descendants the child
+        /// starts afterwards are in it too (a job is inherited). A process the
+        /// child spawned before this call is not — the window is the few
+        /// instructions between the spawn and this call.
+        pub fn for_child(child_pid: u32) -> io::Result<Job> {
+            // SAFETY: plain Win32 calls with valid (null or owned) arguments;
+            // every handle is closed on every failure path or owned by `Job`.
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() || job == INVALID_HANDLE_VALUE {
+                    return Err(io::Error::last_os_error());
+                }
+                let job = Job(job);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, child_pid);
+                if process.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let assigned = AssignProcessToJobObject(job.0, process);
+                let err = io::Error::last_os_error();
+                CloseHandle(process);
+                if assigned == 0 {
+                    return Err(err);
+                }
+                Ok(job)
+            }
+        }
+
+        /// End every process in the job.
+        pub fn terminate(&self) -> io::Result<()> {
+            // SAFETY: an owned, valid job handle.
+            if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned and closed exactly once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
 }

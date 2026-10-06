@@ -477,6 +477,44 @@ fn pty_holder_data_path_kill_ends_the_child() {
     assert_eq!(status.code(), Some(128 + libc::SIGHUP));
 }
 
+/// Review round 1, finding 2: input the child does not read never blocks the
+/// connection's dispatch. A megabyte of input to a child that never reads its
+/// stdin (far more than the PTY's input buffer) is queued to the holder's PTY
+/// writer thread; a `resize` and then a `kill` sent on the SAME connection
+/// behind it are still answered, and the child dies with the queue still full
+/// — which the writer then discards, so the holder exits.
+#[test]
+fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
+    let mut h = start("blocked", sh("exec sleep 3600"));
+    let mut s = attach(&h, None);
+    let first_offset = s.info.start_offset;
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..16 {
+        s.writer
+            .input(&chunk, soon())
+            .expect("input is queued, not written through a full PTY");
+    }
+    s.writer.resize(100, 40, soon()).unwrap();
+    let c = collect_until(&mut s, first_offset, Duration::from_secs(5), |c| {
+        c.events.contains(&Event::Reply(Reply::Ok {
+            verb: "resize".into(),
+        }))
+    });
+    s.writer.kill(soon()).unwrap();
+    let c2 = collect_until(&mut s, c.next, Duration::from_secs(10), |c| {
+        exit_of(&c.events).is_some()
+    });
+    assert!(c2.events.contains(&Event::Reply(Reply::Ok {
+        verb: "kill".into()
+    })));
+    assert_eq!(exit_of(&c2.events).unwrap().signal, Some(libc::SIGHUP));
+    assert!(!alive(h.child_pid));
+    assert!(
+        h.exits_within(Duration::from_secs(10)).is_some(),
+        "the holder exits once the exit is delivered, queued input notwithstanding"
+    );
+}
+
 /// A child that ignores SIGHUP still dies: SIGKILL follows the grace.
 #[test]
 fn pty_holder_data_path_kill_escalates_past_an_ignored_hangup() {

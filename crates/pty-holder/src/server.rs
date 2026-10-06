@@ -73,6 +73,13 @@ pub const REPLY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// for this long is dropped; it can reattach at its last offset.
 pub const PUMP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longest an input frame waits for room in the pane's input queue (the child
+/// has not read the last few MiB) before its connection is closed. Longer than
+/// the runner's own input deadline (`DaemonPaneIo`'s `INPUT_DEADLINE`, 60 s),
+/// so a live runner gives up first and reattaches; this bound frees the
+/// connection's thread and slot when nobody does.
+pub const INPUT_QUEUE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Largest output frame payload (offset header excluded).
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
 
@@ -394,6 +401,7 @@ pub fn serve_conn(conn: Conn, info: &HolderInfo, pane: Option<&Arc<Pane>>) {
         pane,
         ConnParams {
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            input_queue_timeout: INPUT_QUEUE_TIMEOUT,
             #[cfg(unix)]
             expected_uid: transport::own_uid(),
         },
@@ -407,6 +415,9 @@ pub(crate) struct ConnParams {
     /// The whole-handshake bound: the FIRST frame must arrive complete within
     /// it, however it is trickled.
     pub handshake_timeout: Duration,
+    /// Longest one input frame waits for room in the pane's input queue
+    /// before the connection is closed. See [`INPUT_QUEUE_TIMEOUT`].
+    pub input_queue_timeout: Duration,
     /// The uid a peer must have.
     #[cfg(unix)]
     pub expected_uid: u32,
@@ -528,10 +539,19 @@ pub(crate) fn serve_conn_with(
                 state = ConnState::Attached(v);
             }
             Action::Input(bytes) => {
-                // No reply for input. A child that is gone takes nothing; that
-                // is not this connection's error.
+                // No reply for input. The bytes go to the pane's writer thread
+                // (`crate::pty`), so this dispatch keeps serving `kill`,
+                // `resize`, `pause` and `detach` while the child is slow to
+                // read. A child that is gone takes nothing; that is not this
+                // connection's error. A queue that stays full for
+                // `params.input_queue_timeout` closes THIS connection — its
+                // thread and slot are not held hostage by a child that ignores
+                // stdin; the runner reattaches.
                 if let Some(pane) = pane {
-                    let _ = pane.write_input(&bytes);
+                    match pane.write_input(&bytes, params.input_queue_timeout) {
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
+                        _ => {}
+                    }
                 }
             }
             Action::Resize { cols, rows } => {
@@ -923,6 +943,7 @@ mod tests {
         let timeout = Duration::from_millis(300);
         let params = ConnParams {
             handshake_timeout: timeout,
+            input_queue_timeout: INPUT_QUEUE_TIMEOUT,
             expected_uid: transport::own_uid(),
         };
 
@@ -974,6 +995,7 @@ mod tests {
         use std::io::Read;
         let params = ConnParams {
             handshake_timeout: Duration::from_secs(5),
+            input_queue_timeout: INPUT_QUEUE_TIMEOUT,
             expected_uid: transport::own_uid().wrapping_add(1),
         };
         let (mut client, t) = serve_pair(params);
