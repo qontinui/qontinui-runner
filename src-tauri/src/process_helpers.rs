@@ -21,6 +21,12 @@ pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
+        // Repository-local env (`GIT_DIR`, `GIT_INDEX_FILE`, …) inherited from
+        // whoever launched the runner — a git hook, a shell that exported them —
+        // would point THIS git at the launcher's repo, whatever `-C` /
+        // `current_dir` says. Scrubbed here, at the one chokepoint, so no call
+        // site has to remember.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
     }
     cmd
 }
@@ -39,6 +45,10 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
     if is_git {
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
+        }
+        // The same repository-local scrub as [`no_window`].
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            cmd.env_remove(var);
         }
     }
     cmd
@@ -2751,6 +2761,123 @@ mod console_window_guard {
     }
 }
 
+/// Every production git spawn goes through [`no_window`] / [`tokio_no_window`],
+/// because that is where BOTH git postures are applied: the prompt-closing env
+/// and the repository-local scrub. A raw `Command::new("git")` skips both — it
+/// can hang on a credential prompt, and under a `GIT_DIR` inherited from the
+/// runner's launcher it reads and WRITES the launcher's repo instead of the one
+/// `-C` names (`git reset --hard`, `worktree remove`, `git config --local`).
+///
+/// A deliberate exception carries a `git-env-ok: <reason>` marker on the line
+/// or just above it. Today there is exactly one: `bin/qontinui_cli.rs`, a
+/// console tool that acts on the user's OWN shell repo, where the inherited
+/// environment is what the user means.
+#[cfg(test)]
+mod raw_git_guard {
+    use std::path::{Path, PathBuf};
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Does `src` (production text only) build a raw git command without a
+    /// `git-env-ok:` marker? Returns the offending 1-based line numbers.
+    pub(super) fn raw_git_spawns(src: &str) -> Vec<usize> {
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if !(line.contains("Command::new(\"git\")")
+                || line.contains("Command::new(\"git.exe\")"))
+            {
+                continue;
+            }
+            let start = i.saturating_sub(3);
+            if lines[start..=i].iter().any(|l| l.contains("git-env-ok:")) {
+                continue;
+            }
+            out.push(i + 1);
+        }
+        out
+    }
+
+    #[test]
+    fn no_production_git_spawn_bypasses_the_chokepoint() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "walked only {} files under {} — the guard scanned nothing",
+            files.len(),
+            root.display()
+        );
+        let mut violations = Vec::new();
+        let mut marked_cli = false;
+        for file in files {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if rel == "bin/qontinui_cli.rs" {
+                marked_cli = src.contains("git-env-ok:");
+            }
+            for n in raw_git_spawns(&src) {
+                violations.push(format!("{rel}:{n}"));
+            }
+        }
+        assert!(
+            marked_cli,
+            "bin/qontinui_cli.rs no longer carries its git-env-ok marker — if its raw \
+             git spawn moved or went away, update this guard's allowlist note"
+        );
+        assert!(
+            violations.is_empty(),
+            "raw git spawn(s) that bypass process_helpers::no_window / tokio_no_window \
+             (the prompt posture AND the repository-local scrub):\n{}\n\nBuild them with \
+             `crate::process_helpers::no_window(\"git\")` instead. A deliberate exception \
+             carries a `// git-env-ok: <reason>` comment on the line or just above it.",
+            violations.join("\n")
+        );
+    }
+
+    /// The detector itself: a raw spawn is caught, a marked one and a test-only
+    /// one are not. Without this the guard could pass by matching nothing.
+    #[test]
+    fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
+        let raw = "fn f() {\n    let c = std::process::Command::new(\"git\");\n}\n";
+        assert_eq!(raw_git_spawns(raw), vec![2]);
+        let marked =
+            "fn f() {\n    // git-env-ok: user's own repo\n    let c = Command::new(\"git\");\n}\n";
+        assert!(raw_git_spawns(marked).is_empty());
+        let test_only = "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"git\"); } }\n";
+        assert!(raw_git_spawns(test_only).is_empty());
+        let tokio_raw = "fn f() { tokio::process::Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(tokio_raw), vec![1]);
+    }
+}
+
 #[cfg(test)]
 mod prompt_proof_tests {
     use super::*;
@@ -2840,6 +2967,74 @@ mod prompt_proof_tests {
                 "{program} must not receive the git posture"
             );
         }
+    }
+
+    /// The same chokepoint scrubs the REPOSITORY-LOCAL git environment: every
+    /// `REPO_LOCAL_GIT_ENV` name is REMOVED on the command (`get_envs` reports a
+    /// removal as `None`), so a `GIT_DIR` inherited from whoever launched the
+    /// runner never reaches a git child — while command-scope config
+    /// (`GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT`) is left alone, because an
+    /// env-injected `safe.directory` or credential helper rides on it.
+    fn assert_repo_local_scrubbed(envs: &[(String, Option<String>)], what: &str) {
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{what}: {var} must be removed so an inherited value never reaches git; envs: {envs:?}"
+            );
+        }
+        for var in qontinui_runner_lib::git_posture::COMMAND_SCOPE_GIT_CONFIG_ENV {
+            assert!(
+                !envs.iter().any(|(k, _)| k == var),
+                "{what}: {var} is command-scope config and must not be touched; envs: {envs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_window_git_scrubs_the_repo_local_env() {
+        for program in [
+            "git",
+            "/usr/bin/git",
+            r"C:\Program Files\Git\cmd\git.exe",
+            "GIT.EXE",
+        ] {
+            assert_repo_local_scrubbed(&env_of(&no_window(program)), program);
+        }
+    }
+
+    #[test]
+    fn tokio_no_window_git_scrubs_the_repo_local_env() {
+        let cmd = tokio_no_window("git");
+        assert_repo_local_scrubbed(&env_of(cmd.as_std()), "tokio_no_window(git)");
+    }
+
+    /// Scoped like the prompt posture: a non-git child keeps whatever
+    /// repository env it inherited (a `claude` session the runner launches is
+    /// a different question, out of this chokepoint's scope).
+    #[test]
+    fn no_window_does_not_scrub_non_git_programs() {
+        for program in ["cmd.exe", "claude", "git-lfs", "node"] {
+            assert!(
+                !env_of(&no_window(program))
+                    .iter()
+                    .any(|(k, _)| k == "GIT_DIR"),
+                "{program} must not have GIT_DIR touched"
+            );
+        }
+    }
+
+    /// A caller that DELIBERATELY points git elsewhere still can: an explicit
+    /// `.env` after construction wins over the construction-time removal.
+    #[test]
+    fn an_explicit_env_after_construction_wins_over_the_scrub() {
+        let mut cmd = no_window("git");
+        cmd.env("GIT_INDEX_FILE", "/tmp/alt-index");
+        assert!(
+            env_of(&cmd)
+                .iter()
+                .any(|(k, v)| k == "GIT_INDEX_FILE" && v.as_deref() == Some("/tmp/alt-index")),
+            "a later explicit GIT_INDEX_FILE must survive"
+        );
     }
 
     /// The prompt-proof subset is DERIVED from the one posture, never restated:

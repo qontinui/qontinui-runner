@@ -4506,6 +4506,65 @@ mod tests {",
         assert_eq!(row.building, Some(false));
     }
 
+    const LANDED_TARGET_ENV: &str = "QONTINUI_TEST_LANDED_TARGET";
+
+    /// Child of [`compute_landed_in_main_ignores_an_inherited_git_dir`]:
+    /// skipped in a normal run, run only re-executed by it.
+    #[test]
+    #[ignore = "re-executed by compute_landed_in_main_ignores_an_inherited_git_dir"]
+    fn inherited_git_dir_child_landed_in_main_reads_the_named_repo() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let Some(target) = reexec::child_input(LANDED_TARGET_ENV) else {
+            eprintln!("not under the re-exec parent; nothing to assert");
+            return;
+        };
+        let decoy_git_dir = reexec::child_input("GIT_DIR").expect("set with the child flag");
+        reexec::assert_inherited_git_dir(&decoy_git_dir);
+        let target = Path::new(&target);
+
+        // Control: a raw, UNscrubbed git with `-C <target>` answers for the
+        // inherited decoy, whose HEAD IS on its trunk.
+        let control = Command::new("git")
+            .arg("-C")
+            .arg(target)
+            .args(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+            .status()
+            .expect("git runs");
+        assert!(
+            control.success(),
+            "control: the inherited decoy must answer unscrubbed git"
+        );
+
+        // The production function answers for the repo it names: the
+        // target's HEAD carries a commit its trunk does not have.
+        assert_eq!(
+            compute_landed_in_main(target),
+            Some(false),
+            "compute_landed_in_main must read the worktree it names, not an inherited GIT_DIR — \
+             a wrong Some(true) here lets a worktree with unlanded work be reclaimed"
+        );
+        println!("{}", reexec::ASSERTED_MARKER);
+    }
+
+    /// The REAL census predicate under a `GIT_DIR` the process INHERITED (set
+    /// on a re-executed child only). The target holds unlanded work, the decoy
+    /// does not, so the inherited decoy would answer `Some(true)` — the
+    /// reclaim-permitting answer — for the target.
+    #[test]
+    fn compute_landed_in_main_ignores_an_inherited_git_dir() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let target = reexec::repo_with_origin_main(true);
+        let decoy = reexec::repo_with_origin_main(false);
+        assert_eq!(compute_landed_in_main(target.path()), Some(false));
+        assert_eq!(compute_landed_in_main(decoy.path()), Some(true));
+        reexec::run_child(
+            module_path!(),
+            "inherited_git_dir_child_landed_in_main_reads_the_named_repo",
+            &decoy.path().join(".git"),
+            &[(LANDED_TARGET_ENV, target.path().as_os_str())],
+        );
+    }
+
     #[test]
     fn landed_in_main_is_none_without_origin_main() {
         // A real git repo but no `origin/main` ref → undeterminable → None.

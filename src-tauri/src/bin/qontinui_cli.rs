@@ -1363,6 +1363,10 @@ fn first_stdin_line() -> Option<String> {
 
 /// Run `git <args>` in cwd and return trimmed stdout on success.
 fn git_stdout(args: &[&str]) -> Option<String> {
+    // git-env-ok: a console tool run by the user in their own shell — the
+    // repo the inherited environment names IS the repo the user means, so
+    // the runner's repository-local scrub (`process_helpers::no_window`)
+    // would be wrong here.
     let out = std::process::Command::new("git")
         .args(args)
         .stderr(std::process::Stdio::null())
