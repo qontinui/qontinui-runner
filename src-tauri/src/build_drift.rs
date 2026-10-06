@@ -1028,6 +1028,31 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         assert!(first_parsable_tool_policy(&read).is_none());
     }
 
+    /// Run fixture `git <args>` in `repo` (fixed identity, no signing, no
+    /// hooks), returning trimmed stdout; panics on failure.
+    fn fixture_git(repo: &Path, args: &[&str]) -> String {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .current_dir(repo);
+        // Run under a git hook (or any caller that exported them), these
+        // would point the fixture's git at the CALLER's repo and index
+        // instead of the tempdir — the same scrub production applies.
+        crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
+        let out = cmd.output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// A one-commit git repo holding `files`, and that commit's sha.
     fn git_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1037,32 +1062,10 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
             std::fs::write(path, text).expect("write fixture");
         }
-        let git = |args: &[&str]| {
-            let mut cmd = std::process::Command::new("git");
-            cmd.args([
-                "-c",
-                "user.name=fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-            ])
-            .args(args)
-            .current_dir(repo);
-            // Run under a git hook (or any caller that exported them), these
-            // would point the fixture's git at the CALLER's repo and index
-            // instead of the tempdir — the same scrub production applies.
-            crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
-            let out = cmd.output().expect("git runs");
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        git(&["init", "--quiet"]);
-        git(&["add", "-A"]);
-        git(&["commit", "--quiet", "-m", "fixture"]);
-        let sha = git(&["rev-parse", "HEAD"]);
+        fixture_git(repo, &["init", "--quiet"]);
+        fixture_git(repo, &["add", "-A"]);
+        fixture_git(repo, &["commit", "--quiet", "-m", "fixture"]);
+        let sha = fixture_git(repo, &["rev-parse", "HEAD"]);
         (dir, sha)
     }
 
@@ -1210,6 +1213,107 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             "control: an unscrubbed GIT_DIR wins"
         );
         assert_eq!(head(true), target_sha, "scrubbed, current_dir decides");
+    }
+
+    const CHILD_TARGET_ENV: &str = "QONTINUI_TEST_DRIFT_TARGET";
+    const CHILD_TARGET_SHA_ENV: &str = "QONTINUI_TEST_DRIFT_TARGET_SHA";
+    const CHILD_DECOY_SHA_ENV: &str = "QONTINUI_TEST_DRIFT_DECOY_SHA";
+    const CHILD_REMOTE_SHA_ENV: &str = "QONTINUI_TEST_DRIFT_REMOTE_SHA";
+
+    /// Child of [`production_drift_probes_ignore_an_inherited_git_dir`]:
+    /// skipped in a normal run, run only re-executed by it.
+    #[test]
+    #[ignore = "re-executed by production_drift_probes_ignore_an_inherited_git_dir"]
+    fn inherited_git_dir_child_drift_probes_read_the_named_repo() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let Some(target) = reexec::child_input(CHILD_TARGET_ENV) else {
+            eprintln!("not under the re-exec parent; nothing to assert");
+            return;
+        };
+        let input = |name| reexec::child_input(name).expect("set with the child flag");
+        let (target_sha, decoy_sha, remote_sha) = (
+            input(CHILD_TARGET_SHA_ENV),
+            input(CHILD_DECOY_SHA_ENV),
+            input(CHILD_REMOTE_SHA_ENV),
+        );
+        reexec::assert_inherited_git_dir(&input("GIT_DIR"));
+        let target = Path::new(&target);
+
+        // Control: the production posture UNscrubbed, in the same
+        // `current_dir`, answers for the inherited decoy.
+        let out = crate::process_helpers::no_window("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(target)
+            .output()
+            .expect("git runs");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            decoy_sha,
+            "control: the inherited decoy must answer unscrubbed git"
+        );
+
+        assert_eq!(
+            git_output(target, &["rev-parse", "HEAD"]),
+            Some(target_sha),
+            "git_output must read the repo it names, not the inherited GIT_DIR"
+        );
+        // The fetch must land in the target (where `git_output` then reads
+        // it), so the verdict is `fetched` with the remote's tip.
+        assert_eq!(
+            resolve_trunk_tip(target),
+            Some((remote_sha, "fetched")),
+            "resolve_trunk_tip must fetch into the repo it names"
+        );
+        println!("{}", reexec::ASSERTED_MARKER);
+    }
+
+    /// The REAL drift probes — [`git_output`] and [`resolve_trunk_tip`]'s
+    /// fetch, both built by [`drift_git`] — under a `GIT_DIR` the process
+    /// INHERITED (set on a re-executed child only). The target, its decoy
+    /// and their shared `origin` (a local path, no network) each hold a
+    /// different commit. [`a_decoy_git_dir_is_not_read_once_scrubbed`] proves
+    /// the scrub on a hand-built command; this proves the probes use it.
+    #[test]
+    fn production_drift_probes_ignore_an_inherited_git_dir() {
+        let (remote, remote_sha) = git_fixture(&[("a.txt", "remote\n")]);
+        fixture_git(remote.path(), &["branch", "-M", "main"]);
+        let (target, target_sha) = git_fixture(&[("a.txt", "target\n")]);
+        let (decoy, decoy_sha) = git_fixture(&[("a.txt", "decoy\n")]);
+        let origin = remote.path().to_str().expect("utf-8 tempdir");
+        for repo in [target.path(), decoy.path()] {
+            fixture_git(repo, &["remote", "add", "origin", origin]);
+        }
+        assert!(
+            target_sha != decoy_sha && target_sha != remote_sha && decoy_sha != remote_sha,
+            "three distinct commits, or the shas prove nothing"
+        );
+        let private_ref = |repo: &Path| {
+            git_output(
+                repo,
+                &["rev-parse", "--verify", "--quiet", TRUNK_PRIVATE_REF],
+            )
+        };
+        assert_eq!(private_ref(target.path()), None, "no fetch has run yet");
+
+        crate::git_trunk::inherited_git_dir_reexec::run_child(
+            module_path!(),
+            "inherited_git_dir_child_drift_probes_read_the_named_repo",
+            &decoy.path().join(".git"),
+            &[
+                (CHILD_TARGET_ENV, target.path().as_os_str()),
+                (CHILD_TARGET_SHA_ENV, std::ffi::OsStr::new(&target_sha)),
+                (CHILD_DECOY_SHA_ENV, std::ffi::OsStr::new(&decoy_sha)),
+                (CHILD_REMOTE_SHA_ENV, std::ffi::OsStr::new(&remote_sha)),
+            ],
+        );
+
+        // Where the child's fetch landed, read from out here.
+        assert_eq!(private_ref(target.path()), Some(remote_sha));
+        assert_eq!(
+            private_ref(decoy.path()),
+            None,
+            "the inherited decoy must not receive the fetch"
+        );
     }
 
     #[test]
