@@ -124,7 +124,17 @@ pub struct Record {
     pub ended_at_s: Option<u64>,
     pub state: RecordState,
     pub exit_code: Option<i32>,
-    pub peak_anon_bytes: Option<u64>,
+    /// The highest anonymous memory the broker SAMPLED for this lease's tree
+    /// (every process below the wrapper pid, every tick). This, not anything a
+    /// caller reports, feeds the estimate history.
+    #[serde(default)]
+    pub max_sampled_anon_bytes: Option<u64>,
+    /// The latest sample.
+    #[serde(default)]
+    pub current_anon_bytes: Option<u64>,
+    /// What the wrapper reported at release: a cross-check only, never history.
+    #[serde(default)]
+    pub reported_peak_anon_bytes: Option<u64>,
     pub shadow: Shadow,
     pub would: Would,
 }
@@ -135,6 +145,16 @@ pub enum AccessError {
     NotFound,
     BadSecret,
 }
+
+/// Why opening a ticket was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// Too many tickets are open at once (a runaway or hostile caller).
+    TooMany,
+}
+
+/// Most tickets that may be open (non-terminal) at once.
+pub const MAX_OPEN: usize = 256;
 
 /// How a wrapper ended its lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -207,7 +227,16 @@ impl Broker {
         facts: &HostFacts,
         policy: &Policy,
         now_s: u64,
-    ) -> &Record {
+    ) -> Result<&Record, OpenError> {
+        if self
+            .records
+            .values()
+            .filter(|r| !r.state.is_terminal())
+            .count()
+            >= MAX_OPEN
+        {
+            return Err(OpenError::TooMany);
+        }
         let (class, demoted) = match req.class.unwrap_or(Class::Agent) {
             Class::Operator => (
                 Class::Agent,
@@ -239,12 +268,15 @@ impl Broker {
             ended_at_s: None,
             state: RecordState::Running,
             exit_code: None,
-            peak_anon_bytes: None,
+            max_sampled_anon_bytes: None,
+            current_anon_bytes: None,
+            reported_peak_anon_bytes: None,
             shadow: Shadow::Queued,
             would: Would::default(),
         };
         self.records.insert(id.clone(), rec);
-        let blocking = match self.shadow_admission_of(&id, facts, policy) {
+        let shadow_facts = self.shadow_facts(facts);
+        let blocking = match self.shadow_admission_of(&id, &shadow_facts, policy) {
             Some(Admission::Wait { blocking }) => blocking,
             _ => Vec::new(),
         };
@@ -252,7 +284,7 @@ impl Broker {
             r.would.blocking_at_open = blocking;
         }
         self.shadow_step(facts, policy, now_s);
-        &self.records[&id]
+        Ok(&self.records[&id])
     }
 
     /// Check a presented secret for a record.
@@ -278,8 +310,10 @@ impl Broker {
         secret: &str,
         reason: ReleaseReason,
         exit_code: Option<i32>,
-        peak_anon_bytes: Option<u64>,
+        reported_peak_anon_bytes: Option<u64>,
         cpus: u32,
+        facts: &HostFacts,
+        policy: &Policy,
         now_s: u64,
     ) -> Result<&Record, AccessError> {
         self.authorize(id, secret)?;
@@ -293,9 +327,9 @@ impl Broker {
             (ReleaseReason::Exit, _) => RecordState::Failed,
         };
         r.exit_code = exit_code;
-        r.peak_anon_bytes = peak_anon_bytes;
+        r.reported_peak_anon_bytes = reported_peak_anon_bytes;
         Self::end(r, now_s);
-        if let (RecordState::Done, Some(peak)) = (r.state, peak_anon_bytes) {
+        if let (RecordState::Done, Some(peak)) = (r.state, r.max_sampled_anon_bytes) {
             let m = HistoryRow {
                 key: Self::key(&r.request),
                 peak_bytes: peak,
@@ -308,8 +342,43 @@ impl Broker {
             let excess = self.history.len().saturating_sub(KEEP_HISTORY);
             self.history.drain(..excess);
         }
+        // The released lease frees its shadow slot now, not on the next tick.
+        self.shadow_step(facts, policy, now_s);
         self.prune();
         Ok(&self.records[id])
+    }
+
+    /// Record this tick's sampled anonymous memory per running lease (by
+    /// wrapper pid). A lease with no process below it this tick samples 0.
+    pub fn observe_usage(&mut self, per_lease: &std::collections::HashMap<u32, u64>) {
+        for r in self.records.values_mut() {
+            if r.state != RecordState::Running {
+                continue;
+            }
+            let now = per_lease.get(&r.request.pid).copied().unwrap_or(0);
+            r.current_anon_bytes = Some(now);
+            r.max_sampled_anon_bytes = Some(r.max_sampled_anon_bytes.unwrap_or(0).max(now));
+        }
+    }
+
+    /// The facts the SHADOW decides on. In observe every ticket really runs,
+    /// so a ticket the shadow still holds is nevertheless consuming memory;
+    /// its sampled anon is added back to MemAvailable so it does not count
+    /// against itself or the tickets ahead of it. (PSI cannot be corrected the
+    /// same way; the shadow's pressure check reads the real host.)
+    pub fn shadow_facts(&self, facts: &HostFacts) -> HostFacts {
+        let held: u64 = self
+            .records
+            .values()
+            .filter(|r| r.state == RecordState::Running && r.shadow == Shadow::Queued)
+            .filter_map(|r| r.current_anon_bytes)
+            .sum();
+        let mut f = *facts;
+        if let qontinui_types::build_admission::Fact::Measured(a) = f.mem_available_bytes {
+            f.mem_available_bytes =
+                qontinui_types::build_admission::Fact::Measured(a.saturating_add(held));
+        }
+        f
     }
 
     fn end(r: &mut Record, now_s: u64) {
@@ -396,13 +465,14 @@ impl Broker {
     }
 
     /// Run the shadow scheduler until it holds. Returns how many it admitted.
-    pub fn shadow_step(&mut self, facts: &HostFacts, policy: &Policy, now_s: u64) -> usize {
+    pub fn shadow_step(&mut self, real: &HostFacts, policy: &Policy, now_s: u64) -> usize {
         let mut admitted = 0;
         // Each pass admits at most one; the queue bounds the passes.
         for _ in 0..=self.records.len() {
             let queue = self.shadow_queue();
             let leases = self.shadow_leases();
-            match schedule(&queue, &leases, facts, now_s, policy) {
+            let facts = self.shadow_facts(real);
+            match schedule(&queue, &leases, &facts, now_s, policy) {
                 Schedule::Start {
                     ticket_id,
                     jobs,
@@ -505,6 +575,7 @@ mod tests {
             &Policy::default(),
             now,
         )
+        .unwrap()
         .clone()
     }
 
@@ -528,8 +599,18 @@ mod tests {
             .iter()
             .any(|x| matches!(x, Blocking::Reservation { .. })));
         // A shadow lease ends: the waiter is admitted with its would-wait.
-        b.release("a", "a", ReleaseReason::Exit, Some(0), None, 16, 50)
-            .unwrap();
+        b.release(
+            "a",
+            "a",
+            ReleaseReason::Exit,
+            Some(0),
+            None,
+            16,
+            &facts(),
+            &Policy::default(),
+            50,
+        )
+        .unwrap();
         b.shadow_step(&f, &Policy::default(), 50);
         let c = &b.records["c"];
         assert_eq!((c.shadow, c.would.wait_s), (Shadow::Leased, Some(48)));
@@ -546,8 +627,18 @@ mod tests {
             r.would.blocking_at_open[..],
             [Blocking::Target { .. }]
         ));
-        b.release("b", "b", ReleaseReason::Exit, Some(1), None, 16, 30)
-            .unwrap();
+        b.release(
+            "b",
+            "b",
+            ReleaseReason::Exit,
+            Some(1),
+            None,
+            16,
+            &facts(),
+            &Policy::default(),
+            30,
+        )
+        .unwrap();
         assert_eq!(b.records["b"].would.released_while_queued_s, Some(30));
         assert_eq!(b.records["b"].state, RecordState::Failed);
     }
@@ -563,8 +654,18 @@ mod tests {
         );
         assert_eq!(b.authorize("zz", "a").unwrap_err(), AccessError::NotFound);
         assert_eq!(
-            b.release("a", "wrong", ReleaseReason::Exit, Some(0), None, 16, 1)
-                .unwrap_err(),
+            b.release(
+                "a",
+                "wrong",
+                ReleaseReason::Exit,
+                Some(0),
+                None,
+                16,
+                &facts(),
+                &Policy::default(),
+                1
+            )
+            .unwrap_err(),
             AccessError::BadSecret
         );
         assert_eq!(b.records["a"].state, RecordState::Running);
@@ -578,28 +679,32 @@ mod tests {
         let mut b = seeded(GIB);
         let mut r = req("d", 1);
         r.class = Some(Class::Operator);
-        let rec = b.open(
-            "a".into(),
-            hash_secret("a"),
-            r,
-            None,
-            &facts(),
-            &Policy::default(),
-            0,
-        );
+        let rec = b
+            .open(
+                "a".into(),
+                hash_secret("a"),
+                r,
+                None,
+                &facts(),
+                &Policy::default(),
+                0,
+            )
+            .unwrap();
         assert_eq!(rec.class, Class::Agent);
         assert!(rec.class_demoted_reason.is_some());
         let mut r = req("e", 2);
         r.class = Some(Class::Background);
-        let rec = b.open(
-            "b".into(),
-            hash_secret("b"),
-            r,
-            None,
-            &facts(),
-            &Policy::default(),
-            0,
-        );
+        let rec = b
+            .open(
+                "b".into(),
+                hash_secret("b"),
+                r,
+                None,
+                &facts(),
+                &Policy::default(),
+                0,
+            )
+            .unwrap();
         assert_eq!(
             (rec.class, rec.class_demoted_reason.clone()),
             (Class::Background, None)
@@ -612,13 +717,21 @@ mod tests {
         let f = facts();
         open(&mut b, "a", "d1", 1, &f, 0);
         open(&mut b, "b", "d2", 2, &f, 0);
+        // The broker samples the trees: 5 GiB, then 7 GiB at peak, then 2.
+        for gib in [5, 7, 2] {
+            b.observe_usage(&std::collections::HashMap::from([(1, gib * GIB), (2, GIB)]));
+        }
+        assert_eq!(b.records["a"].current_anon_bytes, Some(2 * GIB));
         b.release(
             "a",
             "a",
             ReleaseReason::Exit,
             Some(0),
-            Some(7 * GIB),
+            // The wrapper's report is a cross-check, never the history.
+            Some(999 * GIB),
             16,
+            &facts(),
+            &Policy::default(),
             90,
         )
         .unwrap();
@@ -629,13 +742,17 @@ mod tests {
             None,
             Some(GIB),
             16,
+            &facts(),
+            &Policy::default(),
             90,
         )
         .unwrap();
         assert_eq!(b.records["a"].state, RecordState::Done);
         assert_eq!(b.records["b"].state, RecordState::HarnessKilled);
-        // Only a clean, measured exit becomes history; jobs default to cpus.
+        // Only a clean exit becomes history, with the SAMPLED peak; jobs
+        // default to cpus.
         assert_eq!(b.history.len(), 1);
+        assert_eq!(b.records["a"].reported_peak_anon_bytes, Some(999 * GIB));
         assert_eq!(
             (
                 b.history[0].peak_bytes,
@@ -646,12 +763,62 @@ mod tests {
         );
         // Idempotent.
         let again = b
-            .release("a", "a", ReleaseReason::Exit, Some(1), None, 16, 99)
+            .release(
+                "a",
+                "a",
+                ReleaseReason::Exit,
+                Some(1),
+                None,
+                16,
+                &facts(),
+                &Policy::default(),
+                99,
+            )
             .unwrap();
         assert_eq!(
             (again.state, again.ended_at_s),
             (RecordState::Done, Some(90))
         );
+    }
+
+    #[test]
+    fn open_tickets_are_capped() {
+        let mut b = seeded(GIB);
+        let f = facts();
+        for i in 0..MAX_OPEN {
+            let id = format!("t{i}");
+            open(&mut b, &id, &id, i as u32 + 10, &f, 0);
+        }
+        let over = b.open(
+            "x".into(),
+            hash_secret("x"),
+            req("x", 1),
+            None,
+            &f,
+            &Policy::default(),
+            0,
+        );
+        assert_eq!(over.err(), Some(OpenError::TooMany));
+    }
+
+    /// A ticket the shadow holds still runs in observe; its own memory must
+    /// not count against it.
+    #[test]
+    fn shadow_adds_back_the_memory_of_builds_it_holds() {
+        let mut b = seeded(30 * GIB);
+        let mut f = facts();
+        f.mem_available_bytes = Fact::Measured(40 * GIB);
+        open(&mut b, "a", "same", 1, &f, 0);
+        open(&mut b, "b", "same", 2, &f, 0); // held by the target check
+        b.observe_usage(&std::collections::HashMap::from([
+            (1, 10 * GIB),
+            (2, 25 * GIB),
+        ]));
+        let sf = b.shadow_facts(&f);
+        assert_eq!(sf.mem_available_bytes, Fact::Measured(65 * GIB));
+        // Unknown memory stays unknown.
+        f.mem_available_bytes = Fact::Unknown;
+        assert_eq!(b.shadow_facts(&f).mem_available_bytes, Fact::Unknown);
     }
 
     #[test]
@@ -698,8 +865,18 @@ mod tests {
         for i in 0..(KEEP_TERMINAL + 5) {
             let id = format!("t{i}");
             open(&mut b, &id, &id, i as u32 + 10, &f, 0);
-            b.release(&id, &id, ReleaseReason::Exit, Some(0), None, 16, i as u64)
-                .unwrap();
+            b.release(
+                &id,
+                &id,
+                ReleaseReason::Exit,
+                Some(0),
+                None,
+                16,
+                &facts(),
+                &Policy::default(),
+                i as u64,
+            )
+            .unwrap();
         }
         assert_eq!(b.records.len(), KEEP_TERMINAL + 1);
         assert!(b.records.contains_key("keep"));

@@ -48,7 +48,11 @@ pub fn load_state(dir: &Path) -> (Broker, Option<String>) {
     match serde_json::from_str::<Broker>(&text) {
         Ok(b) => (b, None),
         Err(e) => {
-            let aside = dir.join("state.json.unreadable");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = dir.join(format!("state.json.unreadable-{stamp}"));
             let _ = std::fs::rename(&path, &aside);
             (
                 Broker::default(),
@@ -132,8 +136,15 @@ pub fn save_estimates(dir: &Path, file: &EstimatesFile) -> std::io::Result<()> {
     write(&dir.join("estimates.json"), &bytes)
 }
 
-pub fn read_text(dir: &Path, name: &str) -> Option<String> {
-    std::fs::read_to_string(dir.join(name)).ok()
+/// A config file read: absent is a fact (`Ok(None)`); any other failure is an
+/// error the caller must not mistake for absence (D8: an unreadable layer
+/// keeps its last-known value).
+pub fn read_text(dir: &Path, name: &str) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(dir.join(name)) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -182,7 +193,8 @@ mod tests {
             &facts(),
             &Policy::default(),
             5,
-        );
+        )
+        .unwrap();
         save_state(d.path(), &b).unwrap();
         let text = std::fs::read_to_string(d.path().join("state.json")).unwrap();
         assert!(!text.contains("s3cret"));
@@ -194,7 +206,11 @@ mod tests {
         let (empty, note) = load_state(d.path());
         assert!(empty.records.is_empty());
         assert!(note.unwrap().contains("unreadable"));
-        assert!(d.path().join("state.json.unreadable").exists());
+        assert!(std::fs::read_dir(d.path()).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("state.json.unreadable-")));
     }
 
     #[test]
@@ -207,8 +223,10 @@ mod tests {
         .unwrap();
         let (seeds, note) = load_seeds(d.path());
         assert!(note.is_none());
-        let mut b = Broker::default();
-        b.seeds = seeds;
+        let b = Broker {
+            seeds,
+            ..Default::default()
+        };
         let rows = estimates(&b, &Policy::default());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key.measure_method, MeasureMethod::RssSample);

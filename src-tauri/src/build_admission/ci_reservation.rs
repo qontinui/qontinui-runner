@@ -32,12 +32,15 @@ pub enum Limit {
     Unreadable,
 }
 
-/// A slice and the slices nested in it.
+/// A slice (or a service/scope inside one) and the cgroups nested in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SliceNode {
     pub name: String,
     /// `None` = unreadable.
     pub current: Option<u64>,
+    /// `anon` from `memory.stat`: what the work actually holds, without
+    /// reclaimable page cache. `None` = unreadable.
+    pub anon: Option<u64>,
     pub high: Limit,
     pub max: Limit,
     pub children: Vec<SliceNode>,
@@ -91,19 +94,47 @@ pub fn reserve(node: &SliceNode) -> Option<u64> {
     }
 }
 
-/// The host's CI reservation over `tops` (the top-level CI slices).
-pub fn reservation(tops: &[SliceNode]) -> (Fact<u64>, CiSource) {
-    if tops.is_empty() {
-        return (Fact::Measured(0), CiSource::NoCiSlice);
-    }
-    let mut total = 0u64;
-    for t in tops {
-        match reserve(t) {
-            Some(r) => total = total.saturating_add(r),
-            None => return (Fact::Unknown, CiSource::Unknown),
+/// What the CI slices reserve and what they hold right now.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct CiMeasure {
+    /// D6's reservation: what agent builds must leave to CI.
+    pub reservation: Fact<u64>,
+    /// The anonymous memory the CI slices hold NOW (sum of top-level `anon`).
+    /// This, never the reservation, is what comes off used memory to give
+    /// non-build use (D3: non-build is used memory OUTSIDE the CI slices).
+    pub usage: Fact<u64>,
+    pub source: CiSource,
+}
+
+impl CiMeasure {
+    fn uniform(f: Fact<u64>, source: CiSource) -> Self {
+        CiMeasure {
+            reservation: f,
+            usage: f,
+            source,
         }
     }
-    (Fact::Measured(total), CiSource::Measured)
+}
+
+/// The host's CI reservation and usage over `tops` (the top-level CI slices).
+pub fn reservation(tops: &[SliceNode]) -> CiMeasure {
+    if tops.is_empty() {
+        return CiMeasure::uniform(Fact::Measured(0), CiSource::NoCiSlice);
+    }
+    let mut total = 0u64;
+    let mut usage = Some(0u64);
+    for t in tops {
+        let Some(r) = reserve(t) else {
+            return CiMeasure::uniform(Fact::Unknown, CiSource::Unknown);
+        };
+        total = total.saturating_add(r);
+        usage = usage.and_then(|u| t.anon.map(|a| u.saturating_add(a)));
+    }
+    CiMeasure {
+        reservation: Fact::Measured(total),
+        usage: usage.map_or(Fact::Unknown, Fact::Measured),
+        source: CiSource::Measured,
+    }
 }
 
 fn read_limit(dir: &Path, file: &str) -> Limit {
@@ -120,6 +151,18 @@ fn read_limit(dir: &Path, file: &str) -> Limit {
     }
 }
 
+fn read_anon(dir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join("memory.stat")).ok()?;
+    text.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        if it.next() == Some("anon") {
+            it.next()?.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 fn read_node(dir: &Path, name: String) -> SliceNode {
     let current = std::fs::read_to_string(dir.join("memory.current"))
         .ok()
@@ -130,7 +173,11 @@ fn read_node(dir: &Path, name: String) -> SliceNode {
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .filter_map(|e| {
                     let n = e.file_name().to_string_lossy().into_owned();
-                    n.ends_with(".slice").then(|| read_node(&e.path(), n))
+                    // A limited service or scope directly under an unlimited
+                    // slice bounds what it may take just as a child slice does.
+                    let cgroup =
+                        n.ends_with(".slice") || n.ends_with(".service") || n.ends_with(".scope");
+                    cgroup.then(|| read_node(&e.path(), n))
                 })
                 .collect()
         })
@@ -139,13 +186,19 @@ fn read_node(dir: &Path, name: String) -> SliceNode {
     SliceNode {
         name,
         current,
+        anon: read_anon(dir),
         high: read_limit(dir, "memory.high"),
         max: read_limit(dir, "memory.max"),
         children,
     }
 }
 
-/// Read the top-level `ci*.slice` trees under a cgroup v2 root. `None` when the
+/// `ci.slice` or `ci-<anything>.slice` — not merely a name starting "ci".
+pub fn is_ci_slice(name: &str) -> bool {
+    name == "ci.slice" || (name.starts_with("ci-") && name.ends_with(".slice"))
+}
+
+/// Read the top-level CI slice trees under a cgroup v2 root. `None` when the
 /// root is not a readable cgroup v2 hierarchy (not supported here).
 pub fn read_tops(cgroup_root: &Path) -> Option<Vec<SliceNode>> {
     if !cgroup_root.join("cgroup.controllers").exists() {
@@ -156,7 +209,7 @@ pub fn read_tops(cgroup_root: &Path) -> Option<Vec<SliceNode>> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            (n.starts_with("ci") && n.ends_with(".slice")).then(|| read_node(&e.path(), n))
+            is_ci_slice(&n).then(|| read_node(&e.path(), n))
         })
         .collect();
     tops.sort_by(|a, b| a.name.cmp(&b.name));
@@ -164,9 +217,9 @@ pub fn read_tops(cgroup_root: &Path) -> Option<Vec<SliceNode>> {
 }
 
 /// [`reservation`] read from cgroupfs.
-pub fn measure(cgroup_root: &Path) -> (Fact<u64>, CiSource) {
+pub fn measure(cgroup_root: &Path) -> CiMeasure {
     match read_tops(cgroup_root) {
-        None => (Fact::NotSupported, CiSource::NotSupported),
+        None => CiMeasure::uniform(Fact::NotSupported, CiSource::NotSupported),
         Some(tops) => reservation(&tops),
     }
 }
@@ -187,6 +240,7 @@ mod tests {
         SliceNode {
             name: name.into(),
             current,
+            anon: current,
             high,
             max,
             children,
@@ -194,7 +248,8 @@ mod tests {
     }
 
     /// The merytshost shape: an unlimited `ci.slice` whose only child carries
-    /// the limits. The reservation is the child's bound, not infinity.
+    /// the limits. The reservation is the child's bound, not infinity; the
+    /// usage is what it holds now.
     #[test]
     fn unlimited_top_takes_its_limited_child() {
         let runners = node(
@@ -211,10 +266,12 @@ mod tests {
             Limit::Unlimited,
             vec![runners],
         );
+        let m = reservation(&[ci]);
         assert_eq!(
-            reservation(&[ci]),
+            (m.reservation, m.source),
             (Fact::Measured(148_512_964_608), CiSource::Measured)
         );
+        assert_eq!(m.usage, Fact::Measured(43 * G));
     }
 
     #[test]
@@ -272,7 +329,11 @@ mod tests {
             Limit::Unlimited,
             vec![child],
         );
-        assert_eq!(reservation(&[ci]), (Fact::Unknown, CiSource::Unknown));
+        let m = reservation(&[ci]);
+        assert_eq!(
+            (m.reservation, m.usage, m.source),
+            (Fact::Unknown, Fact::Unknown, CiSource::Unknown)
+        );
         let bad = node(
             "ci.slice",
             Some(G),
@@ -280,12 +341,36 @@ mod tests {
             Limit::Unlimited,
             vec![],
         );
-        assert_eq!(reservation(&[bad]).0, Fact::Unknown);
+        assert_eq!(reservation(&[bad]).reservation, Fact::Unknown);
+        let mut no_stat = node(
+            "ci.slice",
+            Some(G),
+            Limit::Bytes(G),
+            Limit::Unlimited,
+            vec![],
+        );
+        no_stat.anon = None;
+        let m = reservation(&[no_stat]);
+        assert_eq!((m.reservation, m.usage), (Fact::Measured(G), Fact::Unknown));
     }
 
     #[test]
-    fn no_ci_slice_is_a_measured_zero_with_its_label() {
-        assert_eq!(reservation(&[]), (Fact::Measured(0), CiSource::NoCiSlice));
+    fn no_ci_slice_is_a_measured_zero_with_its_label_and_names_match_exactly() {
+        let m = reservation(&[]);
+        assert_eq!(
+            (m.reservation, m.usage, m.source),
+            (Fact::Measured(0), Fact::Measured(0), CiSource::NoCiSlice)
+        );
+        assert!(is_ci_slice("ci.slice") && is_ci_slice("ci-runners.slice"));
+        assert!(!is_ci_slice("circus.slice") && !is_ci_slice("ci.service"));
+    }
+
+    fn cg(dir: &Path, cur: &str, high: &str, max: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("memory.current"), cur).unwrap();
+        std::fs::write(dir.join("memory.high"), high).unwrap();
+        std::fs::write(dir.join("memory.max"), max).unwrap();
+        std::fs::write(dir.join("memory.stat"), format!("anon {cur}\nfile 5\n")).unwrap();
     }
 
     #[test]
@@ -295,15 +380,37 @@ mod tests {
         std::fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
         let ci = root.join("ci.slice");
         let runners = ci.join("ci-runners.slice");
-        std::fs::create_dir_all(&runners).unwrap();
+        cg(&ci, "100", "max", "max");
+        cg(&runners, "90", "4096", "8192");
+        cg(
+            &runners.join("actions.runner.x.service"),
+            "80",
+            "max",
+            "max",
+        );
         std::fs::create_dir_all(root.join("user.slice")).unwrap();
-        for (d, cur, high, max) in [(&ci, "100", "max", "max"), (&runners, "90", "4096", "8192")] {
-            std::fs::write(d.join("memory.current"), cur).unwrap();
-            std::fs::write(d.join("memory.high"), high).unwrap();
-            std::fs::write(d.join("memory.max"), max).unwrap();
-        }
-        // 4096 from the child + 10 bytes held directly by ci.slice.
-        assert_eq!(measure(root), (Fact::Measured(4106), CiSource::Measured));
-        assert_eq!(measure(&root.join("nope")).1, CiSource::NotSupported);
+        cg(&root.join("circus.slice"), "999999", "max", "max");
+        // 4096 from the bounded child + 10 bytes held directly by ci.slice.
+        let m = measure(root);
+        assert_eq!(
+            (m.reservation, m.usage, m.source),
+            (
+                Fact::Measured(4106),
+                Fact::Measured(100),
+                CiSource::Measured
+            )
+        );
+        assert_eq!(measure(&root.join("nope")).source, CiSource::NotSupported);
+    }
+
+    #[test]
+    fn a_limited_service_bounds_an_unlimited_top() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::write(root.join("cgroup.controllers"), "memory\n").unwrap();
+        let top = root.join("ci-x.slice");
+        cg(&top, "10", "max", "max");
+        cg(&top.join("a.service"), "10", "1000", "max");
+        assert_eq!(measure(root).reservation, Fact::Measured(1000));
     }
 }
