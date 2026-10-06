@@ -443,9 +443,9 @@ fn expectation_workdir(workdir: &str) -> Option<&str> {
     (!w.is_empty() && w != ROTATION_UNKNOWN).then_some(w)
 }
 
-/// The expectation a live binding carries, and the workdir it resolves from.
-/// `None` when the nonce is not a live binding (unregistered, expired, or a
-/// graced superseded key, which carries no binding).
+/// The expectation a live binding — or a graced superseded key, which shares
+/// its evicted binding's — carries, and the workdir it resolves from. `None`
+/// when the nonce is neither (unregistered or expired).
 pub(crate) fn session_expectation_for_nonce(
     nonce: &str,
 ) -> Option<(crate::coord_mcp_tenant::SessionExpectation, Option<String>)> {
@@ -2119,9 +2119,31 @@ fn restore_graced_nonces(
     let now_wall = std::time::SystemTime::now();
     let now = std::time::Instant::now();
     let mut restored = Vec::new();
+    // The caller-named half reads declaration files, so it is computed BEFORE
+    // the registry lock is taken (a panic or a stall under that lock would
+    // poison or block every proxy request).
+    let persisted: Vec<_> = persisted
+        .into_iter()
+        .map(|(nonce, g)| {
+            // Only a STORED `explicit` names the tenant (as the live restore).
+            let named_origin = match g.session_tenant_origin {
+                Some(crate::secure_storage::StoredPinOrigin::Explicit) => PinOrigin::Explicit,
+                _ => PinOrigin::MachineSampled,
+            };
+            let caller_named = caller_named_tenant(
+                g.session_tenant
+                    .map(crate::session::tenant_pin::TenantPin::Pinned)
+                    .unwrap_or(crate::session::tenant_pin::TenantPin::Unpinned),
+                named_origin,
+                &ProxyPrincipal::Device,
+                &normalize_binding_workdir(&g.workdir),
+            );
+            (nonce, g, caller_named)
+        })
+        .collect();
     {
         let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
-        for (nonce, g) in persisted {
+        for (nonce, g, caller_named) in persisted {
             let grace_until = minted_at_from_unix(Some(g.grace_until_unix));
             let Ok(remaining) = grace_until.duration_since(now_wall) else {
                 continue; // already expired — nothing to restore
@@ -2141,34 +2163,11 @@ fn restore_graced_nonces(
                     // Restored VERBATIM when settled (never re-resolved, F2),
                     // pending otherwise — no settle hook: a graced key is never
                     // re-persisted by its own resolution.
-                    expected: {
-                        // The caller-named half, recomputed exactly as the live
-                        // restore does (only a STORED `explicit` names the
-                        // tenant), or a superseded key of an explicitly pinned
-                        // session would report a false TENANT MISMATCH.
-                        let named_origin = match g.session_tenant_origin {
-                            Some(crate::secure_storage::StoredPinOrigin::Explicit) => {
-                                PinOrigin::Explicit
-                            }
-                            _ => PinOrigin::MachineSampled,
-                        };
-                        let caller_named = caller_named_tenant(
-                            g.session_tenant
-                                .map(crate::session::tenant_pin::TenantPin::Pinned)
-                                .unwrap_or(crate::session::tenant_pin::TenantPin::Unpinned),
-                            named_origin,
-                            &ProxyPrincipal::Device,
-                            &normalize_binding_workdir(&g.workdir),
-                        );
-                        match g.expected_tenant.clone() {
-                            Some(cwd) => crate::coord_mcp_tenant::SessionExpectation::known(
-                                cwd,
-                                caller_named,
-                            ),
-                            None => {
-                                crate::coord_mcp_tenant::SessionExpectation::pending(caller_named)
-                            }
+                    expected: match g.expected_tenant.clone() {
+                        Some(cwd) => {
+                            crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named)
                         }
+                        None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
                     },
                 },
             );
@@ -6169,7 +6168,9 @@ pub(crate) fn repo_unsettled_refusal(
         Some(_) => return None,
     };
     let from_machine_rows = match decision {
-        SessionTenantDecision::BindingPin { .. } => inputs.binding_origin == PinOrigin::MachineSampled,
+        SessionTenantDecision::BindingPin { .. } => {
+            inputs.binding_origin == PinOrigin::MachineSampled
+        }
         SessionTenantDecision::LivePin(_)
         | SessionTenantDecision::DefaultSlot
         | SessionTenantDecision::JwtClaim(_) => true,
@@ -6258,7 +6259,10 @@ pub(crate) fn repo_tenant_unbound_error(
     // per request now, so a transient hiccup (a locked file, a mid-write read)
     // must answer "ask again" (503), not a terminal authorization refusal that
     // a client never retries. A genuine NotPaired stays a terminal 403.
-    let transient = matches!(refusal, SpawnTenantRefusal::CredentialStoreUnreadable { .. });
+    let transient = matches!(
+        refusal,
+        SpawnTenantRefusal::CredentialStoreUnreadable { .. }
+    );
     ProxyRefusal {
         status: if transient { 503 } else { 403 },
         code,
@@ -7975,10 +7979,9 @@ mod session_tenant_resolution_tests {
             Some(CwdTenant::Resolved { tenant_id, .. }) if tenant_id == b
         ));
         // The wire form of an old entry has no `expected_tenant` at all.
-        let old: crate::secure_storage::StoredGracedNonce = serde_json::from_value(
-            serde_json::json!({"workdir": "/w", "grace_until_unix": 1u64}),
-        )
-        .expect("an entry written before the field still loads");
+        let old: crate::secure_storage::StoredGracedNonce =
+            serde_json::from_value(serde_json::json!({"workdir": "/w", "grace_until_unix": 1u64}))
+                .expect("an entry written before the field still loads");
         assert!(old.expected_tenant.is_none());
     }
 
@@ -8030,7 +8033,10 @@ mod session_tenant_resolution_tests {
             tenant: a,
             live_differs: false,
         };
-        for repo in [None, Some(CwdTenant::unknown_transient("coord unreachable"))] {
+        for repo in [
+            None,
+            Some(CwdTenant::unknown_transient("coord unreachable")),
+        ] {
             let got = repo_unsettled_refusal(
                 &inputs(repo.clone(), PinOrigin::MachineSampled),
                 &machine,
@@ -8089,16 +8095,90 @@ mod session_tenant_resolution_tests {
             },
         );
         assert_eq!((unreadable.status, unreadable.retryable), (503, true));
-        let unpaired =
-            repo_tenant_unbound_error(b, "qontinui/repo-b", &SpawnTenantRefusal::NotPaired { tenant: b });
+        let unpaired = repo_tenant_unbound_error(
+            b,
+            "qontinui/repo-b",
+            &SpawnTenantRefusal::NotPaired { tenant: b },
+        );
         assert_eq!((unpaired.status, unpaired.retryable), (403, false));
         for m in [&unreadable.message, &unpaired.message] {
-            assert!(!m.contains("  "), "a lost `\\` continuation leaves a run of spaces: {m}");
+            assert!(
+                !m.contains("  "),
+                "a lost `\\` continuation leaves a run of spaces: {m}"
+            );
         }
+        assert!(!repo_tenant_ambiguous_error("qontinui/shared", &[b])
+            .message
+            .contains("  "));
+    }
+
+    /// In-cwd reuse: a spawn that NAMED a tenant never reuses a machine-sampled
+    /// key, and a tenant-less spawn never reuses an explicitly pinned one.
+    #[test]
+    fn in_cwd_reuse_respects_pin_provenance() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = std::env::temp_dir().join(format!("p5-2029-reuse-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let wd = dir.to_string_lossy().to_string();
+        let port = 23498u16;
+        write_coord_mcp_proxy_config(&wd, port, None);
+        let nonce = read_proxy_nonce(&dir.join(".mcp.json")).expect("nonce");
+        let t = tenant(0x67);
+        let set = |origin| {
+            let mut map = proxy_nonces().lock().unwrap();
+            let b = map.get_mut(&nonce).expect("live binding");
+            b.session_pin = TenantPin::Pinned(t);
+            b.pin_origin = origin;
+        };
+        set(PinOrigin::MachineSampled);
         assert!(
-            !repo_tenant_ambiguous_error("qontinui/shared", &[b])
-                .message
-                .contains("  ")
+            reusable_in_cwd_device_nonce(&wd, port, Some(t)).is_none(),
+            "a spawn that named a tenant must not ride a machine-sampled key"
+        );
+        set(PinOrigin::Explicit);
+        assert!(
+            reusable_in_cwd_device_nonce(&wd, port, Some(t)).is_some(),
+            "a key chosen for the named tenant is reusable"
+        );
+        assert!(
+            reusable_in_cwd_device_nonce(&wd, port, None).is_none(),
+            "a tenant-less spawn must not ride an explicitly pinned key"
+        );
+    }
+
+    /// A restored graced entry recomputes the caller-named half and keeps a
+    /// settled expectation verbatim.
+    #[test]
+    fn a_restored_graced_key_keeps_its_settled_expectation() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0x68), tenant(0x69));
+        let nonce = format!("graced-restore-2029-{}", Uuid::new_v4().simple());
+        let until = minted_at_to_unix(std::time::SystemTime::now()) + 3_600;
+        restore_graced_nonces(HashMap::from([(
+            nonce.clone(),
+            crate::secure_storage::StoredGracedNonce {
+                workdir: "/graced/2029/restore".to_string(),
+                terminal_id: None,
+                grace_until_unix: until,
+                session_tenant: Some(a),
+                session_tenant_origin: Some(crate::secure_storage::StoredPinOrigin::Explicit),
+                expected_tenant: Some(CwdTenant::Resolved {
+                    tenant_id: b,
+                    repo: "qontinui/repo-b".to_string(),
+                    source: "canonical_repos".to_string(),
+                    observed_at: "2026-10-06T00:00:00Z".to_string(),
+                }),
+            },
+        )]));
+        let g = live_graced_nonce(&nonce).expect("restored");
+        assert!(matches!(
+            g.expected.settled(),
+            Some(CwdTenant::Resolved { tenant_id, .. }) if tenant_id == b
+        ));
+        assert_eq!(
+            g.expected.caller_named().map(|c| c.tenant_id),
+            Some(a),
+            "an explicitly pinned session's superseded key still names its tenant"
         );
     }
 
@@ -9014,8 +9094,12 @@ fn reusable_in_cwd_device_nonce(
             (Some(t), pin) => {
                 pin == TenantPin::Pinned(t) && binding.pin_origin == PinOrigin::Explicit
             }
+            // An EXPLICIT pin sits at row 1 and outranks the workspace and repo
+            // tiers a fresh tenant-less mint would be steered by, so only a
+            // machine-SAMPLED key is interchangeable with a re-mint.
             (None, TenantPin::Pinned(t)) => {
                 crate::session::tenant_pin::resolve_tenant_pin() == TenantPin::Pinned(t)
+                    && binding.pin_origin == PinOrigin::MachineSampled
             }
             (None, _) => true,
         };
@@ -22676,7 +22760,10 @@ pub(crate) mod doctor {
                 binding_origin,
                 workdir: workspace.clone(),
                 repo: repo.clone(),
-                repo_steers: nonce_resolved == Some(true),
+                // Only an ESTABLISHED-but-transient repo answer is judged; an
+                // unestablished one (never called) would read as refused here
+                // though the proxy resolves it on the first call.
+                repo_steers: nonce_resolved == Some(true) && repo.is_some(),
             },
             &decision,
             device_is_multi_bound,
