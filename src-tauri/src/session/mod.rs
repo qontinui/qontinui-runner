@@ -69,6 +69,7 @@ pub mod handoff;
 pub mod intent;
 pub mod local_store;
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
+pub mod operator_touch_close; // The runner closes the touches it opened: the persisted open set, the D4 close words, the input/orphan signals (plan 2026-10-05-operator-touch-close-path, Phase 3)
 pub mod output_pipe;
 pub mod pane_store;
 pub mod past_sessions;
@@ -426,6 +427,30 @@ pub enum SessionEventKind {
     /// fails if it is missed.
     #[serde(rename = "operator_input")]
     OperatorInput,
+    /// The CLOSE of an operator touch this runner opened (plan
+    /// `2026-10-05-operator-touch-close-path`, Phase 3). Producer:
+    /// [`crate::session::operator_touch_close`] — the first input after an
+    /// `idle_at_prompt` / `permission_prompt` opened (`answered` /
+    /// `self_resolved`, worded from #1857's door classifier), or the
+    /// terminal's death (`abandoned`). `session_exit` is never closed here.
+    ///
+    /// Rides the SAME session lane as its open, so it drains after it in the
+    /// per-session seq chain — and carries the open anyway (plan D1): the
+    /// outbox acks any 2xx and drops an open after its transport budget, so
+    /// coord inserts the carried open and the close in one transaction.
+    ///
+    /// Drained to `POST /coord/sessions/operator-touch/close` with body
+    /// `{touch, resolution, close_actor_class?, observed_wait_ms?}`, built by
+    /// [`crate::session::operator_touch_close::close_body`] from the recorded
+    /// payload and this row's own `recorded_at` (the wait is close
+    /// `recorded_at` − open `recorded_at`, one device clock — plan D3).
+    ///
+    /// Best-effort, same posture as [`Self::OperatorTouch`]; no retry on a
+    /// `touch_not_found` 200. ⚠️ Same load-bearing-arm hazard: without its
+    /// `push_record` arm the kind is ACK-DROPPED silently —
+    /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
+    #[serde(rename = "operator_touch_close")]
+    OperatorTouchClose,
 }
 
 impl SessionEventKind {
@@ -451,6 +476,7 @@ impl SessionEventKind {
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
             SessionEventKind::OperatorInput => "operator_input",
+            SessionEventKind::OperatorTouchClose => "operator_touch_close",
         }
     }
 }

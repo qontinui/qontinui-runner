@@ -209,6 +209,11 @@ struct CoordSyncInner {
     /// session to `PendingResolution`. Entries live only as long as a
     /// [`DrainHold`] guard.
     held: Mutex<HashSet<Uuid>>,
+    /// The operator touches this runner opened and has not yet closed (plan
+    /// `2026-10-05-operator-touch-close-path` Phase 3), persisted beside the
+    /// outbox so a restart does not orphan them. See
+    /// [`crate::session::operator_touch_close`].
+    open_touches: Arc<crate::session::operator_touch_close::OpenTouchStore>,
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
@@ -255,6 +260,9 @@ impl CoordSync {
                 reqwest::Client::new()
             });
 
+        let open_touches = Arc::new(
+            crate::session::operator_touch_close::OpenTouchStore::open_beside(outbox.path()),
+        );
         Self {
             inner: Arc::new(CoordSyncInner {
                 outbox,
@@ -271,6 +279,7 @@ impl CoordSync {
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
                 held: Mutex::new(HashSet::new()),
+                open_touches,
             }),
         }
     }
@@ -285,6 +294,9 @@ impl CoordSync {
         heartbeat: Duration,
         stale: Duration,
     ) -> Self {
+        let open_touches = Arc::new(
+            crate::session::operator_touch_close::OpenTouchStore::open_beside(outbox.path()),
+        );
         Self {
             inner: Arc::new(CoordSyncInner {
                 outbox,
@@ -306,6 +318,7 @@ impl CoordSync {
                 // probe the REAL upstream from a unit test.
                 outside_observer: None,
                 held: Mutex::new(HashSet::new()),
+                open_touches,
             }),
         }
     }
@@ -313,6 +326,12 @@ impl CoordSync {
     /// Borrow the local outbox. Phase 2 surface — unchanged.
     pub fn outbox(&self) -> &OutboxWriter {
         &self.inner.outbox
+    }
+
+    /// The persisted set of operator touches this runner opened and has not
+    /// closed (plan `2026-10-05-operator-touch-close-path` Phase 3).
+    pub fn open_touches(&self) -> Arc<crate::session::operator_touch_close::OpenTouchStore> {
+        self.inner.open_touches.clone()
     }
 
     /// Coord URL the loops POST/PATCH/DELETE against. Surfaced for tests
@@ -1021,6 +1040,7 @@ fn is_best_effort_kind(kind: &str) -> bool {
         || kind == SessionEventKind::AgentNotification.as_str()
         || kind == SessionEventKind::OperatorTouch.as_str()
         || kind == SessionEventKind::OperatorInput.as_str()
+        || kind == SessionEventKind::OperatorTouchClose.as_str()
 }
 
 /// How many per-session push chains run at once (plan
@@ -1759,6 +1779,37 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "operator_touch_close" => {
+            // Operator-touch CLOSE (plan 2026-10-05-operator-touch-close-path,
+            // Phase 3). POST /coord/sessions/operator-touch/close with
+            // `{touch, resolution, close_actor_class?, observed_wait_ms?}`.
+            // The body is built HERE, not by the producer, because
+            // `observed_wait_ms` is this row's own `recorded_at` minus the
+            // open's (plan D3) — only the drained row knows the former. The
+            // close carries its full open (plan D1), so coord inserts the
+            // open and the close in one transaction; a `touch_not_found` 200
+            // is acked like any 2xx and never retried. Same device-JWT auth
+            // as the open's arm above.
+            //
+            // ⚠️ LOAD-BEARING, same hazard as "operator_touch": without this
+            // arm the kind falls to the `other` catch-all and every close is
+            // ACKed and DROPPED. See
+            // `every_session_outbox_kind_has_a_dispatch_arm` and
+            // `drain_pushes_operator_touch_close_to_the_dedicated_route`.
+            let Some(body) =
+                crate::session::operator_touch_close::close_body(&rec.payload, rec.recorded_at)
+            else {
+                return PushOutcome::PermanentFailure(
+                    "operator_touch_close payload carries no open `touch` of a kind the \
+                     runner closes, or no `resolution` — the close body cannot be built"
+                        .to_string(),
+                );
+            };
+            let url = format!("{base}/coord/sessions/operator-touch/close");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
         "operator_input" => {
             // Operator-input episode (plan
             // 2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record,
@@ -1892,6 +1943,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             }
             if kind == "finding_posted" {
                 return finding_outcome(rec, resp).await;
+            }
+            if kind == "operator_touch_close" {
+                return operator_touch_close_outcome(rec, resp).await;
             }
             let status = resp.status();
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
@@ -2160,6 +2214,40 @@ async fn helper_task_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> Pus
         // Transient 503 (ELB / deploy) — bounded-retry, don't drop the task.
         return PushOutcome::Transport(format!("{status}: {detail}"));
     }
+    write_failure_outcome(status, format!("{status}: {detail}"))
+}
+
+/// The close route answers 200 for every outcome (plan
+/// `2026-10-05-operator-touch-close-path` Phase 2a). Two of them record NO
+/// close — `touch_not_found` (a foreign or other-device key; never retried,
+/// plan D1) and `token_carries_no_tenant` — so they are counted and warned at
+/// most once a minute rather than acked silently. Any 2xx is acked.
+async fn operator_touch_close_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> PushOutcome {
+    use crate::session::operator_touch_close::{
+        is_unrecorded_close_outcome, note_unrecorded_close,
+    };
+    let status = resp.status();
+    if status.is_success() {
+        let outcome = resp.json::<JsonValue>().await.ok().and_then(|b| {
+            b.get("outcome")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        });
+        if let Some(outcome) = outcome.filter(|o| is_unrecorded_close_outcome(o)) {
+            let (total, log) = note_unrecorded_close();
+            if log {
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    outcome = %outcome,
+                    unrecorded_total = total,
+                    "coord_sync: coord recorded NO operator-touch close — acked, not retried"
+                );
+            }
+        }
+        return PushOutcome::Acked;
+    }
+    let detail = resp.text().await.unwrap_or_default();
     write_failure_outcome(status, format!("{status}: {detail}"))
 }
 
@@ -3458,6 +3546,7 @@ mod tests {
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
             SessionEventKind::OperatorInput,
+            SessionEventKind::OperatorTouchClose,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -3634,6 +3723,8 @@ mod tests {
         operator_touches: Vec<JsonValue>,
         /// Bodies accepted by `POST /coord/sessions/operator-input`.
         operator_inputs: Vec<JsonValue>,
+        /// Bodies accepted by `POST /coord/sessions/operator-touch/close`.
+        operator_touch_closes: Vec<JsonValue>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -3991,6 +4082,17 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/sessions/operator-touch/close",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.operator_touch_closes.push(body.clone());
+                        (AxumStatus::OK, Json(json!({ "outcome": "closed" }))).into_response()
                     },
                 ),
             )
@@ -4382,6 +4484,399 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// `operator_touch_close` end-to-end through a real drain, recorded by the
+    /// producer itself ([`crate::session::operator_touch_close`]): the close
+    /// reaches the DEDICATED close route (an empty `operator_touch_closes`
+    /// means `push_record` has no arm and the row was Ack-DROPPED), carries
+    /// the full open verbatim (plan D1), the D4 words, and a wait measured
+    /// from the two outbox `recorded_at`s (plan D3) — and nothing else.
+    #[tokio::test]
+    async fn drain_pushes_operator_touch_close_to_the_dedicated_route() {
+        use crate::session::operator_touch_close::{
+            record_closes, CloseActorClass, OpenTouch, PendingClose, Resolution,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let open_payload = crate::session::operator_touch::touch_payload(
+            crate::session::operator_touch::KIND_PERMISSION_PROMPT,
+            session_id,
+            Some("harness-session-abc"),
+            1_726_000_020,
+        );
+        let open_recorded_at = chrono::Utc::now() - chrono::Duration::seconds(90);
+        record_closes(
+            &outbox,
+            machine_id,
+            &[PendingClose {
+                touch: OpenTouch {
+                    terminal_id: "t1".to_string(),
+                    kind: crate::session::operator_touch::KIND_PERMISSION_PROMPT.to_string(),
+                    coord_session_id: session_id,
+                    idempotency_key: format!("{session_id}:permission_prompt:1726000020"),
+                    open_payload: open_payload.clone(),
+                    open_recorded_at,
+                    open_confirmed: true,
+                    failed_close: None,
+                    tenant_id: Some(Uuid::new_v4()),
+                    reloaded: false,
+                },
+                resolution: Resolution::Answered,
+                actor_class: Some(CloseActorClass::Unknown),
+            }],
+        )
+        .unwrap();
+        let close_recorded_at = outbox.pending().unwrap()[0].recorded_at;
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.operator_touch_closes.is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.operator_touch_closes.len(), 1);
+        assert!(
+            g.events.is_empty() && g.operator_touches.is_empty(),
+            "the close rides its own route"
+        );
+        let body = &g.operator_touch_closes[0];
+        assert_eq!(body["touch"], open_payload, "the full open, verbatim");
+        assert_eq!(body["resolution"], json!("answered"));
+        assert_eq!(body["close_actor_class"], json!("unknown"));
+        assert_eq!(
+            body["observed_wait_ms"],
+            json!((close_recorded_at - open_recorded_at).num_milliseconds())
+        );
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            4,
+            "the record's tenant_id picks the credential and never rides the body"
+        );
+        drop(g);
+
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    // ---- operator-touch close path: the production wiring (plan
+    // 2026-10-05-operator-touch-close-path Phase 3) ------------------------
+
+    /// A registry over `outbox` whose coord is never reached (nothing drains).
+    fn close_path_registry(outbox: &Arc<OutboxWriter>) -> (CoordSync, Arc<SessionRegistry>) {
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:9".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let registry = build_registry(coord.clone());
+        (coord, registry)
+    }
+
+    fn start_with_tenant(registry: &Arc<SessionRegistry>, tenant: Uuid) -> Uuid {
+        let mut intent = make_test_intent();
+        intent.tenant_id = Some(tenant);
+        registry.start(intent).unwrap().id()
+    }
+
+    fn close_rows(outbox: &OutboxWriter) -> Vec<OutboxRecord> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::OperatorTouchClose.as_str())
+            .collect()
+    }
+
+    fn open_row_key(
+        outbox: &OutboxWriter,
+        session_id: Uuid,
+    ) -> (String, chrono::DateTime<chrono::Utc>) {
+        let row = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| {
+                r.session_id == session_id
+                    && r.event_kind == SessionEventKind::OperatorTouch.as_str()
+            })
+            .expect("the open row");
+        (
+            row.payload["idempotency_key"].as_str().unwrap().to_string(),
+            row.recorded_at,
+        )
+    }
+
+    /// `emit` → `begin_tracking` (remembered AND persisted before the append,
+    /// with the session's tenant) → append → `confirm_tracking` (the row's
+    /// own `recorded_at`). Fails if either call site leaves `emit`.
+    #[tokio::test]
+    async fn emit_tracks_the_open_with_the_sessions_tenant_and_the_rows_recorded_at() {
+        use crate::session::operator_touch::{self, KIND_IDLE_AT_PROMPT, KIND_SESSION_EXIT};
+        use crate::session::operator_touch_close::OpenTouchStore;
+        assert!(operator_touch::armed(), "kill switch set in the test env");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (coord, registry) = close_path_registry(&outbox);
+        let tenant = Uuid::from_bytes([0x37; 16]);
+        let sid = start_with_tenant(&registry, tenant);
+
+        operator_touch::emit(
+            &registry,
+            sid,
+            KIND_IDLE_AT_PROMPT,
+            Some("h"),
+            Some("term-1"),
+        )
+        .unwrap();
+        let (key, recorded_at) = open_row_key(&outbox, sid);
+        let held = coord.open_touches().snapshot();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].idempotency_key, key);
+        assert_eq!(held[0].terminal_id, "term-1");
+        assert_eq!(held[0].tenant_id, Some(tenant));
+        assert!(held[0].open_confirmed, "confirm_tracking ran");
+        assert_eq!(held[0].open_recorded_at, recorded_at, "the row's own stamp");
+
+        let on_disk = OpenTouchStore::open_beside(outbox.path()).snapshot();
+        assert_eq!(on_disk.len(), 1, "persisted");
+        assert_eq!(on_disk[0].tenant_id, Some(tenant));
+
+        operator_touch::emit(&registry, sid, KIND_SESSION_EXIT, None, Some("term-1")).unwrap();
+        assert_eq!(
+            coord.open_touches().snapshot().len(),
+            1,
+            "session_exit is never tracked"
+        );
+        operator_touch::emit(&registry, sid, KIND_IDLE_AT_PROMPT, Some("h"), None).unwrap();
+        assert_eq!(
+            coord.open_touches().snapshot().len(),
+            1,
+            "no terminal to track on, nothing tracked"
+        );
+    }
+
+    /// Persist-before-append, at the exact point `emit` reaches between
+    /// `begin_tracking` and its outbox append: the provisional open (with the
+    /// session's tenant) is already ON DISK, unconfirmed. A failed append's
+    /// `abort_tracking` removes it from disk again. A source guard pins that
+    /// `emit` calls the three in that order, `abort_tracking` on the error arm.
+    #[tokio::test]
+    async fn begin_tracking_persists_before_the_append_and_abort_unpersists() {
+        use crate::session::operator_touch::{self, KIND_PERMISSION_PROMPT};
+        use crate::session::operator_touch_close::{
+            abort_tracking, begin_tracking, OpenTouchStore,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (_coord, registry) = close_path_registry(&outbox);
+        let tenant = Uuid::from_bytes([0x3b; 16]);
+        let sid = start_with_tenant(&registry, tenant);
+        let key = operator_touch::idempotency_key(sid, KIND_PERMISSION_PROMPT, 60);
+        let payload = operator_touch::touch_payload(KIND_PERMISSION_PROMPT, sid, None, 60);
+        let begun = begin_tracking(
+            &registry,
+            "term-p",
+            sid,
+            KIND_PERMISSION_PROMPT,
+            &key,
+            &payload,
+        );
+        assert_eq!(begun.as_deref(), Some(key.as_str()));
+        let on_disk = OpenTouchStore::open_beside(outbox.path()).snapshot();
+        assert_eq!(on_disk.len(), 1, "on disk before any append");
+        assert!(!on_disk[0].open_confirmed);
+        assert_eq!(on_disk[0].tenant_id, Some(tenant));
+        abort_tracking(&registry, &key);
+        assert!(OpenTouchStore::open_beside(outbox.path())
+            .snapshot()
+            .is_empty());
+
+        let src =
+            crate::terminal::operator_touch_watch::code_only(include_str!("operator_touch.rs"));
+        let emit = src
+            .split_once("pub fn emit(")
+            .expect("emit exists")
+            .1
+            .split_once("\n}\n")
+            .expect("emit body")
+            .0;
+        let begin = emit.find("close::begin_tracking(").expect("begin_tracking");
+        let append = emit.find(".record(").expect("the append");
+        let abort = emit.find("close::abort_tracking(").expect("abort_tracking");
+        let confirm = emit
+            .find("close::confirm_tracking(")
+            .expect("confirm_tracking");
+        assert!(begin < append && append < abort && abort < confirm);
+    }
+
+    /// The orphan step against a fake terminal snapshot — a dead pane and a
+    /// removed one are abandoned with a measured wait, a live one is kept —
+    /// then a "restart" (a new CoordSync reloading the store beside the same
+    /// outbox) abandons the survivor WITHOUT a wait, and its close still
+    /// picks the session's tenant although the new registry never saw it.
+    #[tokio::test]
+    async fn orphan_step_abandons_dead_and_gone_terminals_and_a_restart_recovers_the_rest() {
+        use crate::session::operator_touch::{self, KIND_IDLE_AT_PROMPT};
+        use crate::session::operator_touch_close::{close_body, close_orphaned};
+        assert!(operator_touch::armed(), "kill switch set in the test env");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (coord, registry) = close_path_registry(&outbox);
+        let tenant = Uuid::from_bytes([0x38; 16]);
+        let mut keys = std::collections::HashMap::new();
+        for term in ["dead", "gone", "live"] {
+            let sid = start_with_tenant(&registry, tenant);
+            operator_touch::emit(&registry, sid, KIND_IDLE_AT_PROMPT, None, Some(term)).unwrap();
+            keys.insert(term, open_row_key(&outbox, sid).0);
+        }
+
+        // The tick's shape: candidates first, then the snapshot.
+        let candidates = coord.open_touches().terminal_ids();
+        let snapshot = [("dead", false), ("live", true)]; // "gone" was removed
+        close_orphaned(&registry, &candidates, |tid| {
+            snapshot.iter().any(|(id, alive)| *id == tid && *alive)
+        });
+        let rows = close_rows(&outbox);
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let body = close_body(&row.payload, row.recorded_at).unwrap();
+            assert_eq!(body["resolution"], json!("abandoned"));
+            assert!(body.get("close_actor_class").is_none());
+            assert!(body["observed_wait_ms"].is_u64(), "observed in-process");
+            let key = body["touch"]["idempotency_key"].as_str().unwrap();
+            assert!(key == keys["dead"] || key == keys["gone"], "{key}");
+        }
+        assert_eq!(
+            coord.open_touches().terminal_ids(),
+            vec!["live".to_string()]
+        );
+
+        // Restart.
+        let (coord2, registry2) = close_path_registry(&outbox);
+        let reloaded = coord2.open_touches().terminal_ids();
+        assert_eq!(reloaded, vec!["live".to_string()]);
+        close_orphaned(&registry2, &reloaded, |_| false);
+        let rows = close_rows(&outbox);
+        assert_eq!(rows.len(), 3);
+        let recovered = rows
+            .iter()
+            .find(|r| r.payload["touch"]["idempotency_key"] == json!(keys["live"]))
+            .expect("the survivor was closed");
+        let body = close_body(&recovered.payload, recovered.recorded_at).unwrap();
+        assert_eq!(body["resolution"], json!("abandoned"));
+        assert!(
+            body.get("observed_wait_ms").is_none(),
+            "a reloaded open's end was not observed"
+        );
+        assert!(
+            body.get("tenant_id").is_none(),
+            "tenant never rides the body"
+        );
+        assert!(
+            matches!(
+                record_session_tenant(&coord2.inner, recovered),
+                TenantScope::Owned(t) if t == tenant
+            ),
+            "the close presents the session's tenant credential"
+        );
+        assert!(coord2.open_touches().terminal_ids().is_empty());
+    }
+
+    /// The input path's production half: `close_on_input` takes the open and
+    /// ENQUEUES it to the close thread, which appends the close. Fails if the
+    /// enqueue is deleted.
+    #[tokio::test]
+    async fn an_input_close_is_enqueued_and_recorded_by_the_close_thread() {
+        use crate::session::operator_touch::{self, KIND_PERMISSION_PROMPT};
+        use crate::session::operator_touch_close::{close_body, close_on_input};
+        use crate::terminal::session::PtyWriteCaller;
+        assert!(operator_touch::armed(), "kill switch set in the test env");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (coord, registry) = close_path_registry(&outbox);
+        let tenant = Uuid::from_bytes([0x39; 16]);
+        let sid = start_with_tenant(&registry, tenant);
+        operator_touch::emit(
+            &registry,
+            sid,
+            KIND_PERMISSION_PROMPT,
+            None,
+            Some("term-in"),
+        )
+        .unwrap();
+
+        close_on_input(&registry, "term-in", &PtyWriteCaller::TauriTerminalWrite);
+        wait_until(Duration::from_secs(5), || close_rows(&outbox).len() == 1).await;
+        let row = &close_rows(&outbox)[0];
+        assert_eq!(row.session_id, sid, "the open's own lane");
+        assert_eq!(row.payload["tenant_id"], json!(tenant.to_string()));
+        let body = close_body(&row.payload, row.recorded_at).unwrap();
+        assert_eq!(body["resolution"], json!("answered"));
+        assert_eq!(body["close_actor_class"], json!("human"));
+        assert!(body["observed_wait_ms"].is_u64());
+        assert!(coord.open_touches().terminal_ids().is_empty());
+    }
+
+    /// D4's episode-end row through a real registry: the idle open closes
+    /// `self_resolved` / `none` with a measured wait; a permission prompt on
+    /// the same terminal is NOT an idle episode and stays open.
+    #[tokio::test]
+    async fn an_idle_episode_that_ends_without_input_self_resolves_only_the_idle_open() {
+        use crate::session::operator_touch::{self, KIND_IDLE_AT_PROMPT, KIND_PERMISSION_PROMPT};
+        use crate::session::operator_touch_close::{close_body, close_idle_episode};
+        assert!(operator_touch::armed(), "kill switch set in the test env");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (coord, registry) = close_path_registry(&outbox);
+        let tenant = Uuid::from_bytes([0x3a; 16]);
+        let older = start_with_tenant(&registry, tenant);
+        let newer = start_with_tenant(&registry, tenant);
+        operator_touch::emit(&registry, older, KIND_IDLE_AT_PROMPT, None, Some("term-ep")).unwrap();
+        operator_touch::emit(&registry, newer, KIND_IDLE_AT_PROMPT, None, Some("term-ep")).unwrap();
+        operator_touch::emit(
+            &registry,
+            older,
+            KIND_PERMISSION_PROMPT,
+            None,
+            Some("term-ep"),
+        )
+        .unwrap();
+
+        close_idle_episode(&registry, "term-ep");
+        let rows = close_rows(&outbox);
+        assert_eq!(
+            rows.len(),
+            2,
+            "every stale idle open, not the permission prompt"
+        );
+        for row in &rows {
+            let body = close_body(&row.payload, row.recorded_at).unwrap();
+            assert_eq!(body["touch"]["kind"], json!(KIND_IDLE_AT_PROMPT));
+            assert_eq!(body["resolution"], json!("self_resolved"));
+            assert_eq!(body["close_actor_class"], json!("none"));
+            assert!(body["observed_wait_ms"].is_u64());
+        }
+        let left = coord.open_touches().snapshot();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, KIND_PERMISSION_PROMPT);
     }
 
     /// `operator_input` end-to-end through a real drain: an empty
@@ -6976,6 +7471,7 @@ mod tests {
             SessionEventKind::FindingPosted,
             SessionEventKind::OperatorTouch,
             SessionEventKind::OperatorInput,
+            SessionEventKind::OperatorTouchClose,
         ] {
             assert!(is_best_effort_kind(kind.as_str()), "{kind:?}");
         }

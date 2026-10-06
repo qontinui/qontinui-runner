@@ -4063,6 +4063,12 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// This terminal's runner id — the `TerminalManager` key, minted fresh
+    /// per terminal (and so per process).
+    pub fn terminal_id(&self) -> &str {
+        &self.id
+    }
+
     /// The harness session id the identity seam pinned this PTY child to —
     /// the value of `QONTINUI_PINNED_SESSION_ID` in the child's env, and the
     /// id the coord session row is registered under. Fixed at spawn.
@@ -8578,6 +8584,117 @@ pub(crate) mod tests {
             .expect("live fixture write");
         assert_eq!(session.operator_input_episodes().opened(), 0);
         assert_eq!(session.operator_input_episodes().state_reads(), 0);
+    }
+
+    // ---- operator-touch close signal (plan 2026-10-05-operator-touch-close-
+    // path, Phase 3, D4) — through the real write / submit_prompt funnel ----
+
+    fn open_touch_for(
+        session: &TerminalSession,
+        kind: &str,
+    ) -> crate::session::operator_touch_close::OpenTouch {
+        let sid = uuid::Uuid::new_v4();
+        crate::session::operator_touch_close::OpenTouch {
+            terminal_id: session.terminal_id().to_string(),
+            kind: kind.to_string(),
+            coord_session_id: sid,
+            idempotency_key: crate::session::operator_touch::idempotency_key(sid, kind, 60),
+            open_payload: crate::session::operator_touch::touch_payload(kind, sid, None, 60),
+            open_recorded_at: chrono::Utc::now(),
+            open_confirmed: true,
+            failed_close: None,
+            tenant_id: None,
+            reloaded: false,
+        }
+    }
+
+    /// Clicking into a pane (a focus report) is the emulator talking: it
+    /// closes nothing. The first REAL keystroke after it does.
+    #[test]
+    fn a_control_response_never_closes_an_operator_touch_but_the_next_keystroke_does() {
+        use crate::session::operator_touch_close::{
+            test_hook, CloseActorClass, OpenTouchStore, Resolution,
+        };
+        assert!(
+            crate::session::operator_touch::armed(),
+            "QONTINUI_OPERATOR_TOUCH_HOOK=0 is set in the test env — this test would be vacuous"
+        );
+        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        let store = Arc::new(OpenTouchStore::in_memory());
+        store
+            .remember(open_touch_for(
+                &session,
+                crate::session::operator_touch::KIND_IDLE_AT_PROMPT,
+            ))
+            .unwrap();
+
+        let ((), closed) = test_hook::with_store(store.clone(), || {
+            session
+                .write(b"\x1b[I", PtyWriteCaller::TauriTerminalWrite)
+                .expect("live fixture write");
+            session
+                .write(&[], PtyWriteCaller::TauriTerminalWrite)
+                .expect("live fixture write");
+        });
+        assert!(
+            closed.is_empty(),
+            "a focus report / empty write closed {closed:?}"
+        );
+        assert_eq!(store.snapshot().len(), 1);
+
+        let ((), closed) = test_hook::with_store(store.clone(), || {
+            session
+                .write(b"y", PtyWriteCaller::TauriTerminalWrite)
+                .expect("live fixture write");
+        });
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].resolution, Resolution::Answered);
+        assert_eq!(closed[0].actor_class, Some(CloseActorClass::Human));
+        assert!(store.snapshot().is_empty());
+    }
+
+    /// `submit_prompt` is the second funnel: an automated submit (which opens
+    /// no operator-input episode) still closes a permission prompt as
+    /// `self_resolved`, and an ambiguous-door submit answers it as `unknown`.
+    #[test]
+    fn submit_prompt_closes_an_operator_touch_with_the_doors_words() {
+        use crate::session::operator_touch_close::{
+            test_hook, CloseActorClass, OpenTouchStore, Resolution,
+        };
+        assert!(
+            crate::session::operator_touch::armed(),
+            "QONTINUI_OPERATOR_TOUCH_HOOK=0 is set in the test env — this test would be vacuous"
+        );
+        for (caller, resolution, class) in [
+            (
+                PtyWriteCaller::LoopingAgentNudge,
+                Resolution::SelfResolved,
+                CloseActorClass::None,
+            ),
+            (
+                PtyWriteCaller::HttpSubmitPrompt,
+                Resolution::Answered,
+                CloseActorClass::Unknown,
+            ),
+        ] {
+            let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+            let store = Arc::new(OpenTouchStore::in_memory());
+            store
+                .remember(open_touch_for(
+                    &session,
+                    crate::session::operator_touch::KIND_PERMISSION_PROMPT,
+                ))
+                .unwrap();
+            let tag = caller.to_string();
+            let ((), closed) = test_hook::with_store(store.clone(), || {
+                session
+                    .submit_prompt("go on", caller)
+                    .expect("live fixture submit");
+            });
+            assert_eq!(closed.len(), 1, "{tag}");
+            assert_eq!(closed[0].resolution, resolution, "{tag}");
+            assert_eq!(closed[0].actor_class, Some(class), "{tag}");
+        }
     }
 
     /// The non-blocking grid read answers `None` under contention, never waits.

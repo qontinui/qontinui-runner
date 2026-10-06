@@ -19,6 +19,11 @@
 //! present and future PTY producer already passes through those two, tagged
 //! with its [`PtyWriteCaller`], so no producer can bypass this.
 //!
+//! The same seam is the operator-touch CLOSE signal
+//! ([`crate::session::operator_touch_close::on_terminal_input`], plan
+//! `2026-10-05-operator-touch-close-path` Phase 3): [`on_input`] hands it the
+//! terminal id and the caller tag — never the bytes — before its own latch.
+//!
 //! ## `actor_class` comes from the DOOR, never from the content
 //!
 //! [`classify`] is an exhaustive `match` on [`PtyWriteCaller`] with NO
@@ -398,6 +403,13 @@ pub fn input_payload(
 /// every input write re-opens and re-releases, so `unattributed` counts
 /// WRITES, not episodes.
 pub fn on_input(session: &TerminalSession, caller: &PtyWriteCaller, now_unix_secs: i64) {
+    // Operator-touch close signal (plan `2026-10-05-operator-touch-close-path`
+    // Phase 3, D4): the first input after a touch opened closes it, worded
+    // from this same door classification. Ahead of the latch on purpose — an
+    // automated door opens no input episode but still closes a touch as
+    // `self_resolved`, and every keystroke (not just the latch-opening one)
+    // must see an open that appeared mid-bucket. Never blocks.
+    crate::session::operator_touch_close::on_terminal_input(session.terminal_id(), caller);
     let Some(episode) = session
         .operator_input_episodes()
         .observe(caller, now_unix_secs)
