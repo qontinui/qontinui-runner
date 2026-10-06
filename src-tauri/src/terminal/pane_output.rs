@@ -35,13 +35,33 @@ use tracing::{debug, warn};
 /// carry its own wording without a closure allocation.
 pub type LossMarker = fn(u64) -> Vec<u8>;
 
+/// The sending half: unbounded (`RemotePaneIo`, whose producer is the relay's
+/// async routing loop and must never block) or bounded (`DaemonPaneIo`, whose
+/// producer is its own pump thread and SHOULD block, so a flood backs up into
+/// the holder's ring rather than into this process's memory).
+#[derive(Clone)]
+enum OutputTx {
+    Unbounded(mpsc::Sender<Vec<u8>>),
+    Bounded(mpsc::SyncSender<Vec<u8>>),
+}
+
+impl OutputTx {
+    /// Blocks while a bounded channel is full; `Err` once the reader is gone.
+    fn send(&self, chunk: Vec<u8>) -> Result<(), ()> {
+        match self {
+            OutputTx::Unbounded(tx) => tx.send(chunk).map_err(|_| ()),
+            OutputTx::Bounded(tx) => tx.send(chunk).map_err(|_| ()),
+        }
+    }
+}
+
 /// See the module docs.
 pub struct PaneOutput {
     /// The correlation key, for log lines only.
     key: String,
     /// Sender half of the output channel. `None` once closed — the reader
     /// sees EOF when the last sender drops.
-    output_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    output_tx: Mutex<Option<OutputTx>>,
     /// Receiver half, taken exactly once by [`Self::take_reader`].
     output_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     /// The settled exit; `wait` parks on the condvar until it is `Some`.
@@ -51,6 +71,8 @@ pub struct PaneOutput {
     /// reconnect splice point.
     offset: AtomicU64,
     loss_marker: LossMarker,
+    /// `Some(n)` for a bounded channel (see [`Self::new_bounded`]).
+    capacity: Option<usize>,
 }
 
 impl PaneOutput {
@@ -70,13 +92,52 @@ impl PaneOutput {
         }
         Self {
             key: key.into(),
-            output_tx: Mutex::new(Some(tx)),
+            output_tx: Mutex::new(Some(OutputTx::Unbounded(tx))),
             output_rx: Mutex::new(Some(rx)),
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             offset: AtomicU64::new(next),
             loss_marker,
+            capacity: None,
         }
+    }
+
+    /// An empty channel holding at most `capacity` chunks, beginning at
+    /// absolute source offset `start_offset`. [`Self::push_output`] and
+    /// [`Self::push_local`] BLOCK while it is full — call them only from a
+    /// thread whose blocking is the backpressure you want (a pump), never
+    /// from an async task.
+    pub fn new_bounded(
+        key: impl Into<String>,
+        start_offset: u64,
+        loss_marker: LossMarker,
+        capacity: usize,
+    ) -> Self {
+        let capacity = capacity.max(1);
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(capacity);
+        Self {
+            key: key.into(),
+            output_tx: Mutex::new(Some(OutputTx::Bounded(tx))),
+            output_rx: Mutex::new(Some(rx)),
+            exit: Mutex::new(None),
+            exit_cv: Condvar::new(),
+            offset: AtomicU64::new(start_offset),
+            loss_marker,
+            capacity: Some(capacity),
+        }
+    }
+
+    /// How many chunks the channel holds before a producer blocks — `None`
+    /// for an unbounded channel.
+    pub fn capacity(&self) -> Option<usize> {
+        self.capacity
+    }
+
+    /// A clone of the live sender, taken OUT of the lock so a send that blocks
+    /// on a full bounded channel never holds it (a concurrent `close_output`
+    /// must not queue behind it).
+    fn sender(&self) -> Option<OutputTx> {
+        self.output_tx.lock().ok().and_then(|tx| tx.clone())
     }
 
     pub fn key(&self) -> &str {
@@ -114,10 +175,7 @@ impl PaneOutput {
         if bytes.is_empty() {
             return false;
         }
-        let Ok(tx) = self.output_tx.lock() else {
-            return false;
-        };
-        match tx.as_ref() {
+        match self.sender() {
             Some(tx) if tx.send(bytes.to_vec()).is_ok() => {
                 self.offset.fetch_add(bytes.len() as u64, Ordering::AcqRel);
                 true
@@ -141,10 +199,7 @@ impl PaneOutput {
         if bytes.is_empty() {
             return;
         }
-        let Ok(tx) = self.output_tx.lock() else {
-            return;
-        };
-        if let Some(tx) = tx.as_ref() {
+        if let Some(tx) = self.sender() {
             let _ = tx.send(bytes.to_vec());
         }
     }
@@ -195,10 +250,10 @@ impl PaneOutput {
         if to <= have {
             return;
         }
-        let lost = to - from.max(have);
-        if lost > 0 {
-            self.note_gap(lost);
-        }
+        // Everything from the last byte we delivered up to `to` is missing —
+        // including any part of `[have, from)` the source did not mention.
+        debug!(pane = %self.key, from, to, have, "pane output: source reported a loss");
+        self.note_gap(to - have);
         self.offset.store(to, Ordering::Release);
     }
 
@@ -327,6 +382,42 @@ mod tests {
         out.splice(10, b"XY");
         out.settle(Ok(0));
         assert_eq!(drain(&out), b"abc<lost 7>XY");
+    }
+
+    /// A reported range that starts PAST what we have still counts the bytes
+    /// in between as lost (pty_holder review finding 8: `to - have`).
+    #[test]
+    fn pty_holder_note_lost_counts_from_the_last_delivered_byte() {
+        let out = PaneOutput::new("k", b"abc".to_vec(), 0, marker);
+        out.note_lost(5, 10);
+        assert_eq!(out.offset(), 10);
+        out.settle(Ok(0));
+        assert_eq!(drain(&out), b"abc<lost 7>");
+    }
+
+    /// A bounded channel blocks its producer while full and releases it as the
+    /// reader drains; nothing is dropped and the offset counts every byte.
+    #[test]
+    fn pty_holder_bounded_output_blocks_the_producer_instead_of_growing() {
+        let out = std::sync::Arc::new(PaneOutput::new_bounded("k", 0, marker, 2));
+        let producer = {
+            let out = out.clone();
+            std::thread::spawn(move || {
+                for _ in 0..10 {
+                    out.push_output(b"0123456789");
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(out.offset() <= 30, "the producer ran ahead of a full channel");
+        let mut r = out.take_reader().unwrap();
+        let mut buf = [0u8; 100];
+        let mut got = 0;
+        while got < 100 {
+            got += r.read(&mut buf).unwrap();
+        }
+        producer.join().unwrap();
+        assert_eq!(out.offset(), 100);
     }
 
     /// `wait_for` is bounded and sees a later settle; first settle wins.
