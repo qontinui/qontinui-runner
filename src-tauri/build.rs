@@ -159,57 +159,24 @@ fn main() {
     // refactor that narrows the dist watch doesn't silently freeze the id).
     println!("cargo:rerun-if-changed=../dist/build-id.txt");
 
-    // Re-run this script when HEAD moves.
-    //   - <git-dir>/HEAD fires on branch switch / detached-head jumps.
-    //   - <common-dir>/refs/heads/ (directory) fires on any new commit to any
-    //     local branch, since refs/heads/<branch> is the file git updates when
-    //     advancing a branch ref. Without this a fresh commit on the
-    //     currently-checked-out branch would keep the old QONTINUI_GIT_SHA
-    //     embedded, defeating the purpose of this stamp.
+    // Re-run this script when HEAD moves, so a commit in THIS checkout
+    // refreshes QONTINUI_GIT_SHA and the other provenance stamps. The watched
+    // files are the exact ones git resolves for this checkout (see
+    // `git_watch_paths`): HEAD, logs/HEAD, the checked-out branch's loose ref
+    // and, in a reftable repo, reftable/tables.list.
     //
-    // The paths MUST be resolved worktree-aware: in a linked `git worktree`,
-    // `../.git` is a FILE (`gitdir: <path>`), so the former hardcoded
-    // `../.git/HEAD` / `../.git/refs/heads` watches pointed at nonexistent
-    // paths — and cargo re-runs the build script (recompiling this whole
-    // crate) on EVERY invocation when a watched path does not exist. That made
-    // each check/clippy/test in an agent worktree a full rebuild.
-    let git_entry = std::path::Path::new("../.git");
-    let git_dir = if git_entry.is_dir() {
-        Some(git_entry.to_path_buf())
-    } else {
-        // Linked worktree: `.git` is a file `gitdir: <per-worktree git dir>`.
-        std::fs::read_to_string(git_entry).ok().and_then(|s| {
-            s.strip_prefix("gitdir:").map(|p| {
-                let p = std::path::PathBuf::from(p.trim());
-                if p.is_absolute() {
-                    p
-                } else {
-                    std::path::Path::new("..").join(p)
-                }
-            })
-        })
-    };
-    if let Some(git_dir) = git_dir {
-        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-        // refs/heads lives in the COMMON git dir; a linked worktree's git dir
-        // has a `commondir` file pointing there (usually `../..`).
-        let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
-            .map(|s| {
-                let p = std::path::PathBuf::from(s.trim());
-                if p.is_absolute() {
-                    p
-                } else {
-                    git_dir.join(p)
-                }
-            })
-            .unwrap_or_else(|_| git_dir.clone());
-        println!(
-            "cargo:rerun-if-changed={}",
-            common_dir.join("refs/heads").display()
-        );
+    // Never a directory: cargo scans a `rerun-if-changed` directory
+    // recursively, so the former `<common-dir>/refs/heads` watch reran this
+    // script — and recompiled the whole crate — on every peer commit to ANY
+    // branch in the shared repo. And never a missing path: cargo reruns on
+    // EVERY build when a watched path does not exist (the linked-worktree
+    // `../.git` is a FILE, which is why the paths are resolved by git rather
+    // than spelled `.git/...`). Not a git checkout (source tarball): the list
+    // is empty and no watch is emitted — a stable fingerprint beats a
+    // nonexistent-path watch that forces a rebuild every run.
+    for path in git_watch_paths(std::path::Path::new("..")) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
-    // No git dir at all (source tarball): emit no watch — a stable fingerprint
-    // beats a nonexistent-path watch that forces a rebuild every run.
 
     // Generate the Rust `VALID_TAB_IDS` gate FROM the TypeScript `MainTabId`
     // union — one source of truth, not two hand-maintained lists (iter-2 R2).
@@ -865,6 +832,7 @@ fn git_output(
         .env_remove("GIT_DIR")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -909,6 +877,242 @@ fn finish_git(args: &[&str], out: std::process::Output) -> Result<Vec<u8>, Strin
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ))
+    }
+}
+
+/// The files whose change can move `HEAD` for the checkout containing `dir`,
+/// resolved by git itself (`rev-parse --path-format=absolute --git-path`) so a
+/// primary checkout and a linked worktree both work: `HEAD` and `logs/HEAD`
+/// (per-worktree; the reflog moves on every commit, reset or checkout in THIS
+/// worktree, even when the branch ref is packed and has no loose file), the
+/// checked-out branch's loose ref (from `symbolic-ref -q HEAD`; it resolves into
+/// the COMMON dir, so a linked worktree watches the shared ref file for its own
+/// branch only), and `reftable/tables.list` in a reftable repository.
+///
+/// Never a directory and never `packed-refs`: cargo watches a directory
+/// recursively, so `refs/heads` reran the build script on every peer commit to
+/// any branch; `packed-refs` is shared by every worktree and rewritten by ref
+/// deletions, `fetch --prune` and `gc`, none of which move this checkout's
+/// `HEAD`. Only paths that EXIST are returned — cargo treats a missing
+/// `rerun-if-changed` path as "always rerun". Git failing or `dir` not being in
+/// a repository (a source tarball) yields an empty list.
+///
+/// Accepted costs and gaps:
+/// - (a) A `git gc` costs one rerun per worktree: it rewrites `logs/HEAD` and
+///   packs the loose branch ref, whose vanished path forces one rerun that
+///   re-resolves this list. Once per gc, not once per build.
+/// - (b) With `core.logAllRefUpdates=false` AND the branch packed, a commit
+///   touches none of these files, so the stamp stays stale until the next
+///   rerun for another reason. Known, accepted stale gap (the reflog is off by
+///   default only in bare repositories, which never build).
+/// - (c) In a reftable PRIMARY checkout `tables.list` is the shared table list,
+///   so there the script reruns on any ref activity in the repo — extra reruns,
+///   never a stale stamp. A linked worktree's list is per-worktree.
+fn git_watch_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let stdout = |args: &[&str]| -> Option<String> {
+        let out = git_output(dir, args, None).ok()?;
+        let s = String::from_utf8(out).ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let mut names: Vec<String> = ["HEAD", "logs/HEAD", "reftable/tables.list"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    // Detached HEAD has no symbolic ref; HEAD and logs/HEAD cover it.
+    if let Some(branch) = stdout(&["symbolic-ref", "-q", "HEAD"]) {
+        names.push(branch);
+    }
+    let mut paths = Vec::new();
+    for name in names {
+        let Some(p) = stdout(&["rev-parse", "--path-format=absolute", "--git-path", &name]) else {
+            continue;
+        };
+        let p = std::path::PathBuf::from(p);
+        // `--path-format` is git >= 2.31; an older git that still answered
+        // relative is relative to the directory it ran in.
+        let p = if p.is_absolute() { p } else { dir.join(p) };
+        if p.is_file() && !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
+/// `git_watch_paths` against hermetic fixture repositories. Placed here rather
+/// than at the end of the file to keep it hunk-disjoint from edits there.
+#[cfg(test)]
+mod git_watch_tests {
+    use super::git_watch_paths;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Run a fixture git command isolated from the developer's config and
+    /// environment: no global/system config, no injected `GIT_CONFIG_*`, no
+    /// env that relocates the repository or changes its ref format.
+    fn git(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DEFAULT_REF_FORMAT")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git runs");
+        assert!(st.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// `<tmp>/main`: one commit on branch `main`, with a nested `src-tauri`
+    /// dir mirroring where the build script runs.
+    fn repo(tmp: &Path) -> PathBuf {
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src-tauri")).unwrap();
+        git(&main, &["init", "-q", "--template=", "-b", "main"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["config", "user.email", "t@example.invalid"]);
+        git(&main, &["config", "core.logAllRefUpdates", "true"]);
+        std::fs::write(main.join("src-tauri/f"), "x").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        main
+    }
+
+    /// Every returned path is an existing regular file; returned as
+    /// `/`-separated strings for suffix matching.
+    fn names(paths: &[PathBuf]) -> Vec<String> {
+        for p in paths {
+            assert!(p.is_file(), "{} is not an existing file", p.display());
+            assert!(p.is_absolute(), "{} is not absolute", p.display());
+        }
+        paths
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    fn no_dirs_no_packed_refs(n: &[String]) {
+        assert!(
+            !n.iter()
+                .any(|p| p.ends_with("/refs") || p.ends_with("/refs/heads")),
+            "a directory watch fires on every peer ref: {n:?}"
+        );
+        assert!(
+            !n.iter().any(|p| p.ends_with("packed-refs")),
+            "packed-refs is shared and moves on peer ref deletions: {n:?}"
+        );
+    }
+
+    #[test]
+    fn branch_checkout_watches_head_reflog_and_loose_branch_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        let n = names(&git_watch_paths(&main.join("src-tauri").join("..")));
+        assert!(n.iter().any(|p| p.ends_with("main/.git/HEAD")), "{n:?}");
+        assert!(
+            n.iter().any(|p| p.ends_with("main/.git/logs/HEAD")),
+            "{n:?}"
+        );
+        assert!(
+            n.iter().any(|p| p.ends_with("main/.git/refs/heads/main")),
+            "{n:?}"
+        );
+        assert_eq!(n.len(), 3, "{n:?}");
+        no_dirs_no_packed_refs(&n);
+    }
+
+    #[test]
+    fn linked_worktree_head_is_per_worktree_and_branch_ref_is_in_common_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        let wt = tmp.path().join("wt");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            wt.join(".git").is_file(),
+            "a linked worktree's .git is a file"
+        );
+        let n = names(&git_watch_paths(&wt.join("src-tauri").join("..")));
+        assert!(
+            n.iter().any(|p| p.ends_with("main/.git/worktrees/wt/HEAD")),
+            "{n:?}"
+        );
+        assert!(
+            n.iter()
+                .any(|p| p.ends_with("main/.git/worktrees/wt/logs/HEAD")),
+            "{n:?}"
+        );
+        assert!(
+            n.iter()
+                .any(|p| p.ends_with("main/.git/refs/heads/feature")),
+            "the branch ref resolves into the common dir: {n:?}"
+        );
+        assert!(
+            !n.iter().any(|p| p.ends_with("refs/heads/main")),
+            "a peer branch's ref is not watched: {n:?}"
+        );
+        assert!(
+            !n.iter().any(|p| p.ends_with("main/.git/HEAD")),
+            "the primary checkout's HEAD is not this worktree's: {n:?}"
+        );
+        no_dirs_no_packed_refs(&n);
+    }
+
+    #[test]
+    fn detached_head_watches_only_head_and_reflog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        git(&main, &["checkout", "-q", "--detach"]);
+        let n = names(&git_watch_paths(&main));
+        assert_eq!(n.len(), 2, "{n:?}");
+        assert!(n.iter().any(|p| p.ends_with(".git/HEAD")), "{n:?}");
+        assert!(n.iter().any(|p| p.ends_with(".git/logs/HEAD")), "{n:?}");
+        no_dirs_no_packed_refs(&n);
+    }
+
+    #[test]
+    fn packed_branch_ref_is_not_emitted_but_the_reflog_still_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        git(&main, &["pack-refs", "--all"]);
+        assert!(!main.join(".git/refs/heads/main").exists());
+        assert!(main.join(".git/packed-refs").is_file());
+        let n = names(&git_watch_paths(&main));
+        assert!(!n.iter().any(|p| p.ends_with("refs/heads/main")), "{n:?}");
+        assert!(n.iter().any(|p| p.ends_with(".git/HEAD")), "{n:?}");
+        assert!(n.iter().any(|p| p.ends_with(".git/logs/HEAD")), "{n:?}");
+        assert_eq!(n.len(), 2, "{n:?}");
+        no_dirs_no_packed_refs(&n);
+    }
+
+    #[test]
+    fn non_repository_watches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A broken `.git` file stops git's upward discovery at the tempdir,
+        // which may sit inside a checkout on a developer box.
+        let dir = tmp.path().join("plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /nonexistent/for-test\n").unwrap();
+        assert!(git_watch_paths(&dir).is_empty());
     }
 }
 
