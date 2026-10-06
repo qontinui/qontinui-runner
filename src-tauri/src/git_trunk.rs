@@ -246,6 +246,117 @@ fn resolve_trunk_branch_on(repo: &Path, git: &dyn Fn() -> Command) -> Option<Str
         .map(str::to_string)
 }
 
+/// Test support for proving a PRODUCTION git path ignores an INHERITED
+/// repository-local environment — the shape the scrub exists for, which a
+/// seam or a hand-built `Command` can only imitate.
+///
+/// The variable must be inherited, i.e. present in the process environment,
+/// but this process's environment is shared by every test running in
+/// parallel. So the parent test re-executes this very test binary
+/// ([`std::env::current_exe`]) to run ONE `#[ignore]`d child test, with
+/// `GIT_DIR` naming a decoy repo set on that child process alone. The child
+/// calls the real production function and asserts it answered for the repo
+/// it was named, plus an in-child control proving the inheritance is real.
+/// libtest flags are passed explicitly, so the re-exec depends on nothing
+/// the outer harness (cargo test, nextest) passed to the parent.
+#[cfg(test)]
+pub(crate) mod inherited_git_dir_reexec {
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Printed by a child only after its last assertion. The parent requires
+    /// it, so a child that returned early — or a filter that matched nothing
+    /// — cannot pass vacuously.
+    pub(crate) const ASSERTED_MARKER: &str = "INHERITED-GIT-DIR-CHILD-ASSERTED";
+
+    /// Set on the child alongside `GIT_DIR`; its absence tells a child it is
+    /// not under the parent (e.g. a `--include-ignored` sweep), where it
+    /// returns without asserting — and without the marker.
+    pub(crate) const CHILD_ENV: &str = "QONTINUI_TEST_INHERITED_GIT_DIR_CHILD";
+
+    /// The child's inputs, read from its environment; `None` outside a parent.
+    pub(crate) fn child_input(name: &str) -> Option<String> {
+        std::env::var_os(CHILD_ENV)?;
+        Some(std::env::var(name).unwrap_or_else(|_| panic!("the parent must set {name}")))
+    }
+
+    /// The child's own inherited `GIT_DIR`, asserted to be the decoy the
+    /// parent named — the first half of the in-child control.
+    pub(crate) fn assert_inherited_git_dir(decoy_git_dir: &str) {
+        assert_eq!(
+            std::env::var("GIT_DIR").ok().as_deref(),
+            Some(decoy_git_dir),
+            "control: the child must INHERIT the decoy GIT_DIR, or it proves nothing"
+        );
+    }
+
+    /// Run the `#[ignore]`d test `child` (its name inside `module_path`, as
+    /// `module_path!()` spells it) in a re-executed copy of this test binary,
+    /// with `GIT_DIR=<decoy_git_dir>` and `envs` set on the child only, git's
+    /// global and system config replaced by an empty file, and no other
+    /// repository-local or command-scope git variable inherited. Asserts the
+    /// child exited 0, ran exactly one test, and reached its last assertion.
+    pub(crate) fn run_child(
+        module_path: &str,
+        child: &str,
+        decoy_git_dir: &Path,
+        envs: &[(&str, &OsStr)],
+    ) {
+        // `module_path!()` leads with the crate name; libtest names a test
+        // by its path inside the crate.
+        let (_, in_crate) = module_path
+            .split_once("::")
+            .expect("a test module path names its crate");
+        let test_name = format!("{in_crate}::{child}");
+
+        let cfg = tempfile::tempdir().expect("tempdir");
+        let empty_global: PathBuf = cfg.path().join("empty-global.gitconfig");
+        std::fs::write(&empty_global, "").expect("write empty git config");
+
+        let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
+        cmd.args([
+            "--exact",
+            test_name.as_str(),
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        for var in super::REPO_LOCAL_GIT_ENV
+            .iter()
+            .chain(super::COMMAND_SCOPE_GIT_CONFIG_ENV)
+        {
+            cmd.env_remove(var);
+        }
+        cmd.env("GIT_DIR", decoy_git_dir)
+            .env("GIT_CONFIG_GLOBAL", &empty_global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(CHILD_ENV, "1");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child {test_name} failed ({}):\n{stdout}\n{stderr}",
+            out.status
+        );
+        assert!(
+            // `--nocapture` interleaves the child's own output after the
+            // `...`, so the name line and the summary are checked apart.
+            stdout.contains(&format!("test {test_name} ..."))
+                && stdout.contains("test result: ok. 1 passed;"),
+            "child ran no test (filter mismatch?):\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(ASSERTED_MARKER),
+            "child {test_name} returned before its assertions:\n{stdout}\n{stderr}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +657,62 @@ mod tests {
         assert!(
             missing.is_empty(),
             "REPO_LOCAL_GIT_ENV is missing git's {missing:?}"
+        );
+    }
+
+    const TARGET_ENV: &str = "QONTINUI_TEST_TRUNK_TARGET";
+
+    /// Child of [`the_production_resolver_ignores_an_inherited_git_dir`]:
+    /// skipped in a normal run, run only re-executed by it.
+    #[test]
+    #[ignore = "re-executed by the_production_resolver_ignores_an_inherited_git_dir"]
+    fn inherited_git_dir_child_resolves_the_named_repos_trunk() {
+        use super::inherited_git_dir_reexec as reexec;
+        let Some(target) = reexec::child_input(TARGET_ENV) else {
+            eprintln!("not under the re-exec parent; nothing to assert");
+            return;
+        };
+        let decoy_git_dir = reexec::child_input("GIT_DIR").expect("set with the child flag");
+        reexec::assert_inherited_git_dir(&decoy_git_dir);
+        let target = Path::new(&target);
+
+        // Control: unscrubbed, the inherited GIT_DIR beats `-C <target>`.
+        let out = host_git()
+            .arg("-C")
+            .arg(target)
+            .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+            .output()
+            .expect("git runs");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "origin/master",
+            "control: the inherited decoy must answer unscrubbed git"
+        );
+
+        assert_eq!(resolve_trunk_branch(target).as_deref(), Some("main"));
+        assert_eq!(resolve_trunk_ref(target).as_deref(), Some("origin/main"));
+        println!("{}", reexec::ASSERTED_MARKER);
+    }
+
+    /// The REAL entry point — [`resolve_trunk_branch`] over [`host_git`], no
+    /// seam — under a `GIT_DIR` the process INHERITED (set on a re-executed
+    /// child only): the target's trunk is `main`, the decoy's `master`, and
+    /// the answer is `main`. [`an_inherited_git_dir_does_not_decide_the_trunk`]
+    /// proves the scrub through the seam; this proves the production wiring.
+    #[test]
+    fn the_production_resolver_ignores_an_inherited_git_dir() {
+        let target = repo_with_trunk("main");
+        let decoy = repo_with_trunk("master");
+        assert_eq!(resolve_trunk_branch(target.path()).as_deref(), Some("main"));
+        assert_eq!(
+            resolve_trunk_branch(decoy.path()).as_deref(),
+            Some("master")
+        );
+        super::inherited_git_dir_reexec::run_child(
+            module_path!(),
+            "inherited_git_dir_child_resolves_the_named_repos_trunk",
+            &decoy.path().join(".git"),
+            &[(TARGET_ENV, target.path().as_os_str())],
         );
     }
 }
