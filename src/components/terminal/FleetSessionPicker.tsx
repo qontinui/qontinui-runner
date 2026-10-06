@@ -59,6 +59,8 @@ import {
   type DeviceCreateState,
 } from "./remoteCreate";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
+import { useTenant } from "@/contexts/TenantContext";
+import { FleetTenantSelect } from "./FleetTenantSelect";
 import { formatRelativeTime } from "../../lib/formatting";
 
 /**
@@ -360,6 +362,26 @@ export function FleetSessionPicker() {
   const [deviceIdEntry, setDeviceIdEntry] = useState(false);
 
   /**
+   * The tenant whose fleet this view reads — `null` sends none and lets the
+   * runner's own authority order choose (the machine pin, else the default
+   * slot), which is exactly the pre-selector behaviour. VIEW-LOCAL on purpose:
+   * never written through `set_active_tenant`, which would move the default
+   * for new sessions. Offered only on a multi-bound device.
+   */
+  const {
+    showSwitcher,
+    candidates: tenantCandidates,
+    credentials: tenantCredentials,
+  } = useTenant();
+  const [fleetTenant, setFleetTenant] = useState<string | null>(null);
+  const chooseFleetTenant = useCallback((tenantId: string | null) => {
+    setFleetTenant(tenantId);
+    // A device filter names a device of the PREVIOUS tenant; carried across it
+    // could only ever return an empty read.
+    setServer((s) => ({ ...s, deviceId: null }));
+  }, []);
+
+  /**
    * Re-render on a slow timer so the per-row relative times keep moving.
    *
    * `formatRelativeTime` is computed during render, and nothing else here
@@ -402,6 +424,7 @@ export function FleetSessionPicker() {
     state: server.state ?? undefined,
     includeClosed: server.includeClosed,
     limit: server.limit,
+    tenantId: fleetTenant,
   });
 
   const visible = useMemo(() => filterFleetSessions(sessions, text), [sessions, text]);
@@ -479,6 +502,9 @@ export function FleetSessionPicker() {
   /** Per-DEVICE create state. Keyed by device id: the action belongs to the
    * group header, not to any one session row. */
   const [createState, setCreateState] = useState<Record<string, DeviceCreateState>>({});
+  /** The tenant the rows on screen were served under — the envelope's own
+   * `tenantId`, never the pending selection, which may not have answered yet. */
+  const rowsTenant = response?.tenantId ?? null;
 
   const clearFilters = useCallback(() => {
     setServer(DEFAULT_FLEET_SERVER_FILTER);
@@ -508,6 +534,11 @@ export function FleetSessionPicker() {
           // Same routing as `createTerminal`: the tab lands on THIS page via
           // the `terminal-created` listener that claims its `pageId`.
           pageId: pageId !== "default" ? pageId : null,
+          // The tenant the row was LISTED under — the envelope's, which moves
+          // in the same tick as the rows. coord resolves an attach target
+          // within the presented principal's tenant only, so a row from a
+          // non-default tenant minted under the default slot is a 404.
+          tenant: rowsTenant,
         });
         set({ pending: false, openedId: info.id });
         setActiveId(info.id);
@@ -515,7 +546,7 @@ export function FleetSessionPicker() {
         set({ pending: false, error: attachErrorMessage(err) });
       }
     },
-    [pageId, setActiveId],
+    [pageId, setActiveId, rowsTenant],
   );
 
   /**
@@ -548,6 +579,8 @@ export function FleetSessionPicker() {
           workingDirKey: null,
           intentRepo: null,
           pageId: pageId !== "default" ? pageId : null,
+          // The tenant the device group was listed under (see `attach`).
+          tenant: rowsTenant,
         });
         set({ pending: false, openedId: info.id });
         setActiveId(info.id);
@@ -557,7 +590,7 @@ export function FleetSessionPicker() {
         set({ pending: false, refusal: describeRemoteCreateFailure(err) });
       }
     },
-    [pageId, refresh, setActiveId],
+    [pageId, refresh, setActiveId, rowsTenant],
   );
 
   const remoteCount = visible.filter((s) => !s.isCallerDevice).length;
@@ -601,6 +634,11 @@ export function FleetSessionPicker() {
       // 0 for both in the only state this attribute is about — the empty
       // read — so it settles the question exactly where it never arises.
       data-fleet-tenant={response?.tenantId ?? ""}
+      // The tenant the view ASKED for ("" = none sent; the runner's authority
+      // order chose). Beside `data-fleet-tenant`, which says which tenant
+      // ANSWERED: once a read settles, a disagreement between a non-empty
+      // request and the answer is a defect worth seeing.
+      data-fleet-tenant-requested={fleetTenant ?? ""}
       // coord's stable machine code for the last failed read. Projected because
       // the banner beside it carries PROSE, which is explicitly not the
       // contract — a driver that had to match on the sentence would break on
@@ -694,6 +732,14 @@ export function FleetSessionPicker() {
 
       {/* Server-side narrowing: these two reach past a truncated page. */}
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[#2a2d3d]">
+        <FleetTenantSelect
+          showSwitcher={showSwitcher}
+          candidates={tenantCandidates}
+          credentials={tenantCredentials}
+          selected={fleetTenant}
+          onChange={chooseFleetTenant}
+          className={SELECT_CLASS}
+        />
         {deviceIdEntry ? (
           <input
             data-ui-bridge-id={FLEET_PICKER_DEVICE_ID_ENTRY_ID}

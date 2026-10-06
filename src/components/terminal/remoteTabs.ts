@@ -24,6 +24,14 @@ export interface RemoteTabIdentity {
   remoteTerminalId: string;
   /** True when the target still holds output OLDER than the attach seed. */
   historyAvailable: boolean;
+  /**
+   * The tenant whose credential minted this tab's grant, when the opener
+   * stated one (the Fleet view's tenant); `null`/absent when the runner's
+   * authority order chose — and on every tab saved by a build that predates
+   * the field. A reattach sends it back so the fresh grant is minted in the
+   * tenant the session lives in.
+   */
+  tenant?: string | null;
 }
 
 /** Runner-local `TerminalInfo` + `remote`, as `terminal_attach_remote` returns. */

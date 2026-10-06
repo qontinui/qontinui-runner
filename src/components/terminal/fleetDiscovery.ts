@@ -81,6 +81,14 @@ export interface FleetScope {
   deviceId: string | null;
   state: string | null;
   includeClosed: boolean;
+  /**
+   * The tenant the read presents a credential for — `null` lets the runner's
+   * own authority order choose. coord fingerprints the tenant into the cursor
+   * (`scope_fingerprint`), so a cursor replayed across tenants is a
+   * `cursor_scope_mismatch` at best and a list mixing two tenants' rows at
+   * worst; a tenant switch must restart the walk like any other scope change.
+   */
+  tenantId: string | null;
 }
 
 /**
@@ -88,7 +96,7 @@ export interface FleetScope {
  * under the other; unequal keys mean the walk must restart with no cursor.
  */
 export function fleetScopeKey(scope: FleetScope): string {
-  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);
+  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);
 }
 
 /** True when two scopes would accept each other's cursors. */
@@ -742,9 +750,18 @@ export const DEFAULT_FLEET_SERVER_FILTER: FleetServerFilter = {
   limit: FLEET_DEFAULT_LIMIT,
 };
 
-/** The scope half of a filter — what a cursor is validated against. */
-export function fleetScopeOf(server: FleetServerFilter): FleetScope {
-  return { deviceId: server.deviceId, state: server.state, includeClosed: server.includeClosed };
+/**
+ * The scope half of a filter — what a cursor is validated against. The tenant
+ * is not a FILTER (coord takes no tenant argument; it is the credential the
+ * read presents), so it is supplied beside the filter rather than inside it.
+ */
+export function fleetScopeOf(server: FleetServerFilter, tenantId: string | null): FleetScope {
+  return {
+    deviceId: server.deviceId,
+    state: server.state,
+    includeClosed: server.includeClosed,
+    tenantId,
+  };
 }
 
 /**

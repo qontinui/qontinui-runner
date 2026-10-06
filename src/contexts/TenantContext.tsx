@@ -66,10 +66,30 @@ interface CommandResponse<T = unknown> {
   data?: T | null;
 }
 
+/**
+ * One bound tenant's credential state, as `get_active_tenant` serves it
+ * (Rust `commands::tenant::CandidateCredential`, computed by
+ * `auth::credential_state` — the rule pinned to agree with the credential
+ * selector). A bound tenant can have no usable credential: never paired on this
+ * device, or its slot expired. Its reads will 401, and a selector must say so.
+ */
+export interface TenantCandidateCredential {
+  tenant: string;
+  /** `true` acts, `false` cannot, `null` UNKNOWN (a store read failed). */
+  can_act: boolean | null;
+  /** The tenant's OWN slot: `usable` | `present-but-dead` | `absent` | `unreadable`. */
+  slot: string;
+  /** `can_act` rests on the legacy default slot — it works; no re-pair owed. */
+  via_default_slot: boolean;
+}
+
 interface GetActiveTenantResponse {
   active_tenant_id: string | null;
   source: "machine.json" | "paired_user.json" | null;
   candidates: string[];
+  /** One per candidate, in candidate order. Absent from a runner build that
+   * predates it — read as UNKNOWN per tenant, never as "usable". */
+  credentials?: TenantCandidateCredential[];
 }
 
 export interface TenantContextValue {
@@ -121,6 +141,12 @@ export interface TenantContextValue {
    * states something about the bindings must say unknown instead.
    */
   candidates: string[];
+  /**
+   * Per-candidate credential state (see {@link TenantCandidateCredential}).
+   * Empty while loading or against a runner build that serves none — a
+   * candidate with no entry is UNKNOWN, not usable.
+   */
+  credentials: TenantCandidateCredential[];
   /** True iff the runner UI should render a tenant switcher. Per D12,
    * single-tenant operators see no UI. */
   showSwitcher: boolean;
@@ -165,6 +191,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
   );
   const [source, setSource] = useState<TenantContextValue["source"]>(null);
   const [candidates, setCandidates] = useState<string[]>([]);
+  const [credentials, setCredentials] = useState<TenantCandidateCredential[]>([]);
   const [spawnTenantId, setSpawnTenantId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -174,6 +201,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
       setDefaultTenantIdForNewSessions(data?.active_tenant_id ?? null);
       setSource(data?.source ?? null);
       setCandidates(data?.candidates ?? []);
+      setCredentials(data?.credentials ?? []);
     } catch (e) {
       // Non-fatal — runner still works without tenant resolution,
       // sessions just go out without the default-tenant stamp until
@@ -234,6 +262,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
       defaultTenantIdForNewSessions,
       source,
       candidates,
+      credentials,
       showSwitcher,
       setDefaultTenantForNewSessions,
       refresh,
@@ -244,6 +273,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
       defaultTenantIdForNewSessions,
       source,
       candidates,
+      credentials,
       showSwitcher,
       setDefaultTenantForNewSessions,
       refresh,
