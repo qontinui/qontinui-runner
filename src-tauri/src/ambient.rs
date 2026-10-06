@@ -1149,10 +1149,119 @@ pub mod test_support {
             crate::profiles::set_runtime_tier_override(None);
         }
     }
+
+    /// Root under which every test PROCESS gets its own scratch directory.
+    pub const PROCESS_SCRATCH_ROOT: &str = "qontinui-test-scratch";
+
+    /// How old a sibling process's scratch directory must be before the first
+    /// call in a new process prunes it. Long enough that no live suite run is
+    /// touched, short enough that the temp dir does not grow without bound.
+    const STALE_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+    /// A directory under the system temp dir that belongs to THIS test process
+    /// alone: `<temp>/qontinui-test-scratch/<pid>/<label>`, created on demand.
+    ///
+    /// Test helpers used to build fixed paths such as
+    /// `env::temp_dir().join("qontinui_test_auth")` and `remove_file` + re-seed
+    /// a store in them. Two runner test processes on one box — what parallel
+    /// agent worktrees run all day — then shared and clobbered each other's
+    /// stores, and tests such as `auth::tests::test_device_id_persistence` went
+    /// red only while a sibling PROCESS was live. Neither `isolated_ambient()`
+    /// (no `TMPDIR` key) nor cargo-guard's per-process config sandbox redirects
+    /// `env::temp_dir()`, so the path itself has to be process-scoped. Plan
+    /// `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`
+    /// Phase 3.
+    ///
+    /// Within one process, callers keep their per-test file names, exactly as
+    /// before. The first call in a process removes sibling `<pid>` directories
+    /// older than a day (best-effort), so the root does not grow per run.
+    pub fn process_scratch_dir(label: &str) -> PathBuf {
+        static PRUNED: std::sync::Once = std::sync::Once::new();
+        let root = std::env::temp_dir().join(PROCESS_SCRATCH_ROOT);
+        let pid = std::process::id().to_string();
+        PRUNED.call_once(|| prune_stale_scratch(&root, &pid));
+        let dir = root.join(&pid).join(label);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn prune_stale_scratch(root: &Path, own_pid: &str) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy() == own_pid {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_SCRATCH_AGE);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The per-process scratch dir is per PROCESS (two pids never share it)
+    /// and per LABEL, and it exists once handed out.
+    #[test]
+    fn process_scratch_dir_is_scoped_to_this_process() {
+        let dir = test_support::process_scratch_dir("ambient_scratch_probe");
+        assert!(dir.is_dir(), "the scratch dir is created on demand");
+        let pid = std::process::id().to_string();
+        let parent = dir.parent().expect("label dir has a parent");
+        assert_eq!(parent.file_name().unwrap().to_string_lossy(), pid);
+        assert_eq!(
+            parent
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            test_support::PROCESS_SCRATCH_ROOT
+        );
+        assert_ne!(
+            dir,
+            test_support::process_scratch_dir("ambient_scratch_other")
+        );
+    }
+
+    /// Source pin: the test helpers that used to share FIXED temp paths
+    /// across processes must not grow a literal-named `temp_dir().join("…")`
+    /// again — that is the cross-process clobber the per-process scratch dir
+    /// retired. A literal name is the defect; a `format!` that carries a
+    /// pid or a uuid is unique already and stays allowed.
+    #[test]
+    fn no_fixed_name_temp_dir_join_in_the_store_test_helpers() {
+        let sources: &[(&str, &str)] = &[
+            ("auth.rs", include_str!("auth.rs")),
+            ("secure_storage.rs", include_str!("secure_storage.rs")),
+            (
+                "mcp/device_jwt_refresher.rs",
+                include_str!("mcp/device_jwt_refresher.rs"),
+            ),
+        ];
+        let mut offenders = Vec::new();
+        for (name, src) in sources {
+            let compact: String = src.split_whitespace().collect();
+            let hits = compact.matches("temp_dir().join(\"").count();
+            if hits > 0 {
+                offenders.push(format!("{name}: {hits}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "fixed-name `temp_dir().join(\"…\")` is shared by every test process on the box \
+             — use `test_env::process_scratch_dir(label)` instead: {offenders:?}"
+        );
+    }
+
     use super::test_support::*;
     use super::*;
     use proc_macro2::{Delimiter, TokenStream, TokenTree};

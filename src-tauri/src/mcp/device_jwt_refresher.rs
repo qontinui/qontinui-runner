@@ -5939,7 +5939,7 @@ mod try_refresh_once_tests {
     /// Per-test isolated AuthManager. Each test name maps to its own
     /// `.enc` file under the OS temp dir.
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_refresher");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_refresher");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -6412,7 +6412,7 @@ mod device_self_refresh_tests {
     }
 
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_self_refresh");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_self_refresh");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -6688,7 +6688,7 @@ mod tenant_slot_refresh_tests {
     }
 
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_tenant_slots");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_tenant_slots");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -10692,7 +10692,7 @@ mod tenant_slot_refresh_tests {
     /// phase makes, not an accident of an unconfigured box
     /// (`try_device_machine_key_exchange` returns early with no `dmk_`).
     fn test_auth_manager_with_dmk(name: &str, dmk: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_tenant_slots");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_tenant_slots");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -10704,8 +10704,7 @@ mod tenant_slot_refresh_tests {
     }
 
     fn sidecar_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join("qontinui_test_binding_gaps")
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_binding_gaps")
             .join(format!("{name}_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -11013,8 +11012,7 @@ mod tenant_slot_refresh_tests {
     /// `binding_gap_ask_path()` — these tests must not touch the operator's
     /// box.
     fn gap_state_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join("qontinui_test_gap_asks")
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_gap_asks")
             .join(format!("{name}_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir.join("binding_gap_asks.json")
@@ -11722,7 +11720,7 @@ mod device_machine_key_exchange_tests {
         dmk: Option<&str>,
         existing_jwt: Option<&str>,
     ) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_dmk_exchange");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_dmk_exchange");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
