@@ -149,6 +149,18 @@ fi
 # shellcheck source=lib/ts-codegen-deps.sh
 . "$TS_CODEGEN_DEPS_LIB"
 
+# Scratch-tree removal that survives a read-only baseline snapshot. Same
+# guarded-source shape as the two libraries above.
+SCRATCH_CLEANUP_LIB="$SCRIPT_DIR/lib/scratch-cleanup.sh"
+if [ ! -f "$SCRATCH_CLEANUP_LIB" ]; then
+    fail "ERROR: missing $SCRATCH_CLEANUP_LIB"
+    fail "Restore the file (it ships with this repo) or bypass this push with:"
+    fail "    SKIP=gen-events-drift git push"
+    exit 1
+fi
+# shellcheck source=lib/scratch-cleanup.sh
+. "$SCRATCH_CLEANUP_LIB"
+
 # Before the first `git`. A hook inherits GIT_DIR, which overrides every
 # `git -C <dir>` below — including the ones aimed at $SCHEMAS_DIR, which would
 # otherwise report on THIS repo. See the function's own comment.
@@ -257,7 +269,12 @@ case "$SCRATCH_PARENT/" in
 esac
 
 SCRATCH_ROOT="$(mktemp -d -t gen-events-drift-XXXXXXXX)"
-cleanup() { rm -rf "$SCRATCH_ROOT"; }
+# scratch_dir_remove, not a bare `rm -rf`: the baseline snapshot below is a
+# `cp -R` that keeps the source's modes, and a read-only baseline (the SHA-keyed
+# sibling store) left directories `rm` could not empty. As the EXIT trap's last
+# command, that failure became this hook's exit status and aborted a push whose
+# drift check had passed (coord finding 51901722). See lib/scratch-cleanup.sh.
+cleanup() { scratch_dir_remove "$SCRATCH_ROOT"; }
 trap cleanup EXIT
 
 # Belt and braces: mktemp may ignore TMPDIR (some implementations, or a -t
