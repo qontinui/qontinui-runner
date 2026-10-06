@@ -46,10 +46,9 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
-        // The same repository-local scrub as [`no_window`].
-        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
-            cmd.env_remove(var);
-        }
+        // The same repository-local scrub as [`no_window`], through the same
+        // function, so the two constructors cannot drift.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(cmd.as_std_mut());
     }
     cmd
 }
@@ -2790,32 +2789,61 @@ mod raw_git_guard {
         }
     }
 
-    /// Does `src` (production text only) build a raw git command without a
-    /// `git-env-ok:` marker? Returns the offending 1-based line numbers.
-    pub(super) fn raw_git_spawns(src: &str) -> Vec<usize> {
-        let prod = src
-            .split_once("\n#[cfg(test)]")
+    /// How far above a raw spawn a `git-env-ok:` marker still covers it — a
+    /// marker comment may run to several lines.
+    const MARKER_WINDOW: usize = 6;
+
+    /// Is this line a raw git spawn? Whitespace is removed first, so
+    /// `Command::new( "git" )`, `Command::new(r"git")`, `"git.exe"` and
+    /// `"git".to_string()` all count.
+    fn is_raw_git_spawn(line: &str) -> bool {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        [
+            "Command::new(\"git",
+            "Command::new(r\"git",
+            "Command::new(r#\"git",
+        ]
+        .iter()
+        .any(|needle| {
+            compact.match_indices(needle).any(|(i, _)| {
+                let rest = compact.get(i + needle.len()..).unwrap_or("");
+                rest.starts_with('"')
+                    || rest.starts_with(".exe\"")
+                    || rest.starts_with("\"#")
+                    || rest.starts_with(".exe\"#")
+            })
+        })
+    }
+
+    /// Production text only: everything up to the first `#[cfg(test)]` MODULE.
+    /// A `#[cfg(test)]` on a single helper item early in a file must not hide
+    /// the production code after it, so only an attribute directly followed by
+    /// a `mod` ends the scan.
+    fn production_text(src: &str) -> &str {
+        src.split_once("\n#[cfg(test)]\nmod ")
             .map(|(before, _)| before)
-            .unwrap_or(src);
-        let lines: Vec<&str> = prod.lines().collect();
-        let mut out = Vec::new();
+            .unwrap_or(src)
+    }
+
+    /// Returns `(unmarked, marked)`: the 1-based lines of raw git spawns in
+    /// `src`'s production text without a `git-env-ok:` marker, and the count
+    /// of those that carry one.
+    pub(super) fn raw_git_spawns(src: &str) -> (Vec<usize>, usize) {
+        let lines: Vec<&str> = production_text(src).lines().collect();
+        let mut unmarked = Vec::new();
+        let mut marked = 0;
         for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
+            if line.trim_start().starts_with("//") || !is_raw_git_spawn(line) {
                 continue;
             }
-            if !(line.contains("Command::new(\"git\")")
-                || line.contains("Command::new(\"git.exe\")"))
-            {
-                continue;
-            }
-            let start = i.saturating_sub(3);
+            let start = i.saturating_sub(MARKER_WINDOW);
             if lines[start..=i].iter().any(|l| l.contains("git-env-ok:")) {
-                continue;
+                marked += 1;
+            } else {
+                unmarked.push(i + 1);
             }
-            out.push(i + 1);
         }
-        out
+        (unmarked, marked)
     }
 
     #[test]
@@ -2830,7 +2858,7 @@ mod raw_git_guard {
             root.display()
         );
         let mut violations = Vec::new();
-        let mut marked_cli = false;
+        let mut marked_cli = 0;
         for file in files {
             let rel = file
                 .strip_prefix(&root)
@@ -2840,17 +2868,22 @@ mod raw_git_guard {
             let Ok(src) = std::fs::read_to_string(&file) else {
                 continue;
             };
+            let (unmarked, marked) = raw_git_spawns(&src);
             if rel == "bin/qontinui_cli.rs" {
-                marked_cli = src.contains("git-env-ok:");
+                marked_cli = marked;
+            } else if marked > 0 {
+                violations.push(format!(
+                    "{rel}: {marked} git-env-ok exception(s) outside the one allowlisted file"
+                ));
             }
-            for n in raw_git_spawns(&src) {
+            for n in unmarked {
                 violations.push(format!("{rel}:{n}"));
             }
         }
-        assert!(
-            marked_cli,
-            "bin/qontinui_cli.rs no longer carries its git-env-ok marker — if its raw \
-             git spawn moved or went away, update this guard's allowlist note"
+        assert_eq!(
+            marked_cli, 1,
+            "bin/qontinui_cli.rs must carry exactly one marked raw git spawn (git_stdout) — \
+             if it moved, went away or gained a sibling, update this guard's allowlist note"
         );
         assert!(
             violations.is_empty(),
@@ -2867,14 +2900,35 @@ mod raw_git_guard {
     #[test]
     fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
         let raw = "fn f() {\n    let c = std::process::Command::new(\"git\");\n}\n";
-        assert_eq!(raw_git_spawns(raw), vec![2]);
-        let marked =
-            "fn f() {\n    // git-env-ok: user's own repo\n    let c = Command::new(\"git\");\n}\n";
-        assert!(raw_git_spawns(marked).is_empty());
-        let test_only = "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"git\"); } }\n";
-        assert!(raw_git_spawns(test_only).is_empty());
-        let tokio_raw = "fn f() { tokio::process::Command::new(\"git\"); }\n";
-        assert_eq!(raw_git_spawns(tokio_raw), vec![1]);
+        assert_eq!(raw_git_spawns(raw), (vec![2], 0));
+        let marked = "fn f() {\n    // git-env-ok: user's own repo,\n    // a second line,\n    \
+                      // and a third.\n    let c = Command::new(\"git\");\n}\n";
+        assert_eq!(raw_git_spawns(marked), (vec![], 1));
+        let test_mod = "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"git\"); } }\n";
+        assert_eq!(raw_git_spawns(test_mod), (vec![], 0));
+        // A test-only helper ITEM does not hide the production code after it.
+        let after_helper = "#[cfg(test)]\nfn helper() {}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(after_helper), (vec![3], 0));
+        for spelling in [
+            "tokio::process::Command::new(\"git\")",
+            "Command::new( \"git\" )",
+            "Command::new(\"git.exe\")",
+            "Command::new(r\"git\")",
+            "Command::new(\"git\".to_string())",
+        ] {
+            assert_eq!(
+                raw_git_spawns(&format!("fn f() {{ {spelling}; }}\n")),
+                (vec![1], 0),
+                "{spelling} must be caught"
+            );
+        }
+        for not_git in ["Command::new(\"gitk\")", "Command::new(\"git-lfs\")"] {
+            assert_eq!(
+                raw_git_spawns(&format!("fn f() {{ {not_git}; }}\n")),
+                (vec![], 0),
+                "{not_git} is not git"
+            );
+        }
     }
 }
 

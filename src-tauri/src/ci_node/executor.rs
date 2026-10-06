@@ -643,8 +643,14 @@ fn resolve_step_cwd(worktree: &Path, step: &CiStep) -> Result<PathBuf, String> {
 /// Build the tokio Command for a step's argv. On Windows the creation
 /// flags combine `CREATE_NO_WINDOW` with `BELOW_NORMAL_PRIORITY_CLASS` so a
 /// CI build never steals the foreground from the developer.
+///
+/// Built on [`crate::process_helpers::tokio_no_window`] so a step whose argv
+/// starts with `git` gets the same git posture as every other runner git
+/// spawn: prompt-proof, and scrubbed of a repository-local env (`GIT_DIR`, …)
+/// inherited from whoever launched the runner — which would otherwise point
+/// the step at the launcher's repo instead of the worktree it runs in.
 fn build_step_command(program: &str, args: &[String]) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = crate::process_helpers::tokio_no_window(program);
     cmd.args(args);
     #[cfg(target_os = "windows")]
     {
