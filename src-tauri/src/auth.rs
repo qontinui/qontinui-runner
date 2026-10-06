@@ -3237,13 +3237,12 @@ mod jwt_exp_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     /// Create an isolated AuthManager for testing.
     /// Each test gets its own unique storage file to avoid test interference.
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
@@ -3258,7 +3257,7 @@ mod tests {
         test_name: &str,
         machine_file: std::path::PathBuf,
     ) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -3397,8 +3396,7 @@ mod tests {
         // A store that EXISTS but cannot be decrypted/parsed — what a machine
         // rename or disk move leaves behind (the AES key derives from
         // hostname+username). Same path the helper handed the manager.
-        let store_path = env::temp_dir()
-            .join("qontinui_test_auth")
+        let store_path = crate::test_env::process_scratch_dir("qontinui_test_auth")
             .join(format!("{test_name}.enc"));
         fs::write(&store_path, b"not-ciphertext-at-all").unwrap();
         assert!(
@@ -3516,7 +3514,7 @@ mod tests {
         // every platform: with no keychain entry, get_access_token returns
         // Err — exactly the case where the OLD code would have re-migrated
         // and overwritten the file had a keychain token existed.
-        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth");
         let storage_path = temp_dir.join("malformed_store_present_is_not_overwritten.enc");
         let _ = fs::remove_file(&storage_path);
         fs::create_dir_all(&temp_dir).unwrap();
@@ -3549,11 +3547,10 @@ mod tests {
 mod signed_in_verdict_tests {
     use super::*;
     use base64::Engine;
-    use std::env;
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_verdict");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_verdict");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -3700,11 +3697,10 @@ mod signed_in_verdict_tests {
 #[cfg(test)]
 mod tenant_device_jwt_tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_tenant_jwt");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_tenant_jwt");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -3785,7 +3781,7 @@ mod bearer_selection_tests {
     use std::fs;
 
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_bearer_select");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_bearer_select");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
@@ -5671,13 +5667,12 @@ mod bearer_selection_tests {
 #[cfg(test)]
 mod device_jwt_tests {
     use super::*;
-    use std::env;
     use std::fs;
 
     /// Each test gets its own isolated storage file so they don't poison
     /// each other.
     fn create_test_auth_manager(test_name: &str) -> AuthManager {
-        let temp_dir = env::temp_dir().join("qontinui_test_auth_device_jwt");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_auth_device_jwt");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();

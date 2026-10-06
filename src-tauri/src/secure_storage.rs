@@ -1857,7 +1857,7 @@ mod tests {
     /// Create an isolated storage instance for testing.
     /// Each test gets its own unique storage file to avoid test interference.
     fn create_test_storage(test_name: &str) -> SecureStorage {
-        let temp_dir = env::temp_dir().join("qontinui_test_storage");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_storage");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
