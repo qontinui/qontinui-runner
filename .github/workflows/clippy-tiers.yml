@@ -9,9 +9,10 @@ name: Clippy tiers
 on:
   pull_request:
     branches: [main, develop, 'session-restore-**']
-  # Nightly cron drives `clippy-nightly-unscoped` (whole-tree, all-targets) so
-  # test-module / untouched-file lint rot is surfaced loudly on a schedule
-  # rather than ambushing an unrelated PR at push time.
+  # Nightly cron drives `clippy-nightly-unscoped` (whole-tree, all-targets) as
+  # a scheduled backstop. Deny-tier lints in test code now fail the PR that adds
+  # them (ci.yml's `Clippy check` runs --all-targets); warn-tier rot is still
+  # surfaced here rather than at push time.
   schedule:
     - cron: '23 7 * * *'
   # On-demand trigger for the nightly unscoped clippy sweep.
@@ -22,11 +23,12 @@ env:
 
 jobs:
   # Nightly UNSCOPED clippy sweep. The per-PR `Clippy check` step in ci.yml runs
-  # plain `cargo clippy` (default target only, levels from Cargo.toml) so it
-  # never ambushes an unrelated PR with test-module / whole-tree lint rot. This
-  # job restores that whole-tree coverage on a schedule instead: `--all-targets`
-  # compiles #[cfg(test)] modules too, surfacing warn-tier rot loudly once a day
-  # (and on-demand via workflow_dispatch) without gating any PR. It is allowed to
+  # `cargo clippy --all-targets` (levels from Cargo.toml), so a deny-tier lint in
+  # test code fails the PR that introduces it. Before that it ran the default
+  # target only, and this nightly job was the sole all-targets run; its failures
+  # went unnoticed from 2026-09-30 to 2026-10-05. This job is now the scheduled
+  # backstop: it surfaces warn-tier rot loudly once a day (and on-demand via
+  # workflow_dispatch) without gating any PR. It is allowed to
   # fail on its own to make rot visible; it is NOT a required check and blocks
   # nothing. Runs on schedule/manual only.
   clippy-nightly-unscoped:
@@ -160,8 +162,8 @@ jobs:
         # No `-D warnings`: report rot, don't deny-block the world. Levels come
         # from Cargo.toml. ci.yml's PR clippy now runs --all-targets too, so this
         # job is the unscoped nightly backstop, not extra test-module coverage
-        # (plan 2026-10-05-coord-mcp-split-followups-...-runner-clippy-baseline,
-        # Phase 3). A deny-tier lint anywhere in the tree still
+        # (plan 2026-10-05-coord-mcp-split-followups-drift-gate-test-files-
+        # selftest-units-runner-clippy-baseline, Phase 3). A deny-tier lint anywhere in the tree still
         # fails this job (by design — that's the loud signal), but this job
         # gates no PR.
         env:
