@@ -105,13 +105,27 @@ pub fn agent_logs_from_sessions_enabled() -> bool {
 
 /// Per-call overrides for [`AiCoordRegistrar::register_inner`]; both `None`
 /// for the pinned and sniffed planes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct RegisterOverrides {
     /// Adopt this existing coord session id instead of minting one; no
     /// `Started` row is written for it.
     adopt: Option<Uuid>,
     /// Stamp this tenant instead of the resolver's answer.
     tenant: Option<Uuid>,
+    /// Resume parameters stamped on a FRESH `Started` row.
+    resume: ResumeParams,
+}
+
+/// The parameters a later `claude --resume` must be pinned to: which account's
+/// config dir holds the transcript. Sent as optional fields on the `Started`
+/// create body, which coord persists best-effort to
+/// `coord.sessions.account_label` / `config_dir` (plan
+/// `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
+/// Phase 1). Both `None` for every plane that does not know them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeParams {
+    pub account_label: Option<String>,
+    pub config_dir: Option<String>,
 }
 
 /// Why [`AiCoordRegistrar::bind_transcript_session`] declined.
@@ -540,13 +554,18 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         adopt: Option<Uuid>,
         tenant: Option<Uuid>,
+        resume: ResumeParams,
     ) -> Result<Uuid, TranscriptBindRefusal> {
         self.register_inner(
             claude_session_id,
             None,
             "Claude Code session (transcript bind)",
             None,
-            RegisterOverrides { adopt, tenant },
+            RegisterOverrides {
+                adopt,
+                tenant,
+                resume,
+            },
         )
     }
 
@@ -722,6 +741,14 @@ impl AiCoordRegistrar {
         // non-uuid anchor simply omits the field, exactly as before.
         if uuid::Uuid::parse_str(claude_session_id.trim()).is_ok() {
             payload["claude_code_session_id"] = json!(claude_session_id);
+        }
+        // Resume parameters (unfinished-resume Phase 1) — optional on the wire,
+        // so a coord that predates them ignores the keys.
+        if let Some(a) = overrides.resume.account_label.as_deref().filter(|a| !a.is_empty()) {
+            payload["account_label"] = json!(a);
+        }
+        if let Some(c) = overrides.resume.config_dir.as_deref().filter(|c| !c.is_empty()) {
+            payload["config_dir"] = json!(c);
         }
 
         // An ADOPTED row already exists coord-side, so writing `Started` for

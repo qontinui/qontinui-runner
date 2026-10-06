@@ -151,7 +151,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::claude_session::coord_register::{AiCoordRegistrar, TranscriptBindRefusal};
+use crate::claude_session::coord_register::{AiCoordRegistrar, ResumeParams, TranscriptBindRefusal};
 
 use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
 
@@ -217,13 +217,16 @@ pub enum Admit {
 }
 
 /// What the caller of [`SessionTranscriptTailer::bind_and_replay`] asks for.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BindRequest {
     /// An existing coord session to adopt — ONLY one the caller has confirmed
     /// with coord belongs to this Claude session in this tenant.
     pub adopt: Option<Uuid>,
     /// The caller's resolved tenant, stamped on a fresh registration.
     pub tenant: Option<Uuid>,
+    /// Account / config dir stamped on a FRESHLY minted coord row (an adopted
+    /// row already exists, so nothing is written for it).
+    pub resume: ResumeParams,
 }
 
 /// What a successful [`SessionTranscriptTailer::bind_and_replay`] did.
@@ -556,6 +559,12 @@ struct Coverage {
     transcript_holes: u64,
     /// First-seen batches held because their line boundary was unreadable.
     held_batches: u64,
+    /// Auto-bind outcomes (unfinished-resume Phase 1): sessions bound by
+    /// adopting the row coord already had, by minting a new row, and attempts
+    /// that could not settle (coord unreadable, consent off, bind refused).
+    autobind_adopted: u64,
+    autobind_minted: u64,
+    autobind_deferred: u64,
     /// Gate 1 as observed at the last append. `None` until an append is seen —
     /// which is why the report models it as an option: "no data yet" and
     /// "consent withheld" are different answers and a bare `false` conflates
@@ -565,7 +574,7 @@ struct Coverage {
     /// idle fleet without losing the ability to say "still nothing bound".
     /// Compared field by field, not as a sum: a held batch moves one count
     /// from `appends_emitted` to `held_batches`, which a sum cannot see.
-    last_reported: [u64; 5],
+    last_reported: [u64; 8],
 }
 
 /// Point-in-time coverage snapshot. `Serialize` so a health/diagnostic surface
@@ -591,6 +600,50 @@ pub struct CoverageReport {
     /// First-seen batches held (not emitted) because their line boundary
     /// could not be read; the next batch retries.
     pub held_batches: u64,
+    /// Transcripts the watcher bound itself by adopting coord's existing row.
+    pub autobind_adopted: u64,
+    /// Transcripts the watcher bound by minting a new coord row (coord said
+    /// `unknown`).
+    pub autobind_minted: u64,
+    /// Auto-bind attempts that did not bind (coord unreadable / unresolved,
+    /// Gate 1 off, registrar refusal). Retried on the next throttle window.
+    pub autobind_deferred: u64,
+}
+
+/// How an auto-bind attempt ended, for the coverage counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoBindKind {
+    Adopted,
+    Minted,
+    Deferred,
+}
+
+impl SessionTranscriptTailer {
+    /// Is `session_key` already mapped to a coord session in this process?
+    pub fn is_bound(&self, session_key: &str) -> bool {
+        self.registrar.session_id_for(session_key).is_some()
+    }
+
+    /// Record that the watcher SAW `session_key` and it has no binding, so the
+    /// coverage report counts it in `sessions_unbound` even before it appends
+    /// a byte — an idle, closed transcript is exactly the session the
+    /// unfinished-resume sweep must be able to find. A bound key is left alone.
+    pub fn note_seen_unbound(&self, session_key: &str) {
+        if self.is_bound(session_key) {
+            return;
+        }
+        self.lock_coverage().unbound.insert(session_key.to_string());
+    }
+
+    /// Count one auto-bind outcome (see [`AutoBindKind`]).
+    pub fn note_autobind(&self, kind: AutoBindKind) {
+        let mut cov = self.lock_coverage();
+        match kind {
+            AutoBindKind::Adopted => cov.autobind_adopted += 1,
+            AutoBindKind::Minted => cov.autobind_minted += 1,
+            AutoBindKind::Deferred => cov.autobind_deferred += 1,
+        }
+    }
 }
 
 impl SessionTranscriptTailer {
@@ -1191,7 +1244,7 @@ impl SessionTranscriptTailer {
             None => {
                 let id = self
                     .registrar
-                    .bind_transcript_session(session_key, req.adopt, req.tenant)
+                    .bind_transcript_session(session_key, req.adopt, req.tenant, req.resume.clone())
                     .map_err(|e| match e {
                         TranscriptBindRefusal::RegistrationDisabled => {
                             BindRefusal::RegistrationDisabled
@@ -1418,6 +1471,9 @@ impl SessionTranscriptTailer {
             appends_skipped_gate_off: cov.appends_skipped_gate_off,
             transcript_holes: cov.transcript_holes,
             held_batches: cov.held_batches,
+            autobind_adopted: cov.autobind_adopted,
+            autobind_minted: cov.autobind_minted,
+            autobind_deferred: cov.autobind_deferred,
         }
     }
 
@@ -1453,6 +1509,9 @@ impl SessionTranscriptTailer {
             report.appends_skipped_gate_off,
             report.transcript_holes,
             report.held_batches,
+            report.autobind_adopted,
+            report.autobind_minted,
+            report.autobind_deferred,
         ];
 
         let mut cov = self.lock_coverage();
@@ -1473,12 +1532,13 @@ impl SessionTranscriptTailer {
                 appends_skipped_unbound = report.appends_skipped_unbound,
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
+                autobind_deferred = report.autobind_deferred,
                 "session_transcript_tailer: RUNNING BUT REACHING NO PANE — every watched \
-                 transcript lacks a coord session binding, so nothing is being synced. A \
-                 binding is written by the claude --resume sniffer \
-                 (claude_resume_sniff -> AiCoordRegistrar::register_sniffed_session) or on \
-                 request by POST /sessions/transcript-bind; a pane neither reaches is never \
-                 bound. GET /sessions/transcript-coverage serves these counts."
+                 transcript lacks a coord session binding, so nothing is being synced. The \
+                 watcher binds each transcript itself (transcript_autobind) and the \
+                 claude --resume sniffer binds typed resumes; nothing bound here means \
+                 Gate 1 is off, coord is unreadable (autobind_deferred), or registration \
+                 is disabled. GET /sessions/transcript-coverage serves these counts."
             );
         } else {
             tracing::info!(
@@ -1492,6 +1552,9 @@ impl SessionTranscriptTailer {
                 appends_skipped_gate_off = report.appends_skipped_gate_off,
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
+                autobind_adopted = report.autobind_adopted,
+                autobind_minted = report.autobind_minted,
+                autobind_deferred = report.autobind_deferred,
                 "session_transcript_tailer: coverage"
             );
         }
@@ -2013,6 +2076,7 @@ mod tests {
                     BindRequest {
                         adopt: Some(existing),
                         tenant: None,
+                        ..BindRequest::default()
                     },
                     true,
                 ) {
@@ -2057,6 +2121,7 @@ mod tests {
                     BindRequest {
                         adopt: Some(held),
                         tenant: None,
+                        ..BindRequest::default()
                     },
                     true,
                 ) {
@@ -2429,6 +2494,7 @@ mod tests {
                 BindRequest {
                     adopt: Some(bound),
                     tenant: None,
+                    ..BindRequest::default()
                 },
                 true,
             )
@@ -2444,6 +2510,7 @@ mod tests {
                 BindRequest {
                     adopt: Some(other),
                     tenant: None,
+                    ..BindRequest::default()
                 },
                 true,
             ),
