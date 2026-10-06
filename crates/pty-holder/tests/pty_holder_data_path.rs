@@ -532,9 +532,16 @@ fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
     //   rather than pushing back, so the PTY write never blocks and the queue
     //   never fills; non-canonical input throttles, which is the backpressure
     //   under test.
-    let mut h = start("blocked", sh("stty raw -echo; exec sleep 3600"));
+    // The child prints `R` only once `stty` has run: input sent before that
+    // would still be echoed in cooked mode (seen as a 16 KiB echo burst).
+    let mut h = start("blocked", sh("stty raw -echo; printf R; exec sleep 3600"));
     let mut s = attach(&h, None);
-    let first_offset = s.info.start_offset;
+    let start_offset = s.info.start_offset;
+    let ready = collect_until(&mut s, start_offset, Duration::from_secs(10), |c| {
+        c.bytes.ends_with(b"R")
+    });
+    assert_eq!(ready.bytes, b"R", "nothing but the ready byte");
+    let first_offset = ready.next;
     let mut inp = input_of(&h);
     let frames = qontinui_pty_holder::pty::INPUT_QUEUE_FRAMES * 3;
     let paster = std::thread::spawn(move || {
@@ -571,6 +578,18 @@ fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
             c.events
                 .contains(&Event::Reply(Reply::Ok { verb: verb.into() }))
         });
+        // The pane is silent by construction (`raw -echo`, `sleep`): any byte
+        // or any loss report here is a defect, not noise to absorb.
+        assert!(
+            c.bytes.is_empty(),
+            "unexpected output: {} bytes",
+            c.bytes.len()
+        );
+        assert!(
+            c.events.iter().all(|e| !matches!(e, Event::Lost { .. })),
+            "{:?}",
+            c.events
+        );
         next = c.next;
     }
     assert!(
@@ -584,6 +603,16 @@ fn pty_holder_data_path_control_is_served_while_input_is_blocked() {
     assert!(c2.events.contains(&Event::Reply(Reply::Ok {
         verb: "kill".into()
     })));
+    assert!(
+        c2.bytes.is_empty(),
+        "unexpected output: {} bytes",
+        c2.bytes.len()
+    );
+    assert!(
+        c2.events.iter().all(|e| !matches!(e, Event::Lost { .. })),
+        "{:?}",
+        c2.events
+    );
     assert_eq!(exit_of(&c2.events).unwrap().signal, Some(libc::SIGHUP));
     assert!(!alive(h.child_pid));
     let end = Instant::now() + Duration::from_secs(20);
