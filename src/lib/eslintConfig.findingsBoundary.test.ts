@@ -39,6 +39,20 @@ const FORBIDDEN_IMPORTS: Record<string, string> = {
   "@tauri-apps/api (root barrel)": `import { core } from "@tauri-apps/api";\nexport const x = core;\n`,
   'dynamic import("@tauri-apps/api/core")': `export async function f() {\n  const { invoke } = await import("@tauri-apps/api/core");\n  return invoke("x");\n}\n`,
   'dynamic import("@/hooks")': `export async function f() {\n  const { executeAiTask } = await import("@/hooks");\n  return executeAiTask;\n}\n`,
+  "@/lib/operatorDoors.ts": `import { invokeOperatorDoor } from "@/lib/operatorDoors.ts";\nexport const x = invokeOperatorDoor;\n`,
+  "@/hooks/useAiTaskPolling.ts": `import { executeAiTask } from "@/hooks/useAiTaskPolling.ts";\nexport const x = executeAiTask;\n`,
+  "../hooks/ (trailing slash)": `import { executeAiTask } from "../hooks/";\nexport const x = executeAiTask;\n`,
+  "@/lib/runner-api.js": `import { tracedFetch } from "@/lib/runner-api.js";\nexport const x = tracedFetch;\n`,
+  "@tauri-apps/plugin-fs": `import { readTextFile } from "@tauri-apps/plugin-fs";\nexport const x = readTextFile;\n`,
+  "@tauri-apps/plugin-opener": `import { openUrl } from "@tauri-apps/plugin-opener";\nexport const x = openUrl;\n`,
+  "dynamic import(`@tauri-apps/api/core`) (template literal)":
+    'export async function f() {\n  const { invoke } = await import(`@tauri-apps/api/core`);\n  return invoke("x");\n}\n',
+  "dynamic import(<variable>)": `export async function f(m: string) {\n  return import(m);\n}\n`,
+  'dynamic import("@tauri-apps/plugin-fs")': `export async function f() {\n  return import("@tauri-apps/plugin-fs");\n}\n`,
+  'dynamic import("@/lib/operatorDoors.ts")': `export async function f() {\n  return import("@/lib/operatorDoors.ts");\n}\n`,
+  'dynamic import("../hooks/")': `export async function f() {\n  return import("../hooks/");\n}\n`,
+  'dynamic import("@/hooks/useAiTaskPolling.ts")': `export async function f() {\n  return import("@/hooks/useAiTaskPolling.ts");\n}\n`,
+  'dynamic import("@/hooks/useSomethingElse")': `export async function f() {\n  return import("@/hooks/useSomethingElse");\n}\n`,
 };
 
 const ALLOWED_IMPORT = `import { persistFindingsData } from "../findings/FindingsPersistence";\nexport const x = persistFindingsData;\n`;

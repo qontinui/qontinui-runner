@@ -99,10 +99,12 @@ const CATCH_SITE_DISCARD_SELECTORS = [
  * on the next webview mount.
  *
  * What this enforces is ONE import hop over the named modules only: these
- * files may not import Tauri IPC (`@tauri-apps/api`, its `core` entry, or any
- * `core*` spelling), the operator doors, the `hooks` barrel or
- * `useAiTaskPolling` (where `executeAiTask` lives), `runner-api`, or anything
- * named `*VerificationService*` — statically or through a dynamic `import()`.
+ * files may not import Tauri IPC or plugins (`@tauri-apps/api`, any
+ * `core*` spelling, `@tauri-apps/plugin-*`), the operator doors, anything under
+ * `hooks` (the barrel and `useAiTaskPolling`, where `executeAiTask` lives),
+ * `runner-api`, or anything named `*VerificationService*` — statically or
+ * through a dynamic `import()`, with or without a file extension; a dynamic
+ * `import()` whose source is not a plain string literal is refused outright.
  * It is not a transitive guarantee. `./ReportPersistenceService` (backend
  * sync) and `../findings/FindingsPersistence` (the `save_findings_data`
  * command) remain allowed for FindingsTracker's caller-invoked report/archive
@@ -125,17 +127,27 @@ const FINDINGS_BOUNDARY_MESSAGE =
   "(plan 2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task).";
 const FINDINGS_BOUNDARY_PATTERNS = [
   "@tauri-apps/api/core*",
+  "@tauri-apps/plugin-*",
   "**/lib/operatorDoors",
+  "**/lib/operatorDoors.*",
   "**/hooks",
+  "**/hooks/",
   "**/hooks/index",
   "**/hooks/useAiTaskPolling",
+  "**/hooks/useAiTaskPolling.*",
   "**/lib/runner-api",
+  "**/lib/runner-api.*",
   "**/*VerificationService*",
 ];
+// Dynamic `import()`: a non-Literal source (template literal, variable) is
+// refused outright because its target cannot be read statically; the regexes
+// accept an optional `.ts`/`.js`-family extension and a trailing slash, and
+// `hooks` is refused as a whole directory to agree with the static `**/hooks`.
 const FINDINGS_BOUNDARY_DYNAMIC_IMPORT_SELECTORS = [
-  "ImportExpression[source.value=/^@tauri-apps\\/api/]",
-  "ImportExpression[source.value=/(^|\\/)lib\\/(operatorDoors|runner-api)$/]",
-  "ImportExpression[source.value=/(^|\\/)hooks(\\/(index|useAiTaskPolling))?$/]",
+  'ImportExpression[source.type!="Literal"]',
+  "ImportExpression[source.value=/^@tauri-apps\\//]",
+  "ImportExpression[source.value=/(^|\\/)lib\\/(operatorDoors|runner-api)(\\.[cm]?[jt]sx?)?\\/?$/]",
+  "ImportExpression[source.value=/(^|\\/)hooks(\\/|$)/]",
   "ImportExpression[source.value=/VerificationService/]",
 ].map((selector) => ({ selector, message: FINDINGS_BOUNDARY_MESSAGE }));
 
