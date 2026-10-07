@@ -4297,15 +4297,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let finished_app_handle = app.handle().clone();
                     lifecycle_store.attach_finish_observer(move |rec| {
                         use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
-                        match reg.upgrade() {
+                        let sync = match reg.upgrade() {
                             Some(r) => r.forward_finish_change(rec),
                             None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
-                        }
+                        };
                         let _ = tauri::Emitter::emit(
                             &finished_app_handle,
                             commands::terminal_finished::FINISHED_CHANGED_EVENT,
                             serde_json::json!({ "claudeSessionId": rec.claude_session_id }),
                         );
+                        sync
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
                     coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
