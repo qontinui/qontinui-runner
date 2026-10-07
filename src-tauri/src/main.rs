@@ -171,6 +171,7 @@ mod install_effects_producer;
 mod instance;
 mod instance_health;
 mod instance_manager;
+mod ipc_registry; // Per-module Tauri IPC groups + name router (plan 2026-10-02-split-run-app-invoke-handler)
 mod iteration_bundle;
 mod journey;
 mod knowledge_acquisition;
@@ -282,7 +283,6 @@ mod subagent;
 mod summary_generator;
 mod tauri_app_handle;
 mod tauri_command_audit;
-mod ipc_registry; // Per-module Tauri IPC groups + name router (plan 2026-10-02-split-run-app-invoke-handler)
 mod terminal;
 mod test_executor;
 mod test_orchestrator;
