@@ -2906,9 +2906,9 @@ impl SessionLifecycleStore {
             if rec.state != "open" || rec.terminal_id.trim().is_empty() {
                 return None;
             }
-            if !rec
+            if rec
                 .restored_from_boot_at
-                .is_some_and(|t| t >= current_boot_ms)
+                .is_none_or(|t| t < current_boot_ms)
             {
                 return None;
             }
