@@ -59,11 +59,11 @@
             "state": "refused",
             "terminalId": null,
             "claudeSessionId": null,
-            "reason": "fanout_bound_occupied",
+            "reason": "resource_guard:critical:free_commit_bytes: Not starting a new fan-out member: the host lane has 1.00 GiB of free commit, below the 1.50 GiB critical floor. Free memory (close a build or a session) and try again, or start anyway to override. The limits live in Settings > Resource Guard.",
             "admittedAt": null,
             "releasedAt": null,
-            "refusals": 0,
-            "nextRetryAt": null
+            "refusals": 1,
+            "nextRetryAt": "2026-01-01T00:00:11Z"
           }
         ]
       }
@@ -128,11 +128,11 @@
             "state": "refused",
             "terminalId": null,
             "claudeSessionId": null,
-            "reason": "fanout_bound_occupied",
+            "reason": "resource_guard:critical:free_commit_bytes: Not starting a new fan-out member: the host lane has 1.00 GiB of free commit, below the 1.50 GiB critical floor. Free memory (close a build or a session) and try again, or start anyway to override. The limits live in Settings > Resource Guard.",
             "admittedAt": null,
             "releasedAt": null,
-            "refusals": 0,
-            "nextRetryAt": null
+            "refusals": 1,
+            "nextRetryAt": "2026-01-01T00:00:11Z"
           }
         ]
       },
