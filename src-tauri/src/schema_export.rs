@@ -888,6 +888,14 @@ pub fn export_all_schemas() -> Value {
     add!("JourneyEdgeObservation", qj::JourneyEdgeObservation);
     add!("FrontierEntry", qj::FrontierEntry);
     add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
+    // ── qontinui-types: page (plan
+    // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
+    // qontinui-schemas#186). The bounded-read wire contract every list
+    // surface reports: `BoundedReadMeta` references `BoundKind` and
+    // `FilterNarrowing` by name, so all three are top-level. (3) ──
+    add!("BoundKind", qontinui_types::page::BoundKind);
+    add!("BoundedReadMeta", qontinui_types::page::BoundedReadMeta);
+    add!("FilterNarrowing", qontinui_types::page::FilterNarrowing);
 
     Value::Object(m)
 }
@@ -965,8 +973,12 @@ mod tests {
         // JourneyEdgeObservation, FrontierEntry, JourneyLedgerHealth — plan
         // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
         // Phase 1; the journey enums are schemars-inline) = 566.
-        // The codegen's "Processing N top-level types" line should read 566 here.
-        assert_eq!(obj.len(), 566, "Expected 566 schema entries");
+        // + the 3 bounded-read page types (BoundKind, BoundedReadMeta,
+        // FilterNarrowing — plan
+        // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
+        // qontinui-schemas#186) = 569.
+        // The codegen's "Processing N top-level types" line should read 569 here.
+        assert_eq!(obj.len(), 569, "Expected 569 schema entries");
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
@@ -975,6 +987,9 @@ mod tests {
             "JourneyLedgerHealth",
         ] {
             assert!(obj.contains_key(journey), "Missing {journey} schema");
+        }
+        for page in ["BoundKind", "BoundedReadMeta", "FilterNarrowing"] {
+            assert!(obj.contains_key(page), "Missing {page} schema");
         }
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
