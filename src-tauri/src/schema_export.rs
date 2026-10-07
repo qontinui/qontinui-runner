@@ -37,7 +37,7 @@ pub fn export_all_schemas() -> Value {
         app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn,
         functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
-        journey as qj, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
+        journey as qj, mcp_config as qmc, memory as qmem, orchestration_config as qoc, page as qpg,
         priorities_profile as qpp, process_management as qpm, projects as qprj, rag as qr,
         runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
         state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
@@ -889,6 +889,17 @@ pub fn export_all_schemas() -> Value {
     add!("FrontierEntry", qj::FrontierEntry);
     add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
 
+    // ── qontinui-types: page (plan
+    // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, Phase 1).
+    // Only the monomorphic wire envelope is registered: `Page<T>` is generic
+    // and the schemars → Pydantic pipeline has no generic support, so each
+    // bounded response `#[serde(flatten)]`s a `BoundedReadMeta` beside its
+    // collection. `BoundKind` and `FilterNarrowing` are the envelope's
+    // referenced types. (3) ──
+    add!("BoundedReadMeta", qpg::BoundedReadMeta);
+    add!("BoundKind", qpg::BoundKind);
+    add!("FilterNarrowing", qpg::FilterNarrowing);
+
     Value::Object(m)
 }
 
@@ -965,8 +976,15 @@ mod tests {
         // JourneyEdgeObservation, FrontierEntry, JourneyLedgerHealth — plan
         // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
         // Phase 1; the journey enums are schemars-inline) = 566.
-        // The codegen's "Processing N top-level types" line should read 566 here.
-        assert_eq!(obj.len(), 566, "Expected 566 schema entries");
+        // + the 3 bounded-read envelope types (BoundedReadMeta, BoundKind,
+        // FilterNarrowing — plan
+        // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus
+        // Phase 1) = 569.
+        // The codegen's "Processing N top-level types" line should read 569 here.
+        assert_eq!(obj.len(), 569, "Expected 569 schema entries");
+        for bounded in ["BoundedReadMeta", "BoundKind", "FilterNarrowing"] {
+            assert!(obj.contains_key(bounded), "Missing {bounded} schema");
+        }
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
