@@ -239,6 +239,24 @@ impl TerminalManager {
         )
     }
 
+    /// The ids of every terminal this manager holds whose pinned harness id is
+    /// `pinned_session_id`, sorted. A terminal is pinned at create, before its
+    /// session's lifecycle record exists, so this finds a `claude` whose
+    /// record was never written (its spawner died between the two). Empty on
+    /// a poisoned lock.
+    pub fn terminal_ids_pinned_to(&self, pinned_session_id: &str) -> Vec<String> {
+        let Ok(sessions) = self.sessions.lock() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.pinned_session_id() == pinned_session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Record the pane behind a remote tab (see `remote_panes`).
     pub fn set_remote_pane(&self, id: &str, pane: Arc<super::remote_pane_io::RemotePaneIo>) {
         if let Ok(mut map) = self.remote_panes.lock() {
@@ -986,6 +1004,24 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+
+    /// The fan-out liveness lookup: a terminal is found by its PINNED harness
+    /// id (no lifecycle record needed), never by its terminal id.
+    #[test]
+    fn fanout_liveness_finds_a_terminal_by_its_pinned_id() {
+        use std::sync::{Arc, Mutex};
+        let tm = TerminalManager::new();
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        tm.insert_for_test("term-1", session.clone());
+        assert_eq!(
+            tm.terminal_ids_pinned_to("test-pinned-session"),
+            vec!["term-1".to_string()]
+        );
+        assert!(tm.terminal_ids_pinned_to("another-session").is_empty());
+        assert!(tm.terminal_ids_pinned_to("term-1").is_empty());
+    }
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
     /// manager. `bind_coord_session` must fire the observer with the

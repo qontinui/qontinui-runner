@@ -1144,7 +1144,7 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Each active run renders an expandable pill.",
+          "description": "Each active run renders an expandable pill (matched by `data-fanout-part=run-toggle`; its id is suffixed per run).",
           "enabled": true,
           "id": "term-fanout-running-elem-1",
           "reviewed": false,
@@ -1152,7 +1152,9 @@
           "source": "ai-generated",
           "target": {
             "criteria": {
-              "id": "terminal.fanout-strip-toggle"
+              "dataAttributes": {
+                "fanout-part": "run-toggle"
+              }
             },
             "label": "Fan-out run pill",
             "type": "search"
@@ -1538,7 +1540,9 @@
             "id": "terminal.fanout-strip"
           },
           {
-            "id": "terminal.fanout-strip-toggle"
+            "dataAttributes": {
+              "fanout-part": "run-toggle"
+            }
           }
         ],
         "id": "term-fanout-running",

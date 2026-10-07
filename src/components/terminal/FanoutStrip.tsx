@@ -42,6 +42,13 @@ import {
   runAgeLabel,
   unknownStripText,
 } from "./fanoutStripModel";
+import {
+  FANOUT_PART_RUN_TOGGLE,
+  FANOUT_STRIP_ID,
+  fanoutStripMemberId,
+  fanoutStripRunId,
+  shortRunKeys,
+} from "./fanoutUiIds";
 import type { FanoutRunsApi } from "./useFanoutRuns";
 import { useNow1Hz } from "./useNow1Hz";
 
@@ -58,7 +65,7 @@ export function FanoutStrip({ api }: { api: FanoutRunsApi }) {
   if (state.kind === "settling") {
     return (
       <span
-        data-ui-bridge-id="terminal.fanout-strip"
+        data-ui-bridge-id={FANOUT_STRIP_ID}
         data-fanout-state="settling"
         className="px-1.5 py-0.5 text-[10px] leading-none whitespace-nowrap text-[#565f89]"
         title={state.reason}
@@ -72,7 +79,7 @@ export function FanoutStrip({ api }: { api: FanoutRunsApi }) {
   if (state.kind === "unknown") {
     return (
       <span
-        data-ui-bridge-id="terminal.fanout-strip"
+        data-ui-bridge-id={FANOUT_STRIP_ID}
         data-fanout-state="unknown"
         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium leading-none whitespace-nowrap text-[#e0af68]"
         data-fanout-unknown-code={state.errorCode}
@@ -96,20 +103,31 @@ export function FanoutStrip({ api }: { api: FanoutRunsApi }) {
   }
 
   if (state.kind !== "ok") return null;
+  const runs = activeFanoutRuns(state.runs);
+  const runKeys = shortRunKeys(runs.map((r) => r.id));
   return (
     <span
-      data-ui-bridge-id="terminal.fanout-strip"
+      data-ui-bridge-id={FANOUT_STRIP_ID}
       data-fanout-state="ok"
       className="flex items-center gap-1"
     >
-      {activeFanoutRuns(state.runs).map((run) => (
-        <FanoutRunPill key={run.id} run={run} api={api} />
+      {runs.map((run) => (
+        <FanoutRunPill key={run.id} run={run} runKey={runKeys.get(run.id) ?? run.id} api={api} />
       ))}
     </span>
   );
 }
 
-function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi }) {
+function FanoutRunPill({
+  run,
+  runKey,
+  api,
+}: {
+  run: FanoutRunView;
+  /** This run's short id, unique among the strip's runs — suffixes its ids. */
+  runKey: string;
+  api: FanoutRunsApi;
+}) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ text: string; error: boolean } | null>(null);
@@ -167,12 +185,13 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
     <span
       ref={ref}
       className="relative"
-      data-ui-bridge-id="terminal.fanout-strip-run"
+      data-ui-bridge-id={fanoutStripRunId("run", runKey)}
       data-run-id={run.id}
     >
       <button
         type="button"
-        data-ui-bridge-id="terminal.fanout-strip-toggle"
+        data-ui-bridge-id={fanoutStripRunId("toggle", runKey)}
+        data-fanout-part={FANOUT_PART_RUN_TOGGLE}
         onClick={() => setOpen((v) => !v)}
         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium leading-none whitespace-nowrap text-[#bb9af7] hover:bg-white/5 transition-colors"
         title={`${summary} — max ${run.maxConcurrent} at once, in ${run.workingDir}${
@@ -183,7 +202,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
         <Layers className="w-2.5 h-2.5" />
         <span>{summary}</span>
         {age && (
-          <span data-ui-bridge-id="terminal.fanout-strip-age" className="text-[#565f89]">
+          <span data-ui-bridge-id={fanoutStripRunId("age", runKey)} className="text-[#565f89]">
             · {age}
           </span>
         )}
@@ -193,7 +212,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
         <div
           role="dialog"
           aria-label={`Fan-out run ${run.templateSlug ?? run.id}`}
-          data-ui-bridge-id="terminal.fanout-strip-panel"
+          data-ui-bridge-id={fanoutStripRunId("panel", runKey)}
           className="absolute left-0 top-full mt-1 w-[420px] max-w-[90vw] bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden"
         >
           <div className="flex items-center gap-2 px-3 py-2 border-b border-[#2a2d3d] text-[10px]">
@@ -203,7 +222,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
             <span className="text-[#565f89]">max at once</span>
             <button
               type="button"
-              data-ui-bridge-id="terminal.fanout-strip-cap-decrease"
+              data-ui-bridge-id={fanoutStripRunId("cap-decrease", runKey)}
               disabled={busy || run.maxConcurrent <= 1}
               onClick={() => changeCap(-1)}
               className="p-0.5 rounded text-[#a9b1d6] hover:bg-white/5 disabled:opacity-40"
@@ -212,14 +231,14 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
               <Minus className="w-3 h-3" />
             </button>
             <span
-              data-ui-bridge-id="terminal.fanout-strip-cap-value"
+              data-ui-bridge-id={fanoutStripRunId("cap-value", runKey)}
               className="text-[#c0caf5] font-mono"
             >
               {run.maxConcurrent}
             </span>
             <button
               type="button"
-              data-ui-bridge-id="terminal.fanout-strip-cap-increase"
+              data-ui-bridge-id={fanoutStripRunId("cap-increase", runKey)}
               disabled={busy}
               onClick={() => changeCap(1)}
               className="p-0.5 rounded text-[#a9b1d6] hover:bg-white/5 disabled:opacity-40"
@@ -229,7 +248,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
             </button>
             <button
               type="button"
-              data-ui-bridge-id="terminal.fanout-strip-cancel-queued"
+              data-ui-bridge-id={fanoutStripRunId("cancel-queued", runKey)}
               disabled={busy || cancellable === 0}
               onClick={() =>
                 void runOp(
@@ -247,7 +266,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
             {run.members.map((m) => (
               <div
                 key={m.index}
-                data-ui-bridge-id="terminal.fanout-strip-member"
+                data-ui-bridge-id={fanoutStripMemberId("member", runKey, m.index)}
                 data-member-index={m.index}
                 data-member-state={m.state}
                 className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]/50 last:border-b-0 text-[11px]"
@@ -266,7 +285,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
                 {canReleaseMember(m) && (
                   <button
                     type="button"
-                    data-ui-bridge-id="terminal.fanout-strip-release"
+                    data-ui-bridge-id={fanoutStripMemberId("release", runKey, m.index)}
                     data-member-index={m.index}
                     disabled={busy}
                     onClick={() =>
@@ -286,7 +305,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
           </div>
           {note && (
             <div
-              data-ui-bridge-id="terminal.fanout-strip-note"
+              data-ui-bridge-id={fanoutStripRunId("note", runKey)}
               className={`px-3 py-1.5 text-[10px] border-t border-[#2a2d3d] ${
                 note.error ? "text-[#f7768e]" : "text-[#9ece6a]"
               }`}
