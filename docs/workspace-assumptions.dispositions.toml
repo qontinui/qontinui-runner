@@ -582,3 +582,23 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/resource_sample.rs"
+symbol = "wsl_distro_running"
+disposition = "fallback_correct"
+note = "Asks `wsl --list --running` whether the WSL lane's distro is up so the sampler never boots a stopped one; WSL exists only on Windows, and collect_wsl_lane's cfg(not(windows)) arm returns no lane."
+reviewed = [
+    "cfg(windows)-only fn `wsl_distro_running` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/resource_sample.rs"
+symbol = "note_wsl_lane_gate"
+disposition = "fallback_correct"
+note = "Logs the WSL lane's run/skip gate on change; Windows-only because the WSL lane is, and collect_wsl_lane's cfg(not(windows)) arm returns no lane."
+reviewed = [
+    "cfg(windows)-only fn `note_wsl_lane_gate` has no cfg(not(windows)) sibling in this file",
+]
