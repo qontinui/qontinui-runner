@@ -1208,6 +1208,17 @@ struct CoordAllocateResponse {
     /// [`Isolation::default`] (junctioned worktree, today's behavior).
     #[serde(default)]
     isolation: Option<Isolation>,
+    /// Plan `2026-10-02-allocate-skips-a-declared-sibling-silently`: one
+    /// redacted line per thing coord could NOT establish while expanding the
+    /// requested repos' declared build siblings — a cold or stale canonical
+    /// mirror, an unparseable `.qontinui/ci.toml`, a repo missing from coord's
+    /// registry. A non-empty list means a sibling this allocation may need was
+    /// NOT provisioned, which otherwise surfaces minutes later as a cargo
+    /// `failed to read …/Cargo.toml`. Absent on an older coord, and empty
+    /// (key omitted) when there is nothing to report — absent is UNKNOWN, not
+    /// "nothing skipped", so nothing is logged for it either way.
+    #[serde(default)]
+    sibling_notes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1249,6 +1260,33 @@ struct CoordAllocatedWorktree {
     /// defaults, so an older coord's row reads `Unknown` / `None`.
     #[serde(flatten)]
     parent_sha_provenance: ParentShaProvenance,
+}
+
+/// One coord `sibling_notes` entry, made safe for a single log line. coord
+/// already sanitizes every note to one line, but the runner does not take a
+/// remote peer's word for what lands in its own log: control characters and
+/// every non-space whitespace (a newline, or U+2028/U+2029, would forge an
+/// extra apparent log line) and bidi overrides/isolates (which visually
+/// reorder a line) become spaces, and the line is bounded.
+fn sibling_note_log_line(note: &str) -> String {
+    const MAX_CHARS: usize = 600;
+    let one_line: String = note
+        .chars()
+        .map(|c| {
+            let bidi = matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || (c.is_whitespace() && c != ' ') || bidi {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(MAX_CHARS)
+        .collect();
+    if note.chars().count() > MAX_CHARS {
+        format!("{one_line}…")
+    } else {
+        one_line
+    }
 }
 
 /// Error variants returned by [`allocate_and_materialize_with_claim`]. Distinct
@@ -1744,6 +1782,13 @@ pub async fn allocate_and_materialize_with_claim(
     for w in &coord_resp.worktrees {
         w.parent_sha_provenance
             .warn_if_not_fresh(&w.repo, &w.parent_sha);
+    }
+    for note in &coord_resp.sibling_notes {
+        warn!(
+            "allocate: coord sibling note agent_id={}: {}",
+            coord_resp.agent_id,
+            sibling_note_log_line(note)
+        );
     }
 
     // `wait` — coord declined to materialize. Surface a typed Wait
@@ -2633,6 +2678,36 @@ pub fn coord_ws_to_http(coord_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// coord#2779 added `sibling_notes`; the runner must decode it (so it can
+    /// log it) and must still decode a coord that predates it.
+    #[test]
+    fn coord_allocate_response_decodes_sibling_notes_and_tolerates_their_absence() {
+        let with: CoordAllocateResponse = serde_json::from_value(serde_json::json!({
+            "agent_id": "a",
+            "worktrees": [],
+            "sibling_notes": ["qontinui/x: coord could not read .qontinui/ci.toml"],
+        }))
+        .unwrap();
+        assert_eq!(with.sibling_notes.len(), 1);
+
+        let without: CoordAllocateResponse =
+            serde_json::from_value(serde_json::json!({"agent_id": "a", "worktrees": []}))
+                .unwrap();
+        assert!(without.sibling_notes.is_empty());
+    }
+
+    /// A remote peer's text lands in the runner's own log: a newline in it
+    /// must not forge a second log line, and its length is bounded.
+    #[test]
+    fn sibling_note_log_line_is_one_bounded_line() {
+        assert_eq!(sibling_note_log_line("a\nFORGED: b\tc"), "a FORGED: b c");
+        assert_eq!(sibling_note_log_line("a\u{2028}b\u{202E}c"), "a b c");
+        let long = sibling_note_log_line(&"x".repeat(5000));
+        assert_eq!(long.chars().count(), 601, "600 chars plus the ellipsis");
+        assert!(long.ends_with('…'));
+        assert_eq!(sibling_note_log_line("short"), "short");
+    }
 
     // =======================================================================
     // D3 — the four `parent_sha_*` freshness fields on the allocate row
