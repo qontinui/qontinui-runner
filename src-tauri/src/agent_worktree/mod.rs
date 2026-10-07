@@ -2692,8 +2692,7 @@ mod tests {
         assert_eq!(with.sibling_notes.len(), 1);
 
         let without: CoordAllocateResponse =
-            serde_json::from_value(serde_json::json!({"agent_id": "a", "worktrees": []}))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({"agent_id": "a", "worktrees": []})).unwrap();
         assert!(without.sibling_notes.is_empty());
     }
 
