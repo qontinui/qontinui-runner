@@ -952,6 +952,15 @@ fn pass_concluded_cell() -> &'static watch::Sender<u64> {
     CELL.get_or_init(|| watch::channel(0u64).0)
 }
 
+/// Mark the start of a pass: every kick numbered at or below the returned
+/// sequence was issued before this pass read any state, so this pass answers
+/// it. Called at the top of each `refresher_loop` iteration.
+fn begin_pass() -> u64 {
+    let seq = KICK_SEQ.load(std::sync::atomic::Ordering::SeqCst);
+    PASS_IN_FLIGHT_KICK_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
+    seq
+}
+
 /// Mark the pass now running as concluded. Called wherever a pass ends: every
 /// iteration of `refresher_loop` ends in a wait, so the wait is where it goes.
 fn note_pass_concluded() {
@@ -1315,6 +1324,11 @@ impl PairMintAttempt {
             | (_, Some(RefreshOutcome::BearerRejected { .. })) => {
                 DefaultSlotRecovery::BearerRejected
             }
+            // Neither is fixed by re-running the same pass: no tenant resolves
+            // from any source, or coord keeps minting for the wrong one. Both
+            // need the account re-paired.
+            (PairProgress::BailNoTenant, _) => DefaultSlotRecovery::NoTenant,
+            (PairProgress::BailTenantMismatch { .. }, _) => DefaultSlotRecovery::TenantMismatch,
             _ => DefaultSlotRecovery::KeptExisting,
         }
     }
@@ -1453,6 +1467,42 @@ pub(crate) async fn attempt_pair_mint(
     }
 }
 
+/// Where a pass publishes its posture — the loop's per-pass inputs.
+pub(crate) struct PassPosture<'a> {
+    /// No per-tenant slot exists, so the legacy default slot IS this runner's
+    /// coord credential and its posture is re-published from the verdict.
+    pub publish_legacy: bool,
+    pub pins: PosturePinInputs,
+    pub app: Option<&'a tauri::AppHandle>,
+}
+
+/// One `Pair`-arm mint tick, from the attempt to the pass being CONCLUDED:
+/// [`attempt_pair_mint`] → record the default slot's verdict → re-publish the
+/// legacy posture from it → [`note_pass_concluded`].
+///
+/// The ORDER is the contract a kick-and-wait caller relies on (D5): the pass
+/// must be marked concluded only AFTER the posture it produced is published,
+/// or "Retry refresh now" reads the previous pass's posture. Kept in one
+/// function so the order is testable rather than spread across the loop. The
+/// loop's later `wait_with_signals` marks the same pass concluded again,
+/// which is a no-op.
+pub(crate) async fn run_pair_tick(
+    auth_manager: &crate::auth::AuthManager,
+    req: PairMintRequest<'_>,
+    posture: PassPosture<'_>,
+) -> PairMintAttempt {
+    let attempt = attempt_pair_mint(auth_manager, req).await;
+    conclude_default_slot_recovery(
+        auth_manager,
+        attempt.verdict(),
+        posture.publish_legacy,
+        posture.pins,
+        posture.app,
+    );
+    note_pass_concluded();
+    attempt
+}
+
 /// Record how the `Pair` arm's recovery of the default slot concluded, and —
 /// on a runner whose coord credential IS that slot (`publish_legacy`, i.e. no
 /// per-tenant slot exists) — re-publish the posture from it.
@@ -1463,7 +1513,7 @@ fn conclude_default_slot_recovery(
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    record_default_slot_recovery(verdict, auth_manager.access_token_exp());
+    record_default_slot_recovery(verdict, auth_manager.get_access_token().ok().as_deref());
     if publish_legacy {
         derive_and_publish_legacy_posture(auth_manager, pins, app);
     }
@@ -2181,7 +2231,8 @@ pub(crate) enum DefaultSlotRecovery {
     /// or the device-machine-key exchange).
     Refreshed,
     /// The mint failed in a way that says nothing about the bearer — a 5xx,
-    /// a transport fault, a transient Cognito refresh. A retry can help.
+    /// a transport fault, a transient Cognito refresh, a persist error — or
+    /// did not fail at all while the slot is still valid. A retry can help.
     KeptExisting,
     /// No usable user bearer existed, so pair-cli was skipped (D1), and the
     /// device-machine-key exchange did not recover the slot either.
@@ -2189,6 +2240,15 @@ pub(crate) enum DefaultSlotRecovery {
     /// pair-cli refused the presented user bearer (401/403, D2), and the
     /// device-machine-key exchange did not recover the slot either.
     BearerRejected,
+    /// No tenant resolved from any source (OAuth claim, outgoing device JWT,
+    /// `machine.json`), and the device-machine-key exchange did not recover
+    /// the slot either. Configuration, not a transient fault: a retry re-runs
+    /// the same resolution.
+    NoTenant,
+    /// Coord minted for a DIFFERENT tenant than requested and the mint was
+    /// refused ([`PairProgress::BailTenantMismatch`]). Re-running the pass
+    /// asks the same coord row the same question; re-pairing fixes it.
+    TenantMismatch,
 }
 
 /// The two outcome tokens the per-tenant pass and the default slot share — ONE
@@ -2197,11 +2257,12 @@ const OUTCOME_TOKEN_REFRESHED: &str = "refreshed";
 const OUTCOME_TOKEN_KEPT_EXISTING: &str = "kept-existing";
 
 impl DefaultSlotRecovery {
-    /// Did every automatic rung fail in a way only a sign-in can fix?
+    /// Did every automatic rung fail in a way only a sign-in (re-pair) can
+    /// fix — i.e. would "Retry refresh now" re-run a pass that cannot help?
     pub(crate) fn needs_sign_in(self) -> bool {
-        matches!(
+        !matches!(
             self,
-            DefaultSlotRecovery::NeedsSignIn | DefaultSlotRecovery::BearerRejected
+            DefaultSlotRecovery::Refreshed | DefaultSlotRecovery::KeptExisting
         )
     }
 
@@ -2212,43 +2273,68 @@ impl DefaultSlotRecovery {
             DefaultSlotRecovery::KeptExisting => OUTCOME_TOKEN_KEPT_EXISTING,
             DefaultSlotRecovery::NeedsSignIn => "needs-sign-in",
             DefaultSlotRecovery::BearerRejected => "bearer-rejected",
+            DefaultSlotRecovery::NoTenant => "no-tenant",
+            DefaultSlotRecovery::TenantMismatch => "tenant-mismatch",
         }
     }
 }
 
 /// The last concluded default-slot verdict, and WHICH credential it judged —
-/// the decoded `exp` the slot held when the verdict was recorded. A verdict
-/// describes one credential: once the slot holds a different one (a sign-in,
-/// a pair-code redeem) the old verdict must not colour it, so a lookup only
-/// answers for a matching `exp`.
+/// a fingerprint of the token the slot held when the verdict was recorded. A
+/// verdict describes one credential: once the slot holds a different one (a
+/// sign-in, a pair-code redeem) the old verdict must not colour it, so a lookup
+/// only answers for a matching fingerprint.
+///
+/// A fingerprint rather than the decoded `exp`: every opaque token and an empty
+/// slot all decode to `exp: None`, so an `exp` key would let a verdict recorded
+/// against an empty slot colour a later, unrelated opaque token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DefaultSlotRecoveryRecord {
     verdict: DefaultSlotRecovery,
-    judged_exp: Option<i64>,
+    judged: Option<SlotFingerprint>,
+}
+
+/// The first 8 bytes of the token's SHA-256 — enough to tell two credentials
+/// apart, and never the credential itself (the record is process memory, but
+/// a debug print of it must not leak a bearer).
+type SlotFingerprint = [u8; 8];
+
+/// Fingerprint of a slot value; `None` for an absent/blank slot.
+fn slot_fingerprint(token: Option<&str>) -> Option<SlotFingerprint> {
+    use sha2::{Digest, Sha256};
+    let t = token.map(str::trim).filter(|t| !t.is_empty())?;
+    let digest = Sha256::digest(t.as_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    Some(out)
 }
 
 static DEFAULT_SLOT_RECOVERY: std::sync::Mutex<Option<DefaultSlotRecoveryRecord>> =
     std::sync::Mutex::new(None);
 
 /// Record how the `Pair` arm's recovery of the default slot concluded.
-/// `slot_exp` is the decoded `exp` of what the slot holds NOW, after the
-/// attempt — the new credential on success, the unchanged dead one otherwise.
-pub(crate) fn record_default_slot_recovery(verdict: DefaultSlotRecovery, slot_exp: Option<i64>) {
+/// `slot_token` is what the slot holds NOW, after the attempt — the new
+/// credential on success, the unchanged dead one otherwise.
+pub(crate) fn record_default_slot_recovery(
+    verdict: DefaultSlotRecovery,
+    slot_token: Option<&str>,
+) {
     *DEFAULT_SLOT_RECOVERY
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(DefaultSlotRecoveryRecord {
         verdict,
-        judged_exp: slot_exp,
+        judged: slot_fingerprint(slot_token),
     });
 }
 
-/// The recorded verdict, if it was about the credential whose `exp` is
-/// `slot_exp`. `None` = no recovery has concluded for this credential.
-pub(crate) fn default_slot_recovery_for(slot_exp: Option<i64>) -> Option<DefaultSlotRecovery> {
+/// The recorded verdict, if it was about `slot_token`. `None` = no recovery
+/// has concluded for this credential.
+pub(crate) fn default_slot_recovery_for(slot_token: Option<&str>) -> Option<DefaultSlotRecovery> {
+    let judged = slot_fingerprint(slot_token);
     DEFAULT_SLOT_RECOVERY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .filter(|r| r.judged_exp == slot_exp)
+        .filter(|r| r.judged == judged)
         .map(|r| r.verdict)
 }
 
@@ -2258,15 +2344,17 @@ pub(crate) fn legacy_slot_observation(
     read: crate::secure_storage::StoredTokenRead,
 ) -> SlotObservation {
     use crate::secure_storage::StoredTokenRead;
-    let mut obs = match read {
-        StoredTokenRead::Present(t) => SlotObservation::observed(None, Some(t.as_str())),
+    match read {
+        StoredTokenRead::Present(t) => {
+            let mut obs = SlotObservation::observed(None, Some(t.as_str()));
+            if obs.present {
+                obs.recovery = default_slot_recovery_for(Some(t.as_str()));
+            }
+            obs
+        }
         StoredTokenRead::Absent => SlotObservation::observed(None, None),
         StoredTokenRead::Unreadable(_) => SlotObservation::unreadable(None),
-    };
-    if obs.present {
-        obs.recovery = default_slot_recovery_for(obs.exp);
     }
-    obs
 }
 
 /// The upstream half of the derivation: what COORD said about the credential
@@ -3935,8 +4023,9 @@ fn upstream_signal_for_observation(tenant_id: Option<&str>, fold_default: bool) 
 /// 3. **The runner HOLDS a dead credential** (decoded `exp` in the past, or an
 ///    opaque value):
 ///    - whose last CONCLUDED automatic recovery ended needing a sign-in
-///      ([`DefaultSlotRecovery::needs_sign_in`]: no user bearer to present and
-///      no device-machine-key recovery, or pair-cli rejected the bearer) →
+///      ([`DefaultSlotRecovery::needs_sign_in`]: no user bearer to present, a
+///      rejected bearer, no resolvable tenant or a tenant mismatch — each with
+///      no device-machine-key recovery) →
 ///      `unrefreshable`. Every automatic rung has failed in a way a retry
 ///      cannot fix, so the CTA must be the sign-in, not "Retry refresh now" —
 ///      and a later pass that finds the same dead credential still present
@@ -5714,10 +5803,7 @@ async fn refresher_loop(
         }
         // D5: every kick numbered at or below this was issued before this pass
         // read any state, so this pass answers it.
-        PASS_IN_FLIGHT_KICK_SEQ.store(
-            KICK_SEQ.load(std::sync::atomic::Ordering::SeqCst),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        begin_pass();
 
         // Heal a vanished `paired_user.json` from valid per-tenant slots
         // BEFORE anything below reads it, so the tier (`device_is_paired`),
@@ -6183,7 +6269,12 @@ async fn refresher_loop(
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.trim().to_string())
                     .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
-                let attempt = attempt_pair_mint(
+                // D3/D4/D5: attempt, record how this pass's recovery concluded,
+                // (on a legacy-slot runner) re-publish the posture from it NOW,
+                // and mark the pass concluded — so a kicked retry concludes with
+                // the banner showing ITS verdict. One function, so the order is
+                // pinned by `default_slot_recovery_tests`.
+                let attempt = run_pair_tick(
                     &auth_manager,
                     PairMintRequest {
                         pair_base: &pair_base,
@@ -6195,18 +6286,13 @@ async fn refresher_loop(
                         machine_tenant,
                         dmk_device_id: dmk_device_id.as_deref(),
                     },
+                    PassPosture {
+                        publish_legacy: !has_tenant_slots,
+                        pins: sweep_inputs.posture_pin_inputs(),
+                        app: Some(&api_state.app_handle),
+                    },
                 )
                 .await;
-                // D3/D4: record how this pass's recovery concluded, and (on a
-                // legacy-slot runner) re-publish the posture from it NOW, so a
-                // kicked retry concludes with the banner showing ITS verdict.
-                conclude_default_slot_recovery(
-                    &auth_manager,
-                    attempt.verdict(),
-                    !has_tenant_slots,
-                    sweep_inputs.posture_pin_inputs(),
-                    Some(&api_state.app_handle),
-                );
                 if let Some(RefreshOutcome::Replaced { new_jwt }) = &attempt.outcome {
                     info!(
                         "device_jwt_refresher: device-JWT refreshed (len={})",
@@ -12004,7 +12090,10 @@ mod tenant_slot_refresh_tests {
             calls[0].starts_with(concat!(
                 "qontinui_runner_lib::pair::",
                 "pair_with_auth",
-                "_token_with_ids("
+                // The typed variant: same request, the failure's HTTP status
+                // kept as data (plan 2026-10-07-runner-credential-banner-…
+                // D2). Still the one call, still try_refresh_once's.
+                "_token_with_ids_typed("
             )),
             "the one call is try_refresh_once's: {calls:?}"
         );
@@ -13315,6 +13404,11 @@ mod default_slot_recovery_tests {
     //!   needs a sign-in is `unrefreshable` (CTA `re_pair`), does not regress
     //!   to `expired` on a later pass, and names its `lastRefreshOutcome`.
     //! - D5: the pass-concluded signal a kick-and-wait reads.
+    //!
+    //! Every test that can reach a mint takes [`posture_test_lock`]: a
+    //! persisted mint retires the PROCESS-GLOBAL upstream rejection streaks
+    //! (`retire_rejection_streaks_after_legacy_mint`), and unserialised it
+    //! erased evidence a concurrently running posture test asserts on.
 
     use super::*;
     use crate::secure_storage::StoredTokenRead;
@@ -13490,6 +13584,8 @@ mod default_slot_recovery_tests {
 
     #[tokio::test]
     async fn expired_slot_without_cognito_sends_no_pair_cli_and_tries_the_dmk_exchange() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let dead = device_jwt(now - 60);
         let mgr = setup("d1_dmk_recovers", Some(&dead), Some("dmk_unit_fixture"));
@@ -13516,6 +13612,8 @@ mod default_slot_recovery_tests {
 
     #[tokio::test]
     async fn expired_slot_without_cognito_or_dmk_concludes_needs_sign_in() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let dead = device_jwt(now - 60);
         let mgr = setup("d1_needs_sign_in", Some(&dead), None);
@@ -13545,6 +13643,8 @@ mod default_slot_recovery_tests {
 
     #[tokio::test]
     async fn a_transient_cognito_blip_with_a_dead_slot_stays_retryable() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let mgr = setup("d1_transient", Some(&device_jwt(now - 60)), None);
         let (base, _mock, _stop) = spawn_web(
@@ -13561,6 +13661,8 @@ mod default_slot_recovery_tests {
 
     #[tokio::test]
     async fn pair_cli_401_with_a_dead_slot_is_bearer_rejected_and_still_tries_dmk() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let dead = device_jwt(now - 60);
         let mgr = setup("d2_401", Some(&dead), Some("dmk_unit_fixture"));
@@ -13594,6 +13696,8 @@ mod default_slot_recovery_tests {
 
     #[tokio::test]
     async fn pair_cli_403_is_bearer_rejected_too() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let mgr = setup("d2_403", Some(&device_jwt(now + 30 * 60)), None);
         let (base, _mock, _stop) = spawn_web(
@@ -13606,6 +13710,8 @@ mod default_slot_recovery_tests {
 
     #[tokio::test]
     async fn pair_cli_503_stays_kept_existing_and_the_pin_is_unchanged() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let dead = device_jwt(now - 60);
         let mgr = setup("d2_503", Some(&dead), None);
@@ -13672,7 +13778,7 @@ mod default_slot_recovery_tests {
         assert_eq!(boot.last_refresh_outcome, None, "boot: no pass has concluded");
 
         // The pass concludes: no bearer, no dmk recovery → `unrefreshable`.
-        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(dead_exp));
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(&dead));
         let concluded = publish(legacy(&dead), now);
         assert_eq!(concluded.posture, CoordCredentialPosture::Unrefreshable);
         assert_eq!(concluded.posture.cta(), Some("re_pair"));
@@ -13692,7 +13798,7 @@ mod default_slot_recovery_tests {
         );
 
         // pair-cli rejecting the bearer is the same verdict class.
-        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(dead_exp));
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(&dead));
         let rejected = publish(legacy(&dead), now + 600);
         assert_eq!(rejected.posture, CoordCredentialPosture::Unrefreshable);
         assert_eq!(
@@ -13701,7 +13807,7 @@ mod default_slot_recovery_tests {
         );
 
         // A transient failure → `expired` again: a retry CAN help there.
-        record_default_slot_recovery(DefaultSlotRecovery::KeptExisting, Some(dead_exp));
+        record_default_slot_recovery(DefaultSlotRecovery::KeptExisting, Some(&dead));
         let transient = publish(legacy(&dead), now + 900);
         assert_eq!(transient.posture, CoordCredentialPosture::Expired);
         assert_eq!(transient.posture.cta(), Some("retry_refresh"));
@@ -13711,9 +13817,9 @@ mod default_slot_recovery_tests {
         );
 
         // A successful mint → `live`, naming the outcome.
-        let fresh_exp = now + 4 * 60 * 60;
-        record_default_slot_recovery(DefaultSlotRecovery::Refreshed, Some(fresh_exp));
-        let healed = publish(legacy(&device_jwt(fresh_exp)), now + 1200);
+        let fresh = device_jwt(now + 4 * 60 * 60);
+        record_default_slot_recovery(DefaultSlotRecovery::Refreshed, Some(&fresh));
+        let healed = publish(legacy(&fresh), now + 1200);
         assert_eq!(healed.posture, CoordCredentialPosture::Live);
         assert_eq!(healed.last_refresh_outcome.as_deref(), Some("refreshed"));
         assert_eq!(
@@ -13728,16 +13834,62 @@ mod default_slot_recovery_tests {
         let _g = posture_test_lock();
         reset_coord_credential_posture_for_test();
         let now = chrono::Utc::now().timestamp();
-        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(now - 600));
-        // A DIFFERENT dead credential (another exp) has no concluded recovery.
-        let other = publish(legacy(&device_jwt(now - 60)), now);
+        let judged = device_jwt(now - 600);
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(&judged));
+        // A DIFFERENT dead credential has no concluded recovery.
+        let other_token = device_jwt(now - 60);
+        let other = publish(legacy(&other_token), now);
         assert_eq!(other.posture, CoordCredentialPosture::Expired);
         assert_eq!(other.last_refresh_outcome, None);
-        assert_eq!(default_slot_recovery_for(Some(now - 60)), None);
+        assert_eq!(default_slot_recovery_for(Some(&other_token)), None);
         assert_eq!(
-            default_slot_recovery_for(Some(now - 600)),
+            default_slot_recovery_for(Some(&judged)),
             Some(DefaultSlotRecovery::NeedsSignIn)
         );
+    }
+
+    /// Opaque values and an empty slot all decode to `exp: None`; keyed on
+    /// `exp`, a verdict recorded against an EMPTY slot coloured any later
+    /// opaque token. Keyed on the token's fingerprint, it does not.
+    #[test]
+    fn a_verdict_recorded_on_an_empty_slot_does_not_colour_an_opaque_token() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, None);
+        let opaque = publish(legacy("qontinui_runner_legacy_abc"), now);
+        assert_eq!(opaque.posture, CoordCredentialPosture::Expired);
+        assert_eq!(opaque.last_refresh_outcome, None);
+        // Two different opaque values are two different credentials too.
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some("opaque-a"));
+        assert_eq!(default_slot_recovery_for(Some("opaque-b")), None);
+        assert_eq!(
+            default_slot_recovery_for(Some("opaque-a")),
+            Some(DefaultSlotRecovery::BearerRejected)
+        );
+    }
+
+    #[test]
+    fn a_tenant_fault_is_not_offered_a_retry() {
+        let attempt = |progress| PairMintAttempt {
+            outcome: Some(RefreshOutcome::KeptExisting),
+            progress,
+            dmk_jwt: None,
+        };
+        let no_tenant = attempt(PairProgress::BailNoTenant).verdict();
+        assert_eq!(no_tenant, DefaultSlotRecovery::NoTenant);
+        assert!(no_tenant.needs_sign_in());
+        let mismatch = attempt(PairProgress::BailTenantMismatch {
+            expected: uuid::Uuid::nil(),
+            returned: None,
+        })
+        .verdict();
+        assert_eq!(mismatch, DefaultSlotRecovery::TenantMismatch);
+        assert!(mismatch.needs_sign_in());
+        // A transient failure keeps the retry.
+        let transient = attempt(PairProgress::BailRefreshFailedExpired).verdict();
+        assert_eq!(transient, DefaultSlotRecovery::KeptExisting);
+        assert!(!transient.needs_sign_in());
     }
 
     #[test]
@@ -13745,11 +13897,11 @@ mod default_slot_recovery_tests {
         let _g = posture_test_lock();
         reset_coord_credential_posture_for_test();
         let now = chrono::Utc::now().timestamp();
-        let exp = now + 4 * 60 * 60;
+        let live_token = device_jwt(now + 4 * 60 * 60);
         // D2's healthy-for-now case: pair-cli rejected the bearer while the slot
         // was still valid. The ladder only consults the verdict for a DEAD slot.
-        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(exp));
-        let live = publish(legacy(&device_jwt(exp)), now);
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(&live_token));
+        let live = publish(legacy(&live_token), now);
         assert_eq!(live.posture, CoordCredentialPosture::Live);
     }
 
@@ -13758,6 +13910,8 @@ mod default_slot_recovery_tests {
     #[tokio::test]
     async fn a_kick_waiter_wakes_only_when_its_pass_concludes() {
         use std::sync::atomic::Ordering;
+        // The kick/pass counters are process-global; the tick test moves them.
+        let _g = posture_test_lock();
         let seq = KICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         // Not concluded yet → the bounded wait reports UNKNOWN, not success.
         assert!(
@@ -13772,5 +13926,73 @@ mod default_slot_recovery_tests {
         assert!(waiter.await.unwrap(), "the waiter wakes on its own pass");
         // A later kick is not answered by an earlier pass.
         assert!(!wait_for_pass_concluded(seq + 1_000_000, Duration::from_millis(50)).await);
+    }
+
+    /// The `Pair`-arm tick the loop runs, end to end on the incident's shape:
+    /// a dead default slot, no Cognito session, no device machine key. Pins
+    /// the WIRING the unit tests above cannot see — the top-of-pass publish,
+    /// the verdict recorded, the posture re-published from it, and the pass
+    /// marked concluded for the kick-and-wait caller.
+    #[tokio::test]
+    async fn a_pair_tick_on_the_incident_shape_concludes_unrefreshable() {
+        use std::sync::atomic::Ordering;
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("tick_incident", Some(&dead), None);
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::UNAUTHORIZED, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+
+        // A "Retry refresh now" kick, then the pass that answers it.
+        let seq = KICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(begin_pass() >= seq, "the pass started after the kick answers it");
+        assert!(
+            !wait_for_pass_concluded(seq, Duration::from_millis(20)).await,
+            "not concluded before the tick runs"
+        );
+        // Top of pass: the legacy branch publishes from the dead slot.
+        derive_and_publish_legacy_posture(&mgr, PosturePinInputs::UNPINNED, None);
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Expired
+        );
+
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let attempt = run_pair_tick(
+            &mgr,
+            PairMintRequest {
+                pair_base: &base,
+                pair_base_arm: None,
+                bearer: &bearer,
+                refresh_class: RefreshClass::NoSession,
+                device_id: DID,
+                user_id: UID,
+                machine_tenant: None,
+                dmk_device_id: Some(DID),
+            },
+            PassPosture {
+                publish_legacy: true,
+                pins: PosturePinInputs::UNPINNED,
+                app: None,
+            },
+        )
+        .await;
+
+        assert_eq!(*mock.pair_hits.lock().unwrap(), 0, "zero pair-cli requests");
+        assert_eq!(attempt.verdict(), DefaultSlotRecovery::NeedsSignIn);
+        // The pass is concluded, and what a waiter then reads is THIS pass's
+        // posture — not the top-of-pass `expired`.
+        assert!(wait_for_pass_concluded(seq, Duration::from_millis(20)).await);
+        let after = coord_credential_posture().expect("published");
+        assert_eq!(after.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(after.posture.cta(), Some("re_pair"));
+        assert_eq!(after.last_refresh_outcome.as_deref(), Some("needs-sign-in"));
+        assert_eq!(
+            after.to_json()["lastRefreshOutcome"],
+            serde_json::json!("needs-sign-in")
+        );
     }
 }
