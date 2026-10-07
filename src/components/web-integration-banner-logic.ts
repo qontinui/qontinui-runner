@@ -216,7 +216,10 @@ export function shouldShowAuthBanner(
  *   rungs, so re-running the refresher would complete with no error and leave
  *   the banner standing. Sign-in is the only rung that can re-pair.
  * - `kick_refresher` — the headless retry (`kick_device_jwt_refresher_cmd`),
- *   for `retry_refresh` ("Retry refresh now") only.
+ *   for `retry_refresh` ("Retry refresh now") only. It waits for the kicked
+ *   pass and reports its result ({@link makeRetryRefreshHandler}), so a retry
+ *   that cannot recover the credential says so instead of silently changing
+ *   nothing.
  */
 export interface CredentialDarkPresentation {
   title: string;
@@ -532,6 +535,85 @@ export function makeRePairClickHandler(
   return async () => {
     await invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
   };
+}
+
+// ---------------------------------------------------------------------------
+// "Retry refresh now" reports what happened (plan
+// 2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover D5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Args the retry CTA passes: wait (bounded, runner-side) for the kicked pass to
+ * conclude and return `{ concluded, posture }`. The other kick callers (the
+ * re-pair CTA, the tenant switch) stay fire-and-forget with `{}`.
+ */
+export const RETRY_REFRESH_ARGS = { awaitConclusion: true } as const;
+
+/** Shown when the kicked pass concluded and the credential is still dark. */
+export const RETRY_DID_NOT_RECOVER = "Refresh did not recover the credential.";
+
+/** Appended when the concluded posture's only remedy is a sign-in. */
+export const RETRY_SIGN_IN_SUFFIX = " Sign in to re-pair.";
+
+/** Shown when the bounded wait ended before the pass concluded — UNKNOWN. */
+export const RETRY_STILL_RUNNING =
+  "The refresh is still running — this banner updates when it finishes.";
+
+/** What the banner does with a retry's answer. */
+export interface RetryRefreshResult {
+  /** The posture signal to fold into the banner, or `null` to leave it as is. */
+  signal: CredentialDarkSignal | null;
+  /** The inline error to show beside the CTA, or `null`. */
+  error: string | null;
+}
+
+/**
+ * Interpret `kick_device_jwt_refresher_cmd`'s `{ concluded, posture }`.
+ *
+ * Before this the button returned nothing, so a retry that could never work
+ * (no Cognito session, an expired device JWT) looked exactly like one that
+ * had not finished. Now:
+ *
+ * - concluded, `live` → the recovery signal (clears the banner), no error;
+ * - concluded, still dark → the concluded posture (so an `unrefreshable`
+ *   verdict swaps the button to "Sign in to re-pair" immediately) plus an
+ *   inline error saying the retry did not recover it;
+ * - NOT concluded (the runner's bounded wait ran out) → "still running". Only
+ *   a dark posture is applied: a timeout is UNKNOWN and must never render as
+ *   a recovery;
+ * - an older runner that answers nothing → nothing to apply, nothing to say.
+ */
+export function retryRefreshResult(raw: unknown): RetryRefreshResult {
+  if (raw === null || typeof raw !== "object") return { signal: null, error: null };
+  const r = raw as Record<string, unknown>;
+  if (typeof r.concluded !== "boolean") return { signal: null, error: null };
+  const signal = credentialDarkFromPostureSnapshot(r.posture);
+  if (!r.concluded) {
+    return { signal: signal?.dark ? signal : null, error: RETRY_STILL_RUNNING };
+  }
+  if (signal === null) {
+    // Concluded, yet no posture to read: UNKNOWN, so say the retry did not
+    // demonstrably recover anything rather than imply it did.
+    return { signal: null, error: RETRY_DID_NOT_RECOVER };
+  }
+  if (!signal.dark) return { signal, error: null };
+  const needsSignIn = signal.cta === "re_pair" || signal.cta === "sign_in";
+  return {
+    signal,
+    error: needsSignIn ? `${RETRY_DID_NOT_RECOVER}${RETRY_SIGN_IN_SUFFIX}` : RETRY_DID_NOT_RECOVER,
+  };
+}
+
+/**
+ * Build the "Retry refresh now" click handler: kick the refresher, wait for
+ * the pass it triggers, and return what the banner should do with the answer.
+ * Extracted so the contract is unit-testable in node.
+ */
+export function makeRetryRefreshHandler(
+  invoker: (cmd: string, args: Record<string, unknown>) => Promise<unknown>,
+): () => Promise<RetryRefreshResult> {
+  return async () =>
+    retryRefreshResult(await invoker(KICK_DEVICE_JWT_REFRESHER_CMD, { ...RETRY_REFRESH_ARGS }));
 }
 
 /**

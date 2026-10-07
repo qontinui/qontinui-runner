@@ -48,6 +48,7 @@ import {
   effectiveCredentialDark,
   GET_COORD_CREDENTIAL_POSTURE_CMD,
   makeRePairClickHandler,
+  makeRetryRefreshHandler,
   makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
@@ -123,6 +124,10 @@ export function WebIntegrationAuthBanner() {
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [reKicking, setReKicking] = useState(false);
   const [reKickError, setReKickError] = useState<string | null>(null);
+  // The credential banner's "Retry refresh now" result. Held apart from
+  // `reKickError` because a concluded `unrefreshable` swaps the CTA to the
+  // sign-in, and the error must stay visible beside the new button.
+  const [retryRefreshError, setRetryRefreshError] = useState<string | null>(null);
 
   // Credential-dark signal. The device-JWT refresher emits
   // `autonomy-credential-dark` with `{dark, cause, message, cta, since}` for
@@ -379,6 +384,8 @@ export function WebIntegrationAuthBanner() {
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", { backendUrl });
+      // A retry's "did not recover" is answered by this sign-in.
+      setRetryRefreshError(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
       setAuthorizeError(String(err));
@@ -432,6 +439,28 @@ export function WebIntegrationAuthBanner() {
     setDismissedSignature(sig);
   }, [status, deviceJwtPresent, credentialDark]);
 
+  // "Retry refresh now": kick the refresher, WAIT for the pass it triggers,
+  // and render from the posture that pass left behind — so a retry that could
+  // not recover the credential says so (and an `unrefreshable` verdict swaps
+  // the button to the sign-in) instead of silently changing nothing.
+  const handleRetryRefresh = useCallback(async () => {
+    setReKicking(true);
+    setRetryRefreshError(null);
+    try {
+      const retry = makeRetryRefreshHandler((cmd, args) => invoke<unknown>(cmd, args));
+      const result = await retry();
+      const signal = result.signal;
+      if (signal !== null) {
+        setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+      }
+      setRetryRefreshError(result.error);
+    } catch (err) {
+      setRetryRefreshError(String(err));
+    } finally {
+      setReKicking(false);
+    }
+  }, []);
+
   // The credential banner's CTA. Both destinations are commands that already
   // exist: an interactive Cognito re-login, or the headless refresher kick.
   const handleCredentialCta = useCallback(
@@ -440,9 +469,9 @@ export function WebIntegrationAuthBanner() {
         await handleAuthorize();
         return;
       }
-      await handleRePair();
+      await handleRetryRefresh();
     },
-    [handleAuthorize, handleRePair],
+    [handleAuthorize, handleRetryRefresh],
   );
 
   if (tier !== "qontinui_account") return null;
@@ -458,6 +487,7 @@ export function WebIntegrationAuthBanner() {
     const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
     const ctaError =
       (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
+      retryRefreshError ??
       (presentation.showSwitchTenant ? switchTenantError : null);
     return (
       <div
