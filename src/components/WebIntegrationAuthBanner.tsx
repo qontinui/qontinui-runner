@@ -52,6 +52,7 @@ import {
   makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
+  retryErrorSurvives,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
@@ -124,10 +125,16 @@ export function WebIntegrationAuthBanner() {
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [reKicking, setReKicking] = useState(false);
   const [reKickError, setReKickError] = useState<string | null>(null);
-  // The credential banner's "Retry refresh now" result. Held apart from
-  // `reKickError` because a concluded `unrefreshable` swaps the CTA to the
-  // sign-in, and the error must stay visible beside the new button.
-  const [retryRefreshError, setRetryRefreshError] = useState<string | null>(null);
+  // The credential banner's "Retry refresh now" result: its inline error and
+  // the posture signal it was written about. Held apart from `reKickError`
+  // because a concluded `unrefreshable` swaps the CTA to the sign-in, and the
+  // error must stay visible beside the new button — but only until a posture
+  // signal that says something else arrives (`retryErrorSurvives`).
+  const [retryRefresh, setRetryRefresh] = useState<{
+    error: string;
+    signal: CredentialDarkSignal | null;
+  } | null>(null);
+  const retryRefreshError = retryRefresh?.error ?? null;
 
   // Credential-dark signal. The device-JWT refresher emits
   // `autonomy-credential-dark` with `{dark, cause, message, cta, since}` for
@@ -273,6 +280,7 @@ export function WebIntegrationAuthBanner() {
       const signal = normalizeCredentialDarkSignal(event.payload);
       if (!cancelled && signal !== null) {
         setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+        setRetryRefresh((prev) => (prev && retryErrorSurvives(prev.signal, signal) ? prev : null));
       }
     });
     return () => {
@@ -306,6 +314,9 @@ export function WebIntegrationAuthBanner() {
           // health, and it is not a recovery: contribute nothing.
           if (signal !== null) {
             setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+            setRetryRefresh((prev) =>
+              prev && retryErrorSurvives(prev.signal, signal) ? prev : null,
+            );
           }
         })
         .catch(() => {
@@ -385,7 +396,7 @@ export function WebIntegrationAuthBanner() {
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", { backendUrl });
       // A retry's "did not recover" is answered by this sign-in.
-      setRetryRefreshError(null);
+      setRetryRefresh(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
       setAuthorizeError(String(err));
@@ -445,7 +456,7 @@ export function WebIntegrationAuthBanner() {
   // the button to the sign-in) instead of silently changing nothing.
   const handleRetryRefresh = useCallback(async () => {
     setReKicking(true);
-    setRetryRefreshError(null);
+    setRetryRefresh(null);
     try {
       const retry = makeRetryRefreshHandler((cmd, args) => invoke<unknown>(cmd, args));
       const result = await retry();
@@ -453,9 +464,9 @@ export function WebIntegrationAuthBanner() {
       if (signal !== null) {
         setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
       }
-      setRetryRefreshError(result.error);
+      setRetryRefresh(result.error === null ? null : { error: result.error, signal });
     } catch (err) {
-      setRetryRefreshError(String(err));
+      setRetryRefresh({ error: String(err), signal: null });
     } finally {
       setReKicking(false);
     }
