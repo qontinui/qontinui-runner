@@ -13,7 +13,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 106 | 107 | 105 | 1 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
 
 ## `repo_layout` (55 rows)
@@ -214,7 +214,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 |---|---|---|---:|---|
 | `src/ai_provider/oauth_refresh.rs` | `const CLIENT_ID` | `const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";` | 1 | fallback_correct — Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install. |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (106 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -255,6 +255,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/execution_core/unified_tools.rs` | `execute_shell_command` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/fleet.rs` | `build_host_capabilities` | `caps.push("shell:powershell".to_string());` | 1 | unreviewed |
 | `src/fleet.rs` | `powershell_on_path` | `binary_on_path("pwsh") \|\| binary_on_path("powershell")` | 1 | unreviewed |
+| `src/fleet/capability_report.rs` | `doctor_mechanism_id` | `"install-pwsh-linux" \| "installer-pwsh-linux" => "installer_pwsh_linux",` | 1 | fallback_correct — A capability-record NAME in the transcribed capability-doctor.sh alias table (a mechanism id string), not tooling the runner invokes. |
 | `src/fleet/resource_sample.rs` | `attach_wsl_disk` | `cfg(windows)-only fn 'attach_wsl_disk' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `decode_utf16le` | `cfg(windows)-only fn 'decode_utf16le' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `resolve_wsl_distro` | `cfg(windows)-only fn 'resolve_wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

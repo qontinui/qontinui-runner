@@ -304,7 +304,7 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
         timing: PinTiming::Live,
         readers: &[
             "mcp/device_jwt_refresher.rs::refresher_loop",
-            "mcp/device_jwt_refresher.rs::publish_coord_credential_status",
+            "mcp/device_jwt_refresher.rs::post_device_status",
             "mcp/device_jwt_refresher.rs::read_sweep_inputs",
         ],
         detail: "re-read on each refresher tick (5 min) and each slot sweep",

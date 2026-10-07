@@ -707,6 +707,15 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/fleet/capability_report.rs",
+      "symbol": "doctor_mechanism_id",
+      "excerpt": "\"install-pwsh-linux\" | \"installer-pwsh-linux\" => \"installer_pwsh_linux\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "A capability-record NAME in the transcribed capability-doctor.sh alias table (a mechanism id string), not tooling the runner invokes."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/fleet/resource_sample.rs",
       "symbol": "attach_wsl_disk",
       "excerpt": "cfg(windows)-only fn `attach_wsl_disk` has no cfg(not(windows)) sibling in this file",

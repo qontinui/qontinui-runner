@@ -333,7 +333,10 @@ the existing corpus in `plans/*.md`).
 > **Status: DRAFT <YYYY-MM-DD>.** <one-line summary of what this plan does>.
 > **Area:** `<area>` — work-unit `metadata.area`; kebab-case only,
 > `[a-z0-9]+(-[a-z0-9]+)*`, in THIS blockquote; free text here is dropped with a
-> warning. Omit the line when no area applies.
+> warning. Omit the line when no area applies. Pick it from
+> `qontinui-dev-notes/steering/autonomy-domains.toml`, or add a row there in the
+> same change — an area in no list is reported `unmapped` by
+> `coord_query_domain_cost`.
 
 > **Repo(s):** <repo1>[, <repo2>...]
 
