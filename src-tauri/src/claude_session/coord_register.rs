@@ -3845,7 +3845,8 @@ mod tests {
                 last_session_start_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
-                gate_bound_boot_ms: None,
+                gate_bound_generation: None,
+                restored_in_generation: None,
             },
         );
         let finished_at = store
@@ -3952,7 +3953,8 @@ mod tests {
                 last_session_start_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
-                gate_bound_boot_ms: None,
+                gate_bound_generation: None,
+                restored_in_generation: None,
             },
         );
         let coord_id = reg
