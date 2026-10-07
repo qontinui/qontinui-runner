@@ -285,4 +285,46 @@ describe("toggleZonePanel", () => {
     const next = toggleZonePanel(start, "t1", "review");
     expect(next.prompts).toBe(start.prompts);
   });
+
+  describe("with the global prompts default on", () => {
+    it("closing prompts records the tab as an override", () => {
+      const next = toggleZonePanel(empty, "t1", "prompts", true);
+      expect([...next.prompts]).toEqual(["t1"]);
+      const back = toggleZonePanel(next, "t1", "prompts", true);
+      expect(back.prompts.size).toBe(0);
+    });
+
+    it("opening review closes the default-open prompts panel", () => {
+      const next = toggleZonePanel(empty, "t1", "review", true);
+      expect([...next.review]).toEqual(["t1"]);
+      expect([...next.prompts]).toEqual(["t1"]);
+    });
+
+    it("opening review leaves an already-closed prompts panel closed", () => {
+      const start = { prompts: new Set(["t1"]), review: new Set<string>() };
+      const next = toggleZonePanel(start, "t1", "review", true);
+      expect(next.prompts).toBe(start.prompts);
+    });
+
+    it("prompts hidden behind review open in one click, closing review", () => {
+      // The state a global "show" flip leaves when t1 had review open.
+      const start = { prompts: new Set<string>(), review: new Set(["t1"]) };
+      const next = toggleZonePanel(start, "t1", "prompts", true);
+      expect(next.prompts).toBe(start.prompts);
+      expect(next.review.size).toBe(0);
+    });
+
+    it("a stale review entry does not hide prompts where review is unavailable", () => {
+      const start = { prompts: new Set<string>(), review: new Set(["t1"]) };
+      const next = toggleZonePanel(start, "t1", "prompts", true, false);
+      expect([...next.prompts]).toEqual(["t1"]);
+    });
+
+    it("re-opening prompts closes review", () => {
+      const start = { prompts: new Set(["t1"]), review: new Set(["t1"]) };
+      const next = toggleZonePanel(start, "t1", "prompts", true);
+      expect(next.prompts.size).toBe(0);
+      expect(next.review.size).toBe(0);
+    });
+  });
 });

@@ -19,10 +19,11 @@ export const PROMPTS_PANEL_TOP_HEIGHT_PX = 104;
 export const PROMPTS_PANEL_RIGHT_WIDTH_PX = 300;
 
 /**
- * The operator's own prompts for one session, deliberately styled as a LIGHT
- * surface: everything else in a zone is dark terminal output, so the contrast
- * is what makes "my side of the conversation" findable at a glance rather than
- * something to be read for.
+ * The operator's own prompts for one session, styled in the terminal's own
+ * Tokyo Night palette. It used to be a LIGHT surface for contrast, but a bright
+ * white block on an otherwise dark page was glaring; findability now comes from
+ * a slightly deeper panel tone and a blue accent rail on each prompt card —
+ * "my side of the conversation" still reads at a glance without the glare.
  *
  * Newest sits at the bottom, matching terminal output — the panel auto-scrolls
  * there on new prompts unless the operator has scrolled up to read history, in
@@ -145,7 +146,7 @@ export function ZonePromptsPanel({
       // sentinels (z-5), but BELOW the zone title bar and filter bar (z-10).
       // Those bars open dropdowns at z-50, and a z-10 bar is a stacking
       // context — so a panel above it would swallow its own title bar's menus.
-      className={`${frame} z-[6] flex flex-col bg-[#f4f4f8] border-[#c8ccd8] text-[#1f2233]`}
+      className={`${frame} z-[6] flex flex-col bg-[#16161e]/95 backdrop-blur-sm border-[#2a2d3d] text-[#c0caf5] shadow-[0_4px_16px_rgba(0,0,0,0.35)]`}
       style={frameStyle}
       // The panel is a reading surface layered over a terminal; without this
       // the zone's mousedown handler would steal focus and route keystrokes
@@ -153,10 +154,14 @@ export function ZonePromptsPanel({
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      <div className="flex items-center gap-1.5 px-2 py-0.5 border-b border-[#d7dae3] bg-[#e7e9f0] shrink-0">
-        <MessageSquare className="w-2.5 h-2.5 text-[#5a6180]" />
-        <span className="text-[10px] font-medium text-[#3a405c]">My prompts</span>
-        {status === "ready" && <span className="text-[9px] text-[#6b7191]">{prompts.length}</span>}
+      <div className="flex items-center gap-1.5 px-2 py-0.5 border-b border-[#2a2d3d] bg-[#13141f] shrink-0">
+        <MessageSquare className="w-2.5 h-2.5 text-[#7aa2f7]" />
+        <span className="text-[10px] font-medium text-[#a9b1d6]">My prompts</span>
+        {status === "ready" && (
+          <span className="px-1 rounded-full text-[9px] leading-[12px] text-[#7aa2f7] bg-[#7aa2f7]/15">
+            {prompts.length}
+          </span>
+        )}
         {/* Right-anchored in the strip, but LEFT-anchored in the column: the
             zone's hover-action cluster owns the top-right ~150px at a higher
             z-index, and a 300px-wide column puts these two buttons squarely
@@ -165,14 +170,14 @@ export function ZonePromptsPanel({
           <button
             onClick={refresh}
             disabled={refreshing}
-            className="p-0.5 rounded text-[#6b7191] hover:text-[#1f2233] hover:bg-[#d7dae3] transition-colors disabled:opacity-50"
+            className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
             title="Reload prompts from the session transcript"
           >
             <RefreshCw className={`w-2.5 h-2.5 ${refreshing ? "animate-spin" : ""}`} />
           </button>
           <button
             onClick={onClose}
-            className="p-0.5 rounded text-[#6b7191] hover:text-[#1f2233] hover:bg-[#d7dae3] transition-colors"
+            className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
             title="Hide prompts"
           >
             <X className="w-2.5 h-2.5" />
@@ -183,21 +188,21 @@ export function ZonePromptsPanel({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-2 py-1"
+        className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-2 py-1.5 [scrollbar-width:thin] [scrollbar-color:#2a2d3d_transparent]"
         // Scrolling here must not also scroll the terminal underneath.
         onWheel={(e) => e.stopPropagation()}
       >
-        <div ref={contentRef} className="space-y-1">
+        <div ref={contentRef} className="space-y-1.5">
           {status === "loading" && (
-            <div className="text-[10px] text-[#6b7191] py-1">Reading transcript…</div>
+            <div className="text-[10px] text-[#565f89] py-1">Reading transcript…</div>
           )}
           {status === "unavailable" && (
-            <div className="text-[10px] text-[#a1442f] py-1">
+            <div className="text-[10px] text-[#f7768e] py-1">
               Prompts unavailable{reason ? ` — ${reason}` : ""}
             </div>
           )}
           {status === "ready" && prompts.length === 0 && (
-            <div className="text-[10px] text-[#6b7191] py-1">No prompts in this session yet.</div>
+            <div className="text-[10px] text-[#565f89] py-1">No prompts in this session yet.</div>
           )}
           {status === "ready" &&
             prompts.map((p) => (
@@ -240,20 +245,22 @@ function PromptCard({
   const canExpand = clamped || expanded;
   return (
     <div
-      className={`rounded border border-[#d7dae3] bg-white px-1.5 py-1 shadow-[0_1px_1px_rgba(31,34,51,0.04)] ${
-        canExpand ? "cursor-pointer hover:border-[#b6bccd]" : ""
+      className={`group rounded-md border border-[#2a2d3d] border-l-2 border-l-[#7aa2f7]/70 bg-[#1f2335] pl-2 pr-1.5 py-1 transition-colors ${
+        canExpand
+          ? "cursor-pointer hover:border-[#3b4261] hover:border-l-[#7aa2f7] hover:bg-[#232840]"
+          : ""
       }`}
       onClick={canExpand ? onToggle : undefined}
       title={canExpand ? (expanded ? "Collapse" : "Show the whole prompt") : undefined}
     >
       {prompt.timestamp && (
-        <div className="text-[8px] font-mono text-[#8a90ad] leading-tight">
+        <div className="text-[8px] font-mono text-[#565f89] leading-tight mb-0.5">
           {formatPromptTime(prompt.timestamp)}
         </div>
       )}
       <div
         ref={bodyRef}
-        className="text-[10px] leading-snug whitespace-pre-wrap break-words text-[#1f2233]"
+        className="text-[10px] leading-relaxed whitespace-pre-wrap break-words text-[#c0caf5]"
         style={
           expanded
             ? undefined
@@ -268,7 +275,7 @@ function PromptCard({
         {prompt.text}
       </div>
       {canExpand && (
-        <div className="text-[8px] text-[#8a90ad] mt-0.5">
+        <div className="text-[8px] text-[#7aa2f7]/80 group-hover:text-[#7aa2f7] mt-0.5">
           {expanded ? "Show less" : "Show more"}
         </div>
       )}

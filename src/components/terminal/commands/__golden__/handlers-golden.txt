@@ -100,6 +100,9 @@ terminal.toggle-findings	canonical	[]	ok	findings.toggle	false	opened 1 the find
 terminal.toggle-findings	empty	[]	ok	findings.toggle	false	opened 1 the findings panel [state]	ok
 terminal.toggle-focus-mode	canonical	[]	ok	ui.toggleFocusMode	false	enabled 1 focus mode [state]	ok
 terminal.toggle-focus-mode	empty	[]	ok	ui.toggleFocusMode	false	enabled 1 focus mode [state]	ok
+terminal.toggle-prompts-view	alternate	[["state","needs-input"]]	error:invalid-args	instanceStorage.getItem	true	-	error
+terminal.toggle-prompts-view	canonical	[["state","idle"]]	error:invalid-args	instanceStorage.getItem	true	-	error
+terminal.toggle-prompts-view	empty	[]	ok	instanceStorage.getItem,instanceStorage.getItem,instanceStorage.setItem	true	shown 1 prompts in all sessions [state]	ok
 terminal.toggle-sessions-sidebar	canonical	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok
 terminal.toggle-sessions-sidebar	empty	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok
 terminal.toggle-sound	canonical	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]	ok
