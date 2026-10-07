@@ -164,11 +164,11 @@ describe("PromptModal fan-out mode", () => {
     ).toContain("all 2 members share that directory");
 
     // The Create gate is open (absolute dir, all rows complete) and says what it will do.
-    const create = host.querySelector(
+    const createButton = host.querySelector(
       '[data-ui-bridge-id="terminal.fanout-create"]',
     ) as HTMLButtonElement;
-    expect(create.disabled).toBe(false);
-    expect(create.textContent).toContain("Create 2 sessions");
+    expect(createButton.disabled).toBe(false);
+    expect(createButton.textContent).toContain("Create 2 sessions");
     expect(host.querySelector('[data-ui-bridge-id="terminal.fanout-create-blocked"]')).toBeNull();
 
     // The per-member collision probe answers after its debounce.
@@ -183,35 +183,43 @@ describe("PromptModal fan-out mode", () => {
     expect(
       requests
         .filter((r) => r.url.endsWith("/file-registry/probe-conflicts"))
-        .map((r) => JSON.parse(r.body!).prompt)
+        .map((r) => r.body)
         .sort(),
-    ).toEqual(["Write release notes for Android", "Write release notes for iOS"]);
+    ).toEqual([
+      JSON.stringify({ prompt: "Write release notes for Android", cwd: "/work/repo" }),
+      JSON.stringify({ prompt: "Write release notes for iOS", cwd: "/work/repo" }),
+    ]);
 
-    await click(create);
+    await click(createButton);
 
     // Exactly the previewed rows were posted, each carrying its preview number.
     const post = requests.find((r) => r.url.endsWith("/fanout") && r.method === "POST");
-    expect(post).toBeDefined();
-    const body = JSON.parse(post!.body!);
-    expect(body).toMatchObject({
-      templateSlug: "ship-notes",
-      templateVersion: 2,
-      maxConcurrent: 3,
-      configDirPolicy: { kind: "bestHeadroom" },
-      workingDir: "/work/repo",
-    });
-    expect(body.members).toEqual([
-      { title: "ship-notes — iOS", prompt: "Write release notes for iOS", previewIndex: 0 },
-      { title: "ship-notes — Android", prompt: "Write release notes for Android", previewIndex: 1 },
-    ]);
+    // Byte-for-byte: the body the runner receives, in the order it is built.
+    expect(post?.body).toBe(
+      JSON.stringify({
+        templateSlug: "ship-notes",
+        templateVersion: 2,
+        maxConcurrent: 3,
+        configDirPolicy: { kind: "bestHeadroom" },
+        workingDir: "/work/repo",
+        members: [
+          { title: "ship-notes — iOS", prompt: "Write release notes for iOS", previewIndex: 0 },
+          {
+            title: "ship-notes — Android",
+            prompt: "Write release notes for Android",
+            previewIndex: 1,
+          },
+        ],
+      }),
+    );
 
     // Judged against what the runner holds, then the same body cannot be created twice.
     const result = host.querySelector('[data-ui-bridge-id="terminal.fanout-create-result"]');
     expect(result?.getAttribute("data-result")).toBe("ok");
     expect(result?.textContent).toContain("Queued 2 members — up to 3 run at once");
     expect(created).toEqual([wire.createdTwo.data.run.id]);
-    expect(create.disabled).toBe(true);
-    expect(create.textContent).toContain("Created");
+    expect(createButton.disabled).toBe(true);
+    expect(createButton.textContent).toContain("Created");
     expect(
       host.querySelector('[data-ui-bridge-id="terminal.fanout-create-blocked"]')?.textContent,
     ).toBeTruthy();

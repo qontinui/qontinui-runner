@@ -398,7 +398,7 @@ describe("StatusStrip fan-out runs (prompt-matrix fan-out, Phase 7)", () => {
     );
     const patch = requests.find((r) => r.method === "PATCH");
     expect(patch?.url.endsWith(`/fanout/${runId}`)).toBe(true);
-    expect(JSON.parse(patch!.body!)).toEqual({ maxConcurrent: 5 });
+    expect(patch?.body).toBe(JSON.stringify({ maxConcurrent: 5 }));
     expect(
       host.querySelector('[data-ui-bridge-id="terminal.fanout-strip-note.7f3c9a21"]')!.textContent,
     ).toBe("asked for 5, clamped to 4 (fan-out bound 4)");
