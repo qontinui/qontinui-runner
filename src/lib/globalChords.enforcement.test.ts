@@ -437,6 +437,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/resumeVerification.ts",
   "components/terminal/sessionReviewApi.test.ts",
   "components/terminal/sessionReviewApi.ts",
+  "components/terminal/sessionReviewView.ts",
   "components/terminal/suggestions/useSuggestions.tsx",
   "components/terminal/terminalKeySequence.test.ts",
   "components/terminal/terminalKeySequence.ts",

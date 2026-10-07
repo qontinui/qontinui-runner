@@ -14,6 +14,7 @@
  */
 
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 import type { ReviewNote, ReviewNoteState } from "./sessionReview";
 
 /** Where a send delivers (`NoteTarget` in `mcp/session_review.rs`). */
@@ -243,7 +244,7 @@ async function call(url: string, init: RequestInit): Promise<unknown> {
   } catch (err) {
     if (init.signal?.aborted) throw err;
     throw new ReviewApiError(
-      `runner unreachable: ${err instanceof Error ? err.message : String(err)}`,
+      `runner unreachable: ${describeThrown(err, "network error")}`,
       { status: null, code: "network" },
     );
   }
