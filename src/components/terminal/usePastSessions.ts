@@ -132,6 +132,8 @@ export interface PastSessionsQuery {
 export interface UsePastSessionsResult {
   sessions: PastSession[];
   loading: boolean;
+  /** True once a read has SUCCEEDED — before that an empty `sessions` is UNKNOWN, not none. */
+  loaded: boolean;
   error: string | null;
   refresh: () => void;
 }
@@ -168,6 +170,7 @@ function extractSessions(data: unknown): PastSession[] {
 export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult {
   const [sessions, setSessions] = useState<PastSession[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const didLoad = useRef(false);
 
@@ -186,6 +189,7 @@ export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult
         // earlier revision assigned the envelope object straight to state,
         // and `groupByCohort`'s `for...of` then crashed the whole panel).
         setSessions(extractSessions(result.data));
+        setLoaded(true);
       } else {
         setError(result.message || "Failed to load previous sessions");
       }
@@ -206,6 +210,7 @@ export function usePastSessions(opts?: PastSessionsQuery): UsePastSessionsResult
   return {
     sessions,
     loading,
+    loaded,
     error,
     refresh: fetchSessions,
   };

@@ -7,6 +7,7 @@ import {
 } from "./useLiveClaudeSessionNames";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SinceRestartSection } from "./SinceRestartSection";
+import { UnfinishedSessionsSection } from "./UnfinishedSessionsSection";
 import { useSinceRestart } from "./SinceRestartContext";
 import { finishButtonModel, pastSessionFinishId, type FinishOp } from "./sinceRestart";
 import { useFinishOps } from "./useFinishOps";
@@ -490,7 +491,7 @@ function PastSessionCard({
  * its own `usePastSessions` hook.
  */
 export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
-  const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
+  const { sessions, loading, loaded, error, refresh: refreshSessions } = usePastSessions();
   // The "Since restart" roster (null outside a `SinceRestartProvider`).
   const roster = useSinceRestart();
   const refreshRoster = roster?.refresh;
@@ -598,6 +599,12 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
         {/* "Before the last restart" / the pre-rebuild preview — first, so
             the strip's Review lands on it. */}
         <SinceRestartSection />
+        <UnfinishedSessionsSection
+          sessions={sessions}
+          loaded={loaded}
+          error={error}
+          onSettled={refreshSessions}
+        />
         {loading && sessions.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
             <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
