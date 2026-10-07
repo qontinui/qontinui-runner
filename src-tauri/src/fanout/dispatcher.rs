@@ -244,10 +244,13 @@ pub(crate) const SPAWN_SETTLE_BOUND: chrono::Duration = chrono::Duration::minute
 /// How long the admission loop waits for one spawn's answer before settling it
 /// outcome-UNKNOWN ([`SpawnSettle::Unknown`]). Deliberately SHORTER than
 /// [`SPAWN_SETTLE_BOUND`], so a slow spawn always settles through this path.
-/// The in-flight marker is re-stamped when each spawn of a batch STARTS (not
-/// when the tick admitted it), so a member queued behind slow spawns earlier
-/// in the batch keeps its whole bound for its own spawn; the marker then only
-/// expires for a loop that died.
+/// A member's in-flight marker is stamped when the tick admits it, re-stamped
+/// each time an earlier spawn of its batch settles, and re-stamped again when
+/// its own spawn STARTS. While the batch runs, consecutive stamps are therefore
+/// about one `spawn_call_timeout` apart — well inside [`SPAWN_SETTLE_BOUND`] —
+/// however many slow spawns precede the member. A marker can expire only when
+/// no live batch holds it: the loop that would re-stamp and settle it panicked
+/// or was aborted.
 ///
 /// A timed-out spawn is not aborted — cutting `TerminalManager::create` off
 /// mid-way could leave a child nothing records. It runs on, and whatever it
@@ -257,6 +260,11 @@ pub(crate) const SPAWN_SETTLE_BOUND: chrono::Duration = chrono::Duration::minute
 /// running `claude` is never left untracked), and a late refusal, drain
 /// deferral or occupied bound maps exactly as an on-time one would — refused
 /// with its backoff, or back to the queue — so its prompt is never lost.
+///
+/// `spawn_unconfirmed` is therefore NOT a final state: a late not-spawned
+/// answer re-queues the member and the dispatcher spawns it again. A prompt
+/// an operator re-submitted by hand after seeing `spawn_unconfirmed` can so
+/// run twice.
 pub(crate) const SPAWN_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How long an admitted member may read [`Liveness::Unconfirmed`] before the
@@ -302,8 +310,10 @@ struct RunEntry {
     /// Backoff per refused member index. In-memory: a restart retries at once.
     retry: HashMap<u32, RetryState>,
     /// Member indices whose spawn is in flight outside the book lock, with
-    /// when it was admitted — so a marker whose settle was lost expires
-    /// ([`SPAWN_SETTLE_BOUND`]) instead of pinning the member forever.
+    /// when the marker was last stamped (admission, each earlier settle in
+    /// its batch, its own spawn start — see [`SPAWN_CALL_TIMEOUT`]) — so a
+    /// marker whose settle was lost expires ([`SPAWN_SETTLE_BOUND`]) instead
+    /// of pinning the member forever.
     spawning: HashMap<u32, DateTime<Utc>>,
     /// Since when (and under which release reason) a member has read
     /// [`Liveness::Unconfirmed`].
@@ -374,7 +384,8 @@ struct PendingSpawn {
 /// How one recorded admission settled.
 #[derive(Debug)]
 enum SpawnSettle {
-    /// Not attempted (an earlier spawn in the batch halted it).
+    /// Not attempted: an earlier spawn in the batch halted it, or the member
+    /// no longer held the admission when its turn came.
     NotAttempted,
     /// The host answered.
     Outcome(SpawnOutcome),
@@ -861,7 +872,9 @@ impl FanoutDispatcher {
     async fn spawn_admitted(&self, pending: Vec<PendingSpawn>) {
         let mut halt_all = false;
         let mut halted_runs: HashSet<Uuid> = HashSet::new();
-        for PendingSpawn { req } in pending {
+        let batch: Vec<MemberSpawnRequest> = pending.into_iter().map(|p| p.req).collect();
+        for (i, req) in batch.iter().enumerate() {
+            let req = req.clone();
             let settle = if halt_all || halted_runs.contains(&req.run_id) {
                 SpawnSettle::NotAttempted
             } else {
@@ -888,6 +901,32 @@ impl FanoutDispatcher {
                 _ => {}
             }
             self.record_spawn(&req, settle).await;
+            // Every member still waiting in this batch is in flight for as
+            // long as the batch is alive: re-stamp them all, so none expires
+            // behind slow spawns before its own starts.
+            self.restamp_waiting(&batch[i + 1..]).await;
+        }
+    }
+
+    /// Re-stamp, under one lock acquisition, the in-flight marker of every
+    /// member in `waiting` that still holds its admission. A marker already
+    /// gone (its admission was settled some other way) is not re-created.
+    async fn restamp_waiting(&self, waiting: &[MemberSpawnRequest]) {
+        if waiting.is_empty() {
+            return;
+        }
+        let now = self.now();
+        let mut book = self.book.lock().await;
+        for req in waiting {
+            let Some(entry) = book.runs.get_mut(&req.run_id) else {
+                continue;
+            };
+            if !holds_admission(entry, req) {
+                continue;
+            }
+            if let Some(at) = entry.spawning.get_mut(&req.index) {
+                *at = now;
+            }
         }
     }
 
@@ -906,11 +945,7 @@ impl FanoutDispatcher {
         let Some(entry) = book.runs.get_mut(&req.run_id) else {
             return false;
         };
-        let holds = entry.members.iter().any(|m| {
-            m.index == req.index
-                && m.state == MemberState::Admitted
-                && m.claude_session_id.as_deref() == Some(req.claude_session_id.as_str())
-        });
+        let holds = holds_admission(entry, req);
         if holds {
             entry.spawning.insert(req.index, now);
         }
@@ -1005,6 +1040,12 @@ impl FanoutDispatcher {
                 entry.unconfirmed.remove(&req.index);
                 entry.members[pos].released_at = None;
             } else if entry.members[pos].state != MemberState::Admitted {
+                if matches!(settle, SpawnSettle::NotAttempted) {
+                    info!(run_id = %run_id, index = req.index,
+                        state = ?entry.members[pos].state,
+                        "fanout: admission withdrawn before its spawn started; nothing spawned");
+                    return;
+                }
                 if !readopt_late_spawn(&mut entry.members[pos], &settle, now) {
                     warn!(run_id = %run_id, index = req.index,
                         state = ?entry.members[pos].state, outcome = ?settle,
@@ -1025,9 +1066,6 @@ impl FanoutDispatcher {
                 entry.retry.remove(&req.index);
                 self.persist_member(run_id, &mut entry.members[pos], now)
                     .await;
-                if entry.run.state == RunState::Completed {
-                    entry.completed_at = None;
-                }
                 let view = self.settle_run_state(entry).await;
                 self.publish(&book);
                 drop(book);
@@ -1401,6 +1439,16 @@ fn late_spawn_did_not_happen(m: &FanoutMember, settle: &SpawnSettle) -> bool {
                     | SpawnOutcome::BoundOccupied { .. }
             )
         )
+}
+
+/// Whether the member `req` was spawned for still holds that admission: same
+/// index, still admitted, same pinned session id.
+fn holds_admission(entry: &RunEntry, req: &MemberSpawnRequest) -> bool {
+    entry.members.iter().any(|m| {
+        m.index == req.index
+            && m.state == MemberState::Admitted
+            && m.claude_session_id.as_deref() == Some(req.claude_session_id.as_str())
+    })
 }
 
 /// Undo an admission that did not produce a session.
@@ -2943,57 +2991,88 @@ mod tests {
     }
 
     /// Spawns run serially, each waited for up to `spawn_call_timeout`. A
-    /// member admitted in the same tick but spawned after earlier spawns
-    /// timed out keeps its in-flight marker for its OWN spawn: the marker is
-    /// stamped when that spawn starts, so an operator release is still
-    /// refused while it runs.
+    /// member admitted in the same tick but waiting behind spawns that time
+    /// out keeps its in-flight marker the whole time: every settle in the
+    /// batch re-stamps the members still waiting, and the member's own spawn
+    /// start re-stamps it again. So an operator release is refused both
+    /// while it WAITS (behind two timed-out spawns, past the settle bound
+    /// counted from its admission) and while its own spawn runs.
     #[tokio::test(start_paused = true)]
     async fn fanout_a_member_late_in_a_slow_batch_stays_in_flight_until_its_spawn_settles() {
         let f = fixture(15).await;
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *f.host.gate.lock().unwrap() = Some(gate.clone());
-        let a = f.d.create(new_run(1, 1, None)).await.unwrap().run.id;
-        let b = f.d.create(new_run(1, 1, None)).await.unwrap().run.id;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(f.d.create(new_run(1, 1, None)).await.unwrap().run.id);
+        }
         // The book spawns runs in id order.
-        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        ids.sort();
+        let (first, second, third) = (ids[0], ids[1], ids[2]);
         let ticker = {
             let d = f.d.clone();
             tokio::spawn(async move { d.tick().await })
         };
-        while f.host.started.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let started = |n: u32| {
+            let host = f.host.clone();
+            async move {
+                while host.started.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        };
+        started(1).await;
+        // All three were admitted (and stamped) by the tick.
+        for id in [first, second, third] {
+            assert_eq!(
+                f.d.get(id).unwrap().unwrap().members[0].state,
+                MemberState::Admitted
+            );
         }
-        // Both were admitted (and stamped) by the tick. While the first spawn
-        // hangs, the dispatcher's clock passes the settle bound — as a batch
-        // of slow spawns would take it.
-        assert_eq!(
-            f.d.get(second).unwrap().unwrap().members[0].state,
-            MemberState::Admitted
-        );
-        advance(&f.d, SPAWN_SETTLE_BOUND.num_seconds() + 60);
-        // The first spawn's wait times out (paused time); the second starts.
-        while f.host.started.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
+        // The first spawn hangs for its whole wait; the dispatcher's clock
+        // moves with it.
+        let one_wait = chrono::Duration::from_std(SPAWN_CALL_TIMEOUT)
+            .unwrap()
+            .num_seconds()
+            + 60;
+        advance(&f.d, one_wait);
+        // Its wait times out (paused time) and it settles UNKNOWN; the
+        // second spawn starts and hangs too.
+        started(2).await;
         assert_eq!(
             f.d.get(first).unwrap().unwrap().members[0].terminal_id,
             None,
             "the first spawn settled UNKNOWN"
         );
-        // The second member's spawn is running: it cannot be released.
-        let r = f.d.release(second, 0).await;
+        advance(&f.d, one_wait);
+        // The third member has now waited past the settle bound counted from
+        // its admission, behind two slow spawns, and its own spawn has not
+        // started — the second is still held. It is still in flight.
+        assert!(
+            chrono::Duration::seconds(2 * one_wait) > SPAWN_SETTLE_BOUND,
+            "the test must wait past the bound"
+        );
+        assert_eq!(f.host.started.load(Ordering::SeqCst), 2);
+        let r = f.d.release(third, 0).await;
+        assert!(
+            matches!(r, Err(OpError::Conflict(ref m)) if m.contains("being spawned")),
+            "a member waiting in a live batch must not be releasable: {r:?}"
+        );
+        // The second spawn's wait times out; the third's own spawn runs.
+        started(3).await;
+        let r = f.d.release(third, 0).await;
         assert!(
             matches!(r, Err(OpError::Conflict(ref m)) if m.contains("being spawned")),
             "{r:?}"
         );
         // Once its spawn lands it is admitted with its terminal, and only
         // then releasable.
-        gate.add_permits(2);
+        gate.add_permits(3);
         ticker.await.unwrap();
-        let v = f.d.get(second).unwrap().unwrap();
+        let v = f.d.get(third).unwrap().unwrap();
         assert_eq!(v.members[0].state, MemberState::Admitted);
         assert!(v.members[0].terminal_id.is_some());
-        assert!(f.d.release(second, 0).await.is_ok());
+        assert!(f.d.release(third, 0).await.is_ok());
     }
 
     /// Every write stamps `updated_at`, refusals and drain deferrals included,

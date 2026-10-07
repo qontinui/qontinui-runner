@@ -360,7 +360,11 @@ describe("StatusStrip fan-out runs (prompt-matrix fan-out, Phase 7)", () => {
     );
     expect(toggle!.textContent).toContain("run review-sweep — 1 running · 1 ");
     expect(toggle!.textContent).toContain("(runner draining)");
-    expect(toggle!.textContent).toContain("1 refused (fan-out bound full)");
+    // A refusal is the runner's own text (a resource-guard refusal here),
+    // truncated for the strip.
+    expect(toggle!.textContent).toContain(
+      "1 refused (resource_guard:critical:free_commit_bytes: Not starting a n…)",
+    );
     expect(
       host.querySelector('[data-ui-bridge-id="terminal.fanout-strip-age.7f3c9a21"]')!.textContent,
     ).toMatch(/started \d+d ago/);
@@ -378,7 +382,12 @@ describe("StatusStrip fan-out runs (prompt-matrix fan-out, Phase 7)", () => {
       "terminal.fanout-strip-member.7f3c9a21.2",
     ]);
     expect(members.map((m) => m.textContent?.match(/#\d+/)?.[0])).toEqual(["#1", "#3", "#4"]);
-    expect(members[2].textContent).toContain("refused (fan-out bound full)");
+    // The refused member says why and that its backoff (first refusal, so no
+    // count) has elapsed; the row's tooltip carries the same text.
+    const refusedText =
+      "refused (resource_guard:critical:free_commit_bytes: Not starting a n… · retrying)";
+    expect(members[2].textContent).toContain(refusedText);
+    expect(members[2].querySelector(`[title="${refusedText}"]`)).not.toBeNull();
     // Only the ADMITTED member offers Release slot.
     expect(
       host.querySelector('[data-ui-bridge-id="terminal.fanout-strip-release.7f3c9a21.0"]'),
