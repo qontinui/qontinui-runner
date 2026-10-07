@@ -19,6 +19,7 @@
  */
 
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -124,9 +125,11 @@ export type FanoutResult<T> =
       error: string;
       /**
        * The envelope's machine-readable `code`, when the server sent one —
-       * e.g. {@link FANOUT_LEDGER_NOT_LOADED}.
+       * e.g. {@link FANOUT_LEDGER_NOT_LOADED}. Named `errorCode` here, not
+       * `code`, so no reader of it looks like a keyboard `code` read to the
+       * chord scanner (`lib/keyClaimScan.ts`).
        */
-      code?: string;
+      errorCode?: string;
     };
 
 /**
@@ -150,6 +153,13 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/** A string field of the reply envelope, or `null` when absent or not a string. */
+function envelopeString(body: unknown, field: "error" | "code"): string | null {
+  if (!isRecord(body)) return null;
+  const value = body[field];
+  return typeof value === "string" ? value : null;
+}
+
 /**
  * Turn an HTTP status + parsed body into a {@link FanoutResult}.
  *
@@ -164,8 +174,9 @@ export function parseFanoutEnvelope<T>(
   validate: (data: unknown) => data is T,
   what: string,
 ): FanoutResult<T> {
-  const envelopeError = isRecord(body) && typeof body.error === "string" ? body.error : null;
-  const code = isRecord(body) && typeof body.code === "string" ? { code: body.code } : {};
+  const envelopeError = envelopeString(body, "error");
+  const errorCode = envelopeString(body, "code");
+  const code = errorCode !== null ? { errorCode } : {};
   if (status < 200 || status >= 300) {
     return { ok: false, status, error: envelopeError ?? `${what}: HTTP ${status}`, ...code };
   }
@@ -237,7 +248,7 @@ export async function fanoutFetch<T>(
     return {
       ok: false,
       status: null,
-      error: `${what}: runner unreachable (${err instanceof Error ? err.message : String(err)})`,
+      error: `${what}: runner unreachable (${describeThrown(err, "no response")})`,
     };
   }
   let body: unknown = null;

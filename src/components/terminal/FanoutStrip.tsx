@@ -75,7 +75,7 @@ export function FanoutStrip({ api }: { api: FanoutRunsApi }) {
         data-ui-bridge-id="terminal.fanout-strip"
         data-fanout-state="unknown"
         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium leading-none whitespace-nowrap text-[#e0af68]"
-        data-fanout-unknown-code={state.code}
+        data-fanout-unknown-code={state.errorCode}
         title={`The fan-out scheduler could not be read${
           state.status !== null ? ` (HTTP ${state.status})` : ""
         }: ${state.error}`}

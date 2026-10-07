@@ -77,7 +77,7 @@ describe("parseFanoutEnvelope", () => {
       ok: false,
       status: 503,
       error: "the fan-out ledger has not been loaded yet",
-      code: FANOUT_LEDGER_NOT_LOADED,
+      errorCode: FANOUT_LEDGER_NOT_LOADED,
     });
   });
 

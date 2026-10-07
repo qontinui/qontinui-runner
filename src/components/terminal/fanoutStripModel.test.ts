@@ -100,7 +100,7 @@ describe("read state", () => {
       kind: "unknown",
       status: 503,
       error: "the fan-out ledger could not be loaded from PostgreSQL (connection refused)",
-      code: FANOUT_LEDGER_LOAD_FAILED,
+      errorCode: FANOUT_LEDGER_LOAD_FAILED,
     });
     expect(fanoutStripVisible(s)).toBe(true);
     if (s.kind !== "unknown") throw new Error("unreachable");

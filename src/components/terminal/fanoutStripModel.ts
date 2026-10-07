@@ -36,21 +36,22 @@ export type FanoutReadState =
   /**
    * The last read failed: the scheduler's state is UNKNOWN, not empty. This
    * includes a runner whose ledger load FAILED (503
-   * `FANOUT_LEDGER_LOAD_FAILED`, PostgreSQL unreadable) — `code` carries the
+   * `FANOUT_LEDGER_LOAD_FAILED`, PostgreSQL unreadable) — `errorCode` carries the
    * server's word when it sent one.
    */
-  | { kind: "unknown"; error: string; status: number | null; code?: string }
+  | { kind: "unknown"; error: string; status: number | null; errorCode?: string }
   | { kind: "ok"; runs: FanoutRunView[] };
 
 /** Fold a `GET /fanout` result into the read state. */
 export function readStateFromResult(result: FanoutResult<FanoutRunView[]>): FanoutReadState {
   if (result.ok) return { kind: "ok", runs: result.data };
-  if (result.code === FANOUT_LEDGER_NOT_LOADED) return { kind: "settling", reason: result.error };
+  if (result.errorCode === FANOUT_LEDGER_NOT_LOADED)
+    return { kind: "settling", reason: result.error };
   return {
     kind: "unknown",
     error: result.error,
     status: result.status,
-    ...(result.code !== undefined ? { code: result.code } : {}),
+    ...(result.errorCode !== undefined ? { errorCode: result.errorCode } : {}),
   };
 }
 
