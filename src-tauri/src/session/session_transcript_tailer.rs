@@ -151,7 +151,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::claude_session::coord_register::{AiCoordRegistrar, ResumeParams, TranscriptBindRefusal};
+use crate::claude_session::coord_register::{
+    AiCoordRegistrar, ResumeParams, TranscriptBindRefusal,
+};
 
 use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
 

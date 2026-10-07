@@ -334,22 +334,28 @@ async fn fetch_wire(ids: &[String]) -> Result<(WireResponse, String), String> {
     let (base, jwt) = match parts {
         Ok(Ok(Ok(p))) => p,
         Ok(Ok(Err(e))) => {
-            return Err(format!("coord work-status: no credential ({e}){clamp_note}"))
+            return Err(format!(
+                "coord work-status: no credential ({e}){clamp_note}"
+            ))
         }
         Ok(Err(e)) => {
-            return Err(format!("coord work-status: credential resolution panicked ({e}){clamp_note}"))
+            return Err(format!(
+                "coord work-status: credential resolution panicked ({e}){clamp_note}"
+            ))
         }
         Err(_) => {
             return Err(format!(
-                    "coord work-status: credential resolution timed out after {}s{clamp_note}",
-                    CREDENTIAL_TIMEOUT.as_secs()
-                ))
+                "coord work-status: credential resolution timed out after {}s{clamp_note}",
+                CREDENTIAL_TIMEOUT.as_secs()
+            ))
         }
     };
     let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
-            return Err(format!("coord work-status: client build failed ({e}){clamp_note}"))
+            return Err(format!(
+                "coord work-status: client build failed ({e}){clamp_note}"
+            ))
         }
     };
 
@@ -373,12 +379,17 @@ async fn fetch_wire(ids: &[String]) -> Result<(WireResponse, String), String> {
     };
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("coord work-status: HTTP {}{clamp_note}", status.as_u16()));
+        return Err(format!(
+            "coord work-status: HTTP {}{clamp_note}",
+            status.as_u16()
+        ));
     }
     let body: WireResponse = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
-            return Err(format!("coord work-status: undecodable 2xx body ({e}){clamp_note}"))
+            return Err(format!(
+                "coord work-status: undecodable 2xx body ({e}){clamp_note}"
+            ))
         }
     };
     Ok((body, clamp_note))
@@ -481,9 +492,7 @@ fn resolution_from_body(body: &WireResponse, csid: &str) -> RowResolution {
     if body.unknown.iter().any(|u| u == csid) {
         return RowResolution::Unknown;
     }
-    RowResolution::Unresolved(
-        "coord named the id in neither `statuses` nor `unknown`".to_string(),
-    )
+    RowResolution::Unresolved("coord named the id in neither `statuses` nor `unknown`".to_string())
 }
 
 /// Ask coord which `coord.sessions` row answers for the harness session id
@@ -528,7 +537,10 @@ mod tests {
             "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
             "truncated": false, "sessionBridgeColumnPresent": true
         }));
-        assert_eq!(resolution_from_body(&unknown, "sid"), RowResolution::Unknown);
+        assert_eq!(
+            resolution_from_body(&unknown, "sid"),
+            RowResolution::Unknown
+        );
 
         // In neither bucket: coord did not settle it — must NOT read as mintable.
         let silent = body(serde_json::json!({
@@ -557,7 +569,10 @@ mod tests {
             "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
             "sessionBridgeColumnPresent": true
         }));
-        assert!(matches!(resolution_from_body(&b, "sid"), RowResolution::Unresolved(_)));
+        assert!(matches!(
+            resolution_from_body(&b, "sid"),
+            RowResolution::Unresolved(_)
+        ));
     }
 
     #[test]

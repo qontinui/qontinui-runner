@@ -127,7 +127,8 @@ impl AttemptLedger {
     }
 }
 
-static LEDGER: std::sync::LazyLock<AttemptLedger> = std::sync::LazyLock::new(AttemptLedger::default);
+static LEDGER: std::sync::LazyLock<AttemptLedger> =
+    std::sync::LazyLock::new(AttemptLedger::default);
 
 /// Apply a [`Decision`] through the tailer's binder. Blocking (file I/O in the
 /// replay). Returns what to count, or `None` when the key was already bound.
@@ -213,7 +214,8 @@ pub async fn ensure_bound(tailer: &Arc<SessionTranscriptTailer>, path: &Path) {
     if !LEDGER.try_begin(&identity.claude_session_id, Instant::now()) {
         return;
     }
-    let resolution = crate::mcp::session_work_status::resolve_coord_row(&identity.claude_session_id).await;
+    let resolution =
+        crate::mcp::session_work_status::resolve_coord_row(&identity.claude_session_id).await;
     let decision = decide(&resolution);
     let (t, id, p) = (tailer.clone(), identity, path.to_path_buf());
     let joined = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
@@ -237,8 +239,8 @@ mod tests {
 
     #[test]
     fn identity_reads_config_dir_and_account_from_the_path() {
-        let p = Path::new("/home/u/.claude-gmail/projects/-home-u-proj")
-            .join(format!("{CSID}.jsonl"));
+        let p =
+            Path::new("/home/u/.claude-gmail/projects/-home-u-proj").join(format!("{CSID}.jsonl"));
         let id = identity_from_path(&p).expect("identity");
         assert_eq!(id.claude_session_id, CSID);
         assert_eq!(id.config_dir, "/home/u/.claude-gmail");
@@ -258,8 +260,10 @@ mod tests {
             identity_from_path(Path::new(&format!("/c/.claude/projects/p/{CSID}.txt"))).is_none()
         );
         // The default home carries the stable `unknown` label, not a failure.
-        let id = identity_from_path(Path::new(&format!("/home/u/.claude/projects/p/{CSID}.jsonl")))
-            .unwrap();
+        let id = identity_from_path(Path::new(&format!(
+            "/home/u/.claude/projects/p/{CSID}.jsonl"
+        )))
+        .unwrap();
         assert_eq!(id.account_label, "unknown");
     }
 
@@ -279,12 +283,21 @@ mod tests {
         let l = AttemptLedger::default();
         let t0 = Instant::now();
         assert!(l.try_begin("a", t0));
-        assert!(!l.try_begin("a", t0 + Duration::from_secs(5)), "inside window");
+        assert!(
+            !l.try_begin("a", t0 + Duration::from_secs(5)),
+            "inside window"
+        );
         assert!(l.try_begin("b", t0), "another session is independent");
         assert!(l.try_begin("a", t0 + ATTEMPT_WINDOW), "window elapsed");
     }
 
-    fn tailer(dir: &Path) -> (Arc<SessionTranscriptTailer>, Arc<AiCoordRegistrar>, Arc<OutboxWriter>) {
+    fn tailer(
+        dir: &Path,
+    ) -> (
+        Arc<SessionTranscriptTailer>,
+        Arc<AiCoordRegistrar>,
+        Arc<OutboxWriter>,
+    ) {
         let outbox = Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap());
         let machine_id = Uuid::new_v4();
         let registrar = Arc::new(AiCoordRegistrar::with_tenant_resolver(
@@ -292,7 +305,11 @@ mod tests {
             machine_id,
             || None,
         ));
-        let emitter = Arc::new(TranscriptEmitter::new(outbox.clone(), machine_id, registrar.clone()));
+        let emitter = Arc::new(TranscriptEmitter::new(
+            outbox.clone(),
+            machine_id,
+            registrar.clone(),
+        ));
         (
             Arc::new(SessionTranscriptTailer::new(emitter, registrar.clone())),
             registrar,
@@ -330,10 +347,18 @@ mod tests {
     fn mint_binds_stamps_the_account_and_replays_the_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let (t, registrar, outbox) = tailer(dir.path());
-        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n");
+        let path = transcript(
+            dir.path(),
+            CSID,
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
+        );
         let id = identity_from_path(&path).unwrap();
         t.note_seen_unbound(CSID);
-        assert_eq!(t.coverage().sessions_unbound, 1, "a seen-but-unbound transcript is a hole");
+        assert_eq!(
+            t.coverage().sessions_unbound,
+            1,
+            "a seen-but-unbound transcript is a hole"
+        );
 
         let kind = apply_retrying(&t, &id, &path, &Decision::Mint);
         assert_eq!(kind, Some(AutoBindKind::Minted));
@@ -415,6 +440,9 @@ mod tests {
         t.note_autobind(AutoBindKind::Minted);
         t.note_autobind(AutoBindKind::Deferred);
         let c = t.coverage();
-        assert_eq!((c.autobind_adopted, c.autobind_minted, c.autobind_deferred), (1, 2, 1));
+        assert_eq!(
+            (c.autobind_adopted, c.autobind_minted, c.autobind_deferred),
+            (1, 2, 1)
+        );
     }
 }
