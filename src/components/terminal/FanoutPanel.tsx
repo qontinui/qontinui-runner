@@ -38,6 +38,7 @@ import {
   type FanoutCreateVerdict,
 } from "./fanoutPlan";
 import { buildProbeBody, buildProbeUrl } from "./LaunchMenu";
+import { fanoutPreviewRowId } from "./fanoutUiIds";
 import { parseMatrix, type MatrixMode } from "./promptMatrix";
 import type { PromptTemplate } from "./promptLibraryApi";
 import type { PromptParamValues } from "./renderPromptTemplate";
@@ -366,8 +367,14 @@ export function FanoutPanel({
         </label>
       </div>
 
+      {/* Distinct keys: without them React reuses ONE <div> across the two
+          branches, and the UI Bridge auto-registrar — which records an
+          element's id the first time it sees the element and never re-reads
+          it — keeps reporting the error id on the preview table after the
+          matrix becomes valid. Each branch is its own element with its own id. */}
       {preview.kind === "error" ? (
         <div
+          key="fanout-matrix-error"
           data-ui-bridge-id="terminal.fanout-matrix-error"
           className="flex items-start gap-1.5 text-[11px] text-[#e0af68]"
         >
@@ -375,7 +382,11 @@ export function FanoutPanel({
           <span>{preview.message}</span>
         </div>
       ) : (
-        <div className="border border-[#2a2d3d] rounded overflow-hidden">
+        <div
+          key="fanout-preview-table"
+          data-ui-bridge-id="terminal.fanout-preview-table"
+          className="border border-[#2a2d3d] rounded overflow-hidden"
+        >
           <div className="grid grid-cols-[28px_32px_minmax(0,1fr)_minmax(0,1.4fr)_110px] gap-2 px-2 py-1.5 bg-[#13141f] text-[10px] uppercase tracking-wider text-[#565f89]">
             <span />
             <span>#</span>
@@ -397,7 +408,7 @@ export function FanoutPanel({
               return (
                 <div
                   key={r.index}
-                  data-ui-bridge-id="terminal.fanout-preview-row"
+                  data-ui-bridge-id={fanoutPreviewRowId("", r.index)}
                   data-row-index={r.index}
                   data-row-ticked={isTicked ? "true" : "false"}
                   data-row-blocked={blocked ? "true" : "false"}
@@ -406,7 +417,7 @@ export function FanoutPanel({
                   <div className="grid grid-cols-[28px_32px_minmax(0,1fr)_minmax(0,1.4fr)_110px] gap-2 px-2 py-1.5 items-start text-[11px]">
                     <input
                       type="checkbox"
-                      data-ui-bridge-id="terminal.fanout-preview-row-tick"
+                      data-ui-bridge-id={fanoutPreviewRowId("tick", r.index)}
                       data-row-index={r.index}
                       checked={isTicked}
                       onChange={() => toggleTick(r.index)}
@@ -415,7 +426,7 @@ export function FanoutPanel({
                     />
                     <button
                       type="button"
-                      data-ui-bridge-id="terminal.fanout-preview-row-expand"
+                      data-ui-bridge-id={fanoutPreviewRowId("expand", r.index)}
                       data-row-index={r.index}
                       onClick={() => toggleExpand(r.index)}
                       className="flex items-center gap-0.5 text-[#565f89] hover:text-[#a9b1d6] font-mono"
@@ -443,7 +454,7 @@ export function FanoutPanel({
                       )}
                     </span>
                     <span
-                      data-ui-bridge-id="terminal.fanout-preview-row-collisions"
+                      data-ui-bridge-id={fanoutPreviewRowId("collisions", r.index)}
                       data-row-index={r.index}
                       style={{ color: TONE_COLOR[probe.tone] }}
                       title={probe.title}
@@ -453,7 +464,7 @@ export function FanoutPanel({
                   </div>
                   {isOpen && (
                     <pre
-                      data-ui-bridge-id="terminal.fanout-preview-row-prompt"
+                      data-ui-bridge-id={fanoutPreviewRowId("prompt", r.index)}
                       data-row-index={r.index}
                       className="mx-2 mb-2 p-2.5 bg-[#13141f] border border-[#2a2d3d] rounded text-[11px] text-[#a9b1d6] whitespace-pre-wrap break-words max-h-[160px] overflow-y-auto scrollbar-dark"
                     >

@@ -13,7 +13,12 @@
 //! is lost — its task panicked, or the loop driving it was aborted — is
 //! outcome-UNKNOWN, never a refusal: the member stays `admitted` under its
 //! pinned session id and the next tick's liveness reconcile decides whether it
-//! ran, so a prompt is never spawned twice. Every transition is
+//! ran, so a prompt is never spawned twice. A spawn is waited for at most
+//! [`SPAWN_CALL_TIMEOUT`]; one that answers later (or after its loop died) is
+//! recorded by the next tick, and a late `Spawned` re-adopts a member liveness
+//! released `spawn_unconfirmed` meanwhile — a running `claude` is never left
+//! untracked, at the cost of the run briefly sitting one over its cap. Every
+//! transition is
 //! written through to the store; the book is reloaded from it at runner start
 //! and its `admitted` members reconciled against the terminals that survived
 //! ([`FanoutDispatcher::boot`]).
@@ -236,6 +241,19 @@ pub(crate) const STALE_RUN_AGE: chrono::Duration = chrono::Duration::hours(24);
 /// the liveness reconcile like a panicked spawn ([`SpawnSettle::Unknown`]).
 pub(crate) const SPAWN_SETTLE_BOUND: chrono::Duration = chrono::Duration::minutes(10);
 
+/// How long the admission loop waits for one spawn's answer before settling it
+/// outcome-UNKNOWN ([`SpawnSettle::Unknown`]). Deliberately SHORTER than
+/// [`SPAWN_SETTLE_BOUND`], so a slow spawn always settles through this path
+/// (and the in-flight marker is only ever expired for a loop that died).
+///
+/// A timed-out spawn is not aborted — cutting `TerminalManager::create` off
+/// mid-way could leave a child nothing records. It runs on, and whatever it
+/// comes to is queued as a LATE settle that the next tick records
+/// ([`FanoutDispatcher::record_spawn`]): a late `Spawned` for a member the
+/// liveness reconcile meanwhile released `spawn_unconfirmed` RE-ADOPTS it, so a
+/// running `claude` is never left untracked.
+pub(crate) const SPAWN_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// How long an admitted member may read [`Liveness::Unconfirmed`] before the
 /// slot is released as an exit. Covers a respawn and the restore rebind, which
 /// run after the boot settle.
@@ -361,6 +379,14 @@ enum SpawnSettle {
     Unknown(String),
 }
 
+/// A spawn that answered after the admission loop stopped waiting for it (it
+/// timed out, or the loop was aborted). Recorded by the next tick.
+#[derive(Debug)]
+struct LateSettle {
+    req: MemberSpawnRequest,
+    outcome: SpawnOutcome,
+}
+
 pub(crate) struct FanoutDispatcher {
     owner_instance: String,
     store: Arc<dyn FanoutStore>,
@@ -377,6 +403,13 @@ pub(crate) struct FanoutDispatcher {
     /// Seconds added to the wall clock — moved only by tests, to step through
     /// backoffs and grace windows without sleeping.
     clock_skew_secs: AtomicI64,
+    /// How long one spawn is waited for ([`SPAWN_CALL_TIMEOUT`]; shortened by
+    /// tests).
+    spawn_call_timeout: std::time::Duration,
+    /// Spawn outcomes that arrived after nobody was waiting for them, drained
+    /// at the start of every tick. Shared with the detached spawn tasks, so an
+    /// outcome lands here even when the loop that started the spawn is gone.
+    late_settles: Arc<std::sync::Mutex<Vec<LateSettle>>>,
 }
 
 impl FanoutDispatcher {
@@ -396,6 +429,19 @@ impl FanoutDispatcher {
             ledger: RwLock::new(LedgerState::Pending),
             wake: tokio::sync::Notify::new(),
             clock_skew_secs: AtomicI64::new(0),
+            spawn_call_timeout: SPAWN_CALL_TIMEOUT,
+            late_settles: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Record every late spawn outcome queued since the last tick.
+    async fn record_late_settles(&self) {
+        let late = match self.late_settles.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(p) => std::mem::take(&mut *p.into_inner()),
+        };
+        for LateSettle { req, outcome } in late {
+            self.record_spawn(&req, SpawnSettle::Outcome(outcome)).await;
         }
     }
 
@@ -751,6 +797,10 @@ impl FanoutDispatcher {
     /// The admissions are recorded under the book lock; the spawns run after
     /// it is released ([`Self::spawn_admitted`]).
     pub(crate) async fn tick(&self) {
+        // A spawn that answered after its loop stopped waiting is recorded
+        // before this tick reads liveness, so a late `Spawned` re-adopts its
+        // member rather than racing a second release.
+        self.record_late_settles().await;
         // Read before taking the book: the bound may resolve the registry
         // over the network.
         let bound = self.host.fanout_bound().await;
@@ -815,12 +865,7 @@ impl FanoutDispatcher {
                 // whether the terminal was created before it — so it is
                 // UNKNOWN, never a refusal (which would re-queue the member
                 // under a fresh session id and could run its prompt twice).
-                let host = self.host.clone();
-                let r = req.clone();
-                match tokio::spawn(async move { host.spawn_fanout_member(r).await }).await {
-                    Ok(o) => SpawnSettle::Outcome(o),
-                    Err(e) => SpawnSettle::Unknown(format!("spawn task failed: {e}")),
-                }
+                self.await_spawn(req.clone()).await
             };
             match &settle {
                 SpawnSettle::Outcome(
@@ -837,6 +882,58 @@ impl FanoutDispatcher {
         }
     }
 
+    /// Run one spawn on a task of its own and wait for it, at most
+    /// `spawn_call_timeout` ([`SPAWN_CALL_TIMEOUT`]).
+    ///
+    /// The task delivers its outcome over a oneshot; when nobody is listening
+    /// any more (this wait timed out, or the loop running it was aborted) it
+    /// queues the outcome as a [`LateSettle`] instead, so no answer is ever
+    /// dropped. A timeout is outcome-UNKNOWN, exactly like a panic: the member
+    /// stays admitted under its pinned session id for liveness to decide, and
+    /// the late answer, when it comes, is recorded by the next tick.
+    async fn await_spawn(&self, req: MemberSpawnRequest) -> SpawnSettle {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<SpawnOutcome>();
+        let host = self.host.clone();
+        let late = self.late_settles.clone();
+        let task = tokio::spawn(async move {
+            let outcome = host.spawn_fanout_member(req.clone()).await;
+            if let Err(outcome) = tx.send(outcome) {
+                warn!(run_id = %req.run_id, index = req.index, outcome = ?outcome,
+                    "fanout: a spawn answered after its caller stopped waiting — \
+                     recorded on the next tick");
+                let settle = LateSettle { req, outcome };
+                match late.lock() {
+                    Ok(mut g) => g.push(settle),
+                    Err(p) => p.into_inner().push(settle),
+                }
+            }
+        });
+        match tokio::time::timeout(self.spawn_call_timeout, &mut rx).await {
+            Ok(Ok(outcome)) => SpawnSettle::Outcome(outcome),
+            // The sender was dropped unsent: the task panicked (or was
+            // cancelled) inside the spawn.
+            Ok(Err(_)) => match task.await {
+                Err(e) => SpawnSettle::Unknown(format!("spawn task failed: {e}")),
+                Ok(()) => SpawnSettle::Unknown("spawn task ended without an answer".to_string()),
+            },
+            Err(_) => {
+                // Close first, then look once more: an outcome sent in the gap
+                // between the timeout and the close is taken here, and any
+                // later one fails its send and goes to the late queue — never
+                // both, never neither.
+                rx.close();
+                match rx.try_recv() {
+                    Ok(outcome) => SpawnSettle::Outcome(outcome),
+                    Err(_) => SpawnSettle::Unknown(format!(
+                        "spawn did not answer within {}s — still running; its outcome is \
+                         recorded when it lands",
+                        self.spawn_call_timeout.as_secs()
+                    )),
+                }
+            }
+        }
+    }
+
     /// Record what one spawn came to.
     async fn record_spawn(&self, req: &MemberSpawnRequest, settle: SpawnSettle) {
         let now = self.now();
@@ -847,18 +944,49 @@ impl FanoutDispatcher {
                     "fanout: a spawn settled for a run the book no longer holds");
                 return;
             };
-            entry.spawning.remove(&req.index);
-            let cancel_requested = entry.cancel_requested;
+            // The member this spawn was for: same index, same pinned session.
             let Some(pos) = entry.members.iter().position(|m| {
                 m.index == req.index
-                    && m.state == MemberState::Admitted
                     && m.claude_session_id.as_deref() == Some(req.claude_session_id.as_str())
             }) else {
                 warn!(run_id = %req.run_id, index = req.index,
-                    "fanout: a spawn settled for a member no longer admitted under its session");
+                    "fanout: a spawn settled for a member no longer holding its session");
                 return;
             };
+            // Only this admission's settle may clear its in-flight marker.
+            entry.spawning.remove(&req.index);
             let run_id = entry.run.id;
+            if entry.members[pos].state != MemberState::Admitted {
+                if !readopt_late_spawn(&mut entry.members[pos], &settle, now) {
+                    warn!(run_id = %run_id, index = req.index,
+                        state = ?entry.members[pos].state, outcome = ?settle,
+                        "fanout: a spawn settled for a member no longer admitted — ignored");
+                    return;
+                }
+                // A running `claude` the liveness reconcile released before
+                // its spawn answered (it outlived SPAWN_CALL_TIMEOUT and its
+                // record was not written yet). It counts toward the cap again:
+                // the run may sit one over its cap until a member ends, which
+                // is the lesser harm than a session nothing tracks.
+                warn!(run_id = %run_id, index = req.index,
+                    session = %req.claude_session_id,
+                    terminal_id = ?entry.members[pos].terminal_id,
+                    "fanout: a late spawn landed for a member released spawn_unconfirmed — \
+                     re-adopted as admitted; the run may briefly exceed its cap");
+                entry.unconfirmed.remove(&req.index);
+                entry.retry.remove(&req.index);
+                self.persist_member(run_id, &mut entry.members[pos], now)
+                    .await;
+                if entry.run.state == RunState::Completed {
+                    entry.completed_at = None;
+                }
+                let view = self.settle_run_state(entry).await;
+                self.publish(&book);
+                drop(book);
+                self.events.changed(&view);
+                return;
+            }
+            let cancel_requested = entry.cancel_requested;
             let member = &mut entry.members[pos];
             match settle {
                 SpawnSettle::Unknown(why) => {
@@ -867,10 +995,20 @@ impl FanoutDispatcher {
                     // tick's reconcile reads liveness — live/unconfirmed keeps
                     // the slot, no record at all releases `spawn_unconfirmed`.
                     // A cancel never applies: the member may be running.
+                    //
+                    // A terminal already pinned to the session (the create
+                    // registered it, then the task panicked before the
+                    // lifecycle record existed) is recorded now, so the
+                    // member is never read as `Unrecorded` with no terminal.
+                    let found = match self.host.liveness(&req.claude_session_id, None) {
+                        Liveness::Live { terminal_id } => Some(terminal_id),
+                        _ => None,
+                    };
                     warn!(run_id = %run_id, index = member.index, error = %why,
+                        terminal_id = ?found,
                         "fanout: a spawn's outcome was lost — member kept admitted under its \
                          session id for the liveness reconcile to decide");
-                    member.terminal_id = None;
+                    member.terminal_id = found;
                     entry.unconfirmed.remove(&req.index);
                 }
                 SpawnSettle::Outcome(SpawnOutcome::Spawned { terminal_id }) => {
@@ -1174,6 +1312,27 @@ fn mark_released(m: &mut FanoutMember, why: &str, now: DateTime<Utc>) {
     m.released_at = Some(now);
 }
 
+/// Re-admit a member whose spawn answered `Spawned` after the liveness
+/// reconcile had released it `spawn_unconfirmed` — the only release a late
+/// spawn can contradict. Any other state (an operator release, an exit, a
+/// cancel) or any other outcome is left alone. Returns whether it re-adopted.
+fn readopt_late_spawn(m: &mut FanoutMember, settle: &SpawnSettle, now: DateTime<Utc>) -> bool {
+    let SpawnSettle::Outcome(SpawnOutcome::Spawned { terminal_id }) = settle else {
+        return false;
+    };
+    if m.state != MemberState::Released || m.reason.as_deref() != Some(reason::SPAWN_UNCONFIRMED) {
+        return false;
+    }
+    m.state = MemberState::Admitted;
+    m.terminal_id = Some(terminal_id.clone());
+    m.reason = None;
+    m.released_at = None;
+    if m.admitted_at.is_none() {
+        m.admitted_at = Some(now);
+    }
+    true
+}
+
 /// Undo an admission that did not produce a session.
 fn unadmit(m: &mut FanoutMember, state: MemberState, why: Option<String>) {
     m.state = state;
@@ -1414,15 +1573,21 @@ mod tests {
     }
 
     async fn fixture(bound: u32) -> Fixture {
+        fixture_with_spawn_timeout(bound, SPAWN_CALL_TIMEOUT).await
+    }
+
+    async fn fixture_with_spawn_timeout(bound: u32, timeout: std::time::Duration) -> Fixture {
         let store = Arc::new(MemoryStore::default());
         let host = MockHost::with_bound(bound);
         let events = Arc::new(RecordingEvents::default());
-        let d = Arc::new(FanoutDispatcher::new(
+        let mut d = FanoutDispatcher::new(
             "primary".to_string(),
             store.clone(),
             host.clone(),
             events.clone(),
-        ));
+        );
+        d.spawn_call_timeout = timeout;
+        let d = Arc::new(d);
         d.boot().await.unwrap();
         Fixture {
             store,
@@ -2338,7 +2503,10 @@ mod tests {
         let v = f.d.get(id).unwrap().unwrap();
         let pinned = csid(&v, 0);
         assert_eq!(v.members[0].state, MemberState::Admitted);
-        assert_eq!(v.members[0].terminal_id, None);
+        assert!(
+            v.members[0].terminal_id.is_some(),
+            "the terminal pinned to the session is recorded at the UNKNOWN settle"
+        );
         assert_eq!(v.members[1].state, MemberState::Queued, "the cap is held");
         // The marker is cleared, so an operator release is no longer refused…
         // but the next tick decides first.
@@ -2382,13 +2550,26 @@ mod tests {
         assert_eq!(f.host.spawn_count(), 2, "member 0 was never re-spawned");
     }
 
-    /// The loop driving a spawn is aborted mid-flight, so its settle is never
-    /// recorded. The in-flight marker expires after SPAWN_SETTLE_BOUND and the
+    /// Wait (bounded) until `cond` holds.
+    async fn until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The loop driving a spawn is aborted mid-flight and the spawn has not
+    /// answered. The in-flight marker expires after SPAWN_SETTLE_BOUND and the
     /// member is handed to the liveness reconcile, like a panicked spawn —
-    /// never pinned forever, never re-spawned.
+    /// never pinned forever, never re-spawned. When the orphaned spawn finally
+    /// answers `Spawned`, the next tick RE-ADOPTS the member it released
+    /// `spawn_unconfirmed`: a running claude is never left untracked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fanout_a_lost_spawn_settle_expires_into_the_liveness_reconcile() {
-        let f = fixture(15).await;
+        // Short enough that member 1's held spawn (below) settles UNKNOWN
+        // promptly; the aborted loop never reaches its own wait's end.
+        let f = fixture_with_spawn_timeout(15, std::time::Duration::from_millis(500)).await;
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *f.host.gate.lock().unwrap() = Some(gate.clone());
         let id = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
@@ -2396,22 +2577,16 @@ mod tests {
             let d = f.d.clone();
             tokio::spawn(async move { d.tick().await })
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while f.host.started.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < deadline, "spawn never started");
-            tokio::task::yield_now().await;
-        }
-        // The supervised loop dies mid-`spawn_admitted`.
+        until("spawn never started", || {
+            f.host.started.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        // The supervised loop dies mid-`spawn_admitted`; the detached spawn
+        // task is still waiting, and its session does not exist yet.
         ticker.abort();
         let _ = ticker.await;
-        // The detached spawn task still completes — its terminal now exists —
-        // but nothing records it.
-        gate.add_permits(1);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while f.host.spawn_count() == 0 {
-            assert!(std::time::Instant::now() < deadline, "spawn never finished");
-            tokio::task::yield_now().await;
-        }
+        let lost = csid(&f.d.get(id).unwrap().unwrap(), 0);
+        f.host.unrecorded.lock().unwrap().insert(lost.clone());
         // Inside the bound the member is still in flight: not reconciled, and
         // an operator release is refused.
         f.d.tick().await;
@@ -2420,14 +2595,142 @@ mod tests {
             Err(OpError::Conflict(ref m)) if m.contains("being spawned")
         ));
         assert_eq!(f.d.get(id).unwrap().unwrap().members[0].terminal_id, None);
-        // Past it, liveness decides: the session is live, so it keeps its slot.
+        // Past it, liveness decides: no record and no terminal.
         advance(&f.d, SPAWN_SETTLE_BOUND.num_seconds() + 1);
+        f.host.cap_limit.store(2, Ordering::SeqCst);
         f.d.tick().await;
         let v = f.d.get(id).unwrap().unwrap();
-        assert_eq!(v.members[0].state, MemberState::Admitted);
+        assert_eq!(v.members[0].state, MemberState::Released);
+        assert_eq!(
+            v.members[0].reason.as_deref(),
+            Some(reason::SPAWN_UNCONFIRMED)
+        );
+        assert_eq!(v.members[1].state, MemberState::Admitted, "slot reused");
+        // Both held spawns now land late: member 0's orphan (its loop died)
+        // and member 1's (its wait timed out, settled UNKNOWN and kept).
+        f.host.unrecorded.lock().unwrap().remove(&lost);
+        gate.add_permits(2);
+        until("the late spawns never landed", || {
+            f.d.late_settles.lock().unwrap().len() == 2
+        })
+        .await;
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(v.members[0].state, MemberState::Admitted, "re-adopted");
+        assert_eq!(csid(&v, 0), lost, "under its own pinned session");
         assert!(v.members[0].terminal_id.is_some());
+        assert_eq!(v.members[0].reason, None);
+        assert_eq!(v.members[1].state, MemberState::Admitted);
+        assert_eq!(f.host.spawn_count(), 2, "member 0 was never re-spawned");
+        let row = f.store.rows.lock().unwrap()[&id].1[0].clone();
+        assert_eq!(
+            row.state,
+            MemberState::Admitted,
+            "the re-adoption is persisted"
+        );
+    }
+
+    /// The spawn wait is shorter than the settle bound, so the marker only
+    /// ever expires for a loop that died.
+    #[test]
+    fn fanout_the_spawn_wait_is_shorter_than_the_settle_bound() {
+        assert!(
+            chrono::Duration::from_std(SPAWN_CALL_TIMEOUT).unwrap() < SPAWN_SETTLE_BOUND,
+            "SPAWN_CALL_TIMEOUT must settle a slow spawn before its marker expires"
+        );
+    }
+
+    /// A spawn that outlives SPAWN_CALL_TIMEOUT settles outcome-UNKNOWN (kept
+    /// admitted, never refused or re-queued); the liveness reconcile releases
+    /// it `spawn_unconfirmed` while no record exists; and when the spawn
+    /// finally answers `Spawned`, the member is RE-ADOPTED as admitted under
+    /// its own session id with its terminal — counting toward the cap again,
+    /// so the run may sit one over its cap until a member ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fanout_a_spawn_that_outlives_its_wait_is_readopted_when_it_lands() {
+        let f = fixture_with_spawn_timeout(15, std::time::Duration::from_millis(50)).await;
+        f.host.cap_limit.store(2, Ordering::SeqCst);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.host.gate.lock().unwrap() = Some(gate.clone());
+        let id = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
+        // The tick returns once the wait times out; the spawn runs on.
+        tokio::time::timeout(std::time::Duration::from_secs(5), f.d.tick())
+            .await
+            .expect("the tick waited past the spawn timeout");
+        let v = f.d.get(id).unwrap().unwrap();
+        let slow = csid(&v, 0);
+        assert_eq!(v.members[0].state, MemberState::Admitted, "UNKNOWN, kept");
+        assert_eq!(v.members[0].terminal_id, None);
         assert_eq!(v.members[1].state, MemberState::Queued);
-        assert_eq!(f.host.spawn_count(), 1, "never spawned twice");
+        // No record and no terminal yet: released `spawn_unconfirmed`, and the
+        // slot goes to member 1 (whose own spawn is held, and kept, too).
+        f.host.unrecorded.lock().unwrap().insert(slow.clone());
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(
+            v.members[0].reason.as_deref(),
+            Some(reason::SPAWN_UNCONFIRMED)
+        );
+        assert_eq!(v.members[1].state, MemberState::Admitted);
+        let held = csid(&v, 1);
+        f.host.unconfirmed.lock().unwrap().insert(held);
+        // Member 0's spawn lands late.
+        f.host.unrecorded.lock().unwrap().remove(&slow);
+        gate.add_permits(1);
+        until("the late spawn never landed", || {
+            f.d.late_settles.lock().unwrap().len() == 1
+        })
+        .await;
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(v.members[0].state, MemberState::Admitted, "re-adopted");
+        assert_eq!(csid(&v, 0), slow);
+        assert_eq!(
+            v.members[0].terminal_id.as_deref(),
+            Some(format!("term-{}-0", id.simple()).as_str())
+        );
+        assert_eq!(v.members[0].released_at, None);
+        assert_eq!(
+            states(&v),
+            vec![MemberState::Admitted, MemberState::Admitted],
+            "transiently over the cap of 1 rather than an untracked claude"
+        );
+        assert_eq!(v.state, RunState::Active);
+        assert_eq!(f.host.spawn_count(), 1, "nothing was spawned twice");
+        // Over the cap, nothing more is admitted; the re-adopted member is
+        // reconciled like any other (it reads live and keeps its terminal).
+        f.d.tick().await;
+        assert_eq!(
+            f.d.get(id).unwrap().unwrap().members[0].state,
+            MemberState::Admitted
+        );
+    }
+
+    /// A late answer never resurrects a member released for any reason other
+    /// than `spawn_unconfirmed` (an operator release, an exit), and a late
+    /// non-`Spawned` answer never re-admits anything.
+    #[test]
+    fn fanout_only_a_late_spawned_contradicts_only_spawn_unconfirmed() {
+        let now = Utc::now();
+        let spawned = SpawnSettle::Outcome(SpawnOutcome::Spawned {
+            terminal_id: "t1".to_string(),
+        });
+        let mut m = members(1).remove(0);
+        mark_released(&mut m, reason::SPAWN_UNCONFIRMED, now);
+        let refused = SpawnSettle::Outcome(SpawnOutcome::Refused {
+            reason: "x".to_string(),
+        });
+        assert!(!readopt_late_spawn(&mut m, &refused, now));
+        assert_eq!(m.state, MemberState::Released);
+        assert!(readopt_late_spawn(&mut m, &spawned, now));
+        assert_eq!(m.state, MemberState::Admitted);
+        assert_eq!(m.terminal_id.as_deref(), Some("t1"));
+        for other in [reason::TERMINAL_EXIT, reason::FINISHED] {
+            let mut m = members(1).remove(0);
+            mark_released(&mut m, other, now);
+            assert!(!readopt_late_spawn(&mut m, &spawned, now), "{other}");
+            assert_eq!(m.state, MemberState::Released);
+        }
     }
 
     /// Every write stamps `updated_at`, refusals and drain deferrals included,

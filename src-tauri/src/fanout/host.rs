@@ -139,12 +139,20 @@ impl FanoutHost for TauriFanoutHost {
             .app
             .try_state::<Arc<crate::terminal::TerminalManager>>()
             .map(|s| s.inner().clone());
+        // Terminals pinned to the session at create — found even when the
+        // spawner died before the lifecycle record or the member's terminal id
+        // was written.
+        let pinned = manager
+            .as_ref()
+            .map(|m| m.terminal_ids_pinned_to(claude_session_id))
+            .unwrap_or_default();
         classify_liveness(
             store,
             manager
                 .as_ref()
                 .map(|m| move |tid: &str| -> Option<bool> { m.get(tid).map(|s| s.is_alive()) }),
             terminal_id,
+            &pinned,
         )
     }
 }
@@ -190,6 +198,12 @@ pub(crate) struct RecordFacts {
 /// `probe(tid)` is `Some(alive)` for a terminal the manager holds and `None`
 /// for one it does not; `probe` itself is `None` when no manager is managed.
 ///
+/// `pinned` is every terminal the manager holds whose pinned harness id is the
+/// session's — the one place a `claude` whose spawner died after
+/// `TerminalManager::create` but before its lifecycle record (or the member's
+/// terminal id) was written can still be found. Without it such a member reads
+/// [`Liveness::Unrecorded`] and is released `spawn_unconfirmed` while it runs.
+///
 /// The arm that matters is the open record with NO terminal answering for it:
 /// a session mid-respawn, or one session restore has not rebound yet, reads
 /// exactly like that for a while — so it is [`Liveness::Unconfirmed`] (the
@@ -199,6 +213,7 @@ pub(crate) fn classify_liveness<P: Fn(&str) -> Option<bool>>(
     store: StoreRead,
     probe: Option<P>,
     member_terminal: Option<&str>,
+    pinned: &[String],
 ) -> Liveness {
     let record = match store {
         StoreRead::Unreadable => return Liveness::Unknown,
@@ -217,7 +232,8 @@ pub(crate) fn classify_liveness<P: Fn(&str) -> Option<bool>>(
         .as_ref()
         .map(|r| r.terminal_id.clone())
         .into_iter()
-        .chain(member_terminal.map(str::to_string));
+        .chain(member_terminal.map(str::to_string))
+        .chain(pinned.iter().cloned());
     let mut a_terminal_answered = false;
     for tid in candidates {
         match probe(&tid) {
@@ -526,7 +542,7 @@ mod tests {
             .iter()
             .map(|(t, a)| ((*t).to_string(), *a))
             .collect();
-        classify_liveness(store, Some(|tid: &str| map.get(tid).copied()), member)
+        classify_liveness(store, Some(|tid: &str| map.get(tid).copied()), member, &[])
     }
 
     #[test]
@@ -546,7 +562,7 @@ mod tests {
         );
         let no_manager: Option<fn(&str) -> Option<bool>> = None;
         assert_eq!(
-            classify_liveness(record(true, false, "t1"), no_manager, Some("t1")),
+            classify_liveness(record(true, false, "t1"), no_manager, Some("t1"), &[]),
             Liveness::Unknown
         );
     }
@@ -615,6 +631,44 @@ mod tests {
         assert_eq!(
             classify(StoreRead::Absent, &[("t1", false)], Some("t1")),
             Liveness::Exited
+        );
+    }
+
+    /// A spawner that died after `TerminalManager::create` registered the
+    /// child but before the lifecycle record (or the member's terminal id)
+    /// existed: the terminal pinned to the session is found, so the member
+    /// reads live — never `Unrecorded`, which would release a running claude
+    /// `spawn_unconfirmed`.
+    #[test]
+    fn fanout_a_terminal_pinned_to_the_session_is_found_without_a_record() {
+        let map: HashMap<String, bool> = [("t-pinned".to_string(), true)].into();
+        let probe = Some(|tid: &str| map.get(tid).copied());
+        assert_eq!(
+            classify_liveness(StoreRead::Absent, probe, None, &["t-pinned".to_string()]),
+            Liveness::Live {
+                terminal_id: "t-pinned".to_string()
+            }
+        );
+        // Pinned and already dead: it ran, so an exit — not "never started".
+        let dead: HashMap<String, bool> = [("t-pinned".to_string(), false)].into();
+        assert_eq!(
+            classify_liveness(
+                StoreRead::Absent,
+                Some(|tid: &str| dead.get(tid).copied()),
+                None,
+                &["t-pinned".to_string()]
+            ),
+            Liveness::Exited
+        );
+        // Nothing pinned and nothing recorded is still unrecorded.
+        assert_eq!(
+            classify_liveness(
+                StoreRead::Absent,
+                Some(|tid: &str| map.get(tid).copied()),
+                None,
+                &[]
+            ),
+            Liveness::Unrecorded
         );
     }
 }

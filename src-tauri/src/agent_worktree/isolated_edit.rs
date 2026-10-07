@@ -484,9 +484,41 @@ fn worktree_done_verdict(success: bool, body: &str) -> WorktreeDoneVerdict {
 /// never descends into a link. A tree that cannot be fully walked, or a link
 /// that cannot be unlinked, refuses the removal: an unmeasured tree is not a
 /// measured absence of links. Returns how many links were unlinked.
+///
+/// Two refusals run BEFORE anything is walked or unlinked, so a refused path
+/// is left exactly as it was found: the root itself being a link (junction or
+/// symlink — the walk would read, and unlink inside, whatever it points at),
+/// and the clone-rootness probe (INV-W5 — a real clone, or one that cannot be
+/// measured, is never touched, not merely never deleted).
 fn unlink_links_then_remove(path: &Path) -> Result<usize, String> {
+    // Before `exists()`, which follows a link: a dangling link root is still a
+    // link, not an absent worktree.
+    if super::census::is_junction(path) {
+        return Err(format!(
+            "refusing to remove {} — the worktree root is itself a link (junction or \
+             symlink); walking it would unlink entries inside its target (INV-W4)",
+            path.display()
+        ));
+    }
     if !path.exists() {
         return Ok(0);
+    }
+    match super::census::probe_clone_rootness(path) {
+        super::census::CloneRootness::NotCloneRoot => {}
+        super::census::CloneRootness::CloneRoot => {
+            return Err(format!(
+                "refusing to remove {} — `.git` is a DIRECTORY, so this is a real clone, \
+                 not a linked worktree (INV-W5); nothing was unlinked",
+                path.display()
+            ));
+        }
+        super::census::CloneRootness::Undetermined => {
+            return Err(format!(
+                "refusing to remove {} — could not determine whether it is a real clone \
+                 (INV-W5); nothing was unlinked",
+                path.display()
+            ));
+        }
     }
     let links = links_under(path)?;
     for link in &links {
@@ -1608,6 +1640,64 @@ mod tests {
             canonical.join("pkg").join("index.js").exists(),
             "the canonical tree a link pointed at must survive"
         );
+    }
+
+    /// A root that is itself a link is refused before anything is walked: the
+    /// links inside its TARGET are never unlinked, and the target survives.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_refuses_a_root_that_is_a_link_before_unlinking_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical-node_modules");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let target = dir.path().join("real-tree");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        std::os::unix::fs::symlink(&canonical, target.join("node_modules")).unwrap();
+        let root = dir.path().join("qontinui-web");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+
+        let verdict = super::unlink_links_then_remove(&root);
+        assert!(
+            matches!(verdict, Err(ref e) if e.contains("itself a link")),
+            "{verdict:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(target.join("node_modules")).is_ok(),
+            "a link inside the root's target must not be unlinked"
+        );
+        assert!(target.exists() && root.exists());
+
+        // A DANGLING link root is still a link, never "already gone".
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(super::unlink_links_then_remove(&dangling).is_err());
+    }
+
+    /// INV-W5 runs BEFORE the unlink walk: a real clone (`.git` a directory)
+    /// is refused with its links still in place, not unlinked and then refused.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_probes_clone_rootness_before_unlinking_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical-node_modules");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let clone = dir.path().join("qontinui-web");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&canonical, clone.join("node_modules")).unwrap();
+
+        let verdict = super::unlink_links_then_remove(&clone);
+        assert!(
+            matches!(verdict, Err(ref e) if e.contains("INV-W5")),
+            "{verdict:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(clone.join("node_modules"))
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the clone's link must still be there"
+        );
+        assert!(clone.join(".git").is_dir());
     }
 
     /// A tree that cannot be walked is not removed.
