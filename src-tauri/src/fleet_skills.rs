@@ -135,8 +135,10 @@ pub(crate) const PROVISIONED_FILE_MODE: u32 = 0o644;
 /// guessed at: the served half of this corpus is a `files` map of
 /// `path -> text`, so a non-text file has no representation in the layer this
 /// floor has to be interchangeable with. Nothing in the shipped bundle is
-/// non-UTF-8 today (measured 2026-09-14: 15 files, all `.md`/`.sh`), and
-/// [`tests::every_embedded_file_is_text`] is what keeps that true.
+/// non-UTF-8 — it is `.md`, `.sh` and `.py` text (the `.py` files are the
+/// `command-scripts` helpers and a `lib/` reader) — and
+/// [`tests::every_embedded_file_is_text`] is what keeps that true, so no file
+/// count is pinned here to go stale.
 pub(crate) fn embedded_skills() -> Vec<ResolvedSkill> {
     let mut out = Vec::new();
     for skill in FLEET_SKILLS.dirs() {

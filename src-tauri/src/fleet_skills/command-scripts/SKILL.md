@@ -22,7 +22,7 @@ these skills, byte for byte:
 
 | Helper | Used by | Needs |
 |---|---|---|
-| `_scripts/qontinui-http.py` | `/analyze-automation` | Python 3 with `httpx` and the `qontinui-mcp` package (`qontinui_mcp.client`) |
+| `_scripts/qontinui-http.py` | `/analyze-automation` | Python 3 and the `qontinui-mcp` package (`qontinui_mcp.client`, which brings `httpx`), installed from a source checkout: it is not on PyPI |
 | `_scripts/lib/envelope.py` | `/workflow-runs` | Python 3.9+, stdlib only |
 | `_scripts/mobile-feedback.py` | `/mobile-dev`, `/mobile-verify` | Python 3 and Android `adb` |
 
