@@ -22,7 +22,7 @@
  * never becomes an empty list.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { AiSessionState } from "@qontinui/shared-types";
 import { describeThrown } from "@/lib/utils";
@@ -74,6 +74,24 @@ export function shouldFetchChanges(args: {
   return args.stale;
 }
 
+/**
+ * Whether a refresh closure captured for `captured` may still run, given the
+ * session id the hook is rendering for NOW. Pure, exported for the test.
+ *
+ * A refresh is captured by long-lived things — the debounce timer, a review
+ * mutation's `finally` — that can outlive an id change (prev/next in the
+ * maximized header, a zone reassignment). Run for the OLD id after the switch,
+ * it would abort the new id's in-flight read, point `fetchedFor` back at the
+ * old id and tag the state with it, so the new id's surface sat on `loading`
+ * forever (nothing re-runs the fetch effect: its deps did not change).
+ */
+export function isCurrentSession(
+  captured: string | null,
+  current: string | null,
+): captured is string {
+  return captured !== null && captured === current;
+}
+
 /** The read state a visible-gated fetcher carries — shared by both reads. */
 interface GatedRead<T> {
   read:
@@ -97,6 +115,8 @@ function useGatedRead<T>(
   sessionId: string | null,
   visible: boolean,
   fetcher: (id: string, signal: AbortSignal) => Promise<T>,
+  /** `describeThrown` fallback when a failed read carries no message of its own. */
+  errorFallback: string,
 ): GatedRead<T> {
   // The read is tagged with the session it belongs to, so a different
   // session's data is never shown under this one's id — without an effect
@@ -119,9 +139,16 @@ function useGatedRead<T>(
   useEffect(() => {
     visibleRef.current = visible;
   }, [visible]);
+  // The id being rendered NOW. A layout effect, so it is current before any
+  // passive effect (the fetch effect below) or a later timer can run.
+  const sessionIdRef = useRef(sessionId);
+  useLayoutEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
 
   const refresh = useCallback(() => {
-    if (!sessionId) return;
+    // A stale closure for a previous id is a no-op (see `isCurrentSession`).
+    if (!isCurrentSession(sessionId, sessionIdRef.current)) return;
     inFlightRef.current?.abort();
     const ctrl = new AbortController();
     inFlightRef.current = ctrl;
@@ -146,12 +173,12 @@ function useGatedRead<T>(
         staleRef.current = true;
         setRead({
           status: "error",
-          error: describeThrown(err, "Failed to load session file changes"),
+          error: describeThrown(err, errorFallback),
           atMs: Date.now(),
           previous: latestRef.current,
         });
       });
-  }, [sessionId, fetcher]);
+  }, [sessionId, fetcher, errorFallback]);
 
   const refreshIfVisible = useCallback(() => {
     if (!visibleRef.current) {
@@ -232,7 +259,12 @@ export function useSessionFileChanges(
   options: { visible: boolean; sessionState?: AiSessionState },
 ): { read: FileChangesRead; refresh: () => void } {
   const { visible, sessionState } = options;
-  const changes = useGatedRead(sessionId, visible, fetchChanges);
+  const changes = useGatedRead(
+    sessionId,
+    visible,
+    fetchChanges,
+    "Failed to load session file changes",
+  );
   const { refreshIfVisible } = changes;
 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -240,11 +272,15 @@ export function useSessionFileChanges(
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(refreshIfVisible, CHANGES_REFRESH_DEBOUNCE_MS);
   }, [refreshIfVisible]);
+  // A pending debounce belongs to the id it was armed for: cleared on every id
+  // change (and on unmount), so session A's timer never fires after the
+  // surface moved to B. `refresh` also refuses a stale id, as a second line.
   useEffect(
     () => () => {
       if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
     },
-    [],
+    [sessionId, refreshIfVisible],
   );
   useSessionEvent("commit-state-changed", "task_run_id", sessionId, onCommitState);
 
@@ -287,7 +323,12 @@ export function useSessionReview(
   options: { visible: boolean; sessionState?: AiSessionState },
 ): SessionReviewHandle {
   const { read: changes, refresh: refreshChanges } = useSessionFileChanges(sessionId, options);
-  const review = useGatedRead(sessionId, options.visible, fetchReview);
+  const review = useGatedRead(
+    sessionId,
+    options.visible,
+    fetchReview,
+    "Failed to load the session's review notes",
+  );
   const { refresh: refreshReview, refreshIfVisible: refreshReviewIfVisible } = review;
 
   useSessionEvent("session-review-changed", "sessionId", sessionId, refreshReviewIfVisible);
