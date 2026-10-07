@@ -1399,6 +1399,19 @@ pub(crate) enum TenantSlotOutcome {
     /// persist error. The existing slot value is left UNTOUCHED
     /// (REPLACE-not-REVOKE), and the pass CONTINUES with the remaining slots.
     KeptExisting,
+    /// LEGACY default slot only — the runner holds NO per-tenant slot, so the
+    /// slot pass above never runs and the `Decision::Pair` arm is the whole
+    /// recovery. That arm ran its automatic ladder (device self-refresh,
+    /// pair-cli re-mint, device-machine-key exchange) and NONE of it minted a
+    /// credential. Nothing was cleared: the legacy slot has no clear arm.
+    ///
+    /// Without this outcome the legacy posture was derived with no outcome at
+    /// all, so a dead legacy credential read `expired` + `retry_refresh` with
+    /// `lastRefreshOutcome: null` FOREVER — while the refresher was in fact
+    /// retrying pair-cli every 5 minutes and being refused. Measured on the
+    /// operator box 2026-10-07: 138 pair-cli 401s in one day under a posture
+    /// that claimed no refresh had ever been attempted.
+    RefreshFailed,
 }
 
 /// Does this refresh status mean coord REJECTED the credential we presented?
@@ -3458,6 +3471,14 @@ pub(crate) fn derive_coord_credential_posture(
             Some(e) => now >= e, // already expired
         };
         if dead {
+            // The legacy arm's automatic ladder already ran for THIS dead
+            // credential and minted nothing: `retry_refresh` would promise a
+            // heal the refresher has just failed to deliver, so this is the
+            // terminal `unrefreshable` (cta `re_pair`), exactly as a cleared
+            // slot that could not be re-derived is.
+            if matches!(obs.outcome, Some(TenantSlotOutcome::RefreshFailed)) {
+                return CoordCredentialPosture::Unrefreshable;
+            }
             return CoordCredentialPosture::Expired;
         }
     } else {
@@ -4066,6 +4087,7 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
         TenantSlotOutcome::SkippedNoToken => "skipped-no-token",
         TenantSlotOutcome::Cleared { .. } => "cleared",
         TenantSlotOutcome::KeptExisting => "kept-existing",
+        TenantSlotOutcome::RefreshFailed => "refresh-failed",
     }
     .to_string()
 }
@@ -4843,6 +4865,88 @@ fn pair_base_origin(
     }
 }
 
+/// What one concluded `Decision::Pair` pass did for the LEGACY default slot, as
+/// a posture outcome. `reminted` = some rung (self-refresh, pair-cli, or the
+/// device-machine-key exchange) persisted a new credential this pass.
+///
+/// - A re-mint is `Refreshed`.
+/// - `Healthy` without a re-mint is a non-advancing pass over a credential
+///   that is still valid — `KeptExisting`, so the posture keeps speaking from
+///   its `exp`.
+/// - Every bail (no bearer, no tenant, the mint refused or failed with the
+///   held credential dead, a tenant-mismatched mint refused) is
+///   `RefreshFailed`: the ladder ran and nothing usable came back.
+pub(crate) fn legacy_pair_outcome(progress: &PairProgress, reminted: bool) -> TenantSlotOutcome {
+    if reminted {
+        return TenantSlotOutcome::Refreshed;
+    }
+    match progress {
+        PairProgress::Healthy => TenantSlotOutcome::KeptExisting,
+        PairProgress::BailNoBearer
+        | PairProgress::BailNoTenant
+        | PairProgress::BailRefreshFailedExpired
+        | PairProgress::BailTenantMismatch { .. } => TenantSlotOutcome::RefreshFailed,
+    }
+}
+
+/// The legacy `access_token` slot as a posture observation, refined with what
+/// the last concluded `Pair` pass did about it (`None` = no pass has concluded
+/// since boot, or the slot pass owns the posture).
+///
+/// Read through the TRI-STATE probe, not `get_access_token`: that returns
+/// `Err` both for a never-paired runner and for a present-but-undecryptable
+/// store, and collapsing the two would fire a "you have no coord credential"
+/// banner at a paired runner whose store merely failed to decrypt this tick.
+fn legacy_slot_observation(
+    auth_manager: &crate::auth::AuthManager,
+    outcome: Option<TenantSlotOutcome>,
+) -> SlotObservation {
+    let mut obs = match auth_manager.probe_access_token() {
+        crate::secure_storage::StoredTokenRead::Present(t) => {
+            SlotObservation::observed(None, Some(t.as_str()))
+        }
+        crate::secure_storage::StoredTokenRead::Absent => SlotObservation::observed(None, None),
+        crate::secure_storage::StoredTokenRead::Unreadable(_) => SlotObservation::unreadable(None),
+    };
+    obs.outcome = outcome;
+    obs
+}
+
+/// Derive and publish the posture from the LEGACY slot (a runner holding no
+/// per-tenant slot), firing the banner on a transition.
+fn publish_legacy_posture(
+    auth_manager: &crate::auth::AuthManager,
+    pins: PosturePinInputs,
+    outcome: Option<TenantSlotOutcome>,
+    app: Option<&tauri::AppHandle>,
+) {
+    let obs = legacy_slot_observation(auth_manager, outcome);
+    if let Some(transition) =
+        derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
+    {
+        notify_posture_transition(app, transition);
+    }
+}
+
+/// Record a concluded `Pair` pass's legacy-slot outcome and publish it NOW, so
+/// `/health.coordCredential.lastRefreshOutcome` names the attempt the moment it
+/// concludes. A no-op when per-tenant slots exist: the slot pass owns the
+/// posture there, and the legacy slot is not the credential it describes.
+fn record_legacy_pair_outcome(
+    carried: &mut Option<TenantSlotOutcome>,
+    has_tenant_slots: bool,
+    outcome: TenantSlotOutcome,
+    auth_manager: &crate::auth::AuthManager,
+    pins: PosturePinInputs,
+    app: Option<&tauri::AppHandle>,
+) {
+    if has_tenant_slots {
+        return;
+    }
+    *carried = Some(outcome);
+    publish_legacy_posture(auth_manager, pins, *carried, app);
+}
+
 async fn refresher_loop(
     api_state: Arc<ApiState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -4860,6 +4964,11 @@ async fn refresher_loop(
     // bounded re-announcement (`should_warn_sweep_join_failure`). Reset on a
     // successful read.
     let mut sweep_join_failures: u32 = 0;
+    // What the last concluded `Pair` pass did for the LEGACY slot, carried so
+    // the top-of-pass legacy posture publish does not erase it back to `None`
+    // (the `lastRefreshOutcome: null` that hid every failed attempt). Reset
+    // whenever per-tenant slots exist — the slot pass owns the posture then.
+    let mut legacy_outcome: Option<TenantSlotOutcome> = None;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -5029,30 +5138,21 @@ async fn refresher_loop(
             // forever. Derived from the same pure ladder; no pass outcome
             // exists, so the derivation sees `None` and speaks from `exp`.
             //
-            // Read through the TRI-STATE probe, not `get_access_token`: that
-            // returns `Err` both for a never-paired runner and for a
-            // present-but-undecryptable store, and collapsing the two would
-            // fire a "you have no coord credential" banner at a paired runner
-            // whose store merely failed to decrypt this tick.
-            let obs = match auth_manager.probe_access_token() {
-                crate::secure_storage::StoredTokenRead::Present(t) => {
-                    SlotObservation::observed(None, Some(t.as_str()))
-                }
-                crate::secure_storage::StoredTokenRead::Absent => {
-                    SlotObservation::observed(None, None)
-                }
-                crate::secure_storage::StoredTokenRead::Unreadable(_) => {
-                    SlotObservation::unreadable(None)
-                }
-            };
-            if let Some(transition) = derive_and_publish_posture(
-                &[obs],
+            // The observation carries the last concluded `Pair` pass's
+            // outcome (see [`legacy_slot_observation`]), so a dead credential
+            // the ladder already failed to heal stays `unrefreshable` rather
+            // than reverting to an outcome-less `expired`.
+            publish_legacy_posture(
+                &auth_manager,
                 sweep_inputs.posture_pin_inputs(),
-                chrono::Utc::now().timestamp(),
-            ) {
-                notify_posture_transition(Some(&api_state.app_handle), transition);
-            }
+                legacy_outcome,
+                Some(&api_state.app_handle),
+            );
         }
+        if has_tenant_slots {
+            legacy_outcome = None;
+        }
+        let pins = sweep_inputs.posture_pin_inputs();
 
         match decision {
             Decision::IdleWrongTier => {
@@ -5133,6 +5233,14 @@ async fn refresher_loop(
                         // wake the relay so it reconnects with the new JWT, publish
                         // healthy, reset backoff, and fall to the steady cadence.
                         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                        record_legacy_pair_outcome(
+                            &mut legacy_outcome,
+                            has_tenant_slots,
+                            TenantSlotOutcome::Refreshed,
+                            &auth_manager,
+                            pins,
+                            Some(&api_state.app_handle),
+                        );
                         publish_coord_credential_status(
                             &auth_manager,
                             &coord_credential_health(decision, Some(PairProgress::Healthy)),
@@ -5175,6 +5283,14 @@ async fn refresher_loop(
                                  empty — user must sign in to Qontinui before the refresher can pair"
                             );
                             // Phase 1b: credential-dark (not signed in).
+                            record_legacy_pair_outcome(
+                                &mut legacy_outcome,
+                                has_tenant_slots,
+                                legacy_pair_outcome(&PairProgress::BailNoBearer, false),
+                                &auth_manager,
+                                pins,
+                                Some(&api_state.app_handle),
+                            );
                             publish_coord_credential_status(
                                 &auth_manager,
                                 &coord_credential_health(
@@ -5381,6 +5497,14 @@ async fn refresher_loop(
                                 new_jwt.len()
                             );
                             crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                            record_legacy_pair_outcome(
+                                &mut legacy_outcome,
+                                has_tenant_slots,
+                                TenantSlotOutcome::Refreshed,
+                                &auth_manager,
+                                pins,
+                                Some(&api_state.app_handle),
+                            );
                             publish_coord_credential_status(
                                 &auth_manager,
                                 &coord_credential_health(decision, Some(PairProgress::Healthy)),
@@ -5399,6 +5523,17 @@ async fn refresher_loop(
                     }
                 }
 
+                record_legacy_pair_outcome(
+                    &mut legacy_outcome,
+                    has_tenant_slots,
+                    legacy_pair_outcome(
+                        &progress,
+                        matches!(outcome, RefreshOutcome::Replaced { .. }),
+                    ),
+                    &auth_manager,
+                    pins,
+                    Some(&api_state.app_handle),
+                );
                 publish_coord_credential_status(
                     &auth_manager,
                     &coord_credential_health(decision, Some(progress)),
@@ -7290,6 +7425,114 @@ mod tenant_slot_refresh_tests {
     /// starts from a known zero.
     fn reset_posture() {
         reset_coord_credential_posture_for_test();
+    }
+
+    /// The 2026-10-07 primary-runner shape: no per-tenant slot (the pinned
+    /// tenant's slot was cleared and could not be re-derived), a DEAD legacy
+    /// credential, and a `Pair` arm whose pair-cli re-mint was refused every
+    /// 5 minutes. The legacy posture used to be derived with NO outcome, so it
+    /// read `expired` / `retry_refresh` / `lastRefreshOutcome: null` forever.
+    /// A concluded failed attempt must be RECORDED and must be terminal.
+    #[test]
+    fn a_failed_legacy_pair_attempt_on_a_dead_credential_is_recorded_and_unrefreshable() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 8 * 3600, "legacy-dead");
+
+        // Before any `Pair` pass has concluded: `expired`, no outcome — the
+        // boot observation, unchanged.
+        let boot = SlotObservation::observed(None, Some(dead.as_str()));
+        derive_and_publish_posture(&[boot], PosturePinInputs::UNPINNED, now);
+        let before = coord_credential_posture().expect("published");
+        assert_eq!(before.posture, CoordCredentialPosture::Expired);
+        assert_eq!(before.last_refresh_outcome, None);
+
+        // The pair-cli mint was refused with the held credential dead.
+        let outcome = legacy_pair_outcome(&PairProgress::BailRefreshFailedExpired, false);
+        assert_eq!(outcome, TenantSlotOutcome::RefreshFailed);
+        let mut concluded = SlotObservation::observed(None, Some(dead.as_str()));
+        concluded.outcome = Some(outcome);
+        let transition = derive_and_publish_posture(&[concluded], PosturePinInputs::UNPINNED, now);
+        assert_eq!(
+            transition.map(|t| t.to),
+            Some(CoordCredentialPosture::Unrefreshable),
+            "a dead credential the automatic ladder failed to heal is terminal"
+        );
+        let after = coord_credential_posture().expect("published");
+        assert_eq!(after.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(
+            after.last_refresh_outcome.as_deref(),
+            Some("refresh-failed"),
+            "the attempt must be named on /health, never null"
+        );
+        assert_eq!(after.posture.cta(), Some("re_pair"));
+        assert_eq!(after.tenant_id, None, "it is the legacy default slot");
+        reset_posture();
+    }
+
+    /// The mapping from a concluded `Pair` pass to the legacy outcome, and the
+    /// derivation boundaries: a re-mint heals, a still-valid kept credential
+    /// speaks from its `exp`, and `RefreshFailed` never turns an ABSENT slot or
+    /// a still-valid one into `unrefreshable`.
+    #[test]
+    fn legacy_pair_outcome_mapping_and_derivation_boundaries() {
+        assert_eq!(
+            legacy_pair_outcome(&PairProgress::Healthy, true),
+            TenantSlotOutcome::Refreshed
+        );
+        assert_eq!(
+            legacy_pair_outcome(&PairProgress::BailRefreshFailedExpired, true),
+            TenantSlotOutcome::Refreshed,
+            "a later rung (dmk exchange) that re-minted wins over the bail"
+        );
+        assert_eq!(
+            legacy_pair_outcome(&PairProgress::Healthy, false),
+            TenantSlotOutcome::KeptExisting
+        );
+        for bail in [
+            PairProgress::BailNoBearer,
+            PairProgress::BailNoTenant,
+            PairProgress::BailRefreshFailedExpired,
+            PairProgress::BailTenantMismatch {
+                expected: tenant(1),
+                returned: None,
+            },
+        ] {
+            assert_eq!(
+                legacy_pair_outcome(&bail, false),
+                TenantSlotOutcome::RefreshFailed,
+                "{bail:?}"
+            );
+        }
+        assert_eq!(
+            tenant_slot_outcome_token(TenantSlotOutcome::RefreshFailed),
+            "refresh-failed"
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        let quiet = UpstreamSignal::default();
+        let mut absent = SlotObservation::observed(None, None);
+        absent.outcome = Some(TenantSlotOutcome::RefreshFailed);
+        assert_eq!(
+            derive_coord_credential_posture(&absent, quiet, now),
+            CoordCredentialPosture::Absent
+        );
+        let live_jwt = synth_jwt(now + 4 * 3600, "legacy-live");
+        let mut live = SlotObservation::observed(None, Some(live_jwt.as_str()));
+        live.outcome = Some(TenantSlotOutcome::RefreshFailed);
+        assert_eq!(
+            derive_coord_credential_posture(&live, quiet, now),
+            CoordCredentialPosture::Live,
+            "a re-paired, valid credential is live whatever the last attempt said"
+        );
+        let dead_jwt = synth_jwt(now - 60, "legacy-dead");
+        let mut kept = SlotObservation::observed(None, Some(dead_jwt.as_str()));
+        kept.outcome = Some(TenantSlotOutcome::KeptExisting);
+        assert_eq!(
+            derive_coord_credential_posture(&kept, quiet, now),
+            CoordCredentialPosture::Expired
+        );
     }
 
     /// DD2 — *"Boot is a transition"*. A runner that restores an ALREADY
