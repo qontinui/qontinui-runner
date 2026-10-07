@@ -1987,7 +1987,10 @@ mod usage_twin_report {
         fn posture_label_names_unknown_and_dark_cause() {
             use crate::mcp::device_jwt_refresher::{CoordCredentialPosture, DarkCause};
             assert_eq!(posture_label(None), "unknown");
-            assert_eq!(posture_label(Some(CoordCredentialPosture::Expired)), "expired");
+            assert_eq!(
+                posture_label(Some(CoordCredentialPosture::Expired)),
+                "expired"
+            );
             assert_eq!(
                 posture_label(Some(CoordCredentialPosture::Dark(
                     DarkCause::UpstreamRejected
@@ -2015,7 +2018,8 @@ mod usage_twin_report {
         fn warn_once_per_key_change() {
             let a: IngestRefusalKey = (403, "auth_required".into(), "expired".into());
             let same = a.clone();
-            let new_posture: IngestRefusalKey = (403, "auth_required".into(), "unrefreshable".into());
+            let new_posture: IngestRefusalKey =
+                (403, "auth_required".into(), "unrefreshable".into());
             let new_status: IngestRefusalKey = (401, "auth_required".into(), "expired".into());
             let new_token: IngestRefusalKey = (403, "token_expired".into(), "expired".into());
             // Nothing WARNed yet (fresh process, or reset by a 2xx) -> WARN.
