@@ -9,13 +9,25 @@ Find and display workflow runs across all runner instances.
 
 ### Step 1: Discover All Runner Instances
 
-Read every coord/web/runner response through `scripts/lib/envelope.py` / `envelope.sh`; assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative. The per-door key
+Read every runner response through `lib/envelope.py`, which the `command-scripts` skill carries (Python 3.9+, stdlib only); assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative. The per-door key
 names live in the helper's docstring, not here; `--first-of data,.` reads the
 `{data: …}` envelope or a bare body, and an unreadable one prints nothing.
 
 ```bash
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+ENV_PY=$(CS_REL=lib/envelope.py command_script) || exit 1
 # Try each known port to find active instances
-ENV_PY="qontinui-claude-config/scripts/lib/envelope.py"
 for port in 9876 9877 9878; do
   powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/status\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null \
     | python3 "$ENV_PY" require --door runner-status --first-of data,. | python3 -c "
@@ -26,8 +38,22 @@ print(f'Port {${port}}: {data.get(\"instance_name\", \"primary\")} (running)')
 done
 ```
 
-Also try the instances endpoint for a complete picture:
+Also try the instances endpoint for a complete picture (a new shell, so define
+`command_script` again):
 ```bash
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+ENV_PY=$(CS_REL=lib/envelope.py command_script) || exit 1
 for port in 9876 9877 9878; do
   powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/instances\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null \
     | python3 "$ENV_PY" require --door runner-instances --first-of data,. | python3 -c "

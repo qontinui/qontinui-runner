@@ -250,17 +250,30 @@ Task 3: Fix runner issue Z
 
 **NEVER restart the qontinui-runner unless you specifically modified files in the qontinui-runner directory.**
 
+Restart only the service whose code changed, with the command your project
+already uses to restart it (its dev script, `docker compose restart <service>`,
+its process manager). This command does not ship a restart script: how services
+are started is a property of your project, not of Qontinui.
+
+After a runner restart, restore the loaded config, workflow and monitor.
+`qontinui-http.py` is carried by the `command-scripts` skill and needs Python 3
+with `httpx` and the `qontinui-mcp` package (it imports `qontinui_mcp.client`);
+`pip install qontinui-mcp` if the import fails.
+
 ```bash
-# ONLY if backend code (qontinui-web/backend) was changed:
-$PWD/qontinui-claude-config/scripts/restart-services.sh backend
-
-# ONLY if frontend code (qontinui-web/frontend) was changed:
-$PWD/qontinui-claude-config/scripts/restart-services.sh frontend clean
-
-# ONLY if qontinui-runner Rust code (src-tauri/) was changed - requires full restart:
-powershell.exe -Command "Stop-Process -Name qontinui-runner -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; cd '$PWD\qontinui-runner'; Start-Process -FilePath 'npm.cmd' -ArgumentList 'run','tauri','dev' -WindowStyle Normal"
-# IMPORTANT: After runner restart, restore config/workflow/monitor by calling:
-python $PWD/qontinui-claude-config/scripts/qontinui-http.py load-last-config
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+QH=$(CS_REL=qontinui-http.py command_script) && python3 "$QH" load-last-config
 ```
 
 **Note on qontinui-runner hot-reload:**
@@ -363,7 +376,8 @@ If `.automation-results/latest/` doesn't exist or is empty:
 
 1. Check if runner is running:
    ```bash
-   python $PWD/qontinui-claude-config/scripts/qontinui-http.py status
+   # Define command_script exactly as in Phase 4 first: each shell starts empty.
+   QH=$(CS_REL=qontinui-http.py command_script) && python3 "$QH" status
    ```
 
 2. Check if a config is loaded:
