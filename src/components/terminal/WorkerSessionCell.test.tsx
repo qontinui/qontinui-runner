@@ -586,6 +586,50 @@ describe("FileChangesPanel", () => {
     expect(html).toContain("+1");
     expect(html).toContain("2 changed");
   });
+
+  it("never shows a path with no established before side as a creation", () => {
+    // A PTY-hosted session's path with no pre-edit snapshot and no git base:
+    // diffing it from empty would claim the whole file is new.
+    const read: FileChangesRead = {
+      status: "ok",
+      response: okResponse([
+        {
+          filePath: "/repo/d.ts",
+          status: "created",
+          before: null,
+          after: "existing\n",
+          beforeBytes: null,
+          afterBytes: 9,
+          beforeSha256: null,
+          afterSha256: "w",
+          truncated: false,
+          takenAt: null,
+          detail: null,
+          beforeSource: "none",
+          baseKind: null,
+          baseSha: null,
+        },
+      ]),
+    };
+    // Called as a function (it holds no hooks) so the render enters through
+    // the panel itself, exactly as the worker cell and review panel mount it.
+    const html = renderToStaticMarkup(FileChangesPanel({ read, onRefresh: noop }));
+    expect(html).toContain("d.ts");
+    expect(html).toContain("UNKNOWN — no pre-edit snapshot and no git base to diff against");
+    expect(html).not.toContain("+1");
+  });
+
+  it("names the git base the changes are diffed against in the panel header", () => {
+    const read: FileChangesRead = {
+      status: "ok",
+      response: okResponse([], { baseKind: "head", baseSha: "abc1234567890" }),
+    };
+    // Called as a function (it holds no hooks) so the render enters through
+    // the panel itself, exactly as the worker cell and review panel mount it.
+    const html = renderToStaticMarkup(FileChangesPanel({ read, onRefresh: noop }));
+    expect(html).toContain('data-review-base="head"');
+    expect(html).toContain("vs HEAD abc123456 — committed work not shown");
+  });
 });
 
 describe("ConversationView", () => {
