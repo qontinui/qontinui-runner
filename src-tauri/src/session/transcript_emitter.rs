@@ -305,6 +305,28 @@ impl TranscriptOffsetLog {
     pub fn next_offset(&self, session_key: &str) -> i64 {
         self.lock().next_offset(session_key)
     }
+
+    /// The recorded value for `session_key`, `None` when never written — the
+    /// generic read the tailer's file-mark log uses (it reuses this type as a
+    /// durable key → i64 map rather than growing a second one).
+    pub(crate) fn get(&self, session_key: &str) -> Option<i64> {
+        self.lock().state.lanes.get(session_key).copied()
+    }
+
+    /// Durably record `value` for `session_key` (append + fsync, compacted in
+    /// place). The generic write behind [`Self::get`].
+    pub(crate) fn set(&self, session_key: &str, value: i64) {
+        self.lock().record(session_key, value);
+    }
+
+    /// Durably record several keys in ONE append + fsync, in the given order —
+    /// so the tailer's mark and its hole-detection record cost one fsync. A
+    /// crash mid-append can keep a PREFIX of the entries (a torn trailing line
+    /// is dropped on replay, keeping that key's previous value), so callers put
+    /// the entry that commits the reservation LAST.
+    pub(crate) fn set_many(&self, entries: &[(&str, i64)]) {
+        self.lock().record_many(entries);
+    }
 }
 
 /// Locked view of the lane map. Every mutation is durable before it returns
@@ -317,6 +339,44 @@ struct OffsetLane<'a> {
 impl OffsetLane<'_> {
     fn next_offset(&self, session_key: &str) -> i64 {
         self.state.lanes.get(session_key).copied().unwrap_or(0)
+    }
+
+    /// [`Self::record`] for several keys in one append + fsync.
+    fn record_many(&mut self, entries: &[(&str, i64)]) {
+        for (k, v) in entries {
+            self.state.lanes.insert((*k).to_string(), *v);
+        }
+        if self.state.degraded || entries.is_empty() {
+            return;
+        }
+        let mut buf = String::new();
+        for (k, v) in entries {
+            buf.push_str(&json!({ "session_key": k, "next_offset": v }).to_string());
+            buf.push('\n');
+        }
+        let write = (|| -> std::io::Result<()> {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.path)?;
+            f.write_all(buf.as_bytes())?;
+            f.sync_data()
+        })();
+        if let Err(e) = write {
+            self.state.degraded = true;
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "transcript_emitter: offset log write failed — falling back to in-memory \
+                 offsets for the rest of this run"
+            );
+            return;
+        }
+        self.state.lines += entries.len();
+        self.maybe_compact();
     }
 
     /// Record `next_offset` for `session_key`, durably. Used both to reserve
@@ -342,6 +402,11 @@ impl OffsetLane<'_> {
             return;
         }
         self.state.lines += 1;
+        self.maybe_compact();
+    }
+
+    /// Rewrite the log in place once it holds enough superseded lines.
+    fn maybe_compact(&mut self) {
         if self.state.lines >= OFFSET_LOG_COMPACT_LINES
             && self.state.lines >= self.state.lanes.len() * 2
         {
@@ -454,6 +519,22 @@ impl TranscriptEmitter {
         self.emit_inner(session_key, text);
     }
 
+    /// Path of the tailer's durable FILE-mark sidecar for this emitter's
+    /// outbox — beside the offset sidecar, for the same reasons (instance
+    /// scoping and the unwritable-home fallback come with the outbox path).
+    /// See `session_transcript_tailer`'s "File marks" section.
+    pub(crate) fn file_mark_log_path(&self) -> PathBuf {
+        let stem = self
+            .outbox
+            .path()
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session-outbox".to_string());
+        self.outbox
+            .path()
+            .with_file_name(format!("{stem}-transcript-file-marks.jsonl"))
+    }
+
     /// Gate-2/3 + append path, split from [`Self::emit`] so tests can drive
     /// it without touching the machine's real `settings.json`.
     ///
@@ -464,9 +545,15 @@ impl TranscriptEmitter {
     /// gate's value anyway to report coverage and so checks it itself rather
     /// than paying the settings read twice per append. Every other caller
     /// goes through [`Self::emit`].
-    pub(crate) fn emit_inner(&self, session_key: &str, text: &str) {
+    ///
+    /// Returns how many chunks were durably queued: `0` means nothing reached
+    /// the outbox (empty text, no coord binding, or a clean outbox failure).
+    /// The tailer's file mark advances only on a non-zero return, so a
+    /// block this call dropped stays inside the range a later
+    /// `POST /sessions/transcript-bind` replay can re-read.
+    pub(crate) fn emit_inner(&self, session_key: &str, text: &str) -> usize {
         if text.is_empty() {
-            return;
+            return 0;
         }
 
         // Linkage: claude_session_id → coord session UUID via the registrar's
@@ -485,7 +572,7 @@ impl TranscriptEmitter {
                     "transcript_emitter: no coord session for session key — skipping cloud sync"
                 );
             }
-            return;
+            return 0;
         };
 
         // Gate 3 — redact unconditionally. Workflow runs carry no
@@ -493,7 +580,7 @@ impl TranscriptEmitter {
         // ever reaches the durable outbox file.
         let bytes = redact_secrets(text.as_bytes());
         if bytes.is_empty() {
-            return;
+            return 0;
         }
 
         // Allocate the per-(session-key, transcript-stream) offsets and
@@ -539,8 +626,9 @@ impl TranscriptEmitter {
         // clean failure means NOTHING was written, so durably rewind the
         // reservation and the same chunks re-send next time (idempotent
         // coord-side) rather than leaving a permanent hole.
+        let queued = events.len();
         match self.outbox.record_batch(events) {
-            Ok(_) => {}
+            Ok(_) => queued,
             Err(e) => {
                 lane.record(session_key, start_offset);
                 tracing::warn!(
@@ -550,6 +638,7 @@ impl TranscriptEmitter {
                     "transcript_emitter: outbox append failed (best-effort) — block dropped \
                      locally, offset lane rewound to {start_offset}"
                 );
+                0
             }
         }
     }

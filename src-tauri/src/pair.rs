@@ -644,6 +644,11 @@ pub struct BindingReconcileReport {
     /// re-pointed (`Some(tenant)`) or cleared entirely (`None` — no
     /// bindings remain).
     pub default_repointed: Option<Option<uuid::Uuid>>,
+    /// Tenants missing from this echo that were KEPT (binding and slot), each
+    /// with its current consecutive-omission count. A count of 0 means the
+    /// drop was due but the slot had changed since the decision, so it was
+    /// spared. Observability only — never part of [`Self::changed`].
+    pub held: Vec<(uuid::Uuid, u32)>,
 }
 
 impl BindingReconcileReport {
@@ -926,7 +931,9 @@ pub fn coord_bound_tenants_at_within(
 /// - **Drop**: local binding entries whose tenant is NOT in `coord_set`
 ///   are removed, and their `device_jwt:<tenant>` slots cleared (coord
 ///   Phase 3's refresh gate would 403 them anyway). Orphan slots with no
-///   binding entry are cleared by the same rule.
+///   binding entry are cleared by the same rule. Only after the tenant has
+///   been missing from [`RECONCILE_DROP_AFTER_OMISSIONS`] CONSECUTIVE echoes
+///   (tracked in `coord_omission_streaks.json`); a single omission is held.
 /// - **Flag**: tenants in `coord_set` the runner holds no USABLE credential
 ///   for are reported (`coord_only`, with each one's slot state) — never
 ///   fabricated locally; pair, or let the refresher re-derive, to heal.
@@ -955,6 +962,170 @@ pub fn reconcile_paired_bindings(
     reconcile_paired_bindings_with(&mgr, &path, coord_set)
 }
 
+/// How many CONSECUTIVE reconciles must omit a tenant from coord's echoed set
+/// before its binding is dropped and its slot cleared. One omitted echo used to
+/// delete a live credential outright (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// D4); a single bad echo is now held, not acted on.
+pub const RECONCILE_DROP_AFTER_OMISSIONS: u32 = 2;
+
+/// An omission counts toward the streak only this long after the previously
+/// COUNTED one. Every runner on a box shares the streak file (it sits beside the
+/// shared `paired_user.json`), so without this a primary and an instance runner
+/// heartbeating through the same coord glitch would each add one within seconds
+/// and turn ONE bad echo into two "consecutive" omissions. Below the 30 s
+/// heartbeat cadence, so a single runner's consecutive heartbeats still count.
+pub const RECONCILE_OMISSION_MIN_SPACING_SECS: i64 = 20;
+
+/// One tenant's run of consecutive omissions from coord's echoed set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OmissionStreak {
+    consecutive: u32,
+    /// Unix seconds of the first omission in this run (forensics: logged on drop).
+    first_omitted_at: i64,
+    /// Unix seconds of the most recent omission that was COUNTED.
+    #[serde(default)]
+    last_counted_at: i64,
+}
+
+/// `coord_omission_streaks.json`, beside `paired_user.json`: tenant id → streak.
+/// Written by the reconcile (advance) and by `persist_pairing_with` (reset on a
+/// fresh pairing). Both do so only while holding the binding-reconcile lock
+/// ([`lock_binding_reconcile`]), which serializes them across threads and
+/// processes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct OmissionStreaksFile {
+    #[serde(default)]
+    tenants: std::collections::BTreeMap<String, OmissionStreak>,
+}
+
+fn omission_streaks_path(paired_user: &std::path::Path) -> PathBuf {
+    paired_user.with_file_name("coord_omission_streaks.json")
+}
+
+/// The cross-process lock (`coord_omission_streaks.json.lock`) held for a whole
+/// reconcile pass AND a whole `persist_pairing_with`, so a pairing can never
+/// land between a reconcile's decision and its clears, and the streak file is
+/// never read-modify-written by two writers at once.
+fn lock_binding_reconcile(
+    paired_user: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<crate::secure_storage::FileLockGuard, String> {
+    let lock = crate::secure_storage::lock_path_for(&omission_streaks_path(paired_user));
+    crate::secure_storage::lock_file_exclusive_within(&lock, timeout).map_err(|e| format!("{e:#}"))
+}
+
+/// How long a reconcile waits for the reconcile lock. A reconcile that cannot
+/// get it just tries again next heartbeat.
+const RECONCILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long `persist_pairing_with` waits for the reconcile lock. It runs AFTER
+/// coord already minted the credential, so failing here discards a good token:
+/// the budget must sit clearly above a reconcile's worst-case hold: three
+/// store-lock waits (the one batched conditional clear, then the default
+/// re-point's `store_tokens` — its legacy write and its `mirror_into_tenant_slot`
+/// write — 10 s each), one bounded keychain call (3 s), plus file I/O (~33 s).
+pub(crate) const PAIRING_RECONCILE_LOCK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
+// Test hook run after a reconcile has decided what to drop and read the slots
+// it will clear, and before it clears them.
+#[cfg(test)]
+thread_local! {
+    static AFTER_RECONCILE_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn read_omission_streaks(path: &std::path::Path) -> OmissionStreaksFile {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic write under a temp name unique per process AND per call (callers hold
+/// the reconcile lock, but a unique name costs nothing and survives a lock bug).
+fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let written = serde_json::to_vec_pretty(file)
+        .map_err(|e| e.to_string())
+        .and_then(|body| {
+            let tmp =
+                path.with_extension(format!("json.omission.{}.{seq}.tmp", std::process::id()));
+            std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        });
+    if let Err(e) = written {
+        tracing::warn!("reconcile: could not persist {}: {e}", path.display());
+    }
+}
+
+/// Advance the streaks for this pass and return the tenants that have now been
+/// omitted [`RECONCILE_DROP_AFTER_OMISSIONS`] times in a row, each with the
+/// unix second its run began (their records are consumed). Every tenant NOT
+/// omitted this pass has its streak reset. An omission closer than
+/// [`RECONCILE_OMISSION_MIN_SPACING_SECS`] to the last counted one is not
+/// counted; a NEGATIVE gap (the clock moved back) does count, and restamps.
+/// An unreadable sidecar reads as empty, and a consumed streak whose clear then
+/// fails restarts at one — both only DELAY a drop, never cause one.
+/// Returns `(due, held)`: due tenants with the unix second their run began, and
+/// held tenants with their current count. Caller holds the reconcile lock.
+#[allow(clippy::type_complexity)]
+fn advance_omission_streaks(
+    paired_user: &std::path::Path,
+    omitted: &[uuid::Uuid],
+    now_unix: i64,
+) -> (Vec<(uuid::Uuid, i64)>, Vec<(uuid::Uuid, u32)>) {
+    let path = omission_streaks_path(paired_user);
+    let before = read_omission_streaks(&path);
+    let mut after = OmissionStreaksFile::default();
+    let mut due = Vec::new();
+    let mut held = Vec::new();
+    for t in omitted {
+        let key = t.to_string();
+        let streak = match before.tenants.get(&key) {
+            Some(prev)
+                if (0..RECONCILE_OMISSION_MIN_SPACING_SECS)
+                    .contains(&(now_unix - prev.last_counted_at)) =>
+            {
+                prev.clone()
+            }
+            Some(prev) => OmissionStreak {
+                consecutive: prev.consecutive.saturating_add(1),
+                first_omitted_at: prev.first_omitted_at,
+                last_counted_at: now_unix,
+            },
+            None => OmissionStreak {
+                consecutive: 1,
+                first_omitted_at: now_unix,
+                last_counted_at: now_unix,
+            },
+        };
+        if streak.consecutive >= RECONCILE_DROP_AFTER_OMISSIONS {
+            due.push((*t, streak.first_omitted_at));
+        } else {
+            held.push((*t, streak.consecutive));
+            after.tenants.insert(key, streak);
+        }
+    }
+    if after != before {
+        write_omission_streaks(&path, &after);
+    }
+    (due, held)
+}
+
+/// A fresh pairing proves the binding is wanted: forget any omission streak the
+/// tenant had, so a coord echo that lags the pair by one heartbeat cannot drop
+/// the credential just minted. Best-effort. Caller holds the reconcile lock.
+fn reset_omission_streak(paired_user: &std::path::Path, tenant: &uuid::Uuid) {
+    let path = omission_streaks_path(paired_user);
+    let mut file = read_omission_streaks(&path);
+    if file.tenants.remove(&tenant.to_string()).is_some() {
+        write_omission_streaks(&path, &file);
+    }
+}
+
 /// Parameterized core of [`reconcile_paired_bindings`] — explicit
 /// `AuthManager` + file path so the unit tests run hermetically against
 /// a temp store, never the operator's real credentials.
@@ -963,6 +1134,20 @@ pub(crate) fn reconcile_paired_bindings_with(
     path: &std::path::Path,
     coord_set: &[uuid::Uuid],
 ) -> Result<BindingReconcileReport, String> {
+    reconcile_paired_bindings_at(mgr, path, coord_set, chrono::Utc::now().timestamp())
+}
+
+/// [`reconcile_paired_bindings_with`] at an explicit clock, so the omission
+/// streak's spacing rule is testable.
+pub(crate) fn reconcile_paired_bindings_at(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    now_unix: i64,
+) -> Result<BindingReconcileReport, String> {
+    // One pass is one critical section: decide, then clear, with no pairing
+    // able to interleave (persist_pairing_with takes the same lock).
+    let _reconcile_lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
     let mut report = BindingReconcileReport::default();
 
     let bytes = match std::fs::read(path) {
@@ -986,22 +1171,119 @@ pub(crate) fn reconcile_paired_bindings_with(
     let pf: PairedUserFile =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
 
+    // Hysteresis: a tenant (binding or orphan slot) missing from this echo is
+    // dropped only once it has been missing from RECONCILE_DROP_AFTER_OMISSIONS
+    // consecutive echoes; until then it is held exactly as if coord had echoed it.
+    let bindings = pf.effective_bindings();
+    let mut omitted: Vec<uuid::Uuid> = bindings
+        .iter()
+        .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
+        .chain(mgr.list_tenant_device_jwt_tenants())
+        .filter(|t| !coord_set.contains(t))
+        .collect();
+    omitted.sort();
+    omitted.dedup();
+    let (due_runs, held) = advance_omission_streaks(path, &omitted, now_unix);
+    report.held = held;
+    let due: Vec<uuid::Uuid> = due_runs.iter().map(|(t, _)| *t).collect();
+    let run_began = |t: &uuid::Uuid| {
+        due_runs
+            .iter()
+            .find(|(d, _)| d == t)
+            .map(|(_, since)| *since)
+            .unwrap_or_default()
+    };
+    for t in omitted.iter().filter(|t| !due.contains(t)) {
+        tracing::info!(
+            "reconcile: tenant {t} is missing from coord's echoed set {coord_set:?} — HOLDING its \
+             binding and slot until {RECONCILE_DROP_AFTER_OMISSIONS} consecutive echoes omit it"
+        );
+    }
+    // The exact token each due tenant's slot held when the drop was decided.
+    // Clears are conditional on it, so a slot rewritten since (a refresher
+    // re-mint) is spared rather than deleted. A slot whose read FAILED is
+    // UNKNOWN: its tenant is held, never dropped on an unread slot.
+    let mut observed: Vec<(uuid::Uuid, String)> = Vec::new();
+    let mut unreadable: Vec<uuid::Uuid> = Vec::new();
+    for t in &due {
+        match mgr.get_tenant_device_jwt(t) {
+            Ok(Some(tok)) => observed.push((*t, tok)),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "reconcile: tenant {t} was due to drop but its slot could not be read \
+                     ({e:#}) — HOLDING it (unknown); this echo was {coord_set:?}"
+                );
+                unreadable.push(*t);
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_RECONCILE_DECISION.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    // ALL conditional clears under ONE store-lock acquisition, so this pass
+    // holds the reconcile lock for at most one store wait here.
+    let cleared: Result<std::collections::HashMap<uuid::Uuid, bool>, String> = mgr
+        .clear_tenant_device_jwts_if_unchanged(&observed)
+        .map(|v| v.into_iter().collect())
+        .map_err(|e| format!("{e:#}"));
+    if let Err(e) = &cleared {
+        tracing::warn!(
+            "reconcile: conditional slot clear failed ({e}) — HOLDING every due tenant this pass"
+        );
+    }
+    /// What became of one due tenant's slot.
+    enum SlotFate {
+        /// Cleared, or there was no slot to clear: the drop may proceed.
+        Gone,
+        /// Changed since the decision, unreadable, or the clear failed: hold.
+        Held,
+    }
+    let fate = |t: &uuid::Uuid| -> SlotFate {
+        if unreadable.contains(t) {
+            return SlotFate::Held;
+        }
+        match &cleared {
+            Err(_) => SlotFate::Held,
+            Ok(map) => match map.get(t) {
+                Some(true) | None => SlotFate::Gone,
+                Some(false) => SlotFate::Held,
+            },
+        }
+    };
+    let keeps = |t: &uuid::Uuid| coord_set.contains(t) || !due.contains(t);
+
     // Partition the (migrated) binding set by coord membership. Entries
     // with malformed tenant_id can never match coord and carry no slot —
     // dropped as junk (logged, not reported).
     let mut kept: Vec<PairedBinding> = Vec::new();
     let mut dropped_malformed = false;
-    for b in pf.effective_bindings() {
+    for b in bindings {
         match uuid::Uuid::parse_str(b.tenant_id.trim()) {
-            Ok(t) if coord_set.contains(&t) => kept.push(b),
-            Ok(t) => {
-                report.dropped.push(t);
-                // Designed home of slot deletion: coord no longer has the
-                // binding, so its credential is dead weight. Best-effort.
-                if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
-                    tracing::debug!("reconcile: clear slot for dropped tenant {t} failed: {e}");
+            Ok(t) if keeps(&t) => kept.push(b),
+            Ok(t) => match fate(&t) {
+                SlotFate::Held => {
+                    tracing::warn!(
+                        "reconcile: tenant {t} was due to drop but its slot changed since the \
+                         decision or could not be read/cleared — KEEPING binding and slot; \
+                         this echo was {coord_set:?}"
+                    );
+                    report.held.push((t, 0));
+                    kept.push(b);
                 }
-            }
+                SlotFate::Gone => {
+                    // Designed home of slot deletion: coord no longer has the
+                    // binding, so its credential is dead weight.
+                    tracing::warn!(
+                        "reconcile: DROPPED binding and cleared slot for tenant {t} — omitted \
+                         from {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since \
+                         unix {}; this echo was {coord_set:?}",
+                        run_began(&t)
+                    );
+                    report.dropped.push(t);
+                }
+            },
             Err(_) => {
                 tracing::warn!(
                     "reconcile: dropping paired_user.json binding with malformed tenant_id {:?}",
@@ -1013,17 +1295,33 @@ pub(crate) fn reconcile_paired_bindings_with(
     }
 
     // Orphan slots (credential without a binding entry) that coord's set
-    // doesn't contain either — same authority statement, same fate.
+    // doesn't contain either — same authority statement, same fate. Only
+    // slots OBSERVED (or unreadable) at decision time: a slot that appeared
+    // since is not one this pass decided about.
     let kept_tenants: Vec<uuid::Uuid> = kept
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
         .collect();
-    for t in mgr.list_tenant_device_jwt_tenants() {
-        if !coord_set.contains(&t) && !report.dropped.contains(&t) {
-            if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
-                tracing::debug!("reconcile: clear orphan slot {t} failed: {e}");
-            } else {
-                report.dropped_slots.push(t);
+    let mut orphans: Vec<uuid::Uuid> = observed
+        .iter()
+        .map(|(t, _)| *t)
+        .chain(unreadable.iter().copied())
+        .collect();
+    orphans.sort();
+    orphans.dedup();
+    for t in orphans {
+        if !keeps(&t) && !report.dropped.contains(&t) && !kept_tenants.contains(&t) {
+            match fate(&t) {
+                SlotFate::Gone => {
+                    tracing::warn!(
+                        "reconcile: cleared ORPHAN slot for tenant {t} — omitted from \
+                         {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix \
+                         {}; this echo was {coord_set:?}",
+                        run_began(&t)
+                    );
+                    report.dropped_slots.push(t);
+                }
+                SlotFate::Held => report.held.push((t, 0)),
             }
         }
     }
@@ -1881,8 +2179,13 @@ pub(crate) fn persist_pairing_with(
     // methods). This is the FIRST write of the sequence, so on an undecryptable
     // `.enc` it heals the store and every write below then merges over the
     // now-readable store. See `SecureStorage::WriteMode`.
+    // Serialize with the heartbeat reconcile for the whole pairing, so a
+    // reconcile can neither decide against a half-written pairing nor clear the
+    // slot this pairing is about to write.
+    let _reconcile_lock = lock_binding_reconcile(path, PAIRING_RECONCILE_LOCK_WAIT)?;
     mgr.store_tenant_device_jwt_fresh(&tenant_id, &resp.token)
         .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
+    reset_omission_streak(path, &tenant_id);
 
     // 2. Load + migrate the existing file (missing → fresh; unparseable
     //    → start over, same clobber posture the pre-8a writer had).
@@ -2824,6 +3127,49 @@ mod tests {
         assert!(json.contains("\"tenant_id\""));
     }
 
+    /// Plan `2026-09-14-credential-posture-third-residuals` D5 — sign-in does
+    /// NOT re-pin. `machine.json` pins T; a sign-in lands in tenant B, the
+    /// tenant coord stamped on the minted JWT. The two local-disk steps of
+    /// `commands::auth::finalize_signed_in` — `ensure_device_initialized` and
+    /// the pairing persist (`persist_pairing` → this core) — leave
+    /// `machine.json` byte-for-byte as it was, so its `active_tenant_id` is
+    /// still T. Re-pointing FUTURE sessions for the whole machine is
+    /// `set_active_tenant`'s job, an explicit operator act; doing it as a side
+    /// effect of a sign-in whose tenant coord chooses would be a silent
+    /// machine-wide change. The posture half — the next pass still publishes
+    /// the pinned arm naming T — is
+    /// `a_sign_in_to_another_tenant_leaves_the_pinned_arm_naming_the_pin` in
+    /// the refresher.
+    #[test]
+    fn a_pairing_for_another_tenant_never_rewrites_the_machine_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        let pinned = tc();
+        let machine_json = amb.write_active_tenant_id(pinned);
+        let before = std::fs::read(&machine_json).expect("read machine.json");
+        let mgr = test_mgr(amb.dir());
+        let path = amb.dir().join("paired_user.json");
+
+        ensure_device_initialized();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).expect("persist B");
+
+        assert_eq!(
+            read_file(&path).default_tenant_id.as_deref(),
+            Some(T_B),
+            "precondition: the pairing landed, in B"
+        );
+        assert_eq!(
+            std::fs::read(&machine_json).expect("re-read machine.json"),
+            before,
+            "machine.json is untouched by a sign-in"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&before).expect("machine.json parses");
+        assert_eq!(
+            v["active_tenant_id"].as_str(),
+            Some(T_C),
+            "the pin is still T"
+        );
+    }
+
     /// First pair: binding appended, becomes default, JWT written to BOTH
     /// the tenant slot and the legacy access_token slot, mirrors set.
     #[test]
@@ -3021,8 +3367,15 @@ mod tests {
         persist_pairing_with(&mgr, &path, &pair_resp(&ja), ta()).unwrap();
         persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
 
-        // Coord says: A still bound, B gone, C newly bound elsewhere.
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tc()]).expect("reconcile");
+        // Coord says: A still bound, B gone, C newly bound elsewhere. The
+        // first omission is held (hysteresis); the second acts.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0).expect("reconcile");
+        assert!(
+            held.dropped.is_empty(),
+            "one omission must not drop: {held:?}"
+        );
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![tb()]);
         assert_eq!(
@@ -3058,8 +3411,14 @@ mod tests {
         persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
         assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
 
-        // Coord dropped A (the default); B survives.
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[tb()]).expect("reconcile");
+        // Coord dropped A (the default); B survives. Held once, then acted on.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[tb()], T0).expect("reconcile");
+        assert_eq!(
+            held.default_repointed, None,
+            "one omission must not re-point"
+        );
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[tb()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![ta()]);
         assert_eq!(report.default_repointed, Some(Some(tb())));
@@ -3089,7 +3448,9 @@ mod tests {
         let path = dir.join("paired_user.json");
         persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
 
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[]).expect("reconcile");
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[], T0).expect("reconcile");
+        assert!(!held.changed(), "one empty echo must not drop: {held:?}");
+        let report = reconcile_paired_bindings_at(&mgr, &path, &[], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![ta()]);
         assert_eq!(report.default_repointed, Some(None), "default cleared");
@@ -3130,6 +3491,206 @@ mod tests {
             std::fs::read(&path).unwrap(),
             before,
             "steady state must not rewrite the file"
+        );
+    }
+
+    /// Reconcile clock for the hysteresis tests; successive heartbeats are 30 s apart.
+    const T0: i64 = 1_790_000_000;
+
+    /// Two omissions closer together than RECONCILE_OMISSION_MIN_SPACING_SECS
+    /// (e.g. a primary and an instance runner heartbeating through the same coord
+    /// glitch against the SHARED streak file) count once, so nothing is dropped.
+    #[test]
+    fn reconcile_omissions_closer_than_the_spacing_count_once() {
+        let dir = temp_dir_for("reconcile_spacing");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 5).expect("r2");
+        assert!(!r1.changed() && !r2.changed(), "{r1:?} {r2:?}");
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+        // A properly spaced second omission does drop.
+        let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r3");
+        assert_eq!(r3.dropped, vec![tb()]);
+    }
+
+    /// MAJOR 1: a slot rewritten AFTER the reconcile decided to drop its
+    /// tenant (here by the test hook, standing in for a refresher re-mint) is
+    /// spared — the clear is conditional on the token observed at decision —
+    /// and the binding is kept and reported as held.
+    #[test]
+    fn reconcile_spares_a_slot_rewritten_after_the_decision() {
+        let dir = temp_dir_for("reconcile_toctou");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+
+        let fresh = live_jwt("b-remint");
+        let (m2, f2) = (mgr.clone(), fresh.clone());
+        AFTER_RECONCILE_DECISION.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                m2.store_tenant_device_jwt(&tb(), &f2).unwrap();
+            }))
+        });
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert!(r2.dropped.is_empty(), "{r2:?}");
+        assert_eq!(r2.held, vec![(tb(), 0)]);
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), Some(fresh));
+        assert_eq!(read_file(&path).bindings.len(), 2);
+    }
+
+    /// A pairing that lands WHILE a reconcile holds the reconcile lock waits for
+    /// it and succeeds (it runs after coord already minted, so failing would
+    /// discard a good credential), and both effects survive.
+    #[test]
+    fn a_pairing_concurrent_with_a_reconcile_succeeds() {
+        assert!(
+            PAIRING_RECONCILE_LOCK_WAIT
+                > 3 * crate::secure_storage::STORE_LOCK_TIMEOUT
+                    + crate::auth::KEYCHAIN_CALL_TIMEOUT,
+            "the pairing budget must exceed a reconcile's worst-case hold"
+        );
+        let dir = temp_dir_for("reconcile_concurrent_pair");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+
+        let (in_hook_tx, in_hook_rx) = std::sync::mpsc::channel::<()>();
+        let (m, p) = (mgr.clone(), path.clone());
+        let reconciler = std::thread::spawn(move || {
+            AFTER_RECONCILE_DECISION.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    in_hook_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }))
+            });
+            reconcile_paired_bindings_at(&m, &p, &[ta()], T0 + 30).expect("r2")
+        });
+        // The reconcile is mid-pass and holds the lock; pair tenant C now.
+        in_hook_rx.recv().unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("c")), tc())
+            .expect("a pairing must wait out a reconcile, not fail");
+        let r2 = reconciler.join().unwrap();
+        assert_eq!(r2.dropped, vec![tb()]);
+        let tenants: Vec<String> = read_file(&path)
+            .bindings
+            .into_iter()
+            .map(|b| b.tenant_id)
+            .collect();
+        assert!(tenants.contains(&T_C.to_string()), "{tenants:?}");
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_some());
+    }
+
+    /// S8: a negative gap (the clock moved back) counts as an omission and
+    /// restamps, rather than freezing the streak until the clock catches up.
+    #[test]
+    fn reconcile_a_backwards_clock_still_counts_the_omission() {
+        let dir = temp_dir_for("reconcile_clock_back");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 1000).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r2");
+        assert_eq!(r2.dropped, vec![tb()]);
+    }
+
+    /// Re-pairing a tenant forgets its omission streak: an echo lagging the
+    /// pair by one heartbeat must not drop the credential just minted.
+    #[test]
+    fn repairing_a_tenant_resets_its_omission_streak() {
+        let dir = temp_dir_for("reconcile_repair_resets");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert!(!r1.changed(), "{r1:?}");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b2")), tb()).unwrap();
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert!(!r2.changed(), "re-pair must reset the streak: {r2:?}");
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+    }
+
+    /// D4 hysteresis: ONE echo omitting a tenant keeps its binding and slot;
+    /// the tenant reappearing resets the streak (so a later single omission is
+    /// held again); TWO consecutive omissions drop the binding and clear the
+    /// slot. Orphan slots follow the same rule.
+    #[test]
+    fn reconcile_requires_two_consecutive_omissions_and_reappearance_resets() {
+        let dir = temp_dir_for("reconcile_hysteresis");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        // An orphan slot (no binding entry) for C.
+        mgr.store_tenant_device_jwt(&tc(), &live_jwt("c")).unwrap();
+        let slot_b = mgr.get_tenant_device_jwt(&tb()).unwrap();
+        assert!(slot_b.is_some());
+
+        // 1st omission of B and C: held.
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("reconcile");
+        assert!(!r1.changed(), "one omission must not drop: {r1:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), slot_b);
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_some());
+        assert_eq!(read_file(&path).bindings.len(), 2);
+
+        // B and C reappear: streaks reset.
+        let r2 =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tb(), tc()], T0 + 30).expect("r2");
+        assert!(!r2.changed(), "{r2:?}");
+
+        // Omitted once again after the reset: still held (count restarted at 1).
+        let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 60).expect("r3");
+        assert!(!r3.changed(), "a reset streak must restart at one: {r3:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), slot_b);
+
+        // Second CONSECUTIVE omission: dropped and cleared.
+        let r4 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 90).expect("r4");
+        assert_eq!(r4.dropped, vec![tb()]);
+        assert_eq!(r4.dropped_slots, vec![tc()]);
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_none());
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
+        assert!(mgr.get_tenant_device_jwt(&ta()).unwrap().is_some());
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 1);
+        assert_eq!(pf.bindings[0].tenant_id, T_A);
+    }
+
+    /// Gate of Phase 1: pairing tenant A leaves tenant B's slot BYTE-IDENTICAL
+    /// — through the Fresh (explicit-acquisition) write path `persist_pairing`
+    /// uses — on a readable store.
+    #[test]
+    fn pairing_one_tenant_leaves_another_tenants_slot_byte_identical() {
+        let dir = temp_dir_for("pair_leaves_sibling_slot");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        let jb = live_jwt("b");
+        persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
+        let before = mgr.get_tenant_device_jwt(&tb()).unwrap().expect("B slot");
+        assert_eq!(before, jb);
+
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a2")), ta()).unwrap();
+
+        let after = mgr
+            .get_tenant_device_jwt(&tb())
+            .unwrap()
+            .expect("B slot survives");
+        assert_eq!(
+            after.as_bytes(),
+            before.as_bytes(),
+            "B's slot must be byte-identical"
         );
     }
 
@@ -3398,7 +3959,11 @@ mod tests {
         // Orphan slot for C: no binding entry, and coord doesn't have C.
         mgr.store_tenant_device_jwt(&tc(), "jwt.c.orphan").unwrap();
 
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
+        // First omission is held (D4 hysteresis); the second clears.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("reconcile");
+        assert!(held.dropped_slots.is_empty(), "{held:?}");
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped_slots, vec![tc()]);
         assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
@@ -4318,13 +4883,7 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         canonical,
         others,
         bare_default.as_deref(),
-        &|t: &uuid::Uuid, is_default: bool| {
-            crate::auth::holds_credential_for(
-                crate::auth::read_tenant_slot(&mgr, t).state(),
-                is_default,
-                crate::auth::read_legacy_slot(&mgr).state(),
-            )
-        },
+        &holds_credential_predicate(&mgr),
         &today,
     );
     if report.wrote_canonical
@@ -4355,6 +4914,47 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         );
     }
     report
+}
+
+/// The production credential predicate — "does this process hold a credential
+/// for `tenant`?" — shared by [`converge_binding_store`] (which merges under it)
+/// and [`binding_store_check`] (which judges the merge under it), so the two can
+/// never disagree about "credentialed".
+///
+/// Answers [`crate::auth::holds_credential_for`] over the tenant's own
+/// per-tenant slot and the LEGACY `access_token` slot. The legacy slot is read
+/// at most ONCE per predicate, and only when a DEFAULT tenant is asked about
+/// (`holds_credential_for` never consults it for a non-default tenant): the
+/// doctor builds one of these on every `/coord-mcp/doctor` probe, and the
+/// legacy read can reach the OS keychain.
+///
+/// **What "credentialed" establishes, stated so it is not over-claimed.**
+/// Per-tenant slots are file storage scoped by `$QONTINUI_SECURE_STORAGE_DIR`,
+/// so they are this installation's own. The legacy slot is not entirely:
+/// [`crate::auth::read_legacy_slot`] goes through `probe_access_token`, whose
+/// chain can fall back to the OS keychain under the fixed service name
+/// `com.qontinui.runner` — shared by every instance on the box. So for the
+/// DEFAULT tenant this predicate can be answered by another installation's
+/// keychain token. That is what converge merges under, and the doctor uses the
+/// very same predicate so that it judges the merge by the merge's own rule.
+pub(crate) fn holds_credential_predicate(
+    mgr: &crate::auth::AuthManager,
+) -> impl Fn(&uuid::Uuid, bool) -> Option<bool> + '_ {
+    let legacy: std::cell::OnceCell<crate::auth::SlotState> = std::cell::OnceCell::new();
+    move |tenant: &uuid::Uuid, is_default: bool| {
+        crate::auth::holds_credential_for(
+            crate::auth::read_tenant_slot(mgr, tenant).state(),
+            is_default,
+            // `holds_credential_for` consults the legacy slot only for the
+            // default tenant, so a non-default probe never pays the (possibly
+            // keychain-backed) read; `Absent` is never inspected on that arm.
+            if is_default {
+                *legacy.get_or_init(|| crate::auth::read_legacy_slot(mgr).state())
+            } else {
+                crate::auth::SlotState::Absent
+            },
+        )
+    }
 }
 
 /// Path-parameterized core of [`converge_binding_store`] — explicit canonical
@@ -4797,187 +5397,11 @@ fn supersede_copy(from: &std::path::Path, today: &str) -> Result<PathBuf, String
 }
 
 // ----------------------------------------------------------------------------
-// The doctor check
+// The doctor check — read-only, in `pair/binding_store_doctor.rs`
 // ----------------------------------------------------------------------------
 
-/// One computed copy, described. Serialized into `/coord-mcp/doctor`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BindingStoreCopyView {
-    pub path: String,
-    /// Is this the file [`paired_user_path`] resolves to?
-    pub canonical: bool,
-    /// `present` | `absent` | `unreadable`.
-    pub read: &'static str,
-    /// The migrated binding set, sorted. `None` is UNKNOWN (unreadable) —
-    /// never an empty list, which would read as "bound to nothing".
-    pub tenants: Option<Vec<String>>,
-    pub default_tenant_id: Option<String>,
-    /// `Some(true)` when this copy is in the pre-v2 single-tenant shape.
-    pub legacy_shape: Option<bool>,
-    /// `tenant_id -> paired_at`, for the REPORT-only difference arm.
-    pub paired_at: Option<std::collections::BTreeMap<String, String>>,
-}
-
-/// The split-brain verdict over the computed copies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BindingStoreCheck {
-    /// `ok` | `report` | `fail` | `unknown`.
-    ///
-    /// - `fail` — two live copies disagree on the BINDING SET or on
-    ///   `default_tenant_id`. That is a real split brain: which file a
-    ///   process reads decides which tenants it believes exist.
-    /// - `report` — they agree on both, and differ only on `paired_at`.
-    ///   That is cosmetic, and it is the ONLY way the copies differ on the
-    ///   operator box today, so failing on it would fail a healthy machine
-    ///   from day one and get the check disabled. Deciding priority:
-    ///   robustness.
-    /// - `unknown` — a copy exists and could not be read. UNKNOWN is never
-    ///   "no disagreement" (same discipline as `tenant_slots_unknown` and
-    ///   `auth::BindingTenantRead::Unknown`).
-    /// - `ok` — fewer than two live copies, or they agree outright.
-    pub verdict: &'static str,
-    pub detail: String,
-    pub copies: Vec<BindingStoreCopyView>,
-}
-
-impl BindingStoreCheck {
-    /// Does this verdict FAIL the doctor?
-    pub fn failed(&self) -> bool {
-        self.verdict == "fail"
-    }
-    /// Is the comparison UNKNOWN? A caller must not read this as agreement.
-    pub fn is_unknown(&self) -> bool {
-        self.verdict == "unknown"
-    }
-}
-
-/// Inspect the `paired_user.json` copies this process would itself compute.
-/// Read-only — the doctor never writes.
-pub fn binding_store_check() -> BindingStoreCheck {
-    inspect_binding_store_paths(&binding_store_candidate_paths())
-}
-
-/// Path-parameterized core of [`binding_store_check`]. `paths[0]` is the
-/// canonical one.
-pub(crate) fn inspect_binding_store_paths(paths: &[PathBuf]) -> BindingStoreCheck {
-    let copies: Vec<BindingStoreCopyView> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| describe_binding_store_copy(p, i == 0))
-        .collect();
-
-    let live: Vec<&BindingStoreCopyView> = copies.iter().filter(|c| c.read != "absent").collect();
-    let unreadable = live.iter().filter(|c| c.read == "unreadable").count();
-    let readable: Vec<&&BindingStoreCopyView> =
-        live.iter().filter(|c| c.read == "present").collect();
-
-    // Order matters: a disagreement we CAN see is a fail even when another
-    // copy is unreadable, but an unreadable copy must never let "the rest
-    // agree" stand in for "no disagreement".
-    let sets_differ = readable
-        .windows(2)
-        .any(|w| w[0].tenants != w[1].tenants || w[0].default_tenant_id != w[1].default_tenant_id);
-    let paired_at_differs = readable
-        .windows(2)
-        .any(|w| w[0].paired_at != w[1].paired_at);
-
-    let (verdict, detail) = if sets_differ {
-        (
-            "fail",
-            format!(
-                "{} live paired_user.json copies disagree on the binding set or on \
-                 default_tenant_id — which file a process reads decides which tenants it \
-                 believes exist. Run the runner once to converge them (the non-canonical \
-                 copy is left as .superseded-<date>), or reconcile by hand.",
-                readable.len()
-            ),
-        )
-    } else if unreadable > 0 {
-        (
-            "unknown",
-            format!(
-                "{unreadable} of {} live paired_user.json copies could not be read — \
-                 agreement is UNKNOWN, not established. An unreadable copy is never \
-                 evidence of no disagreement.",
-                live.len()
-            ),
-        )
-    } else if paired_at_differs {
-        (
-            "report",
-            format!(
-                "{} live paired_user.json copies agree on the binding set and on \
-                 default_tenant_id, and differ only on paired_at — cosmetic, reported \
-                 rather than failed.",
-                readable.len()
-            ),
-        )
-    } else if readable.len() < 2 {
-        (
-            "ok",
-            format!(
-                "{} live paired_user.json copy/copies under a path this process computes — \
-                 nothing to disagree with.",
-                readable.len()
-            ),
-        )
-    } else {
-        (
-            "ok",
-            format!("{} live paired_user.json copies agree.", readable.len()),
-        )
-    };
-
-    BindingStoreCheck {
-        verdict,
-        detail,
-        copies,
-    }
-}
-
-fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> BindingStoreCopyView {
-    let mut view = BindingStoreCopyView {
-        path: path.display().to_string(),
-        canonical,
-        read: "absent",
-        tenants: None,
-        default_tenant_id: None,
-        legacy_shape: None,
-        paired_at: None,
-    };
-    if !path.exists() {
-        return view;
-    }
-    let Some(pf) = read_paired_user_file_at(path) else {
-        // Present and unreadable. `tenants: None` stays UNKNOWN.
-        view.read = "unreadable";
-        return view;
-    };
-    view.read = "present";
-    let bindings = pf.effective_bindings();
-    let mut tenants: Vec<String> = bindings
-        .iter()
-        .map(|b| b.tenant_id.trim().to_string())
-        .collect();
-    tenants.sort();
-    tenants.dedup();
-    view.tenants = Some(tenants);
-    view.default_tenant_id = pf
-        .effective_default_tenant_id()
-        .map(|d| d.trim().to_string());
-    view.legacy_shape = Some(!pf.is_v2());
-    view.paired_at = Some(
-        bindings
-            .iter()
-            .filter_map(|b| {
-                b.paired_at
-                    .as_ref()
-                    .map(|p| (b.tenant_id.trim().to_string(), p.clone()))
-            })
-            .collect(),
-    );
-    view
-}
+mod binding_store_doctor;
+pub use binding_store_doctor::{binding_store_check, BindingStoreCheck, BindingStoreCopyView};
 
 // ============================================================================
 // D4 gate — "One binding store"
@@ -4994,26 +5418,36 @@ fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> Bindi
 //   2. both bindings survive the merge;
 //   3. the legacy single-tenant copy is migrated in place to v2;
 //   4. `bindings` gains NO tenant this runner has no credential for;
-//   5. the doctor check FAILS on a binding-set / `default_tenant_id`
-//      disagreement;
-//   6. the doctor check only REPORTS a `paired_at`-only difference;
-//   7. an unreadable copy reads as UNKNOWN, never as "no disagreement".
+//   5. the doctor check FAILS only on a MERGE GAP — a tenant another copy
+//      carries, that this process holds a credential for, and that the
+//      canonical lacks — or on a credential with no canonical store at all;
+//   6. the doctor check only REPORTS the expected one-way-merge residue
+//      (withheld / credential-unknown tenants, canonical-only tenants, a
+//      differing `default_tenant_id`, `paired_at` / `user_id` differences);
+//      two copies DIFFERING is the permanent, intended state under an
+//      override, so it is never by itself a fail;
+//   7. an unreadable copy reads as UNKNOWN, never as "nothing missing".
+//
+// Items 5-7 are asserted in `pair/binding_store_doctor.rs`'s tests, which
+// share this module's fixtures (hence the `pub(super)` items below); plan
+// 2026-10-02-binding-store-doctor-fails-forever-on-the-store-an-override-runner-must-retain
+// retired the pairwise "two copies must agree" rules these items used to state.
 #[cfg(test)]
 mod one_binding_store_tests {
     use super::*;
     use std::path::Path;
 
     /// `c231d9da…` on the operator box — the device default.
-    const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
+    pub(super) const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
     /// `7ac125b6…` on the operator box — Portofino, the second binding.
-    const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
+    pub(super) const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
     /// A tenant NO slot exists for. The merge must never admit it.
-    const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
-    const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    pub(super) const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
+    pub(super) const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// The production predicate, with the store answers pinned: the two real
     /// tenants have slots, everything else does not.
-    fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
+    pub(super) fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
         let slot = match tenant.to_string().as_str() {
             DEFAULT_TENANT | SECOND_TENANT => crate::auth::SlotState::Usable,
             _ => crate::auth::SlotState::Absent,
@@ -5021,13 +5455,13 @@ mod one_binding_store_tests {
         crate::auth::holds_credential_for(slot, is_default, crate::auth::SlotState::Usable)
     }
 
-    fn write(path: &Path, body: &str) {
+    pub(super) fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
 
     /// v2 shape: `bindings` + `default_tenant_id` + the legacy mirrors.
-    fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
+    pub(super) fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
         format!(
             r#"{{
   "user_id": "{USER}",
@@ -5043,7 +5477,7 @@ mod one_binding_store_tests {
 
     /// The 4-month-stale `%APPDATA%/com.qontinui.runner/paired_user.json`:
     /// pre-v2 single-tenant shape, no `bindings` array at all.
-    fn legacy() -> String {
+    pub(super) fn legacy() -> String {
         format!(r#"{{"user_id": "{USER}", "tenant_id": "{DEFAULT_TENANT}"}}"#)
     }
 
@@ -5379,128 +5813,6 @@ mod one_binding_store_tests {
         );
         assert!(other.exists(), "and it is left in place");
         assert!(!report.wrote_canonical);
-    }
-
-    // ------------------------------------------------------------------
-    // 5 + 6 — the doctor check
-    // ------------------------------------------------------------------
-
-    /// FAILS on a binding-set disagreement, and again on a
-    /// `default_tenant_id` disagreement — the two ways a split brain changes
-    /// which tenants a process believes exist.
-    #[test]
-    fn doctor_check_fails_on_a_binding_set_or_default_tenant_disagreement() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-
-        // Binding-set disagreement: the legacy copy cannot see the second
-        // binding at all. This is the operator box's %APPDATA% copy.
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, &legacy());
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(check.verdict, "fail", "{}", check.detail);
-        assert!(check.failed());
-        assert_eq!(
-            check.copies[1].legacy_shape,
-            Some(true),
-            "the legacy shape must be visible in the report"
-        );
-
-        // default_tenant_id disagreement, same binding set.
-        write(
-            &b,
-            &format!(
-                r#"{{"user_id":"{USER}","tenant_id":"{SECOND_TENANT}",
-  "bindings":[
-    {{"tenant_id":"{DEFAULT_TENANT}","user_id":"{USER}","paired_at":"2026-09-17T15:42:00Z"}},
-    {{"tenant_id":"{SECOND_TENANT}","user_id":"{USER}","paired_at":"2026-08-02T10:00:00Z"}}],
-  "default_tenant_id":"{SECOND_TENANT}"}}"#
-            ),
-        );
-        let check = inspect_binding_store_paths(&[a, b]);
-        assert_eq!(
-            check.verdict, "fail",
-            "same tenants, different default — still a split brain: {}",
-            check.detail
-        );
-    }
-
-    /// Only REPORTS a `paired_at`-only difference. This is the ONLY way the
-    /// copies differ on the operator box today, so a strict check would fail
-    /// a healthy machine from day one and get disabled.
-    #[test]
-    fn doctor_check_only_reports_a_paired_at_only_difference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
-
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(
-            check.verdict, "report",
-            "a paired_at-only difference is cosmetic: {}",
-            check.detail
-        );
-        assert!(!check.failed(), "and it must NOT fail the doctor");
-        assert!(check.detail.contains("paired_at"));
-
-        // Identical copies: plain ok.
-        write(&b, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        assert_eq!(inspect_binding_store_paths(&[a, b]).verdict, "ok");
-    }
-
-    /// One copy (the shape of a box with no `$QONTINUI_SECURE_STORAGE_DIR`)
-    /// is `ok`, not a fail.
-    #[test]
-    fn doctor_check_is_ok_with_a_single_live_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let missing = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-
-        let check = inspect_binding_store_paths(&[a, missing]);
-        assert_eq!(check.verdict, "ok", "{}", check.detail);
-        assert_eq!(check.copies[1].read, "absent");
-        assert_eq!(
-            check.copies[1].tenants, None,
-            "an ABSENT copy carries no binding list"
-        );
-    }
-
-    /// UNKNOWN discipline: an unreadable copy must never read as "no
-    /// disagreement", and a disagreement we CAN see still fails.
-    #[test]
-    fn doctor_check_reports_unknown_not_agreement_for_an_unreadable_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, "\u{0}\u{1}not-json-at-all");
-
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(
-            check.verdict, "unknown",
-            "an undecryptable/corrupt copy is UNKNOWN, never 'the rest agree': {}",
-            check.detail
-        );
-        assert!(check.is_unknown());
-        assert!(!check.failed(), "unknown is not a fail either");
-        assert_eq!(check.copies[1].read, "unreadable");
-        assert_eq!(
-            check.copies[1].tenants, None,
-            "an unreadable copy must NOT report an empty binding list — absence is not zero"
-        );
-
-        // A visible disagreement beats the unknown: still a fail.
-        let c = tmp.path().join("c/paired_user.json");
-        write(&c, &legacy());
-        assert_eq!(
-            inspect_binding_store_paths(&[a, c, b]).verdict,
-            "fail",
-            "a disagreement we can see is not masked by a copy we cannot read"
-        );
     }
 
     // ------------------------------------------------------------------

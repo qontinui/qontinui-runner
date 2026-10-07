@@ -23,6 +23,7 @@ import type {
   DiscoverPagesResult,
   ApiResponse as ApiResp,
 } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 interface SourceIntegrationPanelProps {
   /** When set externally (e.g. from a discovered app card), pre-fills the path and auto-analyzes */
@@ -61,7 +62,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         setError(data.error || "Analysis failed");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Analysis failed");
+      setError(describeThrown(err, "Analysis failed"));
     } finally {
       setAnalyzing(false);
     }
@@ -135,7 +136,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         setError(data.error || "Integration failed");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Integration failed");
+      setError(describeThrown(err, "Integration failed"));
     } finally {
       setIntegrating(false);
     }
@@ -162,7 +163,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         setError(data.error || "Update failed");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Update failed");
+      setError(describeThrown(err, "Update failed"));
     } finally {
       setUpdating(false);
     }
@@ -226,7 +227,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         new CustomEvent("ui-bridge-generate-pages", { detail: { pages: allPages, options } }),
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Prepare All failed");
+      setError(describeThrown(err, "Prepare All failed"));
     } finally {
       setPreparingAll(false);
     }

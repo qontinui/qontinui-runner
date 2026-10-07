@@ -49,6 +49,20 @@ export interface ExternalClaudeProcess {
   working_directory: string | null;
 }
 
+/**
+ * `transcript_find_external_processes`' `data` on success.
+ *
+ * `stale: true` means the runner skipped the enumeration under memory pressure
+ * (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated,
+ * Phase 3) and returned its last COMPLETE result, observed at
+ * `observed_at_ms` — a labelled previous answer, never an empty list.
+ */
+export interface ExternalProcessesResult {
+  processes: ExternalClaudeProcess[];
+  stale: boolean;
+  observed_at_ms: number;
+}
+
 export interface AccountUsageInfo {
   config_dir: string;
   label: string;
@@ -768,7 +782,13 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     try {
       const result = await invoke<CommandResponse>("transcript_find_external_processes");
       if (result.success && result.data) {
-        const processes = result.data as ExternalClaudeProcess[];
+        // A `stale` result is the runner's previous complete enumeration,
+        // returned because it shed the scan under memory pressure. Using its
+        // count is the same "keep the last known count" the degraded arm below
+        // does — the cached list IS the last known answer, re-filtered by the
+        // runner against its current managed PIDs — so no new state is needed
+        // to stay honest; what must never happen is reading it as zero.
+        const { processes } = result.data as ExternalProcessesResult;
         setExternalProcessCount(processes.length);
       }
       // On `success: false` the backend is telling us the enumeration DEGRADED

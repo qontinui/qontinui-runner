@@ -25,6 +25,7 @@ import {
   Clock,
   AlertTriangle,
 } from "lucide-react";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types (mirror Rust structs)
@@ -311,7 +312,7 @@ export function DurableExecutionTab({ taskRunId }: DurableExecutionTabProps) {
     } catch (err) {
       setRollbackResult({
         success: false,
-        message: err instanceof Error ? err.message : String(err),
+        message: describeThrown(err, "Rollback failed"),
       });
     } finally {
       setRollingBack(false);

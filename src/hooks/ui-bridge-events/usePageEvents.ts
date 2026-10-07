@@ -25,6 +25,7 @@ import {
   describeEvaluateResult,
   describeEvaluateBudget,
 } from "./utils";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -245,7 +246,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               requestId,
               type,
               success: false,
-              error: `Navigation failed: ${err instanceof Error ? err.message : String(err)}`,
+              error: `Navigation failed: ${describeThrown(err, "unknown error")}`,
               timestamp: Date.now(),
             });
           }

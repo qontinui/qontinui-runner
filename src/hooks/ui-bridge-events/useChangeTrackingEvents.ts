@@ -1,6 +1,7 @@
 import { useCallback } from "react";
-import { handleChangeTrackingCommand } from "../changeTrackingHandler";
+import { buildChangeTrackingResponse, handleChangeTrackingCommand } from "../changeTrackingHandler";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Tauri event-name registry (module-global).
@@ -199,9 +200,7 @@ export function useChangeTrackingEvents(
                   requestId,
                   type,
                   success: false,
-                  error: `Invalid regex toRoute: ${
-                    err instanceof Error ? err.message : String(err)
-                  }`,
+                  error: `Invalid regex toRoute: ${describeThrown(err, "unknown error")}`,
                   timestamp: Date.now(),
                 });
                 return true;
@@ -462,11 +461,13 @@ export function useChangeTrackingEvents(
             },
           );
 
+          // The SDK's `actionSuccess` decides the outer verdict for the
+          // execute-with-diff commands; the result (and its diff) is kept as
+          // `data` on a failure too. See `buildChangeTrackingResponse`.
           await sendResponse({
             requestId,
             type,
-            success: true,
-            data: ctResult,
+            ...buildChangeTrackingResponse(type, ctResult),
             timestamp: Date.now(),
           });
           return true;

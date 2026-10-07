@@ -2,7 +2,7 @@
 //!
 //! Lives in the LIB crate because it has two consumers on opposite sides of the
 //! lib/bin split: `credential_helper` (bin) applies it to the eight seams that
-//! spawn a `claude`, and `process_helpers` (compiled into BOTH crates) applies
+//! spawn a `claude`, and `process_helpers` (lib-owned, imported by the bin) applies
 //! its prompt-closing subset to every git subprocess the runner starts. A
 //! second copy is exactly the accretion the dossier
 //! `git-push-hang-credential-helper` exists to stop, so there is one list and

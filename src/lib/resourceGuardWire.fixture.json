@@ -1,0 +1,12 @@
+{
+  "$comment": "The CRITICAL refusal wire, shared byte for byte by src-tauri/src/resource_guard.rs (tests: the_refusal_wire_matches_the_shared_fixture, the_lane_headlines_match_the_shared_fixture) and src/lib/resourceGuard.test.ts. Change it on both sides or neither: a Rust-side rewording that is not mirrored here fails the Rust test, and a webview parser that cannot read these strings fails the vitest.",
+  "prefix": "resource_guard:critical:",
+  "headlines": {
+    "free_commit_bytes": "Low memory",
+    "thread_count": "High thread count"
+  },
+  "refusals": {
+    "free_commit_bytes": "resource_guard:critical:free_commit_bytes: Not starting a new terminal session: the host lane has 1.00 GiB of free commit, below the 1.50 GiB critical floor. Free memory (close a build or a session) and try again, or start anyway to override. The limits live in Settings > Resource Guard.",
+    "thread_count": "resource_guard:critical:thread_count: Not starting a new terminal session: the runner process is carrying 540 threads, above the 400-thread critical ceiling. Let some running sessions finish (or close a few) and try again, or start anyway to override. The limits live in Settings > Resource Guard."
+  }
+}

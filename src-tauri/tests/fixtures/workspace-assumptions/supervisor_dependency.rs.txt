@@ -1,4 +1,11 @@
 // Planted fixture for class `supervisor_dependency`.
+// Both the vocabulary's port arm and the runner-local helper-call refinement.
 fn planted_supervisor_dependency() -> String {
-    format!("http://127.0.0.1:{}/health", 9875)
+    let _ = check_supervisor_available();
+    "http://127.0.0.1:9875/health".to_string()
+}
+
+// The runner-local bare-port-constant refinement (code, literals blanked).
+fn planted_supervisor_port_constant() -> (&'static str, u16) {
+    ("supervisor", 9875)
 }

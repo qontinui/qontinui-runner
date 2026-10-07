@@ -196,20 +196,10 @@ const CODE_FIX: &str = include_str!("fleet_commands/code-fix.md");
 /// there, then re-vendor.
 const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 
-/// `/create-tutorial` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/create-tutorial.md` (canonical) — edit it
-/// there, then re-vendor.
-const CREATE_TUTORIAL: &str = include_str!("fleet_commands/create-tutorial.md");
-
 /// `/find-debt` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/find-debt.md` (canonical) — edit it
 /// there, then re-vendor.
 const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
-
-/// `/find-misplaced` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/find-misplaced.md` (canonical) — edit it
-/// there, then re-vendor.
-const FIND_MISPLACED: &str = include_str!("fleet_commands/find-misplaced.md");
 
 /// `/fix` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/fix.md` (canonical) — edit it
@@ -226,11 +216,6 @@ const IMPLEMENT_PHASE: &str = include_str!("fleet_commands/implement-phase.md");
 /// there, then re-vendor.
 const IMPROVE_ALL: &str = include_str!("fleet_commands/improve-all.md");
 
-/// `/manual-test-coord-loop` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/manual-test-coord-loop.md` (canonical) — edit it
-/// there, then re-vendor.
-const MANUAL_TEST_COORD_LOOP: &str = include_str!("fleet_commands/manual-test-coord-loop.md");
-
 /// `/manual-test-loop` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/manual-test-loop.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -241,16 +226,6 @@ const MANUAL_TEST_LOOP: &str = include_str!("fleet_commands/manual-test-loop.md"
 /// there, then re-vendor.
 const MANUAL_TEST: &str = include_str!("fleet_commands/manual-test.md");
 
-/// `/mobile-dev` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/mobile-dev.md` (canonical) — edit it
-/// there, then re-vendor.
-const MOBILE_DEV: &str = include_str!("fleet_commands/mobile-dev.md");
-
-/// `/mobile-verify` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/mobile-verify.md` (canonical) — edit it
-/// there, then re-vendor.
-const MOBILE_VERIFY: &str = include_str!("fleet_commands/mobile-verify.md");
-
 /// `/name` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/name.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -260,11 +235,6 @@ const NAME: &str = include_str!("fleet_commands/name.md");
 /// qontinui-claude-config `.claude/commands/next-steps.md` (canonical) — edit it
 /// there, then re-vendor.
 const NEXT_STEPS: &str = include_str!("fleet_commands/next-steps.md");
-
-/// `/organize-notes` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/organize-notes.md` (canonical) — edit it
-/// there, then re-vendor.
-const ORGANIZE_NOTES: &str = include_str!("fleet_commands/organize-notes.md");
 
 /// `/pull-all` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/pull-all.md` (canonical) — edit it
@@ -281,11 +251,6 @@ const PULL_SCOPED: &str = include_str!("fleet_commands/pull-scoped.md");
 /// there, then re-vendor.
 const PVI: &str = include_str!("fleet_commands/pvi.md");
 
-/// `/qa` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/qa.md` (canonical) — edit it
-/// there, then re-vendor.
-const QA: &str = include_str!("fleet_commands/qa.md");
-
 /// `/recursive-automation` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/recursive-automation.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -296,20 +261,10 @@ const RECURSIVE_AUTOMATION: &str = include_str!("fleet_commands/recursive-automa
 /// there, then re-vendor.
 const REFACTOR_SRP: &str = include_str!("fleet_commands/refactor-srp.md");
 
-/// `/reflect-ui-bridge` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/reflect-ui-bridge.md` (canonical) — edit it
-/// there, then re-vendor.
-const REFLECT_UI_BRIDGE: &str = include_str!("fleet_commands/reflect-ui-bridge.md");
-
 /// `/research-plan` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/research-plan.md` (canonical) — edit it
 /// there, then re-vendor.
 const RESEARCH_PLAN: &str = include_str!("fleet_commands/research-plan.md");
-
-/// `/resume-foreign` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/resume-foreign.md` (canonical) — edit it
-/// there, then re-vendor.
-const RESUME_FOREIGN: &str = include_str!("fleet_commands/resume-foreign.md");
 
 /// `/review-before-code` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/review-before-code.md` (canonical) — edit it
@@ -320,11 +275,6 @@ const REVIEW_BEFORE_CODE: &str = include_str!("fleet_commands/review-before-code
 /// qontinui-claude-config `.claude/commands/review-commit.md` (canonical) — edit it
 /// there, then re-vendor.
 const REVIEW_COMMIT: &str = include_str!("fleet_commands/review-commit.md");
-
-/// `/review-logs` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/review-logs.md` (canonical) — edit it
-/// there, then re-vendor.
-const REVIEW_LOGS: &str = include_str!("fleet_commands/review-logs.md");
 
 /// `/review-plan` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/review-plan.md` (canonical) — edit it
@@ -346,11 +296,6 @@ const REWIND_SESSION: &str = include_str!("fleet_commands/rewind-session.md");
 /// there, then re-vendor.
 const RUN_AUTOMATION: &str = include_str!("fleet_commands/run-automation.md");
 
-/// `/scout` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/scout.md` (canonical) — edit it
-/// there, then re-vendor.
-const SCOUT: &str = include_str!("fleet_commands/scout.md");
-
 /// `/security-scan` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/security-scan.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -360,16 +305,6 @@ const SECURITY_SCAN: &str = include_str!("fleet_commands/security-scan.md");
 /// qontinui-claude-config `.claude/commands/summarize-session.md` (canonical) — edit it
 /// there, then re-vendor.
 const SUMMARIZE_SESSION: &str = include_str!("fleet_commands/summarize-session.md");
-
-/// `/symbol-claims-warn` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/symbol-claims-warn.md` (canonical) — edit it
-/// there, then re-vendor.
-const SYMBOL_CLAIMS_WARN: &str = include_str!("fleet_commands/symbol-claims-warn.md");
-
-/// `/test-ui-bridge` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/test-ui-bridge.md` (canonical) — edit it
-/// there, then re-vendor.
-const TEST_UI_BRIDGE: &str = include_str!("fleet_commands/test-ui-bridge.md");
 
 /// `/ui-bridge` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/ui-bridge.md` (canonical) — edit it
@@ -431,41 +366,28 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("code-analyze", CODE_ANALYZE),
     ("code-fix", CODE_FIX),
     ("create-plan", CREATE_PLAN),
-    ("create-tutorial", CREATE_TUTORIAL),
     ("find-debt", FIND_DEBT),
-    ("find-misplaced", FIND_MISPLACED),
     ("fix", FIX),
     ("implement-phase", IMPLEMENT_PHASE),
     ("improve-all", IMPROVE_ALL),
-    ("manual-test-coord-loop", MANUAL_TEST_COORD_LOOP),
     ("manual-test-loop", MANUAL_TEST_LOOP),
     ("manual-test", MANUAL_TEST),
-    ("mobile-dev", MOBILE_DEV),
-    ("mobile-verify", MOBILE_VERIFY),
     ("name", NAME),
     ("next-steps", NEXT_STEPS),
-    ("organize-notes", ORGANIZE_NOTES),
     ("pull-all", PULL_ALL),
     ("pull-scoped", PULL_SCOPED),
     ("pvi", PVI),
-    ("qa", QA),
     ("recursive-automation", RECURSIVE_AUTOMATION),
     ("refactor-srp", REFACTOR_SRP),
-    ("reflect-ui-bridge", REFLECT_UI_BRIDGE),
     ("research-plan", RESEARCH_PLAN),
-    ("resume-foreign", RESUME_FOREIGN),
     ("review-before-code", REVIEW_BEFORE_CODE),
     ("review-commit", REVIEW_COMMIT),
-    ("review-logs", REVIEW_LOGS),
     ("review-plan", REVIEW_PLAN),
     ("review-plan-next-steps", REVIEW_PLAN_NEXT_STEPS),
     ("rewind-session", REWIND_SESSION),
     ("run-automation", RUN_AUTOMATION),
-    ("scout", SCOUT),
     ("security-scan", SECURITY_SCAN),
     ("summarize-session", SUMMARIZE_SESSION),
-    ("symbol-claims-warn", SYMBOL_CLAIMS_WARN),
-    ("test-ui-bridge", TEST_UI_BRIDGE),
     ("ui-bridge", UI_BRIDGE),
     ("unattended", UNATTENDED),
     ("update-spec", UPDATE_SPEC),
@@ -2005,14 +1927,7 @@ mod tests {
     /// directory). Mirrors `fleet_skills::tests::bundled_skills_have_no_operator_local_paths`
     /// one module over: these bodies ship to every fleet device the same way
     /// the embedded skills do, so a path rooted on one operator's machine is a
-    /// dead pointer on every other one.
-    ///
-    /// `reflect-ui-bridge` is the one documented exception, for the same
-    /// reason the skills test documents its own: it cites
-    /// `C:/Users/<someone>/AppData/...` as the ANTI-pattern the command
-    /// instructs a session never to hardcode, immediately followed by the
-    /// env-resolved alternative — a citation of what not to do, not an
-    /// instruction to read that path.
+    /// dead pointer on every other one. No bundled command is exempt.
     #[test]
     fn staged_fleet_commands_have_no_operator_local_paths() {
         const FORBIDDEN: &[&str] = &[
@@ -2023,9 +1938,6 @@ mod tests {
         ];
         let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
-            if *name == "reflect-ui-bridge" {
-                continue;
-            }
             checked += 1;
             for pat in FORBIDDEN {
                 assert!(
@@ -2039,8 +1951,7 @@ mod tests {
         }
         assert!(
             checked > 0,
-            "every bundled command was excluded from this guard — either the bundle is empty \
-             or the exclusion list swallowed it; check FLEET_COMMANDS and the exclusion above"
+            "no bundled command was checked — the bundle is empty; check FLEET_COMMANDS"
         );
     }
 

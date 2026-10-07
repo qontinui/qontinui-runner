@@ -117,14 +117,20 @@ pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// never-fatal posture. Set the body and a per-request deadline on the
 /// returned builder.
 pub fn coord_post(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(session-noop): unlike `coord_get`'s 21 cross-class callers, this helper
-    // has exactly ONE caller -- `commands/remote_attach.rs:174`, `POST
-    // /coord/sessions/{id}/attach-grants` -- so the helper's class is that route's class. The
-    // route is session-scoped, but the runner can set no tenant on it: coord takes the SOURCE
-    // device from the presented principal and the TARGET (and hence the tenant) from the
-    // `coord.sessions` row named by the path id, which is the D6 mint's whole point -- a body
-    // field could be forged, so neither end is read from one. Nothing to thread; terminal.
-    // Re-classify if a second caller of a different class ever joins.
+    // coord-tenant-scope(session-noop): this helper has SEVERAL callers -- no count is pinned
+    // here, `grep coord_post(` for the live set -- and every one is a DEVICE-authorised route
+    // whose tenant coord derives from the rows it names, never from the credential's claim:
+    // the attach-grant mint (`POST /coord/sessions/{id}/attach-grants`,
+    // `commands/remote_attach.rs`), the create-grant mint (`POST
+    // /coord/devices/{id}/create-grants`, `commands/remote_create.rs`), the target's
+    // create-grant consume (`POST /sessions/create-requests/{jti}/consume`,
+    // `session/create.rs`) and the remote-interactivity observation door (`POST
+    // /coord/sessions/{id}/interactivity-observations`, `mcp/remote_interactivity.rs`). For the
+    // attach mint, coord takes the SOURCE device from the presented principal and the TARGET
+    // (and hence the tenant) from the `coord.sessions` row named by the path id; the
+    // observation door authorises the reporter DEVICE against the session's device or a grant
+    // coord minted. A body field could be forged, so neither end is read from one. Nothing to
+    // thread; terminal. Re-classify if a caller of a different class ever joins.
     qontinui_runner_lib::auth::attach_device_auth(client.post(url))
 }
 

@@ -4,6 +4,8 @@ import type { SpecExecutionOptions } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
 import { loadDiscoveredSpecs } from "../../lib/ui-bridge/use-discovered-specs";
+import { actionOutcome, actionOutcomeError, actionSucceeded } from "../sdk-ui-bridge/actionOutcome";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Browser / Console capture type interfaces
@@ -66,7 +68,8 @@ function getBrowserCapture(): BrowserCaptureAPI | undefined {
  */
 function consoleEntryLevel(entry: unknown): string | undefined {
   if (typeof entry !== "object" || entry === null) return undefined;
-  const raw = (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
+  const raw =
+    (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
     (entry as { severity?: unknown }).severity ??
     (entry as { type?: unknown }).type;
   return typeof raw === "string" ? raw.toLowerCase() : undefined;
@@ -686,15 +689,17 @@ export function useDebugInspectEvents(
 
             try {
               const r = await currentBridge.executeAction(fieldId, { action, params });
-              const ok = !r || (r as { success?: boolean }).success !== false;
-              if (ok) {
+              // Strict: a null result, or one with no boolean `success`, is
+              // not a filled field.
+              const outcome = actionOutcome(r);
+              if (actionSucceeded(outcome)) {
                 perField[fieldId] = { success: true, action };
                 filledCount++;
               } else {
                 perField[fieldId] = {
                   success: false,
                   action,
-                  error: (r as { error?: string }).error ?? "action returned non-success",
+                  error: actionOutcomeError(outcome, "action returned non-success"),
                 };
                 errorCount++;
               }
@@ -702,7 +707,7 @@ export function useDebugInspectEvents(
               perField[fieldId] = {
                 success: false,
                 action,
-                error: err instanceof Error ? err.message : String(err),
+                error: describeThrown(err, "field action failed"),
               };
               errorCount++;
             }

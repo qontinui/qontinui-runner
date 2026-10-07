@@ -60,14 +60,50 @@ ipc_handler_path_get!(
     "transitionId"
 );
 ipc_handler_path_post!(
-    ui_bridge_execute_transition_handler,
+    ui_bridge_execute_transition_handler_dispatch,
     "execute_transition",
     "transitionId"
 );
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/transition/{id}/execute` is ONE `batch_action` (`transition:<id>`, an IR transition id).
+pub async fn ui_bridge_execute_transition_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind(&format!("transition:{id}"), None);
+    let result = ui_bridge_execute_transition_handler_dispatch(
+        State(Arc::clone(&state)),
+        axum::extract::Path(id),
+        Json(body),
+    )
+    .await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 // Path-finding / multi-state navigation
 ipc_handler_post!(ui_bridge_find_state_path_handler, "find_state_path");
-ipc_handler_post!(ui_bridge_navigate_to_state_handler, "navigate_to_state");
+ipc_handler_post!(
+    ui_bridge_navigate_to_state_handler_dispatch,
+    "navigate_to_state"
+);
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/states/navigate` is ONE `batch_action` (`states_navigate`).
+pub async fn ui_bridge_navigate_to_state_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind("states_navigate", None);
+    let result =
+        ui_bridge_navigate_to_state_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::{get, post};

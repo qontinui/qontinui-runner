@@ -23,6 +23,7 @@
 import { useEffect, useState } from "react";
 import { resolvePort } from "@/lib/runner-api";
 import type { DiscoveredSpec } from "../spec-prompt-builder";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * This runner's own app id in the `project.apps` registry.
@@ -191,9 +192,7 @@ async function fetchSpecs(): Promise<DiscoveredSpec[]> {
     // the port fix it is the honest shape of "nothing is listening on my own
     // port", which is a very different diagnosis from the 404 another
     // process used to hand back.
-    throw upstreamFetchError(
-      `GET ${url} failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    throw upstreamFetchError(`GET ${url} failed: ${describeThrown(err, "unknown error")}`);
   }
 
   if (!response.ok) {

@@ -91,19 +91,20 @@ export function concurrencyAboveSuggestionWarning(
   return `${value} is above the suggested ${suggestion.suggested} for this host, which is bounded by ${term}. Each build also gets a smaller share of the host.`;
 }
 
-// Typing bounds on the two thread-ceiling inputs. Wider than anything the
-// runner will enforce, on purpose — the same relationship the GiB inputs have to
-// the 3/1.5 GiB defaults: the enforcing side folds `min(configured, built-in)`
-// and clamps up at 200, so every value outside [200, 400] is inert and the
-// "Enforced" line beside the box is what says so. A range narrowed to the
-// enforceable one would hide that fold instead of explaining it.
+// Typing bounds on the two thread-ceiling inputs.
 //
-// 50 at the bottom because it is well under a measured idle runner (150-151
-// threads on 2026-08-30) and so can demonstrate the clamp; 2048 at the top
-// because it is four times tokio's 512-slot blocking pool, past which a ceiling
-// could not fire before the pool it protects was already exhausted.
+// The top is the ENFORCED bound, not just a typing one: it mirrors
+// `resource_guard::THREAD_CEILING_ABS_MAX` (2048, four times tokio's 512-slot
+// blocking pool, past which a ceiling could not fire before the pool it
+// protects was already exhausted), which the save command refuses above.
+// `resourceGuardHelpers.test.ts` reads the Rust constant from source so the two
+// sides cannot drift apart.
+//
+// 50 at the bottom is a typing bound only: well under a measured idle runner
+// (150-151 threads), so an operator can watch the runner's lower clamp —
+// `THREAD_CEILING_MIN + shift`, served in `thread_ceilings.clampMin` — raise it.
 export const THREAD_CEILING_INPUT_MIN = 50;
-export const THREAD_CEILING_INPUT_MAX = 2048;
+export const THREAD_CEILING_ABS_MAX = 2048;
 
 /**
  * The runner's own hardcoded floors and ceiling — the terms that decide what a
@@ -120,24 +121,6 @@ export const THREAD_CEILING_INPUT_MAX = 2048;
 export const SESSION_FLOOR_DEFAULT_WARN_GIB = 3;
 export const SESSION_FLOOR_DEFAULT_CRITICAL_GIB = 1.5;
 export const SESSION_FLOOR_CAP_GIB = 12;
-
-/**
- * The thread lane's hardcoded ceilings and its lower clamp — the mirror of the
- * three constants above, and every one of them inverts.
- *
- * Mirrors `settings::SessionGuardSettings::default()` (256 warn / 400 critical,
- * fractions of tokio's 512-slot blocking pool) and
- * `resource_guard::THREAD_CEILING_MIN` (200, measured to clear a 150-151-thread
- * idle runner). Duplicated here for the same reason the byte constants are: the
- * panel has to render an enforced number before any invoke resolves.
- *
- * A ceiling is not a floor, so the fold is a `min` and the clamp pushes UP. The
- * one place they are used, `effectiveThreadCeilings`, spells that out clause by
- * clause.
- */
-export const THREAD_CEILING_DEFAULT_WARN = 256;
-export const THREAD_CEILING_DEFAULT_CRITICAL = 400;
-export const THREAD_CEILING_FLOOR = 200;
 
 /** Bytes → GiB, rounded to 2 decimals so 1.5 GiB round-trips as `1.5`. */
 export function bytesToGib(bytes: number): number {
@@ -231,49 +214,134 @@ export function effectiveSessionFloorsGib(
  * `critical < warn` — the opposite comparison to
  * {@link sessionFloorsAreInverted}. Equal ceilings are legal, exactly as equal
  * floors are.
+ *
+ * Takes the operator's OPTIONAL overrides (`null` = machine default): only a
+ * pair the operator stated in full can be transposed. With one half on the
+ * machine default its partner moves with the box, so the runner's fold coerces
+ * that case instead of the writer refusing it.
  */
-export function threadCeilingsAreInverted(warnThreads: number, criticalThreads: number): boolean {
-  return criticalThreads < warnThreads;
+export function threadCeilingsAreInverted(
+  warnThreads: number | null,
+  criticalThreads: number | null,
+): boolean {
+  return warnThreads !== null && criticalThreads !== null && criticalThreads < warnThreads;
 }
 
 /**
- * What the runner will ACTUALLY enforce for a pair of configured ceilings.
- *
- * Mirrors `resource_guard::merge_thread_ceilings` minus its fleet term, in
- * order — and every step is the inverse of {@link effectiveSessionFloorsGib}:
- *
- *   1. `min(configured, built-in)` — the local value can only ever TIGHTEN, and
- *      on a ceiling tightening means LOWERING. So the whole range above 256
- *      (warn) / 400 (critical) is inert, which is the discrepancy this helper
- *      exists to surface.
- *   2. `max(…, THREAD_CEILING_FLOOR)` — a ceiling under the runner's own at-rest
- *      thread count is not a stricter guard, it is a machine that can never
- *      start a session again, so the enforcing side clamps it UP.
- *   3. `critical = max(critical, warn)` — the warn verdict is the lighter one
- *      and must fire first, so an inverted ladder is coerced by raising the
- *      critical ceiling, not by lowering the warn one.
- *
- * The FLEET term is absent for the same reason as on the memory lane, plus one
- * more: coord publishes no thread column at all today, so the fold degrades to
- * `min(local, built-in)` on every machine.
+ * Commit a thread-ceiling input's text draft (on blur, and on save). Anything
+ * numeric is an explicit override clamped to the typing range; empty or
+ * non-numeric text REVERTS to `previous` — it never silently switches to the
+ * machine default. The "Use machine default" button is the only way to write
+ * `null`. The same contract as {@link parseConcurrencyInput}.
  */
-export function effectiveThreadCeilings(
-  warnThreads: number,
-  criticalThreads: number,
-): { warnThreads: number; criticalThreads: number } {
-  const warn = clampInt(
-    Math.min(warnThreads, THREAD_CEILING_DEFAULT_WARN),
-    THREAD_CEILING_FLOOR,
-    THREAD_CEILING_DEFAULT_WARN,
-    THREAD_CEILING_DEFAULT_WARN,
-  );
-  const critical = clampInt(
-    Math.min(criticalThreads, THREAD_CEILING_DEFAULT_CRITICAL),
-    THREAD_CEILING_FLOOR,
-    THREAD_CEILING_DEFAULT_CRITICAL,
-    THREAD_CEILING_DEFAULT_CRITICAL,
-  );
-  return { warnThreads: warn, criticalThreads: Math.max(critical, warn) };
+export function parseThreadCeilingInput(raw: string, previous: number | null): number | null {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return previous;
+  return clampInt(n, THREAD_CEILING_INPUT_MIN, THREAD_CEILING_ABS_MAX, THREAD_CEILING_INPUT_MIN);
+}
+
+/**
+ * Which term decided one enforced thread ceiling — the runner's
+ * `resource_guard::CeilingSource::wire_name`.
+ */
+export type ThreadCeilingSource =
+  | "local"
+  | "scaled"
+  | "floor"
+  | "fleet"
+  | "clamp_min"
+  | "clamp_max"
+  | "ladder"
+  | "census_misread";
+
+interface ThreadCeilingPair {
+  warn: number;
+  critical: number;
+}
+
+/**
+ * The thread ceilings the runner ENFORCES and how it reached them, served by
+ * `get_session_guard_settings` as `thread_ceilings` (Rust:
+ * `resource_guard::EffectiveThreadCeilings::to_json` — the same projection
+ * `/health` serves as `threadCeilings`).
+ *
+ * The panel renders this instead of re-deriving the fold. It used to carry a
+ * TypeScript copy (`effectiveThreadCeilings`), which had already drifted — it
+ * never knew the machine shift — and once the default became a function of the
+ * machine (cores, memory, the measured at-rest floor) no copy could be right.
+ * Every UNKNOWN is `null`, never a zero.
+ */
+export interface ThreadCeilingsReport {
+  enabled: boolean;
+  warn: number;
+  critical: number;
+  provenance: { warn: ThreadCeilingSource; critical: ThreadCeilingSource };
+  local: { warn: number | null; critical: number | null };
+  fleet: { warn: number | null; critical: number | null };
+  floor: ThreadCeilingPair;
+  shift: number;
+  clampMin: number;
+  absMax: number;
+  scaled:
+    | (ThreadCeilingPair & {
+        sessionArm: ThreadCeilingPair;
+        poolArm: ThreadCeilingPair;
+        sessionCapacity: ThreadCeilingPair;
+        baselineUsed: number;
+        perSessionThreadsUsed: number;
+      })
+    | null;
+  scaledUnknown:
+    | "cores_unknown"
+    | "mem_total_unknown"
+    | "session_threads_unknown"
+    | "session_census_misread"
+    | null;
+  inputs: {
+    cores: number | null;
+    memTotalBytes: number | null;
+    baseline: number | null;
+    perSessionThreads: number | null;
+    sessionThreadsNow: number | null;
+    sessionCensusMisread: boolean;
+  };
+  ladderCoerced: boolean;
+}
+
+/**
+ * One sentence saying where an enforced thread ceiling came from, for the line
+ * under each input. Pure, so each arm's wording is pinned by a test; the
+ * numbers in it are the runner's, never recomputed here.
+ */
+export function threadCeilingSourceText(
+  which: "warn" | "critical",
+  report: ThreadCeilingsReport,
+): string {
+  const source = report.provenance[which];
+  switch (source) {
+    case "local":
+      return "your value — it replaces this machine's default, looser or tighter";
+    case "scaled": {
+      const s = report.scaled;
+      if (!s) return "this machine's default";
+      const arm = s[which] === s.sessionArm[which] ? "session capacity" : "blocking-pool headroom";
+      return `this machine's default, sized from ${report.inputs.cores ?? "?"} cores and memory (bound by ${arm})`;
+    }
+    case "floor":
+      return report.scaledUnknown
+        ? `the built-in floor — the machine-sized default is unavailable (${report.scaledUnknown.replace(/_/g, " ")})`
+        : "the built-in floor — this machine's sized default is below it";
+    case "fleet":
+      return "your tenant's fleet ceiling, which can only tighten";
+    case "clamp_min":
+      return `raised to ${report.clampMin}, the lowest ceiling this machine can still spawn under`;
+    case "clamp_max":
+      return `cut to the ${report.absMax}-thread bound`;
+    case "ladder":
+      return "raised to the warn ceiling — the lighter verdict has to fire first";
+    case "census_misread":
+      return "the built-in floor — the thread census disagreed with the live session count, so this machine's sized default is unknown right now";
+  }
 }
 
 /**

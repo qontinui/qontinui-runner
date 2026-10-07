@@ -3,6 +3,23 @@
 //! Background service that monitors scheduled tasks and executes them
 //! at their scheduled times. Integrates with existing workflow and prompt
 //! execution infrastructure.
+//!
+//! # Concurrency with user edits
+//!
+//! A tick works from a snapshot of each task. The writes it derives from that
+//! snapshot (`condition_status`, `next_run`, a condition-timeout record) are
+//! conditional on the snapshot's `modified_at`, which only a USER edit moves:
+//! when an edit lands in between, the tick writes nothing and re-evaluates on
+//! its next pass.
+//!
+//! Documented residual: the timezone-change recompute
+//! (`mcp::scheduler::update_scheduler_settings`) writes each task's
+//! `next_run` with the same conditional write, but against a list read once
+//! for the whole settings change. A task edited between that read and its
+//! write keeps the `next_run` its edit computed, which may be in the OLD zone
+//! if the edit's own zone read raced the settings write. The next edit, or a
+//! run of the task (which recomputes `next_run` in the current zone), corrects
+//! it. Accepted in review round 4 as not worth a per-task re-read loop.
 
 use crate::commands::AppState;
 use crate::database::pg::PgDb;
@@ -47,6 +64,125 @@ impl CatchUpContext {
 // Scheduler Service
 // ============================================================================
 
+/// The [`ScheduleConditions`](crate::scheduler::ScheduleConditions) fields this
+/// build's [`SchedulerService::check_conditions_at`] evaluates, by their
+/// snake_case names — the single list both the evaluator's contract and the
+/// `GET /health` `schedulerConditions` capability field are read from.
+///
+/// It is a CAPABILITY statement a client reads before relying on a condition:
+/// serde does not refuse unknown fields, so a schedule posted to a build that
+/// predates a condition silently loses that gate (plan
+/// `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`
+/// Phase 5). A test pins it against the serialized `ScheduleConditions` shape,
+/// so a field added to the schema without an evaluator entry here fails CI.
+pub const EVALUATED_CONDITIONS: &[&str] = &[
+    "require_idle",
+    "require_repo_inactive",
+    "require_probe",
+    "timeout_minutes",
+];
+
+/// The conditions this build ENFORCES end to end: [`EVALUATED_CONDITIONS`]
+/// when the task store round-trips a task's `conditions`, and none when it
+/// does not. Served as `GET /health` `schedulerConditions`.
+///
+/// The distinction is not academic. Until Phase 4c `project.scheduled_tasks`
+/// (owned by qontinui-web's alembic chain) had NO `conditions` column: the PG
+/// store dropped a task's conditions on insert/update and read every task
+/// back with `conditions: None`, so every condition — `require_probe`
+/// included — was inert, and advertising the evaluator's list would have
+/// told the Phase 5 installer that a probe-gated `Condition` schedule was
+/// safe on a build where it fires ungated every rearm. This derives from the
+/// store's own column list
+/// ([`crate::database::pg::scheduler::task_store_persists_conditions`]), so a
+/// store that stops persisting conditions stops advertising them.
+pub fn enforced_conditions() -> &'static [&'static str] {
+    if crate::database::pg::scheduler::task_store_persists_conditions() {
+        EVALUATED_CONDITIONS
+    } else {
+        &[]
+    }
+}
+
+/// Whether `task` belongs in this tick's candidate set: enabled, and either
+/// already parked waiting for conditions or at/past its `next_run`.
+fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    if !task.enabled {
+        return false;
+    }
+    if task.is_waiting_for_conditions() {
+        return true;
+    }
+    task.next_run
+        .as_deref()
+        .and_then(|next_run| chrono::DateTime::parse_from_rfc3339(next_run).ok())
+        .is_some_and(|next_dt| next_dt.with_timezone(&chrono::Utc) <= now)
+}
+
+/// The `Skipped` history row for a condition wait that timed out.
+///
+/// It is stamped with the SLOT the wait was for — the task's `next_run`, which
+/// a waiting task does not advance — so the missed-run reconciler
+/// (`find_missed_slots` matches on `scheduled_for`) sees that slot as handled.
+/// Unstamped, a slot the conditions held to timeout read as "missed" and a
+/// `RunOnce` catch-up ran it on the next runner start, conditions unchecked.
+/// A `Condition` schedule has no slots, so it stamps nothing.
+fn condition_timeout_record(task: &ScheduledTask) -> TaskExecutionRecord {
+    let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+    record.status = ScheduledTaskStatus::Skipped;
+    record.ended_at = Some(chrono::Utc::now().to_rfc3339());
+    record.error_message = Some("Condition timeout exceeded".to_string());
+    if !matches!(task.schedule, ScheduleExpression::Condition(_)) {
+        record.scheduled_for = task
+            .next_run
+            .as_deref()
+            .and_then(|next| chrono::DateTime::parse_from_rfc3339(next).ok())
+            .map(|slot| slot.with_timezone(&Utc).to_rfc3339());
+    }
+    record
+}
+
+/// Catch-up actions for a task with conditions, given whether the gate
+/// admitted a run NOW (`fire`).
+///
+/// One admission is one run: a met gate (a spent probe result included) keeps
+/// only the LATEST `Enqueue` — actions are chronological, so the last one — and
+/// every earlier `Enqueue` becomes a `Skip` (a `MissedRunnerDown` row). So
+/// `CatchUpPolicy::Run` with N missed slots runs once, not N times on one
+/// admission. Not admitted (`fire == false`, or the task is already running):
+/// every `Enqueue` becomes a `Skip`.
+fn gate_catch_up_actions(actions: Vec<CatchUpAction>, fire: bool) -> Vec<CatchUpAction> {
+    let keep = if fire {
+        actions
+            .iter()
+            .rposition(|a| matches!(a, CatchUpAction::Enqueue { .. }))
+    } else {
+        None
+    };
+    actions
+        .into_iter()
+        .enumerate()
+        .map(|(i, action)| match action {
+            CatchUpAction::Enqueue { scheduled_for } if Some(i) != keep => {
+                CatchUpAction::Skip { scheduled_for }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// What a due task's conditions say this tick — see
+/// [`SchedulerService::gate_conditions`].
+#[derive(Debug)]
+enum ConditionGate {
+    /// No conditions, or all met: run it now.
+    Fire,
+    /// Not met yet: persist this status and re-check next tick.
+    Wait(ConditionStatus),
+    /// `timeout_minutes` elapsed while waiting: record a `Skipped` run.
+    TimedOut,
+}
+
 /// Background scheduler service that executes tasks at their scheduled times
 pub struct SchedulerService {
     /// PostgreSQL database for activity timeline and watchers (optional)
@@ -59,6 +195,13 @@ pub struct SchedulerService {
     running_tasks: Arc<RwLock<Vec<String>>>,
     /// Check interval in seconds
     check_interval_secs: u64,
+    /// Rate-limited `require_probe` state, per task (in memory).
+    probe_gate: crate::scheduler_probe::ProbeGate,
+    /// Serializes [`Self::tick`] and [`Self::reconcile_missed_runs`]. Both are
+    /// public entry points (the loop, the wake handler, `/scheduler/reconcile-now`)
+    /// and two concurrent passes would each evaluate — and could each fire —
+    /// the same due task.
+    pass_lock: tokio::sync::Mutex<()>,
 }
 
 impl SchedulerService {
@@ -70,6 +213,8 @@ impl SchedulerService {
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
+            probe_gate: crate::scheduler_probe::ProbeGate::new(),
+            pass_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -81,6 +226,8 @@ impl SchedulerService {
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60,
+            probe_gate: crate::scheduler_probe::ProbeGate::new(),
+            pass_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -209,7 +356,9 @@ impl SchedulerService {
             } else {
                 None
             };
-            pg.update_task_next_run(&task.id, next.as_deref()).await?;
+            // Conditional on this snapshot; a concurrent edit recomputed it.
+            pg.update_task_next_run(&task.id, next.as_deref(), &task.modified_at)
+                .await?;
         }
 
         Ok(())
@@ -221,6 +370,25 @@ impl SchedulerService {
     /// Phase B missed-run reconciler) can fire an immediate cycle without
     /// waiting for the next `check_interval_secs` heartbeat.
     pub async fn tick(self: Arc<Self>) {
+        let _pass = self.pass_lock.lock().await;
+        self.clone().tick_pass().await;
+    }
+
+    /// [`Self::tick`] unless a pass (a tick — which runs sync task types to
+    /// completion — or a reconcile) is already in progress, in which case it
+    /// returns `false` at once instead of waiting behind it. For callers that
+    /// must not hang for a whole sync run: the wake handler (the loop ticks
+    /// again within a minute anyway).
+    pub async fn try_tick(self: Arc<Self>) -> bool {
+        let Ok(_pass) = self.pass_lock.try_lock() else {
+            return false;
+        };
+        self.clone().tick_pass().await;
+        true
+    }
+
+    /// One tick's body; the caller holds [`Self::pass_lock`].
+    async fn tick_pass(self: Arc<Self>) {
         let pg = match self.pg() {
             Ok(pg) => pg,
             Err(e) => {
@@ -252,31 +420,23 @@ impl SchedulerService {
 
         let now = chrono::Utc::now();
 
+        // Probe state for a deleted or disabled task is dropped (which kills a
+        // probe still running for it).
+        {
+            let live: Vec<&str> = tasks
+                .iter()
+                .filter(|t| t.enabled)
+                .map(|t| t.id.as_str())
+                .collect();
+            self.probe_gate.retain(&live);
+        }
+
         // Find tasks that are:
         // 1. Due for execution (next_run <= now), OR
         // 2. Already waiting for conditions (have condition_status set)
         let mut due_tasks: Vec<ScheduledTask> = tasks
             .into_iter()
-            .filter(|task| {
-                // Must be enabled
-                if !task.enabled {
-                    return false;
-                }
-
-                // Include if already waiting for conditions
-                if task.is_waiting_for_conditions() {
-                    return true;
-                }
-
-                // Include if due for execution
-                if let Some(ref next_run) = task.next_run {
-                    if let Ok(next_dt) = chrono::DateTime::parse_from_rfc3339(next_run) {
-                        return next_dt.with_timezone(&chrono::Utc) <= now;
-                    }
-                }
-
-                false
-            })
+            .filter(|task| task_is_due(task, now))
             .collect();
 
         // Sort by: waiting tasks first (by waiting_since), then by next_run time
@@ -371,37 +531,69 @@ impl SchedulerService {
 
             // Check conditions if task has any
             if task.has_conditions() {
-                let (conditions_met, status) = self.check_conditions(&task).await;
-
-                if status.timed_out {
-                    info!(
-                        "Scheduler: Task '{}' timed out waiting for conditions",
-                        task.name
-                    );
-                    self.record_condition_timeout(&task).await;
-                    continue;
-                }
-
-                if !conditions_met {
-                    info!(
-                        "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?})",
-                        task.name, status.idle_met, status.repo_inactive_met
-                    );
-                    let status_json = serde_json::to_string(&status).ok();
-                    if let Err(e) = pg
-                        .update_task_condition_status(&task.id, status_json.as_deref())
-                        .await
-                    {
-                        error!("Failed to update condition status: {}", e);
+                match self.gate_conditions(&task, std::time::Instant::now()).await {
+                    ConditionGate::TimedOut => {
+                        info!(
+                            "Scheduler: Task '{}' timed out waiting for conditions",
+                            task.name
+                        );
+                        self.record_condition_timeout(&task).await;
+                        continue;
                     }
-                    continue;
+                    ConditionGate::Wait(status) => {
+                        info!(
+                            "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?}, \
+                             probe: {:?} {:?})",
+                            task.name,
+                            status.idle_met,
+                            status.repo_inactive_met,
+                            status.probe_met,
+                            status.probe_detail
+                        );
+                        let status_json = serde_json::to_string(&status).ok();
+                        match pg
+                            .update_task_condition_status(
+                                &task.id,
+                                status_json.as_deref(),
+                                &task.modified_at,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => info!(
+                                "Scheduler: task '{}' was edited since this tick read it; \
+                                 its wait state is re-evaluated next tick",
+                                task.name
+                            ),
+                            Err(e) => error!("Failed to update condition status: {}", e),
+                        }
+                        continue;
+                    }
+                    ConditionGate::Fire => {
+                        // Conditions met - clear status before execution. The
+                        // clear is conditional on the snapshot the conditions
+                        // were evaluated against: if the task was edited since,
+                        // this tick's verdict is about a task that no longer
+                        // exists in that form, so it does not run; the next
+                        // tick re-reads and re-evaluates.
+                        match pg
+                            .update_task_condition_status(&task.id, None, &task.modified_at)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                info!(
+                                    "Scheduler: task '{}' was edited since this tick read it; \
+                                     not running on the stale verdict — re-evaluating next tick",
+                                    task.name
+                                );
+                                continue;
+                            }
+                            Err(e) => error!("Failed to clear condition status: {}", e),
+                        }
+                        info!("Scheduler: Task '{}' conditions met, executing", task.name);
+                    }
                 }
-
-                // Conditions met - clear status before execution
-                if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
-                    error!("Failed to clear condition status: {}", e);
-                }
-                info!("Scheduler: Task '{}' conditions met, executing", task.name);
             }
 
             info!("Scheduler: Executing task '{}'", task.name);
@@ -476,9 +668,15 @@ impl SchedulerService {
 
         // Mark as running (stays marked until the spawned poller completes
         // for async workflows; until the sync execute_* returns otherwise).
-        {
-            let mut running = self.running_tasks.write().await;
-            running.push(task_id.clone());
+        // Check-and-insert is one step under one write lock: the tick, a
+        // catch-up and "Run now" can all reach here, and a separate
+        // read-then-push lets two of them both start the task.
+        if !self.try_mark_running(&task_id).await {
+            warn!(
+                "Scheduler: task '{}' is already running; not starting a second run",
+                task_name
+            );
+            return;
         }
 
         // === Async launch-and-poll paths ===
@@ -764,6 +962,7 @@ impl SchedulerService {
             }
         };
 
+        let read_modified_at = task.modified_at.clone();
         task.record_launch_failure();
         let failures = task.consecutive_launch_failures;
         let backoff = task.launch_failure_backoff();
@@ -793,11 +992,13 @@ impl SchedulerService {
         }
 
         let next_run_str = next_run.map(|dt| dt.to_rfc3339());
-        if let Err(e) = pg
-            .update_task_next_run(task_id, next_run_str.as_deref())
+        match pg
+            .update_task_next_run(task_id, next_run_str.as_deref(), &read_modified_at)
             .await
         {
-            error!("Failed to update next_run after launch failure: {}", e);
+            Ok(true) => {}
+            Ok(false) => debug!("backoff next_run for task {task_id} left to a concurrent edit"),
+            Err(e) => error!("Failed to update next_run after launch failure: {}", e),
         }
     }
 
@@ -1230,8 +1431,15 @@ impl SchedulerService {
         let zone = self.schedule_zone().await;
         let next = compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339());
 
-        if let Err(e) = pg.update_task_next_run(task_id, next.as_deref()).await {
-            error!("Failed to update task next_run: {}", e);
+        match pg
+            .update_task_next_run(task_id, next.as_deref(), &task.modified_at)
+            .await
+        {
+            Ok(true) => {}
+            // An edit landed between this read and the write; it recomputed
+            // next_run itself, so the edit's value stands.
+            Ok(false) => debug!("next_run for task {task_id} left to a concurrent edit"),
+            Err(e) => error!("Failed to update task next_run: {}", e),
         }
     }
 
@@ -1449,6 +1657,17 @@ After making fixes, run tests if applicable to verify the fixes work."#
     }
 
     /// Check if a specific task is currently running
+    /// Atomically mark `task_id` running: `false` (and no change) when it
+    /// already is.
+    async fn try_mark_running(&self, task_id: &str) -> bool {
+        let mut running = self.running_tasks.write().await;
+        if running.iter().any(|id| id == task_id) {
+            return false;
+        }
+        running.push(task_id.to_string());
+        true
+    }
+
     pub async fn is_task_running(&self, task_id: &str) -> bool {
         let running = self.running_tasks.read().await;
         running.contains(&task_id.to_string())
@@ -1646,9 +1865,46 @@ fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 }
 
 impl SchedulerService {
-    /// Check if a task's conditions are met
-    /// Returns (all_conditions_met, updated_status)
-    async fn check_conditions(&self, task: &ScheduledTask) -> (bool, ConditionStatus) {
+    /// Decide what a due task's conditions say at `now`, with the side effects
+    /// on the probe state that decision implies: a MET probe result is spent by
+    /// the evaluation that returns it, i.e. on the run this Fire admits (so a `Cron` slot runs once, and a `Condition` task
+    /// needs a fresh exit 0 after every rearm), and a timed-out wait drops the
+    /// task's probe state (killing a probe still running for it).
+    async fn gate_conditions(
+        &self,
+        task: &ScheduledTask,
+        now: std::time::Instant,
+    ) -> ConditionGate {
+        if !task.has_conditions() {
+            return ConditionGate::Fire;
+        }
+        let (met, status) = self.check_conditions_at(task, now).await;
+        if status.timed_out {
+            self.probe_gate.forget(&task.id);
+            return ConditionGate::TimedOut;
+        }
+        if !met {
+            return ConditionGate::Wait(status);
+        }
+        // A met probe was already spent inside `ProbeGate::evaluate`, under
+        // the task's own lock — this Fire is the one run it admits.
+        ConditionGate::Fire
+    }
+
+    /// Check if a task's conditions are met at `now`.
+    /// Returns (all_conditions_met, updated_status).
+    ///
+    /// Evaluates exactly the conditions named in [`EVALUATED_CONDITIONS`]:
+    /// `timeout_minutes` first (a timed-out wait is reported without running
+    /// anything else), then `require_idle`, `require_repo_inactive` and
+    /// `require_probe` — ALL enabled ones must be met. `require_probe` is
+    /// rate-limited by [`crate::scheduler_probe::ProbeGate`]; its result and a
+    /// one-line outcome land in `probe_met` / `probe_detail`.
+    async fn check_conditions_at(
+        &self,
+        task: &ScheduledTask,
+        now: std::time::Instant,
+    ) -> (bool, ConditionStatus) {
         let conditions = match &task.conditions {
             Some(c) => c,
             None => return (true, condition_status_default()),
@@ -1663,12 +1919,7 @@ impl SchedulerService {
         let mut status = task
             .condition_status
             .clone()
-            .unwrap_or_else(|| ConditionStatus {
-                waiting_since: chrono::Utc::now().to_rfc3339(),
-                idle_met: None,
-                repo_inactive_met: None,
-                timed_out: false,
-            });
+            .unwrap_or_else(condition_status_default);
 
         // Check timeout first
         if let Some(timeout_mins) = conditions.timeout_minutes {
@@ -1701,6 +1952,24 @@ impl SchedulerService {
                 let all_repos_inactive = repo_status.iter().all(|(_, inactive)| *inactive);
                 status.repo_inactive_met = Some(repo_status);
                 if !all_repos_inactive {
+                    all_met = false;
+                }
+            }
+        }
+
+        // Check probe condition — last, and only when everything else is met:
+        // the probe is the one condition that costs a process spawn, and its
+        // answer cannot change the verdict when another condition already
+        // says no.
+        if let Some(probe) = &conditions.require_probe {
+            if probe.enabled && !all_met {
+                status.probe_met = None;
+                status.probe_detail = Some("not run: another condition is not met".to_string());
+            } else if probe.enabled {
+                let verdict = self.probe_gate.evaluate(&task.id, probe, now).await;
+                status.probe_met = Some(verdict.met);
+                status.probe_detail = Some(verdict.detail);
+                if !verdict.met {
                     all_met = false;
                 }
             }
@@ -1773,24 +2042,45 @@ impl SchedulerService {
                 return;
             }
         };
-        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
-        record.status = ScheduledTaskStatus::Skipped;
-        record.ended_at = Some(chrono::Utc::now().to_rfc3339());
-        record.error_message = Some("Condition timeout exceeded".to_string());
-
-        if let Err(e) = pg.insert_execution_record(&task.id, &record).await {
-            error!("Failed to record condition timeout: {}", e);
-        }
-        if let Err(e) = pg
-            .update_task_last_run(&task.id, Some(&record.execution_id))
+        // Clear the wait state FIRST, conditional on the snapshot the timeout
+        // was judged on. If a user edit landed since (the row's modified_at
+        // moved), nothing is recorded: the verdict was about a task that no
+        // longer exists in that form, and the next tick re-reads and
+        // re-evaluates it. (An edit does NOT necessarily reset the wait — a
+        // PUT without `conditions` keeps `condition_status` — which is exactly
+        // why the lost race must not record a Skipped run on stale grounds.)
+        match pg
+            .update_task_condition_status(&task.id, None, &task.modified_at)
             .await
         {
-            error!("Failed to update task last_run: {}", e);
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    "Scheduler: task '{}' was edited since this tick judged its condition wait \
+                     timed out; recording nothing — re-evaluating next tick",
+                    task.name
+                );
+                return;
+            }
+            Err(e) => {
+                error!("Failed to clear condition status: {}", e);
+                return;
+            }
         }
 
-        // Clear condition status
-        if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
-            error!("Failed to clear condition status: {}", e);
+        let record = condition_timeout_record(task);
+        // last_run points at the history row, so it moves only when that row
+        // exists — otherwise it would name an execution id with no record.
+        match pg.insert_execution_record(&task.id, &record).await {
+            Ok(_) => {
+                if let Err(e) = pg
+                    .update_task_last_run(&task.id, Some(&record.execution_id))
+                    .await
+                {
+                    error!("Failed to update task last_run: {}", e);
+                }
+            }
+            Err(e) => error!("Failed to record condition timeout: {}", e),
         }
 
         // Update next_run
@@ -1956,6 +2246,22 @@ impl SchedulerService {
     /// Errors per-task are logged and swallowed so one broken task can't
     /// block the entire fleet from reconciling.
     pub async fn reconcile_missed_runs(self: Arc<Self>) -> Result<(), String> {
+        let _pass = self.pass_lock.lock().await;
+        self.clone().reconcile_pass().await
+    }
+
+    /// [`Self::reconcile_missed_runs`] unless a pass is already in progress:
+    /// `Ok(false)` at once instead of waiting behind it. `/scheduler/reconcile-now`
+    /// answers that with 409 rather than hanging for a whole sync run.
+    pub async fn try_reconcile_missed_runs(self: Arc<Self>) -> Result<bool, String> {
+        let Ok(_pass) = self.pass_lock.try_lock() else {
+            return Ok(false);
+        };
+        self.clone().reconcile_pass().await.map(|()| true)
+    }
+
+    /// The reconciler's body; the caller holds [`Self::pass_lock`].
+    async fn reconcile_pass(self: Arc<Self>) -> Result<(), String> {
         let pg = self.pg()?;
 
         let settings = match pg.get_scheduler_settings().await {
@@ -2071,8 +2377,38 @@ impl SchedulerService {
             return Ok(());
         }
 
-        let actions = plan_catch_up_actions(&missed, task.catch_up_policy);
+        let mut actions = plan_catch_up_actions(&missed, task.catch_up_policy);
         let policy = task.catch_up_policy;
+
+        // A catch-up is a run like any other: a task with conditions goes
+        // through the same gate the tick uses (a met probe is spent on it).
+        // Not admitted now -> the slots are recorded MissedRunnerDown.
+        // A task that is running right now gets no concurrent catch-up either
+        // way (the tick skips a running task for the same reason).
+        let wants_run = actions
+            .iter()
+            .any(|a| matches!(a, CatchUpAction::Enqueue { .. }));
+        if wants_run && self.is_task_running(&task.id).await {
+            info!(
+                task_id = %task.id,
+                "scheduler reconciler: task is running — recording missed slots instead \
+                 of a concurrent catch-up run"
+            );
+            actions = gate_catch_up_actions(actions, false);
+        } else if wants_run && task.has_conditions() {
+            let fire = matches!(
+                self.gate_conditions(task, std::time::Instant::now()).await,
+                ConditionGate::Fire
+            );
+            if !fire {
+                info!(
+                    task_id = %task.id,
+                    "scheduler reconciler: conditions not met — recording missed slots \
+                     instead of a catch-up run"
+                );
+            }
+            actions = gate_catch_up_actions(actions, fire);
+        }
 
         info!(
             task_id = %task.id,
@@ -3194,5 +3530,511 @@ mod tests {
         let mut runtime_record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         runtime_record.complete(false, Some("runtime error".to_string()));
         assert!(matches!(runtime_record.status, ScheduledTaskStatus::Failed));
+    }
+
+    // ========================================================================
+    // `require_probe` (plan 2026-09-29-quiet-is-measured-by-session-existence-
+    // and-machine-wide-so-a-24x7-box-never-gets-one, Phase 4b). Each "tick"
+    // below walks the same path `tick()` does for one task — `task_is_due`,
+    // the Condition rearm check, `gate_conditions` — minus the database, with
+    // the probe's rate-limit clock driven one 60 s tick per iteration.
+    // ========================================================================
+
+    use crate::scheduler::{ProbeCondition, ScheduleConditions, ScheduleZone};
+
+    /// A probe that exits 0 only from its `flip_at`-th run on, counting runs
+    /// in `counter`.
+    #[cfg(unix)]
+    fn counting_probe(counter: &std::path::Path, flip_at: u32) -> ProbeCondition {
+        let c = counter.display();
+        ProbeCondition {
+            enabled: true,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "n=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'; \
+                     [ \"$n\" -ge {flip_at} ]"
+                ),
+            ],
+            poll_seconds: 60,
+            timeout_seconds: 10,
+        }
+    }
+
+    #[cfg(unix)]
+    fn probe_runs(counter: &std::path::Path) -> u32 {
+        std::fs::read_to_string(counter)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cron_task_waits_for_its_probe_and_runs_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "probe-gated cron".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(counting_probe(&counter, 3)),
+            timeout_minutes: Some(180),
+            ..Default::default()
+        });
+        assert!(task.has_conditions());
+        // The cron slot has just passed.
+        task.next_run = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+
+        let t0 = std::time::Instant::now();
+        let mut fired_on = Vec::new();
+        for tick in 0..8u64 {
+            let now = Utc::now();
+            if !task_is_due(&task, now) {
+                continue;
+            }
+            let at = t0 + std::time::Duration::from_secs(60 * tick);
+            match service.gate_conditions(&task, at).await {
+                ConditionGate::Fire => {
+                    fired_on.push(tick);
+                    task.condition_status = None;
+                    task.next_run = compute_next_run(&task.schedule, now, ScheduleZone::Utc)
+                        .map(|dt| dt.to_rfc3339());
+                }
+                ConditionGate::Wait(status) => {
+                    assert_eq!(status.probe_met, Some(false));
+                    assert_eq!(status.probe_detail.as_deref(), Some("exit 1"));
+                    task.condition_status = Some(status);
+                }
+                ConditionGate::TimedOut => panic!("no timeout inside 8 minutes"),
+            }
+        }
+        assert_eq!(
+            fired_on,
+            vec![2],
+            "fires on the tick the probe first exits 0, once"
+        );
+        assert_eq!(
+            probe_runs(&counter),
+            3,
+            "no probe runs after the slot fired"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cron_wait_times_out_and_forgets_the_probe() {
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "probe-gated cron".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["false".into()],
+                poll_seconds: 60,
+                timeout_seconds: 5,
+            }),
+            timeout_minutes: Some(30),
+            ..Default::default()
+        });
+        let mut status = condition_status_default();
+        status.waiting_since = (Utc::now() - chrono::Duration::minutes(31)).to_rfc3339();
+        task.condition_status = Some(status);
+        let gate = service
+            .gate_conditions(&task, std::time::Instant::now())
+            .await;
+        assert!(matches!(gate, ConditionGate::TimedOut), "{gate:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_condition_task_fires_when_its_probe_is_met_and_honours_rearm_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "probe-gated condition".to_string(),
+            None,
+            ScheduleExpression::Condition(crate::scheduler::ConditionScheduleConfig {
+                rearm_delay_minutes: 3,
+            }),
+            scheduled_task_type_default(),
+        );
+        // Always met from the first run.
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(counting_probe(&counter, 1)),
+            ..Default::default()
+        });
+
+        let t0 = std::time::Instant::now();
+        let mut fired_on: Vec<u64> = Vec::new();
+        for tick in 0..10u64 {
+            let now = Utc::now();
+            task.next_run =
+                compute_next_run(&task.schedule, now, ScheduleZone::Utc).map(|dt| dt.to_rfc3339());
+            // The last run ended `tick - last_fire` simulated minutes ago.
+            if let Some(&last) = fired_on.last() {
+                let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+                record.complete(true, None);
+                record.ended_at =
+                    Some((now - chrono::Duration::minutes((tick - last) as i64)).to_rfc3339());
+                task.last_run = Some(record);
+            }
+            if !task_is_due(&task, now) || !task.is_rearm_ready() {
+                continue;
+            }
+            let at = t0 + std::time::Duration::from_secs(60 * tick);
+            match service.gate_conditions(&task, at).await {
+                ConditionGate::Fire => fired_on.push(tick),
+                other => panic!("an always-met probe must fire when rearmed, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            fired_on,
+            vec![0, 3, 6, 9],
+            "one run per 3-minute rearm delay"
+        );
+        assert_eq!(
+            probe_runs(&counter),
+            4,
+            "the probe runs only when the rearm delay lets the task be evaluated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_is_not_run_while_another_condition_is_unmet() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let watched = dir.path().join("repo");
+        std::fs::create_dir(&watched).unwrap();
+        std::fs::write(watched.join("fresh"), "just now").unwrap();
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "two conditions".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_repo_inactive: Some(crate::scheduler::RepositoryInactiveCondition {
+                enabled: true,
+                repositories: vec![RepositoryWatch {
+                    path: watched.display().to_string(),
+                    inactive_minutes: 60,
+                }],
+            }),
+            require_probe: Some(counting_probe(&counter, 1)),
+            ..Default::default()
+        });
+        match service
+            .gate_conditions(&task, std::time::Instant::now())
+            .await
+        {
+            ConditionGate::Wait(status) => {
+                assert_eq!(status.probe_met, None);
+                assert_eq!(
+                    status.probe_detail.as_deref(),
+                    Some("not run: another condition is not met")
+                );
+            }
+            other => panic!("a freshly modified repo must hold the task, got {other:?}"),
+        }
+        assert_eq!(probe_runs(&counter), 0);
+    }
+
+    #[test]
+    fn an_enabled_probe_with_no_command_still_gates_the_task() {
+        let mut task = fixture_task(60);
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: Vec::new(),
+                poll_seconds: 60,
+                timeout_seconds: 5,
+            }),
+            ..Default::default()
+        });
+        assert!(
+            task.has_conditions(),
+            "dropping a broken probe would run the task ungated"
+        );
+    }
+
+    /// `EVALUATED_CONDITIONS` is the capability list `/health` serves; it must
+    /// name exactly the fields `ScheduleConditions` carries, so a schema field
+    /// added without an evaluator (or the reverse) fails here.
+    #[test]
+    fn evaluated_conditions_match_the_schedule_conditions_shape() {
+        let full = ScheduleConditions {
+            require_idle: Some(crate::scheduler::IdleCondition { enabled: true }),
+            require_repo_inactive: Some(crate::scheduler::RepositoryInactiveCondition {
+                enabled: true,
+                repositories: Vec::new(),
+            }),
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["true".into()],
+                poll_seconds: 60,
+                timeout_seconds: 5,
+            }),
+            timeout_minutes: Some(1),
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        let mut fields: Vec<String> = value
+            .as_object()
+            .expect("ScheduleConditions serializes as an object")
+            .keys()
+            .map(|camel| {
+                camel.chars().fold(String::new(), |mut acc, ch| {
+                    if ch.is_ascii_uppercase() {
+                        acc.push('_');
+                        acc.push(ch.to_ascii_lowercase());
+                    } else {
+                        acc.push(ch);
+                    }
+                    acc
+                })
+            })
+            .collect();
+        fields.sort();
+        let mut evaluated: Vec<String> =
+            EVALUATED_CONDITIONS.iter().map(|s| s.to_string()).collect();
+        evaluated.sort();
+        assert_eq!(fields, evaluated);
+    }
+
+    /// Two concurrent passes (the tick loop and the wake handler) gating the
+    /// same task on a met probe: exactly one Fire.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_gates_on_a_met_probe_fire_exactly_once() {
+        let service = Arc::new(SchedulerService::new(None));
+        let mut task = ScheduledTask::new(
+            "probe-gated".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["sh".into(), "-c".into(), "sleep 1; exit 0".into()],
+                poll_seconds: 60,
+                timeout_seconds: 10,
+            }),
+            ..Default::default()
+        });
+        let at = std::time::Instant::now();
+        let spawn_gate = |service: Arc<SchedulerService>, task: ScheduledTask| {
+            tokio::spawn(async move { service.gate_conditions(&task, at).await })
+        };
+        let (a, b) = tokio::join!(
+            spawn_gate(service.clone(), task.clone()),
+            spawn_gate(service.clone(), task.clone())
+        );
+        let fires = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|g| matches!(g, ConditionGate::Fire))
+            .count();
+        assert_eq!(fires, 1);
+    }
+
+    #[test]
+    fn a_condition_timeout_is_stamped_with_the_slot_it_was_waiting_for() {
+        let slot = "2026-09-29T07:20:00+00:00";
+        let mut cron = fixture_task(60);
+        cron.schedule = ScheduleExpression::Cron("0 20 7 * * *".to_string());
+        cron.next_run = Some(slot.to_string());
+        let record = condition_timeout_record(&cron);
+        assert!(matches!(record.status, ScheduledTaskStatus::Skipped));
+        assert_eq!(
+            record
+                .scheduled_for
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()),
+            chrono::DateTime::parse_from_rfc3339(slot).ok(),
+            "an unstamped timeout reads as a missed slot and is caught up on restart"
+        );
+
+        let mut condition = fixture_task(60);
+        condition.schedule =
+            ScheduleExpression::Condition(crate::scheduler::ConditionScheduleConfig {
+                rearm_delay_minutes: 60,
+            });
+        condition.next_run = Some(slot.to_string());
+        assert_eq!(condition_timeout_record(&condition).scheduled_for, None);
+    }
+
+    #[test]
+    fn a_conditioned_catch_up_the_gate_does_not_admit_is_recorded_missed() {
+        let slots = six_hourly_missed_slots();
+        let actions = plan_catch_up_actions(&slots, CatchUpPolicy::RunOnce);
+        assert!(matches!(
+            actions.as_slice(),
+            [CatchUpAction::Enqueue { .. }]
+        ));
+        assert_eq!(gate_catch_up_actions(actions.clone(), true), actions);
+        let held = gate_catch_up_actions(actions, false);
+        assert!(
+            held.iter().all(|a| matches!(a, CatchUpAction::Skip { .. })),
+            "{held:?}"
+        );
+        assert_eq!(held.len(), 1);
+    }
+
+    /// `reconcile_task` gates a conditioned catch-up through `gate_conditions`
+    /// before acting on it (source-scan: the reconciler needs a database).
+    #[test]
+    fn the_reconciler_gates_catch_up_for_conditioned_tasks() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn reconcile_task(")
+            .expect("reconcile_task exists");
+        let (body, _) = body.split_once("\n    }\n").expect("reconcile_task closes");
+        let (before_gate, _) = body
+            .split_once("task.has_conditions()")
+            .expect("reconcile_task checks for conditions");
+        let (before_act, _) = body
+            .split_once("for action in actions")
+            .expect("reconcile_task acts on its actions");
+        assert!(
+            before_gate.len() < before_act.len(),
+            "the gate must run before any catch-up is enqueued"
+        );
+        assert!(body.contains("self.gate_conditions(task,"));
+        assert!(body.contains("gate_catch_up_actions(actions, fire)"));
+    }
+
+    /// `CatchUpPolicy::Run` with 3 missed slots and one gate admission: exactly
+    /// one run (the latest slot); the other two are recorded missed.
+    #[test]
+    fn one_admission_runs_one_catch_up_under_the_run_policy() {
+        let slots: Vec<DateTime<Utc>> = six_hourly_missed_slots().into_iter().take(3).collect();
+        assert_eq!(slots.len(), 3);
+        let actions = plan_catch_up_actions(&slots, CatchUpPolicy::Run);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, CatchUpAction::Enqueue { .. }))
+                .count(),
+            3
+        );
+        let gated = gate_catch_up_actions(actions, true);
+        let runs: Vec<_> = gated
+            .iter()
+            .filter_map(|a| match a {
+                CatchUpAction::Enqueue { scheduled_for } => Some(*scheduled_for),
+                CatchUpAction::Skip { .. } => None,
+            })
+            .collect();
+        assert_eq!(runs, vec![slots[2]], "only the latest slot runs");
+        assert_eq!(gated.len(), 3);
+    }
+
+    /// A pass in progress makes the try-variants return at once instead of
+    /// waiting (the wake handler skips; `/scheduler/reconcile-now` answers 409).
+    #[tokio::test]
+    async fn try_variants_do_not_wait_behind_a_pass_in_progress() {
+        let service = Arc::new(SchedulerService::new(None));
+        let held = service.pass_lock.lock().await;
+        let started = std::time::Instant::now();
+        assert!(!service.clone().try_tick().await);
+        assert_eq!(service.clone().try_reconcile_missed_runs().await, Ok(false));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
+        // Free: the pass runs (and, with no database, reports that).
+        assert!(service.clone().try_tick().await);
+        assert!(service.clone().try_reconcile_missed_runs().await.is_err());
+    }
+
+    /// `/health` `schedulerConditions` advertises a condition only when the
+    /// task store round-trips it — derived from the store's own column list.
+    /// Since Phase 4c the store persists `conditions`, so the capability is
+    /// the evaluator's full list.
+    #[test]
+    fn enforced_conditions_are_the_full_list_now_the_store_persists_them() {
+        assert!(crate::database::pg::scheduler::task_store_persists_conditions());
+        assert_eq!(enforced_conditions(), EVALUATED_CONDITIONS);
+        assert_eq!(
+            enforced_conditions(),
+            &[
+                "require_idle",
+                "require_repo_inactive",
+                "require_probe",
+                "timeout_minutes"
+            ]
+        );
+    }
+
+    /// Marking a task running is one atomic check-and-insert: concurrent
+    /// starters of the same task get exactly one `true`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_starter_marks_a_task_running() {
+        let service = Arc::new(SchedulerService::new(None));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let service = service.clone();
+            handles.push(tokio::spawn(
+                async move { service.try_mark_running("t").await },
+            ));
+        }
+        let mut marked = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                marked += 1;
+            }
+        }
+        assert_eq!(marked, 1);
+        assert_eq!(service.get_running_tasks().await, vec!["t".to_string()]);
+        assert!(!service.try_mark_running("t").await);
+        assert!(service.try_mark_running("other").await);
+    }
+
+    /// `execute_task_with_context` starts only through the atomic mark.
+    #[test]
+    fn execute_task_starts_only_through_the_atomic_mark() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn execute_task_with_context(")
+            .expect("execute_task_with_context");
+        let (head, _) = body
+            .split_once("// === Async launch-and-poll paths ===")
+            .expect("launch section");
+        assert!(head.contains("if !self.try_mark_running(&task_id).await {"));
+        assert!(!head.contains("running.push("));
+    }
+
+    /// A condition timeout records its Skipped row and last_run ONLY after the
+    /// snapshot-conditional clear lands; a lost race records nothing.
+    #[test]
+    fn a_condition_timeout_records_only_after_the_conditional_clear_lands() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn record_condition_timeout(")
+            .expect("record_condition_timeout");
+        let (body, _) = body.split_once("\n    }\n").expect("fn ends");
+        let (before_insert, _) = body
+            .split_once("pg.insert_execution_record(")
+            .expect("records a history row");
+        assert!(before_insert
+            .contains(".update_task_condition_status(&task.id, None, &task.modified_at)"));
+        let (_, lost_race) = before_insert
+            .split_once("Ok(false) => {")
+            .expect("lost-race arm");
+        let (lost_race, _) = lost_race.split_once("Err(e) =>").expect("arm ends");
+        assert!(
+            lost_race.contains("return;"),
+            "a lost race must record nothing"
+        );
     }
 }

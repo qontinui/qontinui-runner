@@ -22,19 +22,18 @@
  */
 
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
 import { describe, it, expect } from "vitest";
 
-const SOURCE = readFileSync(
-  fileURLToPath(new URL("./FleetSessionPicker.tsx", import.meta.url)),
-  "utf8",
-);
-const HOOK = readFileSync(fileURLToPath(new URL("./useFleetSessions.ts", import.meta.url)), "utf8");
-const DISCOVERY = readFileSync(
-  fileURLToPath(new URL("./fleetDiscovery.ts", import.meta.url)),
-  "utf8",
-);
+import { assertAnchored, callsOf, subjectDir } from "../../lib/__test-helpers__/assertAnchored";
+
+// `subjectDir` is this directory, or the mutation probe's staged copy of it
+// (see FleetSessionPicker.wiring.test.mutants.json) — the file reads are the
+// only thing that moves, so the SAME assertions run against a mutant.
+const DIR = subjectDir(import.meta.url);
+const SOURCE = readFileSync(`${DIR}FleetSessionPicker.tsx`, "utf8");
+const HOOK = readFileSync(`${DIR}useFleetSessions.ts`, "utf8");
+const DISCOVERY = readFileSync(`${DIR}fleetDiscovery.ts`, "utf8");
 
 /**
  * The same source with its comments removed.
@@ -200,14 +199,13 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // anything carrying `data-ui-bridge-id`), so both are pinned: the root
     // carries the control id, and the tenant sits in its attribute block.
     const code = codeOf(SOURCE);
-    const start = code.indexOf("data-page-element={FLEET_SESSION_PICKER_ELEMENT}");
-    const end = code.indexOf("data-fleet-pending-include-closed=");
-    // Both markers asserted before slicing. `indexOf` returning -1 would make
+    // `assertAnchored` throws on an absent marker (and requires the end to
+    // follow the start). A bare `indexOf` returning -1 would make
     // `slice(start, -1)` run to the end of the file, degrading this into a
     // whole-file presence check — the quiet failure `emptyReadArgs` above
     // refuses to have, and it was reachable here by rewording a className.
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
+    const start = assertAnchored(code, "data-page-element={FLEET_SESSION_PICKER_ELEMENT}");
+    const end = assertAnchored(code, "data-fleet-pending-include-closed=", start);
     const block = code.slice(start, end);
     expect(block).toContain("data-ui-bridge-id={FLEET_PICKER_ROOT_ID}");
     expect(block).toContain('data-fleet-tenant={response?.tenantId ?? ""}');
@@ -273,10 +271,13 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // success branch beside `setResponse`, never in an effect over `response`
     // — an effect would publish the PREVIOUS response's rows under the NEW
     // query for one render, which is exactly the false claim it exists to stop.
-    const success = HOOK.slice(HOOK.indexOf("setResponse(result)"));
-    expect(success.indexOf("setAppliedQuery({")).toBeGreaterThan(-1);
-    expect(success.indexOf("setAppliedQuery({")).toBeLessThan(success.indexOf("} catch"));
-    expect(HOOK).not.toMatch(/useEffect\([^)]*setAppliedQuery/s);
+    const from = assertAnchored(HOOK, "setResponse(result)");
+    const setAt = assertAnchored(HOOK, "setAppliedQuery({", from);
+    const catchAt = assertAnchored(HOOK, "} catch", from);
+    expect(setAt).toBeLessThan(catchAt);
+    for (const effect of callsOf(codeOf(HOOK), "useEffect(")) {
+      expect(effect).not.toContain("setAppliedQuery");
+    }
   });
 });
 
@@ -312,7 +313,9 @@ describe("the retired `truncated` contract is gone from every layer", () => {
     // A ladder click used to raise `server.limit`. A walk click must not touch
     // the filter at all — it re-sends coord's cursor with the identical scope.
     expect(SOURCE).toContain("onClick={() => void loadMore()}");
-    expect(SOURCE).not.toMatch(/setServer\([^)]*limit:/);
+    for (const call of callsOf(codeOf(SOURCE), "setServer(")) {
+      expect(call).not.toMatch(/\blimit\s*:/);
+    }
   });
 });
 
@@ -339,10 +342,9 @@ describe("the walk sends the cursor, and only within its own scope", () => {
     // cursor is dropped before the new page one is asked for.
     expect(HOOK).toContain("if (fleetErrorIsRestart(code)) {");
     expect(HOOK).toContain("setRestartToken((t) => t + 1);");
-    const branch = HOOK.slice(
-      HOOK.indexOf("if (fleetErrorIsRestart(code)) {"),
-      HOOK.indexOf("if (fleetErrorInvalidatesCursor(code)) {"),
-    );
+    const branchStart = assertAnchored(HOOK, "if (fleetErrorIsRestart(code)) {");
+    const branchEnd = assertAnchored(HOOK, "if (fleetErrorInvalidatesCursor(code)) {", branchStart);
+    const branch = HOOK.slice(branchStart, branchEnd);
     expect(branch).toContain("cursorRef.current = null;");
     // No error is published on this path — `return` precedes the setError below.
     expect(branch).not.toContain("setError(");
@@ -365,9 +367,16 @@ describe("a page in flight never makes a true list read as a stale one", () => {
     // `loadingMore` appends: the rows below are the same walk's earlier pages
     // and stay valid, so borrowing the "these are from the previous read"
     // banner would be a false claim in the other direction.
-    const banner = SOURCE.slice(SOURCE.indexOf("FLEET_PICKER_REREADING_ID") - 400);
-    expect(SOURCE).toContain("{loading && (");
-    expect(banner.slice(0, 600)).not.toContain("loadingMore &&");
+    //
+    // The window ends at the banner's own JSX use of the id. It used to start
+    // at the FIRST textual `FLEET_PICKER_REREADING_ID` — the `export const`
+    // near the top of the file — so it inspected the constant's neighbourhood
+    // and a `loadingMore &&` added to the real condition went unseen.
+    const code = codeOf(SOURCE);
+    const at = assertAnchored(code, "data-ui-bridge-id={FLEET_PICKER_REREADING_ID}");
+    const condition = code.slice(Math.max(0, at - 200), at);
+    expect(condition).toContain("{loading && (");
+    expect(condition).not.toContain("loadingMore");
   });
 
   it("disables both page controls while either read is in flight", () => {
@@ -383,7 +392,7 @@ describe("a page in flight never makes a true list read as a stale one", () => {
     // unconditional text it used to be.
     const code = codeOf(SOURCE);
     expect(code).toContain("This is a failed read, not an empty fleet.");
-    const at = code.indexOf("This is a failed read");
+    const at = assertAnchored(code, "This is a failed read");
     const guarded = code.slice(Math.max(0, at - 400), at);
     expect(guarded).toContain("{walkStalled");
     // Both empty-state arms are conditional on it, so neither can be reinstated
@@ -395,7 +404,11 @@ describe("a page in flight never makes a true list read as a stale one", () => {
     // coord answered: the rows below are current and only the next page is out
     // of reach. "Last refresh failed — showing the previous read" over that is
     // a false claim in the other direction, so the prefix is conditional.
-    expect(HOOK).toContain("walkStalled,");
+    // As a property of the returned object — its own line. A bare
+    // `toContain("walkStalled,")` was also satisfied by the `useState`
+    // destructure `const [walkStalled, setWalkStalled]`, so removing it from
+    // the hook's return stayed green.
+    expect(HOOK).toMatch(/^\s+walkStalled,$/m);
     expect(SOURCE).toMatch(/\{walkStalled\s*\?\s*error\s*:/);
   });
 });
@@ -447,10 +460,8 @@ describe("a dropped cursor removes the control, and does not claim completeness"
     // component, and anchoring on that spans most of the file.
     const jsxGuard = '{truncation.kind === "more-available" && (';
     expect(code.split(jsxGuard).length - 1).toBe(1);
-    const guardAt = code.indexOf(jsxGuard);
-    const callAt = code.search(/\bloadMore\(\)/);
-    expect(guardAt).toBeGreaterThan(-1);
-    expect(callAt).toBeGreaterThan(guardAt);
+    const guardAt = assertAnchored(code, jsxGuard);
+    const callAt = assertAnchored(code, "loadMore()", guardAt);
     // …and no other truncation arm opens between the guard and the call, so the
     // control cannot have been re-parented without this failing.
     const between = code.slice(guardAt + jsxGuard.length, callAt);
@@ -476,7 +487,9 @@ describe("a dropped cursor removes the control, and does not claim completeness"
   it("projects coord's machine error code, not only the prose banner", () => {
     // The CODE is coord's contract and the detail prose explicitly is not, so a
     // driver that had to match on the sentence would break on a reword.
-    expect(HOOK).toContain("errorCode,");
+    // Own-line match for the same reason as `walkStalled,` above: the
+    // `useState` destructure also contains `errorCode,`.
+    expect(HOOK).toMatch(/^\s+errorCode,$/m);
     expect(SOURCE).toContain("errorCode,");
     expect(SOURCE).toContain('data-fleet-error-code={errorCode ?? ""}');
   });
@@ -507,8 +520,8 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
     // React runs effects in declaration order. Reversed, a commit that changes
     // the page size and the scope together fetches page one at the OLD size —
     // silently, and only in that one case.
-    expect(HOOK.indexOf("limitRef.current = limit;")).toBeLessThan(
-      HOOK.indexOf('void fetchPage("restart");'),
+    expect(assertAnchored(HOOK, "limitRef.current = limit;")).toBeLessThan(
+      assertAnchored(HOOK, 'void fetchPage("restart");'),
     );
   });
 
@@ -564,5 +577,17 @@ describe("a walked list shows when each row was last observed", () => {
     expect(SOURCE).toContain("setClockTick");
     expect(SOURCE).toContain("setInterval(() => setClockTick((t) => t + 1), 30_000)");
     expect(SOURCE).toContain("clearInterval(id)");
+  });
+});
+
+describe("the 'tab open on this page' notices follow the live tab list", () => {
+  // The opened id is recorded once, on success. Gating the notice on it alone
+  // kept "Attached — tab open on this page." on screen after the tab closed.
+  it("gates both notices on openedTabStillOpen, never on the bare id", () => {
+    const code = codeOf(SOURCE);
+    expect(code).toMatch(/openedTabStillOpen\(row\?\.openedId, tabs\)/);
+    expect(code).toMatch(/openedTabStillOpen\(state\.openedId, tabs\)/);
+    expect(code).not.toMatch(/\{\s*row\?\.openedId\s*&&/);
+    expect(code).not.toMatch(/if \(state\.openedId\)/);
   });
 });

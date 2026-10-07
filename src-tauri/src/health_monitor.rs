@@ -33,7 +33,7 @@ const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
 /// the band on every platform is not this change's job.
 ///
 /// It is `pub(crate)` so the spawn gate can say what it is NOT: the gate's
-/// thread ceilings ([`crate::settings::SessionGuardSettings::warn_thread_count`],
+/// thread ceilings ([`crate::settings::SHIPPED_WARN_THREAD_CEILING`],
 /// [`crate::resource_guard::THREAD_CEILING_MIN`]) must sit strictly ABOVE this
 /// number, and a test pins that. A ceiling at a count the process already
 /// carries at rest would refuse or warn on every spawn forever — which is what
@@ -1042,14 +1042,30 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 
 /// Append one line to `wedge-incidents.log`.
 ///
-/// **The single writer for that file.** Every rung with an incident worth
-/// surviving the process goes through here: the backend and UI-thread wedge
-/// detectors in this module, `webview_recovery`'s latched-recovery report
-/// (`recovery_wedged`), and `coord_outside_observer`'s four coord-liveness
-/// classes (`coord_unreachable`, `coord_worker_dead`, `coord_no_leader`,
-/// `coord_liveness_unknown` — plan
+/// **The single writer for that file — with one deliberate exception.** Every
+/// rung with an incident worth surviving the process goes through here: the
+/// backend and UI-thread wedge detectors in this module, `webview_recovery`'s
+/// latched-recovery report (`recovery_wedged`), and `coord_outside_observer`'s
+/// four coord-liveness classes (`coord_unreachable`, `coord_worker_dead`,
+/// `coord_no_leader`, `coord_liveness_unknown` — plan
 /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
-/// Phase 3b). A second incident file would be one more observability
+/// Phase 3b).
+///
+/// Two writers bypass this function. `append_watchdog_incident` (the
+/// runtime-independent watchdog) writes its own `WATCHDOG` lines; and
+/// `qontinui_runner_lib::alloc_breadcrumb` writes through a handle it opened at
+/// startup — tokens
+/// `alloc_failure`, `commit_exhaustion`, `commit_exhaustion_suspected`,
+/// `resource_exhaustion`, `resource_exhaustion_suspected`, and each episode
+/// token's `_closed` twin (`commit_exhaustion_closed`, …). It cannot come
+/// through here: its `alloc_failure` line is written from inside a failing
+/// allocator, and this function allocates (`format!`, `chrono`). EVERY writer
+/// keeps the `<RFC 3339> <TOKEN> … (pid N)` shape — the timestamp first and
+/// the pid LAST — because the next boot's crash harvest
+/// (`crash_observability::find_prior_exhaustion`) attributes lines to a run by
+/// that trailing pid; a line without it cannot be attributed to any run. Plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0. A second incident file would be one more observability
 /// channel nobody greps — and this one is already the first thing to read after
 /// an unexplained outage, because `runner-lifecycle.log` is truncated at every
 /// startup.
@@ -1065,7 +1081,9 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 ///
 /// `reason` is the stable, greppable token (`backend_wedged`,
 /// `ui_thread_wedged`, `recovery_wedged`, `coord_unreachable`,
-/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`);
+/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`; plus,
+/// through `alloc_breadcrumb`'s own handle, the exhaustion tokens listed
+/// above);
 /// `detail` is the prose after it.
 ///
 /// Best-effort by contract: the process is already sick, so a failure to write
@@ -1223,8 +1241,10 @@ fn watchdog_heartbeat_path(dir: &Path) -> PathBuf {
 }
 
 /// Path of the append-only incident log (shared with the monitor's own
-/// breadcrumb, so one file answers "what happened to this runner").
-fn wedge_incidents_path(dir: &Path) -> PathBuf {
+/// breadcrumb, so one file answers "what happened to this runner"). Also
+/// handed to `alloc_breadcrumb::install` at startup and read back by the
+/// next boot's crash harvest (`crash_observability`).
+pub(crate) fn wedge_incidents_path(dir: &Path) -> PathBuf {
     dir.join("wedge-incidents.log")
 }
 
@@ -1273,13 +1293,14 @@ fn append_watchdog_incident(dir: &Path, reason: WatchdogReason, s: WatchdogSampl
     let line = format!(
         "{} WATCHDOG {} — pid {}, probe heartbeat {}s old, metrics heartbeat {}s old, \
          consecutive /livez failures {}. Written by the runtime-independent watchdog \
-         thread, so this line survives a fully parked runtime.\n",
+         thread, so this line survives a fully parked runtime. (pid {})\n",
         chrono::Utc::now().to_rfc3339(),
         reason.as_str(),
         std::process::id(),
         monitor_age,
         metrics_age,
-        s.consecutive_failures
+        s.consecutive_failures,
+        std::process::id()
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -1568,11 +1589,11 @@ pub(crate) fn thread_count_reading() -> Option<usize> {
 ///
 /// - **The published fleet sample already tolerates 30 s of staleness for this
 ///   same quantity.** `fleet::resource_sample` publishes `thread_count` on a
-///   30 s loop and coord grades it against the same 256/400 ceilings. A verdict
+///   30 s loop and coord grades it against the shipped 256/400 ceilings. A verdict
 ///   taken from a reading up to 250 ms old is two orders of magnitude fresher
 ///   than the number the fleet dashboard renders for the identical decision.
 /// - **The gate structurally cannot close the read-to-PTY race anyway.**
-///   [`crate::settings::SessionGuardSettings::critical_thread_count`]'s own doc
+///   [`crate::settings::SHIPPED_CRITICAL_THREAD_CEILING`]'s own doc
 ///   sizes 400 around exactly this: the reading is taken before the PTY opens,
 ///   and a burst of concurrent admissions can each pass the ceiling and only
 ///   then create their threads. A memo of 0 ms would not make the verdict
@@ -1741,7 +1762,8 @@ pub(crate) fn thread_name_census_memoized() -> Option<ThreadNameCensus> {
 }
 
 /// The memoized census as the `/health` object serves it under `threadCensus`:
-/// `{ total, byName: [{name, count}], sampledAt }`, or JSON `null` when the
+/// `{ total, byName: [{name, count}], sessionThreads, sampledAt }`, or JSON
+/// `null` when the
 /// census is UNKNOWN — never an empty list (served policy
 /// `verification-and-evidence` `silent-empty-is-unknown`).
 pub(crate) fn thread_name_census_json() -> serde_json::Value {
@@ -1762,6 +1784,10 @@ fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
             .iter()
             .map(|row| serde_json::json!({ "name": row.name, "count": row.count }))
             .collect::<Vec<_>>(),
+        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`)
+        // the thread guard subtracts — `byName` is capped and must never be
+        // summed for it.
+        "sessionThreads": census.session_threads,
         "sampledAt": sampled_at,
     })
 }
@@ -2138,6 +2164,11 @@ mod tests {
                     count: *count,
                 })
                 .collect(),
+            session_threads: rows
+                .iter()
+                .filter(|(name, _)| name.starts_with("terminal-"))
+                .map(|(_, n)| n)
+                .sum(),
             sampled_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         }
     }
@@ -2194,6 +2225,7 @@ mod tests {
         assert_eq!(v["byName"][1]["name"], "terminal-reader-*");
         assert_eq!(v["byName"].as_array().map(Vec::len), Some(2));
         assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
+        assert_eq!(v["sessionThreads"], 19);
         assert!(v.get("by_name").is_none(), "wire keys are camelCase");
     }
 

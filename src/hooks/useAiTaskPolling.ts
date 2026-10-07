@@ -11,6 +11,7 @@ import { isTaskFinished } from "../types/taskRun";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { useTaskRunProgress } from "@/hooks/graphql";
 import { invokeOperatorDoor } from "@/lib/operatorDoors";
+import { describeThrown } from "@/lib/utils";
 
 // Polling is now fallback only - GraphQL subscription is primary
 const DEFAULT_POLL_INTERVAL_MS = 15000; // Relaxed from 5s since subscription handles real-time
@@ -285,7 +286,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
         onCompleteRef.current?.(syntheticTask);
         return syntheticTask;
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
+        const errorMsg = describeThrown(err, "AI task failed");
         setError(errorMsg);
         setIsRunning(false);
         onErrorRef.current?.(errorMsg);

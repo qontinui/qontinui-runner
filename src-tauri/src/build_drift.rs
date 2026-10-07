@@ -574,68 +574,149 @@ fn store_both(policy: Option<TrunkToolPolicy>, status: BuildDriftStatus) {
 
 /// Detached periodic drift check — runs once immediately at startup, then
 /// every [`CHECK_INTERVAL`]. WARNs on each tick that finds non-zero drift.
+///
+/// Each tick is gated at its HEAD on the background-work verdict (plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+/// Phase 3): the check reaches the uncached `git_trunk`, so under a commit
+/// exhaustion this loop was one of the four feeding `git_trunk: git` failures
+/// into the log. It skips at WARN and CRITICAL and resumes on the next tick
+/// that runs. A skipped tick leaves the previous status (and its `checkedAt`)
+/// in place — `/health` shows an older check, never a fabricated one — and a
+/// tick skipped at startup leaves the status UNKNOWN, which is what it reports
+/// before any check has run.
 pub async fn run_periodic() {
+    let mut shed = crate::resource_guard::BackgroundShed::new(
+        "build_drift",
+        crate::resource_guard::ShedPolicy::SkipTick,
+    );
     loop {
-        // A panicked tick must clear BOTH caches, not just the status. The
-        // fallback below is an all-null status; pairing it with the previous
-        // tick's surviving `trunkSha` / `trunkReadAt` is exactly the
-        // cross-tick pairing the unified store exists to prevent, so the
-        // panic arm stores `None` for the policy too. On the normal arm
-        // `check_once_blocking` has already stored both and nothing more is
-        // owed here.
-        let status = match spawn_blocking_tracked(check_once_blocking).await {
-            Ok(status) => status,
-            Err(e) => {
-                warn!(error = %e, "build drift: check task panicked");
-                let status = BuildDriftStatus {
-                    checked_at: chrono::Utc::now().timestamp_millis(),
-                    main_sha: None,
-                    behind: None,
-                    commits_behind: None,
-                    divergent: None,
-                    commits_ahead: None,
-                };
-                store_both(None, status.clone());
-                status
-            }
-        };
-
-        match (status.behind, status.main_sha.as_deref()) {
-            (Some(true), Some(main)) => warn!(
-                git_sha = env!("QONTINUI_GIT_SHA"),
-                main_sha = main,
-                commits_behind = ?status.commits_behind,
-                "build drift: this binary was NOT built from the trunk's current \
-                 commit — shipped fixes may not be running here"
-            ),
-            (Some(false), _) => debug!(
-                git_sha = env!("QONTINUI_GIT_SHA"),
-                "build drift: binary matches the trunk tip"
-            ),
-            // Divergent from trunk with an UNMEASURABLE gap. Deliberately
-            // `debug!`, not the WARN above: `ls-remote` gave us the tip's SHA
-            // without fetching the object, so `rev-list --count` cannot run
-            // and we do not know whether this build is behind trunk, ahead of
-            // it, or both. Warning here is what produced a false "shipped
-            // fixes may not be running" on every branch build.
-            (None, Some(main)) if status.divergent == Some(true) => debug!(
-                git_sha = env!("QONTINUI_GIT_SHA"),
-                main_sha = main,
-                "build drift: binary differs from the trunk tip, but the gap is \
-                 not measurable locally (trunk commit not fetched) — drift UNKNOWN"
-            ),
-            _ => debug!(
-                "build drift: trunk tip unresolvable (no repo / no network) — reporting unknown"
-            ),
-        }
-
+        drift_cycle(
+            &mut shed,
+            &crate::resource_guard::background_work_verdict(),
+            check_and_report,
+        )
+        .await;
         tokio::time::sleep(CHECK_INTERVAL).await;
+    }
+}
+
+/// One periodic tick: run `check` only if `shed` admits `verdict`. The verdict
+/// and the check are injected so a test can prove a shed tick reaches no `git`.
+async fn drift_cycle<F, Fut>(
+    shed: &mut crate::resource_guard::BackgroundShed,
+    verdict: &crate::resource_guard::BackgroundWork,
+    check: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if shed.admit(verdict) {
+        check().await;
+    }
+}
+
+/// One drift check: resolve the trunk, store the status, and log the verdict.
+async fn check_and_report() {
+    // A panicked tick must clear BOTH caches, not just the status. The
+    // fallback below is an all-null status; pairing it with the previous
+    // tick's surviving `trunkSha` / `trunkReadAt` is exactly the
+    // cross-tick pairing the unified store exists to prevent, so the
+    // panic arm stores `None` for the policy too. On the normal arm
+    // `check_once_blocking` has already stored both and nothing more is
+    // owed here.
+    let status = match spawn_blocking_tracked(check_once_blocking).await {
+        Ok(status) => status,
+        Err(e) => {
+            warn!(error = %e, "build drift: check task panicked");
+            let status = BuildDriftStatus {
+                checked_at: chrono::Utc::now().timestamp_millis(),
+                main_sha: None,
+                behind: None,
+                commits_behind: None,
+                divergent: None,
+                commits_ahead: None,
+            };
+            store_both(None, status.clone());
+            status
+        }
+    };
+
+    match (status.behind, status.main_sha.as_deref()) {
+        (Some(true), Some(main)) => warn!(
+            git_sha = env!("QONTINUI_GIT_SHA"),
+            main_sha = main,
+            commits_behind = ?status.commits_behind,
+            "build drift: this binary was NOT built from the trunk's current \
+             commit — shipped fixes may not be running here"
+        ),
+        (Some(false), _) => debug!(
+            git_sha = env!("QONTINUI_GIT_SHA"),
+            "build drift: binary matches the trunk tip"
+        ),
+        // Divergent from trunk with an UNMEASURABLE gap. Deliberately
+        // `debug!`, not the WARN above: `ls-remote` gave us the tip's SHA
+        // without fetching the object, so `rev-list --count` cannot run
+        // and we do not know whether this build is behind trunk, ahead of
+        // it, or both. Warning here is what produced a false "shipped
+        // fixes may not be running" on every branch build.
+        (None, Some(main)) if status.divergent == Some(true) => debug!(
+            git_sha = env!("QONTINUI_GIT_SHA"),
+            main_sha = main,
+            "build drift: binary differs from the trunk tip, but the gap is \
+             not measurable locally (trunk commit not fetched) — drift UNKNOWN"
+        ),
+        _ => {
+            debug!("build drift: trunk tip unresolvable (no repo / no network) — reporting unknown")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 3 (plan 2026-09-23-…-ungated): a drift tick at WARN or CRITICAL
+    /// never runs the check — so never reaches `git_trunk` — and logs the shed
+    /// once; the next `Run` tick checks again with no backoff.
+    #[test]
+    fn drift_cycle_sheds_the_check_at_warn_and_critical() {
+        use crate::resource_guard::{
+            capture_logs, test_skip_verdict, test_throttle_verdict, BackgroundShed, BackgroundWork,
+            ShedPolicy,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let checks = AtomicUsize::new(0);
+        let counter = &checks;
+        let check = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), logs) = capture_logs(|| {
+            rt.block_on(async {
+                let mut shed = BackgroundShed::new("build_drift", ShedPolicy::SkipTick);
+                for _ in 0..5 {
+                    drift_cycle(&mut shed, &test_skip_verdict(), check).await;
+                    drift_cycle(&mut shed, &test_throttle_verdict(), check).await;
+                }
+                assert_eq!(
+                    checks.load(Ordering::SeqCst),
+                    0,
+                    "a shed tick checks nothing"
+                );
+                drift_cycle(&mut shed, &BackgroundWork::Run, check).await;
+                assert_eq!(checks.load(Ordering::SeqCst), 1);
+            })
+        });
+        assert_eq!(
+            logs.matches("skipping build_drift's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
 
     #[test]
     fn divergence_is_prefix_match_on_the_12_char_embedded_sha() {

@@ -15,6 +15,26 @@ fn main() {
     // own), i.e. a binary that compiles and then panics on startup.
     guard_tokio_console_cfg();
 
+    // Pin the main-thread stack reserve HERE, not only in
+    // `src-tauri/.cargo/config.toml`. Cargo reads `.cargo/config.toml` from its
+    // CWD upward, so any cargo run from the repo ROOT never sees that file's
+    // `/STACK` -- `pnpm run build:exe` did exactly that until scripts/build-exe.mjs
+    // moved its cargo step into src-tauri, and the exe got MSVC's default 1 MB.
+    // An exported `RUSTFLAGS` drops it the same way (it replaces config
+    // `rustflags` rather than merging). In a debug build the Tauri
+    // invoke-handler closure in `run_app` takes ~916 KB of stack in ONE frame
+    // (cdb `kn` on the 2026-09-30 overflow: Child-SP 0x..768aa830 -> 0x..7698a230),
+    // so the first webview IPC call overflowed the main thread every boot. A
+    // build-script link-arg is the backstop that holds whatever the CWD.
+    // The value must equal the `/STACK` in `.cargo/config.toml` (when both
+    // apply, the config's comes later on the link line and wins);
+    // `stack_reserve_tests` fails `cargo test` when they drift.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg-bins=/STACK:{MAIN_THREAD_STACK_RESERVE}");
+    }
+
     // Self-provision a `../dist/index.html` placeholder on a fresh worktree so a
     // bare `cargo check`/`cargo build` doesn't panic inside
     // `tauri::generate_context!` — `tauri.conf.json` pins
@@ -627,6 +647,11 @@ fn external_bin_patch(existing: Option<&str>) -> Result<String, String> {
     bundle.insert("externalBin".to_string(), Value::Null);
     serde_json::to_string(&root).map_err(|e| e.to_string())
 }
+
+/// The MSVC main-thread stack reserve, in bytes, that `main` links into every
+/// bin. Every other place that states a `/STACK` for this crate must carry this
+/// same value; `stack_reserve_tests` reads each of them.
+const MAIN_THREAD_STACK_RESERVE: u64 = 8_388_608;
 
 /// Refuse to build `--features debug-tokio-console` unless the build also
 /// carries `--cfg tokio_unstable`.
@@ -1512,5 +1537,70 @@ mod sidecar_scope_tests {
         std::fs::create_dir(tmp.path().join("qontinui-pr")).unwrap();
         assert!(remove_zero_length_sidecar_copies(tmp.path(), "").is_empty());
         assert!(tmp.path().join("qontinui-pr").is_dir());
+    }
+}
+
+/// The `/STACK` reserve is stated in four places: `main` above (the backstop
+/// that holds whatever cargo's CWD), `.cargo/config.toml` (which wins when it
+/// is read), and the two `scripts/dev-tokio-console.{ps1,sh}` twins (which
+/// re-state the config's rustflags because their `CARGO_ENCODED_RUSTFLAGS`
+/// replaces them). A value
+/// changed in one place only would leave the exe's reserve depending on which
+/// build path produced it.
+#[cfg(test)]
+mod stack_reserve_tests {
+    use super::MAIN_THREAD_STACK_RESERVE;
+
+    /// Every `/STACK:<n>` value in `text`, in order.
+    fn stack_values(text: &str) -> Vec<u64> {
+        text.match_indices("/STACK:")
+            .map(|(i, m)| {
+                let digits: String = text[i + m.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits
+                    .parse()
+                    .unwrap_or_else(|_| panic!("`/STACK:` with no number at byte {i}"))
+            })
+            .collect()
+    }
+
+    fn assert_matches_build_script(name: &str, text: &str) {
+        let values = stack_values(text);
+        assert!(!values.is_empty(), "{name} states no `/STACK:` value");
+        for v in values {
+            assert_eq!(
+                v, MAIN_THREAD_STACK_RESERVE,
+                "{name} says /STACK:{v} but build.rs links /STACK:{MAIN_THREAD_STACK_RESERVE}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_config_stack_equals_the_build_script_backstop() {
+        assert_matches_build_script(".cargo/config.toml", include_str!(".cargo/config.toml"));
+    }
+
+    #[test]
+    fn tokio_console_ps1_script_stack_equals_the_build_script_backstop() {
+        assert_matches_build_script(
+            "scripts/dev-tokio-console.ps1",
+            include_str!("../scripts/dev-tokio-console.ps1"),
+        );
+    }
+
+    #[test]
+    fn tokio_console_bash_script_stack_equals_the_build_script_backstop() {
+        assert_matches_build_script(
+            "scripts/dev-tokio-console.sh",
+            include_str!("../scripts/dev-tokio-console.sh"),
+        );
+    }
+
+    #[test]
+    fn stack_values_reads_every_occurrence() {
+        assert_eq!(stack_values("a /STACK:1 b /STACK:22 /Brepro"), vec![1, 22]);
+        assert!(stack_values("no reserve here").is_empty());
     }
 }

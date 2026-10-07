@@ -621,9 +621,28 @@ const RESOLVED_SCOPE_NONE: &str = "none";
 /// purpose: `runner_context` reads both in a single render, so two independent
 /// locks would let one test's level sit beside another test's briefing.
 ///
+/// **It sits UNDER `env_lock` in the test-lock hierarchy.** Acquiring the pin
+/// takes `crate::test_env::env_lock()` FIRST and holds it for the pin's life
+/// (field `1`). `env_lock` is reentrant per thread, so a test may take the pin
+/// and `env_lock` / `isolated_ambient()` in EITHER order: whichever it takes
+/// second nests on the env lock it already holds. Before this, the pin was a
+/// sibling of `env_lock` taken in both orders across the crate — 25
+/// `plan_library` tests pin-then-env, four `terminal` / `agent_runtime` tests
+/// env-then-pin — an AB/BA cycle that hung `cargo test` whenever two of them
+/// overlapped. Plan
+/// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`;
+/// `env_test_lock_hierarchy_guard.rs` enforces the shape for every test lock.
+///
+/// Field order is load-bearing: `Drop::drop` restores the globals first, then
+/// the fields drop in declaration order — the pin mutex, then the env guard —
+/// so the restore runs while BOTH locks are still held.
+///
 /// NEVER compiled into a release binary.
 #[cfg(test)]
-pub(crate) struct PlanCaptureLevelPin(std::sync::MutexGuard<'static, ()>);
+pub(crate) struct PlanCaptureLevelPin(
+    std::sync::MutexGuard<'static, ()>,
+    crate::test_env::EnvLockGuard,
+);
 
 #[cfg(test)]
 impl PlanCaptureLevelPin {
@@ -699,6 +718,9 @@ pub(crate) fn briefing_for_test(
 #[cfg(test)]
 pub(crate) fn pin_plan_capture_level_for_test(level: &str) -> PlanCaptureLevelPin {
     static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    // The hierarchy root FIRST — see [`PlanCaptureLevelPin`]. Taking the pin's
+    // own mutex before this is the AB/BA deadlock this line exists to prevent.
+    let env = crate::test_env::env_lock();
     let guard = LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         // A poisoned mutex means a PREVIOUS test panicked while holding it. Its
@@ -706,7 +728,7 @@ pub(crate) fn pin_plan_capture_level_for_test(level: &str) -> PlanCaptureLevelPi
         // every later test on it would only hide the original failure.
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let pin = PlanCaptureLevelPin(guard);
+    let pin = PlanCaptureLevelPin(guard, env);
     pin.set(level);
     pin
 }
@@ -3624,6 +3646,106 @@ mod tests {
         }
         assert_eq!(effective_plan_capture_level(), "record");
         assert_eq!(effective_plan_capture_scope(), None);
+    }
+
+    /// A held pin implies THIS thread holds the env lock — the hierarchy
+    /// property the deadlock fix rests on, asserted directly rather than only
+    /// through its absence-of-hang consequence below. And it is released with
+    /// the pin, so a pin cannot leak the env lock into the rest of the test.
+    #[test]
+    fn a_held_pin_holds_the_env_lock_on_this_thread() {
+        let before = crate::test_env::env_lock_depth();
+        {
+            let _pin = pin_plan_capture_level_for_test("off");
+            assert!(
+                crate::test_env::env_lock_depth() > before,
+                "the plan-capture pin must hold `env_lock` for its whole life — it is a CHILD \
+                 of the env lock in the test-lock hierarchy, not a sibling"
+            );
+            // Nesting the other way round on the same thread must not block.
+            let _env = crate::test_env::env_lock();
+        }
+        assert_eq!(crate::test_env::env_lock_depth(), before);
+    }
+
+    /// REGRESSION: the pin and `env_lock` taken in OPPOSITE orders on two
+    /// threads at once must not deadlock.
+    ///
+    /// Thread A takes the pin then `env_lock`; thread B takes `env_lock` then
+    /// the pin — `plan_library`'s and `terminal` / `agent_runtime`'s orders. On
+    /// the pre-fix code (the pin a sibling of `env_lock`) both reach their
+    /// first lock, meet at the rendezvous and then wait on each other forever.
+    /// With the fix both first acquisitions are the same `ENV_LOCK`, so B
+    /// blocks on its first lock, A times out at the rendezvous and finishes,
+    /// and B then runs.
+    ///
+    /// The rendezvous is BOUNDED on purpose. A `std::sync::Barrier` would hang
+    /// on the FIXED code too: B can never reach it while A holds `ENV_LOCK`.
+    ///
+    /// The tight DEADLOCK bound starts only once A HOLDS its first lock. Until
+    /// then A may simply be queueing behind other env-locked tests in a loaded
+    /// full-suite run — that wait is not a deadlock, so it gets a generous
+    /// hang-guard bound instead. After A holds its first lock, its remaining
+    /// work only nests on locks it already holds (fixed code) or blocks on B
+    /// forever (pre-fix code), so `DEADLOCK_BOUND` separates the two cleanly.
+    ///
+    /// MUTATION CHECK — run this test ALONE (`-- the_pin_and_env_lock_cannot_deadlock
+    /// --exact`-style filter). On the pre-fix code the two deadlocked threads
+    /// keep `ENV_LOCK` and the pin forever, so every later env-locked test in
+    /// the same binary run would hang behind them rather than fail.
+    #[test]
+    fn the_pin_and_env_lock_cannot_deadlock_when_taken_in_opposite_orders() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const RENDEZVOUS: Duration = Duration::from_secs(2);
+        const DEADLOCK_BOUND: Duration = Duration::from_secs(10);
+        const QUEUE_BOUND: Duration = Duration::from_secs(300);
+
+        let (a_ready_tx, a_ready_rx) = mpsc::channel::<()>();
+        let (b_ready_tx, b_ready_rx) = mpsc::channel::<()>();
+        let (a_holds_tx, a_holds_rx) = mpsc::channel::<()>();
+        let (a_done_tx, a_done_rx) = mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
+
+        let a = std::thread::spawn(move || {
+            let pin = pin_plan_capture_level_for_test("off");
+            let _ = a_holds_tx.send(());
+            let _ = a_ready_tx.send(());
+            let _ = b_ready_rx.recv_timeout(RENDEZVOUS);
+            let env = crate::test_env::env_lock();
+            drop(env);
+            drop(pin);
+            let _ = a_done_tx.send(());
+        });
+        let b = std::thread::spawn(move || {
+            let env = crate::test_env::env_lock();
+            let _ = b_ready_tx.send(());
+            let _ = a_ready_rx.recv_timeout(RENDEZVOUS);
+            let pin = pin_plan_capture_level_for_test("off");
+            drop(pin);
+            drop(env);
+            let _ = b_done_tx.send(());
+        });
+
+        a_holds_rx.recv_timeout(QUEUE_BOUND).expect(
+            "thread A never acquired the plan-capture pin within the queueing bound: either \
+             another test held `env_lock` / the pin for minutes, or the pin deadlocks INSIDE \
+             its own acquisition (e.g. it takes `env_lock` AFTER its mutex instead of before)",
+        );
+        if a_done_rx.recv_timeout(DEADLOCK_BOUND).is_err() {
+            panic!(
+                "DEADLOCK: the plan-capture pin and `env_lock` taken in opposite orders on two \
+                 threads — thread A held its first lock and could not finish within \
+                 {DEADLOCK_BOUND:?}. The pin must acquire `crate::test_env::env_lock()` BEFORE \
+                 its own mutex — see `PlanCaptureLevelPin`."
+            );
+        }
+        b_done_rx
+            .recv_timeout(QUEUE_BOUND)
+            .expect("thread B (env_lock then pin) did not finish once A released its locks");
+        a.join().expect("pin-then-env thread");
+        b.join().expect("env-then-pin thread");
     }
 
     #[test]

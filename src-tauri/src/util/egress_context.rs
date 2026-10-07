@@ -361,7 +361,7 @@ pub(crate) fn handle_census() -> HandleCensus {
 // evidence` `a-control-must-test-the-property-it-names`:
 //
 // 1. the headroom read below — a direct measurement, taken on demand;
-// 2. the EMFILE/ENFILE stamp (`util::fd_exhaustion::note_fd_exhaustion`, in
+// 2. the EMFILE/ENFILE stamp (`util::resource_exhaustion::note_fd_exhaustion`, in
 //    the LIB crate so the bin and lib copies of `process_helpers` stamp ONE
 //    static) — a POSITIVE event
 //    recorded by any site that actually hit the ceiling with the `io::Error`
@@ -384,7 +384,7 @@ pub(crate) fn open_descriptor_count() -> Measured {
                 // process is AT its descriptor ceiling is itself the positive
                 // evidence — record it through the second authority instead
                 // of letting it collapse into a bare "unreadable".
-                if qontinui_runner_lib::util::fd_exhaustion::note_fd_exhaustion(&e) {
+                if qontinui_runner_lib::util::resource_exhaustion::note_fd_exhaustion(&e) {
                     Measured::Unavailable("/proc/self/fd unreadable: descriptor ceiling reached")
                 } else {
                     Measured::Unavailable("/proc/self/fd unreadable")

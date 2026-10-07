@@ -249,7 +249,7 @@ fn parse_crash_dump(path: &Path, mtime: SystemTime) -> Option<RecentCrash> {
 
 /// Return the first non-empty trimmed line following a section header.
 /// Returns `None` if the header is absent or no non-empty content follows.
-fn extract_section(content: &str, header: &str) -> Option<String> {
+pub(crate) fn extract_section(content: &str, header: &str) -> Option<String> {
     let mut lines = content.lines();
     while let Some(line) = lines.next() {
         if line.trim() == header {

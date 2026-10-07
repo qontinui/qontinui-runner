@@ -68,8 +68,10 @@
 //!
 //! ## Sizing
 //!
-//! `node_modules` and the build `target` dir (`target` for cargo repos,
-//! `src-tauri/target` for the Tauri runner) are measured with a
+//! `node_modules` and the build `target` dir (resolved from the checked-in
+//! cargo manifests by [`target_dir_for`]: `<root>/target` for a root
+//! `Cargo.toml` — including the runner, whose cargo WORKSPACE is the repo
+//! root — `src-tauri/target` only for a Tauri-only layout) are measured with a
 //! recursive walk that **skips any reparse point** (junction) — it
 //! reports 0 bytes for a junctioned dir and never traverses it. This is
 //! the load-bearing safety property: junctioned build dirs (the runner
@@ -439,6 +441,7 @@ fn merged_snapshot(
             tenant_id,
             volumes,
             worktrees,
+            cargo_locks: None,
         }),
         taken_at: now,
         build_ms,
@@ -692,6 +695,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: chunk.rows,
+            cargo_locks: None,
         };
         self.send(body, true).await;
     }
@@ -706,7 +710,11 @@ impl ChunkPoster {
     /// exactly as stale after it as before, and letting a 60 s volume POST
     /// open the gate would hand the reclaim poller the previous boot's stale
     /// census — precisely the husk-creating race the gate exists to prevent.
-    async fn post_volumes(&mut self, volumes: Vec<VolumeReport>) {
+    async fn post_volumes(
+        &mut self,
+        volumes: Vec<VolumeReport>,
+        cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
+    ) {
         // DEFENSIVE, not a live path: the only caller
         // ([`sample_and_publish_volumes`]) already returns on an empty probe,
         // so this branch is currently unreachable. It is kept because the
@@ -723,6 +731,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: Vec::new(),
+            cargo_locks,
         };
         self.send(body, false).await;
     }
@@ -1076,7 +1085,7 @@ pub struct WorktreeCensus {
     /// exclusive-open probe + recent-activity mtime window). Reported every
     /// census tick regardless of reclaim arming, so coord can gauge
     /// "instructions that WOULD have been G6-skipped" while arming is still
-    /// OFF — the passive prove-out feed for the Q1 rejunction graduation.
+    /// OFF — the passive prove-out feed for arming reclaim.
     /// `Some(_)` is the live probe result; old runners omit the field and
     /// coord reads NULL (honest unknown).
     pub building: Option<bool>,
@@ -1237,6 +1246,14 @@ pub struct WorktreeCensusReq {
     pub tenant_id: Option<Uuid>,
     pub volumes: Vec<VolumeReport>,
     pub worktrees: Vec<WorktreeCensus>,
+    /// Shared cargo target-dir lock state (plan
+    /// `2026-09-19-build-slots-are-not-build-parallelism-cargo-target-lock-and-devops-allocation-stats`
+    /// Phase 2). Carried ONLY on the 60 s volumes-only POST — it is device-level
+    /// and minute-fresh, like `volumes`; a census chunk leaves it `None`.
+    /// OMITTED when `None` = UNKNOWN (non-Linux, or the probe failed), so an
+    /// older coord is unaffected; `Some(vec![])` = measured, no shared targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,21 +1429,33 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     (true, false, dir_size_skipping_junctions(dir))
 }
 
-/// Pick the build `target` dir for a worktree. The Tauri runner's cargo
-/// workspace lives under `src-tauri/`, so its target is
-/// `src-tauri/target`; everything else uses `target`. We prefer
-/// `src-tauri/target` when `src-tauri/` exists, else fall back to the
-/// top-level `target`.
+/// Pick the build `target` dir to MEASURE for a worktree, keyed on the
+/// checked-in cargo manifests — cargo's own layout rule, not on which
+/// `target` dirs happen to exist:
+///
+/// 1. `<root>/Cargo.toml` is a file → `<root>/target`. It is either a
+///    workspace root (qontinui-runner: `[workspace] members = ["src-tauri",
+///    …]`) or a root package; cargo writes the build output there either way.
+/// 2. Otherwise `<root>/src-tauri/Cargo.toml` is a file → `<root>/src-tauri/target`
+///    (a Tauri-only layout with no root manifest).
+/// 3. Otherwise → `<root>/target`: not a cargo project, and the value is only
+///    a measurement path.
+///
+/// No `exists()` check on any `target` dir: the answer depends only on
+/// manifests, so it is the same at census time and at execution time. The old
+/// "prefer `src-tauri/target` when `src-tauri/` exists" fallback pointed the
+/// census at a ~2 MB `schemas.json` stub while the real workspace output sat in
+/// `<root>/target` (plan
+/// `2026-09-30-rejunction-sinks-follow-the-cargo-workspace-and-coord-stops-emitting-refused-rejunctions`,
+/// D1). A nested `[workspace]` under `src-tauri/` beside a root manifest is out
+/// of scope — no fleet repo has one.
 pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
+    if worktree.join("Cargo.toml").is_file() {
+        return worktree.join("target");
+    }
     let src_tauri = worktree.join("src-tauri");
-    if src_tauri.is_dir() {
-        let st_target = src_tauri.join("target");
-        // Use src-tauri/target if it exists OR if there's no top-level
-        // target (the Tauri layout). If the operator happens to have a
-        // top-level target too, prefer the one that actually exists.
-        if st_target.exists() || !worktree.join("target").exists() {
-            return st_target;
-        }
+    if src_tauri.join("Cargo.toml").is_file() {
+        return src_tauri.join("target");
     }
     worktree.join("target")
 }
@@ -2610,6 +2639,7 @@ fn build_census_chunked(
         tenant_id,
         volumes,
         worktrees,
+        cargo_locks: None,
     }
 }
 
@@ -2957,7 +2987,82 @@ async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     let Some(cached) = guard.as_mut() else {
         return;
     };
-    cached.poster.post_volumes(volumes).await;
+    // Nothing will be sent (coord unconfigured, or a secondary instance): skip
+    // the `/proc` probe entirely rather than measure for nobody.
+    if cached.poster.dest.is_none() {
+        return;
+    }
+    let cargo_locks = probe_cargo_locks().await;
+    cached.poster.post_volumes(volumes, cargo_locks).await;
+}
+
+/// Upper bound on the shared-target lock probe. It reads `/proc` and, on an
+/// unconfirmed holder, scans `/proc/*/fd` — normally milliseconds, but a
+/// saturated box must not stall the volume POST behind it.
+const CARGO_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared cargo target lock state for this tick
+/// ([`super::cargo_locks::probe_current`]) on the blocking pool, bounded by
+/// [`CARGO_LOCK_PROBE_TIMEOUT`]. A failed or timed-out probe is UNKNOWN
+/// (`None` → the field is omitted), never an empty list.
+async fn probe_cargo_locks() -> Option<Vec<super::cargo_locks::CargoLockItem>> {
+    // A timed-out probe keeps running on its blocking thread; while it does,
+    // later ticks skip instead of stacking one more blocked thread each.
+    if CARGO_LOCK_PROBE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug!("worktree_census: previous cargo lock probe still running — cargo_locks UNKNOWN this tick");
+        return None;
+    }
+    // The guard exists BEFORE the spawn and moves into the closure, so the flag
+    // clears on every path: normal return, panic, and a closure dropped unrun
+    // (runtime shutdown while queued, or a panicking spawn).
+    let in_flight = ClearOnDrop(&CARGO_LOCK_PROBE_IN_FLIGHT);
+    let task = spawn_blocking_tracked(move || {
+        let _in_flight = in_flight;
+        super::cargo_locks::probe_current()
+    });
+    match tokio::time::timeout(CARGO_LOCK_PROBE_TIMEOUT, task).await {
+        Ok(Ok(locks)) => locks,
+        Ok(Err(e)) => {
+            debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
+            None
+        }
+        Err(_) => {
+            emit_throttled(
+                &LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH,
+                now_epoch_secs(),
+                CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS,
+                || {
+                    warn!(
+                        "worktree_census: cargo lock probe exceeded {}s — cargo_locks UNKNOWN; \
+                         later ticks skip the probe until it finishes",
+                        CARGO_LOCK_PROBE_TIMEOUT.as_secs()
+                    );
+                    true
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Set while a cargo lock probe runs on the blocking pool (cleared by
+/// [`ClearOnDrop`] when that thread finishes, even on panic).
+static CARGO_LOCK_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Throttle for the probe-timeout warning: one per 10 minutes.
+const CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS: u64 = 600;
+static LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
+
+/// Clears an in-flight flag when dropped.
+struct ClearOnDrop(&'static AtomicBool);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Spawn the dedicated volume publisher on the ambient tokio runtime.
@@ -3034,18 +3139,62 @@ pub fn spawn_census() {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shed = crate::resource_guard::BackgroundShed::new(
+            "worktree_census",
+            crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
+        );
         loop {
             tick.tick().await;
-            match build_and_publish().await {
-                Ok(BuildOutcome::Built(req)) => debug!(
-                    "worktree_census: periodic walk published {} rows",
-                    req.worktrees.len()
-                ),
-                Ok(BuildOutcome::AlreadyRunning | BuildOutcome::Skipped) => {}
-                Err(e) => warn!("worktree_census: {e}"),
-            }
+            census_cycle(
+                &mut shed,
+                &crate::resource_guard::background_work_verdict(),
+                build_and_publish,
+            )
+            .await;
         }
     });
+}
+
+/// One periodic census tick: consult the background-work verdict at the HEAD
+/// of the tick, and walk only if it admits.
+///
+/// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+/// Phase 3. The census is the largest single burst the runner makes — ~12–15
+/// `git` per worktree row, ≈2,500 spawns per tick on a ~200-row box — and until
+/// this gate it ran on schedule straight through a commit exhaustion, each
+/// failed spawn one more WARN. Below the warn floor the walk runs one tick in
+/// four (a quarter of the rate, never stopped); below the critical floor it is
+/// skipped and the loop backs off
+/// ([`crate::resource_guard::ShedPolicy::ThrottleAndBackoff`]), so an oscillating
+/// box is not handed the whole burst on the first tick it pokes back above the
+/// floor. A skipped census loses nothing: the next walk recomputes every row.
+///
+/// Gated HERE, on the periodic tick, and not inside `build_and_publish` —
+/// `spawn_census_rebuild` (`?refresh=1`) reaches the walk directly, and that is
+/// an operator asking for an answer now; shedding it would turn memory pressure
+/// into a silently missing census.
+///
+/// The verdict and the walk are injected so a test can prove a shed tick
+/// spawns nothing at all.
+async fn census_cycle<F, Fut>(
+    shed: &mut crate::resource_guard::BackgroundShed,
+    verdict: &crate::resource_guard::BackgroundWork,
+    walk: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<BuildOutcome, String>>,
+{
+    if !shed.admit(verdict) {
+        return;
+    }
+    match walk().await {
+        Ok(BuildOutcome::Built(req)) => debug!(
+            "worktree_census: periodic walk published {} rows",
+            req.worktrees.len()
+        ),
+        Ok(BuildOutcome::AlreadyRunning | BuildOutcome::Skipped) => {}
+        Err(e) => warn!("worktree_census: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3055,6 +3204,115 @@ pub fn spawn_census() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 3 (plan 2026-09-23-…-ungated): at a CRITICAL verdict the periodic
+    /// census tick never starts the walk — zero `git` spawns — across any
+    /// number of ticks, and says so exactly once. Once the reading recovers it
+    /// waits out its capped backoff and then walks again.
+    #[test]
+    fn census_cycle_sheds_the_walk_at_critical_and_logs_once() {
+        use crate::resource_guard::{
+            capture_logs, test_skip_verdict, BackgroundShed, BackgroundWork, ShedPolicy,
+            SHED_BACKOFF_MAX_CYCLES,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let walks = AtomicUsize::new(0);
+        let counter = &walks;
+        let walk = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(BuildOutcome::Skipped)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), logs) = capture_logs(|| {
+            rt.block_on(async {
+                let mut shed =
+                    BackgroundShed::new("worktree_census", ShedPolicy::ThrottleAndBackoff);
+                let skip = test_skip_verdict();
+                for _ in 0..10 {
+                    census_cycle(&mut shed, &skip, walk).await;
+                }
+                assert_eq!(walks.load(Ordering::SeqCst), 0, "a shed tick walks nothing");
+
+                // Recovery: the backoff (capped) is served first, then it walks.
+                for _ in 0..SHED_BACKOFF_MAX_CYCLES {
+                    census_cycle(&mut shed, &BackgroundWork::Run, walk).await;
+                }
+                assert_eq!(walks.load(Ordering::SeqCst), 0, "still holding off");
+                census_cycle(&mut shed, &BackgroundWork::Run, walk).await;
+                assert_eq!(walks.load(Ordering::SeqCst), 1);
+            })
+        });
+        assert_eq!(
+            logs.matches("skipping worktree_census's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// Sustained WARN thins the census, it does not stop it: one walk every
+    /// fourth tick, logged once.
+    #[test]
+    fn census_cycle_runs_one_tick_in_four_at_sustained_warn() {
+        use crate::resource_guard::{
+            capture_logs, test_throttle_verdict, BackgroundShed, ShedPolicy,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let walks = AtomicUsize::new(0);
+        let counter = &walks;
+        let walk = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(BuildOutcome::Skipped)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), logs) = capture_logs(|| {
+            rt.block_on(async {
+                let mut shed =
+                    BackgroundShed::new("worktree_census", ShedPolicy::ThrottleAndBackoff);
+                let throttle = test_throttle_verdict();
+                for _ in 0..12 {
+                    census_cycle(&mut shed, &throttle, walk).await;
+                }
+            })
+        });
+        assert_eq!(walks.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            logs.matches("throttling worktree_census's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// UNKNOWN runs as today: a `Run` verdict walks on every tick.
+    #[test]
+    fn census_cycle_walks_every_tick_when_run() {
+        use crate::resource_guard::{BackgroundShed, BackgroundWork, ShedPolicy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let walks = AtomicUsize::new(0);
+        let counter = &walks;
+        let walk = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(BuildOutcome::Skipped)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut shed = BackgroundShed::new("worktree_census", ShedPolicy::ThrottleAndBackoff);
+            for _ in 0..3 {
+                census_cycle(&mut shed, &BackgroundWork::Run, walk).await;
+            }
+        });
+        assert_eq!(walks.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn custody_occupants_are_none_without_slots_and_omit_absent_fields() {
@@ -3504,17 +3762,52 @@ mod tests {",
         assert_eq!(drive_letter_of(Path::new("relative/path")), None);
     }
 
+    /// (a) The runner / merytshost case: a ROOT workspace manifest beside a
+    /// `src-tauri/Cargo.toml` member, a `src-tauri/target` stub and NO root
+    /// `target` yet → still `<root>/target`, where cargo writes.
     #[test]
-    fn target_dir_prefers_src_tauri_when_present() {
+    fn target_dir_follows_root_workspace_over_src_tauri_stub() {
         let dir = tempfile::tempdir().unwrap();
-        // No src-tauri → top-level target.
-        assert_eq!(target_dir_for(dir.path()), dir.path().join("target"));
-        // With src-tauri/ → src-tauri/target.
-        std::fs::create_dir(dir.path().join("src-tauri")).unwrap();
-        assert_eq!(
-            target_dir_for(dir.path()),
-            dir.path().join("src-tauri").join("target")
-        );
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"src-tauri\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src-tauri").join("target")).unwrap();
+        std::fs::write(root.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        assert!(!root.join("target").exists());
+        assert_eq!(target_dir_for(root), root.join("target"));
+    }
+
+    /// (b) Tauri-only: `src-tauri/Cargo.toml` and no root manifest →
+    /// `src-tauri/target`, whether or not it exists yet.
+    #[test]
+    fn target_dir_tauri_only_layout_uses_src_tauri_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        std::fs::write(root.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(target_dir_for(root), root.join("src-tauri").join("target"));
+    }
+
+    /// (c) Plain cargo repo: root `Cargo.toml` only → `<root>/target`.
+    #[test]
+    fn target_dir_plain_cargo_repo_uses_root_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(target_dir_for(root), root.join("target"));
+    }
+
+    /// (d) No manifest anywhere, even with a `src-tauri/` dir → `<root>/target`
+    /// (the retired "prefer src-tauri when present" fallback was the defect).
+    #[test]
+    fn target_dir_without_manifest_ignores_bare_src_tauri_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src-tauri").join("target")).unwrap();
+        assert_eq!(target_dir_for(root), root.join("target"));
     }
 
     // -----------------------------------------------------------------
@@ -4897,6 +5190,7 @@ mod tests {",
                     // Same PATH, different repo — must be a distinct key.
                     row("qontinui-coord", "D:/x/a", 30),
                 ],
+                cargo_locks: None,
             }),
             taken_at: chrono::Utc::now() - chrono::Duration::hours(2),
             build_ms: 12_345,
@@ -4993,6 +5287,7 @@ mod tests {",
                 tenant_id: None,
                 volumes: Vec::new(),
                 worktrees: vec![row("qontinui-runner", "D:/x/a", 5)],
+                cargo_locks: None,
             },
             777,
         );

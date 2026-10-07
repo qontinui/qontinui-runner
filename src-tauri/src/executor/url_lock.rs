@@ -609,6 +609,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the sync path under test must run outside any runtime, so the test owns one; predates the disallowed_types gate; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+    )]
     fn test_release_all_sync() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mgr = UrlLockManager::new();

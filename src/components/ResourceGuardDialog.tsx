@@ -19,29 +19,31 @@
  * work, which is a worse failure than an occasional missed warning. There is no
  * silent-refusal path: either this dialog is on screen, or the refusal reached a
  * caller that reports it (coord `report_spawn_failed`, an HTTP error body).
+ *
+ * Every word comes from `lib/resourceGuardCopy.ts`: titled by the lane that
+ * actually refused (never a hard-coded "Low memory"), the consequence named for
+ * this OS only where it is true, the number of coalesced starts, the caller that
+ * asked, and how far "Start anyway" reaches (the lane-scoped grant).
  */
 
 import { ConfirmDialog } from "./ui";
 import { resolvePendingResourceBlock, usePendingResourceBlock } from "@/lib/resourceGuard";
+import { detectGuardOs, resourceGuardDialogCopy } from "@/lib/resourceGuardCopy";
 
 export function ResourceGuardDialog() {
   const pending = usePendingResourceBlock();
   if (!pending) return null;
+  const copy = resourceGuardDialogCopy(pending, detectGuardOs());
 
   return (
     <ConfirmDialog
       open
       variant="danger"
-      title="Low memory"
-      message={pending.message}
-      description={
-        "Starting anyway may cause Windows to kill a session that is already running — " +
-        "that is the failure this guard exists to prevent. Closing a build or an idle " +
-        "session first is usually enough. The floors are configurable under " +
-        "Settings > Resource Guard."
-      }
-      confirmText="Start anyway"
-      cancelText="Don't start"
+      title={copy.title}
+      message={copy.message}
+      description={copy.description}
+      confirmText={copy.confirmText}
+      cancelText={copy.cancelText}
       onConfirm={() => resolvePendingResourceBlock(true)}
       onClose={() => resolvePendingResourceBlock(false)}
     />

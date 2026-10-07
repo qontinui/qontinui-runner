@@ -55,7 +55,8 @@ $srcTauri = Join-Path (Split-Path -Parent $scriptDir) 'src-tauri'
 
 $hostTriple = (& rustc -vV | Select-String -Pattern '^host: ').ToString() -replace '^host: ', ''
 
-# Keep in sync with src-tauri/.cargo/config.toml [target.*] rustflags.
+# Keep in sync with src-tauri/.cargo/config.toml [target.*] rustflags. The
+# /STACK value is pinned by build.rs `stack_reserve_tests`.
 if ($hostTriple -like '*windows-msvc*') {
     $flags = @(
         '-C', 'link-args=/STACK:8388608 /Brepro',

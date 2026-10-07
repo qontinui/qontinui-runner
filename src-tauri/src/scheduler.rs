@@ -44,6 +44,8 @@ pub fn condition_status_default() -> ConditionStatus {
         waiting_since: chrono::Utc::now().to_rfc3339(),
         idle_met: None,
         repo_inactive_met: None,
+        probe_met: None,
+        probe_detail: None,
         timed_out: false,
     }
 }
@@ -234,7 +236,15 @@ impl ScheduledTaskExt for ScheduledTask {
                     .as_ref()
                     .map(|c| c.enabled && !c.repositories.is_empty())
                     .unwrap_or(false);
-                idle_enabled || repo_enabled
+                // An enabled probe counts even with an empty command: that is
+                // a condition that can never be met (a spawn failure), not an
+                // absent one — dropping it would run the task ungated.
+                let probe_enabled = cond
+                    .require_probe
+                    .as_ref()
+                    .map(|c| c.enabled)
+                    .unwrap_or(false);
+                idle_enabled || repo_enabled || probe_enabled
             }
             None => false,
         }

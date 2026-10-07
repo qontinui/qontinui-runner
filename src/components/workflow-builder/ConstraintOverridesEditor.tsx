@@ -11,6 +11,7 @@ import { ShieldCheck, Loader2, AlertTriangle } from "lucide-react";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { fetchActiveConstraints } from "@/lib/constraints-api";
 import type { Constraint } from "@qontinui/shared-types/constraints";
+import { describeThrown } from "@/lib/utils";
 
 type OverrideState = "default" | "enable" | "disable";
 
@@ -69,7 +70,7 @@ export function ConstraintOverridesEditor() {
       })
       .catch((err) => {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load constraints");
+          setError(describeThrown(err, "Failed to load constraints"));
           setLoading(false);
         }
       });

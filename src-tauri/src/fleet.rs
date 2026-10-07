@@ -1989,7 +1989,15 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
                 tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
             }
-            match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
+            // Off the async worker: the reconcile holds file locks that may
+            // wait (bounded) on a peer process.
+            let reconcile_set = coord_set;
+            let reconciled = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::pair::reconcile_paired_bindings(&reconcile_set)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
+            match reconciled {
                 Ok(report) => {
                     if report.changed() {
                         info!(
@@ -5152,15 +5160,64 @@ pub fn spawn_tree_publisher() {
         move |hb| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Rebuilt with the loop on a supervised restart, so a restart
+            // starts with no streak — a fresh loop has no episode to back off
+            // from.
+            let mut shed = crate::resource_guard::BackgroundShed::new(
+                "tree_publisher",
+                crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
+            );
             loop {
                 tick.tick().await;
+                // The heartbeat ticks whether or not the cycle is shed: a
+                // deliberately idle loop is a live loop, and the supervisor must
+                // not rebuild it for yielding.
                 hb.tick();
-                if let Err(e) = publish_tree_state().await {
-                    warn!("fleet::tree_publisher: {e}");
-                }
+                shed_gated_cycle(
+                    &mut shed,
+                    &crate::resource_guard::background_work_verdict(),
+                    "fleet::tree_publisher",
+                    publish_tree_state,
+                )
+                .await;
             }
         },
     );
+}
+
+/// One periodic tick of a fleet background loop, gated at its HEAD on the
+/// background-work verdict.
+///
+/// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+/// Phase 3. Two loops go through here: the tree publisher (~9 `git` per repo
+/// plus its `fetch_due` `git fetch`, every 60 s, across every `qontinui-*`
+/// checkout) and the auto-fresh engine (`check_if_behind` /
+/// `pull_and_update_app`, every 300 s). Both are periodic and idempotent — the
+/// next cycle recomputes every row from scratch — so a shed cycle costs one
+/// cycle of staleness and nothing else. What each does at Throttle vs Skip is
+/// the [`crate::resource_guard::ShedPolicy`] its loop constructed `shed` with.
+///
+/// The gate sits on the LOOP, not in `publish_tree_state` or `git_trunk`:
+/// those are reachable from on-demand paths an operator is waiting on, and a
+/// memory-pressure verdict must never turn into a silently missing answer there.
+///
+/// `verdict` and `cycle` are injected so a test can prove a shed tick runs
+/// nothing at all.
+async fn shed_gated_cycle<F, Fut>(
+    shed: &mut crate::resource_guard::BackgroundShed,
+    verdict: &crate::resource_guard::BackgroundWork,
+    loop_name: &str,
+    cycle: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if !shed.admit(verdict) {
+        return;
+    }
+    if let Err(e) = cycle().await {
+        warn!("{loop_name}: {e}");
+    }
 }
 
 /// P3 — Fleet-Wide Auto-Fresh Engine (fleet-fresh test-target routing)
@@ -5187,12 +5244,26 @@ pub fn spawn_auto_fresh_engine() {
         move |hb| async move {
             let mut tick = tokio::time::interval(Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Phase 3 of plan 2026-09-23-…-ungated: `check_if_behind` reaches
+            // the uncached `git_trunk` every cycle, so this loop is one of the
+            // four that turned a commit exhaustion into a stream of
+            // `git_trunk: git` failures. Skipped at WARN and CRITICAL with no
+            // backoff — a handful of `git` calls every five minutes is not a
+            // burst worth delaying recovery for.
+            let mut shed = crate::resource_guard::BackgroundShed::new(
+                "auto_fresh_engine",
+                crate::resource_guard::ShedPolicy::SkipTick,
+            );
             loop {
                 tick.tick().await;
                 hb.tick();
-                if let Err(e) = run_auto_fresh_cycle().await {
-                    warn!("fleet::auto_fresh_engine: {e}");
-                }
+                shed_gated_cycle(
+                    &mut shed,
+                    &crate::resource_guard::background_work_verdict(),
+                    "fleet::auto_fresh_engine",
+                    run_auto_fresh_cycle,
+                )
+                .await;
             }
         },
     );
@@ -5776,6 +5847,126 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 3 (plan 2026-09-23-…-ungated): at a CRITICAL verdict the tree
+    /// publisher's tick never calls `publish_tree_state` — so no `capture_tree`
+    /// and no `fetch_due` `git fetch`, zero `git` spawns — across repeated
+    /// ticks, and logs the skip exactly once. After the capped backoff it
+    /// publishes again.
+    #[test]
+    fn tree_publisher_tick_sheds_capture_at_critical_and_logs_once() {
+        use crate::resource_guard::{
+            capture_logs, test_skip_verdict, BackgroundShed, BackgroundWork, ShedPolicy,
+            SHED_BACKOFF_MAX_CYCLES,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let publishes = AtomicUsize::new(0);
+        let counter = &publishes;
+        let publish = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), logs) = capture_logs(|| {
+            rt.block_on(async {
+                let mut shed =
+                    BackgroundShed::new("tree_publisher", ShedPolicy::ThrottleAndBackoff);
+                let skip = test_skip_verdict();
+                for _ in 0..10 {
+                    shed_gated_cycle(&mut shed, &skip, "fleet::tree_publisher", publish).await;
+                }
+                assert_eq!(
+                    publishes.load(Ordering::SeqCst),
+                    0,
+                    "a shed tick captures nothing"
+                );
+                for _ in 0..SHED_BACKOFF_MAX_CYCLES {
+                    shed_gated_cycle(
+                        &mut shed,
+                        &BackgroundWork::Run,
+                        "fleet::tree_publisher",
+                        publish,
+                    )
+                    .await;
+                }
+                assert_eq!(publishes.load(Ordering::SeqCst), 0, "still holding off");
+                shed_gated_cycle(
+                    &mut shed,
+                    &BackgroundWork::Run,
+                    "fleet::tree_publisher",
+                    publish,
+                )
+                .await;
+                assert_eq!(publishes.load(Ordering::SeqCst), 1);
+            })
+        });
+        assert_eq!(
+            logs.matches("skipping tree_publisher's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// Sustained WARN thins the tree publisher to one publish every fourth
+    /// tick rather than stopping it.
+    #[test]
+    fn tree_publisher_tick_runs_one_tick_in_four_at_sustained_warn() {
+        use crate::resource_guard::{test_throttle_verdict, BackgroundShed, ShedPolicy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let publishes = AtomicUsize::new(0);
+        let counter = &publishes;
+        let publish = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut shed = BackgroundShed::new("tree_publisher", ShedPolicy::ThrottleAndBackoff);
+            let throttle = test_throttle_verdict();
+            for _ in 0..8 {
+                shed_gated_cycle(&mut shed, &throttle, "fleet::tree_publisher", publish).await;
+            }
+        });
+        assert_eq!(publishes.load(Ordering::SeqCst), 2);
+    }
+
+    /// The auto-fresh engine skips at WARN as well as CRITICAL, and resumes on
+    /// the very next `Run` tick — no backoff. A `Run` verdict (which is what an
+    /// UNKNOWN reading produces) runs every tick, exactly as before.
+    #[test]
+    fn auto_fresh_tick_skips_at_warn_and_critical_and_resumes_immediately() {
+        use crate::resource_guard::{
+            test_skip_verdict, test_throttle_verdict, BackgroundShed, BackgroundWork, ShedPolicy,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cycles = AtomicUsize::new(0);
+        let counter = &cycles;
+        let cycle = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut shed = BackgroundShed::new("auto_fresh_engine", ShedPolicy::SkipTick);
+            let name = "fleet::auto_fresh_engine";
+            shed_gated_cycle(&mut shed, &test_throttle_verdict(), name, cycle).await;
+            shed_gated_cycle(&mut shed, &test_skip_verdict(), name, cycle).await;
+            assert_eq!(cycles.load(Ordering::SeqCst), 0);
+            shed_gated_cycle(&mut shed, &BackgroundWork::Run, name, cycle).await;
+            shed_gated_cycle(&mut shed, &BackgroundWork::Run, name, cycle).await;
+            assert_eq!(cycles.load(Ordering::SeqCst), 2);
+        });
+    }
 
     /// The production half of a module's source, with the test module cut off.
     ///

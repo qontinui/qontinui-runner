@@ -12,19 +12,26 @@
 import { describe, it, expect, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
+  // Default pane probe: a plain shell with no claude, so the typing paths run.
+  invoke: vi.fn(async (cmd: string) =>
+    cmd === "terminal_probe_claude" ? { data: { state: "absent", sessionIds: [] } } : undefined,
+  ),
 }));
 
 import {
   stripAnsi,
+  renderAnsi,
+  lastOscTitle,
   detectClaudeHandshake,
   detectResumeFailure,
   detectResumePicker,
   buildPickerAnswer,
   waitForClaudeHandshake,
   typeResumeAndVerify,
+  probeClaudeInPane,
 } from "./resumeVerification";
 import { claudeDescriptor } from "./providerAdapter";
+import { buildResumeCmd } from "./useTerminalInitialization";
 import { TERMINAL_EXITED, TERMINAL_WRITE_FAILED } from "./terminalWriteResult";
 
 const CLAUDE_UI =
@@ -43,6 +50,146 @@ const SESSION_PICKER =
 describe("stripAnsi", () => {
   it("removes CSI sequences so patterns match rendered text", () => {
     expect(stripAnsi("\x1b[38;5;205m? for shortcuts\x1b[0m")).toBe("? for shortcuts");
+  });
+
+  it("collapses cursor-addressed text, so phrases a conversation mentions do not match", () => {
+    expect(stripAnsi("No\x1b[1Cconversation\x1b[1Cfound")).toBe("Noconversationfound");
+  });
+});
+
+describe("renderAnsi", () => {
+  it("renders cursor motion: forward → spaces, vertical/position → newline", () => {
+    expect(renderAnsi("? for\x1b[1Cshortcuts")).toBe("? for shortcuts");
+    expect(renderAnsi("? for\x1b[Cshortcuts")).toBe("? for shortcuts");
+    expect(renderAnsi("bypass\x1b[3Cpermissions")).toBe("bypass   permissions");
+    expect(renderAnsi("a\x1b[7Gb")).toBe("a b");
+    expect(renderAnsi("rule\r\x1b[1B\u276f")).toBe("rule\r\n\u276f");
+    expect(renderAnsi("x\x1b[9;1Hy")).toBe("x\ny");
+    expect(renderAnsi("abc\x1b[5ddef")).toBe("abc\ndef");
+    expect(renderAnsi("abc\x1b[2Adef")).toBe("abc\ndef");
+  });
+
+  it("drops private-parameter CSI, charset designations, two-byte escapes and SI/SO", () => {
+    expect(renderAnsi("\x1b[>0q\x1b[?u\x1b[>4mok\x1b(B\x0f\x1b7\x1b8\x1bM\x1bc")).toBe("ok");
+  });
+
+  it("drops OSC strings terminated by BEL or ST, and DCS strings", () => {
+    expect(renderAnsi("\x1b]0;title\x07a\x1b]633;E;cmd\x1b\\b\x1bPq#0\x1b\\c")).toBe("abc");
+  });
+
+  it("keeps the visible text of an OSC 8 hyperlink", () => {
+    expect(renderAnsi("\x1b]8;;https://x\x07link\x1b]8;;\x07")).toBe("link");
+  });
+});
+
+describe("lastOscTitle", () => {
+  it("returns the most recent OSC 0/2 title, ignoring other OSC marks", () => {
+    expect(lastOscTitle("\x1b]0;\u2733 Claude Code\x07\x1b]633;E;claude\x07\x1b]2;two\x1b\\")).toBe(
+      "two",
+    );
+    expect(lastOscTitle("no titles here")).toBeUndefined();
+  });
+});
+
+// Claude Code v2 (2.1.286) first paint, captured 2026-10-01 from a boot-restored
+// pane whose resume verification timed out and was retyped into the live
+// session. Byte-verbatim apart from the shortened cwd and session title. The
+// shell half carries the typed command in an OSC 633;E mark and an OSC 0 shell
+// title, neither of which may verify on its own.
+const V2_SESSION_ID = "230feb99-2dd7-42d7-92bc-6d36c1883089";
+// The exact line the restore types (env thresholds included), echoed by the
+// shell and repeated in the shell-integration OSC 633;E mark.
+const V2_TYPED = buildResumeCmd(V2_SESSION_ID, "/home/user/.claude", "full").replace(/\r$/, "");
+const V2_SHELL_ECHO =
+  "\x1b]633;A\x07\x1b]0;user@host: ~/repo\x07\x1b[01;32muser@host\x1b[00m:\x1b[01;34m~/repo\x1b[00m$ \x1b]633;B\x07" +
+  `${V2_TYPED}\r\n` +
+  `\x1b[?2004l\r\x1b]633;E;${V2_TYPED}\x07\x1b]633;C\x07`;
+const V2_FIRST_PAINT =
+  "\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?2031h\x1b[?1004h\x1b[>0q\x1b[?u\x1b[c\x1b[>4m" +
+  "\x1b]0;\u2733 session title\x07\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?25l\x1b[H\x1b[7Gby\x1b[10Gits\x1b[14Gid.\r" +
+  "\x1b[2B\x1b[38;5;246m\u273b\x1b[3GChurned for 1m 31s \u00b7 done 7:49 AM\r\x1b[28C\x1b[1B\u25d0 medium \u00b7 /effort\r" +
+  "\x1b[1B\x1b[38;5;244m" +
+  "\u2500".repeat(48) +
+  "\r\x1b[1B\x1b[39m\u276f\u00a0\r\x1b[1B\x1b[38;5;244m" +
+  "\u2500".repeat(48) +
+  "\x1b[39m";
+
+describe("Claude Code v2 handshake (no rounded box, cursor-addressed text)", () => {
+  const hp = claudeDescriptor.handshakePatterns();
+
+  it("verifies the real v2 first paint of a resumed session", () => {
+    expect(detectClaudeHandshake(V2_SHELL_ECHO + V2_FIRST_PAINT, hp)).toBe(true);
+    expect(detectResumeFailure(V2_SHELL_ECHO + V2_FIRST_PAINT, hp)).toBe(false);
+  });
+
+  it("the shell half alone does not verify (command echo, OSC 633 marks, shell title)", () => {
+    expect(detectClaudeHandshake(V2_SHELL_ECHO, hp)).toBe(false);
+  });
+
+  it("the typed command includes the env thresholds the restore really sends", () => {
+    expect(V2_TYPED).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(V2_TYPED).toContain(`--resume ${V2_SESSION_ID}`);
+  });
+
+  it("recognizes the v2 logo line, which carries the version", () => {
+    const logo =
+      "\x1b[38;5;174m \u2590\u259b\u2588\u2588\u2588\u259c\u258c\x1b[39m\x1b[2CClaude Code\x1b[1Cv2.1.286";
+    expect(detectClaudeHandshake(logo, hp)).toBe(true);
+  });
+
+  it("recognizes the 'Claude Code' window title Claude sets at launch", () => {
+    expect(detectClaudeHandshake("\x1b]0;\u2733 Claude Code\x07", hp)).toBe(true);
+  });
+
+  it.each([
+    ["a bare ❯ shell prompt", "~/repo on main\r\n\u276f "],
+    ["a bare rule", "\u2500".repeat(40)],
+    [
+      "a two-line prompt whose first line ends in a ─ fill",
+      "~/repo \x1b[2m" + "\u2500".repeat(60) + "\x1b[0m\r\n\x1b[1;32m\u276f\x1b[0m ",
+    ],
+    [
+      "a CLI error printed to the shell",
+      "$ claude --resume x\r\nClaude Code requires Node.js version 22 or higher.\r\n$ ",
+    ],
+    ["the folder-trust dialog", "Claude\x1b[9GCode'll be able to read files in this folder"],
+    [
+      "a title an earlier Claude set, after it exited",
+      "\x1b]0;\u2733 Claude Code\x07bye\x1b]0;\x07\r\n$ ",
+    ],
+    [
+      "a shell title whose path contains Claude Code",
+      "\x1b]0;user@host: ~/Projects/Claude Code demo\x07$ ",
+    ],
+    ["a shell title that is a bare ~/Claude Code path", "\x1b]2;~/Claude Code\x07$ "],
+    ["shell output listing a directory named Claude Code", "$ ls -1\r\nClaude Code\r\nnotes\r\n$ "],
+  ])("does NOT verify: %s", (_name, text) => {
+    expect(detectClaudeHandshake(text, hp)).toBe(false);
+  });
+
+  it.each([
+    ["the unknown-session error", "No\x1b[1Cconversation\x1b[1Cfound\x1b[1Cwith\x1b[1Csession"],
+    ["the session-picker title", "Select\x1b[1Ca\x1b[1Csession\x1b[1Cto\x1b[1Cresume"],
+  ])("a resumed conversation that mentions %s is not a failure", (_name, mention) => {
+    const live = V2_SHELL_ECHO + V2_FIRST_PAINT + "\r\n" + mention;
+    expect(detectResumeFailure(live, hp)).toBe(false);
+    expect(detectClaudeHandshake(live, hp)).toBe(true);
+  });
+
+  it("picker wording in a resumed conversation does not trigger the picker answer", () => {
+    const live = V2_FIRST_PAINT + "\r\nResume\x1b[1Cfull\x1b[1Csession\x1b[1Cas-is";
+    expect(detectResumePicker(live)).toBe(false);
+  });
+
+  it("a long run of ─ with no prompt is rejected", () => {
+    // The frame regex is anchored to line starts, so this is linear. No
+    // wall-clock assertion: it would flake on a loaded CI runner.
+    expect(detectClaudeHandshake("\u2500".repeat(16_000), hp)).toBe(false);
+  });
+
+  it("a failure frame still wins over the v2 markers", () => {
+    const failed = "\x1b]0;\u2733 Claude Code\x07No conversation found with session ID: x";
+    expect(detectResumeFailure(failed, hp)).toBe(true);
   });
 });
 
@@ -452,5 +599,125 @@ describe("descriptor-driven detection unions the regexes (item 3)", () => {
     const gemini = { success: ["gemini ready"], failure: ["no such chat"] };
     expect(detectClaudeHandshake(FRAME_ONLY, gemini)).toBe(false);
     expect(detectClaudeHandshake("Gemini ready", gemini)).toBe(true);
+  });
+});
+
+describe("typeResumeAndVerify (does not type into a live claude)", () => {
+  const SID = "5c46c390-037d-4b8e-9d7a-1f2e3d4c5b6a";
+  const CMD = `claude --permission-mode bypassPermissions --resume ${SID}\r`;
+  const base = { settleMs: 1, timeoutMs: 10, intervalMs: 1, sessionId: SID };
+  const recorder = () => {
+    const writes: string[] = [];
+    const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
+    return { writes, write: write as never };
+  };
+
+  it("operator retry against a pane already running THIS session: types nothing, verifies", async () => {
+    // Case-insensitive: the command line's spelling of the id is what it is.
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      // A live session whose frame the scrape does not recognise.
+      readTail: async () => "some redraw the patterns miss",
+      probeClaude: async () => ({ state: "live", sessionIds: [SID.toUpperCase()] }),
+    });
+    expect(out).toBe("verified");
+    expect(writes).toEqual([]);
+  });
+
+  it("a claude running some OTHER (or unparseable) session: types nothing, fails", async () => {
+    for (const sessionIds of [["00000000-0000-4000-8000-000000000000"], []]) {
+      const { writes, write } = recorder();
+      const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+        ...base,
+        write,
+        readTail: async () => "",
+        probeClaude: async () => ({ state: "live", sessionIds }),
+      });
+      expect(out).toBe("failed");
+      expect(writes).toEqual([]);
+    }
+  });
+
+  it("skips the retype (and its ESC) once the first attempt brought claude up unseen by the scrape", async () => {
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      readTail: async () => "",
+      probeClaude: async () =>
+        writes.includes(CMD)
+          ? { state: "live", sessionIds: [SID] }
+          : { state: "absent", sessionIds: [] },
+    });
+    expect(out).toBe("verified");
+    expect(writes).toEqual([CMD]);
+  });
+
+  it("an UNREADABLE process table fails closed — nothing typed", async () => {
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      readTail: async () => "",
+      probeClaude: async () => ({ state: "unknown", sessionIds: [] }),
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+  });
+
+  it("a REMOTE pane (unprobeable) types exactly as before", async () => {
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      readTail: async () => "$ ",
+      probeClaude: async () => ({ state: "remote", sessionIds: [] }),
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([CMD, "\x1b", CMD]);
+  });
+
+  it("skipFirstProbe (fresh boot-restore pane) probes only before the retype", async () => {
+    const { write } = recorder();
+    let probes = 0;
+    await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      skipFirstProbe: true,
+      readTail: async () => "$ ",
+      probeClaude: async () => {
+        probes++;
+        return { state: "absent", sessionIds: [] };
+      },
+    });
+    expect(probes).toBe(1);
+  });
+});
+
+describe("probeClaudeInPane", () => {
+  it("passes readings through and maps anything else to unknown", async () => {
+    expect(
+      await probeClaudeInPane("t", async () => ({ data: { state: "live", sessionIds: ["a", 3] } })),
+    ).toEqual({ state: "live", sessionIds: ["a"] });
+    expect(await probeClaudeInPane("t", async () => ({ data: { state: "absent" } }))).toEqual({
+      state: "absent",
+      sessionIds: [],
+    });
+    expect(await probeClaudeInPane("t", async () => ({ data: { state: "remote" } }))).toEqual({
+      state: "remote",
+      sessionIds: [],
+    });
+    const unknown = { state: "unknown", sessionIds: [] };
+    expect(await probeClaudeInPane("t", async () => ({ data: { state: "unknown" } }))).toEqual(
+      unknown,
+    );
+    expect(await probeClaudeInPane("t", async () => undefined)).toEqual(unknown);
+    expect(
+      await probeClaudeInPane("t", async () => {
+        throw new Error("Terminal not found");
+      }),
+    ).toEqual(unknown);
   });
 });

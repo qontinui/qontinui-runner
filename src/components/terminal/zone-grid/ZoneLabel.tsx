@@ -9,30 +9,36 @@ import { TenantBadge } from "../TenantBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import { TabTitle, useDisplayTitle } from "../displayTitle";
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
  * item 8): session/zone identity was previously only observable through a
- * debug DOM text node — `ai/find "<session title>"` resolved nothing. The
- * header element registers with the session title as its label and carries
+ * debug DOM text node — `ai/find "<session name>"` resolved nothing. The
+ * header element registers with the session name as its label and carries
  * the binding as data attributes (`data-claude-session-id`,
  * `data-zone-index`, `data-resume-failed`) so UI Bridge clients can verify
  * session↔zone placement without scraping internals.
  *
+ * The name is the RESOLVED display title (`resolveDisplayTitle`: live Claude
+ * Code registry name -> immutable spawn name -> non-path `tab.title` ->
+ * `Terminal`), never the raw `tab.title`, which for a PTY-launched Claude
+ * session is the shell cwd. The cwd stays in `SessionInfoDropdown`.
+ *
  * When the tab is bound to a Claude session, the label carries a short
- * session-id suffix (`(<first 8 chars>)`): PTY-launched Claude sessions all
- * share the raw shell path as their title, so without the suffix every zone
- * registers an identical label and `ai/find` by label can't tell them apart.
- * The suffix makes each label unique per bound session.
+ * session-id suffix (`(<first 8 chars>)`): sessions may still share a name
+ * (spawn names are not unique by construction), so without the suffix two
+ * zones could register an identical label and `ai/find` by label couldn't
+ * tell them apart. The suffix makes each label unique per bound session.
  *
  * Pure + exported for unit tests (the hook call itself needs a DOM).
  */
 export function zoneHeaderElementSpec(
   zoneIndex: number,
-  title: string,
+  displayName: string,
   claudeSessionId?: string,
 ): { id: string; label: string } {
-  const base = `Zone ${zoneIndex + 1}: ${title}`;
+  const base = `Zone ${zoneIndex + 1}: ${displayName}`;
   return {
     id: `terminal-zone-header-${zoneIndex}`,
     label: claudeSessionId ? `${base} (${claudeSessionId.slice(0, 8)})` : base,
@@ -88,7 +94,8 @@ export function ZoneLabel({
   // Item 8: expose session/zone identity to UI Bridge clients. The label is
   // the session title so `ai/find` by title resolves to this header; the
   // session binding rides as data attributes on the registered node.
-  const headerSpec = zoneHeaderElementSpec(zoneIndex, tab.title, tab.claudeSessionId);
+  const displayTitle = useDisplayTitle(tab);
+  const headerSpec = zoneHeaderElementSpec(zoneIndex, displayTitle, tab.claudeSessionId);
   const { ref: headerRef } = useUIElement({
     id: headerSpec.id,
     type: "generic",
@@ -144,7 +151,7 @@ export function ZoneLabel({
         }`}
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
-      <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{tab.title}</span>
+      <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{displayTitle}</span>
 
       {/* Honesty label (Phase 5): interactive PTY shells are non-durable — a
           runner restart ends them. Mirrors the compact-card marker so the
@@ -282,7 +289,9 @@ export function ZoneLabel({
                         className={`w-1.5 h-1.5 rounded-full shrink-0 ${tabState === "needs-input" ? "animate-pulse" : ""}`}
                         style={{ backgroundColor: STATE_BORDER_COLORS[tabState] }}
                       />
-                      <span className="text-[10px] truncate flex-1">{t.title}</span>
+                      <span className="text-[10px] truncate flex-1">
+                        <TabTitle tab={t} />
+                      </span>
                       {assignedZone && !isCurrent && (
                         <span className="text-[8px] text-[#565f89]">
                           Z{Number(assignedZone[0]) + 1}

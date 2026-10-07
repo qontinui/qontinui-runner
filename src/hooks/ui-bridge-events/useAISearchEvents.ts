@@ -10,6 +10,7 @@ import {
   recoveryVerdict,
   scopeRecoveryExecutor,
 } from "./recoveryScope";
+import { describeThrown } from "@/lib/utils";
 
 // Module-level intent store for persistence across IPC calls (capped at 1000 entries)
 const LOCAL_INTENT_STORE_MAX = 1000;
@@ -818,7 +819,7 @@ export function useAISearchEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "request failed"),
               timestamp: Date.now(),
             });
           }
@@ -1179,7 +1180,7 @@ export function useAISearchEvents(
               timestamp: Date.now(),
             });
           } catch (err) {
-            const thrown = err instanceof Error ? err.message : String(err);
+            const thrown = describeThrown(err, "recovery threw");
             const code = err instanceof RecoveryRefusedError ? err.code : RECOVERY_FAILED;
             await sendResponse({
               requestId,
@@ -1281,7 +1282,7 @@ export function useAISearchEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "request failed"),
               timestamp: Date.now(),
             });
           }
@@ -1367,7 +1368,7 @@ export function useAISearchEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "request failed"),
               timestamp: Date.now(),
             });
           }
