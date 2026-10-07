@@ -1,7 +1,17 @@
-import { X } from "lucide-react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { RotateCcw, X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { SessionState } from "./useZoneLayout";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
+import {
+  DEFAULT_MINIMAP_OFFSET,
+  clampMinimapOffset,
+  type MinimapOffset,
+  type Size,
+} from "./minimapPosition";
+
+/** Pointer travel (px) before a press on the minimap becomes a drag. */
+const DRAG_THRESHOLD = 3;
 
 const STATE_COLORS: Record<SessionState, string> = {
   idle: "#565f89",
@@ -55,7 +65,8 @@ export function ZoneMinimap() {
    * (persisted per instance under `zone-minimap`) alongside the other
    * overlay toggles.
    */
-  const { state: uiState, toggleMinimap } = useUIStateCx();
+  const { state: uiState, toggleMinimap, setMinimapOffset, resetMinimapOffset } = useUIStateCx();
+  const storedOffset = uiState.minimapOffset;
 
   /*
    * Register the minimap itself, not just the things it floats over.
@@ -73,11 +84,110 @@ export function ZoneMinimap() {
     label: "Zone minimap",
   });
 
-  if (!uiState.showMinimap || !zoneLayout.isMultiZone) return null;
+  /*
+   * Dragging.
+   *
+   * The whole widget is the drag surface, but a press only becomes a drag
+   * after DRAG_THRESHOLD px of travel — so a plain click on a zone tile still
+   * focuses that zone. The live position is local state while the pointer is
+   * down and is committed (persisted) once, on release, rather than written
+   * to storage on every move.
+   */
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{
+    pointerX: number;
+    pointerY: number;
+    origin: MinimapOffset;
+    moved: boolean;
+    /** Latest clamped offset — read on release, never the render's `dragOffset`. */
+    latest: MinimapOffset | null;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
+  const [dragOffset, setDragOffset] = useState<MinimapOffset | null>(null);
+
+  /*
+   * The container's size, so a stored position is clamped back on screen
+   * when the window shrinks. The clamp is render-only: the stored value is
+   * left alone, so growing the window again restores the chosen spot.
+   */
+  const [containerSize, setContainerSize] = useState<Size | null>(null);
+  const visible = uiState.showMinimap && zoneLayout.isMultiZone;
+  useEffect(() => {
+    // `parentElement`, not `offsetParent`: the latter is null while the
+    // Terminal page is mounted but hidden, and the observer must still be
+    // attached so it fires once the grid is laid out.
+    const parent = boxRef.current?.parentElement;
+    if (!visible || !parent) return;
+    const measure = () =>
+      setContainerSize({ width: parent.clientWidth, height: parent.clientHeight });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(parent);
+    return () => ro.disconnect();
+  }, [visible]);
+
+  if (!visible) return null;
 
   const { columns, rows } = layout;
   const mapW = 120;
   const mapH = 80;
+  const boxSize: Size = { width: mapW + 8, height: mapH + 8 };
+  const rawOffset = dragOffset ?? storedOffset ?? DEFAULT_MINIMAP_OFFSET;
+  const offset = containerSize ? clampMinimapOffset(rawOffset, containerSize, boxSize) : rawOffset;
+  const isMoved = storedOffset !== null || dragOffset !== null;
+
+  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    // The dismiss / reset buttons are clicks, never drag starts.
+    if ((e.target as Element).closest("button")) return;
+    dragRef.current = {
+      pointerX: e.clientX,
+      pointerY: e.clientY,
+      origin: offset,
+      moved: false,
+      latest: null,
+    };
+  };
+  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    // The button was released outside the widget before the drag armed its
+    // pointer capture, so no pointerup reached us — drop the stale press
+    // instead of letting the minimap follow a hovering cursor.
+    if ((e.buttons & 1) === 0) {
+      dragRef.current = null;
+      return;
+    }
+    const dx = e.clientX - drag.pointerX;
+    const dy = e.clientY - drag.pointerY;
+    if (!drag.moved) {
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+      drag.moved = true;
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+    const parent = boxRef.current?.parentElement;
+    const size = parent
+      ? { width: parent.clientWidth, height: parent.clientHeight }
+      : containerSize;
+    // Offset is from the RIGHT edge, so moving right shrinks it.
+    const next = { top: drag.origin.top + dy, right: drag.origin.right - dx };
+    drag.latest = size ? clampMinimapOffset(next, size, boxSize) : next;
+    setDragOffset(drag.latest);
+  };
+  const endDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (!drag?.moved) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    // The pointerup that ends a drag is followed by a click; it must not
+    // also focus whichever zone tile the pointer happened to land on. A
+    // pointercancel is followed by no click, so it must not arm the swallow.
+    if (e.type === "pointerup") suppressClickRef.current = true;
+    if (drag.latest) setMinimapOffset(drag.latest);
+    setDragOffset(null);
+  };
   const cellW = mapW / columns;
   const cellH = mapH / rows;
 
@@ -131,15 +241,55 @@ export function ZoneMinimap() {
      * minimap must sit BELOW the title bar, not on top of a different
      * piece of chrome.
      *
+     * That placement is the DEFAULT (`DEFAULT_MINIMAP_OFFSET`, 28px /
+     * 8px). The operator can drag the minimap anywhere inside the grid; the
+     * chosen offset is persisted and the reset button returns it here.
+     *
      * The widget stays registered with UI Bridge (see `useUIElement`
      * above) so an automated audit can see the occluder, not just the
      * things it occludes.
      */
-    <div ref={minimapRef} className="absolute top-7 right-2 z-30 group">
+    <div
+      ref={(el) => {
+        boxRef.current = el;
+        minimapRef(el);
+      }}
+      className="absolute z-30 group touch-none select-none"
+      style={{ top: offset.top, right: offset.right }}
+      data-moved={isMoved ? "true" : undefined}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onClickCapture={(e) => {
+        if (suppressClickRef.current) {
+          suppressClickRef.current = false;
+          e.stopPropagation();
+        }
+      }}
+      title="Drag to move the minimap"
+    >
       <div
-        className="relative bg-[#13141f]/80 border border-[#2a2d3d] rounded-md shadow-lg backdrop-blur-sm"
-        style={{ width: mapW + 8, height: mapH + 8, padding: 4 }}
+        className={`relative bg-[#13141f]/80 border border-[#2a2d3d] rounded-md shadow-lg backdrop-blur-sm ${
+          dragOffset ? "cursor-grabbing" : "cursor-grab"
+        }`}
+        style={{ width: boxSize.width, height: boxSize.height, padding: 4 }}
       >
+        {/* Reset position — only offered once the minimap has been moved. */}
+        {isMoved && (
+          <button
+            onClick={() => {
+              setDragOffset(null);
+              resetMinimapOffset();
+            }}
+            title="Move the minimap back to its original location"
+            aria-label="Reset the zone minimap position"
+            className="absolute -top-1.5 right-3.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
+          >
+            <RotateCcw className="w-2.5 h-2.5" />
+          </button>
+        )}
+
         {/* Dismiss button */}
         <button
           onClick={toggleMinimap}
