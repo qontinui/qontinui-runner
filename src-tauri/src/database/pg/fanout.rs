@@ -56,14 +56,16 @@ CREATE TABLE IF NOT EXISTS project.fanout_members ( \
     PRIMARY KEY (run_id, idx) \
 ); \
 ALTER TABLE project.fanout_members ADD COLUMN IF NOT EXISTS preview_index INTEGER; \
+ALTER TABLE project.fanout_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ; \
+ALTER TABLE project.fanout_members ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ; \
 CREATE INDEX IF NOT EXISTS idx_fanout_runs_owner_state \
     ON project.fanout_runs (owner_instance, state);";
 
 const RUN_COLUMNS: &str = "id, tenant_id, template_slug, template_version, max_concurrent, \
-     config_dir_policy, working_dir, created_at, state, owner_instance";
+     config_dir_policy, working_dir, created_at, state, owner_instance, updated_at";
 
 const MEMBER_COLUMNS: &str = "run_id, idx, title, prompt, state, terminal_id, claude_session_id, \
-     reason, admitted_at, released_at, preview_index";
+     reason, admitted_at, released_at, preview_index, updated_at";
 
 fn col<'a, T: tokio_postgres::types::FromSql<'a>>(
     row: &'a Row,
@@ -96,6 +98,7 @@ fn run_from_row(row: &Row) -> Result<FanoutRun, String> {
         state: RunState::parse(&state)
             .ok_or_else(|| format!("fanout row: unknown run state {state:?}"))?,
         owner_instance: col(row, 9, "owner_instance")?,
+        updated_at: col(row, 10, "updated_at")?,
     })
 }
 
@@ -122,6 +125,7 @@ fn member_from_row(row: &Row) -> Result<(Uuid, FanoutMember), String> {
             reason: col(row, 7, "reason")?,
             admitted_at: col(row, 8, "admitted_at")?,
             released_at: col(row, 9, "released_at")?,
+            updated_at: col(row, 11, "updated_at")?,
         },
     ))
 }
@@ -148,7 +152,7 @@ impl PgDb {
         tx.execute(
             &*format!(
                 "INSERT INTO project.fanout_runs ({RUN_COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
             ),
             &[
                 &run.id,
@@ -161,6 +165,7 @@ impl PgDb {
                 &run.created_at,
                 &run.state.as_str(),
                 &run.owner_instance,
+                &run.updated_at,
             ],
         )
         .await
@@ -174,7 +179,7 @@ impl PgDb {
             tx.execute(
                 &*format!(
                     "INSERT INTO project.fanout_members ({MEMBER_COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
                 ),
                 &[
                     &run.id,
@@ -188,6 +193,7 @@ impl PgDb {
                     &m.admitted_at,
                     &m.released_at,
                     &preview_index,
+                    &m.updated_at,
                 ],
             )
             .await
@@ -198,7 +204,7 @@ impl PgDb {
             .map_err(|e| crate::database::pg::pg_err("insert_fanout_run commit", &e))
     }
 
-    /// Persist `max_concurrent` and `state`.
+    /// Persist `max_concurrent`, `state` and `updated_at`.
     pub(crate) async fn update_fanout_run(&self, run: &FanoutRun) -> Result<(), String> {
         let conn = self
             .pool
@@ -208,8 +214,9 @@ impl PgDb {
         let max = as_i32(run.max_concurrent, "max_concurrent")?;
         let n = conn
             .execute(
-                "UPDATE project.fanout_runs SET max_concurrent = $2, state = $3 WHERE id = $1",
-                &[&run.id, &max, &run.state.as_str()],
+                "UPDATE project.fanout_runs SET max_concurrent = $2, state = $3, updated_at = $4 \
+                 WHERE id = $1",
+                &[&run.id, &max, &run.state.as_str(), &run.updated_at],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("update_fanout_run", &e))?;
@@ -235,8 +242,8 @@ impl PgDb {
         let n = conn
             .execute(
                 "UPDATE project.fanout_members SET state = $3, terminal_id = $4, \
-                 claude_session_id = $5, reason = $6, admitted_at = $7, released_at = $8 \
-                 WHERE run_id = $1 AND idx = $2",
+                 claude_session_id = $5, reason = $6, admitted_at = $7, released_at = $8, \
+                 updated_at = $9 WHERE run_id = $1 AND idx = $2",
                 &[
                     &run_id,
                     &idx,
@@ -246,6 +253,7 @@ impl PgDb {
                     &m.reason,
                     &m.admitted_at,
                     &m.released_at,
+                    &m.updated_at,
                 ],
             )
             .await
@@ -364,5 +372,18 @@ mod tests {
             assert!(FANOUT_TABLES_DDL.contains(&*format!("project.{t}")));
         }
         assert!(!FANOUT_TABLES_DDL.contains("coord."));
+    }
+
+    /// Staleness is measured from `updated_at`, which every write stamps; both
+    /// tables must carry it on an already-provisioned cluster too.
+    #[test]
+    fn fanout_updated_at_is_provisioned_on_both_tables() {
+        for t in ["fanout_runs", "fanout_members"] {
+            assert!(FANOUT_TABLES_DDL.contains(&*format!(
+                "ALTER TABLE project.{t} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ"
+            )));
+        }
+        assert!(super::RUN_COLUMNS.ends_with("updated_at"));
+        assert!(super::MEMBER_COLUMNS.ends_with("updated_at"));
     }
 }

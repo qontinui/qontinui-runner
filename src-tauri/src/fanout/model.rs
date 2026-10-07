@@ -171,6 +171,9 @@ pub struct FanoutRun {
     /// The runner instance driving this run. A temp runner and the primary
     /// share one PG cluster; only the owner admits, releases or reconciles.
     pub owner_instance: String,
+    /// When a run-level field was last written (`None`: never since create,
+    /// or a row written before the column existed).
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// One member of a run. `index` is its position in the POSTED list (0-based,
@@ -193,6 +196,11 @@ pub struct FanoutMember {
     pub reason: Option<String>,
     pub admitted_at: Option<DateTime<Utc>>,
     pub released_at: Option<DateTime<Utc>>,
+    /// When the member's row was last written — by EVERY write, a refusal or a
+    /// drain deferral included, so a run's staleness is measured from what
+    /// actually last happened to it rather than from `admitted_at` (which an
+    /// undone admission clears) or `released_at`.
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl FanoutMember {
@@ -209,6 +217,7 @@ impl FanoutMember {
             reason: None,
             admitted_at: None,
             released_at: None,
+            updated_at: None,
         }
     }
 }
@@ -467,6 +476,7 @@ mod tests {
             created_at: Utc::now(),
             state: RunState::Active,
             owner_instance: "primary".to_string(),
+            updated_at: None,
         };
         let wire = serde_json::to_value(RunView::of(&run, &members)).unwrap();
         assert_eq!(wire["members"][1]["index"], 1);

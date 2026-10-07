@@ -6536,7 +6536,9 @@ async fn run_continuation_terminal(
             false,
             // Coord-spawned: no picker chose a tenant — the device default.
             None,
-        );
+        )
+        // The text of the seam's typed error, as this path has always classified it.
+        .map_err(String::from);
 
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
@@ -7538,7 +7540,9 @@ async fn run_condition_check_terminal(
         false,
         // Coord-spawned: no picker chose a tenant — the device default.
         None,
-    );
+    )
+    // The text of the seam's typed error, as this path has always classified it.
+    .map_err(String::from);
 
     match result {
         Ok((terminal_id, coord_session_id)) => {

@@ -42,6 +42,7 @@ pub mod visibility;
 pub mod vt_sanitize;
 
 pub use manager::{TerminalManager, TrustArm};
+pub use session::CreateError;
 
 /// Environment variables that carry a credential VALUE and must never be
 /// inherited by a runner-spawned session.

@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter};
 use tracing::{debug, error, info, warn};
 
 use super::interceptor::OutputInterceptor;
-use super::session::TerminalSession;
+use super::session::{CreateError, TerminalSession};
 use super::types::{TerminalId, TerminalInfo};
 use crate::claude_session::SessionManager;
 
@@ -316,7 +316,7 @@ impl TerminalManager {
         resource_override: bool,
         trust: TrustArm,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<TerminalInfo, String> {
+    ) -> Result<TerminalInfo, CreateError> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
         let working_dir = working_dir
@@ -353,7 +353,8 @@ impl TerminalManager {
                 &working_dir,
                 &trust,
                 TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
-            )?;
+            )
+            .map_err(CreateError::BeforeChild)?;
         }
 
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
@@ -401,11 +402,14 @@ impl TerminalManager {
         let info = session.info();
         let session = Arc::new(session);
 
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
-        sessions.insert(id, session);
+        // The child is RUNNING from here, so no error may be returned: an
+        // `Err` would read as "nothing started" to a caller that then hands
+        // back the worktree the child is working in and spawns it again. A
+        // poisoned registry lock is recovered rather than refused — the map
+        // itself is intact (a panic elsewhere while holding it poisons it
+        // without corrupting a `HashMap::insert`), and an unregistered live
+        // child would be unreachable by every close path.
+        self.lock_sessions_recovering().insert(id, session);
 
         // Notify frontend so externally-created terminals get a UI tab
         if let Err(e) = emitter.emit("terminal-created", &info) {
@@ -537,18 +541,30 @@ impl TerminalManager {
         let info = session.info();
         let session = Arc::new(session);
 
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
-        sessions.insert(id, session);
-        drop(sessions);
+        // As in `create`: the pane is live, so register it whatever the lock's
+        // poison state.
+        self.lock_sessions_recovering().insert(id, session);
 
         if let Err(e) = emitter.emit("terminal-created", &info) {
             error!("Failed to emit terminal-created: {}", e);
         }
 
         Ok(info)
+    }
+
+    /// The session registry, recovering a poisoned lock (logged) instead of
+    /// failing — for the insert of a session whose child is already running.
+    fn lock_sessions_recovering(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<TerminalId, Arc<TerminalSession>>> {
+        self.sessions.lock().unwrap_or_else(|poisoned| {
+            warn!("terminal: sessions lock poisoned — recovering it to register a live child");
+            let guard = poisoned.into_inner();
+            // Clear it too, so `get` / `list` / every close path — which read a
+            // poisoned lock as "no session" — can reach what is registered.
+            self.sessions.clear_poison();
+            guard
+        })
     }
 
     /// Get a terminal session by ID.
@@ -1141,6 +1157,27 @@ mod tests {
         tm.close_all(std::time::Instant::now());
         assert!(tm.remote_identity("close-all-tab").is_none());
         assert!(tm.remote_pane("close-all-tab").is_none());
+    }
+
+    /// A poisoned registry lock is recovered (and its poison cleared) for the
+    /// insert of a live child, never turned into an `Err` that would orphan
+    /// a running PTY child — and afterwards every reader reaches the map.
+    #[test]
+    fn manager_recovers_a_poisoned_sessions_lock_for_a_live_child() {
+        let tm = std::sync::Arc::new(TerminalManager::new());
+        let poisoner = tm.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.sessions.lock().unwrap();
+            panic!("poison the sessions lock");
+        })
+        .join();
+        assert!(tm.sessions.is_poisoned());
+        {
+            let guard = tm.lock_sessions_recovering();
+            assert!(guard.is_empty(), "the recovered map is intact");
+        }
+        assert!(!tm.sessions.is_poisoned(), "the poison is cleared");
+        assert!(tm.sessions.lock().is_ok());
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

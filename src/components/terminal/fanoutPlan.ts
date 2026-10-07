@@ -350,19 +350,21 @@ export function probeKey(cwd: string, prompt: string): string {
 }
 
 /**
- * The prompts still needing a probe: those with no answer yet for this `cwd`
- * and none in flight. An edit that leaves a row's prompt as it was does not
- * re-probe it.
+ * The prompts still needing a probe: those with no SUCCESSFUL answer yet for
+ * this `cwd` and none in flight. An edit that leaves a row's prompt as it was
+ * does not re-probe an answered one; a failed probe (`unknown`) is not an
+ * answer, so it becomes eligible again on the next debounce rather than
+ * staying UNKNOWN for the life of the panel.
  */
 export function promptsToProbe(
   prompts: readonly string[],
   cwd: string,
-  answered: Readonly<Record<string, unknown>>,
+  answered: Readonly<Record<string, { kind: string } | undefined>>,
   inFlight: ReadonlySet<string>,
 ): string[] {
   return prompts.filter((p) => {
     const key = probeKey(cwd, p);
-    return !(key in answered) && !inFlight.has(key);
+    return answered[key]?.kind !== "ok" && !inFlight.has(key);
   });
 }
 

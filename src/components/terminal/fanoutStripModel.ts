@@ -69,6 +69,23 @@ export function mergeRunUpdate(state: FanoutReadState, run: FanoutRunView): Fano
   return { kind: "ok", runs };
 }
 
+/**
+ * Merge one changed run and, when the state actually changed, mark the gate
+ * — synchronously, at the moment the change is decided. Marking from inside
+ * a React `setState` updater would run it late (deferred to render) and twice
+ * (StrictMode double-invokes updaters), so a poll that started between the
+ * event and the render could still overwrite the newer run.
+ */
+export function applyRunUpdateGated(
+  prev: FanoutReadState,
+  run: FanoutRunView,
+  gate: FreshnessGate,
+): FanoutReadState {
+  const next = mergeRunUpdate(prev, run);
+  if (next !== prev) gate.markApplied();
+  return next;
+}
+
 /** Runs the strip shows: active ones only. A completed run has nothing to control. */
 export function activeFanoutRuns(runs: readonly FanoutRunView[]): FanoutRunView[] {
   return runs.filter((r) => r.state === "active");

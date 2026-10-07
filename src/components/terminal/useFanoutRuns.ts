@@ -28,8 +28,8 @@ import {
   type FanoutRunView,
 } from "./fanoutApi";
 import {
+  applyRunUpdateGated,
   createFreshnessGate,
-  mergeRunUpdate,
   readStateFromResult,
   type FanoutReadState,
 } from "./fanoutStripModel";
@@ -49,17 +49,29 @@ export interface FanoutRunsApi {
 
 export function useFanoutRuns(): FanoutRunsApi {
   const [state, setState] = useState<FanoutReadState>({ kind: "loading" });
+  /**
+   * The state as last decided — what an update merges into. Kept beside the
+   * React state so the merge (and the freshness mark) happens synchronously
+   * here, not inside a deferred, possibly double-invoked `setState` updater.
+   */
+  const stateRef = useRef<FanoutReadState>({ kind: "loading" });
   const mountedRef = useRef(true);
   const gateRef = useRef(createFreshnessGate());
 
-  /** Merge one changed run; stamp the state only when it actually changed. */
-  const applyRunUpdate = useCallback((run: FanoutRunView) => {
-    setState((prev) => {
-      const next = mergeRunUpdate(prev, run);
-      if (next !== prev) gateRef.current.markApplied();
-      return next;
-    });
+  const commit = useCallback((next: FanoutReadState) => {
+    stateRef.current = next;
+    setState(next);
   }, []);
+
+  /** Merge one changed run; stamp the state only when it actually changed. */
+  const applyRunUpdate = useCallback(
+    (run: FanoutRunView) => {
+      const prev = stateRef.current;
+      const next = applyRunUpdateGated(prev, run, gateRef.current);
+      if (next !== prev) commit(next);
+    },
+    [commit],
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -74,8 +86,8 @@ export function useFanoutRuns(): FanoutRunsApi {
     if (!mountedRef.current) return;
     // Read before a change the state already shows: newer state wins.
     if (!gateRef.current.acceptPoll(stamp)) return;
-    setState(readStateFromResult(result));
-  }, []);
+    commit(readStateFromResult(result));
+  }, [commit]);
 
   // Fallback poll (also the initial read).
   useEffect(() => {
