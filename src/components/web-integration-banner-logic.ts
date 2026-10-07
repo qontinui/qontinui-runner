@@ -605,6 +605,30 @@ export function retryRefreshResult(raw: unknown): RetryRefreshResult {
 }
 
 /**
+ * Does a retry's inline error still describe the banner after `incoming`
+ * arrives (a posture event, or a mount-time snapshot)?
+ *
+ * Only while `incoming` says the same thing the retry's own answer said. Any
+ * other signal is newer information the error was not written about: a
+ * timed-out retry's "still running" must go when that pass's `unrefreshable`
+ * event lands, and a "did not recover" must not resurface on a later dark
+ * episode after the operator signed in elsewhere (the recovery in between is a
+ * different signal, so it already cleared the error).
+ */
+export function retryErrorSurvives(
+  retrySignal: CredentialDarkSignal | null,
+  incoming: CredentialDarkSignal,
+): boolean {
+  return (
+    retrySignal !== null &&
+    retrySignal.source === incoming.source &&
+    retrySignal.dark === incoming.dark &&
+    retrySignal.cause === incoming.cause &&
+    retrySignal.cta === incoming.cta
+  );
+}
+
+/**
  * Build the "Retry refresh now" click handler: kick the refresher, wait for
  * the pass it triggers, and return what the banner should do with the answer.
  * Extracted so the contract is unit-testable in node.

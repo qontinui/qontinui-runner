@@ -20,6 +20,7 @@ import {
   RE_PAIR_CTA_GRACE_MS,
   RETRY_DID_NOT_RECOVER,
   RETRY_STILL_RUNNING,
+  retryErrorSurvives,
   retryRefreshResult,
   shouldShowAuthBanner,
   shouldShowRePairCta,
@@ -929,6 +930,42 @@ describe("retry refresh CTA reports the concluded posture", () => {
     const stillDark = retryRefreshResult({ concluded: false, posture: posture({}) });
     expect(stillDark.error).toBe(RETRY_STILL_RUNNING);
     expect(stillDark.signal?.dark).toBe(true);
+  });
+
+  it("a timed-out retry's 'still running' clears when that pass's posture event lands", () => {
+    // The click: the runner's bounded wait ran out with the slot still `expired`.
+    const timedOut = retryRefreshResult({ concluded: false, posture: posture({}) });
+    expect(timedOut.error).toBe(RETRY_STILL_RUNNING);
+    // A re-announcement of the SAME posture leaves the message standing.
+    const same = credentialDarkFromPostureSnapshot(posture({}))!;
+    expect(retryErrorSurvives(timedOut.signal, same)).toBe(true);
+    // The pass then concludes `unrefreshable` and its event arrives: the CTA
+    // swaps to the sign-in, and the stale "still running" must go with it.
+    const concluded = normalizeCredentialDarkSignal({
+      source: "posture",
+      dark: true,
+      cause: "unrefreshable",
+      message: "the coord credential expired and automatic refresh FAILED (unrefreshable).",
+      cta: "re_pair",
+      since: 1_791_337_100,
+    })!;
+    expect(retryErrorSurvives(timedOut.signal, concluded)).toBe(false);
+    expect(credentialDarkPresentation(concluded).ctaLabel).toBe("Sign in to re-pair");
+  });
+
+  it("a 'did not recover' does not outlive a recovery (no resurfacing on a later dark episode)", () => {
+    const failed = retryRefreshResult({
+      concluded: true,
+      posture: posture({ posture: "unrefreshable", cta: "re_pair" }),
+    });
+    expect(failed.error).not.toBeNull();
+    const recovered = credentialDarkFromPostureSnapshot(
+      posture({ posture: "live", canAnswer: true, cta: null }),
+    )!;
+    expect(retryErrorSurvives(failed.signal, recovered)).toBe(false);
+    // A retry that produced no signal (an older runner, a thrown invoke)
+    // survives nothing.
+    expect(retryErrorSurvives(null, recovered)).toBe(false);
   });
 
   it("an older runner that answers nothing changes nothing", () => {
