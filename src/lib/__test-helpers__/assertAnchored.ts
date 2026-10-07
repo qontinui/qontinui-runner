@@ -52,6 +52,44 @@ export function subjectDir(testFileUrl: string): string {
 }
 
 /**
+ * Index of the character that closes the string literal opened at `code[open]`
+ * (a `"`, `'` or backtick), or -1 when it never closes.
+ *
+ * Backslash escapes are honoured. In a template literal each `${…}` is scanned
+ * as CODE — braces counted, nested literals (including nested templates)
+ * skipped recursively — so a backtick inside an interpolation cannot end the
+ * outer template early. Before this, `` `a ${`b`} c` `` closed at the second
+ * backtick and every later quote was read inverted: a scan that silently
+ * measured the wrong text instead of throwing.
+ */
+function closeOfLiteral(code: string, open: number): number {
+  const quote = code[open];
+  for (let i = open + 1; i < code.length; i += 1) {
+    const ch = code[i];
+    if (ch === "\\") i += 1;
+    else if (ch === quote) return i;
+    else if (quote === "`" && ch === "$" && code[i + 1] === "{") {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < code.length; j += 1) {
+        const c = code[j];
+        if (c === '"' || c === "'" || c === "`") {
+          j = closeOfLiteral(code, j);
+          if (j < 0) return -1;
+        } else if (c === "{") depth += 1;
+        else if (c === "}") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+      if (j >= code.length) return -1;
+      i = j;
+    }
+  }
+  return -1;
+}
+
+/**
  * The full text of every `<needle>…)` call in `code` (comments already
  * stripped by the caller), found by paren counting.
  *
@@ -63,11 +101,15 @@ export function subjectDir(testFileUrl: string): string {
  * FleetSessionPicker.wiring.test.mutants.json) — it stayed green. Slicing the
  * call and asserting on its text has no such blind spot.
  *
- * String literals (single, double, backtick; backslash escapes honoured) are
- * skipped. Template `${…}` interpolation is not parsed.
+ * String literals (single, double, backtick; backslash escapes honoured;
+ * template `${…}` interpolation scanned as code) are skipped. Regex literals
+ * (and JSX text, where an apostrophe opens a "literal") are NOT recognised — a `(`, `)` or quote inside one moves the scan; that
+ * fails loudly (unbalanced / unterminated) rather than quietly in the shapes
+ * measured so far, and is a stated residual.
  *
  * Throws when `needle` occurs nowhere, so "no call contains X" can never be
- * satisfied by a scan that found no calls, and when a call never closes.
+ * satisfied by a scan that found no calls, and when a call or a literal inside
+ * it never closes.
  */
 export function callsOf(code: string, needle: string): string[] {
   const calls: string[] = [];
@@ -81,11 +123,10 @@ export function callsOf(code: string, needle: string): string[] {
     for (let i = open; i < code.length; i += 1) {
       const ch = code[i];
       if (ch === '"' || ch === "'" || ch === "`") {
-        // Skip a string literal whole, honouring backslash escapes, so a paren
-        // inside a string argument cannot move the depth.
-        for (i += 1; i < code.length && code[i] !== ch; i += 1) {
-          if (code[i] === "\\") i += 1;
-        }
+        // Skip a string literal whole so a paren inside it cannot move the depth.
+        const close = closeOfLiteral(code, i);
+        if (close < 0) throw new Error(`unterminated string literal in ${needle} call`);
+        i = close;
       } else if (ch === "(") depth += 1;
       else if (ch === ")") {
         depth -= 1;
@@ -102,4 +143,39 @@ export function callsOf(code: string, needle: string): string[] {
   if (calls.length === 0)
     throw new Error(`no ${needle} call found; a scan of nothing proves nothing`);
   return calls;
+}
+
+/**
+ * The top-level arguments of one call as `callsOf` returns it
+ * (`name(a, b, …)`), whitespace flattened, empty trailing argument dropped.
+ *
+ * Commas nested in `()`, `[]`, `{}` or inside any string literal do not split.
+ * NOT understood: `<…>` type arguments (`new Map<K, V>()` splits at the comma),
+ * regex literals, and JSX text — an apostrophe in JSX text reads as an
+ * unterminated literal and throws. Callers pin the arity to catch a mis-split.
+ */
+export function argsOf(call: string): string[] {
+  const open = call.indexOf("(");
+  if (open < 0 || !call.endsWith(")"))
+    throw new Error(`argsOf: not a call: ${JSON.stringify(call)}`);
+  const inner = call.slice(open + 1, -1);
+  const args: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const close = closeOfLiteral(inner, i);
+      if (close < 0)
+        throw new Error(`argsOf: unterminated string literal in ${JSON.stringify(call)}`);
+      i = close;
+    } else if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+    else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+    else if (ch === "," && depth === 0) {
+      args.push(inner.slice(from, i));
+      from = i + 1;
+    }
+  }
+  args.push(inner.slice(from));
+  return args.map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
 }
