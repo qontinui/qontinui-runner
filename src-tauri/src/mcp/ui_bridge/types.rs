@@ -213,10 +213,10 @@ impl UIBridgeDiscoveryRequest {
     ///
     /// The keys this struct DOES name keep the grammar [`Self::resolve`] gives
     /// them — top-level beats `options`, snake_case folds to camelCase — and an
-    /// unset one is OMITTED rather than sent as `null`. That omission is
-    /// load-bearing: the frontend seeds `includeHidden: true` beneath the
-    /// caller's filters, and an explicit `null` would override the seed with a
-    /// value the SDK reads as false. Untyped keys follow the same precedence:
+    /// unset one is OMITTED rather than sent as `null`, so the frontend's
+    /// `includeHidden: true` default (`withIncludeHiddenDefault`, which also
+    /// treats a `null` as unset) is what the SDK sees for an unset flag rather
+    /// than a `null` it would read as false. Untyped keys follow the same precedence:
     /// nested first, then top-level over it. `force` is a meta-flag about
     /// registry state, so it travels beside `options`, never inside it.
     pub(crate) fn discover_ipc_request(

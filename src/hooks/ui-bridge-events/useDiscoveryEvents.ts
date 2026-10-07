@@ -73,20 +73,45 @@ export function readModalContext(bridge: unknown): unknown {
  * allowlist, which had drifted from the `find` arm's list even though both call
  * `bridge.discover()` with the same SDK type.
  *
- * `includeHidden` is seeded beneath the caller's own filters, exactly as the
- * `find` arm does, so an explicit `false` still wins. Without the seed the two
+ * `includeHidden` defaults beneath the caller's own filters, exactly as the
+ * `find` arm does — see {@link withIncludeHiddenDefault}. Without it the two
  * arms answered the same request differently: the SDK executor behind
  * `bridge.discover()` filters on `!options.includeHidden`, so an unset flag
- * dropped off-viewport and zero-rect elements on `discover` only. The Rust
- * handler omits an unset `includeHidden` rather than sending `null`, which
- * would override this seed.
+ * dropped off-viewport and zero-rect elements on `discover` only.
  */
 export function toDiscoverRequest(payload: object): Record<string, unknown> {
   const nested = (payload as { options?: unknown }).options;
-  return {
-    includeHidden: true,
-    ...toFindRequest(nested ?? payload),
-  };
+  return withIncludeHiddenDefault(toFindRequest(nested ?? payload));
+}
+
+/**
+ * Default `includeHidden` to `true` on a built `FindRequest`, leaving an
+ * explicit boolean alone.
+ *
+ * An explicit `null` counts as unset. `toFindRequest` forwards `null` by
+ * identity, and the SDK executor filters on `!options.includeHidden`, so a
+ * `null` that slipped past the default would read as `false` and silently drop
+ * hidden elements — which is what `/control/find` did with
+ * `{"includeHidden": null}` while `/control/discover` (whose Rust handler folds
+ * a typed `null` to "unset") did not.
+ */
+export function withIncludeHiddenDefault(
+  request: Record<string, unknown>,
+): Record<string, unknown> {
+  const includeHidden = request.includeHidden ?? true;
+  return { ...request, includeHidden };
+}
+
+/** Build the `FindRequest` the `find` arm hands to `bridge.discover()`. */
+export function toFindArmRequest(payload: object): Record<string, unknown> {
+  // The Rust backend merges the HTTP request body at the top level of the
+  // payload (alongside requestId and type), so the filters are read off the
+  // payload itself, falling back to nested params/body for backward
+  // compatibility. `toFindRequest` then carries them by identity.
+  const { params, body } = payload as { params?: unknown; body?: unknown };
+  const nested = params ?? body;
+  const source = nested && typeof nested === "object" ? nested : payload;
+  return withIncludeHiddenDefault(toFindRequest(source));
 }
 
 /**
@@ -165,27 +190,9 @@ export function useDiscoveryEvents(
         }
 
         case "find": {
-          // The Rust backend merges the HTTP request body at the top level
-          // of the payload (alongside requestId and type), so the filters are
-          // read off the payload itself, falling back to nested params/body
-          // for backward compatibility. `toFindRequest` then carries them by
-          // identity — see the `discover` arm above for the drift that shared
-          // seam closes.
-          const nested = payload.params ?? payload.body;
-          const source = (nested && typeof nested === "object" ? nested : payload) as Record<
-            string,
-            unknown
-          >;
-          // `includeHidden` is seeded before the caller's own filters so an
-          // explicit `false` still wins. `FindRequest` documents a TRUE default,
-          // but the executor behind `bridge.discover()` filters on
-          // `!options.includeHidden`, so without this seed an unset flag would
-          // drop hidden elements. `toDiscoverRequest` seeds the `discover` arm
-          // the same way.
-          const findOptions: Record<string, unknown> = {
-            includeHidden: true,
-            ...toFindRequest(source),
-          };
+          // `toFindArmRequest` shares `toFindRequest` with the `discover` arm
+          // above — see there for the drift that shared seam closes.
+          const findOptions = toFindArmRequest(payload);
           const discovered = await currentBridge.discover(findOptions);
           await sendResponse({
             requestId,
