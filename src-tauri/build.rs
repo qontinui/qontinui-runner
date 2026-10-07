@@ -881,8 +881,8 @@ fn finish_git(args: &[&str], out: std::process::Output) -> Result<Vec<u8>, Strin
 }
 
 /// The files whose change can move `HEAD` for the checkout containing `dir`,
-/// resolved by git itself (`rev-parse --path-format=absolute --git-path`) so a
-/// primary checkout and a linked worktree both work: `HEAD` and `logs/HEAD`
+/// resolved by git itself (`rev-parse --git-path`) so a primary checkout and a
+/// linked worktree both work: `HEAD` and `logs/HEAD`
 /// (per-worktree; the reflog moves on every commit, reset or checkout in THIS
 /// worktree, even when the branch ref is packed and has no loose file), the
 /// checked-out branch's loose ref (from `symbolic-ref -q HEAD`; it resolves into
@@ -908,6 +908,10 @@ fn finish_git(args: &[&str], out: std::process::Output) -> Result<Vec<u8>, Strin
 /// - (c) In a reftable PRIMARY checkout `tables.list` is the shared table list,
 ///   so there the script reruns on any ref activity in the repo — extra reruns,
 ///   never a stale stamp. A linked worktree's list is per-worktree.
+/// - (d) On an UNBORN branch only `HEAD` exists, and the first commit creates
+///   `logs/HEAD` and the branch ref without rewriting `HEAD`, so the stamp
+///   reads the pre-commit value until the next rerun for another reason. The
+///   runner repo is never unborn; accepted.
 fn git_watch_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let stdout = |args: &[&str]| -> Option<String> {
         let out = git_output(dir, args, None).ok()?;
@@ -924,13 +928,14 @@ fn git_watch_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     let mut paths = Vec::new();
     for name in names {
-        let Some(p) = stdout(&["rev-parse", "--path-format=absolute", "--git-path", &name]) else {
+        // No `--path-format=absolute`: a git older than 2.31 echoes the unknown
+        // option to stdout and exits 0, which would silently drop every watch.
+        // `--git-path` answers relative to the directory git ran in (`dir`), or
+        // absolute (a linked worktree); `join` handles both.
+        let Some(p) = stdout(&["rev-parse", "--git-path", &name]) else {
             continue;
         };
-        let p = std::path::PathBuf::from(p);
-        // `--path-format` is git >= 2.31; an older git that still answered
-        // relative is relative to the directory it ran in.
-        let p = if p.is_absolute() { p } else { dir.join(p) };
+        let p = dir.join(p);
         if p.is_file() && !paths.contains(&p) {
             paths.push(p);
         }
@@ -964,6 +969,10 @@ mod git_watch_tests {
             .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // `GIT_CONFIG_GLOBAL` is git >= 2.32; an older git reads
+            // `$HOME/.gitconfig`, so point HOME somewhere empty as well.
+            .env("HOME", dir)
+            .env("XDG_CONFIG_HOME", dir)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
             .env("GIT_COMMITTER_NAME", "t")
@@ -982,23 +991,33 @@ mod git_watch_tests {
         git(&main, &["config", "user.name", "t"]);
         git(&main, &["config", "user.email", "t@example.invalid"]);
         git(&main, &["config", "core.logAllRefUpdates", "true"]);
+        git(&main, &["config", "commit.gpgsign", "false"]);
         std::fs::write(main.join("src-tauri/f"), "x").unwrap();
         git(&main, &["add", "."]);
         git(&main, &["commit", "-q", "-m", "init"]);
         main
     }
 
-    /// Every returned path is an existing regular file; returned as
-    /// `/`-separated strings for suffix matching.
+    /// Every returned path is an existing regular file; returned canonical
+    /// and `/`-separated for suffix matching (the production paths may carry a
+    /// `..` segment from the `src-tauri/..` spelling, which cargo accepts).
     fn names(paths: &[PathBuf]) -> Vec<String> {
-        for p in paths {
-            assert!(p.is_file(), "{} is not an existing file", p.display());
-            assert!(p.is_absolute(), "{} is not absolute", p.display());
-        }
         paths
             .iter()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map(|p| {
+                assert!(p.is_file(), "{} is not an existing file", p.display());
+                std::fs::canonicalize(p)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect()
+    }
+
+    /// The branch-checkout layout is not the files ref backend (a git whose
+    /// default became reftable): the loose-ref assertions do not apply.
+    fn files_backend(main: &Path) -> bool {
+        main.join(".git/refs/heads/main").is_file()
     }
 
     fn no_dirs_no_packed_refs(n: &[String]) {
@@ -1017,6 +1036,9 @@ mod git_watch_tests {
     fn branch_checkout_watches_head_reflog_and_loose_branch_ref() {
         let tmp = tempfile::tempdir().unwrap();
         let main = repo(tmp.path());
+        if !files_backend(&main) {
+            return;
+        }
         let n = names(&git_watch_paths(&main.join("src-tauri").join("..")));
         assert!(n.iter().any(|p| p.ends_with("main/.git/HEAD")), "{n:?}");
         assert!(
@@ -1035,6 +1057,9 @@ mod git_watch_tests {
     fn linked_worktree_head_is_per_worktree_and_branch_ref_is_in_common_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let main = repo(tmp.path());
+        if !files_backend(&main) {
+            return;
+        }
         let wt = tmp.path().join("wt");
         git(
             &main,
@@ -1093,6 +1118,9 @@ mod git_watch_tests {
     fn packed_branch_ref_is_not_emitted_but_the_reflog_still_is() {
         let tmp = tempfile::tempdir().unwrap();
         let main = repo(tmp.path());
+        if !files_backend(&main) {
+            return;
+        }
         git(&main, &["pack-refs", "--all"]);
         assert!(!main.join(".git/refs/heads/main").exists());
         assert!(main.join(".git/packed-refs").is_file());
@@ -1102,6 +1130,35 @@ mod git_watch_tests {
         assert!(n.iter().any(|p| p.ends_with(".git/logs/HEAD")), "{n:?}");
         assert_eq!(n.len(), 2, "{n:?}");
         no_dirs_no_packed_refs(&n);
+    }
+
+    /// `main()` passes the RELATIVE `..`; the answer must name the same files
+    /// as an absolute spelling of the same directory.
+    #[test]
+    fn relative_dir_resolves_the_same_files_as_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        let cwd = std::env::current_dir().unwrap();
+        // Relative path from the test's cwd to the fixture: `..` up to the
+        // root, then down. Not expressible across drives (Windows) — skip.
+        let Ok(down) = main.strip_prefix(main.ancestors().last().unwrap()) else {
+            return;
+        };
+        if cwd.ancestors().last() != main.ancestors().last() {
+            return;
+        }
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        let rel = rel.join(down).join("src-tauri").join("..");
+        assert!(rel.is_relative());
+        let mut a = names(&git_watch_paths(&rel));
+        let mut b = names(&git_watch_paths(&main));
+        a.sort();
+        b.sort();
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
     }
 
     #[test]
