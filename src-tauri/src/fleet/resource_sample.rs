@@ -2304,11 +2304,8 @@ MemAvailable:   15335424 kB
     }
 
     /// Slices one production fn body out of this file, the same way the pins
-    /// above do, so a call written inside a test cannot satisfy them.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
+    /// above do, so a call written inside a test cannot satisfy them. Uses
+    /// `str::get`, not byte slicing (the `string_slice` ratchet only falls).
     fn prod_fn_body(signature: &str) -> String {
         const SRC: &str = include_str!("resource_sample.rs");
         let prod = SRC
@@ -2318,12 +2315,13 @@ MemAvailable:   15335424 kB
         let start = prod
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} must exist"));
-        let body = &prod[start..];
-        let end = body[1..]
-            .find("\n#[cfg")
+        let body = prod.get(start..).expect("start is a char boundary");
+        let end = body
+            .get(1..)
+            .and_then(|rest| rest.find("\n#[cfg"))
             .map(|i| i + 1)
             .unwrap_or(body.len());
-        body[..end].to_string()
+        body.get(..end).expect("end is a char boundary").to_string()
     }
 
     /// **The liveness check never targets a distro.** `-d`/`--distribution`
@@ -2369,8 +2367,9 @@ MemAvailable:   15335424 kB
         let gate = body
             .find("if !wsl_lane_may_read(")
             .expect("the read must be gated by wsl_lane_may_read");
-        let early = body[gate..]
-            .find("return None;")
+        let early = body
+            .get(gate..)
+            .and_then(|rest| rest.find("return None;"))
             .map(|i| i + gate)
             .expect("a closed gate must return before the read");
         assert!(
