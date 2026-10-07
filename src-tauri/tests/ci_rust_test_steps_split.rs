@@ -514,6 +514,34 @@ fn an_expiry_is_explained_and_the_memory_peak_is_sampled() {
          precisely the ones the CARGO_BUILD_JOBS retune is gated on"
     );
 
+    // Phase 3 step 1b: the reading must reach the job LOG, not only the job
+    // summary. No API exposes a job summary (`check-runs/<id>` returns
+    // `output.summary: ""`), so a summary-only sampler produces a peak nobody
+    // can collect and the soak it exists for never completes. `tee -a` keeps
+    // the summary AND writes the log; `MEMPEAK` is the line the soak greps.
+    let sampler_body = command_lines(sampler, "Windows memory peak after the Rust test steps");
+    assert!(
+        sampler_body.contains("MEMPEAK name=") && sampler_body.contains("peak_mb="),
+        "the memory sampler must emit one greppable `MEMPEAK name=… peak_mb=…` \
+         line per pagefile — that line is what the CARGO_BUILD_JOBS soak reads \
+         back out of `gh api …/actions/jobs/<id>/logs`"
+    );
+    assert!(
+        sampler_body.contains("MEMPEAK unknown=1"),
+        "a sampler that read no pagefile must say `MEMPEAK unknown=1`, never \
+         print nothing (an absent line reads as \"no data\", a zero as \"no peak\")"
+    );
+    assert!(
+        sampler_body.contains("tee -a \"$GITHUB_STEP_SUMMARY\""),
+        "the memory sampler must write the summary through `tee -a \
+         \"$GITHUB_STEP_SUMMARY\"` so the same lines land in the job log"
+    );
+    assert!(
+        !sampler_body.contains(">> \"$GITHUB_STEP_SUMMARY\""),
+        "the memory sampler must not write the summary with `>>` — that sends \
+         the reading ONLY to the summary, which no API exposes"
+    );
+
     // Neither diagnostic may become a second way to fail the job.
     for (name, step) in [
         (
@@ -608,5 +636,35 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
         cond.contains("matrix.platform == 'windows-latest'"),
         "the memory sampler's `if:` must gate on \
          `matrix.platform == 'windows-latest'`, got `{cond}`"
+    );
+}
+
+/// Phase 5a of 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound:
+/// the JOB cap must contain the two Rust step bounds plus the measured time
+/// outside them (max 49.0 min over 881 windows jobs, 2026-09-24..10-07).
+/// Otherwise a build that runs to its own bound becomes a job timeout, which
+/// GitHub concludes `cancelled`, and the `if: failure()` expiry summariser
+/// never runs — the attribution the build/run split exists to provide is
+/// erased one level up. 150 failed this: 90 + 20 + 49 = 159.
+#[test]
+fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
+    const MEASURED_OVERHEAD_MAX_MINUTES: u64 = 50; // 49.0 measured, rounded up
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let build_bound = timeout_minutes(find_step(&steps, BUILD), BUILD);
+    let run_bound = timeout_minutes(find_step(&steps, RUN), RUN);
+    let job_cap = doc
+        .get("jobs")
+        .and_then(|j| j.get("test"))
+        .and_then(|j| j.get("timeout-minutes"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("job `test` must carry an integer job-level `timeout-minutes`"));
+    let floor = build_bound + run_bound + MEASURED_OVERHEAD_MAX_MINUTES;
+    assert!(
+        job_cap >= floor,
+        "job `test` timeout-minutes ({job_cap}) must be >= `{BUILD}` ({build_bound}) \
+         + `{RUN}` ({run_bound}) + measured non-Rust overhead ({MEASURED_OVERHEAD_MAX_MINUTES}) \
+         = {floor}. A smaller cap turns a build-bound expiry into a job-level \
+         `cancelled`, which the `if: failure()` expiry summariser never explains."
     );
 }
