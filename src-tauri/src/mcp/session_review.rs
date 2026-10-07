@@ -59,8 +59,10 @@
 //! liveness AFTER that write and settles in-line ([`PromptDoor::target_live`]).
 //! And a runner restart drops every exit hook on the floor — so
 //! [`start_stranded_note_sweep`] settles, once at boot, every `submitted` note
-//! a previous process of this same runner instance sent ([`NoteSender`]) whose
-//! target no live terminal or task run holds.
+//! a previous process of this same runner instance, on this same machine, sent
+//! ([`NoteSender`]) whose target no live terminal or task run holds. A runner
+//! that cannot establish that identity (a nameless secondary, or no device id)
+//! skips the sweep rather than guess.
 //!
 //! Every mutation emits `session-review-changed` `{ "sessionId": … }` so the
 //! page refreshes.
@@ -265,16 +267,16 @@ pub struct ReviewNote {
     pub sender: Option<NoteSender>,
 }
 
-/// The runner process that submitted a note: its instance name
-/// ([`crate::orchestration_loop::loop_engine::run_owner_instance`] — the
-/// `QONTINUI_INSTANCE_NAME`, or `primary`) and a UUID minted once per process.
+/// The runner process that submitted a note: its sweep scope `instance`
+/// (`"<device_id>/<runner scope>"`, see [`NoteSender::resolve`]) and a UUID
+/// minted once per process.
 ///
 /// Several runners can share one PG cluster — a temp or named runner attaches
 /// to the primary's embedded cluster (`database::embedded_pg`), and
-/// external-arm runners share one `database_url` — so "not live in THIS
-/// process" says nothing about a note another runner sent. The boot sweep
-/// settles only notes a PREVIOUS life of this same instance sent
-/// ([`NoteSender::is_previous_life_of`]).
+/// external-arm runners share one `database_url`, possibly from several
+/// machines — so "not live in THIS process" says nothing about a note another
+/// runner sent. The boot sweep settles only notes a PREVIOUS life of this same
+/// runner on this same machine sent ([`NoteSender::is_previous_life_of`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteSender {
     pub instance: String,
@@ -284,20 +286,97 @@ pub struct NoteSender {
 /// This process's boot id: minted on first use, constant for its lifetime.
 static BOOT_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
+/// The `instance` prefix of a stamp from a process that could not establish
+/// its sweep identity. No resolved identity carries it (a resolved one leads
+/// with a device id), so such a note is never settled by any boot sweep — the
+/// same fail-closed treatment as an unstamped row.
+const UNATTRIBUTED: &str = "unattributed";
+
 impl NoteSender {
-    /// The stamp this process puts on every note it submits.
-    pub fn this_process() -> Self {
-        NoteSender {
-            instance: crate::orchestration_loop::loop_engine::run_owner_instance(),
-            boot_id: BOOT_ID.clone(),
+    /// Pure decision core for [`Self::process_identity`] — every input
+    /// injected so it is testable without the process-global env the parallel
+    /// test harness mutates.
+    ///
+    /// - `device_id`: this machine's device id (`QONTINUI_MACHINE_ID`, else
+    ///   `machine.json`). Qualifies the stamp so two primaries on different
+    ///   machines sharing one external database are different senders.
+    /// - `unnamed_secondary`: a secondary runner launched without
+    ///   `QONTINUI_INSTANCE_NAME` (see [`crate::instance::data_subdir`]).
+    /// - `scope`: [`crate::instance::data_subdir`] — `None` for the primary.
+    ///
+    /// Fails closed: an unnamed secondary (whose quarantine scope is only its
+    /// port, and which would otherwise read as `primary`) or an unresolvable
+    /// device id is an error, and the caller must not sweep on it.
+    pub fn resolve(
+        device_id: Option<&str>,
+        unnamed_secondary: bool,
+        scope: Option<&str>,
+        boot_id: &str,
+    ) -> Result<NoteSender, String> {
+        if unnamed_secondary {
+            return Err(
+                "this runner is a secondary with no QONTINUI_INSTANCE_NAME, so it \
+                 cannot tell its own previous life from another runner's"
+                    .to_string(),
+            );
         }
+        let device_id = device_id
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| {
+                "no device id resolves (QONTINUI_MACHINE_ID unset, machine.json \
+                 unreadable), so this machine's notes cannot be told from another's"
+                    .to_string()
+            })?;
+        Ok(NoteSender {
+            instance: format!("{device_id}/{}", scope.unwrap_or("primary")),
+            boot_id: boot_id.to_string(),
+        })
+    }
+
+    /// This process's sweep identity, or why it has none. Only an `Ok` may
+    /// drive [`settle_stranded`].
+    pub fn process_identity() -> Result<NoteSender, String> {
+        // `owns_shared_root_state` is `instance.rs`'s own fail-closed
+        // predicate (false for ANY secondary, named or not); with no name it
+        // is false only for the nameless one. `data_subdir` is consulted only
+        // otherwise, since it logs an error for that case on every call.
+        let unnamed_secondary = crate::instance::instance_name().is_none()
+            && !crate::instance::owns_shared_root_state();
+        let scope = if unnamed_secondary {
+            None
+        } else {
+            crate::instance::data_subdir()
+        };
+        let device_id = std::env::var("QONTINUI_MACHINE_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| crate::machine_identity::read_device_id().ok());
+        Self::resolve(
+            device_id.as_deref(),
+            unnamed_secondary,
+            scope.as_deref(),
+            &BOOT_ID,
+        )
+    }
+
+    /// The stamp this process puts on every note it submits: its sweep
+    /// identity, or an [`UNATTRIBUTED`] stamp no sweep ever matches.
+    pub fn this_process() -> Self {
+        Self::process_identity().unwrap_or_else(|_| NoteSender {
+            instance: UNATTRIBUTED.to_string(),
+            boot_id: BOOT_ID.clone(),
+        })
     }
 
     /// True when `self` was sent by an earlier process of `current`'s
-    /// instance: same instance name, different boot id. Another instance's
-    /// notes, and this process's own, are never a previous life.
+    /// runner: same device-qualified instance, different boot id. Another
+    /// runner's notes, another machine's, this process's own, and
+    /// unattributed ones are never a previous life.
     pub fn is_previous_life_of(&self, current: &NoteSender) -> bool {
-        self.instance == current.instance && self.boot_id != current.boot_id
+        self.instance != UNATTRIBUTED
+            && self.instance == current.instance
+            && self.boot_id != current.boot_id
     }
 }
 
@@ -1069,7 +1148,8 @@ pub struct SendOutcome {
 }
 
 /// Validate, deliver, and — for [`SendMode::Submit`], only after the write
-/// returned Ok — move every note to `submitted`.
+/// returned Ok — move every note to `submitted`, stamped with
+/// [`NoteSender::this_process`].
 pub async fn send(
     store: &dyn ReviewStore,
     door: &dyn PromptDoor,
@@ -1077,6 +1157,29 @@ pub async fn send(
     session_id: &str,
     req: SendRequest,
     mode: SendMode,
+) -> Result<SendOutcome, ApiError> {
+    send_as(
+        store,
+        door,
+        sightings,
+        session_id,
+        req,
+        mode,
+        NoteSender::this_process(),
+    )
+    .await
+}
+
+/// [`send`] with the sender stamp injected — the seam tests use so a stamp
+/// does not depend on process-global env.
+pub async fn send_as(
+    store: &dyn ReviewStore,
+    door: &dyn PromptDoor,
+    sightings: &MarkerSightings,
+    session_id: &str,
+    req: SendRequest,
+    mode: SendMode,
+    sender: NoteSender,
 ) -> Result<SendOutcome, ApiError> {
     check_session_id(session_id)?;
     check_len("target id", req.target.id(), MAX_SESSION_ID_BYTES, true)?;
@@ -1165,7 +1268,6 @@ pub async fn send(
     // Every edge is validated BEFORE the write, so a send either delivers with
     // all of its notes legal or delivers nothing.
     let at = now_iso();
-    let sender = NoteSender::this_process();
     let mut submitted = Vec::with_capacity(notes.len());
     for note in &notes {
         let next = transition(
@@ -1479,9 +1581,12 @@ const STRANDED_SWEEP_ATTEMPTS: u32 = 8;
 ///
 /// Scoped by the note's [`NoteSender`] stamp because several runners can
 /// share one PG cluster: a temp runner booting must not settle the notes the
-/// primary is still delivering. Notes another instance sent are that
-/// instance's own sweep's, and unstamped rows (submitted before the stamp
-/// existed) are left alone.
+/// primary is still delivering. Notes another instance (or another machine's
+/// runner) sent are that runner's own sweep's, and unstamped rows (submitted
+/// before the stamp existed) are left alone. A process with no sweep identity
+/// ([`NoteSender::process_identity`] — a secondary launched without
+/// `QONTINUI_INSTANCE_NAME`, or no resolvable device id) does not sweep at all:
+/// it cannot tell its own previous life from a live peer's, so it fails closed.
 ///
 /// A runner restart loses every exit hook a note was waiting on: the terminal
 /// it was sent into, and the stream-json worker, died with the old process,
@@ -1496,6 +1601,16 @@ const STRANDED_SWEEP_ATTEMPTS: u32 = 8;
 /// settling it here too is the same compare-and-set, so the two cannot disagree.
 /// `unknown` is not terminal: a later marker sighting still confirms it.
 pub fn start_stranded_note_sweep(app: tauri::AppHandle) {
+    let me = match NoteSender::process_identity() {
+        Ok(me) => me,
+        Err(why) => {
+            warn!(
+                "session review: boot sweep skipped — {}; stranded submitted notes stay submitted",
+                why
+            );
+            return;
+        }
+    };
     tauri::async_runtime::spawn(async move {
         for attempt in 1..=STRANDED_SWEEP_ATTEMPTS {
             tokio::time::sleep(STRANDED_SWEEP_DELAY).await;
@@ -1504,7 +1619,7 @@ pub fn start_stranded_note_sweep(app: tauri::AppHandle) {
             };
             let probe = app.clone();
             let is_live = move |target: &NoteTarget| target_is_live(&probe, target);
-            match settle_stranded(&*pg, &NoteSender::this_process(), &is_live).await {
+            match settle_stranded(&*pg, &me, &is_live).await {
                 Ok(sessions) => {
                     info!(
                         sessions = sessions.len(),
@@ -2774,21 +2889,24 @@ mod tests {
             let mut req = send_req(&[&note.id]);
             req.target = target;
             req.text = text_with(marker);
-            send(
+            send_as(
                 &store,
                 &ScriptedDoor::ok(),
                 &MarkerSightings::new(),
                 SESSION,
                 req,
                 SendMode::Submit,
+                fixed_sender("boot-before"),
             )
             .await
             .expect("send");
         }
-        // The next life of this same instance.
+        // The next life of this same instance, built from the stamp the send
+        // actually stored — never from a second read of the environment.
+        let sent = store.note(&dead.id).sender.expect("send stamps the note");
         let next_life = NoteSender {
             boot_id: "next-boot".to_string(),
-            ..NoteSender::this_process()
+            ..sent
         };
         let is_live = |t: &NoteTarget| t.id() == "new-term";
         let changed = settle_stranded(&store, &next_life, &is_live).await.unwrap();
@@ -2851,12 +2969,39 @@ mod tests {
         }
     }
 
-    /// A send stamps every note it submits with this process's sender.
+    /// A resolved sweep identity for device `dev-a`'s primary.
+    fn fixed_sender(boot_id: &str) -> NoteSender {
+        NoteSender::resolve(Some("dev-a"), false, None, boot_id).expect("resolves")
+    }
+
+    /// A send stamps every note it submits with the sender it was given.
     #[tokio::test]
     async fn session_review_send_stamps_the_sending_process() {
         let store = MemoryStore::default();
         let note = attached_note(&store, SESSION).await;
         assert_eq!(note.sender, None);
+        let sender = fixed_sender("boot-now");
+        send_as(
+            &store,
+            &ScriptedDoor::ok(),
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&note.id]),
+            SendMode::Submit,
+            sender.clone(),
+        )
+        .await
+        .expect("send");
+        assert_eq!(store.note(&note.id).sender, Some(sender));
+    }
+
+    /// The default [`send`] stamps this process's boot id. Whether the
+    /// instance part resolves depends on process env other tests mutate, so
+    /// only the env-independent half is asserted — read back from the store.
+    #[tokio::test]
+    async fn session_review_default_send_stamps_this_boot() {
+        let store = MemoryStore::default();
+        let note = attached_note(&store, SESSION).await;
         send(
             &store,
             &ScriptedDoor::ok(),
@@ -2867,10 +3012,67 @@ mod tests {
         )
         .await
         .expect("send");
-        assert_eq!(
-            store.note(&note.id).sender,
-            Some(NoteSender::this_process())
-        );
+        let stamp = store.note(&note.id).sender.expect("stamped");
+        assert_eq!(stamp.boot_id, *BOOT_ID);
+    }
+
+    /// The stamp is `<device>/<scope>`: a primary is `primary`, a named
+    /// secondary its sanitized `data_subdir`.
+    #[test]
+    fn session_review_sender_is_device_qualified() {
+        assert_eq!(fixed_sender("b").instance, "dev-a/primary");
+        let named = NoteSender::resolve(Some(" dev-a "), false, Some("instance-temp-1"), "b")
+            .expect("resolves");
+        assert_eq!(named.instance, "dev-a/instance-temp-1");
+    }
+
+    /// A secondary started without `QONTINUI_INSTANCE_NAME` would otherwise
+    /// stamp itself `primary` and settle the live primary's notes: it gets no
+    /// sweep identity at all, and its stamp is never anyone's previous life.
+    #[test]
+    fn session_review_unnamed_secondary_does_not_sweep() {
+        assert!(NoteSender::resolve(Some("dev-a"), true, None, "b").is_err());
+        let unattributed = NoteSender {
+            instance: UNATTRIBUTED.to_string(),
+            boot_id: "boot-before".to_string(),
+        };
+        let later = NoteSender {
+            instance: UNATTRIBUTED.to_string(),
+            boot_id: "boot-now".to_string(),
+        };
+        assert!(!unattributed.is_previous_life_of(&later));
+    }
+
+    /// No device id resolves: fail closed rather than stamp a bare instance
+    /// that a primary on another machine would share.
+    #[test]
+    fn session_review_no_device_id_does_not_sweep() {
+        assert!(NoteSender::resolve(None, false, None, "b").is_err());
+        assert!(NoteSender::resolve(Some("  "), false, None, "b").is_err());
+    }
+
+    /// Two primaries on different machines sharing one external database:
+    /// the other device's `primary` notes are not this one's previous life.
+    #[tokio::test]
+    async fn session_review_boot_sweep_leaves_another_devices_primary_alone() {
+        let store = MemoryStore::default();
+        let other_device =
+            NoteSender::resolve(Some("dev-b"), false, None, "boot-b").expect("resolves");
+        let note = ReviewNote {
+            id: "other-device".to_string(),
+            state: NoteState::Submitted,
+            submitted_at: Some(now_iso()),
+            target: Some(NoteTarget::TerminalId("term-b".to_string())),
+            sender: Some(other_device),
+            ..note_in(NoteState::Submitted)
+        };
+        store.insert_note(&note).await.unwrap();
+        let nothing_live = |_: &NoteTarget| false;
+        let changed = settle_stranded(&store, &fixed_sender("boot-a"), &nothing_live)
+            .await
+            .unwrap();
+        assert!(changed.is_empty());
+        assert_eq!(store.note("other-device").state, NoteState::Submitted);
     }
 
     #[test]
