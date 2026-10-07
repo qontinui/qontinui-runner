@@ -1007,9 +1007,9 @@ export function toFindRequest(source: unknown): Record<string, unknown> {
     // `null` is deliberately NOT skipped: a caller that sends an explicit null
     // gets it forwarded, as the previous allowlists did (their guard was
     // `!== undefined`). `ui_bridge_discover_handler` no longer manufactures
-    // nulls for unset filters — it omits them — because a forwarded
-    // `includeHidden: null` would override the `includeHidden: true` seed in
-    // `toDiscoverRequest` with a value the SDK reads as false.
+    // nulls for unset filters — it omits them — and `withIncludeHiddenDefault`
+    // treats an explicit `includeHidden: null` as unset, since the SDK would
+    // otherwise read it as false.
     if (value === undefined) continue;
     if ((FIND_ENVELOPE_KEYS as readonly string[]).includes(key)) continue;
     request[key] = value;
@@ -1017,10 +1017,12 @@ export function toFindRequest(source: unknown): Record<string, unknown> {
 
   for (const [snake, camel] of FIND_SNAKE_ALIASES) {
     if (!(snake in request)) continue;
-    // The caller's own camelCase value wins; the alias only fills a gap. Then
-    // the snake key is dropped so exactly one spelling reaches the SDK, which
-    // is what the previous per-key mapping did.
-    if (!(camel in request)) request[camel] = request[snake];
+    // The caller's own camelCase value wins; the alias only fills a gap — and
+    // a camelCase `null` is a gap, since downstream defaults treat `null` as
+    // unset (`withIncludeHiddenDefault`). Then the snake key is dropped so
+    // exactly one spelling reaches the SDK, which is what the previous per-key
+    // mapping did.
+    if (request[camel] == null) request[camel] = request[snake];
     delete request[snake];
   }
 
