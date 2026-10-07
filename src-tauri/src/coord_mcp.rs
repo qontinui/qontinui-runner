@@ -8950,7 +8950,12 @@ pub(crate) fn write_degraded_breadcrumb(
     );
     let line2 = breadcrumb_stamp_json(workdir, verdict, port);
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{line1}\n{line2}\n")) {
+    // Temp-then-rename, never `fs::write`: that truncates first, so a reader
+    // racing a rewrite (`/gate`, `/coord-revive`, the probe re-stamping it) read
+    // an EMPTY breadcrumb -- a verdict that was never written.
+    if let Err(e) =
+        crate::fs_atomic::atomic_write(&path, format!("{line1}\n{line2}\n").as_bytes())
+    {
         warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
     }
 }
@@ -8977,7 +8982,7 @@ pub(crate) fn write_unprovisioned_breadcrumb(workdir: &str, reason: &str) {
 /// a write failure only logs — losing the breadcrumb must never fail a spawn.
 fn write_status_breadcrumb(workdir: &str, line: &str) {
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
+    if let Err(e) = crate::fs_atomic::atomic_write(&path, format!("{line}\n").as_bytes()) {
         warn!("coord_mcp: failed to write status breadcrumb in {workdir}: {e}");
     }
 }
