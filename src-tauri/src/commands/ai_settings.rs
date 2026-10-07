@@ -1647,20 +1647,143 @@ mod usage_twin_report {
         };
         // coord-tenant-scope(device): the payload is this machine's whole Claude-account roster (:1540-1561) -- a device property, with no session and no artifact in scope.
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
-        match req.json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(
-                    accounts = results.len(),
-                    prepaid = prepaid.len(),
-                    "account usage mirrored to coord twin"
-                );
-            }
-            Ok(resp) => {
-                warn!(status = %resp.status(), "coord account-usage ingest non-2xx (older coord?) — skipped");
-            }
+        let resp = match req.json(&body).send().await {
+            Ok(resp) => resp,
             Err(e) => {
                 warn!(error = %e, "coord account-usage report failed — skipped");
+                return;
             }
+        };
+        // Read status and body ONCE: both the upstream-verdict classifier and
+        // the refusal diagnosis below need the bytes.
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.unwrap_or_default();
+        // coord's FleetPrincipal verifies the bearer on this route, so a 2xx
+        // is a real Accepted (resets the dark streak). Coord's codeless
+        // `{"error":"auth_required"}` 403 classifies Indeterminate and records
+        // nothing — expected; the posture below names the cause instead.
+        crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(None, true, status, &bytes);
+        if (200..300).contains(&status) {
+            forget_ingest_refusal();
+            debug!(
+                accounts = results.len(),
+                prepaid = prepaid.len(),
+                "account usage mirrored to coord twin"
+            );
+            return;
+        }
+        log_ingest_refusal(status, &bytes);
+    }
+
+    /// One non-2xx ingest answer, as the WARN rate-limit keys it:
+    /// `(status, refusal token, credential posture)`.
+    type IngestRefusalKey = (u16, String, String);
+
+    /// The last non-2xx answer this process WARNed about. A repeat of the
+    /// same key logs at debug; a 2xx clears it so a later refusal WARNs
+    /// again. Without this the ingest logged one identical WARN per refresh
+    /// (147 in one day on the primary runner).
+    static LAST_INGEST_REFUSAL: std::sync::Mutex<Option<IngestRefusalKey>> =
+        std::sync::Mutex::new(None);
+
+    fn forget_ingest_refusal() {
+        *LAST_INGEST_REFUSAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Diagnose and log a non-2xx ingest answer.
+    ///
+    /// Coord's ingest answers EVERY device-verification failure with the same
+    /// codeless `403 {"error":"auth_required"}` and never a 401, so the cause
+    /// cannot be read off the response — it is named from the runner's own
+    /// coord-credential posture instead. 404 is the one status that still
+    /// means "this coord predates the route".
+    fn log_ingest_refusal(status: u16, body: &[u8]) {
+        let token = ingest_refusal_token(body);
+        let posture = crate::mcp::device_jwt_refresher::coord_credential_posture();
+        let posture_text = posture_label(posture.as_ref().map(|s| s.posture));
+        let message = ingest_refusal_message(status, &token, &posture_text);
+        let key: IngestRefusalKey = (status, token, posture_text);
+        let fresh = {
+            let mut last = LAST_INGEST_REFUSAL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let fresh = should_warn_refusal(last.as_ref(), &key);
+            if fresh {
+                *last = Some(key);
+            }
+            fresh
+        };
+        if fresh {
+            warn!(status, "{message}");
+        } else {
+            debug!(status, "{message} (repeat)");
+        }
+    }
+
+    /// The refusal token a non-2xx body carries: coord's typed `code` when
+    /// present, else the top-level `error` string, else `none`. Bounded so a
+    /// long prose `error` cannot balloon the log line or the dedup key.
+    fn ingest_refusal_token(body: &[u8]) -> String {
+        const MAX_TOKEN_CHARS: usize = 64;
+        let text = String::from_utf8_lossy(body);
+        let token = crate::mcp::device_jwt_refresher::upstream_refusal_code(&text).or_else(|| {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(serde_json::Value::Object(map)) => match map.get("error") {
+                    Some(serde_json::Value::String(e)) => Some(e.trim().to_string()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        });
+        match token {
+            Some(t) if !t.is_empty() => t.chars().take(MAX_TOKEN_CHARS).collect(),
+            _ => "none".to_string(),
+        }
+    }
+
+    /// Render the runner's coord-credential posture for the log line. `None`
+    /// (no refresher pass has run yet) is UNKNOWN, never healthy.
+    fn posture_label(
+        posture: Option<crate::mcp::device_jwt_refresher::CoordCredentialPosture>,
+    ) -> String {
+        match posture {
+            None => "unknown".to_string(),
+            Some(p) => match p.cause() {
+                Some(cause) => format!("{} ({cause})", p.as_str()),
+                None => p.as_str().to_string(),
+            },
+        }
+    }
+
+    /// Pure rate-limit rule: WARN only when the key differs from the last one
+    /// WARNed about (or nothing has been WARNed since the last 2xx).
+    fn should_warn_refusal(last: Option<&IngestRefusalKey>, current: &IngestRefusalKey) -> bool {
+        last != Some(current)
+    }
+
+    fn ingest_refusal_message(status: u16, token: &str, posture: &str) -> String {
+        match status {
+            401 | 403 => {
+                let action = match posture {
+                    "live" | "expiring" => {
+                        "credential looks live locally; check this device's coord pairing/tenant"
+                    }
+                    "unknown" => "credential state not yet known",
+                    _ => "re-pair",
+                };
+                format!(
+                    "coord account-usage ingest refused ({status} {token}) — runner coord \
+                     credential posture: {posture} — device feed not updating; {action}"
+                )
+            }
+            404 => "coord account-usage ingest 404 (older coord without the route?) — skipped"
+                .to_string(),
+            _ => format!(
+                "coord account-usage ingest non-2xx ({status} {token}) — runner coord \
+                 credential posture: {posture} — skipped"
+            ),
         }
     }
 
@@ -1819,6 +1942,90 @@ mod usage_twin_report {
                     v[k]
                 );
             }
+        }
+    }
+
+    /// The pure halves of the ingest-refusal diagnosis. The process-global
+    /// rate-limit memory itself is deliberately not exercised here (parallel
+    /// tests would race on it); its rule is [`should_warn_refusal`].
+    #[cfg(test)]
+    mod refusal_tests {
+        use super::*;
+
+        #[test]
+        fn codeless_auth_required_403_reads_its_error_string() {
+            // coord's uniform device-verification refusal (fleet_principal.rs).
+            assert_eq!(
+                ingest_refusal_token(br#"{"error":"auth_required"}"#),
+                "auth_required"
+            );
+        }
+
+        #[test]
+        fn typed_code_wins_over_error_prose() {
+            assert_eq!(
+                ingest_refusal_token(br#"{"error":"Token expired","code":"token_expired"}"#),
+                "token_expired"
+            );
+        }
+
+        #[test]
+        fn non_json_or_empty_body_is_none() {
+            assert_eq!(ingest_refusal_token(b"<html>Forbidden</html>"), "none");
+            assert_eq!(ingest_refusal_token(b""), "none");
+            assert_eq!(ingest_refusal_token(br#"{"error":42}"#), "none");
+            assert_eq!(ingest_refusal_token(br#"{"error":"  "}"#), "none");
+        }
+
+        #[test]
+        fn long_error_prose_is_bounded() {
+            let body = format!(r#"{{"error":"{}"}}"#, "x".repeat(500));
+            assert_eq!(ingest_refusal_token(body.as_bytes()).chars().count(), 64);
+        }
+
+        #[test]
+        fn posture_label_names_unknown_and_dark_cause() {
+            use crate::mcp::device_jwt_refresher::{CoordCredentialPosture, DarkCause};
+            assert_eq!(posture_label(None), "unknown");
+            assert_eq!(posture_label(Some(CoordCredentialPosture::Expired)), "expired");
+            assert_eq!(
+                posture_label(Some(CoordCredentialPosture::Dark(
+                    DarkCause::UpstreamRejected
+                ))),
+                "dark (upstream_401)"
+            );
+        }
+
+        #[test]
+        fn refusal_message_names_status_token_and_posture() {
+            assert_eq!(
+                ingest_refusal_message(403, "auth_required", "expired"),
+                "coord account-usage ingest refused (403 auth_required) — runner coord \
+                 credential posture: expired — device feed not updating; re-pair"
+            );
+            let m = ingest_refusal_message(404, "none", "live");
+            assert!(m.contains("older coord"), "{m}");
+            let m = ingest_refusal_message(403, "auth_required", "live");
+            assert!(!m.contains("older coord") && m.contains("pairing"), "{m}");
+            let m = ingest_refusal_message(502, "none", "live");
+            assert!(m.contains("502") && !m.contains("older coord"), "{m}");
+        }
+
+        #[test]
+        fn warn_once_per_key_change() {
+            let a: IngestRefusalKey = (403, "auth_required".into(), "expired".into());
+            let same = a.clone();
+            let new_posture: IngestRefusalKey = (403, "auth_required".into(), "unrefreshable".into());
+            let new_status: IngestRefusalKey = (401, "auth_required".into(), "expired".into());
+            let new_token: IngestRefusalKey = (403, "token_expired".into(), "expired".into());
+            // Nothing WARNed yet (fresh process, or reset by a 2xx) -> WARN.
+            assert!(should_warn_refusal(None, &a));
+            // Identical repeat -> debug only.
+            assert!(!should_warn_refusal(Some(&a), &same));
+            // Any component changing -> WARN again.
+            assert!(should_warn_refusal(Some(&a), &new_posture));
+            assert!(should_warn_refusal(Some(&a), &new_status));
+            assert!(should_warn_refusal(Some(&a), &new_token));
         }
     }
 }
