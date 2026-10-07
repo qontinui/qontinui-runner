@@ -197,6 +197,16 @@ pub struct SnapshotSession {
     pub restorable: Option<bool>,
     /// Unix millis the session was first opened (stable across snapshots).
     pub opened_at: i64,
+    /// Unix millis the operator marked the session's WORK finished, as of this
+    /// snapshot. Without it a finished session whose registry row aged out
+    /// (~24 h) reads as unfinished in Past Sessions, which merges the snapshot
+    /// history in for older rows. `None` = no finish recorded (also every line
+    /// written before this field existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// Free-text reason recorded with [`Self::finished_at`] (`"dismissed"`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 impl SnapshotSession {
@@ -227,6 +237,8 @@ impl SnapshotSession {
             transcript_exists,
             restorable: transcript_exists.map(|e| is_restorable_identity(confirmed, e)),
             opened_at: rec.opened_at,
+            finished_at: rec.finished_at,
+            finish_reason: rec.finish_reason.clone(),
         }
     }
 }
@@ -808,6 +820,8 @@ mod tests {
             transcript_exists: None,
             restorable: None,
             opened_at: 1_000,
+            finished_at: None,
+            finish_reason: None,
         }
     }
 
@@ -1410,5 +1424,25 @@ mod tests {
 
         let missing = read_tree_resets(&dir.path().join("nope.jsonl"), &TreeResetQuery::default());
         assert!(missing.is_empty(), "missing file reads as empty");
+    }
+
+    #[test]
+    fn finish_mark_round_trips_through_the_snapshot_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("h.jsonl");
+        let h = SnapshotHistory::open(&path).unwrap();
+        let mut s = sess("a", 0);
+        s.finished_at = Some(5_000);
+        s.finish_reason = Some("dismissed".into());
+        h.record_change(vec![s]);
+        let read = read_all_snapshot_sessions(&path);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].finished_at, Some(5_000));
+        assert_eq!(read[0].finish_reason.as_deref(), Some("dismissed"));
+        // Unfinished sessions omit the keys, so old lines and new ones agree.
+        let json = serde_json::to_string(&sess("b", 1)).unwrap();
+        assert!(!json.contains("finishedAt") && !json.contains("finishReason"));
+        let back: SnapshotSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.finished_at, None);
     }
 }

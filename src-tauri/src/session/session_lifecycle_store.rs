@@ -2284,6 +2284,10 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed.clone()),
             }],
         );
+        // Record the mark in the snapshot history too: past-sessions merges
+        // that history in once the registry row ages out (~24 h), and without
+        // this line a finished session would read as unfinished there.
+        self.snapshot_change(std::iter::once(changed.clone()));
         // Notify AFTER the durable local write and outside the map lock (the
         // guard was consumed by `persist`). Fires for every write that owes
         // coord a write — a fresh mark, a reason update on a mark coord has not

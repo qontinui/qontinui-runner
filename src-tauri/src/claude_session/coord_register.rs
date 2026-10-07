@@ -265,6 +265,21 @@ pub(crate) fn resolve_adoption_chain<T>(
     None
 }
 
+/// Reason sent to coord when a session is marked finished with no reason of its
+/// own (`/finish-session` with no body reason, the Tauri command with `None`).
+pub const FINISH_REASON_DEFAULT: &str = "finished";
+
+/// The `finish_reason` a `Finished` payload carries: the operator's own reason
+/// verbatim (a dismissal records `"dismissed"`), else [`FINISH_REASON_DEFAULT`].
+/// Never empty, so coord can tell "finished, no reason given" from "no
+/// reason column written".
+pub fn normalize_finish_reason(reason: Option<&str>) -> String {
+    match reason.map(str::trim) {
+        Some(r) if !r.is_empty() => r.to_string(),
+        _ => FINISH_REASON_DEFAULT.to_string(),
+    }
+}
+
 impl AiCoordRegistrar {
     /// Construct from the shared session outbox + this device's `machine_id`.
     /// The outbox MUST be the same `Arc` the `CoordSync` drain loop reads.
@@ -396,7 +411,12 @@ impl AiCoordRegistrar {
         let resolved =
             self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
         match rec.finished_at {
-            Some(at) => self.finish_session_on(&rec.claude_session_id, resolved, Some(at)),
+            Some(at) => self.finish_session_on(
+                &rec.claude_session_id,
+                resolved,
+                Some(at),
+                rec.finish_reason.as_deref(),
+            ),
             None => self.unfinish_session_on(&rec.claude_session_id, resolved),
         }
     }
@@ -1173,7 +1193,16 @@ impl AiCoordRegistrar {
     /// never disturbs the session.
     pub fn finish_session(&self, claude_session_id: &str, finished_at: Option<i64>) -> FinishSync {
         let resolved = self.resolve_coord_session_id(claude_session_id);
-        self.finish_session_on(claude_session_id, resolved, finished_at)
+        // The reason is the lifecycle record's own (`/finish-session` stores it
+        // there before the observer fires), so this entry point carries it
+        // without every caller threading it.
+        let reason = self
+            .inner
+            .lifecycle_store
+            .get()
+            .and_then(|store| store.get(claude_session_id))
+            .and_then(|rec| rec.finish_reason);
+        self.finish_session_on(claude_session_id, resolved, finished_at, reason.as_deref())
     }
 
     /// [`Self::finish_session`] against an already-resolved coord row
@@ -1183,6 +1212,7 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         resolved: Option<Uuid>,
         finished_at: Option<i64>,
+        reason: Option<&str>,
     ) -> FinishSync {
         let Some(session_id) = resolved else {
             warn!(
@@ -1192,7 +1222,7 @@ impl AiCoordRegistrar {
             );
             return FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession);
         };
-        self.enqueue_finished(claude_session_id, session_id, finished_at)
+        self.enqueue_finished(claude_session_id, session_id, finished_at, reason)
     }
 
     /// Enqueue the `Finished` row for `claude_session_id`, addressed to the
@@ -1202,6 +1232,7 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         session_id: Uuid,
         finished_at: Option<i64>,
+        reason: Option<&str>,
     ) -> FinishSync {
         let payload = self.stamp_tenant(
             session_id,
@@ -1209,6 +1240,7 @@ impl AiCoordRegistrar {
                 "id": session_id,
                 "claude_session_id": claude_session_id,
                 "finished_at": finished_at,
+                "finish_reason": normalize_finish_reason(reason),
             }),
         );
         match self.inner.outbox.record(
@@ -1306,7 +1338,12 @@ impl AiCoordRegistrar {
                          to coord session {} — delivering the owed write",
                         rec.claude_session_id, target
                     );
-                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                    self.enqueue_finished(
+                        &rec.claude_session_id,
+                        target,
+                        rec.finished_at,
+                        rec.finish_reason.as_deref(),
+                    )
                 })
                 .collect()
         })
@@ -2367,6 +2404,11 @@ mod tests {
             "the ACK needs the local key to stamp finish_synced"
         );
         assert_eq!(finished[0].payload["finished_at"], json!(1));
+        assert_eq!(
+            finished[0].payload["finish_reason"],
+            json!("finished"),
+            "no reason anywhere: the default, never empty"
+        );
 
         assert_eq!(
             reg.unfinish_session(&csid),
@@ -2464,7 +2506,7 @@ mod tests {
         );
 
         let at = store
-            .set_finished(csid, true, None)
+            .set_finished(csid, true, Some("dismissed".into()))
             .unwrap()
             .record
             .finished_at;
@@ -2480,6 +2522,11 @@ mod tests {
         assert_eq!(pending[0].session_id, coord_id);
         assert_eq!(pending[0].event_kind, SessionEventKind::Finished.as_str());
         assert_eq!(pending[0].payload["finished_at"], json!(at));
+        assert_eq!(
+            pending[0].payload["finish_reason"],
+            json!("dismissed"),
+            "the owed write carries the record's stored reason"
+        );
 
         store.mark_finish_synced(csid, at);
         assert!(
@@ -3263,6 +3310,13 @@ mod tests {
             pending.last().unwrap().payload["finished_at"],
             json!(finished_at)
         );
+    }
+
+    #[test]
+    fn finish_reason_defaults_to_finished_and_keeps_an_explicit_one() {
+        assert_eq!(normalize_finish_reason(None), "finished");
+        assert_eq!(normalize_finish_reason(Some("  ")), "finished");
+        assert_eq!(normalize_finish_reason(Some("dismissed")), "dismissed");
     }
 
     #[test]
