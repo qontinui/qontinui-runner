@@ -49,6 +49,8 @@ export type SkipReason =
   | "coord-unreachable"
   | "absent"
   | "not-reapable"
+  /** Another checkout of the same allocation is dirty, unreadable or building (execution-time only). */
+  | "sibling-busy"
   | "error";
 
 export interface WorktreeSurveyItem {
@@ -180,6 +182,7 @@ export const REASON_LABEL: Record<SkipReason, string> = {
   "coord-unreachable": "coord offline",
   absent: "gone",
   "not-reapable": "not reapable",
+  "sibling-busy": "sibling busy",
   error: "error",
 };
 
