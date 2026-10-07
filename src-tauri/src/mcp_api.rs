@@ -4927,9 +4927,11 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// the announcing finding as a precondition, tighten-only PATCH), so
 /// withholding them here would only make a proxied session — which holds MCP
 /// and no raw bearer — unable to reach a door its own device may call over
-/// HTTP. A proxied write goes upstream under this runner's DEVICE credential
-/// (attributed to the session coord can prove), so it is never stronger than
-/// what that device may already do directly.
+/// HTTP. For a device-principal session a proxied write goes upstream under
+/// this runner's DEVICE credential (attributed to the session coord can
+/// prove), so it is never stronger than what that device may already do
+/// directly; an agent-principal session forwards its own agent JWT, which
+/// coord's floor judges as it would over HTTP.
 ///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
