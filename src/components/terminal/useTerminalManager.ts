@@ -76,6 +76,14 @@ export interface TerminalTab {
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
   /**
+   * The account's EXPLICIT config dir for the registry record only — the
+   * default home's path included — set beside {@link claudeConfigDir} (the
+   * TYPED form, `undefined` for the default home) by every resume path. Never
+   * typed. A Retry records the session under it, so a verified Retry of a
+   * default-home session still names its account.
+   */
+  claudeRecordConfigDir?: string;
+  /**
    * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
    * Conductor worker (`dispatch_subtask` in
    * `orchestration_loop/ai_session_executor.rs`). `workerTabFromRecord` is
@@ -1521,6 +1529,7 @@ export function useTerminalManager(
           | "workingDir"
           | "claudeSessionId"
           | "claudeConfigDir"
+          | "claudeRecordConfigDir"
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"

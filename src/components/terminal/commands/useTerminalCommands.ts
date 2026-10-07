@@ -34,8 +34,6 @@
  * §1 and the per-action keystroke budget in `./audit.md`.
  */
 
-import { invoke } from "@tauri-apps/api/core";
-
 import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
 
@@ -49,13 +47,7 @@ import type { AccountUsageInfo } from "../useSessionManager";
 import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec, ResultCardSection } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
-import type { CommandResponse } from "../types";
-import {
-  extractLiveSessions,
-  groupByAccount,
-  sharedSessionIds,
-  type LiveClaudeSession,
-} from "../liveClaudeSessions";
+import { displayNameOf, getSessionLedgerReport, type LedgerEntry } from "@/lib/session-ledger";
 import { computeAutoGrowLayoutId, FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
@@ -177,6 +169,9 @@ export interface TerminalCommandsContext {
    */
   showCard: (spec: ResultCardSpec) => void;
 }
+
+/** `/copy-names` stand-in for a session with no resume line. */
+const NO_RESUME_LINE = "no resume line — the account or the working directory is unknown";
 
 /**
  * Every layout id `zoneLayout.setLayoutId` will actually accept — the
@@ -1894,70 +1889,65 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     },
   });
 
-  // 36. /copy-names — copy the open sessions' RESUME names + resume commands
+  // 36. /copy-names — copy the roster's UNFINISHED sessions + resume lines
   //
-  // Written for the rebuild loop: write the open sessions down, rebuild the
-  // primary runner, resume them. That loop needs the name Claude Code shows in
-  // its `/resume` picker plus the `clX --resume <id>` command — NOT the tab
-  // title, which is what this command originally copied.
+  // Written for the rebuild loop: write the sessions down, rebuild the runner,
+  // resume them — and for pasting the list into notes or onto another machine.
   //
-  // Source: Claude Code's OWN live-session registry, via
-  // `terminal_claude_session_list_live`. `name` there is verbatim the string
-  // the session window and `/resume` show.
+  // Source: the session ledger's CURRENT roster (`session_ledger_report`,
+  // plan `2026-10-04-runner-session-roster-restore-picker` Phase 5) — the same
+  // roster a restart restores from, so this list is what would come back.
+  // Finished sessions are skipped (a restart does not bring them back), every
+  // name is THE display-name rule, and every line is the shared
+  // `session_ledger::resume_command_for` — `cd` + `CLAUDE_CONFIG_DIR`, omitted
+  // rather than guessed when the account or the directory is unknown.
   //
-  // Two sources were tried and rejected, both measured 2026-07-23:
-  //  - `terminal_list` (`TerminalInfo.title`) — the PTY/OSC *tab* title. Of
-  //    255 live terminals, 122 were titled just `"claude"` and 24
-  //    `powershell.exe`; tab titles agreed with the real name on 0 of 21
-  //    joinable rows, and the non-generic ones are working-dir-derived and not
-  //    unique (11 sessions shared `qontinui-runner-1d`).
-  //  - `terminal_session_list_history` (`PastSession.resumeName`) — better,
-  //    but transcript-derived: it knew 33 of 80 live sessions and matched the
-  //    real window name on 11 of those 33. The transcript preview is simply a
-  //    different string from the window name.
-  //
-  // The registry covers LIVE processes only (Claude Code deletes the file on
-  // exit) — exactly right for "write down what's open before I rebuild", and
-  // cross-page by construction, so the active-page React context is no limit.
+  // It replaced Claude Code's own live-process registry, which covered only
+  // running processes (a session whose PTY had already exited during a
+  // graceful stop was missing) and could not see the finished marker.
   useCommandAction({
     id: "terminal.copy-names",
     slash: "/copy-names",
     aliases: ["/copy-sessions", "/session-names"],
-    label: "Copy live sessions + resume commands",
+    label: "Copy unfinished sessions + resume commands",
     description:
-      "Copy every LIVE Claude Code session's real name (the one shown in the " +
-      "session window and in /resume) plus its ready-to-run `clX --resume <id>` " +
-      "command, grouped by account. Save this before a restart so the sessions " +
-      "can be resumed afterwards.",
+      "Copy every UNFINISHED session on the runner's roster — the sessions a " +
+      "restart would bring back — with its name and its ready-to-run " +
+      "`cd … && CLAUDE_CONFIG_DIR=… claude --resume <id>` line, grouped by " +
+      "account. Finished sessions are skipped.",
     paramSchema: SCHEMA.empty,
     patterns: [/^copy[- ]names$/i, /^copy[- ]sessions$/i, /^session[- ]names$/i],
     handler: async (): Promise<CommandResult<{ count: number }>> => {
-      let sessions: LiveClaudeSession[] = [];
+      let roster: LedgerEntry[];
       try {
-        const res = await invoke<CommandResponse>("terminal_claude_session_list_live");
-        // Normalize at the boundary: the command wraps its payload as
-        // `{sessions:[…]}`, and a shape surprise must degrade to an empty list
-        // rather than crash the grouping below.
-        if (res.success) sessions = extractLiveSessions(res.data);
+        const report = await getSessionLedgerReport();
+        // A shape surprise is a failed read, never "no sessions".
+        if (!Array.isArray(report?.current?.sessions)) {
+          return fail("list-failed", "the session roster came back in an unrecognized shape");
+        }
+        roster = report.current.sessions;
       } catch {
-        return fail("list-failed", "could not read Claude Code's session registry");
+        return fail("list-failed", "could not read the session roster");
       }
-      if (sessions.length === 0) {
-        return fail("no-sessions", "no live Claude Code sessions found");
+      const unfinished = roster.filter((e) => !e.finished);
+      const skipped = roster.length - unfinished.length;
+      if (unfinished.length === 0) {
+        return fail(
+          "no-sessions",
+          skipped > 0
+            ? `all ${skipped} session${skipped === 1 ? " on the roster is" : "s on the roster are"} marked finished`
+            : "no sessions on the runner's roster",
+        );
       }
 
-      // The Rust reader keeps nameless rows (old CLI builds) because they
-      // still prove liveness for the restore oracle — for DISPLAY, substitute
-      // a placeholder so the label/heading is never blank.
-      const displayName = (s: LiveClaudeSession) => s.name || "(unnamed)";
-
-      // Group by account: resume commands are per-wrapper (clg/clh/clp/…), so
-      // each block stays directly runnable as a unit.
-      const byAccount = groupByAccount(sessions);
-      // Several live processes can share one session id — the restore
-      // duplication symptom. Resuming that id once will not reproduce every
-      // window, so say so rather than implying the list is 1:1.
-      const shared = sharedSessionIds(sessions);
+      // Group by account, so each block reads as one account's sessions. Every
+      // line names its account by `CLAUDE_CONFIG_DIR`, so each stays runnable
+      // on its own.
+      const byAccount = new Map<string, LedgerEntry[]>();
+      for (const e of unfinished) {
+        const label = e.accountLabel?.trim() || "account unknown";
+        byAccount.set(label, [...(byAccount.get(label) ?? []), e]);
+      }
 
       const lines: string[] = [];
       const sections: ResultCardSection[] = [];
@@ -1965,38 +1955,31 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         lines.push(`# ${label} (${list.length})`);
         sections.push({
           heading: `${label} (${list.length})`,
-          rows: list.map((s) => ({ label: displayName(s), value: s.resumeCommand })),
+          rows: list.map((e) => ({
+            label: displayNameOf(e),
+            value: e.resumeCommand ?? NO_RESUME_LINE,
+          })),
         });
-        for (const s of list) {
-          lines.push(`# ${displayName(s)}   [${s.status}]`);
-          lines.push(s.resumeCommand);
+        for (const e of list) {
+          lines.push(`# ${displayNameOf(e)}`);
+          lines.push(e.resumeCommand ?? `# ${NO_RESUME_LINE}`);
         }
         lines.push("");
       }
-      if (shared.size > 0) {
-        lines.push(`# ${shared.size} session id(s) are shared by several live processes —`);
-        lines.push("# resuming one of these ids will NOT bring back every window:");
-        for (const [id, list] of shared) {
-          lines.push(`#   ${id}: ${list.map(displayName).join(", ")}`);
-        }
-        sections.push({
-          heading: `Shared session ids (${shared.size})`,
-          rows: [...shared].map(([id, list]) => ({
-            label: id,
-            value: list.map((s) => `${displayName(s)} [pid ${s.pid}]`).join(", "),
-          })),
-        });
+      if (skipped > 0) {
+        lines.push(`# ${skipped} finished session${skipped === 1 ? "" : "s"} skipped`);
       }
       const text = lines.join("\n").trimEnd();
 
       const copied = await writeClipboard(text);
-      const n = sessions.length;
-      const ids = new Set(sessions.map((s) => s.sessionId)).size;
+      const n = unfinished.length;
       ctx.showCard({
-        title: `${n} live session${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
-        subtitle: copied
-          ? `Names + resume commands are on your clipboard (${ids} distinct session id${ids === 1 ? "" : "s"}).`
-          : "Clipboard write failed — copy them from below.",
+        title: `${n} unfinished session${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
+        subtitle:
+          (copied
+            ? "Names + resume commands are on your clipboard."
+            : "Clipboard write failed — copy them from below.") +
+          (skipped > 0 ? ` ${skipped} finished skipped.` : ""),
         sections,
         footer: {
           label: "Copy again",

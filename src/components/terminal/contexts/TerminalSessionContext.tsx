@@ -78,15 +78,10 @@ import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
-import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
-import {
-  buildSessionOpenArgs,
-  describeRecordOpenOutcome,
-  noteRecordedZone,
-  recordedZoneLedgerFor,
-} from "../sessionRecordArgs";
+import { buildSessionOpenArgs } from "../sessionRecordArgs";
+import { resumeProfileSession } from "../resumeInNewTab";
 import { createLogger } from "@/lib/logger";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
@@ -332,6 +327,11 @@ const PageSessionScope = memo(function PageSessionScope({
     }
   }, [tabs]);
 
+  // The page notification, for the zone-profile resume below — workflowGen
+  // (which owns it) is defined further down, so it is wired through a ref like
+  // the other cross-hook setters.
+  const notificationSetterRef = useRef<WorkflowGenReturn["setNotification"]>(() => {});
+
   // Pending Claude sessions to resume after a zone profile load settles.
   const pendingProfileSessionsRef = useRef<ZoneSessionInfo[] | null>(null);
 
@@ -339,17 +339,6 @@ const PageSessionScope = memo(function PageSessionScope({
     const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
     const sessions = pendingProfileSessionsRef.current;
     if (!sessions || sessions.length === 0) return;
-
-    const isWindows = navigator.platform.startsWith("Win");
-    const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
-      // Autonomous resume (matches clg/clh/clp) so a re-attached session
-      // doesn't stall on a permission prompt.
-      const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
-      if (!configDir) return `${base}\r`;
-      return isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
-        : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
-    };
 
     // Process only sessions whose zone now has an assignment; leave the
     // rest in the ref for the next assignments tick. The partition (and the
@@ -394,33 +383,21 @@ const PageSessionScope = memo(function PageSessionScope({
           );
           continue;
         }
-        updateTab(tabId, {
-          claudeSessionId: s.claudeSessionId,
-          claudeConfigDir: s.claudeConfigDir,
-        });
-        // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
-        // the exact id in the typed command — no transcript guess.
+        // The open record for the VERIFIED branch.
         //
         // Built by `buildSessionOpenArgs` rather than by hand, so this writer
         // cannot drift from the command's signature the way it once did:
-        // `origin`, NOT the retired `bindOrigin`. This call site was the last
-        // writer still spelling the pre-migration key AND the pre-migration
-        // value ("pinned"). `terminal_session_record_open` has no `bind_origin`
-        // parameter, so Tauri dropped the argument silently and the row landed
-        // with `origin: None` -- which reads as "reconciled", and
-        // `classifyRestoreAction` keeps a reconciled row off the auto-resume
-        // track. A profile resume types the exact id in `--resume`, so it is
-        // the most authoritative bind there is; saying so in the key the
-        // command actually reads was the whole fix, and a typed builder is what
-        // keeps it said. (A hand-built object literal is exactly what let the
-        // dead key survive migration unnoticed.)
+        // `origin`, NOT the retired `bindOrigin` (a hand-built literal let the
+        // dead key survive migration, and the row landed `origin: None`, which
+        // reads as "reconciled" and keeps it off the auto-resume track). A
+        // profile resume types the exact id in `--resume`, so it is the most
+        // authoritative bind there is.
         //
-        // The builder resolves `workingDir`/`title` off the live tab list (the
-        // `resumedTab` lookup this used to do inline) and the zone by reverse
-        // lookup over `zoneLayout.assignments` — which yields `s.zoneIndex`
-        // here by construction, since `tabId` came from
+        // The builder resolves `workingDir`/`title` off the live tab list and
+        // the zone by reverse lookup over `zoneLayout.assignments` — which
+        // yields `s.zoneIndex` here by construction, since `tabId` came from
         // `zoneLayout.assignments[s.zoneIndex]` a few lines up.
-        const openArgs = buildSessionOpenArgs({
+        const recordOpen = buildSessionOpenArgs({
           assignments: zoneLayout.assignments,
           tabs,
           tabId,
@@ -429,36 +406,30 @@ const PageSessionScope = memo(function PageSessionScope({
           pageId,
           origin: "authoritative",
         });
-        // Note the zone we are about to WRITE so the re-resolution backstop in
-        // `TerminalPage` only fires if the tab ends up somewhere else (e.g. the
-        // profile's zone was out of range for the live layout and the tab got
-        // compacted elsewhere) — and stays silent when the profile placement
-        // holds. Read off `openArgs`, not off `s`: the ledger's contract is
-        // "what was WRITTEN", so it must be the same number the payload
-        // carries.
-        noteRecordedZone(recordedZoneLedgerFor(pageId), s.claudeSessionId, openArgs.zoneIndex);
-        invoke("terminal_session_record_open", openArgs)
-          // Written is not bound — report which, rather than only the failure.
-          .then((response) =>
-            recordOpenLogger.debug(
-              describeRecordOpenOutcome({
-                claudeSessionId: s.claudeSessionId,
-                terminalId: tabId,
-                response,
-              }),
-            ),
-          )
-          .catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
-        writeWhenReady(
-          terminalRefs.current,
-          tabId,
-          buildResumeCmd(s.claudeSessionId, s.claudeConfigDir),
+        // THE resume choke point, shared with the boot restore and every
+        // one-click resume: the account rule (`resolveAccountDir` — the
+        // default home is never typed, an unsafe dir is refused), the typed
+        // command (`runVerifiedResume`), a verified handshake, and the open
+        // record written only once it verified. Fire-and-forget per tab, like
+        // the boot drain: a failed verification parks the tab in its Retry.
+        void resumeProfileSession(
           {
-            onTimeout: (id) =>
-              console.warn(
-                `[TerminalSession] profile resume: terminal ref for ${id} never became ready`,
-              ),
+            terminalRefs: terminalRefs.current,
+            updateTab,
+            notify: (message) => notificationSetterRef.current({ message, type: "error" }),
           },
+          {
+            tabId,
+            claudeSessionId: s.claudeSessionId,
+            configDir: s.claudeConfigDir,
+            recordOpen,
+          },
+        ).then((attempt) =>
+          recordOpenLogger.debug(
+            `profile resume ${s.claudeSessionId} → ${tabId}: ${
+              attempt.kind === "verified" ? "verified" : attempt.failure
+            }`,
+          ),
         );
       }
     })();
@@ -798,7 +769,6 @@ const PageSessionScope = memo(function PageSessionScope({
     tabs,
     terminalRefs,
     createTerminal,
-    pendingResumeRef: shellIntegration.pendingResumeRef,
     runGeneration: workflowGen.runGeneration,
     setRightPanelMode: workflowGen.setRightPanelMode,
   });
@@ -850,6 +820,7 @@ const PageSessionScope = memo(function PageSessionScope({
   useEffect(() => {
     rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
     selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
+    notificationSetterRef.current = workflowGen.setNotification;
   });
 
   // Memoize the value object. Keys in deps list mirror the prior

@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "./types";
+import type { ResumeAccount } from "@/lib/session-ledger";
 
 /**
  * The account a past session belonged to — the `/rename`-wrapper pair the
@@ -19,7 +20,7 @@ export interface PastSessionAccount {
  *
  * The headline field is `resumeName` — the real `/rename` name the operator
  * gave the session — and `resumeCommand` is a ready-to-paste
- * `clg --resume <id>`-style command.
+ * `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>` line.
  *
  * Keys are camelCase, matching the Rust command's serde output exactly.
  */
@@ -28,8 +29,18 @@ export interface PastSession {
   claudeSessionId: string;
   /** The real `/rename` name (the headline — show prominently). */
   resumeName: string;
-  /** Ready-to-copy resume command, e.g. `"clg --resume <id>"`. */
-  resumeCommand: string;
+  /**
+   * Ready-to-copy resume line (Rust `session_ledger::resume_command_for`):
+   * `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>`. `null`
+   * when the account or the working dir is unknown — omitted, never guessed.
+   */
+  resumeCommand: string | null;
+  /**
+   * The account a one-click Resume types (Rust `session_ledger::ResumeAccount`),
+   * resolved like {@link resumeCommand}. `known: false` ⇒ the account is unknown
+   * and Resume is refused rather than run under the default account.
+   */
+  resumeAccount: ResumeAccount;
   /** Which account/wrapper the session ran under. */
   account: PastSessionAccount;
   /** Terminal page the session belonged to. */
@@ -46,6 +57,12 @@ export interface PastSession {
   configDir?: string;
   /** Working directory the terminal was opened in. */
   workingDir?: string;
+  /**
+   * The directory a resume opens in — THE resume-dir rule (Rust
+   * `session_ledger::resume_dir_of`: the launch dir, else its worktree root),
+   * the same dir {@link resumeCommand} uses. `null` when neither is known.
+   */
+  resumeDir: string | null;
   /** AI-CLI provider that owned the session (`"claude"`, `"gemini"`). */
   provider: string;
   /** Epoch ms the record was last refreshed (sort key, newest-first). */

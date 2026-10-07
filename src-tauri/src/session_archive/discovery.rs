@@ -83,6 +83,41 @@ pub fn account_label_for(config_dir: Option<&str>) -> (String, String) {
     }
 }
 
+/// Is `config_dir` the DEFAULT account home — `<home>/.claude`, the dir a bare
+/// `claude` uses when no `CLAUDE_CONFIG_DIR` is set?
+///
+/// It matters to every resume line, because the default home is the one
+/// account that must be resumed WITHOUT `CLAUDE_CONFIG_DIR`: Claude Code keeps
+/// its global config at `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is
+/// set but at `<home>/.claude.json` when it is not, so typing
+/// `CLAUDE_CONFIG_DIR=<home>/.claude` swaps the default account's real config
+/// for a different (often absent) file — onboarding, or another login.
+///
+/// Compared on normalized separators with any trailing slash dropped, and
+/// case-insensitively on Windows, where the filesystem is.
+pub fn is_default_config_home(config_dir: &str, home_dir: Option<&Path>) -> bool {
+    let Some(home) = home_dir else {
+        return false;
+    };
+    let norm = |p: &str| {
+        let p = p.replace('\\', "/").trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p
+        }
+    };
+    let default_home = home.join(".claude");
+    default_home
+        .to_str()
+        .is_some_and(|d| norm(d) == norm(config_dir.trim()))
+}
+
+/// [`is_default_config_home`] against this machine's home dir.
+pub fn is_default_config_home_from_env(config_dir: &str) -> bool {
+    is_default_config_home(config_dir, dirs::home_dir().as_deref())
+}
+
 /// Discover every Claude Code account home on this machine, in precedence
 /// order: `CLAUDE_CONFIG_DIR` → the injected `configured` roster → a scan of
 /// `C:/claude/.claude-*` → `%USERPROFILE%/.claude` (or `$HOME/.claude`).
@@ -302,6 +337,19 @@ mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(dir.join(PROJECTS_SUBDIR)).unwrap();
         dir
+    }
+
+    #[test]
+    fn default_config_home_is_home_dot_claude_and_nothing_else() {
+        let home = Path::new("/home/u");
+        assert!(is_default_config_home("/home/u/.claude", Some(home)));
+        assert!(is_default_config_home("/home/u/.claude/", Some(home)));
+        assert!(!is_default_config_home("/home/u/.claude-gmail", Some(home)));
+        assert!(!is_default_config_home("/home/other/.claude", Some(home)));
+        assert!(
+            !is_default_config_home("/home/u/.claude", None),
+            "no home dir ⇒ nothing is the default"
+        );
     }
 
     #[test]

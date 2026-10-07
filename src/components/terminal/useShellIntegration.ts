@@ -1,22 +1,10 @@
 import { useCallback, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import type { ShellIntegrationEvent } from "./TerminalInstance";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
-import { rememberSessionId } from "./lastKnownSessionIds";
-import {
-  describeRecordOpenOutcome,
-  noteRecordedZone,
-  recordedZoneLedgerFor,
-  type SessionOpenArgs,
-  UNZONED_INDEX,
-} from "./sessionRecordArgs";
-import { createLogger } from "@/lib/logger";
-import { writeToPaneOrReport } from "./approveAll";
-
-/** Written-vs-bound reporting for the shell-integration OPEN record. */
-const recordOpenLogger = createLogger("ShellIntegration");
+import type { ResourceGuardSource } from "@/lib/resourceGuard";
+import { resumeInNewTab, type ResumeAttempt, type ResumeTarget } from "./resumeInNewTab";
 
 export interface CommandHistoryEntry {
   command: string;
@@ -39,10 +27,17 @@ interface UseShellIntegrationParams {
       workingDir: string;
       claudeSessionId: string;
       claudeConfigDir: string;
+      isReconnecting: boolean;
+      resumeFailed: boolean;
     }>,
   ) => void;
   renameTab: (id: string, title: string) => void;
-  createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
+  createTerminal: (
+    title?: string,
+    workingDir?: string,
+    tenantId?: string,
+    spawnSource?: ResourceGuardSource,
+  ) => Promise<string | null>;
   setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   setRightPanelMode: React.Dispatch<
@@ -59,8 +54,9 @@ interface UseShellIntegrationResult {
   commandHistories: Record<string, CommandHistoryEntry[]>;
   handleShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
   handleResumeSession: (session: TranscriptSession) => void;
+  /** THE resume path — see `resumeInNewTab`. */
+  resumeTarget: (target: ResumeTarget, spawnSource?: ResourceGuardSource) => Promise<ResumeAttempt>;
   handleFirstInput: (tabId: string, input: string) => void;
-  pendingResumeRef: React.MutableRefObject<{ tabId: string; resumeCmd: string } | null>;
 }
 
 export function useShellIntegration({
@@ -80,26 +76,9 @@ export function useShellIntegration({
   );
   const pendingCommandRef = useRef<Record<string, string>>({});
 
-  // Tracks the tab ID and session ID awaiting the first shell prompt to send the command.
-  const pendingResumeRef = useRef<{ tabId: string; resumeCmd: string } | null>(null);
-
   const handleShellIntegration = useCallback(
     (tabId: string, event: ShellIntegrationEvent) => {
-      // If this tab has a pending resume command, fire it on the first prompt
       if (event.type === "prompt_start") {
-        const pending = pendingResumeRef.current;
-        if (pending && pending.tabId === tabId) {
-          pendingResumeRef.current = null;
-          // Small defer so the prompt finishes rendering before we write
-          setTimeout(() => {
-            void writeToPaneOrReport(
-              terminalRefs.current,
-              tabId,
-              `${pending.resumeCmd}\r`,
-              "resume on prompt_start",
-            );
-          }, 50);
-        }
         // Shell prompt appeared. A `prompt_start` only means "a shell prompt
         // is being drawn" — NOT that a Claude session is awaiting the user.
         // Claude Code redraws its prompt frequently while idle, so latching
@@ -144,124 +123,42 @@ export function useShellIntegration({
         }
       }
     },
-    [updateTab, renameTab, tabs, terminalRefs, setSessionStates],
+    [updateTab, renameTab, tabs, setSessionStates],
   );
 
-  // ── Resume Claude Code session in terminal ─────────────────────────────────
+  // ── Resume a session in a new tab ────────────────────────────────────────
+  //
+  // THE one resume path (`resumeInNewTab`): `createTerminal` + the verified
+  // `runVerifiedResume`, the boot restore's own pair. Every one-click Resume
+  // (transcript panel, session manager, Previous Sessions) and the "Since
+  // restart" bulk resume go through `resumeTarget`, so single and bulk resume
+  // type the same shared command and verify it the same way.
+  const resumeTarget = useCallback(
+    (target: ResumeTarget, spawnSource?: ResourceGuardSource): Promise<ResumeAttempt> =>
+      resumeInNewTab(
+        { createTerminal, updateTab, terminalRefs: terminalRefs.current, pageId },
+        target,
+        spawnSource,
+      ),
+    [createTerminal, updateTab, terminalRefs, pageId],
+  );
 
   const handleResumeSession = useCallback(
     async (session: TranscriptSession) => {
-      // Derive a short label from the session ID for the tab title
-      const tabTitle = `claude ${session.session_id.slice(0, 8)}`;
-      const tabId = await createTerminal(tabTitle, session.project_path);
-      if (!tabId) return;
-
-      // Track which Claude session is running in this tab so "Generate Workflow"
-      // can find the correct transcript instead of picking a random recent session.
-      updateTab(tabId, {
-        claudeSessionId: session.session_id,
-        claudeConfigDir: session.config_dir,
-      });
-      // Persist durably so the tab stays resumable across a close→reopen even
-      // if the live tab object later loses the id.
-      rememberSessionId(tabId, session.session_id, session.config_dir);
-      // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
-      // the exact id. The tab was created a moment ago and no zone has been
-      // assigned to it yet, so the honest recorded zone here is UNZONED. Note
-      // that in the page's recorded-zone ledger so the re-resolution backstop
-      // in `TerminalPage` SEES the disagreement once `reconcileAssignments`
-      // auto-fills the tab and corrects the record. (Without the note the
-      // backstop seeded itself from the already-auto-filled zone, saw no
-      // change, and this `-1` stood for the life of the record.)
-      noteRecordedZone(recordedZoneLedgerFor(pageId), session.session_id, UNZONED_INDEX);
-      // DELIBERATELY hand-built rather than routed through
-      // `buildSessionOpenArgs`, and the reason is a correctness one, not a
-      // stylistic one. That builder resolves `workingDir`/`title` from the live
-      // tab list and the zone by reverse lookup over the page's zone
-      // assignments. Neither input exists honestly here:
-      //
-      //  - The tab was created MILLISECONDS ago by `createTerminal`, whose
-      //    `setTabs` is a React state update. The `tabs` array this callback
-      //    closed over is the render-time value and cannot contain `tabId`
-      //    yet — so the builder would find no tab and record
-      //    `workingDir: undefined, title: undefined`, silently dropping the
-      //    two values this call site knows EXACTLY
-      //    (`session.project_path` / `tabTitle`).
-      //  - This hook takes no zone assignments at all (see
-      //    `UseShellIntegrationParams`). Passing `{}` to get `-1` out of the
-      //    builder would be inventing an argument to reach an answer we
-      //    already have honestly: the tab is genuinely unzoned this instant.
-      //
-      // So the payload stays explicit, but it is TYPED as `SessionOpenArgs`,
-      // which is what actually stops it drifting from the command's signature
-      // (the failure mode that let the retired `bindOrigin` key survive a
-      // migration unnoticed on the sibling writer in `TerminalSessionContext`).
-      const openArgs: SessionOpenArgs = {
-        claudeSessionId: session.session_id,
-        configDir: session.config_dir,
-        workingDir: session.project_path,
-        pageId,
-        zoneIndex: UNZONED_INDEX,
-        title: tabTitle,
-        terminalId: tabId,
-        origin: "authoritative",
-      };
-      invoke("terminal_session_record_open", openArgs)
-        // Written is not bound — report which, rather than only the failure.
-        .then((response) =>
-          recordOpenLogger.debug(
-            describeRecordOpenOutcome({
-              claudeSessionId: session.session_id,
-              terminalId: tabId,
-              response,
-            }),
-          ),
-        )
-        .catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
-
-      // Close the transcript panel so the terminal is visible
+      // Close the transcript panel so the new terminal is visible.
       setRightPanelMode(null);
       setSelectedTranscriptSessionId(null);
-
-      // Queue the resume command — it will be sent once the shell emits its first prompt.
-      // Include the config_dir so Claude CLI searches the right directory.
-      // Windows terminals use PowerShell ($env:VAR), others use bash (VAR=val cmd).
-      const configDir = session.config_dir;
-      const isWindows = navigator.platform.startsWith("Win");
-      // Resume autonomously (`--permission-mode bypassPermissions`) to match
-      // the operator's clg/clh/clp wrappers — a resumed session shouldn't
-      // stall on a permission prompt either.
-      let resumeCmd: string;
-      if (configDir) {
-        resumeCmd = isWindows
-          ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --permission-mode bypassPermissions --resume ${session.session_id}`
-          : `CLAUDE_CONFIG_DIR="${configDir}" claude --permission-mode bypassPermissions --resume ${session.session_id}`;
-      } else {
-        resumeCmd = `claude --permission-mode bypassPermissions --resume ${session.session_id}`;
-      }
-      pendingResumeRef.current = { tabId, resumeCmd };
-
-      // Fallback: send after 1.5 s regardless (in case shell integration isn't active)
-      setTimeout(() => {
-        const pending = pendingResumeRef.current;
-        if (!pending || pending.tabId !== tabId) return;
-        pendingResumeRef.current = null;
-        void writeToPaneOrReport(
-          terminalRefs.current,
-          tabId,
-          `${pending.resumeCmd}\r`,
-          "resume fallback timer",
-        );
-      }, 1500);
+      // The transcript was found under `config_dir`, so that IS the account.
+      await resumeTarget({
+        claudeSessionId: session.session_id,
+        // The real `--resume` name (`/rename` / ai-title), not the first-message
+        // preview in `display_name`.
+        displayName: session.resume_name?.trim() || `claude ${session.session_id.slice(0, 8)}`,
+        workingDir: session.project_path,
+        configDir: session.config_dir || undefined,
+      });
     },
-    [
-      createTerminal,
-      updateTab,
-      terminalRefs,
-      setRightPanelMode,
-      setSelectedTranscriptSessionId,
-      pageId,
-    ],
+    [resumeTarget, setRightPanelMode, setSelectedTranscriptSessionId],
   );
 
   // ── Auto-naming from first input ──────────────────────────────────────────
@@ -281,7 +178,7 @@ export function useShellIntegration({
     commandHistories,
     handleShellIntegration,
     handleResumeSession,
+    resumeTarget,
     handleFirstInput,
-    pendingResumeRef,
   };
 }

@@ -4426,6 +4426,13 @@ impl TerminalSession {
         self.exit_snapshot.lock().ok().and_then(|s| *s)
     }
 
+    /// Test seam: flip the liveness flag of a PTY-less fixture. Set it back to
+    /// `false` before the session drops, or `Drop` runs `close()`.
+    #[cfg(test)]
+    pub(crate) fn set_alive_for_test(&self, alive: bool) {
+        self.is_alive.store(alive, Ordering::Relaxed);
+    }
+
     /// The shell process's exit code, once the waiter thread has recorded one.
     ///
     /// `None` means either "still running" or "exited but the wait itself

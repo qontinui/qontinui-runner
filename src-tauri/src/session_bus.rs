@@ -84,6 +84,20 @@ pub fn spawn_session_bus_executor() {
     });
 }
 
+/// The open record a message for `to_session` is injected into, or `None`
+/// when the target is not live on this device. An UNBOUND row (blank
+/// `terminal_id` — e.g. one held for an account choice) has no PTY, so it is
+/// treated like an absent one: the message stays pending, and no request to
+/// `/terminals//submit-prompt` (nor a warning per tick) is ever made.
+fn delivery_target<'a>(
+    open: &'a [crate::session::session_lifecycle_store::TerminalSessionRecord],
+    to_session: &str,
+) -> Option<&'a crate::session::session_lifecycle_store::TerminalSessionRecord> {
+    open.iter()
+        .find(|r| r.claude_session_id == to_session)
+        .filter(|r| !r.terminal_id.trim().is_empty())
+}
+
 /// One delivery pass: pull pending → inject into live targets → mark delivered.
 async fn deliver_once() -> anyhow::Result<()> {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
@@ -124,8 +138,10 @@ async fn deliver_once() -> anyhow::Result<()> {
         let Some(to_session) = msg.to_session.as_deref() else {
             continue; // unresolved address (Phase 4) — not this executor's job
         };
-        let Some(rec) = open.iter().find(|r| r.claude_session_id == to_session) else {
-            // Target not live on this device. PASSIVE closed-session delivery
+        let Some(rec) = delivery_target(&open, to_session) else {
+            // Target not live on this device (or its row is unbound — a blank
+            // terminal id, e.g. a row held for an account choice, has no PTY
+            // to inject into). PASSIVE closed-session delivery
             // (plan Phase 4): leave the message pending — when that session is
             // next spawned/resumed, the runner's Session Bus spawn preamble
             // drives it to call coord_inbox and it pulls this message itself. We
@@ -216,4 +232,42 @@ async fn deliver_once() -> anyhow::Result<()> {
         debug!("session_bus: delivered {delivered} message(s) this tick");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::session_lifecycle_store::TerminalSessionRecord;
+
+    fn open_rec(id: &str, terminal_id: &str) -> TerminalSessionRecord {
+        serde_json::from_value(serde_json::json!({
+            "claudeSessionId": id,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": terminal_id,
+            "openedAt": 1,
+            "lastSeenAt": 1,
+            "state": "open",
+        }))
+        .expect("minimal record parses")
+    }
+
+    /// Review fixes 6, item 3: an unbound target (blank terminal id — a row
+    /// held for an account choice) is not live: no injection target, so the
+    /// message stays pending with no POST to `/terminals//submit-prompt`.
+    #[test]
+    fn a_blank_terminal_id_is_not_a_delivery_target() {
+        let open = vec![
+            open_rec("held", ""),
+            open_rec("blank-ws", "  "),
+            open_rec("bound", "term-1"),
+        ];
+        assert!(delivery_target(&open, "held").is_none());
+        assert!(delivery_target(&open, "blank-ws").is_none());
+        assert!(delivery_target(&open, "absent").is_none());
+        assert_eq!(
+            delivery_target(&open, "bound").map(|r| r.terminal_id.as_str()),
+            Some("term-1")
+        );
+    }
 }
