@@ -744,10 +744,20 @@ impl AiCoordRegistrar {
         }
         // Resume parameters (unfinished-resume Phase 1) — optional on the wire,
         // so a coord that predates them ignores the keys.
-        if let Some(a) = overrides.resume.account_label.as_deref().filter(|a| !a.is_empty()) {
+        if let Some(a) = overrides
+            .resume
+            .account_label
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
             payload["account_label"] = json!(a);
         }
-        if let Some(c) = overrides.resume.config_dir.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(c) = overrides
+            .resume
+            .config_dir
+            .as_deref()
+            .filter(|c| !c.is_empty())
+        {
             payload["config_dir"] = json!(c);
         }
 
