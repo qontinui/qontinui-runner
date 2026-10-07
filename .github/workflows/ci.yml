@@ -215,7 +215,8 @@ jobs:
     #
     # 180 = 90 + 20 + 10 (allowance for an `if: failure()` failure-path
     # classifier with a 600 s budget, proposed in open PRs #1655/#1769) + 49
-    # (measured overhead max) ≈ 169, plus ~10% for overhead growth. The cap
+    # (measured overhead max) = 169, rounded up to 180 (~6.5% for overhead
+    # growth). The cap
     # still bounds a genuine hang at 3 h, half GitHub's 360-minute default.
     # `ci_rust_test_steps_split.rs` pins this cap >= build + run + 50 so a
     # future change to either step bound has to move this line too.
@@ -1150,7 +1151,7 @@ jobs:
             # One machine-greppable line per pagefile. `tr -d '\r'` because
             # powershell emits CRLF; an empty capture (no pagefile rows, or
             # powershell failed) is reported as UNKNOWN, never as a zero peak.
-            mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$os.FreePhysicalMemory }' | tr -d '\r')" || mem=""
+            mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { $free = if ($os) { $os.FreePhysicalMemory } else { "unknown" }; "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$free }' | tr -d '\r')" || mem=""
             if [ -n "$mem" ]; then
               printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME}/"
             else

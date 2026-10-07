@@ -536,10 +536,15 @@ fn an_expiry_is_explained_and_the_memory_peak_is_sampled() {
         "the memory sampler must write the summary through `tee -a \
          \"$GITHUB_STEP_SUMMARY\"` so the same lines land in the job log"
     );
+    // Every OTHER mention of the summary is a write that bypasses the log
+    // (`>>`, `>>"$…"`, `> $…`, any spelling): with the one `tee -a` removed,
+    // nothing in the commands may name the summary file at all.
+    let without_tee = sampler_body.replace("tee -a \"$GITHUB_STEP_SUMMARY\"", "");
     assert!(
-        !sampler_body.contains(">> \"$GITHUB_STEP_SUMMARY\""),
-        "the memory sampler must not write the summary with `>>` — that sends \
-         the reading ONLY to the summary, which no API exposes"
+        !without_tee.contains("GITHUB_STEP_SUMMARY"),
+        "the memory sampler must reach $GITHUB_STEP_SUMMARY ONLY through `tee -a` \
+         — any other write sends the reading to the summary alone, which no API \
+         exposes"
     );
 
     // Neither diagnostic may become a second way to fail the job.
