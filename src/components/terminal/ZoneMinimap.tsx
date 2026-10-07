@@ -163,7 +163,13 @@ export function ZoneMinimap() {
     if (!drag.moved) {
       if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
       drag.moved = true;
-      e.currentTarget.setPointerCapture(e.pointerId);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // A synthetic pointer (UI Bridge / automation) is not an active
+        // pointer and capture throws NotFoundError; the drag still works
+        // while the pointer stays over the widget.
+      }
     }
     const parent = boxRef.current?.parentElement;
     const size = parent
@@ -284,7 +290,7 @@ export function ZoneMinimap() {
             }}
             title="Move the minimap back to its original location"
             aria-label="Reset the zone minimap position"
-            className="absolute -top-1.5 right-3.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
+            className="absolute -top-1.5 right-3.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity z-10"
           >
             <RotateCcw className="w-2.5 h-2.5" />
           </button>
@@ -295,7 +301,7 @@ export function ZoneMinimap() {
           onClick={toggleMinimap}
           title="Hide the zone minimap (restore it from the status strip)"
           aria-label="Hide the zone minimap"
-          className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
+          className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity z-10"
         >
           <X className="w-2.5 h-2.5" />
         </button>
