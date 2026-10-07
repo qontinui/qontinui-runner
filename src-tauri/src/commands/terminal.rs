@@ -1376,7 +1376,8 @@ pub fn terminal_session_record_open(
         adopted_from: None,
         gate_id: None,
         gate_consuming_device_id: None,
-        gate_bound_boot_ms: None,
+        gate_bound_generation: None,
+        restored_in_generation: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2743,7 +2744,7 @@ async fn poll_and_record_session<F>(
 ) where
     F: Fn() -> Option<String>,
 {
-    let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
+    let (gate_id, gate_consuming_device_id, gate_bound_generation) = gate_record_fields(gate);
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(claude_session_id) = resolve() {
@@ -2788,7 +2789,8 @@ async fn poll_and_record_session<F>(
                 adopted_from: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
-                gate_bound_boot_ms,
+                gate_bound_generation,
+                restored_in_generation: None,
             };
             store.record_open(record);
             info!(
@@ -2827,7 +2829,7 @@ pub(crate) fn record_pinned_session_open(
     provider: String,
     gate: Option<GateIdentity>,
 ) {
-    let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
+    let (gate_id, gate_consuming_device_id, gate_bound_generation) = gate_record_fields(gate);
     // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
     // it just placed `config_dir` into the PTY env — so derive the label +
     // wrapper from it rather than waiting on the live registry. It does NOT
@@ -2886,7 +2888,8 @@ pub(crate) fn record_pinned_session_open(
         adopted_from: None,
         gate_id,
         gate_consuming_device_id,
-        gate_bound_boot_ms,
+        gate_bound_generation,
+        restored_in_generation: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2903,15 +2906,18 @@ pub(crate) fn record_pinned_session_open(
 
 /// The three durable gate fields for a record written by THIS process (plan
 /// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…` D1):
-/// the gate id, the CONSUMING device id, and this process's boot instant as
-/// the generation that bound them. All `None` for a non-gate spawn — which the
-/// sticky merge reads as "keep whatever is stored".
-fn gate_record_fields(gate: Option<GateIdentity>) -> (Option<String>, Option<String>, Option<i64>) {
+/// the gate id, the CONSUMING device id, and this process's
+/// [`crate::session::tracking_health::process_generation`] as the generation
+/// that bound them. All `None` for a non-gate spawn — which the sticky merge
+/// reads as "keep whatever is stored".
+fn gate_record_fields(
+    gate: Option<GateIdentity>,
+) -> (Option<String>, Option<String>, Option<String>) {
     match gate {
         Some(g) => (
             Some(g.gate_id.to_string()),
             Some(g.consuming_device_id.to_string()),
-            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init()),
+            Some(crate::session::tracking_health::process_generation().to_string()),
         ),
         None => (None, None, None),
     }
@@ -2938,18 +2944,19 @@ pub(crate) fn adopt_restored_continuation(
     adopt_restored_continuation_at(
         store,
         claude_session_id,
-        crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+        crate::session::tracking_health::process_generation(),
     )
 }
 
-/// [`adopt_restored_continuation`] against an explicit boot instant (tests).
+/// [`adopt_restored_continuation`] against an explicit process generation
+/// (tests).
 pub(crate) fn adopt_restored_continuation_at(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
-    current_boot_ms: i64,
+    current_generation: &str,
 ) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
     let (terminal_id, gate_id, consuming_device_id) =
-        store.adopt_restored_gate(claude_session_id, current_boot_ms)?;
+        store.adopt_restored_gate(claude_session_id, current_generation)?;
     crate::agent_runtime::register_restored_continuation(
         terminal_id.clone(),
         gate_id,
@@ -3149,7 +3156,8 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
         }
     }
 
@@ -3522,8 +3530,8 @@ mod tests {
             Some(gate.consuming_device_id.to_string())
         );
         assert_eq!(
-            rec.gate_bound_boot_ms,
-            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init())
+            rec.gate_bound_generation.as_deref(),
+            Some(crate::session::tracking_health::process_generation())
         );
     }
 
@@ -3585,7 +3593,7 @@ mod tests {
 
     /// Plan `2026-10-03-…` D1: the continuation spawn's gate identity reaches
     /// the durable record (it used to be dropped at the hint destructure), with
-    /// this process's boot instant as its generation — and the session-open
+    /// this process's generation id as its generation — and the session-open
     /// hook's later gate-less re-record of the same csid does not blank it.
     #[test]
     fn pinned_record_carries_the_gate_and_a_gateless_hook_rewrite_keeps_it() {
@@ -3611,7 +3619,7 @@ mod tests {
             )
         };
         record(Some(gate));
-        let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+        let generation = crate::session::tracking_health::process_generation();
         let check = |what: &str| {
             let rec = store.get(csid).unwrap();
             assert_eq!(rec.gate_id, Some(gate.gate_id.to_string()), "{what}");
@@ -3620,7 +3628,11 @@ mod tests {
                 Some(gate.consuming_device_id.to_string()),
                 "{what}"
             );
-            assert_eq!(rec.gate_bound_boot_ms, Some(boot), "{what}");
+            assert_eq!(
+                rec.gate_bound_generation.as_deref(),
+                Some(generation),
+                "{what}"
+            );
         };
         check("spawn record");
         record(None); // the session-open hook's write

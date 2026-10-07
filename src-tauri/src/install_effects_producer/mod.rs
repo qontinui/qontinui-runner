@@ -1085,21 +1085,18 @@ async fn get_sessions_ledger(
 
     let index = DiskTranscriptIndex::discover();
     let current = ledger::capture(&store, &index, "read", now, boot);
-    // "Came back" = open now, UNION anything stamped restored by THIS boot —
-    // a session that returned and was then closed did in fact return.
-    // `None` when the boot census never latched — see `observed_back`: an
-    // absent boot instant SKIPS the sticky-restore-stamp arm rather than
-    // admitting it with a `0` floor.
-    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
-    let back = ledger::observed_back(&store, boot_at);
-    // `boot_at == None` means the sticky-restore-stamp arm was SKIPPED, so a
-    // session that returned and was then closed cannot be told from one that
-    // never came back. That is reported, not laundered into a miss count.
+    // "Came back" = open now, UNION anything stamped restored by THIS process
+    // generation — a session that returned and was then closed did in fact
+    // return. The generation is always known (it is minted on first read, and
+    // compared for equality), so the sticky-restore-stamp arm is always
+    // readable — unlike the boot instant it replaced, which needed the census
+    // latch and was skipped without it.
+    let back = ledger::observed_back(
+        &store,
+        crate::session::tracking_health::process_generation(),
+    );
     Json(ApiResponse::success(ledger::diff(
-        prior,
-        &back,
-        current,
-        boot_at.is_some(),
+        prior, &back, current, true,
     )))
 }
 
@@ -2342,7 +2339,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store =
             SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
-        let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+        let boot = chrono::Utc::now().timestamp_millis();
         let csid = "5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
         let gate = uuid::Uuid::now_v7();
         let device = uuid::Uuid::now_v7();
@@ -2357,7 +2354,9 @@ mod tests {
             "origin": "authoritative",
             "gateId": gate.to_string(),
             "gateConsumingDeviceId": device.to_string(),
-            "gateBoundBootMs": boot - 1,
+            // A legacy (#1984-era) wall-clock stamp LATER than this boot: a
+            // backwards clock step. It is still a prior generation.
+            "gateBoundBootMs": boot + 86_400_000,
         }))
         .unwrap();
         store.record_open(rec);
@@ -2373,9 +2372,9 @@ mod tests {
         let after = store.get(csid).unwrap();
         assert_eq!(after.terminal_id, "term-after-restore");
         assert_eq!(
-            after.gate_bound_boot_ms,
-            Some(boot),
-            "stamp renewed to this boot"
+            after.gate_bound_generation.as_deref(),
+            Some(crate::session::tracking_health::process_generation()),
+            "stamp renewed to this generation"
         );
         assert_eq!(after.gate_id, Some(gate.to_string()), "gate kept (sticky)");
         assert_eq!(
@@ -2548,7 +2547,8 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
         }
     }
 
@@ -3069,7 +3069,8 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3274,7 +3275,8 @@ mod tests {
                     adopted_from: None,
                     gate_id: None,
                     gate_consuming_device_id: None,
-                    gate_bound_boot_ms: None,
+                    gate_bound_generation: None,
+                    restored_in_generation: None,
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3372,7 +3374,8 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3461,7 +3464,8 @@ mod tests {
             adopted_from: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
         });
 
         let req = SessionOpenRequest {
