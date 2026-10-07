@@ -196,6 +196,8 @@ describe("terminal and AI output text launches no AI task", () => {
     const commands = invokedCommands();
     expect(commands).not.toContain("operator_run_prompt");
     expect(commands).not.toContain(LOAD_PENDING_COMMAND);
+    // Strict: with logManager and listen mocked, the provider makes no IPC.
+    expect(commands).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
 
     const tracker = FindingsTracker.getInstance();
