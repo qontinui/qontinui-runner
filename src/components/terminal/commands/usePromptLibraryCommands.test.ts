@@ -1,10 +1,14 @@
+// @vitest-environment jsdom
 /**
  * Tests for the dynamic per-prompt slash registration
  * (`registerPromptActions`) — the pure core of
- * `usePromptLibraryCommands`, following the node-environment precedent
- * (no JSX/hook rendering; the React glue is a one-line effect).
+ * `usePromptLibraryCommands`. The pure cases need no DOM; the last block
+ * mounts the REAL hook (React 19 `createRoot` + `act`, the
+ * `useSessionReview.test.ts` pattern), which is why the file runs in jsdom.
  */
 
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PromptTemplate } from "../promptLibraryApi";
@@ -14,6 +18,7 @@ import {
   FANOUT_COMMAND_ID,
   registerFanoutAction,
   registerPromptActions,
+  usePromptLibraryCommands,
   type PromptLibraryCommandsContext,
 } from "./usePromptLibraryCommands";
 import type { EffectReport } from "./verdict";
@@ -223,5 +228,46 @@ describe("registerFanoutAction", () => {
     registerPromptActions(prompts, () => ctx);
     expect(getBySlash("/fanout")?.id).toBe(FANOUT_COMMAND_ID);
     expect(getById("prompt.fanout")).toBeUndefined();
+  });
+});
+
+describe("usePromptLibraryCommands (the hook the Terminal page mounts)", () => {
+  it("registers the built-in fan-out command ahead of the library, and disposes it on unmount", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // A library that carries a template literally named `fanout`, beside an ordinary one.
+    // Only registration is observed here, so no command handler is invoked.
+    const ctx = {
+      prompts: [prompt({ name: "fanout" }), prompt({ name: "ship-notes" })],
+      openPromptModal: () => {},
+      spawnWithText: () => {},
+      insertIntoFocused: () => true,
+    } as PromptLibraryCommandsContext;
+
+    const host = document.createElement("div");
+    const root = createRoot(host);
+    await act(async () => {
+      root.render(
+        createElement(function Page() {
+          usePromptLibraryCommands(ctx);
+          return null;
+        }),
+      );
+    });
+
+    const builtIn = getBySlash("/fanout");
+    expect(builtIn?.id).toBe("terminal.fanout");
+    expect(builtIn?.label).toBe("Fan out a prompt");
+    expect(getBySlash("/fan-out")?.id).toBe("terminal.fanout");
+    // The same-named template met the collision rule instead of shadowing it…
+    expect(getById("prompt.fanout")).toBeUndefined();
+    // …while the rest of the library registered as before.
+    expect(getBySlash("/ship-notes")?.id).toBe("prompt.ship-notes");
+
+    await act(async () => {
+      root.unmount();
+    });
+    expect(getBySlash("/fanout")).toBeUndefined();
+    expect(getBySlash("/ship-notes")).toBeUndefined();
   });
 });
