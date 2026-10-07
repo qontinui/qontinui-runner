@@ -246,11 +246,18 @@ pub(crate) const SPAWN_SETTLE_BOUND: chrono::Duration = chrono::Duration::minute
 /// [`SPAWN_SETTLE_BOUND`], so a slow spawn always settles through this path.
 /// A member's in-flight marker is stamped when the tick admits it, re-stamped
 /// each time an earlier spawn of its batch settles, and re-stamped again when
-/// its own spawn STARTS. While the batch runs, consecutive stamps are therefore
-/// about one `spawn_call_timeout` apart — well inside [`SPAWN_SETTLE_BOUND`] —
-/// however many slow spawns precede the member. A marker can expire only when
-/// no live batch holds it: the loop that would re-stamp and settle it panicked
-/// or was aborted.
+/// its own spawn STARTS, each stamp read after the book lock is taken. While
+/// the batch runs, consecutive stamps of a waiting member are therefore apart
+/// by at most one `spawn_call_timeout` plus the bookkeeping of one settle
+/// (`record_spawn`'s store writes under the lock, then the re-stamp's own lock
+/// wait), however many slow spawns precede the member.
+///
+/// What that guarantees, exactly: a marker can expire under a LIVE batch only
+/// if one settle's bookkeeping, or a forward jump of the wall clock (the stamp
+/// is `DateTime<Utc>`, not monotonic), exceeds
+/// `SPAWN_SETTLE_BOUND − SPAWN_CALL_TIMEOUT` (five minutes today). Short of
+/// that, a marker expires only when no live batch holds it — the loop that
+/// would re-stamp and settle it panicked or was aborted.
 ///
 /// A timed-out spawn is not aborted — cutting `TerminalManager::create` off
 /// mid-way could leave a child nothing records. It runs on, and whatever it
@@ -313,7 +320,10 @@ struct RunEntry {
     /// when the marker was last stamped (admission, each earlier settle in
     /// its batch, its own spawn start — see [`SPAWN_CALL_TIMEOUT`]) — so a
     /// marker whose settle was lost expires ([`SPAWN_SETTLE_BOUND`]) instead
-    /// of pinning the member forever.
+    /// of pinning the member forever. Under a live batch it can also expire
+    /// if one settle's bookkeeping or a wall-clock jump exceeds
+    /// `SPAWN_SETTLE_BOUND − SPAWN_CALL_TIMEOUT`; otherwise only when the
+    /// loop panicked or was aborted.
     spawning: HashMap<u32, DateTime<Utc>>,
     /// Since when (and under which release reason) a member has read
     /// [`Liveness::Unconfirmed`].
@@ -915,8 +925,10 @@ impl FanoutDispatcher {
         if waiting.is_empty() {
             return;
         }
-        let now = self.now();
         let mut book = self.book.lock().await;
+        // Read the clock only once the lock is held: a stamp taken before the
+        // lock wait would already be that wait old.
+        let now = self.now();
         for req in waiting {
             let Some(entry) = book.runs.get_mut(&req.run_id) else {
                 continue;
@@ -940,8 +952,9 @@ impl FanoutDispatcher {
     /// `false` when the member no longer holds this admission (nothing to
     /// spawn for).
     async fn mark_spawn_started(&self, req: &MemberSpawnRequest) -> bool {
-        let now = self.now();
         let mut book = self.book.lock().await;
+        // After the lock, for the same reason as `restamp_waiting`.
+        let now = self.now();
         let Some(entry) = book.runs.get_mut(&req.run_id) else {
             return false;
         };

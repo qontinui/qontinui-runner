@@ -233,6 +233,16 @@ describe("labels", () => {
     );
     expect(memberStateLabel(member(1, "queued"))).toBe("queued");
   });
+
+  it("renders an occupied fan-out bound as a QUEUED member's reason", () => {
+    // What the dispatcher actually does with SpawnOutcome::BoundOccupied:
+    // the member goes back to Queued carrying `fanout_bound_occupied`.
+    const m = member(0, "queued", "fanout_bound_occupied");
+    expect(memberStateLabel(m)).toBe("queued (fan-out bound full)");
+    expect(fanoutRunSummary(run([member(1, "admitted"), m]))).toBe(
+      "run port-feature — 1 running · 1 queued (fan-out bound full)",
+    );
+  });
 });
 
 describe("controls", () => {
