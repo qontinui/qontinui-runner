@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 106 | 107 | 104 | 2 | 0 | 0 |
 
 ## `repo_layout` (74 rows)
 
@@ -251,7 +251,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (106 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -293,10 +293,11 @@ _No hits._
 | `src/fleet.rs` | `build_host_capabilities` | `caps.push("shell:powershell".to_string());` | 1 | unreviewed |
 | `src/fleet.rs` | `powershell_on_path` | `binary_on_path("pwsh") \|\| binary_on_path("powershell")` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `attach_wsl_disk` | `cfg(windows)-only fn 'attach_wsl_disk' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
-| `src/fleet/resource_sample.rs` | `decode_utf16le` | `cfg(windows)-only fn 'decode_utf16le' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/resource_sample.rs` | `note_wsl_lane_gate` | `cfg(windows)-only fn 'note_wsl_lane_gate' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Logs the WSL lane's run/skip gate on change; Windows-only because the WSL lane is, and collect_wsl_lane's cfg(not(windows)) arm returns no lane. |
 | `src/fleet/resource_sample.rs` | `resolve_wsl_distro` | `cfg(windows)-only fn 'resolve_wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `wsl_distro` | `cfg(windows)-only fn 'wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `wsl_distro_base_path` | `cfg(windows)-only fn 'wsl_distro_base_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/resource_sample.rs` | `wsl_distro_running` | `cfg(windows)-only fn 'wsl_distro_running' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Asks 'wsl --list --running' whether the WSL lane's distro is up so the sampler never boots a stopped one; WSL exists only on Windows, and collect_wsl_lane's cfg(not(windows)) arm returns no lane. |
 | `src/fleet/resource_sample.rs` | `wsl_probe` | `cfg(windows)-only fn 'wsl_probe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fs_atomic.rs` | `is_transient_rename_denial` | `cfg(windows)-only fn 'is_transient_rename_denial' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fs_perms.rs` | `process_owner_sid_blob` | `cfg(windows)-only fn 'process_owner_sid_blob' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

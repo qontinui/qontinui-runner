@@ -1152,19 +1152,31 @@ async fn resolve_wsl_distro() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    first_distro(&decode_utf16le(&out.stdout))
+    first_distro(&decode_wsl_listing(&out.stdout))
 }
 
-/// `wsl.exe --list` writes UTF-16LE, not UTF-8 — decoding it as UTF-8 yields
-/// NUL-interleaved garbage that parses as a distro name. Same class as the
-/// UTF-16LE Tauri log encoding this repo already tripped over once.
-#[cfg(windows)]
-fn decode_utf16le(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
+/// Decode a `wsl.exe --list` listing.
+///
+/// By default `wsl.exe` writes UTF-16LE — decoding that as UTF-8 yields
+/// NUL-interleaved garbage that parses as a distro name (same class as the
+/// UTF-16LE Tauri log encoding this repo already tripped over once). But with
+/// `WSL_UTF8=1` in the environment it writes plain UTF-8, and decoding THAT as
+/// UTF-16 pairs ASCII bytes into CJK code units: no name ever matches, so the
+/// running check would answer "not running" forever and the lane would vanish.
+/// So sniff: distro names are ASCII-led, and UTF-16LE puts a NUL in the second
+/// byte of every ASCII character.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decode_wsl_listing(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    if bytes.get(1) == Some(&0) {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 /// First non-empty line of a `wsl --list --quiet` listing, with the BOM and
@@ -1176,6 +1188,56 @@ fn first_distro(listing: &str) -> Option<String> {
         .map(|l| l.trim_matches(|c: char| c == '\u{feff}' || c.is_whitespace() || c == '\0'))
         .find(|l| !l.is_empty())
         .map(|l| l.to_string())
+}
+
+/// Is `distro` already running? `Some(true)` only when `wsl.exe -l --running`
+/// lists it; `Some(false)` when that listing answered without it; `None` when
+/// the listing itself could not be had (timeout, spawn failure).
+///
+/// ## Why the lane asks before it reads
+///
+/// `wsl.exe -d <distro> -- cat …` does not *observe* a stopped distro, it
+/// **boots** it. Measured 2026-10-06 on dell-2020: this sampler re-started a
+/// distro its owner had deliberately stopped (the ci-pause-app's "Pause",
+/// which hands the machine's memory back) three times in two minutes, so the
+/// pause could never free the VM — the monitor woke the thing it monitors
+/// (coord finding `50cc26e3`). A reading must never change the state it reads.
+///
+/// `--list --running` is answered by the WSL *service* and never enters or
+/// starts a VM, so it cannot wedge on a VM that cannot `fork()` the way the
+/// 2026-08-27 `cat` probes did; it rides [`wsl_probe`]'s same timeout and
+/// tree-kill. It deliberately takes no `-d`: targeting a distro is exactly
+/// what boots one (`a_running_check_never_targets_a_distro` pins that).
+#[cfg(windows)]
+async fn wsl_distro_running(distro: &str) -> Option<bool> {
+    let out = wsl_probe(&["--list", "--running", "--quiet"]).await?;
+    // With nothing running, wsl.exe exits non-zero and prints a notice instead
+    // of names. Any completed answer that does not list the distro means "not
+    // running"; only a listing that names it permits the procfs read.
+    Some(running_listing_contains(
+        &decode_wsl_listing(&out.stdout),
+        distro,
+    ))
+}
+
+/// The lane's read gate: only `Some(true)` — a listing that NAMES the distro —
+/// permits the procfs read. `Some(false)` (stopped) and `None` (the listing
+/// could not be had) both mean no read, because the read would boot it. Pure,
+/// so "unknown never boots" is a unit test rather than a text match.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_lane_may_read(running: Option<bool>) -> bool {
+    running == Some(true)
+}
+
+/// Whether a `wsl --list --running --quiet` listing names `distro`. WSL
+/// resolves names case-insensitively. Pure for tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn running_listing_contains(listing: &str, distro: &str) -> bool {
+    let wanted = distro.trim();
+    listing
+        .lines()
+        .map(|l| l.trim_matches(|c: char| c == '\u{feff}' || c.is_whitespace() || c == '\0'))
+        .any(|l| !l.is_empty() && l.eq_ignore_ascii_case(wanted))
 }
 
 /// The procfs files the `wsl` lane reads, in one `cat`, in one fork.
@@ -1200,10 +1262,20 @@ const WSL_PROC_FILES: &[&str] = &[
 
 /// Collect the `wsl` lane by reading the VM's own procfs.
 ///
-/// `None` when there is no WSL, the probe times out, or the output does not
-/// parse — a missing lane is honest; a zeroed one is not.
+/// `None` when there is no WSL, the distro is not running (or whether it is
+/// could not be established), the probe times out, or the output does not
+/// parse — a missing lane is honest; a zeroed one is not, and a booted one is
+/// worse than either.
 ///
-/// ## One fork, and that is load-bearing
+/// ## Never boot a stopped distro
+///
+/// The procfs read runs only after [`wsl_distro_running`] has seen the distro
+/// in the running listing. A stopped distro yields no lane for that tick
+/// rather than a probe that would start it (dell-2020, 2026-10-06). The one
+/// remaining window — the distro stops between the listing and the `cat` — can
+/// start it once; the next tick's listing then sees it stopped again.
+///
+/// ## One fork into the VM, and that is load-bearing
 ///
 /// Every file in [`WSL_PROC_FILES`] rides the single `cat` this function
 /// already ran for `/proc/meminfo`. Adding a second `wsl.exe` probe to publish
@@ -1223,6 +1295,13 @@ const WSL_PROC_FILES: &[&str] = &[
 #[cfg(windows)]
 async fn collect_wsl_lane() -> Option<ResourceSample> {
     let distro = wsl_distro().await?;
+    // Ask first: `-d <distro> -- cat` would BOOT a stopped distro. Not running,
+    // or unanswered, means no lane this tick - never a probe that starts it.
+    let running = wsl_distro_running(&distro).await;
+    note_wsl_lane_gate(&distro, running);
+    if !wsl_lane_may_read(running) {
+        return None;
+    }
     // Scoped so the `&distro` borrow ends before the name is moved below.
     let out = {
         let mut args = vec!["-d", distro.as_str(), "--", "cat"];
@@ -1240,6 +1319,27 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
 #[cfg(not(windows))]
 async fn collect_wsl_lane() -> Option<ResourceSample> {
     None
+}
+
+/// Log the lane gate's state on CHANGE only, at info: a paused distro is the
+/// steady state on an owner-paused box, and a debug line every 30 s would say
+/// nothing while the transition is the one fact worth keeping.
+#[cfg(windows)]
+fn note_wsl_lane_gate(distro: &str, running: Option<bool>) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+    let code = match running {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => 2,
+    };
+    if LAST.swap(code, Ordering::Relaxed) != code {
+        match running {
+            Some(true) => tracing::info!("fleet::resource_sample: wsl distro {distro} is running - wsl lane sampling"),
+            Some(false) => tracing::info!("fleet::resource_sample: wsl distro {distro} is stopped - no wsl lane, and no probe that would boot it"),
+            None => tracing::info!("fleet::resource_sample: wsl distro {distro} running state UNKNOWN - no wsl lane, and no probe that would boot it"),
+        }
+    }
 }
 
 /// Populate the `wsl` lane's DISK axis, fork-free, from the Windows side.
@@ -2132,12 +2232,149 @@ MemAvailable:   15335424 kB
         assert_eq!(
             body.matches("wsl_probe(").count(),
             1,
-            "collect_wsl_lane must fork `wsl.exe` exactly once — every file it \
-             reads rides WSL_PROC_FILES on that one `cat`"
+            "collect_wsl_lane must fork `wsl.exe` INTO the VM exactly once — every \
+             file it reads rides WSL_PROC_FILES on that one `cat` (the running \
+             check is a second, service-only fork, pinned separately by \
+             a_running_check_never_targets_a_distro)"
         );
         assert!(
             body.contains("WSL_PROC_FILES"),
             "the file list must be the shared constant, not a second literal"
+        );
+    }
+
+    /// The listing decodes in both encodings `wsl.exe` uses: UTF-16LE by
+    /// default, plain UTF-8 under `WSL_UTF8=1` (measured on dell-2020: 13 bytes
+    /// for `qontinui-ci\r\n`).
+    #[test]
+    fn a_wsl_listing_decodes_in_both_encodings() {
+        let utf8 = b"qontinui-ci\r\n";
+        let utf16: Vec<u8> = "qontinui-ci\r\n"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut utf16_bom = vec![0xFF, 0xFE];
+        utf16_bom.extend_from_slice(&utf16);
+        for bytes in [&utf8[..], &utf16[..], &utf16_bom[..]] {
+            let text = decode_wsl_listing(bytes);
+            assert!(
+                running_listing_contains(&text, "qontinui-ci"),
+                "decoded {text:?}"
+            );
+            assert_eq!(first_distro(&text).as_deref(), Some("qontinui-ci"));
+        }
+        assert_eq!(decode_wsl_listing(b""), "");
+    }
+
+    /// Only a listing that names the distro may permit the read: stopped and
+    /// unknown both keep the probe that would boot it from running.
+    #[test]
+    fn only_a_running_distro_may_be_read() {
+        assert!(wsl_lane_may_read(Some(true)));
+        assert!(!wsl_lane_may_read(Some(false)));
+        assert!(
+            !wsl_lane_may_read(None),
+            "unknown must never boot the distro"
+        );
+    }
+
+    /// The running listing is matched by whole name, case-insensitively, with
+    /// any BOM / CR / NUL debris stripped; the "nothing running" notice and a
+    /// prefix-sharing name are both "not running".
+    #[test]
+    fn a_running_listing_names_the_distro_or_it_is_not_running() {
+        assert!(running_listing_contains(
+            "\u{feff}qontinui-ci\r\nUbuntu\r\n",
+            "qontinui-ci"
+        ));
+        assert!(running_listing_contains("Ubuntu-24.04\r\n", "ubuntu-24.04"));
+        assert!(running_listing_contains(
+            "  qontinui-ci  \r\n",
+            " qontinui-ci "
+        ));
+        assert!(!running_listing_contains(
+            "There are no running distributions.\r\n",
+            "qontinui-ci"
+        ));
+        assert!(!running_listing_contains(
+            "qontinui-ci-2\r\n",
+            "qontinui-ci"
+        ));
+        assert!(!running_listing_contains("", "qontinui-ci"));
+    }
+
+    /// Slices one production fn body out of this file, the same way the pins
+    /// above do, so a call written inside a test cannot satisfy them. Uses
+    /// `str::get`, not byte slicing (the `string_slice` ratchet only falls).
+    fn prod_fn_body(signature: &str) -> String {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let start = prod
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let body = prod.get(start..).expect("start is a char boundary");
+        let end = body
+            .get(1..)
+            .and_then(|rest| rest.find("\n#[cfg"))
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        body.get(..end).expect("end is a char boundary").to_string()
+    }
+
+    /// **The liveness check never targets a distro.** `-d`/`--distribution`
+    /// (or `--exec` into the default distro) is exactly what BOOTS a stopped
+    /// one — dell-2020, 2026-10-06, finding `50cc26e3`. The check may only ask
+    /// the WSL service for its running list.
+    #[test]
+    fn a_running_check_never_targets_a_distro() {
+        let body = prod_fn_body("async fn wsl_distro_running(");
+        for forbidden in [
+            "\"-d\"",
+            "\"--distribution\"",
+            "\"--exec\"",
+            "\"-e\"",
+            "\"--\"",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "wsl_distro_running must not pass {forbidden}: targeting a distro boots it"
+            );
+        }
+        assert!(
+            body.contains("\"--running\""),
+            "the check must ask for the RUNNING list"
+        );
+    }
+
+    /// **Ask before reading.** The procfs `cat` boots a stopped distro, so the
+    /// lane must consult the running listing before its one probe into the VM.
+    #[test]
+    fn the_wsl_lane_asks_whether_the_distro_runs_before_it_reads() {
+        let body = prod_fn_body("async fn collect_wsl_lane()");
+        let ask = body
+            .find("wsl_distro_running(")
+            .expect("collect_wsl_lane must check liveness first");
+        let read = body
+            .find("wsl_probe(")
+            .expect("collect_wsl_lane still reads procfs");
+        assert!(
+            ask < read,
+            "the liveness check must come before the probe that would boot the distro"
+        );
+        let gate = body
+            .find("if !wsl_lane_may_read(")
+            .expect("the read must be gated by wsl_lane_may_read");
+        let early = body
+            .get(gate..)
+            .and_then(|rest| rest.find("return None;"))
+            .map(|i| i + gate)
+            .expect("a closed gate must return before the read");
+        assert!(
+            ask < gate && gate < early && early < read,
+            "ask, then gate, then return, all before the probe that would boot the distro"
         );
     }
 
