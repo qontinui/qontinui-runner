@@ -418,9 +418,15 @@ fn launch_member(
         crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
     ));
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
+    // `claude --name` for the member, from the same title its tab carries —
+    // the gate/condition/looping spawns' convention. It becomes the commit
+    // `Session-Name` trailer and the tab's immutable `spawnName`; `None` (a
+    // title that sanitises to nothing) leaves the argv without `--name`.
+    let spawn_name = crate::claude_session::launch_spec::sanitize_session_name(&req.title);
     let argv = crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
         &req.claude_session_id,
+        spawn_name.as_deref(),
         add_dir_args,
         req.prompt.clone(),
         prompt_carrier,
@@ -449,6 +455,7 @@ fn launch_member(
         config_dir: selected_config_dir,
         working_dir: working_dir.clone(),
         title: req.title.clone(),
+        spawn_name,
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the argv → recorded synchronously.
         claude_session_id: Some(req.claude_session_id.clone()),

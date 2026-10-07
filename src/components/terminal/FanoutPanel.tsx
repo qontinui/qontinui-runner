@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, Layers, Loader2 } from "lucide-react";
 
 import { resolvePort } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 import { createFanoutRun, type ConfigDirPolicy } from "./fanoutApi";
 import {
@@ -211,7 +212,7 @@ export function FanoutPanel({
         } catch (err: unknown) {
           result = controller.signal.aborted
             ? null
-            : { kind: "unknown", error: err instanceof Error ? err.message : String(err) };
+            : { kind: "unknown", error: describeThrown(err, "collision probe failed") };
         } finally {
           inFlightRef.current.delete(key);
         }
