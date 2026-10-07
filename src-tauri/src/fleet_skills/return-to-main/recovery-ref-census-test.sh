@@ -186,7 +186,7 @@ import json,sys
 dev,ref=sys.argv[1],sys.argv[2]
 print(json.dumps([{"claim_kind":"recovery_ref","resource_key":f"{dev}:ungated:{ref}",
  "predicate":{"kind":"time_elapsed","duration_secs":1209600},
- "continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap","ungated",ref,"--device",dev],"target_device_id":dev},
+ "continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap","ungated",ref,"--device",dev],"target_device_id":dev,"pin":"strict"},
  "clearance_audience":"agent","gate_class":"routine-review"}], sort_keys=True))' "$DEV" "$REF_U")"
 eq "A4 the one registration is the contract shape, for the ungated ref, verbatim" "$WANT" "$REG"
 eq "A5 coord was asked about both anchors" 2 "$(wc -l <"$STUB_DIR/queried.log" | tr -d ' ')"

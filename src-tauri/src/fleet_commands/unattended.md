@@ -1,5 +1,5 @@
 ---
-description: "Session-close holistic audit — answers one question: if NO operator ever reads this session's output, will the implementation still be complete and correct? Classifies every unit of this session's work as LANDED / WATCHED / RECORDED / IMPEDED / DROPPED, converts every DROPPED item into a durable store, and where no store could hold it, sweeps for unactivated functionality and unimplemented plans before authoring a new one."
+description: "Session-close holistic audit — answers one question: if NO operator ever reads this session's output, will the implementation still be complete and correct? Classifies every unit of this session's work as LANDED / WATCHED / RECORDED / IMPEDED / DROPPED (plus RECEIPTED-UNVERIFIED for a memory-write receipt no door confirmed), converts every DROPPED item into a durable store, and where no store could hold it, sweeps for unactivated functionality and unimplemented plans before authoring a new one."
 argument-hint: "[optional: area to focus on, or a plan slug this session was working]"
 allowed-tools: Read, Write, Edit, Bash, PowerShell, Glob, Grep, ToolSearch, Agent, AskUserQuestion
 ---
@@ -182,6 +182,7 @@ Now put **every** unit into exactly one terminal state:
 | **LANDED** | On `main`, verified **by content** on `origin/main` | The landed SHA plus the content check. `gh` PR state is not evidence in EITHER direction — `closed, merged=false` and `MERGED` with `mergeCommit.oid == headRefOid` are **both** normal coord lands (`coord-ff-lands.md`). Ancestry only on the LANDED sha, never the head |
 | **WATCHED** | Incomplete, but a coord gate watches the trigger and can resume it after every session dies | `gate_id`, **read back** after registration (`coordination` `gate-read-back`) |
 | **RECORDED** | Not resumable work, but a durable record exists so the next session need not re-derive it | The memory record id / plan slug / policy clause |
+| **RECEIPTED-UNVERIFIED** | A 2c memory write returned a `memory_id`, but no door CONFIRMED the row: no read-back door was reachable, or the by-id read was not served or UNKNOWN and search did not find it. Memory-write receipts only; counts as neither RECORDED nor DROPPED | The `memory_id` plus each named read-back door failure or zero-hit query (2c's by-id read-back rule) |
 | **IMPEDED** | Not done because a condition that is **currently true, environmental and shared** blocks it — and that condition is now posted where the next session will be handed it | The returned `finding_id`. Cite an `alert_key` too *if you actually have one* — `GET /coord/alerts` takes a device JWT, and coord#1601 added a machine arm over a closed allowlist (`FLEET_INFRA_MACHINE_KINDS`), but that arm is **legacy-posture only** and production runs `COORD_ALERTS_TENANT_STRICT=1`, so it never fires. What decides whether you can read this class is your principal's **tenant**, not its kind — measure yours before reading a quiet result in either direction: from the system tenant it is a real read, from an ordinary tenant it is UNKNOWN. Table: `coord-gates-and-access.md` -> "A `200` from a fleet read is not a COMPLETE answer"; mechanics in the alerts note under 2b-findings. Where the blocker is an agent-responder alert, read it from the agent queue, `GET /coord/alerts/queue` (same visibility): a live claim on it means another agent is working it, so cite the row and its claimant rather than working it in parallel. A `404` there, or a body naming `schema_migration_pending`, means the queue is not served yet: cite from `/coord/alerts` and say so. Any other `5xx` is transient: retry |
 | **DROPPED** | Exists only in this transcript | — |
 
@@ -1420,7 +1421,7 @@ started with, an approach that was confirmed — record it.
   redundant.
 - When it is **masked**, or answers `"Command failed with no output"`, do NOT
   fall back to a file on that evidence. Visibility is not the predicate;
-  **reachability** is, and one resolver decides it. Four steps:
+  **reachability** is, and one resolver decides it. Five steps:
   1. `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh`
      from the real cwd, SUBSTITUTING the real workspace root — the ONE door
      resolver (its L2 is the same sibling sweep `/gate` Step 2 runs). Spell
@@ -1434,9 +1435,9 @@ started with, an approach that was confirmed — record it.
      **A correctly-substituted path that STILL says `No such file or
      directory` means no `qontinui-claude-config` checkout exists on this
      box at all** — steps 2
-     and 3 below need the `VERDICT:` line this step produces, so neither is
+     to 4 below need the `VERDICT:` line this step produces, so none of them is
      reachable either. That is functionally the same operational state as
-     step 4's `DEAD`, so treat it as `DEAD` (skip straight to step 4) rather
+     step 5's `DEAD`, so treat it as `DEAD` (skip straight to step 5) rather
      than as a masked-tool retry.
   2. **LIVE loopback proxy (L1/L2)** → raw JSON-RPC `tools/call`
      `{"name":"coord_memory_record","arguments":{title,content,kind}}`:
@@ -1462,9 +1463,12 @@ started with, an approach that was confirmed — record it.
      **The refusal text is on stdout: read it.** It names what was wrong, so
      fix the payload and re-issue — re-sending an identical call that your own
      arguments got refused only reproduces the refusal.
-     Then read back with `coord_memory_search` over the same door
-     (`query_text` is required there too — omit it and the search is refused
-     the same way, `OK over` and all). A zero-hit search is self-describing:
+     Then read back **by id** over the same door: `coord_memory_get` on the
+     receipt's `memory_id`, under the by-id read-back rule below the steps.
+     `coord_memory_search` is the secondary — for checking dedup or that the
+     row is discoverable — and the fallback when that rule finds the by-id
+     tool not served or UNKNOWN (`query_text` is required there — omit it and the search
+     is refused the same way, `OK over` and all). A zero-hit search is self-describing:
      read `live_row_count`, `query_echo` and `anchored_hit_count` before
      concluding anything, exactly as 2b-bis requires. Only a CORRECTED
      payload that is still refused, over a door that carries the call, is a
@@ -1475,8 +1479,31 @@ started with, an approach that was confirmed — record it.
      `{"records":[{title,content,kind}]}` and a FRESH device JWT
      (`get_memory_tenant` verifies coord-signed device JWTs; measured HTTP 200
      on 2026-09-02; `~/.qontinui/coord-device-jwt` lives ~4h — check `exp`
-     first). Read back with `POST …/memory/query` (`query_text` is required).
-  4. **`DEAD`** — and only then — a topic file plus a **one-line** `MEMORY.md`
+     first). Read back by id, under the rule below: `coord_memory_get` over
+     coord's generic remote MCP door `POST https://coord.qontinui.io/mcp`
+     with the same device JWT (`gate.md` Step 4's door). `POST …/memory/query`
+     (`query_text` is required) is the secondary, and the fallback when the
+     by-id tool is not served or UNKNOWN.
+  4. **LIVE bootstrap credential, no runner (L5)** → coord's generic remote
+     MCP door. Mint the token as `coord-revive.sh`'s L5 rung does, by
+     `gate.md` Step 4b's recipe: an anonymous
+     `POST https://coord.qontinui.io/agents/credential` with
+     `{"device_id": …}` (plus the session's `tenant_id` when known). Stage it
+     straight into a `chmod 600` header file as `Authorization: Bearer …`:
+     never on argv, never echoed, never pasted into a transcript or a file
+     anyone else reads. Write with JSON-RPC `tools/call`
+     `{"name":"coord_memory_record","arguments":{title,content,kind}}` to
+     `POST https://coord.qontinui.io/mcp`, with `-H @<that file>`,
+     `Content-Type: application/json` and
+     `Accept: application/json, text/event-stream`. That door was measured
+     carrying `coord_memory_record` on 2026-09-21 (memory `d06de56c`). Read
+     back by id over the same door, under the rule below. This arm is
+     hand-run: `coord-revive.sh call` runs over a `.mcp.json` nonce and never
+     mints, so it does not reach L5. Step 3's web API is no fallback here
+     either. It answers this token 401 because the token has no `user_id`
+     claim (measured on the list route), so before `coord_memory_get` an L5
+     session had no read-back at all.
+  5. **`DEAD`** — and only then — a topic file plus a **one-line** `MEMORY.md`
      index entry (one target per line, as plain index hygiene), with
      frontmatter `metadata.coord_fallback: <YYYY-MM-DD> no-door` so a backfill
      can grep for it. That file is a **single-machine, single-project record
@@ -1485,6 +1512,73 @@ started with, an approach that was confirmed — record it.
      it anywhere. It is readable on this box only, and invisible to every
      other session — including the `coord_memory_search` probes 2b-bis
      prescribes.
+- **The by-id read-back rule — steps 2, 3 and 4.** Plan
+  `2026-09-21-a-memory-write-receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds`.
+  The receipt is the `memory_id` the write returned. The control is
+  `tools/call` `coord_memory_get` with `{"memory_ids":["<that id>"]}`. It takes
+  1 to 50 ids, so one call reads back every memory a closeout wrote. It is
+  deterministic, where search is full-text and can miss a row that exists.
+  - **Probe before relying on it.** The tool is new, so the coord, or the
+    runner-proxy build, that your door reaches may not serve it yet. Confirm it
+    is listed: `tools/list` on that door, or `coord-revive.sh tools` on the
+    proxy arm. If it is absent from the list, or answers `-32601` or "unknown
+    tool", it is **not served**. That never means "write lost". Fall back to
+    that arm's search read-back, and say in the classification that the by-id
+    control was unavailable.
+  - **A tool-level error, or an id in `errors`, is UNKNOWN — never missing.**
+    `coord_memory_get` answers with a tool error when no id got a 200 or the
+    route's own 404, and it lists per-id `errors` entries: a `405` (the web
+    backend predates the by-id route), any other non-2xx, or a transport
+    failure. None of these says anything about the row. Fall back to that
+    arm's search read-back, and if that does not confirm the row either, the
+    item is RECEIPTED-UNVERIFIED.
+  - **An id in `records` is RECORDED, whatever its `state`. The state is the
+    annotation, not the class:**
+    - `live` → **RECORDED**.
+    - `superseded` → **RECORDED**, annotated `superseded → <superseded_by>`.
+    - `tombstoned` → **RECORDED**, annotated `tombstoned`: the write landed and
+      was later deleted. `title` and `content` come back null.
+    - `expired` → **RECORDED**, annotated `expired at <valid_until>`. Say also
+      that the row is no longer discoverable by search.
+    - For `tombstoned` and `expired`, the receipt is confirmed but the
+      knowledge is NOT retrievable by the next session, which is what RECORDED
+      exists to guarantee. Say so in the closeout. Re-record still-true content
+      as a new memory (and read THAT id back) only for an `expired` row; a
+      `tombstoned` row was deleted on purpose unless this session can show
+      otherwise, so report it and leave it rather than undo a peer's delete.
+  - **Read `missing` beside the echoed `tenant_id`.** An id lands in `missing`
+    only on the route's own "not found in your tenant" 404. Another principal's
+    agent- or session-scoped row also reads as missing, because the two cannot
+    be told apart.
+    - **The tenant does NOT match the one this session acts for:** this is a
+      wrong-tenant read, not a lost write. On a device bound to several
+      tenants, a mint that names no tenant resolves the device's DEFAULT
+      binding (memory `c50aefbf`). Retry under the right tenant, and do not
+      count it DROPPED.
+    - **The tenant MATCHES, and the write was `agent`- or `session`-scoped
+      with a `scope_ref` that is not the reading door's own claim** (the
+      device id for `agent`, the session id for `session`): the row may be
+      hidden by coord's private-partition filter, which compares against the
+      READER's claim. Step 3's web write does not clamp `scope_ref`, so this is
+      reachable. Do NOT re-issue: classify it **RECEIPTED-UNVERIFIED** and name
+      the scope mismatch. To avoid it, write `agent`/`session` rows with
+      `scope_ref` set to the writing door's own claim, or use `tenant` scope.
+    - **The tenant MATCHES otherwise:** the write did not land where the
+      receipt claims. Re-issue the write once over the same door and read the
+      new id back. If it is still missing, the item is **DROPPED**, with both
+      ids recorded.
+  - **A receipt that no door CONFIRMED is RECEIPTED-UNVERIFIED** (Step 1's
+    table). A `memory_id` came back, and neither the by-id read nor search
+    confirmed the row. That covers:
+    - every read-back door unreachable, or the door dying between the write
+      and the read;
+    - the by-id tool not served or answering UNKNOWN (above) while search is
+      unreachable;
+    - the by-id tool not served or UNKNOWN, search reachable, and search
+      returning zero hits for the row.
+    Record the `memory_id`, each door failure you actually saw, and each
+    zero-hit query. It counts as neither RECORDED, because nothing confirmed
+    the row, nor DROPPED, because a receipt exists.
 - **A memory written to a file while a door was reachable is RECORDED locally
   but DROPPED fleet-wide.** Report it as **DROPPED** in Step 4's classification
   table — the file is not the evidence RECORDED requires — and re-issue it over
@@ -2015,7 +2109,7 @@ uses, so the two writes can never disagree:
 | Step 1 outcome | Outcome to post |
 |---|---|
 | every unit LANDED / WATCHED / RECORDED | `work_completed` |
-| any unit IMPEDED or DROPPED | `work_abandoned`, detail = the reason |
+| any unit IMPEDED, RECEIPTED-UNVERIFIED or DROPPED | `work_abandoned`, detail = the reason |
 
 A residual DROPPED item you could not convert counts as DROPPED here exactly as
 it does in Step 5. An audit that classified everything as converted **because**
@@ -2054,11 +2148,11 @@ curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}" > "$R/o"
 envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # what coord PERSISTED
 
-# any unit IMPEDED or DROPPED - detail is ONE line, naming the items
+# any unit IMPEDED, RECEIPTED-UNVERIFIED or DROPPED - detail is ONE line, naming the items
 curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/DROPPED items and why>\"}" > "$R/o"
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/RECEIPTED-UNVERIFIED/DROPPED items and why>\"}" > "$R/o"
 envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # compare by PREFIX
 rm -rf "$R"
 ```
@@ -2187,17 +2281,18 @@ work that is still open, not everything that ever ran.
 
 ### The gate
 
-**Mark the session finished UNLESS Step 1 classified any unit as IMPEDED or
-DROPPED.**
+**Mark the session finished UNLESS Step 1 classified any unit as IMPEDED,
+RECEIPTED-UNVERIFIED or DROPPED.**
 
-Those two are exactly the states that mean a human must return. LANDED, WATCHED
+Those are exactly the states that mean a human must return. LANDED, WATCHED
 and RECORDED are all "this is in a durable store and will be picked up without
-me"; IMPEDED and DROPPED are not. So:
+me"; IMPEDED and DROPPED are not, and neither is RECEIPTED-UNVERIFIED until a
+session with a read-back door confirms the id. So:
 
 | Step 1 outcome | Action |
 |---|---|
 | every unit LANDED / WATCHED / RECORDED AND Step 4.9 headline `SAFE TO CLOSE` | **finish** the session |
-| any unit IMPEDED or DROPPED | **leave it unfinished**, and say which items held it open |
+| any unit IMPEDED, RECEIPTED-UNVERIFIED or DROPPED | **leave it unfinished**, and say which items held it open |
 | Step 4.9 headline `NOT SAFE` / `UNKNOWN` | **leave it unfinished**, and name the trees |
 
 A residual DROPPED item you could not convert (Step 2) counts as DROPPED here —
@@ -2311,7 +2406,7 @@ Add one line under the Step 4 verdict:
 
 or, when the gate held:
 
-> **Session left UNFINISHED** — <N> IMPEDED / <M> DROPPED: <the items>.
+> **Session left UNFINISHED** — <N> IMPEDED / <R> RECEIPTED-UNVERIFIED / <M> DROPPED: <the items>.
 
 or, when Step 4.9 held it:
 
