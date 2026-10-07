@@ -25189,7 +25189,20 @@ mod spawn_tenant_credential_tests {
         let a_path = provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
             .unwrap()
             .unwrap();
-        let a_tenant = session_tenant_or_refuse(Some(&read_proxy_nonce(&a_path).unwrap())).unwrap();
+        let a_nonce = read_proxy_nonce(&a_path).unwrap();
+        // The machine-pinned (sampled) session decides from its repo FIRST, and
+        // on a two-tenant device it refuses retryably until that is
+        // established — which the proxy's first-call await does.
+        assert_eq!(
+            session_tenant_or_refuse(Some(&a_nonce))
+                .expect_err("unsettled on a multi-bound device")
+                .code,
+            TENANT_REPO_UNSETTLED_CODE
+        );
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(establish_session_expectation(&a_nonce));
+        let a_tenant = session_tenant_or_refuse(Some(&a_nonce)).unwrap();
         assert!(
             runner_credential_local_refusal(&ProxyPrincipal::Device, a_tenant, Some(&expired_a))
                 .is_some(),
@@ -25220,7 +25233,9 @@ mod spawn_tenant_credential_tests {
             } => {
                 assert_eq!(*tenant, tenant_b());
                 assert_eq!(declared_file, &Path::new(&wd).join(".mcp.json"));
-                assert_eq!(declared, &DeclaredWorkdirKey::Pinned(tenant_a()));
+                // The cwd key was minted tenant-less, so its A pin is the
+                // machine's SAMPLED one — a statement about no chosen tenant.
+                assert_eq!(declared, &DeclaredWorkdirKey::NotPinned);
             }
             other => panic!("wrong refusal: {other:?}"),
         }
