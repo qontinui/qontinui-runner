@@ -72,6 +72,20 @@ if [ -z "${CTC_PY:-}" ]; then
   unset _ctc_c
 fi
 
+# ctc_sanitize <text...> -> the text with a tab turned into a space and every
+# other C0 control, DEL and every byte
+# >= 0x80 (which covers C1 controls in any encoding) REPLACED by `?` -- kept
+# visible, never silently dropped -- and bounded to 2000 bytes with an explicit
+# `...[truncated]`. Coord-served values are passed through it wherever this
+# file BUILDS a message, so a served ESC / OSC / BEL sequence can never reach a
+# terminal. No pipe into head: the result never depends on SIGPIPE.
+ctc_sanitize() {
+  local _s
+  _s="$(printf '%s' "$*" | LC_ALL=C tr '\011' ' ' | LC_ALL=C tr '\000-\037\177-\377' '?')"
+  [ "${#_s}" -le 2000 ] || _s="${_s:0:2000}...[truncated]"
+  printf '%s' "$_s"
+}
+
 ctc_is_uuid() {
   local re='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
   [[ "${1:-}" =~ $re ]]
@@ -231,7 +245,7 @@ PY
 ctc_stage_for_tenant() {
   local want="${1,,}" home_dir="${HOME:-${USERPROFILE:-}}" jwt="" src="" why="" f code c slot
   rm -f "$CTC_TMP/bearer.hdr"
-  ctc_is_uuid "$want" || { printf 'rejected(tenant %s is not a uuid)' "${1:-<empty>}"; return 0; }
+  ctc_is_uuid "$want" || { printf 'rejected(tenant %s is not a uuid)' "$(ctc_sanitize "${1:-<empty>}")"; return 0; }
   _ctc_url_ok || { printf 'rejected(coord url %s is neither https nor loopback; no credential is sent to it)' "$(_ctc_url)"; return 0; }
   slot="$CTC_TMP/ctc.mint.$want"
   f="$(printf '%s' "${COORD_DEVICE_JWT:-}" | tr -d '[:space:]')"
@@ -271,7 +285,7 @@ ctc_stage_for_tenant() {
         # pointer. That token is NOT used: every read under it would answer
         # about the wrong tenant.
         c="${c#* }"
-        printf 'POST /agents/credential for tenant %s returned a token claiming tenant %s (or one that is expired / exp-less) -- not used' "$want" "${c:-<none>}" > "$slot.rejected"
+        printf 'POST /agents/credential for tenant %s returned a token claiming tenant %s (or one that is expired / exp-less) -- not used' "$want" "$(ctc_sanitize "${c:-<none>}")" > "$slot.rejected"
       fi
     fi
     rm -f "$slot.body"
@@ -285,7 +299,7 @@ ctc_stage_for_tenant() {
   fi
 }
 
-CTC_BINDINGS=""; CTC_BINDINGS_NOTE=""; _CTC_BINDINGS_READ=0
+CTC_BINDINGS=""; CTC_BINDINGS_NOTE=""; CTC_BINDINGS_DROPPED=0; _CTC_BINDINGS_READ=0
 ctc_bindings() {
   local code tok out
   if [ "$_CTC_BINDINGS_READ" = 1 ]; then
@@ -293,7 +307,7 @@ ctc_bindings() {
     return 0
   fi
   _CTC_BINDINGS_READ=1
-  CTC_BINDINGS=""; CTC_BINDINGS_NOTE=""
+  CTC_BINDINGS=""; CTC_BINDINGS_NOTE=""; CTC_BINDINGS_DROPPED=0
   if ! _ctc_url_ok; then CTC_BINDINGS_NOTE="coord url $(_ctc_url) is neither https nor loopback"; return 0; fi
   if [ "${CTC_NO_MINT:-0}" = 1 ]; then CTC_BINDINGS_NOTE="minting is disabled, so the binding list was not read"; return 0; fi
   code="$(_ctc_mint "" "$CTC_TMP/ctc.anon.body")"
@@ -315,10 +329,13 @@ ctc_bindings() {
   _ctc_mark "${code:-000}"
   [ "${code:-000}" = 000 ] && _CTC_BINDINGS_TRANSPORT=1
   if [ "$code" != 200 ]; then CTC_BINDINGS_NOTE="POST /mcp coord_query_identity answered HTTP ${code:-000}"; return 0; fi
-  out="$(H_BODY="$(cat "$CTC_TMP/ctc.ident.json" 2>/dev/null)" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r'
+  # The body goes to Python on STDIN, never through the environment: an
+  # answer over ~128 KiB would fail exec with E2BIG and read as "did not
+  # parse". So the program itself is passed with -c.
+  out="$("${CTC_PY:-python3}" -c "$(cat <<'PY'
 import json, os, sys
 try:
-    d = json.loads(os.environ.get("H_BODY") or "")
+    d = json.loads(sys.stdin.read() or "")
     r = d["result"]  # envelope-ok: JSON-RPC result of POST /mcp tools/call
     s = r.get("structuredContent")
     if not isinstance(s, dict):
@@ -328,13 +345,41 @@ except Exception:
     print("ERR the identity answer did not parse"); sys.exit(0)
 if b is None:
     print("ERR device_tenant_bindings.tenant_ids is null (coord could not read the bindings)"); sys.exit(0)
-ids = [x.get("tenant_id") for x in b if isinstance(x, dict) and isinstance(x.get("tenant_id"), str)]
-print("OK " + " ".join(ids))
+if not isinstance(b, list):
+    print("ERR device_tenant_bindings.tenant_ids is not a list"); sys.exit(0)
+# Validated HERE, in one place: one uuid per line, and a count of EVERY other
+# entry (a non-object, a null / non-string / empty tenant_id, a string that is
+# not a uuid -- including one with an embedded newline), so nothing served can
+# vanish before it is counted and nothing served is ever word-split by a shell.
+import re
+uuid_re = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+ids, dropped = [], 0
+for x in b:
+    t = x.get("tenant_id") if isinstance(x, dict) else None
+    if isinstance(t, str) and uuid_re.fullmatch(t):
+        ids.append(t)
+    else:
+        dropped += 1
+print("OK %d" % dropped)
+for t in ids:
+    print(t)
 PY
-)"
+)" <"$CTC_TMP/ctc.ident.json" 2>/dev/null | tr -d '\r')"
   case "$out" in
-    "OK "?*) CTC_BINDINGS="${out#OK }" ;;
-    "OK "|OK) CTC_BINDINGS_NOTE="this device is bound to no tenant" ;;
+    "OK "[0-9]*)
+      # Only uuids are bindings; the Python above already validated them, one
+      # per line, and COUNTED everything else (CTC_BINDINGS_DROPPED), so a
+      # caller that needs the complete list can refuse rather than act on a
+      # silently shortened one. `mapfile`, never word splitting: nothing
+      # served is globbed against the caller's cwd.
+      local _w _ws
+      mapfile -t _ws <<<"$out"
+      CTC_BINDINGS_DROPPED="${_ws[0]#OK }"
+      for _w in "${_ws[@]:1}"; do
+        [ -n "$_w" ] && CTC_BINDINGS="${CTC_BINDINGS:+$CTC_BINDINGS }$_w"
+      done
+      [ "$CTC_BINDINGS_DROPPED" = 0 ] || CTC_BINDINGS_NOTE="dropped $CTC_BINDINGS_DROPPED served binding(s) that are not uuids"
+      [ -n "$CTC_BINDINGS" ] || CTC_BINDINGS_NOTE="${CTC_BINDINGS_NOTE:-this device is bound to no tenant}" ;;
     *) CTC_BINDINGS_NOTE="${out#ERR }"; [ -n "$CTC_BINDINGS_NOTE" ] || CTC_BINDINGS_NOTE="the identity answer did not parse" ;;
   esac
   return 0
@@ -395,9 +440,16 @@ _ctc_owner_walk() {
       bindings_done=1
       ctc_bindings
       if [ -n "$CTC_BINDINGS" ]; then
-        for t in $CTC_BINDINGS; do
-          if ctc_is_uuid "$t"; then _ctc_add "$t" "device_tenant_bindings"; else note="${note}binding '$t' is not a uuid (ignored); "; fi
-        done
+        # ctc_bindings already kept only uuids; a served binding it DROPPED
+        # could have been the owner, so it counts as untried (the walk then
+        # ends unknown, never refuted) and its note is carried.
+        local _bs
+        read -r -a _bs <<<"$CTC_BINDINGS"
+        for t in "${_bs[@]}"; do _ctc_add "$t" "device_tenant_bindings"; done
+        if [ "${CTC_BINDINGS_DROPPED:-0}" != 0 ]; then
+          note="${note}${CTC_BINDINGS_NOTE}; "
+          untried=$((untried + 1))
+        fi
       else
         note="${note}the device's tenant bindings are UNKNOWN ($CTC_BINDINGS_NOTE); "
         untried=$((untried + 1))

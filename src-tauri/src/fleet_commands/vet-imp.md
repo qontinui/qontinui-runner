@@ -913,7 +913,10 @@ rescued by coord still burns a session and delays the work.
 ### Step 3 — Gate: confirm the plan is actually VETTED
 
 After `/vet-plan` returns, re-read the top of the plan file and confirm its
-status block now reads `Status: VETTED`. This gate exists because the two
+status block now reads `Status: VETTED`. `Status: VETTED (self)` passes this
+gate too: it is `/vet-plan`'s stamp for a vet whose fresh-context reviewer
+could not be spawned. It is still VETTED, only without independence, so proceed
+and carry the qualifier forward. This gate exists because the two
 states that legitimately stop the lifecycle must stop it here too:
 
 - **`/vet-plan` aborted** because the existing block was `SHIPPED` /

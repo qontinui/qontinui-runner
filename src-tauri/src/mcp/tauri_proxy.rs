@@ -38,6 +38,13 @@ pub const ALLOWED_PROXIED_COMMANDS: &[&str] = &[
     "list_terminals",
     "get_claude_config_dirs",
     "check_accounts_usage",
+    // The remote-interactivity probe sweep (plan
+    // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    // A3): a headless agent measures a device's sessions without a webview.
+    // It mints grants and attaches with this runner's own device credential,
+    // exactly as the Fleet view does, and carries no input byte by
+    // construction (`ProbeFrameSink`).
+    "remote_interactivity_probe",
 ];
 
 // ============================================================================
@@ -439,8 +446,58 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             }
         }
 
+        // ── remote interactivity ─────────────────────────────────────────────
+        "remote_interactivity_probe" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                device_id: String,
+                #[serde(default)]
+                trigger: Option<String>,
+            }
+            let a = match serde_json::from_value::<Args>(req.args) {
+                Ok(v) => v,
+                Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
+            };
+            // A headless caller is not the Fleet view: `fleet_view` would
+            // stamp the device into the scheduler's sweep set for a week on
+            // behalf of an operator who never opened it. So the proxy passes
+            // an explicit `manual` through and otherwise runs `unspecified`
+            // (which, unlike manual, honours the attempt memory); any other
+            // trigger is refused.
+            let trigger = match proxy_probe_trigger(a.trigger.as_deref()) {
+                Ok(t) => t,
+                Err(e) => return TauriInvokeResponse::err(e),
+            };
+            match crate::commands::remote_interactivity_probe::run_probe_command(
+                &state.app_handle,
+                &a.device_id,
+                Some(trigger),
+            )
+            .await
+            {
+                Ok(report) => TauriInvokeResponse::ok(report),
+                Err(e) => TauriInvokeResponse::err(e),
+            }
+        }
+
         // Unreachable: safelist check above prevents anything else.
         _ => TauriInvokeResponse::err(format!("command '{}' not implemented", req.command)),
+    }
+}
+
+/// The `remote_interactivity_probe` trigger a headless proxy caller may run:
+/// absent/blank → `unspecified`, `manual` → `manual`, anything else (notably
+/// `fleet_view`, which would stamp the device into the scheduler's sweep set)
+/// refused.
+fn proxy_probe_trigger(raw: Option<&str>) -> Result<&'static str, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok("unspecified"),
+        Some("manual") => Ok("manual"),
+        Some(t) => Err(format!(
+            "remote_interactivity_probe:trigger_not_allowed: {t:?} — the proxy runs only \
+             trigger \"manual\" (or none)"
+        )),
     }
 }
 
@@ -451,6 +508,26 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
     axum::Router::new().route("/ui-bridge/tauri/invoke", post(tauri_invoke_handler))
+}
+
+#[cfg(test)]
+mod probe_trigger_tests {
+    use super::proxy_probe_trigger;
+
+    #[test]
+    fn the_proxy_maps_probe_triggers() {
+        assert_eq!(proxy_probe_trigger(None), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("")), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("   ")), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("manual")), Ok("manual"));
+        for refused in ["fleet_view", "scheduler", "Manual", "anything"] {
+            let e = proxy_probe_trigger(Some(refused)).unwrap_err();
+            assert!(
+                e.starts_with("remote_interactivity_probe:trigger_not_allowed:"),
+                "{e}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -284,14 +284,17 @@ pub(crate) const DARK_SOURCE_POSTURE: &str = "posture";
 
 /// Emit the widened credential-dark / recovered notification to the frontend.
 ///
-/// Payload (DD3 of the coord-credential-posture plan, plus M5's `source`):
-/// `{source, dark, cause, message, cta, since}`. ONE event and ONE banner for
+/// Payload (DD3 of the coord-credential-posture plan, plus M5's `source`, plus
+/// `tenant_id` — plan `2026-09-14-credential-posture-third-residuals` Phase 3):
+/// `{source, dark, cause, message, cta, since, tenant_id}` — see
+/// [`credential_dark_payload`]. ONE event and ONE banner for
 /// every terminal credential cause — a second banner component would be the
 /// "wrong layer, two authorities" shape — but the two authorities are now
 /// distinguishable within it.
 ///
 /// Best-effort: an emit failure only `warn!`s — telemetry must never break the
 /// loop.
+#[allow(clippy::too_many_arguments)]
 fn emit_credential_dark_event(
     app: &tauri::AppHandle,
     source: &str,
@@ -300,18 +303,53 @@ fn emit_credential_dark_event(
     message: &str,
     cta: Option<&str>,
     since: Option<i64>,
+    tenant_id: Option<&str>,
+    pinned_tenant: bool,
 ) {
-    let payload = serde_json::json!({
+    let payload = credential_dark_payload(
+        source,
+        dark,
+        cause,
+        message,
+        cta,
+        since,
+        tenant_id,
+        pinned_tenant,
+    );
+    if let Err(e) = app.emit(AUTONOMY_CREDENTIAL_DARK_EVENT, &payload) {
+        warn!("device_jwt_refresher: failed to emit {AUTONOMY_CREDENTIAL_DARK_EVENT}: {e}");
+    }
+}
+
+/// Pure: the `autonomy-credential-dark` event payload.
+///
+/// `tenant_id` is the tenant the posture is about — the same value `/health`
+/// serves as `coordCredential.tenantId` — so the banner can name it and offer
+/// the tenant switch for a pinned tenant without a second read. `null` for the
+/// Cognito arm and for a posture that names no tenant. `pinned_tenant` is
+/// [`CoordCredentialStatus::pinned_tenant`]: the banner offers the tenant
+/// switch on it, never on `tenant_id` alone.
+#[allow(clippy::too_many_arguments)]
+fn credential_dark_payload(
+    source: &str,
+    dark: bool,
+    cause: &str,
+    message: &str,
+    cta: Option<&str>,
+    since: Option<i64>,
+    tenant_id: Option<&str>,
+    pinned_tenant: bool,
+) -> serde_json::Value {
+    serde_json::json!({
         "source": source,
         "dark": dark,
         "cause": cause,
         "message": message,
         "cta": cta,
         "since": since,
-    });
-    if let Err(e) = app.emit(AUTONOMY_CREDENTIAL_DARK_EVENT, &payload) {
-        warn!("device_jwt_refresher: failed to emit {AUTONOMY_CREDENTIAL_DARK_EVENT}: {e}");
-    }
+        "tenant_id": tenant_id,
+        "pinned_tenant": pinned_tenant,
+    })
 }
 
 /// The HARD-Cognito arm, unchanged in meaning and now one CAUSE among several
@@ -328,6 +366,8 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
             "Autonomous sessions paused — sign in again to resume.",
             Some("sign_in"),
             None,
+            None,
+            false,
         );
     } else {
         emit_credential_dark_event(
@@ -338,6 +378,8 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
             "Autonomous sessions resumed — credentials refreshed.",
             None,
             None,
+            None,
+            false,
         );
     }
 }
@@ -352,18 +394,27 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
 /// `app: None` (hermetic tests, headless callers) derives and publishes the
 /// posture but shows nothing — the state is still readable on `/health`.
 fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: PostureTransition) {
-    if !should_notify_posture(transition.from, transition.to) {
+    if !transition_notifies(transition) {
         return;
     }
-    let since = coord_credential_posture().map(|s| s.since);
+    // The status the publisher just wrote: its `since`, and the sentence and
+    // tenant the banner shows — the pinned arm's composed reason names T and
+    // the selector's cause, which `transition.to.message()` cannot.
+    let status = coord_credential_posture();
+    let since = status.as_ref().map(|s| s.since);
+    let reason = status
+        .as_ref()
+        .map(CoordCredentialStatus::reason)
+        .unwrap_or_else(|| transition.to.message().to_string());
+    let tenant_id = status.as_ref().and_then(|s| s.tenant_id.clone());
+    let pinned_tenant = status.as_ref().is_some_and(|s| s.pinned_tenant);
     let from = transition
         .from
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     warn!(
-        "device_jwt_refresher: coord-credential posture {from} -> {} ({})",
+        "device_jwt_refresher: coord-credential posture {from} -> {} ({reason})",
         transition.to.as_str(),
-        transition.to.message()
     );
     let Some(app) = app else { return };
     if transition.to.can_answer() {
@@ -375,6 +426,8 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
             "Coord access restored — this runner's credential is live again.",
             None,
             since,
+            None,
+            false,
         );
     } else {
         emit_credential_dark_event(
@@ -385,9 +438,11 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
                 .to
                 .cause()
                 .unwrap_or_else(|| transition.to.as_str()),
-            transition.to.message(),
+            &reason,
             transition.to.cta(),
             since,
+            tenant_id.as_deref(),
+            pinned_tenant,
         );
     }
 }
@@ -581,6 +636,9 @@ pub(crate) struct CoordCredentialBag {
     /// ISO-8601 UTC instant the runner ENTERED this posture.
     pub since: String,
     pub tenant_id: Option<String>,
+    /// `true` only for the unserved-pin arm — see
+    /// [`CoordCredentialStatus::pinned_tenant`].
+    pub pinned_tenant: bool,
     /// Decoded `exp` of the credential the posture is about, unix seconds.
     pub exp: Option<i64>,
     /// How old this report may get before a reader must stop trusting it:
@@ -626,10 +684,11 @@ pub(crate) fn coord_credential_bag(
     match posture {
         Some(p) => CoordCredentialBag {
             ok: p.posture.can_answer(),
-            reason: (!p.posture.can_answer()).then(|| p.posture.message().to_string()),
+            reason: (!p.posture.can_answer()).then(|| p.reason()),
             posture: p.posture.as_str().to_string(),
             since: iso8601(p.since),
             tenant_id: p.tenant_id.clone(),
+            pinned_tenant: p.pinned_tenant,
             exp: p.exp,
             stale_after_secs: coord_credential_stale_after_secs(),
         },
@@ -639,6 +698,7 @@ pub(crate) fn coord_credential_bag(
             posture: "unknown".to_string(),
             since: iso8601(chrono::Utc::now().timestamp()),
             tenant_id: None,
+            pinned_tenant: false,
             exp: None,
             stale_after_secs: coord_credential_stale_after_secs(),
         },
@@ -2920,55 +2980,110 @@ struct SweepInputs {
     /// signed-in gate [`binding_gap_asks_permitted`]. Read in this blocking
     /// hop with the rest.
     legacy_slot_present: bool,
+    /// The coord-mcp forwarder's OWN verdict for the pinned tenant — see
+    /// [`PosturePinInputs::pin_served`] and [`pin_served_by_selector`].
+    pin_served: Option<Result<(), crate::auth::NoCredential>>,
 }
 
 /// Blocking: reads the slot store, `paired_user.json`, `machine.json` and the
-/// heartbeat's `coord_bound_tenants.json` sidecar.
+/// heartbeat's `coord_bound_tenants.json` sidecar — and, when `machine.json`
+/// pins a tenant, asks the credential SELECTOR whether it would serve it.
 fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
+    let default_binding = crate::auth::default_binding_tenant_probe();
+    let machine_pin = crate::session::tenant_pin::resolve_tenant_pin();
     SweepInputs {
         tenant_slots: auth_manager.try_list_tenant_device_jwt_tenants(),
-        default_binding: crate::auth::default_binding_tenant_probe(),
-        machine_pin: crate::session::tenant_pin::resolve_tenant_pin(),
+        default_binding,
+        machine_pin,
         coord_bound_tenants: qontinui_runner_lib::pair::coord_bound_tenants(),
         coord_bound_tenants_for_ask: qontinui_runner_lib::pair::coord_bound_tenants_for_ask(),
         legacy_slot_present: auth_manager
             .get_access_token()
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false),
+        pin_served: pin_served_by_selector(
+            auth_manager,
+            machine_pin,
+            collapse_default_binding(default_binding),
+            crate::auth::measured_device_binding_count(),
+        ),
     }
 }
 
+/// `default_binding_tenant()`'s collapse, applied to the probe this hop
+/// already took rather than to a second read of `paired_user.json`: `Bound(t)`
+/// is `Some(t)`, and `Unbound` and `Unknown` are both `None`. That is exactly
+/// what the forwarder's [`crate::auth::device_bearer_for`] hands the selector,
+/// so an UNREADABLE binding serves nobody from the legacy slot here either.
+fn collapse_default_binding(binding: crate::auth::BindingTenantRead) -> Option<uuid::Uuid> {
+    match binding {
+        crate::auth::BindingTenantRead::Bound(t) => Some(t),
+        crate::auth::BindingTenantRead::Unbound | crate::auth::BindingTenantRead::Unknown => None,
+    }
+}
+
+/// Blocking: would the coord-mcp forwarder present a credential for the
+/// tenant `machine.json` pins? `None` when nothing is pinned (`Unpinned`,
+/// `Unresolvable`) — no tenant, so no question to ask.
+///
+/// It CALLS the selector — [`crate::auth::select_device_bearer_result_with`],
+/// the one implementation behind the forwarder's `device_bearer_for` — rather
+/// than re-deriving any of its branches (plan
+/// `2026-09-14-credential-posture-third-residuals` D1). Three hand-copied
+/// branches (an unreadable binding, an unreadable pinned slot, the legacy
+/// fallback) were each already a partial copy: none of them knew the selector
+/// also refuses a `Usable` legacy token whose claim names another tenant.
+///
+/// The token is DROPPED here: the posture needs the verdict and its cause,
+/// never the credential. Side effect, accepted: the selector's once-per-process
+/// `warn_once_per_tenant_*` lines can now fire from the pass rather than from
+/// the first request.
+fn pin_served_by_selector(
+    auth_manager: &crate::auth::AuthManager,
+    machine_pin: crate::session::tenant_pin::TenantPin,
+    default_tenant: Option<uuid::Uuid>,
+    binding_count: crate::auth::MeasuredBindingCount,
+) -> Option<Result<(), crate::auth::NoCredential>> {
+    let crate::session::tenant_pin::TenantPin::Pinned(pinned) = machine_pin else {
+        return None;
+    };
+    Some(
+        crate::auth::select_device_bearer_result_with(
+            auth_manager,
+            Some(&pinned),
+            default_tenant,
+            binding_count,
+        )
+        .map(|_token| ()),
+    )
+}
+
 impl SweepInputs {
-    /// The half of these inputs the POSTURE reads, too — or
-    /// [`PosturePinInputs::UNPINNED`] when the slot store could not be read.
+    /// The half of these inputs the POSTURE reads, too.
     ///
-    /// An unreadable store takes the LEGACY arm (the branch choice collapses
-    /// `Err` to "no slots"), whose only observation is the `access_token` slot
-    /// with `tenant_id: None`. That observation can never name the pinned
-    /// tenant, so feeding the real pin through would call a pin `unserved` on a
-    /// multi-tenant box whose `device_jwt:<pin>` slot may be perfectly healthy —
-    /// one failed read publishes `absent(T)`, and the next good read fires
-    /// *"Coord access restored"*. An unreadable input is not evidence, so the
-    /// posture is derived from the observations alone, exactly as if no pin
-    /// existed. `UNPINNED` rather than a doctored `Unresolvable` pin because the
-    /// pin itself WAS read; what is missing is any measurement of whether a slot
-    /// serves it. A readable but EMPTY store (`Ok(vec![])`, a legacy-only
-    /// install) is a measured absence and keeps the real pins.
+    /// An UNREADABLE slot store is no longer special-cased (plan
+    /// `2026-09-14-credential-posture-third-residuals` D3). It used to return
+    /// `UNPINNED`, deriving the posture from the legacy observation alone — so
+    /// a box pinned to T published `live` off the legacy slot while the
+    /// forwarder, whose own read of T's slot hit the same unreadable store,
+    /// refused every T-pinned session. The selector read in
+    /// [`read_sweep_inputs`] reads that store too, and says so in
+    /// [`Self::pin_served`]; the posture follows it. The cost is a flap — one
+    /// failed read publishes `absent(T)` and the next good read fires
+    /// *"Coord access restored"* — which is a TRUE report of what the forwarder
+    /// did in that window, where the abstention was a false `live`.
     fn posture_pin_inputs(&self) -> PosturePinInputs {
-        if self.tenant_slots.is_err() {
-            return PosturePinInputs::UNPINNED;
-        }
         PosturePinInputs {
             machine_pin: self.machine_pin,
-            default_binding: self.default_binding,
+            pin_served: self.pin_served,
         }
     }
 }
 
 /// What the posture needs to know about the tenant this machine ASKS for,
-/// beyond the slots a pass observed: `machine.json`'s pin and
-/// `paired_user.json`'s default binding, already read by
-/// [`read_sweep_inputs`] and passed in rather than re-read.
+/// beyond the slots a pass observed: `machine.json`'s pin, and the credential
+/// selector's verdict for it — both already read by [`read_sweep_inputs`] and
+/// passed in rather than re-read.
 ///
 /// Without it, a pinned tenant whose slot was cleared BEFORE any rejection
 /// streak formed was observed by nothing and remembered by no bucket, so a
@@ -2978,7 +3093,12 @@ impl SweepInputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PosturePinInputs {
     pub machine_pin: crate::session::tenant_pin::TenantPin,
-    pub default_binding: crate::auth::BindingTenantRead,
+    /// Would the coord-mcp forwarder present a credential for the pinned
+    /// tenant? `Some(Ok(()))` = yes; `Some(Err(cause))` = no, and why — the
+    /// selector's own [`crate::auth::NoCredential`], kept so the published
+    /// reason can say *"slot unreadable"* rather than implying the credential
+    /// is gone. `None` when nothing is pinned.
+    pub pin_served: Option<Result<(), crate::auth::NoCredential>>,
 }
 
 impl PosturePinInputs {
@@ -2987,33 +3107,41 @@ impl PosturePinInputs {
     /// `machine.json` to speak of.
     pub(crate) const UNPINNED: Self = Self {
         machine_pin: crate::session::tenant_pin::TenantPin::Unpinned,
-        default_binding: crate::auth::BindingTenantRead::Unknown,
+        pin_served: None,
     };
 
-    /// The tenant `machine.json` pins, iff that pin is POSITIVELY unserved by
-    /// this pass: no observation — an unreadable one included — names it, and
-    /// the default binding is MEASURED to be something else.
+    /// The tenant `machine.json` pins, and why no credential serves it, iff the
+    /// pin is UNSERVED this pass: the selector the forwarder runs refused it
+    /// (`pin_served == Some(Err(_))`), and no MEASURED observation names it.
     ///
-    /// Every unmeasured input abstains. `Unpinned`/`Unresolvable` name no
-    /// tenant; an unreadable binding might be the pin itself (a legacy-only
-    /// install serves its pinned default from the `access_token` slot, which no
-    /// tenant observation names); an unreadable slot might hold a working
-    /// credential. An unmeasured input is not evidence, and the unclaimed-bucket
-    /// rung still covers a pin with a streak.
-    fn unserved_pin(self, observations: &[SlotObservation]) -> Option<uuid::Uuid> {
+    /// - `Unpinned`/`Unresolvable` name no tenant, so there is nothing to say.
+    /// - A selector `Ok` means T-pinned sessions get a credential — from T's
+    ///   slot, or from the legacy slot when T is the default binding and the
+    ///   token's claim is T's. Nothing is synthesized.
+    /// - A MEASURED observation of T's slot (`!o.unknown`) wins: the per-slot
+    ///   ladder speaks for T with more detail (`expired`, `unrefreshable`, …).
+    /// - An UNREADABLE observation of T's slot does NOT count as naming it. The
+    ///   selector treats that read as a miss (fail-closed, correctly — it
+    ///   cannot present what it cannot read), so T-pinned sessions ARE refused,
+    ///   and the posture says so rather than publishing a sibling's `live`.
+    ///
+    /// The unclaimed-bucket rung still covers a T bucket with a streak whose
+    /// pin is served.
+    fn unserved_pin(
+        self,
+        observations: &[SlotObservation],
+    ) -> Option<(uuid::Uuid, crate::auth::NoCredential)> {
         let crate::session::tenant_pin::TenantPin::Pinned(pinned) = self.machine_pin else {
             return None;
         };
-        let binding_is_elsewhere = match self.default_binding {
-            crate::auth::BindingTenantRead::Bound(b) => b != pinned,
-            crate::auth::BindingTenantRead::Unbound => true,
-            crate::auth::BindingTenantRead::Unknown => false,
+        let Some(Err(cause)) = self.pin_served else {
+            return None;
         };
         let key = pinned.to_string();
-        let observed = observations
+        let measured = observations
             .iter()
-            .any(|o| o.tenant_id.as_deref() == Some(key.as_str()));
-        (binding_is_elsewhere && !observed).then_some(pinned)
+            .any(|o| !o.unknown && o.tenant_id.as_deref() == Some(key.as_str()));
+        (!measured).then_some((pinned, cause))
     }
 }
 
@@ -3386,9 +3514,41 @@ pub struct CoordCredentialStatus {
     /// session whose own credential works. `true` on every slot-derived
     /// publish, `false` only on the orphan arm.
     pub attributable: bool,
+    /// The operator-facing sentence, when the arm that published this posture
+    /// composed its own — today only the UNSERVED-PIN arm, whose sentence names
+    /// the pinned tenant and the selector's [`crate::auth::NoCredential`]
+    /// cause (see [`pinned_tenant_reason`]). `None` = the posture's generic
+    /// [`CoordCredentialPosture::message`]. Read it through [`Self::reason`].
+    pub composed_reason: Option<String>,
+    /// Is this the UNSERVED-PIN arm — a posture about the tenant `machine.json`
+    /// pins, which the credential selector refuses? Set ONLY by that arm's
+    /// candidate ([`PinArm`]). It is what lets the banner offer "Switch active
+    /// tenant": re-pinning can resolve a pinned tenant with no credential, and
+    /// cannot help a measured sibling slot that happens to name a tenant.
+    pub pinned_tenant: bool,
+}
+
+/// The unserved-pin arm's extra publish payload. Only
+/// [`derive_and_publish_posture`]'s unserved-pin candidate builds one, so
+/// [`CoordCredentialStatus::pinned_tenant`] cannot be set by any other arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinArm {
+    /// [`pinned_tenant_reason`] for this pin and cause.
+    pub reason: String,
 }
 
 impl CoordCredentialStatus {
+    /// The operator-facing sentence for this status: the publishing arm's
+    /// composed sentence when it wrote one, else the posture's generic
+    /// [`CoordCredentialPosture::message`]. This — never `posture.message()`
+    /// directly — is what `/health` `reason`, the heartbeat bag and the banner
+    /// carry, so the pinned arm's tenant and cause reach every reader.
+    pub fn reason(&self) -> String {
+        self.composed_reason
+            .clone()
+            .unwrap_or_else(|| self.posture.message().to_string())
+    }
+
     /// The `/health` `coordCredential` wire shape.
     ///
     /// The key is `posture` — the same name the heartbeat bag carries
@@ -3401,7 +3561,7 @@ impl CoordCredentialStatus {
             "state": self.posture.as_str(),
             "cause": self.posture.cause(),
             "canAnswer": self.posture.can_answer(),
-            "reason": self.posture.message(),
+            "reason": self.reason(),
             "cta": self.posture.cta(),
             "tenantId": self.tenant_id,
             "exp": self.exp,
@@ -3413,16 +3573,38 @@ impl CoordCredentialStatus {
             // `false` = "we could not say WHICH slot", not "no tenant". A
             // reader joining `tenantId` to a slot must check this first.
             "attributable": self.attributable,
+            // `true` only for the unserved-pin arm — the banner's gate for the
+            // tenant switch.
+            "pinnedTenant": self.pinned_tenant,
         })
     }
 }
 
 /// A posture CHANGE, as seen by the publisher. `from: None` is the boot
 /// publish — the first observation this process made.
+///
+/// `detail_changed` is the second kind of change the banner must hear about:
+/// the posture VALUE stayed the same non-answering one, but WHAT it is about
+/// moved — its tenant, its composed reason (the selector's cause), or whether
+/// it is the pinned-tenant arm. `absent(T)` → `absent(T2)` after the operator
+/// switches the pin, or `absent(T, slot unreadable)` → `absent(T, slot
+/// absent)`, would otherwise leave the banner naming the old tenant and cause.
+/// It is never set on an answering posture, so it can never read as a
+/// recovery; `from == Some(to)` whenever it is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PostureTransition {
     pub from: Option<CoordCredentialPosture>,
     pub to: CoordCredentialPosture,
+    pub detail_changed: bool,
+}
+
+/// Does a reported transition reach the banner? A same-posture DETAIL change
+/// always does — it is a dark re-announcement naming the new tenant or cause
+/// (see [`PostureTransition::detail_changed`]); a value change follows
+/// [`should_notify_posture`]'s dedup rule, which is the only path that can
+/// announce a recovery.
+pub(crate) fn transition_notifies(transition: PostureTransition) -> bool {
+    transition.detail_changed || should_notify_posture(transition.from, transition.to)
 }
 
 /// Should this transition fire the credential banner?
@@ -3508,10 +3690,15 @@ pub fn coord_credential_posture() -> Option<CoordCredentialStatus> {
 ///
 /// Poisoning is recovered rather than propagated: one failing test must not
 /// convert every sibling into a panic-on-lock and hide the real failure.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy (`hierarchy_lock` takes the
+/// env lock first and holds it beneath this one): `terminal`'s briefing tests
+/// hold this AND `isolated_ambient()` AND the plan-capture pin, so as a sibling
+/// it would be one inverted call site away from an AB/BA deadlock.
 #[cfg(test)]
-pub(crate) fn posture_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn posture_test_lock() -> crate::test_env::TestLockGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    crate::test_env::hierarchy_lock(&LOCK)
 }
 
 #[cfg(test)]
@@ -3551,6 +3738,7 @@ pub(crate) fn publish_coord_credential_posture(
         last_refresh_outcome,
         signal,
         true,
+        None,
     )
 }
 
@@ -3560,6 +3748,10 @@ pub(crate) fn publish_coord_credential_posture(
 /// the default slot's bucket ([`upstream_signal_for_observation`]) and a
 /// re-read of the tenant bucket alone would publish a null `last401At` beside
 /// a `dark` posture.
+///
+/// `pin_arm` is `Some` ONLY from the unserved-pin arm; it sets
+/// [`CoordCredentialStatus::composed_reason`] and
+/// [`CoordCredentialStatus::pinned_tenant`].
 fn publish_coord_credential_posture_with(
     posture: CoordCredentialPosture,
     tenant_id: Option<String>,
@@ -3567,6 +3759,7 @@ fn publish_coord_credential_posture_with(
     last_refresh_outcome: Option<String>,
     signal: UpstreamSignal,
     attributable: bool,
+    pin_arm: Option<PinArm>,
 ) -> Option<PostureTransition> {
     let now = chrono::Utc::now().timestamp();
     // L1: a poisoned mutex must not turn `/health` — the endpoint whose job is
@@ -3576,6 +3769,17 @@ fn publish_coord_credential_posture_with(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let previous = cell.as_ref().map(|s| s.posture);
+    let pinned_tenant = pin_arm.is_some();
+    let composed_reason = pin_arm.map(|a| a.reason);
+    // Same non-answering posture, different subject: tenant, cause sentence, or
+    // arm. See [`PostureTransition::detail_changed`].
+    let detail_changed = cell.as_ref().is_some_and(|prev| {
+        prev.posture == posture
+            && !posture.can_answer()
+            && (prev.tenant_id != tenant_id
+                || prev.composed_reason != composed_reason
+                || prev.pinned_tenant != pinned_tenant)
+    });
     let since = match previous {
         Some(p) if p == posture => cell.as_ref().map(|s| s.since).unwrap_or(now),
         _ => now,
@@ -3590,13 +3794,18 @@ fn publish_coord_credential_posture_with(
         since,
         observed_at_unix: now,
         attributable,
+        composed_reason,
+        pinned_tenant,
     });
-    let transition = (previous != Some(posture)).then_some(PostureTransition {
+    let transition = (previous != Some(posture) || detail_changed).then_some(PostureTransition {
         from: previous,
         to: posture,
+        detail_changed,
     });
+    // The test record keeps meaning "posture VALUE changes", which is what
+    // every reader of it asserts on.
     #[cfg(test)]
-    if let Some(t) = transition {
+    if let Some(t) = transition.filter(|t| !t.detail_changed) {
         POSTURE_TRANSITIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3612,9 +3821,12 @@ fn publish_coord_credential_posture_with(
 /// carried, because that is the slot an operator has to fix.
 ///
 /// Observations marked [`SlotObservation::unknown`] are DROPPED first. If that
-/// leaves nothing — every slot unreadable — nothing is published and the
-/// previous posture stands: an unreadable store is UNKNOWN, and publishing
-/// `absent` off it would manufacture a fault out of a missing measurement.
+/// leaves nothing — every slot unreadable — and no pin is unserved, nothing is
+/// published and the previous posture stands: an unreadable store is UNKNOWN,
+/// and publishing `absent` off it would manufacture a fault out of a missing
+/// measurement. An unserved pin is not that case: its verdict is the
+/// SELECTOR's, which already treated the unreadable read as a miss and refuses
+/// every T-pinned session, so it is published (below).
 ///
 /// # The UNATTRIBUTABLE arm (N1)
 ///
@@ -3644,12 +3856,16 @@ fn publish_coord_credential_posture_with(
 ///
 /// # The UNSERVED-PIN arm
 ///
-/// `machine.json` pins tenant T, the pass observes no slot for T, and the
-/// default binding is measured to be another tenant (see
+/// `machine.json` pins tenant T, the pass MEASURED no slot for T, and the
+/// credential selector the coord-mcp forwarder runs refused T this pass (see
 /// [`PosturePinInputs::unserved_pin`]). Every T-pinned session is then refused,
 /// whatever the other slots hold — so T enters the `worst` fold itself, under
 /// its own name, rather than only when a rejection streak happens to exist for
-/// the unclaimed-bucket rung to find. A slot cleared on a LOCAL expiry or a
+/// the unclaimed-bucket rung to find. The posture asks the selector rather than
+/// re-deriving it (plan `2026-09-14-credential-posture-third-residuals` D1): an
+/// unreadable binding, an unreadable T slot, a dead legacy fallback and a
+/// legacy token claiming another tenant are all refusals there, so all of them
+/// are unserved pins here. A slot cleared on a LOCAL expiry or a
 /// refresh-token 401 records no streak at all, and without this arm a healthy
 /// sibling slot published `live` and *"Coord access restored"* over it.
 ///
@@ -3659,6 +3875,11 @@ fn publish_coord_credential_posture_with(
 /// `unrefreshable`; a later pass that finds no slot at all is exactly absent).
 /// It is NOT a synthetic observation fed through the ladder: rung 4 answers
 /// `absent` before rung 5 reads the streak, which would downgrade a dark pin.
+///
+/// Its published REASON is composed ([`pinned_tenant_reason`]): it names T and
+/// carries the selector's cause, so an unreadable slot reads as *unreadable*
+/// rather than as a credential that is gone (D4), and an operator whose
+/// sign-in landed in another tenant can see why the banner did not clear.
 ///
 /// The fold's `fold_default` is still computed from the REAL observations
 /// only: an extra entry would change which credential the default-slot bucket
@@ -3675,13 +3896,17 @@ pub(crate) fn derive_and_publish_posture(
         exp: Option<i64>,
         outcome: Option<TenantSlotOutcome>,
         signal: UpstreamSignal,
+        /// The unserved pin only — see [`PinArm`].
+        pin_arm: Option<PinArm>,
     }
 
     // One usable slot means the default-slot bucket describes the same
     // credential — see [`upstream_signal_for_observation`].
     let fold_default = observations.iter().filter(|o| !o.unknown).count() == 1;
-    let unserved_pin_key = pins.unserved_pin(observations).map(|t| t.to_string());
-    let unserved_pin = unserved_pin_key.clone().map(|key| {
+    let unserved = pins.unserved_pin(observations);
+    let unserved_pin_key = unserved.map(|(t, _)| t.to_string());
+    let unserved_pin = unserved.map(|(pinned, cause)| {
+        let key = pinned.to_string();
         let signal = upstream_signal_for(Some(&key));
         let posture = if signal.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
             && upstream_rejection_is_fresh(&signal, now)
@@ -3696,6 +3921,9 @@ pub(crate) fn derive_and_publish_posture(
             exp: None,
             outcome: None,
             signal,
+            pin_arm: Some(PinArm {
+                reason: pinned_tenant_reason(&pinned, &cause),
+            }),
         }
     });
     // The unserved pin goes FIRST: `max_by_key` keeps the last of equal
@@ -3711,6 +3939,7 @@ pub(crate) fn derive_and_publish_posture(
                 exp: o.exp,
                 outcome: o.outcome,
                 signal,
+                pin_arm: None,
             }
         }))
         .max_by_key(|c| c.posture.severity());
@@ -3767,6 +3996,7 @@ pub(crate) fn derive_and_publish_posture(
                     // every unpinned session on a box where some OTHER,
                     // unreadable slot is the one coord is refusing.
                     false,
+                    None,
                 );
             }
             UnclaimedVerdict::StaleEvidence(orphan_key) => {
@@ -3802,6 +4032,28 @@ pub(crate) fn derive_and_publish_posture(
         // including when it is `None`, which is the LEGACY default slot and
         // is exactly the credential an unpinned session presents.
         true,
+        worst.pin_arm,
+    )
+}
+
+/// The published sentence for the UNSERVED-PIN arm: which tenant, why no
+/// credential serves it (the selector's own [`crate::auth::NoCredential`]),
+/// what that means for sessions, and the two things that can fix it.
+///
+/// The generic [`CoordCredentialPosture::message`] for `absent` reads *"this
+/// runner holds NO coord credential"* — false on a box pinned to T that holds a
+/// live slot for Y, and silent about the one fact that explains why signing in
+/// to Y does not clear it. Signing in does NOT re-pin (plan
+/// `2026-09-14-credential-posture-third-residuals` D5), so the sentence names
+/// the switch as the other remedy.
+pub(crate) fn pinned_tenant_reason(
+    pinned: &uuid::Uuid,
+    cause: &crate::auth::NoCredential,
+) -> String {
+    format!(
+        "this runner is pinned to tenant {pinned} and holds no usable coord credential for it \
+         ({cause}). Sessions pinned to it have no coord access. Sign in with an account in \
+         {pinned}, or switch this runner's active tenant."
     )
 }
 
@@ -4644,9 +4896,10 @@ async fn refresher_loop(
         // tenant slots (never paired post-8a) skip in one storage read.
         // Every input the eviction sweep needs — the slot store,
         // `paired_user.json` and `machine.json` — is read in ONE blocking-pool
-        // hop, then composed on this side. The pin and the default binding
-        // also feed the POSTURE (see [`PosturePinInputs`]): a pinned tenant
-        // with no slot must be published under its own name, never skipped.
+        // hop, then composed on this side. The pin, and the credential
+        // selector's verdict for it (read in the same hop), also feed the
+        // POSTURE (see [`PosturePinInputs`]): a pinned tenant the forwarder
+        // would refuse must be published under its own name, never skipped.
         //
         // The slot read is the UN-COLLAPSED one, because the sweep below is
         // destructive: an unreadable store must not read as "no tenant slots"
@@ -6578,7 +6831,7 @@ mod tenant_slot_refresh_tests {
     ///
     /// Poisoning is recovered rather than propagated: one failing test must not
     /// convert every sibling into a panic-on-lock and hide the real failure.
-    fn health_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn health_lock() -> crate::test_env::TestLockGuard {
         // THE crate-wide lock — the `mcp_api` forwarder-wiring tests take the
         // same one, so the two suites serialise against each other and not
         // merely within themselves.
@@ -7070,6 +7323,7 @@ mod tenant_slot_refresh_tests {
             PostureTransition {
                 from: None,
                 to: CoordCredentialPosture::Expired,
+                detail_changed: false,
             },
             "the FIRST thing a runner holding a dead restored credential says \
              must be `expired`, not silence: {transitions:?}"
@@ -7260,6 +7514,7 @@ mod tenant_slot_refresh_tests {
             vec![PostureTransition {
                 from: None,
                 to: CoordCredentialPosture::Expiring,
+                detail_changed: false,
             }],
             "a timeout may not produce a SECOND transition — the posture the \
              boot observation established still stands: {transitions:?}"
@@ -7473,6 +7728,8 @@ mod tenant_slot_refresh_tests {
             since: 7,
             observed_at_unix: 9,
             attributable: true,
+            composed_reason: None,
+            pinned_tenant: false,
         };
         let v = status.to_json();
         assert_eq!(v["state"], "dark");
@@ -8575,12 +8832,18 @@ mod tenant_slot_refresh_tests {
         // downgrading it to `absent` — and now names the tenant to re-pair.
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Unbound,
+            pin_served: slot_absent(),
         };
+        // Still dark, so never a recovery — but the banner's subject moved from
+        // "no tenant" to T, which is a DETAIL transition that re-announces it.
         assert_eq!(
             derive_and_publish_posture(&slots, pins, now),
-            None,
-            "still dark, so no transition — and never a recovery"
+            Some(PostureTransition {
+                from: Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+                to: CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+                detail_changed: true,
+            }),
+            "still dark — never a recovery — and now naming T"
         );
         let published = coord_credential_posture().expect("published");
         assert_eq!(
@@ -8634,7 +8897,7 @@ mod tenant_slot_refresh_tests {
         );
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
 
         let transition = derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now);
@@ -8655,12 +8918,69 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// Plan 2026-09-14 Phase 1: a pin the DEFAULT binding serves is not
-    /// unserved — the legacy `access_token` slot answers for it (the
-    /// legacy-only install), so no tenant observation naming it proves
-    /// nothing. The posture is exactly what the observations alone derive.
+    /// What the credential selector answers for a pinned tenant with no slot
+    /// that is NOT the default binding: a plain miss. The common shape of an
+    /// unserved pin, so most posture tests inject it directly.
+    fn slot_absent() -> Option<Result<(), crate::auth::NoCredential>> {
+        Some(Err(crate::auth::NoCredential::Slot(
+            crate::auth::SlotState::Absent,
+        )))
+    }
+
+    /// Assert the published posture is the UNSERVED-PIN arm for `pinned`:
+    /// non-answering, naming `pinned`, with a reason that names it and carries
+    /// the selector's cause — on `/health` (`to_json`) and the heartbeat bag
+    /// alike (plan 2026-09-14-credential-posture-third-residuals, Phase 3).
+    fn assert_pin_arm_published(pinned: uuid::Uuid, cause: crate::auth::NoCredential, label: &str) {
+        let published = coord_credential_posture().expect("published");
+        assert!(
+            !published.posture.can_answer(),
+            "{label}: the pin arm is non-answering, got {:?}",
+            published.posture
+        );
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(pinned.to_string().as_str()),
+            "{label}: the posture names the pinned tenant"
+        );
+        assert!(
+            published.pinned_tenant,
+            "{label}: marked as the pinned-tenant arm"
+        );
+        assert_eq!(
+            published.to_json()["pinnedTenant"].as_bool(),
+            Some(true),
+            "{label}: /health carries the pinned-tenant marker"
+        );
+        let expected = pinned_tenant_reason(&pinned, &cause);
+        assert_eq!(published.reason(), expected, "{label}: the composed reason");
+        assert!(
+            expected.contains(&pinned.to_string()) && expected.contains(&cause.to_string()),
+            "{label}: the reason names T and the selector's cause: {expected}"
+        );
+        assert_eq!(
+            published.to_json()["reason"].as_str(),
+            Some(expected.as_str()),
+            "{label}: /health carries the composed reason"
+        );
+        let bag = coord_credential_bag(&CoordCredentialHealth::ok(), Some(&published));
+        assert_eq!(
+            bag.reason.as_deref(),
+            Some(expected.as_str()),
+            "{label}: the heartbeat bag carries it too"
+        );
+        assert!(bag.pinned_tenant, "{label}: and the marker");
+    }
+
+    /// Plan 2026-09-14-credential-posture-third-residuals, Phase 1 exit (d) —
+    /// the rewrite of `a_pin_served_by_the_default_binding_synthesizes_nothing`.
+    /// A pin the SELECTOR serves (`pin_served: Some(Ok)`) is not unserved,
+    /// whatever serves it — T's own slot, or the legacy slot for a default T
+    /// whose token claims T. The posture is exactly what the observations alone
+    /// derive. The real-selector shape of the legacy case is the counterfactual
+    /// half of `a_pin_the_default_binding_cannot_actually_serve_is_non_answering`.
     #[test]
-    fn a_pin_served_by_the_default_binding_synthesizes_nothing() {
+    fn a_pin_the_selector_serves_synthesizes_nothing() {
         use crate::session::tenant_pin::TenantPin;
         let _serialised = health_lock();
         reset_posture();
@@ -8673,30 +8993,33 @@ mod tenant_slot_refresh_tests {
 
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(pinned),
+            pin_served: Some(Ok(())),
         };
         assert_eq!(
             derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
             Some(today)
         );
+        let published = coord_credential_posture().expect("published");
         assert_eq!(
-            coord_credential_posture()
-                .expect("published")
-                .tenant_id
-                .as_deref(),
+            published.tenant_id.as_deref(),
             Some(other_slot.to_string().as_str())
         );
+        assert_eq!(published.composed_reason, None, "no pin sentence either");
         reset_posture();
     }
 
-    /// Plan 2026-09-14 Phase 1: every UNMEASURED pin input abstains — an
-    /// unresolvable `machine.json`, no pin at all, an unreadable default
-    /// binding, and a pinned tenant whose slot this pass could not read (it
-    /// may hold a working credential). None of them is evidence the pin is
-    /// unserved, so each publishes exactly what the observations derive.
+    /// Phase 1 exit (e) — the rewrite of
+    /// `an_unresolvable_pin_or_an_unmeasured_input_synthesizes_nothing`, case by
+    /// case. What SURVIVES: a pin that names no tenant (`Unresolvable`,
+    /// `Unpinned`) synthesizes nothing, and a MEASURED observation of the pinned
+    /// slot speaks for it through the per-slot ladder even when the selector
+    /// refused it. What MOVED: the unreadable-binding case is now exit (a)
+    /// (`an_unreadable_default_binding_does_not_resolve_the_pin_to_live`) and
+    /// the unreadable-pinned-slot case is exit (b)
+    /// (`an_unreadable_pinned_slot_beside_a_live_sibling_is_non_answering`) —
+    /// both now publish the pin, because the forwarder refuses T in both.
     #[test]
-    fn an_unresolvable_pin_or_an_unmeasured_input_synthesizes_nothing() {
-        use crate::auth::BindingTenantRead;
+    fn a_pin_that_names_no_tenant_or_is_measured_synthesizes_nothing() {
         use crate::session::tenant_pin::TenantPin;
         let _serialised = health_lock();
         let now = chrono::Utc::now().timestamp();
@@ -8704,41 +9027,20 @@ mod tenant_slot_refresh_tests {
         let other_slot = tenant(4);
         let live = live_slot(other_slot, now);
         let today = derive_coord_credential_posture(&live, UpstreamSignal::default(), now);
-        let unreadable_pin_slot = SlotObservation::unreadable(Some(pinned.to_string()));
 
-        for (label, machine_pin, default_binding, slots) in [
-            (
-                "unresolvable pin",
-                TenantPin::Unresolvable,
-                BindingTenantRead::Unbound,
-                vec![live.clone()],
-            ),
-            (
-                "no pin",
-                TenantPin::Unpinned,
-                BindingTenantRead::Unbound,
-                vec![live.clone()],
-            ),
-            (
-                "unreadable binding",
-                TenantPin::Pinned(pinned),
-                BindingTenantRead::Unknown,
-                vec![live.clone()],
-            ),
-            (
-                "the pinned slot is unreadable",
-                TenantPin::Pinned(pinned),
-                BindingTenantRead::Unbound,
-                vec![live.clone(), unreadable_pin_slot.clone()],
-            ),
+        for (label, machine_pin) in [
+            ("unresolvable pin", TenantPin::Unresolvable),
+            ("no pin", TenantPin::Unpinned),
         ] {
             reset_posture();
             let pins = PosturePinInputs {
                 machine_pin,
-                default_binding,
+                // What `pin_served_by_selector` answers for both: no tenant,
+                // so no question asked.
+                pin_served: None,
             };
             assert_eq!(
-                derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
+                derive_and_publish_posture(std::slice::from_ref(&live), pins, now).map(|t| t.to),
                 Some(today),
                 "{label}: no synthesis"
             );
@@ -8751,6 +9053,196 @@ mod tenant_slot_refresh_tests {
                 "{label}: the published tenant is the observed one"
             );
         }
+
+        // A MEASURED T observation wins over the selector's refusal: the ladder
+        // says more (here `expired`) than the pin arm's `absent` would.
+        reset_posture();
+        let expired_pin_slot = SlotObservation {
+            tenant_id: Some(pinned.to_string()),
+            exp: Some(now - 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::KeptExisting),
+        };
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: Some(Err(crate::auth::NoCredential::Slot(
+                crate::auth::SlotState::PresentButDead,
+            ))),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live.clone(), expired_pin_slot], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Expired),
+            "the measured pinned slot speaks through the ladder"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        assert_eq!(
+            published.composed_reason, None,
+            "a measured slot's posture keeps the generic sentence"
+        );
+        assert!(
+            !published.pinned_tenant,
+            "a measured slot is not the pinned-tenant arm, even when it IS T's"
+        );
+        reset_posture();
+    }
+
+    /// Phase 1 exit (b) — review finding 1b. T's slot reads `unknown` (the
+    /// store read failed for it), Y is live, the default binding is elsewhere.
+    /// The selector treats the unreadable read as a MISS — fail-closed, and
+    /// correct — so every T-pinned session is refused. The unreadable T
+    /// observation used to count as "naming T", so the pass published Y's
+    /// `live`.
+    #[test]
+    fn an_unreadable_pinned_slot_beside_a_live_sibling_is_non_answering() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Unreadable);
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: Some(Err(cause)),
+        };
+        let slots = [
+            live_slot(other_slot, now),
+            SlotObservation::unreadable(Some(pinned.to_string())),
+        ];
+        assert_eq!(
+            derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "never Y's `live` while the forwarder refuses T"
+        );
+        assert_pin_arm_published(pinned, cause, "unreadable pinned slot");
+        assert!(
+            coord_credential_posture()
+                .expect("published")
+                .reason()
+                .contains("slot unreadable"),
+            "D4: the banner says UNREADABLE, not that the credential is gone"
+        );
+        reset_posture();
+    }
+
+    /// Phase 1 exit (a) — review finding 1a, through the PRODUCTION reads.
+    /// `paired_user.json` is malformed (`BindingTenantRead::Unknown`),
+    /// `machine.json` pins T, T has no slot, Y's slot is live. The forwarder
+    /// collapses the unreadable binding to `None`, so the selector serves
+    /// NOBODY from the legacy slot and refuses T. The old abstention ("an
+    /// unreadable binding might be the pin itself") published Y's `live`.
+    #[test]
+    fn an_unreadable_default_binding_does_not_resolve_the_pin_to_live() {
+        use crate::session::tenant_pin::TenantPin;
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let now = chrono::Utc::now().timestamp();
+        // The ambient fixture is released before the posture lock is taken, so
+        // this test never holds the env lock and the posture lock together.
+        let inputs = {
+            let amb = crate::test_env::isolated_ambient();
+            std::fs::write(amb.dir().join("paired_user.json"), b"{ not json")
+                .expect("write a malformed paired_user.json");
+            amb.write_active_tenant_id(pinned);
+            let am = crate::auth::AuthManager::new();
+            am.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+                .expect("store Y's live slot");
+            read_sweep_inputs(&am)
+        };
+        assert_eq!(
+            inputs.default_binding,
+            crate::auth::BindingTenantRead::Unknown,
+            "precondition: the binding is unreadable"
+        );
+        assert_eq!(inputs.machine_pin, TenantPin::Pinned(pinned));
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Absent);
+        assert_eq!(
+            inputs.pin_served,
+            Some(Err(cause)),
+            "the selector, given the forwarder's collapse of an unreadable binding, refuses T"
+        );
+
+        let _serialised = health_lock();
+        reset_posture();
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(other_slot, now)],
+                inputs.posture_pin_inputs(),
+                now
+            )
+            .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent)
+        );
+        assert_pin_arm_published(pinned, cause, "unreadable binding");
+        reset_posture();
+    }
+
+    /// The legacy arm's observation: the `access_token` slot, holding a
+    /// credential with a future `exp` — what `SlotObservation::observed(None,
+    /// Some(jwt))` yields for a live token.
+    fn live_legacy_observation(now: i64) -> SlotObservation {
+        SlotObservation {
+            tenant_id: None,
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: None,
+        }
+    }
+
+    /// Phase 1 exit (c) — the rewrite of
+    /// `an_unreadable_slot_store_synthesizes_no_pin_posture_on_the_legacy_arm`
+    /// (D3). An UNREADABLE slot store collapses to the legacy arm, whose one
+    /// observation (`tenant_id: None`) can never name the pin. That used to make
+    /// the pin inputs abstain (`UNPINNED`) and publish the legacy slot's `live`
+    /// — while the selector, reading T's slot from the SAME unreadable store,
+    /// refused every T-pinned session. The pin now carries the selector's
+    /// verdict through, and the posture follows it.
+    #[test]
+    fn an_unreadable_slot_store_publishes_the_pin_the_forwarder_refuses_on_the_legacy_arm() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let bound = tenant(4);
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Unreadable);
+        let inputs = SweepInputs {
+            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
+            default_binding: crate::auth::BindingTenantRead::Bound(bound),
+            machine_pin: TenantPin::Pinned(pinned),
+            coord_bound_tenants: unread_sidecar(),
+            coord_bound_tenants_for_ask: unread_sidecar(),
+            legacy_slot_present: false,
+            // What the selector answers when T's slot read hits that store.
+            pin_served: Some(Err(cause)),
+        };
+        let pins = inputs.posture_pin_inputs();
+        assert_eq!(
+            pins,
+            PosturePinInputs {
+                machine_pin: TenantPin::Pinned(pinned),
+                pin_served: Some(Err(cause)),
+            },
+            "an unreadable store no longer erases the pin"
+        );
+
+        let legacy = live_legacy_observation(now);
+        assert!(
+            derive_coord_credential_posture(&legacy, UpstreamSignal::default(), now).can_answer(),
+            "precondition: the legacy slot alone answers"
+        );
+        assert_eq!(
+            derive_and_publish_posture(&[legacy], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "never the legacy slot's `live` while T-pinned sessions are refused"
+        );
+        assert_pin_arm_published(pinned, cause, "unreadable store");
         reset_posture();
     }
 
@@ -8771,7 +9263,7 @@ mod tenant_slot_refresh_tests {
         }
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Unbound,
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
@@ -8788,64 +9280,493 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// The legacy arm's observation: the `access_token` slot, holding a
-    /// credential with a future `exp` — what `SlotObservation::observed(None,
-    /// Some(jwt))` yields for a live token.
-    fn live_legacy_observation(now: i64) -> SlotObservation {
-        SlotObservation {
-            tenant_id: None,
-            exp: Some(now + 3 * 60 * 60),
-            present: true,
-            unknown: false,
-            outcome: None,
+    /// A device JWT carrying the `tenant_id` claim coord stamps into every
+    /// token it issues — what the selector's legacy-fallback claim check reads.
+    fn jwt_with_tenant_claim(t: uuid::Uuid, exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"tenant_id\":\"{t}\"}}").as_bytes());
+        format!("{header}.{payload}.{}", b64url(b"fake-sig"))
+    }
+
+    /// Put `jwt` in the LEGACY `access_token` slot ONLY: the write mirrors into
+    /// `device_jwt:<claim>`, and `clear_claim_slot` removes that mirror so the
+    /// legacy fallback is what a lookup of the claimed tenant actually reaches.
+    fn store_legacy(
+        mgr: &crate::auth::AuthManager,
+        jwt: &str,
+        clear_claim_slot: Option<uuid::Uuid>,
+    ) {
+        mgr.store_tokens(jwt, "").expect("store the legacy slot");
+        if let Some(t) = clear_claim_slot {
+            mgr.clear_tenant_device_jwt(&t)
+                .expect("clear the mirrored slot");
         }
     }
 
-    /// Review round 1, B-1. An UNREADABLE slot store collapses to the legacy
-    /// arm, whose one observation (`tenant_id: None`) can never name the pin.
-    /// Feeding the real pin through published `absent(T)` on a multi-tenant box
-    /// pinned to T and bound to B — off one failed read — and the next good
-    /// read fired "Coord access restored". The pins built from those inputs
-    /// abstain, so the posture is what the observation alone derives.
+    /// Plan 2026-09-14-credential-posture-third-residuals, Phase 2 — review
+    /// finding 2, through the REAL selector. Pin T == the default binding, T's
+    /// tenant slot is gone (cleared, re-derive failed), sibling Y is live. The
+    /// old input treated `Bound(T) == pinned` as served, on the theory that the
+    /// legacy `access_token` slot answers for the default tenant — and nothing
+    /// on the multi-tenant branch measured that slot.
+    ///
+    /// (a) The legacy slot holds the SAME expired token → the selector refuses
+    ///     (`DefaultBindingFallback`) → non-answering, naming T.
+    /// (b) The case the draft missed: the legacy slot holds a LIVE token whose
+    ///     claim names Y → `DefaultBindingClaimMismatch` → non-answering,
+    ///     naming T. A presence-and-`exp` probe would have called it served.
+    /// Counterfactual, same harness: a live legacy token claiming T IS served,
+    ///     so the posture is Y's `live` (Phase 1 exit (d)'s real-selector half).
     #[test]
-    fn an_unreadable_slot_store_synthesizes_no_pin_posture_on_the_legacy_arm() {
+    fn a_pin_the_default_binding_cannot_actually_serve_is_non_answering() {
+        use crate::auth::{MeasuredBindingCount, NoCredential, SlotState};
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let two_bindings = MeasuredBindingCount::Measured(2);
+
+        // (a) expired legacy token, T's own claim.
+        let mgr = test_auth_manager("p2a_expired_legacy_for_default_pin");
+        mgr.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+            .expect("store Y");
+        store_legacy(&mgr, &jwt_with_tenant_claim(pinned, now - 60), Some(pinned));
+        let served =
+            pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), Some(pinned), two_bindings);
+        let cause = NoCredential::DefaultBindingFallback {
+            own: SlotState::Absent,
+            legacy: SlotState::PresentButDead,
+        };
+        assert_eq!(served, Some(Err(cause)), "(a) the selector refuses T");
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "(a) never Y's `live`"
+        );
+        assert_pin_arm_published(pinned, cause, "(a) expired legacy");
+
+        // (b) live legacy token claiming Y.
+        let mgr = test_auth_manager("p2b_claim_mismatch_for_default_pin");
+        mgr.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+            .expect("store Y");
+        store_legacy(
+            &mgr,
+            &jwt_with_tenant_claim(other_slot, now + 3 * 60 * 60),
+            None,
+        );
+        let served =
+            pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), Some(pinned), two_bindings);
+        let cause = NoCredential::DefaultBindingClaimMismatch {
+            own: SlotState::Absent,
+            claimed: Some(other_slot),
+        };
+        assert_eq!(
+            served,
+            Some(Err(cause)),
+            "(b) a Y-claiming token is not T's"
+        );
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "(b) never Y's `live`"
+        );
+        assert_pin_arm_published(pinned, cause, "(b) claim mismatch");
+
+        // Counterfactual: a live legacy token claiming T serves the pin.
+        let mgr = test_auth_manager("p2_counterfactual_live_legacy_for_default_pin");
+        mgr.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+            .expect("store Y");
+        store_legacy(
+            &mgr,
+            &jwt_with_tenant_claim(pinned, now + 3 * 60 * 60),
+            Some(pinned),
+        );
+        let served =
+            pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), Some(pinned), two_bindings);
+        assert_eq!(
+            served,
+            Some(Ok(())),
+            "counterfactual: the legacy slot serves T"
+        );
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live),
+            "counterfactual: a served pin synthesizes nothing"
+        );
+        reset_posture();
+    }
+
+    /// THE control for D1 (`a-control-must-test-the-property-it-names`): for
+    /// every [`crate::auth::NoCredential`] the selector can return for a pinned
+    /// tenant, produced by the REAL selector against a real store rather than
+    /// hand-built, the pin arm is non-answering, names T and carries that
+    /// cause — and the one `Ok` shape is answering. A future selector branch
+    /// that refuses T is covered by construction, because the posture reads the
+    /// verdict rather than re-deriving it; this test pins that it keeps doing
+    /// so. `UnresolvedOnMultiBound` is not in the table: it is built only by the
+    /// scope-lazy selector, which never runs for a NAMED tenant.
+    #[test]
+    fn every_selector_refusal_of_the_pin_is_a_non_answering_pin_posture() {
+        use crate::auth::{MeasuredBindingCount, NoCredential, SlotState};
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let live_y = synth_jwt(now + 3 * 60 * 60, "y");
+        let count = MeasuredBindingCount::Measured(2);
+
+        type Setup = fn(&crate::auth::AuthManager, uuid::Uuid, uuid::Uuid, i64);
+        let cases: [(&str, Setup, Option<uuid::Uuid>, NoCredential); 6] = [
+            (
+                "no T slot, T not the default",
+                |_, _, _, _| {},
+                None,
+                NoCredential::Slot(SlotState::Absent),
+            ),
+            (
+                "dead T slot, T not the default",
+                |m, t, _, now| {
+                    m.store_tenant_device_jwt(&t, &jwt_with_tenant_claim(t, now - 60))
+                        .unwrap();
+                },
+                None,
+                NoCredential::Slot(SlotState::PresentButDead),
+            ),
+            (
+                "no T slot, T the default, no legacy slot",
+                |_, _, _, _| {},
+                Some(tenant(3)),
+                NoCredential::DefaultBindingFallback {
+                    own: SlotState::Absent,
+                    legacy: SlotState::Absent,
+                },
+            ),
+            (
+                "dead T slot, T the default, dead legacy slot",
+                |m, t, _, now| {
+                    store_legacy(m, &jwt_with_tenant_claim(t, now - 60), None);
+                },
+                Some(tenant(3)),
+                NoCredential::DefaultBindingFallback {
+                    own: SlotState::PresentButDead,
+                    legacy: SlotState::PresentButDead,
+                },
+            ),
+            (
+                "no T slot, T the default, legacy claims Y",
+                |m, _, y, now| {
+                    store_legacy(m, &jwt_with_tenant_claim(y, now + 3 * 60 * 60), None);
+                },
+                Some(tenant(3)),
+                NoCredential::DefaultBindingClaimMismatch {
+                    own: SlotState::Absent,
+                    claimed: Some(tenant(4)),
+                },
+            ),
+            (
+                "no T slot, T the default, claimless legacy on a two-binding device",
+                |m, _, _, now| {
+                    store_legacy(m, &synth_jwt(now + 3 * 60 * 60, "claimless"), None);
+                },
+                Some(tenant(3)),
+                NoCredential::DefaultBindingClaimMismatch {
+                    own: SlotState::Absent,
+                    claimed: None,
+                },
+            ),
+        ];
+        for (i, (label, setup, default_tenant, expected)) in cases.into_iter().enumerate() {
+            let mgr = test_auth_manager(&format!("selector_parity_{i}"));
+            mgr.store_tenant_device_jwt(&other_slot, &live_y).unwrap();
+            setup(&mgr, pinned, other_slot, now);
+            let served =
+                pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), default_tenant, count);
+            assert_eq!(
+                served,
+                Some(Err(expected)),
+                "{label}: the selector's own verdict"
+            );
+            reset_posture();
+            let pins = PosturePinInputs {
+                machine_pin: TenantPin::Pinned(pinned),
+                pin_served: served,
+            };
+            let _ = derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now);
+            assert_pin_arm_published(pinned, expected, label);
+        }
+
+        // The `Ok` shape: T's own live slot. The posture is answering (and a
+        // MEASURED T observation would speak for it anyway).
+        let mgr = test_auth_manager("selector_parity_ok");
+        mgr.store_tenant_device_jwt(&pinned, &jwt_with_tenant_claim(pinned, now + 3 * 60 * 60))
+            .unwrap();
+        let served = pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), None, count);
+        assert_eq!(served, Some(Ok(())));
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live)
+        );
+        // And nothing is asked when nothing is pinned.
+        for pin in [TenantPin::Unpinned, TenantPin::Unresolvable] {
+            assert_eq!(pin_served_by_selector(&mgr, pin, None, count), None);
+        }
+        reset_posture();
+    }
+
+    /// Phase 3, D5 — sign-in does NOT re-pin, and the pinned arm survives it.
+    /// `machine.json` pins T; a sign-in lands in tenant B (coord chooses), so
+    /// `paired_user.json` names B as the default and B's slot appears. The
+    /// pairing half (`persist_pairing` never writes `machine.json`) is pinned
+    /// in `pair.rs` by `a_pairing_for_another_tenant_never_rewrites_the_machine_pin`;
+    /// this is the posture half: the NEXT pass, through the production reads,
+    /// still publishes the pinned arm naming T rather than B's `live`.
+    #[test]
+    fn a_sign_in_to_another_tenant_leaves_the_pinned_arm_naming_the_pin() {
+        use crate::session::tenant_pin::TenantPin;
+        let pinned = tenant(3);
+        let signed_in = tenant(4);
+        let now = chrono::Utc::now().timestamp();
+        let inputs = {
+            let amb = crate::test_env::isolated_ambient();
+            amb.write_active_tenant_id(pinned);
+            // The v2 shape `persist_pairing` writes for a first pairing into B.
+            std::fs::write(
+                amb.dir().join("paired_user.json"),
+                format!(
+                    r#"{{"user_id":"u","tenant_id":"{signed_in}","default_tenant_id":"{signed_in}","bindings":[{{"tenant_id":"{signed_in}","user_id":"u"}}]}}"#
+                ),
+            )
+            .expect("write paired_user.json");
+            let am = crate::auth::AuthManager::new();
+            am.store_tenant_device_jwt(
+                &signed_in,
+                &jwt_with_tenant_claim(signed_in, now + 3 * 60 * 60),
+            )
+            .expect("B's fresh slot");
+            read_sweep_inputs(&am)
+        };
+        assert_eq!(
+            inputs.machine_pin,
+            TenantPin::Pinned(pinned),
+            "still pinned to T"
+        );
+        assert_eq!(
+            inputs.default_binding,
+            crate::auth::BindingTenantRead::Bound(signed_in)
+        );
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Absent);
+        assert_eq!(inputs.pin_served, Some(Err(cause)));
+
+        let _serialised = health_lock();
+        reset_posture();
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(signed_in, now)],
+                inputs.posture_pin_inputs(),
+                now
+            )
+            .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "B's fresh slot does not clear the pinned arm"
+        );
+        assert_pin_arm_published(pinned, cause, "after a sign-in to B");
+        reset_posture();
+    }
+
+    /// Phase 3: the banner payload carries the posture's tenant so the banner
+    /// can name it and gate the tenant switch on it; `null` means "names no
+    /// tenant", which keeps today's copy and no switch action.
+    #[test]
+    fn the_credential_dark_payload_carries_the_tenant() {
+        let t = tenant(3).to_string();
+        let with = credential_dark_payload(
+            DARK_SOURCE_POSTURE,
+            true,
+            "absent",
+            "m",
+            Some("re_pair"),
+            Some(1),
+            Some(&t),
+            true,
+        );
+        assert_eq!(with["tenant_id"].as_str(), Some(t.as_str()));
+        assert_eq!(with["pinned_tenant"].as_bool(), Some(true));
+        let without = credential_dark_payload(
+            DARK_SOURCE_COGNITO,
+            true,
+            "cognito_hard",
+            "m",
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(without["tenant_id"].is_null());
+        assert_eq!(without["pinned_tenant"].as_bool(), Some(false));
+        assert!(
+            without
+                .as_object()
+                .expect("object")
+                .contains_key("tenant_id"),
+            "the key is always present"
+        );
+    }
+
+    /// Review of the third-residuals PR, item 1. A transition used to be
+    /// reported only when the posture VALUE changed, so `absent(T)` →
+    /// `absent(T2)` (the operator used "Switch active tenant" and T2 is
+    /// unserved too) or `absent(T, slot unreadable)` → `absent(T, slot absent)`
+    /// fired nothing, and the banner kept the old tenant and cause. Each is now
+    /// a DETAIL transition that notifies; an identical republish is none; and
+    /// an ANSWERING posture whose tenant moves is none too — a detail change can
+    /// never be dressed up as a recovery.
+    #[test]
+    fn a_same_posture_change_of_tenant_or_cause_notifies_and_an_identical_republish_does_not() {
+        use crate::auth::{NoCredential, SlotState};
         use crate::session::tenant_pin::TenantPin;
         let _serialised = health_lock();
         reset_posture();
         let now = chrono::Utc::now().timestamp();
-        let pinned = tenant(3);
-        let bound = tenant(4);
-        let inputs = SweepInputs {
-            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
-            default_binding: crate::auth::BindingTenantRead::Bound(bound),
-            machine_pin: TenantPin::Pinned(pinned),
-            coord_bound_tenants: unread_sidecar(),
-            coord_bound_tenants_for_ask: unread_sidecar(),
-            legacy_slot_present: false,
+        let (t, t2, y) = (tenant(3), tenant(5), tenant(4));
+        let pins = |p: uuid::Uuid, c: SlotState| PosturePinInputs {
+            machine_pin: TenantPin::Pinned(p),
+            pin_served: Some(Err(NoCredential::Slot(c))),
         };
-        let pins = inputs.posture_pin_inputs();
+        let slots = [live_slot(y, now)];
+
+        let first = derive_and_publish_posture(&slots, pins(t, SlotState::Absent), now)
+            .expect("the first publish is a transition");
+        assert!(!first.detail_changed);
         assert_eq!(
-            pins,
-            PosturePinInputs::UNPINNED,
-            "an unreadable input abstains"
+            derive_and_publish_posture(&slots, pins(t, SlotState::Absent), now),
+            None,
+            "an identical republish reports nothing"
         );
 
-        let legacy = live_legacy_observation(now);
-        let without_a_pin =
-            derive_coord_credential_posture(&legacy, UpstreamSignal::default(), now);
+        let switched = derive_and_publish_posture(&slots, pins(t2, SlotState::Absent), now);
+        assert_eq!(
+            switched,
+            Some(PostureTransition {
+                from: Some(CoordCredentialPosture::Absent),
+                to: CoordCredentialPosture::Absent,
+                detail_changed: true,
+            }),
+            "same posture, new tenant"
+        );
+        assert!(transition_notifies(switched.unwrap()));
+        assert_pin_arm_published(
+            t2,
+            NoCredential::Slot(SlotState::Absent),
+            "after the switch",
+        );
+
+        let recaused = derive_and_publish_posture(&slots, pins(t2, SlotState::Unreadable), now);
         assert!(
-            without_a_pin.can_answer(),
-            "precondition: the legacy slot answers"
+            recaused.is_some_and(|x| x.detail_changed && transition_notifies(x)),
+            "same posture and tenant, new cause: {recaused:?}"
+        );
+        assert_pin_arm_published(
+            t2,
+            NoCredential::Slot(SlotState::Unreadable),
+            "after the cause moved",
         );
         assert_eq!(
-            derive_and_publish_posture(&[legacy], pins, now).map(|t| t.to),
-            Some(without_a_pin),
-            "no `absent(T)` off a store this pass could not read"
-        );
-        assert_eq!(
-            coord_credential_posture().expect("published").tenant_id,
+            derive_and_publish_posture(&slots, pins(t2, SlotState::Unreadable), now),
             None,
-            "the published posture is the legacy observation's, not the pin's"
+            "identical again: nothing"
+        );
+        assert_eq!(
+            recorded_posture_transitions().len(),
+            1,
+            "the value-change record is unaffected by detail changes"
+        );
+
+        // Answering → answering with a different tenant is not a transition:
+        // there is no banner to update, and a report here could only read as
+        // a recovery.
+        reset_posture();
+        let _ = derive_and_publish_posture(&[live_slot(y, now)], PosturePinInputs::UNPINNED, now);
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(t, now)], PosturePinInputs::UNPINNED, now),
+            None
+        );
+        reset_posture();
+    }
+
+    /// Review item 2. A MEASURED sibling slot that coord keeps rejecting
+    /// publishes `dark` naming ITS tenant — but it is not the pinned-tenant
+    /// arm, and re-pinning cannot help it, so it carries no marker and the
+    /// banner offers no switch. The pinned arm's marker is asserted by
+    /// `assert_pin_arm_published` in every pin test.
+    #[test]
+    fn a_sibling_slot_dark_with_a_tenant_is_not_the_pinned_tenant_arm() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let (y, z) = (tenant(4), tenant(2));
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(y), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(y, now), live_slot(z, now)],
+                PosturePinInputs::UNPINNED,
+                now
+            )
+            .map(|x| x.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.tenant_id.as_deref(), Some(y.to_string().as_str()));
+        assert!(!published.pinned_tenant);
+        assert_eq!(published.to_json()["pinnedTenant"].as_bool(), Some(false));
+        let bag = coord_credential_bag(&CoordCredentialHealth::ok(), Some(&published));
+        assert!(!bag.pinned_tenant);
+        reset_posture();
+    }
+
+    /// Phase 3 counterfactual: a posture no arm composed a sentence for keeps
+    /// the generic `message()` on every wire.
+    #[test]
+    fn a_posture_without_a_composed_reason_keeps_the_generic_message() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let absent_legacy = SlotObservation::observed(None, None);
+        assert_eq!(
+            derive_and_publish_posture(&[absent_legacy], PosturePinInputs::UNPINNED, now)
+                .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent)
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.tenant_id, None);
+        assert_eq!(published.composed_reason, None);
+        assert_eq!(published.reason(), CoordCredentialPosture::Absent.message());
+        assert_eq!(
+            published.to_json()["reason"].as_str(),
+            Some(CoordCredentialPosture::Absent.message())
         );
         reset_posture();
     }
@@ -8869,6 +9790,9 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: unread_sidecar(),
             coord_bound_tenants_for_ask: unread_sidecar(),
             legacy_slot_present: false,
+            // What the selector answers for a slotless T that is not the
+            // default binding.
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -8907,7 +9831,7 @@ mod tenant_slot_refresh_tests {
         }
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
@@ -8946,7 +9870,7 @@ mod tenant_slot_refresh_tests {
         }
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
@@ -8979,7 +9903,7 @@ mod tenant_slot_refresh_tests {
         let other_slot = tenant(4);
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
         for (label, streak, stale, expected) in [
             (
@@ -9190,6 +10114,7 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: unread_sidecar(),
             coord_bound_tenants_for_ask: unread_sidecar(),
             legacy_slot_present: false,
+            pin_served: None,
         };
         assert!(matches!(
             writable_slot_keys_from(&unreadable),
@@ -9202,6 +10127,7 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: unread_sidecar(),
             coord_bound_tenants_for_ask: unread_sidecar(),
             legacy_slot_present: false,
+            pin_served: None,
         };
         assert_eq!(
             writable_slot_keys_from(&readable),
@@ -9530,6 +10456,8 @@ mod tenant_slot_refresh_tests {
                 since: 1_700_000_000,
                 observed_at_unix: 1_700_000_050,
                 attributable: true,
+                composed_reason: None,
+                pinned_tenant: false,
             };
             let bag = coord_credential_bag(&fallback, Some(&status));
             assert_eq!(
@@ -10010,6 +10938,7 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: CoordBoundTenantsRead::Known(vec![held, bound_only]),
             coord_bound_tenants_for_ask: CoordBoundTenantsRead::Known(vec![held, bound_only]),
             legacy_slot_present: false,
+            pin_served: Some(Ok(())),
         };
         assert_eq!(
             binding_gaps_from(&inputs),

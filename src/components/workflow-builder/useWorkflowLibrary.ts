@@ -4,6 +4,7 @@ import { registerUserSkills } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("WorkflowBuilder");
 
@@ -243,7 +244,7 @@ export function useWorkflowLibrary(
           setWorkflowImportError(result.error || "Failed to import workflow");
         }
       } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : "Failed to import workflow";
+        const errorMsg = describeThrown(error, "Failed to import workflow");
         setWorkflowImportError(errorMsg);
         console.error("Failed to import workflow:", error);
       } finally {

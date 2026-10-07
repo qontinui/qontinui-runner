@@ -1076,7 +1076,8 @@ Edit the plan .md to update its status block to:
 ```
 
 Rules:
-- If the existing block is `Status: VETTED <date>` (and Step 0.45 check 1 did not find it HELD), replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`).
+- If the existing block is `Status: VETTED <date>` (and Step 0.45 check 1 did not find it HELD), replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`). `VETTED (self) <date>` is the same state. `/vet-plan` writes it when it could not spawn its fresh-context reviewer. Keep the qualifier in the body (`Started from VETTED (self) 2026-05-02.`): dropping it turns a self-vet back into a stamp that cannot be told apart from an independent one.
+- **Carry the vet's independence record forward, verbatim: every line from `> Vetted-by:` through `> Independence:`, inclusive, as the last lines of the new block.** `/vet-plan` §5 writes it under the VETTED headline. `Vetted-by:` is a paragraph wrapped over several lines carrying `Plan:`, `Read:`, `Checks:` and `Served policy`, so copy the whole range, not the one line that starts `Vetted-by:`. It is what a later attestation re-send rebuilds its `independence` declaration from (`/vet-plan` §5.4, the REFUSED arm), and a replace that drops it destroys the only durable copy outside git history. Step 6 carries it again into the SHIPPED block (single-stamp invariant item 4). It carries no `Depends-On:` or `**Area:` (`/vet-plan` §5 forbids both), so the plan adapter parses nothing new out of it.
 - If the existing block is `Status: DRAFT` or absent, add the IN PROGRESS block but warn the user in your first text turn that the plan was not vetted — give them a chance to abort and run `/vet-plan` first.
 - If the existing block is `Status: PARTIAL` or `Status: NOT STARTED` (set by `/verify-plan-status`), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent NOT STARTED is also not a reason to re-vet.
 - If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: arm 1 — `shipped: true` ∧ `evidence_complete: true` ∧ the three phase-corroboration conjuncts `/vet-plan` §0.25 arm 1 states (`phases_remaining` the LITERAL `[]`, never `null`; that `[]` corroborated by a non-empty `phases_declared_indices` wholly inside `phases_delivered`; no `NO PHASE ATTRIBUTION` gap) — means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. **Do not stop on `shipped` ∧ `evidence_complete` alone**: that pair is reachable on a unit with phases outstanding (plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`), and a response short of the phase conjuncts falls to arm 6 — fall through to the stamp arms; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped` from the landed citations and the phase-coverage gate, `evidence_complete = evidence_gaps.is_empty()` computed before the phase gaps are appended — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug`, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
@@ -1436,7 +1437,13 @@ and the body. Before writing your stamp:
 4. If folding in history is useful (`Started from VETTED 2026-05-02`),
    put it in **one trailing line inside your new block**, prefixed
    `History:`, `Started from:`, or `Previously:`. Never as a sibling
-   blockquote.
+   blockquote. The one exception: when the block you are replacing carries
+   `/vet-plan`'s independence record (every line from `> Vetted-by:` through
+   `> Independence:`), carry that range verbatim after the trailing line.
+   This applies at Step 0.5 (VETTED → IN PROGRESS) and at Step 6
+   (IN PROGRESS → SHIPPED). It is the durable home a later attestation
+   re-send rebuilds from (`/vet-plan` §5.4), and it outlives the
+   implementation.
 
 This stamp is mandatory before Step 1. It makes concurrent agents see
 "another session is implementing this" via a quick `head -5 plan.md`
@@ -3284,6 +3291,51 @@ body carries NO arming lines and says `arming UNKNOWN: <detail>` (or `arming
 ABSENT`) in prose instead — an absent line reads as absent, which is honest; a
 hand-typed one reads as observed, which is not.
 
+**A fifth block, in the same body: the HANDOFF RECORD (`Coord-Handoff-*`).**
+*(Plan `2026-09-10-the-fixer-contract-authority-context-and-provenance-on-a-pr-you-did-not-author`
+Phase 1; the same shape as `Coord-Reviewed-Head:` by the same decision record.)*
+You are the only party who knows what in this diff must NOT be silently
+changed. A session that inherits this PR — a coord-dispatched fixer, a
+route-around adopter — sees the diff and nothing else, and coord#1815's rescue
+shows what that costs: it re-litigated a fork the author had settled and nearly
+removed the measurement the PR existed to make. So, **after the last push you
+intend to make and before `gh pr create`**, render the record and put it in the
+body:
+
+```bash
+# WORKTREE = the worktree whose HEAD the PR will carry; PR_BODY = the body file
+# you will hand to `gh pr create --body-file`.
+cat <<'ITEMS' | bash <workspace-root>/qontinui-claude-config/scripts/handoff-arm-record.sh --repo-dir "$WORKTREE" --append-to "$PR_BODY"
+# Replace every <...> line below with real items (or delete the section). A
+# `# ` line is a comment; `#328 before x#9` is an item -- PR numbers count.
+[load-bearing]
+<what must not be silently changed, and WHY — one line each>
+[rejected]
+<alternative considered, and the reason it lost — so nobody re-litigates it>
+[fragile]
+<a seam known to break under replay / rebase>
+[deploy-order]
+<repo#N before repo#M>
+ITEMS
+```
+
+It writes `Coord-Handoff-Head: <full 40-hex HEAD>` plus one
+`Coord-Handoff-Load-Bearing:` / `-Rejected:` / `-Fragile:` / `-Deploy-Order:`
+line per item. ~20 lines of *what must not change*, never a transcript; an
+empty section is written as nothing, and a record with no items is refused
+(an empty record is indistinguishable from an absent one, and absent reads as
+UNKNOWN). coord harvests the lines into `coord.pr_labels` on the webhook and
+serves them on `coord_pr_status` as `handoff.state: present|stale|absent`
+against the PR's CURRENT head — so **a later push makes the record `stale`**;
+re-run the command for the new head (it replaces every earlier record in the
+body, whatever head it named, because coord pools items across recorded heads
+and a retracted item would otherwise linger) and push the edited body with `gh pr edit <n> --body-file
+"$PR_BODY"` — coord harvests it on the `edited` webhook. It gates nothing and
+prompts nobody; it is read by whoever
+inherits the PR. Adopters read it through
+`scripts/handoff-arm-check.sh <owner/repo#N>` or the card
+(`/babysit-prs` Step 6 → "Adopting a foreign branch").
+
 **Re-review rule — every push that moves the head needs a new line.** The gate
 compares against the CURRENT head, so the moment you push again the recorded sha
 stops matching and the PR reads `not-reviewed` until the new head is reviewed.
@@ -3314,6 +3366,9 @@ then EDIT the PR body to add a second `Coord-Reviewed-Head:` line for it:
 gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"
 gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep 'Coord-Reviewed-Head'   # read it back
 ```
+
+`<file>` lives in a private `mktemp -d` dir, never a fixed name in the shared scratchpad
+(`knowledge-base/qontinui-specific/common-pitfalls.md` §17).
 
 Not `gh pr edit --body-file`: on this fleet's gh 2.46.0 it exits 1 on the retired
 `repository.pullRequest.projectCards` GraphQL prefetch **before** writing, and
@@ -3657,7 +3712,7 @@ surface (`coord_pr_status` / `/pr-status` skill), which distinguishes a
 genuinely satisfied required-check state from one that has simply never been
 established — a clean `gh pr checks` read is not proof of the latter.
 
-1. **Stamp a status block at the top of the plan .md** (just below the H1 title) summarizing what shipped — applying the single-stamp invariant from Step 0.5 (delete the existing IN PROGRESS block, write SHIPPED in its place):
+1. **Stamp a status block at the top of the plan .md** (just below the H1 title) summarizing what shipped — applying the single-stamp invariant from Step 0.5 (delete the existing IN PROGRESS block, write SHIPPED in its place, carrying its `Vetted-by:` … `Independence:` range forward per item 4):
    ```markdown
    > **Status: SHIPPED <YYYY-MM-DD>.** <one-paragraph summary of what's
    > live and where to find it — repo + key commit SHAs at minimum>.
@@ -4094,14 +4149,14 @@ supersedes unit_ready for the dependency-gated case".)
   `84c0229232cb`, `3e7e4b0475de`), and `non_author_allows_identities` is now a
   six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
   device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
-  only in tier 6 — same device, no proven session on either side. So
+  only in tier 6 — same device, no proven session on one or both sides. So
   `agent_non_author` IS usable when the clearer is a different device or carries
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
-  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-09-23 at
-  `037fc1a8f`: `work_unit_registry::authorize_target_transition` takes the two
+  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-10-03 at
+  `f32fb04ad`: `work_unit_registry::authorize_target_transition` takes the two
   actor keys **plus an optional `independence` declaration**
-  (`{verified, against, context}`), and does the flat `owner == attester`
+  (`{verified, against, context}`), and does the device-grain `owner == attester`
   compare **only when no declaration is sent** — a well-formed one authorizes an
   Attested transition without that compare, while still refusing
   `attester_unresolved` when the caller's token derives no actor key;
@@ -4119,7 +4174,7 @@ supersedes unit_ready for the dependency-gated case".)
   the tool your session advertises, and verify by read — a zero exit is not
   evidence the write landed. ⚠️ **Never re-allocate to get past
   `self_attestation_forbidden`**: a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`. The re-allocate prohibition is that refusal's
-  alone — `attester_unresolved` wants a device- or agent-identified caller,
+  alone — `attester_unresolved` wants a caller coord admits as an SoD actor,
   which is a credential remedy rather than a route around a control. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
   [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:

@@ -11,6 +11,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Shape returned by the `get_scripted_output_stats` Tauri command.
@@ -88,7 +89,10 @@ export function useScriptedOutputStats(taskRunId?: string): UseScriptedOutputSta
   return {
     stats: query.data ?? null,
     loading: query.isLoading,
-    error: query.error instanceof Error ? query.error.message : null,
+    error:
+      query.error == null
+        ? null
+        : describeThrown(query.error, "Failed to load scripted-output stats"),
     refresh: () => query.refetch(),
   };
 }

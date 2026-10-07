@@ -24,6 +24,7 @@ import {
   saveConstraintConfig,
   validateConstraintConfig,
 } from "@/lib/constraints-api";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types
@@ -148,7 +149,7 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
       // Snapshot the loaded state (use local var to avoid stale closure)
       setSavedState(serializeState(activeConstraints, loadedLimits));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to load constraints");
       console.error("[useConstraints] reload failed:", err);
       setError(msg);
     } finally {
@@ -250,7 +251,7 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
       setSavedState(serializeState(constraints, resourceLimits));
       return true;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to save constraints");
       console.error("[useConstraints] save failed:", err);
       setError(msg);
       return false;

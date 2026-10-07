@@ -3127,6 +3127,49 @@ mod tests {
         assert!(json.contains("\"tenant_id\""));
     }
 
+    /// Plan `2026-09-14-credential-posture-third-residuals` D5 — sign-in does
+    /// NOT re-pin. `machine.json` pins T; a sign-in lands in tenant B, the
+    /// tenant coord stamped on the minted JWT. The two local-disk steps of
+    /// `commands::auth::finalize_signed_in` — `ensure_device_initialized` and
+    /// the pairing persist (`persist_pairing` → this core) — leave
+    /// `machine.json` byte-for-byte as it was, so its `active_tenant_id` is
+    /// still T. Re-pointing FUTURE sessions for the whole machine is
+    /// `set_active_tenant`'s job, an explicit operator act; doing it as a side
+    /// effect of a sign-in whose tenant coord chooses would be a silent
+    /// machine-wide change. The posture half — the next pass still publishes
+    /// the pinned arm naming T — is
+    /// `a_sign_in_to_another_tenant_leaves_the_pinned_arm_naming_the_pin` in
+    /// the refresher.
+    #[test]
+    fn a_pairing_for_another_tenant_never_rewrites_the_machine_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        let pinned = tc();
+        let machine_json = amb.write_active_tenant_id(pinned);
+        let before = std::fs::read(&machine_json).expect("read machine.json");
+        let mgr = test_mgr(amb.dir());
+        let path = amb.dir().join("paired_user.json");
+
+        ensure_device_initialized();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).expect("persist B");
+
+        assert_eq!(
+            read_file(&path).default_tenant_id.as_deref(),
+            Some(T_B),
+            "precondition: the pairing landed, in B"
+        );
+        assert_eq!(
+            std::fs::read(&machine_json).expect("re-read machine.json"),
+            before,
+            "machine.json is untouched by a sign-in"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&before).expect("machine.json parses");
+        assert_eq!(
+            v["active_tenant_id"].as_str(),
+            Some(T_C),
+            "the pin is still T"
+        );
+    }
+
     /// First pair: binding appended, becomes default, JWT written to BOTH
     /// the tenant slot and the legacy access_token slot, mirrors set.
     #[test]
@@ -4853,13 +4896,7 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         canonical,
         others,
         bare_default.as_deref(),
-        &|t: &uuid::Uuid, is_default: bool| {
-            crate::auth::holds_credential_for(
-                crate::auth::read_tenant_slot(&mgr, t).state(),
-                is_default,
-                crate::auth::read_legacy_slot(&mgr).state(),
-            )
-        },
+        &holds_credential_predicate(&mgr),
         &today,
     );
     if report.wrote_canonical
@@ -4890,6 +4927,47 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         );
     }
     report
+}
+
+/// The production credential predicate — "does this process hold a credential
+/// for `tenant`?" — shared by [`converge_binding_store`] (which merges under it)
+/// and [`binding_store_check`] (which judges the merge under it), so the two can
+/// never disagree about "credentialed".
+///
+/// Answers [`crate::auth::holds_credential_for`] over the tenant's own
+/// per-tenant slot and the LEGACY `access_token` slot. The legacy slot is read
+/// at most ONCE per predicate, and only when a DEFAULT tenant is asked about
+/// (`holds_credential_for` never consults it for a non-default tenant): the
+/// doctor builds one of these on every `/coord-mcp/doctor` probe, and the
+/// legacy read can reach the OS keychain.
+///
+/// **What "credentialed" establishes, stated so it is not over-claimed.**
+/// Per-tenant slots are file storage scoped by `$QONTINUI_SECURE_STORAGE_DIR`,
+/// so they are this installation's own. The legacy slot is not entirely:
+/// [`crate::auth::read_legacy_slot`] goes through `probe_access_token`, whose
+/// chain can fall back to the OS keychain under the fixed service name
+/// `com.qontinui.runner` — shared by every instance on the box. So for the
+/// DEFAULT tenant this predicate can be answered by another installation's
+/// keychain token. That is what converge merges under, and the doctor uses the
+/// very same predicate so that it judges the merge by the merge's own rule.
+pub(crate) fn holds_credential_predicate(
+    mgr: &crate::auth::AuthManager,
+) -> impl Fn(&uuid::Uuid, bool) -> Option<bool> + '_ {
+    let legacy: std::cell::OnceCell<crate::auth::SlotState> = std::cell::OnceCell::new();
+    move |tenant: &uuid::Uuid, is_default: bool| {
+        crate::auth::holds_credential_for(
+            crate::auth::read_tenant_slot(mgr, tenant).state(),
+            is_default,
+            // `holds_credential_for` consults the legacy slot only for the
+            // default tenant, so a non-default probe never pays the (possibly
+            // keychain-backed) read; `Absent` is never inspected on that arm.
+            if is_default {
+                *legacy.get_or_init(|| crate::auth::read_legacy_slot(mgr).state())
+            } else {
+                crate::auth::SlotState::Absent
+            },
+        )
+    }
 }
 
 /// Path-parameterized core of [`converge_binding_store`] — explicit canonical
@@ -5332,187 +5410,11 @@ fn supersede_copy(from: &std::path::Path, today: &str) -> Result<PathBuf, String
 }
 
 // ----------------------------------------------------------------------------
-// The doctor check
+// The doctor check — read-only, in `pair/binding_store_doctor.rs`
 // ----------------------------------------------------------------------------
 
-/// One computed copy, described. Serialized into `/coord-mcp/doctor`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BindingStoreCopyView {
-    pub path: String,
-    /// Is this the file [`paired_user_path`] resolves to?
-    pub canonical: bool,
-    /// `present` | `absent` | `unreadable`.
-    pub read: &'static str,
-    /// The migrated binding set, sorted. `None` is UNKNOWN (unreadable) —
-    /// never an empty list, which would read as "bound to nothing".
-    pub tenants: Option<Vec<String>>,
-    pub default_tenant_id: Option<String>,
-    /// `Some(true)` when this copy is in the pre-v2 single-tenant shape.
-    pub legacy_shape: Option<bool>,
-    /// `tenant_id -> paired_at`, for the REPORT-only difference arm.
-    pub paired_at: Option<std::collections::BTreeMap<String, String>>,
-}
-
-/// The split-brain verdict over the computed copies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BindingStoreCheck {
-    /// `ok` | `report` | `fail` | `unknown`.
-    ///
-    /// - `fail` — two live copies disagree on the BINDING SET or on
-    ///   `default_tenant_id`. That is a real split brain: which file a
-    ///   process reads decides which tenants it believes exist.
-    /// - `report` — they agree on both, and differ only on `paired_at`.
-    ///   That is cosmetic, and it is the ONLY way the copies differ on the
-    ///   operator box today, so failing on it would fail a healthy machine
-    ///   from day one and get the check disabled. Deciding priority:
-    ///   robustness.
-    /// - `unknown` — a copy exists and could not be read. UNKNOWN is never
-    ///   "no disagreement" (same discipline as `tenant_slots_unknown` and
-    ///   `auth::BindingTenantRead::Unknown`).
-    /// - `ok` — fewer than two live copies, or they agree outright.
-    pub verdict: &'static str,
-    pub detail: String,
-    pub copies: Vec<BindingStoreCopyView>,
-}
-
-impl BindingStoreCheck {
-    /// Does this verdict FAIL the doctor?
-    pub fn failed(&self) -> bool {
-        self.verdict == "fail"
-    }
-    /// Is the comparison UNKNOWN? A caller must not read this as agreement.
-    pub fn is_unknown(&self) -> bool {
-        self.verdict == "unknown"
-    }
-}
-
-/// Inspect the `paired_user.json` copies this process would itself compute.
-/// Read-only — the doctor never writes.
-pub fn binding_store_check() -> BindingStoreCheck {
-    inspect_binding_store_paths(&binding_store_candidate_paths())
-}
-
-/// Path-parameterized core of [`binding_store_check`]. `paths[0]` is the
-/// canonical one.
-pub(crate) fn inspect_binding_store_paths(paths: &[PathBuf]) -> BindingStoreCheck {
-    let copies: Vec<BindingStoreCopyView> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| describe_binding_store_copy(p, i == 0))
-        .collect();
-
-    let live: Vec<&BindingStoreCopyView> = copies.iter().filter(|c| c.read != "absent").collect();
-    let unreadable = live.iter().filter(|c| c.read == "unreadable").count();
-    let readable: Vec<&&BindingStoreCopyView> =
-        live.iter().filter(|c| c.read == "present").collect();
-
-    // Order matters: a disagreement we CAN see is a fail even when another
-    // copy is unreadable, but an unreadable copy must never let "the rest
-    // agree" stand in for "no disagreement".
-    let sets_differ = readable
-        .windows(2)
-        .any(|w| w[0].tenants != w[1].tenants || w[0].default_tenant_id != w[1].default_tenant_id);
-    let paired_at_differs = readable
-        .windows(2)
-        .any(|w| w[0].paired_at != w[1].paired_at);
-
-    let (verdict, detail) = if sets_differ {
-        (
-            "fail",
-            format!(
-                "{} live paired_user.json copies disagree on the binding set or on \
-                 default_tenant_id — which file a process reads decides which tenants it \
-                 believes exist. Run the runner once to converge them (the non-canonical \
-                 copy is left as .superseded-<date>), or reconcile by hand.",
-                readable.len()
-            ),
-        )
-    } else if unreadable > 0 {
-        (
-            "unknown",
-            format!(
-                "{unreadable} of {} live paired_user.json copies could not be read — \
-                 agreement is UNKNOWN, not established. An unreadable copy is never \
-                 evidence of no disagreement.",
-                live.len()
-            ),
-        )
-    } else if paired_at_differs {
-        (
-            "report",
-            format!(
-                "{} live paired_user.json copies agree on the binding set and on \
-                 default_tenant_id, and differ only on paired_at — cosmetic, reported \
-                 rather than failed.",
-                readable.len()
-            ),
-        )
-    } else if readable.len() < 2 {
-        (
-            "ok",
-            format!(
-                "{} live paired_user.json copy/copies under a path this process computes — \
-                 nothing to disagree with.",
-                readable.len()
-            ),
-        )
-    } else {
-        (
-            "ok",
-            format!("{} live paired_user.json copies agree.", readable.len()),
-        )
-    };
-
-    BindingStoreCheck {
-        verdict,
-        detail,
-        copies,
-    }
-}
-
-fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> BindingStoreCopyView {
-    let mut view = BindingStoreCopyView {
-        path: path.display().to_string(),
-        canonical,
-        read: "absent",
-        tenants: None,
-        default_tenant_id: None,
-        legacy_shape: None,
-        paired_at: None,
-    };
-    if !path.exists() {
-        return view;
-    }
-    let Some(pf) = read_paired_user_file_at(path) else {
-        // Present and unreadable. `tenants: None` stays UNKNOWN.
-        view.read = "unreadable";
-        return view;
-    };
-    view.read = "present";
-    let bindings = pf.effective_bindings();
-    let mut tenants: Vec<String> = bindings
-        .iter()
-        .map(|b| b.tenant_id.trim().to_string())
-        .collect();
-    tenants.sort();
-    tenants.dedup();
-    view.tenants = Some(tenants);
-    view.default_tenant_id = pf
-        .effective_default_tenant_id()
-        .map(|d| d.trim().to_string());
-    view.legacy_shape = Some(!pf.is_v2());
-    view.paired_at = Some(
-        bindings
-            .iter()
-            .filter_map(|b| {
-                b.paired_at
-                    .as_ref()
-                    .map(|p| (b.tenant_id.trim().to_string(), p.clone()))
-            })
-            .collect(),
-    );
-    view
-}
+mod binding_store_doctor;
+pub use binding_store_doctor::{binding_store_check, BindingStoreCheck, BindingStoreCopyView};
 
 // ============================================================================
 // D4 gate — "One binding store"
@@ -5529,26 +5431,36 @@ fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> Bindi
 //   2. both bindings survive the merge;
 //   3. the legacy single-tenant copy is migrated in place to v2;
 //   4. `bindings` gains NO tenant this runner has no credential for;
-//   5. the doctor check FAILS on a binding-set / `default_tenant_id`
-//      disagreement;
-//   6. the doctor check only REPORTS a `paired_at`-only difference;
-//   7. an unreadable copy reads as UNKNOWN, never as "no disagreement".
+//   5. the doctor check FAILS only on a MERGE GAP — a tenant another copy
+//      carries, that this process holds a credential for, and that the
+//      canonical lacks — or on a credential with no canonical store at all;
+//   6. the doctor check only REPORTS the expected one-way-merge residue
+//      (withheld / credential-unknown tenants, canonical-only tenants, a
+//      differing `default_tenant_id`, `paired_at` / `user_id` differences);
+//      two copies DIFFERING is the permanent, intended state under an
+//      override, so it is never by itself a fail;
+//   7. an unreadable copy reads as UNKNOWN, never as "nothing missing".
+//
+// Items 5-7 are asserted in `pair/binding_store_doctor.rs`'s tests, which
+// share this module's fixtures (hence the `pub(super)` items below); plan
+// 2026-10-02-binding-store-doctor-fails-forever-on-the-store-an-override-runner-must-retain
+// retired the pairwise "two copies must agree" rules these items used to state.
 #[cfg(test)]
 mod one_binding_store_tests {
     use super::*;
     use std::path::Path;
 
     /// `c231d9da…` on the operator box — the device default.
-    const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
+    pub(super) const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
     /// `7ac125b6…` on the operator box — Portofino, the second binding.
-    const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
+    pub(super) const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
     /// A tenant NO slot exists for. The merge must never admit it.
-    const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
-    const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    pub(super) const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
+    pub(super) const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// The production predicate, with the store answers pinned: the two real
     /// tenants have slots, everything else does not.
-    fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
+    pub(super) fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
         let slot = match tenant.to_string().as_str() {
             DEFAULT_TENANT | SECOND_TENANT => crate::auth::SlotState::Usable,
             _ => crate::auth::SlotState::Absent,
@@ -5556,13 +5468,13 @@ mod one_binding_store_tests {
         crate::auth::holds_credential_for(slot, is_default, crate::auth::SlotState::Usable)
     }
 
-    fn write(path: &Path, body: &str) {
+    pub(super) fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
 
     /// v2 shape: `bindings` + `default_tenant_id` + the legacy mirrors.
-    fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
+    pub(super) fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
         format!(
             r#"{{
   "user_id": "{USER}",
@@ -5578,7 +5490,7 @@ mod one_binding_store_tests {
 
     /// The 4-month-stale `%APPDATA%/com.qontinui.runner/paired_user.json`:
     /// pre-v2 single-tenant shape, no `bindings` array at all.
-    fn legacy() -> String {
+    pub(super) fn legacy() -> String {
         format!(r#"{{"user_id": "{USER}", "tenant_id": "{DEFAULT_TENANT}"}}"#)
     }
 
@@ -5914,128 +5826,6 @@ mod one_binding_store_tests {
         );
         assert!(other.exists(), "and it is left in place");
         assert!(!report.wrote_canonical);
-    }
-
-    // ------------------------------------------------------------------
-    // 5 + 6 — the doctor check
-    // ------------------------------------------------------------------
-
-    /// FAILS on a binding-set disagreement, and again on a
-    /// `default_tenant_id` disagreement — the two ways a split brain changes
-    /// which tenants a process believes exist.
-    #[test]
-    fn doctor_check_fails_on_a_binding_set_or_default_tenant_disagreement() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-
-        // Binding-set disagreement: the legacy copy cannot see the second
-        // binding at all. This is the operator box's %APPDATA% copy.
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, &legacy());
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(check.verdict, "fail", "{}", check.detail);
-        assert!(check.failed());
-        assert_eq!(
-            check.copies[1].legacy_shape,
-            Some(true),
-            "the legacy shape must be visible in the report"
-        );
-
-        // default_tenant_id disagreement, same binding set.
-        write(
-            &b,
-            &format!(
-                r#"{{"user_id":"{USER}","tenant_id":"{SECOND_TENANT}",
-  "bindings":[
-    {{"tenant_id":"{DEFAULT_TENANT}","user_id":"{USER}","paired_at":"2026-09-17T15:42:00Z"}},
-    {{"tenant_id":"{SECOND_TENANT}","user_id":"{USER}","paired_at":"2026-08-02T10:00:00Z"}}],
-  "default_tenant_id":"{SECOND_TENANT}"}}"#
-            ),
-        );
-        let check = inspect_binding_store_paths(&[a, b]);
-        assert_eq!(
-            check.verdict, "fail",
-            "same tenants, different default — still a split brain: {}",
-            check.detail
-        );
-    }
-
-    /// Only REPORTS a `paired_at`-only difference. This is the ONLY way the
-    /// copies differ on the operator box today, so a strict check would fail
-    /// a healthy machine from day one and get disabled.
-    #[test]
-    fn doctor_check_only_reports_a_paired_at_only_difference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
-
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(
-            check.verdict, "report",
-            "a paired_at-only difference is cosmetic: {}",
-            check.detail
-        );
-        assert!(!check.failed(), "and it must NOT fail the doctor");
-        assert!(check.detail.contains("paired_at"));
-
-        // Identical copies: plain ok.
-        write(&b, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        assert_eq!(inspect_binding_store_paths(&[a, b]).verdict, "ok");
-    }
-
-    /// One copy (the shape of a box with no `$QONTINUI_SECURE_STORAGE_DIR`)
-    /// is `ok`, not a fail.
-    #[test]
-    fn doctor_check_is_ok_with_a_single_live_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let missing = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-
-        let check = inspect_binding_store_paths(&[a, missing]);
-        assert_eq!(check.verdict, "ok", "{}", check.detail);
-        assert_eq!(check.copies[1].read, "absent");
-        assert_eq!(
-            check.copies[1].tenants, None,
-            "an ABSENT copy carries no binding list"
-        );
-    }
-
-    /// UNKNOWN discipline: an unreadable copy must never read as "no
-    /// disagreement", and a disagreement we CAN see still fails.
-    #[test]
-    fn doctor_check_reports_unknown_not_agreement_for_an_unreadable_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, "\u{0}\u{1}not-json-at-all");
-
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(
-            check.verdict, "unknown",
-            "an undecryptable/corrupt copy is UNKNOWN, never 'the rest agree': {}",
-            check.detail
-        );
-        assert!(check.is_unknown());
-        assert!(!check.failed(), "unknown is not a fail either");
-        assert_eq!(check.copies[1].read, "unreadable");
-        assert_eq!(
-            check.copies[1].tenants, None,
-            "an unreadable copy must NOT report an empty binding list — absence is not zero"
-        );
-
-        // A visible disagreement beats the unknown: still a fail.
-        let c = tmp.path().join("c/paired_user.json");
-        write(&c, &legacy());
-        assert_eq!(
-            inspect_binding_store_paths(&[a, c, b]).verdict,
-            "fail",
-            "a disagreement we can see is not masked by a copy we cannot read"
-        );
     }
 
     // ------------------------------------------------------------------

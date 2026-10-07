@@ -23,14 +23,7 @@
  */
 
 import { useCallback, useMemo } from "react";
-import {
-  Activity,
-  AlertCircle,
-  CheckCircle2,
-  Loader2,
-  RefreshCw,
-  Shield,
-} from "lucide-react";
+import { Activity, AlertCircle, CheckCircle2, Loader2, RefreshCw, Shield } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 
@@ -43,6 +36,7 @@ import {
   type RegressionSuite,
 } from "@qontinui/ui-bridge-auto/regression";
 import type { IRDocument } from "@qontinui/shared-types/ui-bridge-ir";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Tauri row shape — must match `crate::database::pg::regression::AssertionExecutionRow`.
@@ -211,15 +205,9 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
 
   const diff = useMemo(() => coverageDiff(suite, exerciseLog), [suite, exerciseLog]);
   const staticCoverage = useMemo(() => coverageOf(ir, suite), [ir, suite]);
-  const stats = useMemo(
-    () => deriveCoverageStats(staticCoverage, diff),
-    [staticCoverage, diff],
-  );
+  const stats = useMemo(() => deriveCoverageStats(staticCoverage, diff), [staticCoverage, diff]);
 
-  const unexercisedGroups = useMemo(
-    () => groupUnexercisedByCase(suite, diff),
-    [suite, diff],
-  );
+  const unexercisedGroups = useMemo(() => groupUnexercisedByCase(suite, diff), [suite, diff]);
 
   const handleCopyAssertion = useCallback((assertionId: string) => {
     // `navigator.clipboard` is available in Tauri's webview. We swallow the
@@ -231,9 +219,7 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
 
   const hasNoRuns = (rawExerciseLog?.length ?? 0) === 0;
   const isFullyCovered =
-    !hasNoRuns &&
-    diff.unexercisedAssertions.length === 0 &&
-    diff.uncoveredTransitions.length === 0;
+    !hasNoRuns && diff.unexercisedAssertions.length === 0 && diff.uncoveredTransitions.length === 0;
 
   // Truncate the suite id for display — full id available via tooltip.
   const truncatedSuiteId =
@@ -283,7 +269,7 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
               <div>
                 <div className="font-medium">Failed to load exercise log</div>
                 <pre className="mt-1 whitespace-pre-wrap text-xs text-red-300">
-                  {error instanceof Error ? error.message : String(error)}
+                  {describeThrown(error, "unknown error")}
                 </pre>
               </div>
             </div>
@@ -351,9 +337,7 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
             <div className="rounded-lg border border-border-primary bg-surface-secondary p-3">
               <div className="mb-2 flex items-center justify-between">
                 <h3 className="text-sm font-medium text-text-primary">Un-exercised assertions</h3>
-                <span className="text-xs text-text-muted">
-                  {diff.unexercisedAssertions.length}
-                </span>
+                <span className="text-xs text-text-muted">{diff.unexercisedAssertions.length}</span>
               </div>
               {diff.unexercisedAssertions.length === 0 ? (
                 <p className="text-xs text-text-muted">
@@ -363,10 +347,7 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
                 <div className="space-y-3 max-h-96 overflow-y-auto">
                   {unexercisedGroups.map((g) => (
                     <div key={g.caseId} className="space-y-1">
-                      <div
-                        className="text-xs font-mono text-text-muted truncate"
-                        title={g.caseId}
-                      >
+                      <div className="text-xs font-mono text-text-muted truncate" title={g.caseId}>
                         case: {g.caseId}
                       </div>
                       <ul className="space-y-1">
@@ -397,9 +378,7 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
             <div className="rounded-lg border border-border-primary bg-surface-secondary p-3">
               <div className="mb-2 flex items-center justify-between">
                 <h3 className="text-sm font-medium text-text-primary">Un-covered transitions</h3>
-                <span className="text-xs text-text-muted">
-                  {diff.uncoveredTransitions.length}
-                </span>
+                <span className="text-xs text-text-muted">{diff.uncoveredTransitions.length}</span>
               </div>
               {diff.uncoveredTransitions.length === 0 ? (
                 <p className="text-xs text-text-muted">
@@ -412,10 +391,7 @@ export function CoveragePanel(props: CoveragePanelProps): React.JSX.Element {
                       key={`${t.caseId}|${t.transitionId}`}
                       className="rounded-md border border-border-primary bg-surface-primary p-2 text-xs"
                     >
-                      <div
-                        className="font-mono text-text-muted truncate"
-                        title={t.caseId}
-                      >
+                      <div className="font-mono text-text-muted truncate" title={t.caseId}>
                         case: {t.caseId}
                       </div>
                       <div className="font-mono text-text-primary truncate" title={t.transitionId}>

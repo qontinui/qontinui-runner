@@ -69,6 +69,7 @@ mod check_executor;
 mod check_generation;
 mod ci_node;
 mod claude_accounts;
+mod claude_cli_spawn;
 mod claude_protocol;
 mod claude_session;
 mod click_overlay;
@@ -88,7 +89,7 @@ mod coord_doctor_cmd;
 mod coord_drain_state;
 mod coord_http;
 mod coord_mcp;
-mod coord_mcp_config;
+pub(crate) use qontinui_runner_lib::coord_mcp_config;
 // Plan 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant
 // Phase 2 — compare each coord answer's tenant with the session repo's tenant.
 mod coord_mcp_tenant;
@@ -102,6 +103,9 @@ mod coord_questions;
 mod cost_management;
 mod crash_dumps;
 mod crash_observability;
+// Ratchet: no module may be declared in both this root and `lib.rs`.
+#[cfg(test)]
+mod crate_roots_ratchet;
 mod credential_helper;
 mod database;
 mod debug_lifecycle;
@@ -141,8 +145,8 @@ mod fleet_commands;
 mod fleet_skills;
 mod flow_control;
 mod follow_up;
-mod fs_atomic;
-mod fs_perms;
+pub(crate) use qontinui_runner_lib::fs_atomic;
+pub(crate) use qontinui_runner_lib::fs_perms;
 mod git_status_subset;
 // D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
 // existing `trigger_system` (via the `SupervisionProposal` action variant)
@@ -171,6 +175,7 @@ mod instance;
 mod instance_health;
 mod instance_manager;
 mod iteration_bundle;
+mod journey;
 mod knowledge_acquisition;
 mod known_issues;
 mod launch_env;
@@ -182,7 +187,7 @@ mod logging;
 // covered by `cargo test --lib`.
 mod looping_agent_coord;
 mod looping_agent_supervisor;
-mod machine_identity;
+pub(crate) use qontinui_runner_lib::machine_identity;
 mod macros;
 mod mcp;
 mod mcp_api;
@@ -205,7 +210,7 @@ mod planning_bridge;
 mod playwright;
 mod pm_detect;
 mod process_capture;
-mod process_helpers;
+pub(crate) use qontinui_runner_lib::process_helpers;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
@@ -240,7 +245,7 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
-mod secure_storage;
+pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
 mod server_mode;
@@ -352,6 +357,13 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
+// Source invariant: every test-lock constructor takes `env_lock()` FIRST (a
+// child of the env lock in the test-lock hierarchy) or is marked and audited
+// standalone, so no two test locks can be taken in opposite orders and hang
+// `cargo test`. Plan
+// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`.
+#[cfg(test)]
+mod env_test_lock_hierarchy_guard;
 // Source-scan ratchets for the deny lints that grandfather sites with a
 // fn-level `#[expect]` (`clippy::disallowed_methods` for `Row::get`,
 // `clippy::string_slice`): each count only falls, and each gate stays wired.
@@ -2192,12 +2204,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Ξ_Worktree reclaim (Phase 4) — periodically pull
                 // coord's pending per-device reclaim instructions and
                 // execute the INV-W4 safe path (unlink junctions FIRST,
-                // then remove the worktree; or recreate a drifted
-                // junction). Arming is per-action: rejunction_armed /
-                // remove_armed both default OFF (the poller only LOGS what
-                // it would do); coord arms remove via
-                // COORD_WORKTREE_RECLAIM_ENABLED and graduates rejunction
-                // to default-on once the G6 build-guard is proven.
+                // then remove the worktree). remove_armed defaults OFF (the
+                // poller only LOGS what it would do); coord arms it via
+                // COORD_WORKTREE_RECLAIM_ENABLED. There is no rejunction
+                // executor — coord no longer serves one.
                 // Default 300s cadence (env
                 // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
                 // wide, anonymous, device-keyed posture as the census.
@@ -2920,6 +2930,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_remote_identities,
             commands::remote_attach::terminal_remote_history_load,
             commands::remote_attach::terminal_remote_interactivity,
+            commands::remote_attach::remote_interactivity_probe,
             commands::remote_create::remote_create_preference_get,
             commands::remote_create::remote_create_preference_set,
             commands::remote_create::remote_create_preference_reconcile,
@@ -4270,14 +4281,53 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // ACK stamps `finish_synced` back so the boot reconcile can
                 // tell a synced mark from one coord has not seen. Weak handles
                 // for the same Arc-cycle reason as the close observer above.
+                //
+                // The registrar resolves the coord row across BOTH runner
+                // planes: its own index (AI/task-run + sniffed panes), then
+                // the terminal plane through the lookup injected here — a
+                // terminal-hosted `claude` registers through `SessionRegistry`
+                // and its coord id lives only on the terminal. That lookup
+                // keys on the PINNED harness id alone. A session the provider
+                // adopted after `/clear` resolves as its PREDECESSOR does
+                // (`TerminalSessionRecord::adopted_from`, walked by the
+                // registrar), so a `/clear` in the pinned session reaches the
+                // terminal's row while a `/clear` in a typed `claude --resume
+                // X` reaches X's own row, never the pane's. The observer's
+                // verdict is RETURNED to `set_finished`, so the finish route
+                // reports whether coord was told instead of dropping it. And
+                // every terminal binding re-delivers a mark made before the
+                // terminal had a coord row, for each record whose chain
+                // resolves to that terminal's pinned id — the in-process
+                // window between `record_open` and the bind only: a finished
+                // session is not restored on boot, so nothing re-binds for it
+                // after a restart (the terminal-plane twin of the registrar's
+                // own late-registration re-enqueue).
+                //
+                // Lock order: the finish observer runs inside `set_finished`
+                // AFTER the store's map guard is released (its `finish_forward`
+                // serializer is still held) and receives the record; walking
+                // its adoption chain reads the store (`get`, map lock only),
+                // which is safe there. The bind observer runs outside every
+                // store lock.
                 {
+                    let tm = std::sync::Arc::downgrade(&term_for_session);
+                    ai_coord_registrar.attach_terminal_coord_lookup(move |csid| {
+                        tm.upgrade()?.coord_session_id_for_pinned(csid)
+                    });
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    term_for_session.attach_coord_bind_observer(
+                        move |pinned, terminal_id, coord_id| {
+                            if let Some(r) = reg.upgrade() {
+                                r.deliver_owed_finish(pinned, terminal_id, coord_id);
+                            }
+                        },
+                    );
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     lifecycle_store.attach_finish_observer(move |rec| {
-                        if let Some(r) = reg.upgrade() {
-                            match rec.finished_at {
-                                Some(at) => r.finish_session(&rec.claude_session_id, Some(at)),
-                                None => r.unfinish_session(&rec.claude_session_id),
-                            };
+                        use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
+                        match reg.upgrade() {
+                            Some(r) => r.forward_finish_change(rec),
+                            None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
                         }
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
@@ -6332,6 +6382,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 tauri::async_runtime::spawn(async move {
                     process_capture::cleanup::run_process_log_cleanup_loop(pg_for_logs).await;
+                });
+            }
+
+            // Spawn the journey edge-ledger retention loop (plan
+            // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+            // Phase 0 decision 2): the runner writes journey edges into its OWN
+            // database, which qontinui-web's retention job cannot reach, so the
+            // 90-day prune runs here — once shortly after startup, then hourly.
+            // Same shape as the retention loops beside it.
+            {
+                let pg_for_journey = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::journey::retention::run_journey_edge_retention_loop(pg_for_journey)
+                        .await;
                 });
             }
 

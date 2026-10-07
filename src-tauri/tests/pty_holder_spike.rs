@@ -85,7 +85,9 @@ mod unix {
     fn stat(pid: i32) -> Option<Stat> {
         let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // comm may contain spaces/parens: parse after the LAST ')'.
-        let rest = &raw[raw.rfind(')')? + 1..];
+        // `get` rather than indexing: deny-tier `clippy::string_slice`. The
+        // ')' is ASCII, so the byte after it is always a char boundary.
+        let rest = raw.get(raw.rfind(')')? + 1..)?;
         let f: Vec<&str> = rest.split_whitespace().collect();
         // f[0] = field 3 (state) … f[19] = field 22 (starttime).
         Some(Stat {

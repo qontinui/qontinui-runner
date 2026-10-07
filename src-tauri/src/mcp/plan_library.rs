@@ -2072,9 +2072,14 @@ mod tests {
         }
     }
 
-    /// Pin the tenant dial. Taken BEFORE `with_flag`'s env lock, always — the
-    /// crate-wide ordering (`agent_runtime`'s briefing tests take the pin, then
-    /// an env capture), so there is one global order and no deadlock.
+    /// Pin the tenant dial. The pin acquires `env_lock` itself, before its own
+    /// mutex (it is a CHILD of `env_lock` in the test-lock hierarchy), so the
+    /// `with_flag` call that follows simply nests on the env lock this thread
+    /// already holds. No per-site order exists to get right: the earlier
+    /// comment here claimed "pin first" was the crate-wide order while
+    /// `agent_runtime` documented the opposite, and that disagreement was a
+    /// live deadlock (plan
+    /// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`).
     fn pin(level: &str) -> crate::mcp::fleet_policy_poller::PlanCaptureLevelPin {
         crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test(level)
     }
@@ -4198,9 +4203,9 @@ mod tests {
     /// call would compile clean and only this test would notice.
     #[tokio::test]
     async fn both_edge_correction_routes_are_gated_the_same_three_layers() {
-        // Each layer takes the dial pin BEFORE the env lock — the crate-wide
-        // order `pin` documents — so this test cannot deadlock against one
-        // that takes them the same way.
+        // Each layer takes the dial pin and then the env lock. The order is
+        // not load-bearing: the pin holds `env_lock` itself (see `pin`), so the
+        // explicit `env_lock()` below nests rather than contends.
         // Layer 1: no nonce ⇒ 401, dial open, switch off.
         {
             let _pin = pin("record");

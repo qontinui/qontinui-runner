@@ -671,6 +671,7 @@ mod tests {
     /// Hold for the duration of any test that queues or inspects refresh
     /// requests. Recovers from a poisoned guard (a panicking test must not
     /// cascade into every sibling).
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn refresh_log_guard() -> std::sync::MutexGuard<'static, ()> {
         REFRESH_LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }

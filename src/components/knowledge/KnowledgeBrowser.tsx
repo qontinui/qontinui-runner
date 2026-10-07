@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, Search, X, Loader2, AlertCircle, ChevronDown, ChevronRight } from "lucide-react";
 import { searchKnowledge, type KnowledgeHit } from "./knowledgeApi";
 import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
+import { describeThrown } from "@/lib/utils";
 
 export interface KnowledgeBrowserProps {
   /**
@@ -91,7 +92,7 @@ export function KnowledgeBrowser({ mode = "modal", open = true, onClose }: Knowl
       const results = await searchKnowledge(query, areaFilter ? areaFilter : null, topK);
       setHits(results);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "Knowledge search failed");
       setError(msg);
       setHits([]);
     } finally {

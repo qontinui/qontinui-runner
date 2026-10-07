@@ -1285,6 +1285,29 @@ struct IdentitySeamOutcome {
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
 }
 
+/// What the waiter thread knows when a pane's process exits, handed to the
+/// on-exit hook ([`TerminalSession::set_on_exit`]) and frozen on the session
+/// ([`TerminalSession::exit_snapshot`]).
+///
+/// `close_requested` is [`mark_exited_was_runner_initiated`]'s verdict: a
+/// runner-initiated close (tab close, remote close, `close_all`) cleared
+/// `is_alive` before its kill, so the exit is the kill's, not the agent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneExitFacts {
+    /// The pane's real exit code; `None` when the wait failed.
+    pub code: Option<i32>,
+    /// A runner-initiated close caused this exit.
+    pub close_requested: bool,
+}
+
+impl PaneExitFacts {
+    /// The AGENT's exit code — `None` when the runner's own kill ended the
+    /// process (see [`on_exit_hook_code`]) or no status was observed.
+    pub fn agent_exit_code(self) -> Option<i32> {
+        on_exit_hook_code(self.code, self.close_requested)
+    }
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -1316,6 +1339,13 @@ pub struct TerminalSession {
     is_alive: Arc<AtomicBool>,
     /// Exit code (set when process exits).
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// The exit facts FROZEN by the waiter as the process ended, with that
+    /// instant: the code and whether a runner-initiated close caused the exit
+    /// ([`mark_exited_was_runner_initiated`]). Readers that come AFTER the
+    /// exit — the continuation reaper above all — read this snapshot, so a dead
+    /// tab the operator closes later still reads as the crash it was (plan
+    /// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`).
+    exit_snapshot: Arc<Mutex<Option<(PaneExitFacts, std::time::Instant)>>>,
     /// Handle to the reader thread (for join on cleanup).
     reader_join: Mutex<Option<thread::JoinHandle<()>>>,
     /// Handle to the waiter thread (for join on cleanup).
@@ -1392,6 +1422,11 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// The `claude --name` this session was spawned with (runner-spawned
+    /// continuations only). Immutable once set; surfaced to the webview as the
+    /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
+    /// such field, so it travels beside it like `sessionIdsByTerminal`).
+    spawn_name: std::sync::OnceLock<String>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -1411,7 +1446,7 @@ pub struct TerminalSession {
     /// `pane_io` fix), which the `session_exit` operator-touch trigger needs
     /// and which the low-level waiter thread has no other route to hand to
     /// its callers.
-    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>>>>,
+    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>>>>,
     /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
     /// When the session declared edit intent on a registered repo and
     /// `worktree_mode_enabled()` was true at spawn time, this carries
@@ -2161,7 +2196,7 @@ impl TerminalSession {
         // so the waiter reads them at exit time rather than capturing a
         // value that isn't known yet at spawn. (`coord_session_id` itself is
         // declared above the reader thread, which also needs a clone of it.)
-        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>>>> =
+        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 
         // Spawn waiter thread: detects process exit
@@ -2169,6 +2204,9 @@ impl TerminalSession {
         let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
+        let exit_snapshot: Arc<Mutex<Option<(PaneExitFacts, std::time::Instant)>>> =
+            Arc::new(Mutex::new(None));
+        let waiter_exit_snapshot = exit_snapshot.clone();
         // Retain a clone for the session struct (input-line warn hook)
         // before the original handle is moved into the waiter thread.
         let session_app_handle = app_handle.clone();
@@ -2199,6 +2237,13 @@ impl TerminalSession {
                 // kill — in which case the exit code is the KILL's, not the
                 // agent's (see `on_exit_hook_code`).
                 let runner_initiated = mark_exited_was_runner_initiated(&waiter_alive);
+                let exit_facts = PaneExitFacts {
+                    code,
+                    close_requested: runner_initiated,
+                };
+                if let Ok(mut snap) = waiter_exit_snapshot.lock() {
+                    *snap = Some((exit_facts, std::time::Instant::now()));
+                }
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -2240,7 +2285,7 @@ impl TerminalSession {
                                 coord_session = %coord_id,
                                 "terminal exit — closing coord session mirror"
                             );
-                            cb(coord_id, on_exit_hook_code(code, runner_initiated));
+                            cb(coord_id, exit_facts);
                         }
                     }
                 }
@@ -2293,9 +2338,11 @@ impl TerminalSession {
             output_tx,
             grid,
             coord_session_id,
+            spawn_name: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
+            exit_snapshot,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
@@ -4039,9 +4086,25 @@ impl TerminalSession {
         }
     }
 
+    /// Record the spawn name (first write wins; it is immutable by design).
+    pub fn set_spawn_name(&self, name: String) {
+        let _ = self.spawn_name.set(name);
+    }
+
+    /// The `claude --name` this session was spawned with, if any.
+    pub fn spawn_name(&self) -> Option<String> {
+        self.spawn_name.get().cloned()
+    }
+
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
+    }
+
+    /// This terminal's id (the [`super::manager::TerminalManager`] key, and
+    /// the `terminal_id` its lifecycle records carry).
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// The harness session id the identity seam pinned this PTY child to —
@@ -4077,12 +4140,12 @@ impl TerminalSession {
     /// The callback receives the coord session id and must be idempotent
     /// (it shares the close path with the frontend `terminal_close`
     /// command — `SessionRegistry::close_by_id` is already idempotent). It
-    /// also receives the PTY's real exit code (plan
-    /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c) —
-    /// `None` when the waiter itself failed to observe a status, or when the
-    /// exit was caused by a runner-initiated close's kill (see
-    /// `on_exit_hook_code`) — never a synthesized value.
-    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>) {
+    /// also receives the waiter's [`PaneExitFacts`]: the PTY's real exit code
+    /// (plan `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c)
+    /// and whether a runner-initiated close caused the exit. Callers that want
+    /// the AGENT's exit code (`None` for a runner-caused or unobserved exit)
+    /// read [`PaneExitFacts::agent_exit_code`].
+    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>) {
         if let Ok(mut slot) = self.on_exit.lock() {
             *slot = Some(hook);
         }
@@ -4371,6 +4434,12 @@ impl TerminalSession {
     /// Check if the shell process is still alive.
     pub fn is_alive(&self) -> bool {
         self.is_alive.load(Ordering::Relaxed)
+    }
+
+    /// The waiter's frozen exit facts and exit instant, `None` while the
+    /// process runs. See the `exit_snapshot` field.
+    pub fn exit_snapshot(&self) -> Option<(PaneExitFacts, std::time::Instant)> {
+        self.exit_snapshot.lock().ok().and_then(|s| *s)
     }
 
     /// The shell process's exit code, once the waiter thread has recorded one.
@@ -5182,6 +5251,7 @@ pub(crate) mod tests {
             // join nonexistent reader/waiter threads.
             is_alive: Arc::new(AtomicBool::new(false)),
             exit_code: Arc::new(Mutex::new(None)),
+            exit_snapshot: Arc::new(Mutex::new(None)),
             reader_join: Mutex::new(None),
             waiter_join: Mutex::new(None),
             bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -5199,6 +5269,7 @@ pub(crate) mod tests {
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            spawn_name: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),
@@ -5384,6 +5455,33 @@ pub(crate) mod tests {
                 tracked_alive: alive.to_vec(),
             },
         )
+    }
+
+    /// Plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`: the
+    /// frozen snapshot is never rewritten by a later close of the dead tab, and
+    /// `agent_exit_code` keeps the operator-touch semantics of
+    /// `on_exit_hook_code`.
+    #[test]
+    fn exit_snapshot_is_frozen_and_agent_exit_code_hides_runner_kills() {
+        let s = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(s.exit_snapshot(), None, "no waiter, no exit recorded");
+        let crashed = PaneExitFacts {
+            code: Some(1),
+            close_requested: false,
+        };
+        *s.exit_snapshot.lock().unwrap() = Some((crashed, std::time::Instant::now()));
+        s.close();
+        assert_eq!(
+            s.exit_snapshot().map(|(f, _)| f),
+            Some(crashed),
+            "close() never rewrites the snapshot"
+        );
+        assert_eq!(crashed.agent_exit_code(), Some(1));
+        let killed = PaneExitFacts {
+            code: Some(1),
+            close_requested: true,
+        };
+        assert_eq!(killed.agent_exit_code(), None);
     }
 
     #[tokio::test(start_paused = true)]

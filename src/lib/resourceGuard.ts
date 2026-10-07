@@ -21,6 +21,7 @@
  */
 
 import { useSyncExternalStore } from "react";
+import { describeThrown } from "./utils";
 
 /**
  * Prefix the Rust side stamps on an overridable CRITICAL refusal. Must match
@@ -77,8 +78,7 @@ const LANE_TOKEN = /^([a-z][a-z0-9_]*): /;
  * reported as `"unknown"`.
  */
 export function parseResourceGuardRefusal(err: unknown): ResourceGuardRefusal | null {
-  const text =
-    typeof err === "string" ? err : err instanceof Error ? err.message : String(err ?? "");
+  const text = describeThrown(err, "");
   if (!text.startsWith(CRITICAL_REFUSAL_PREFIX)) return null;
   const rest = text.slice(CRITICAL_REFUSAL_PREFIX.length);
   const token = LANE_TOKEN.exec(rest);

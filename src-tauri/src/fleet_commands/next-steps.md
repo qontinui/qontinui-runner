@@ -144,14 +144,14 @@ gate; just list it.
   than assuming one), and `non_author_allows_identities` is now a
   six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
   device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
-  only in tier 6 — same device, no proven session on either side. So
+  only in tier 6 — same device, no proven session on one or both sides. So
   `agent_non_author` IS usable when the clearer is a different device or carries
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
-  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-09-23 at
-  `037fc1a8f`: `work_unit_registry::authorize_target_transition` takes the two
+  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-10-03 at
+  `f32fb04ad`: `work_unit_registry::authorize_target_transition` takes the two
   actor keys **plus an optional `independence` declaration**
-  (`{verified, against, context}`), and does the flat `owner == attester`
+  (`{verified, against, context}`), and does the device-grain `owner == attester`
   compare **only when no declaration is sent** — a well-formed one authorizes an
   Attested transition without that compare, while still refusing
   `attester_unresolved` when the caller's token derives no actor key;
@@ -169,7 +169,7 @@ gate; just list it.
   the tool your session advertises, and verify by read — a zero exit is not
   evidence the write landed. ⚠️ **Never re-allocate to get past
   `self_attestation_forbidden`**: a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`. The re-allocate prohibition is that refusal's
-  alone — `attester_unresolved` wants a device- or agent-identified caller,
+  alone — `attester_unresolved` wants a caller coord admits as an SoD actor,
   which is a credential remedy rather than a route around a control. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
   [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:
@@ -237,7 +237,12 @@ gate; just list it.
   PENDING continuation so the old queued runner-terminal spawn doesn't fire
   alongside the new one — `GET .../coord/agent-gates?work_unit_id=<id>` for rows
   carrying a `continuation_spawn` with `continuation_consumed_at == null ∧
-  continuation_cancelled_at == null`. **Do NOT also require
+  continuation_cancelled_at == null`.
+  **Never a hold gate** (`/vet-plan` §5.4 step 6's hold-gate skip): a gate holding a
+  vetted plan behind its live trigger carries an armed continuation by design and is
+  that plan's real net — retire only the prior gate you are re-registering or the
+  `vet→implement safety net` row (`_gate-registration` → "Never retire a HOLD gate").
+  **Do NOT also require
   `continuation_dispatched_at != null`**: `cancel_continuation` deliberately omits
   that guard (*"the pre-dispatch stamp is the whole point"*), so a
   dispatched-only filter drops exactly the rows the cancel was built to stamp —
@@ -283,7 +288,9 @@ until a human clicks it.
   `gate_id` — works from a device session since attest takes no upsert); fall back to
   the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
   (header `X-Coord-Mcp-Proxy-Key`, or `Authorization: Bearer <nonce>` on configs
-  written after the Phase 2 header move — no body bearer; maskless fallback), then the
+  written after the Phase 2 header move, a `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}`
+  value expanded from your own environment first, with `${VAR:-default}` shell
+  semantics and never sent literally — no body bearer; maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
   gate with `clearance_audience = 'agent'` in the caller's own tenant; coord flips

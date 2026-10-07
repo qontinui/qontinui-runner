@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from "react";
 import type { MemoryResult, MemorySearchResponse, MemorySourceFilter } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 const API_BASE = "http://localhost:9876";
 
@@ -64,7 +65,7 @@ export function useMemorySearch() {
       setState((prev) => ({
         ...prev,
         loading: false,
-        error: err instanceof Error ? err.message : "Network error",
+        error: describeThrown(err, "Network error"),
       }));
     }
   }, []);

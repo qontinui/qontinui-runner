@@ -37,12 +37,12 @@ pub fn export_all_schemas() -> Value {
         app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn,
         functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
-        mcp_config as qmc, memory as qmem, orchestration_config as qoc, priorities_profile as qpp,
-        process_management as qpm, projects as qprj, rag as qr, runner as qrn, scheduler as qs,
-        spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
-        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
-        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
-        workflow_step as qws,
+        journey as qj, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
+        priorities_profile as qpp, process_management as qpm, projects as qprj, rag as qr,
+        runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
+        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
+        worker_output as qwo, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -876,6 +876,18 @@ pub fn export_all_schemas() -> Value {
     add!("RefusalSource", qontinui_types::refusal::RefusalSource);
     add!("NextAction", qontinui_types::refusal::NextAction);
     add!("NextActionKind", qontinui_types::refusal::NextActionKind);
+    // ── qontinui-types: journey (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 1). STRUCTS ONLY: every journey enum (`NavigationTriggerKind`,
+    // `ChokePoint`, `RunKind`, `EdgeOutcome`, `FrontierReason`, `LedgerState`)
+    // is `#[schemars(inline)]`, so each struct's schema carries its closed
+    // value sets inline and registering the enums would add unreferenced
+    // top-level names. (5) ──
+    add!("JourneyNode", qj::JourneyNode);
+    add!("JourneyTrigger", qj::JourneyTrigger);
+    add!("JourneyEdgeObservation", qj::JourneyEdgeObservation);
+    add!("FrontierEntry", qj::FrontierEntry);
+    add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
 
     Value::Object(m)
 }
@@ -949,8 +961,21 @@ mod tests {
         // + the 1 scheduler probe condition (ProbeCondition — plan
         // 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one
         // Phase 4) = 561.
-        // The codegen's "Processing N top-level types" line should read 561 here.
-        assert_eq!(obj.len(), 561, "Expected 561 schema entries");
+        // + the 5 journey structs (JourneyNode, JourneyTrigger,
+        // JourneyEdgeObservation, FrontierEntry, JourneyLedgerHealth — plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+        // Phase 1; the journey enums are schemars-inline) = 566.
+        // The codegen's "Processing N top-level types" line should read 566 here.
+        assert_eq!(obj.len(), 566, "Expected 566 schema entries");
+        for journey in [
+            "JourneyNode",
+            "JourneyTrigger",
+            "JourneyEdgeObservation",
+            "FrontierEntry",
+            "JourneyLedgerHealth",
+        ] {
+            assert!(obj.contains_key(journey), "Missing {journey} schema");
+        }
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

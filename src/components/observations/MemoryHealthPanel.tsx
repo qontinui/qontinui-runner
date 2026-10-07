@@ -9,6 +9,7 @@ import { useState, useCallback, useEffect } from "react";
 import { Brain, RefreshCw, Loader2, Activity, Archive, Zap, Clock } from "lucide-react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { getAccentColors, getStatusColors } from "@/design-system";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types
@@ -82,7 +83,7 @@ export function MemoryHealthPanel() {
         if (logJson.success) setLog(logJson.data || []);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch memory health");
+      setError(describeThrown(e, "Failed to fetch memory health"));
     } finally {
       setIsLoading(false);
     }
@@ -118,7 +119,7 @@ export function MemoryHealthPanel() {
         setError(json.error || "Consolidation failed");
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to trigger consolidation");
+      setError(describeThrown(e, "Failed to trigger consolidation"));
     } finally {
       setIsConsolidating(false);
     }

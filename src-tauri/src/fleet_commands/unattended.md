@@ -729,6 +729,21 @@ coord_post_finding(
   dossier_slug  = "<slug>",
   title = "<the one-sentence CLAIM a reader sees when bodies are projected away>",
   body  = "<evidence, then method, then what a peer should do differently — in that order>")
+
+# The same write from bash, and the read it owes (the 201/200 is not the answer):
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+bash "$W/.claude/skills/coord-revive/coord-revive.sh" call coord_post_finding \
+  '{"kind":"status","scope":"tenant","topic":"plan-corpus","dossier_slug":"<slug>","resource_keys":["<key>"],"title":"<claim>","body":"<evidence>"}' > "$R/p"
+envelope_mcp_body coord_post_finding "$R/p" > "$R/b"
+P=$(envelope_require coord_post_finding posted "$R/b")          # FIRST - enforced, not printed
+if [ "$P" = true ]; then
+  envelope_require coord_post_finding finding.finding_id "$R/b"   # nested - never `finding_id` off the envelope
+elif [ "$P" = false ]; then  # coord answered: nothing stored, and the reason says why
+  echo "NOT STORED (posted=false)"; envelope_require coord_post_finding reason "$R/b"
+else  # posted unreadable = UNKNOWN, never "not stored": the write is presumed LOST
+  echo "UNKNOWN (write presumed LOST - verify by read)" >&2
+fi
+rm -rf "$R"
 ```
 
 Those are the argument names on both doors — the HTTP twin under **Transport**
@@ -1112,6 +1127,41 @@ coord_recent_findings(topic="dossier:<slug>", kind="dossier")   # the live head 
 coord_memory_search(query_text="DOSSIER <slug>", kinds=["mental_model"])   # the literal KEY — fallback
 coord_memory_search(query_text="<the condition in its own words>")
 coord_memory_search(query_text="<the condition, phrased a second way>")
+
+# The same lookup from bash, with every read it owes. Copy THIS, not a hand-rolled
+# `.get(...)`: coord_memory_search has NO `count` and its rows are `hits`.
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
+REVIVE="$W/.claude/skills/coord-revive/coord-revive.sh"; R=$(mktemp -d)
+bash "$REVIVE" call coord_recent_findings '{"topic":"dossier:<slug>","kind":"dossier","limit":5}' > "$R/f"
+envelope_mcp_body coord_recent_findings "$R/f" > "$R/fb"
+if [ "$(envelope_require coord_recent_findings available "$R/fb")" = true ]; then
+  envelope_collection coord_recent_findings findings "$R/fb"   # the head(s); `count` must equal the rows
+else echo "UNKNOWN: findings store unavailable or unread - never \"no head\""; fi
+# Three probes, each ending HIT / MISS / UNKNOWN - never a bare zero.
+for Q in '{"query_text":"DOSSIER <slug>","kinds":["mental_model"],"limit":50}' \
+         '{"query_text":"<the condition in its own words>","limit":50}' \
+         '{"query_text":"<the condition, phrased a second way>","limit":50}'; do
+  bash "$REVIVE" call coord_memory_search "$Q" > "$R/m" || { echo "UNKNOWN (door): $Q"; continue; }
+  H=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search hits -) \
+    || { echo "UNKNOWN (envelope): $Q"; continue; }
+  [ "$H" != "[]" ] && { echo "HIT: $Q"; printf '%s\n' "$H"; continue; }
+  # An empty `hits` is a hypothesis. It is a MISS only beside a populated store
+  # (this response's own `live_row_count`) AND a common-word control query that
+  # returns rows through the same door; anything else is UNKNOWN.
+  # `vector_arm` says which retrieval ran: `skipped_no_embedding` (the normal
+  # case) means full-text only, so a rephrasing may still hit.
+  L=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search live_row_count -)
+  V=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search vector_arm -)
+  # Control word: pick one that is common in the corpus yet selective
+  # (`dossier`). A stopword such as `the` is dropped by full-text search and
+  # always returns 0; a control that errors or times out leaves `C` unread,
+  # which is UNKNOWN - never a MISS.
+  bash "$REVIVE" call coord_memory_search '{"query_text":"dossier","limit":1}' > "$R/c"
+  C=$(envelope_mcp_body coord_memory_search "$R/c" | envelope_require coord_memory_search hits -)
+  if [ "${L:-0}" -gt 0 ] 2>/dev/null && [ -n "$C" ] && [ "$C" != "[]" ]; then echo "MISS (vector_arm=${V:-unread}): $Q"
+  else echo "UNKNOWN (live_row_count=${L:-unread}, vector_arm=${V:-unread}, control=${C:-unread}): $Q"; fi
+done
+rm -rf "$R"
 ```
 
 **The finding is the primary store; memory is the fallback.** When the first
@@ -1156,10 +1206,8 @@ prefix rule is what makes the head the only row whose title starts with
 **Interim lookup rule (until `title_prefix` lands).** `coord_memory_search` is
 **full-text only** unless the call carries a query vector — read its
 `vector_arm` (`skipped_no_embedding` is the normal case) — so run **at least
-three differently-phrased probes, one of them the literal key above**, and
-treat **every empty answer as UNKNOWN, never as "no dossier"**. Read every coord/web/runner response through `scripts/lib/envelope.py` / `envelope.sh`; assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative.
-The discriminating keys (`live_row_count` from `coord_memory_overview`,
-`vector_arm`) are named in the helper's docstring, not here — the dossier
+three differently-phrased probes, one of them the literal key above** — the
+recipe's loop does, and only its `MISS` line is "no dossier"; the dossier
 `0585cd3f` records why one probe is never enough.
 
 **Resolution path once it lands.** Plan
@@ -1626,10 +1674,15 @@ session that repeats a stale one forecloses the reader's search.
 server-side; the caller presents nothing.
 
 ```bash
-curl -sS -w '\nHTTP %{http_code}\n' \
-  'http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>'
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+curl -sS -w '%{stderr}HTTP %{http_code}\n' \
+  'http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>' > "$R/s"
+envelope_collection 'runner /plan-library/search' data.items "$R/s"   # rows; data.count must agree
+envelope_require    'runner /plan-library/search' data.corpus_health "$R/s"
 # the body, on a runner build that carries the by-id forward (READ-PLAN Phase 2):
-curl -sS 'http://127.0.0.1:9876/plan-library/artifacts/<id>'
+curl -sS -w '%{stderr}HTTP %{http_code}\n' 'http://127.0.0.1:9876/plan-library/artifacts/<id>' > "$R/a"
+envelope_require 'runner /plan-library/artifacts' data "$R/a"
+rm -rf "$R"
 ```
 
 A non-2xx names the host the runner dialled — its configured web base. Record
@@ -1669,10 +1722,26 @@ mint one from the runner (it holds no secret at rest):
 # `data: null` from get_coord_device_token is "this device is unpaired" - a
 # verdict, not a reason to try the next name. Only an HTTP 400 "not in UI Bridge
 # allowlist" (or 404) moves on to the older name for the same slot.
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
-  -H 'Content-Type: application/json' -d '{}'      # -> .data (source: runner-invoke)
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
-  -H 'Content-Type: application/json' -d '{}'      # only after the 400/404 above
+# $R holds a LIVE bearer in $AUTHFILE: `rm -rf "$R"` at the end is not optional.
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
+R=$(mktemp -d); AUTHFILE="$R/auth"
+S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+  http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
+  -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
+# The token never reaches the terminal or argv: it is read (exit 3 on
+# `data: null` = unpaired, or any other shape) straight into the header file.
+S2=""
+if [ "$S1" = 400 ] || [ "$S1" = 404 ]; then   # the older name, ONLY on 400/404
+  S2=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+    http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
+    -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint2" | tail -n 1)
+  echo "HTTP $S1 then $S2" >&2
+  T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint2")
+else
+  echo "HTTP $S1" >&2
+  T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint1")
+fi
+[ -n "$T" ] && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
 
 # DOOR 3b, ONLY when 3a answered HTTP 400 "not in UI Bridge allowlist" (or 404
 # for the route) for BOTH names - a runner build that predates both entries; a
@@ -1692,15 +1761,29 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_web
 # runner unwraps the frontend's `result` envelope before it reaches HTTP.
 # Plans 2026-08-24-headless-box-has-no-working-coord-credential-door,
 # 2026-09-02-steering-layers-unreadable-without-a-credential (1f).
-curl -sS http://127.0.0.1:9876/health   # -> .data.frontendReady
+# The gate is CODE, not the comment above: no bearer from 3a, and BOTH names
+# refused with 400/404.
+case "$S1:$S2" in 400:400|400:404|404:400|404:404) B3=1 ;; *) B3= ;; esac
+if [ ! -s "$AUTHFILE" ] && [ -n "$B3" ]; then
+  curl -sS -w '%{stderr}HTTP %{http_code}\n' http://127.0.0.1:9876/health > "$R/h"
+  if [ "$(envelope_require 'runner /health' data.frontendReady "$R/h")" = true ]; then
+    curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST http://127.0.0.1:9876/ui-bridge/control/page/evaluate \
+      -H 'Content-Type: application/json' \
+      -d '{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}' > "$R/mint3"   # (source: runner-eval)
+    T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint3") \
+      && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
+  else echo "eval door DEAD (frontendReady false or unread) - NOT signed out" >&2; fi
+fi
 
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/control/page/evaluate \
-  -H 'Content-Type: application/json' \
-  -d '{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'   # (source: runner-eval)
-
-# Then read the corpus, staging the bearer OFF argv into $AUTHFILE:
-curl -sS --get 'https://api.qontinui.io/api/v1/plan-library' \
-  --data-urlencode 'kind=plan' --data-urlencode 'slug=<stem>' -H @"$AUTHFILE"
+# Then read the corpus, the bearer staged OFF argv in $AUTHFILE. No bearer at
+# all (3a gave no token, and 3b did not fire or minted nothing) is its own UNKNOWN - name
+# it, rather than let curl's unreadable -H file surface as an empty body:
+if [ -s "$AUTHFILE" ]; then
+  curl -sS -w '%{stderr}HTTP %{http_code}\n' --get 'https://api.qontinui.io/api/v1/plan-library' \
+    --data-urlencode 'kind=plan' --data-urlencode 'slug=<stem>' -H @"$AUTHFILE" > "$R/p"
+  envelope_collection 'web /api/v1/plan-library' items "$R/p"   # `total` is the UNPAGED total
+else echo "UNKNOWN: no bearer minted (Door 3a/3b) - plan-library NOT read" >&2; fi
+rm -rf "$R"                                                    # the bearer goes with it
 ```
 
 Two independent sessions on 2026-08-25 both reported PLAN-STATUS UNKNOWN off a
@@ -1931,17 +2014,22 @@ escalation.
 (`$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`):
 
 ```bash
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+: "${COORD_HTTP_URL:=https://coord.qontinui.io}"
 # every unit LANDED / WATCHED / RECORDED
-curl -sS -X POST \
+curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}"
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}" > "$R/o"
+envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # what coord PERSISTED
 
 # any unit IMPEDED or DROPPED - detail is ONE line, naming the items
-curl -sS -X POST \
+curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/DROPPED items and why>\"}"
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/DROPPED items and why>\"}" > "$R/o"
+envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # compare by PREFIX
+rm -rf "$R"
 ```
 
 `work_completed` is persisted **bare** — coord carries no detail on it, so the
@@ -2115,10 +2203,39 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
-`--reason "unattended: 7 units, all landed"`. It runs the transport cascade and
-handles the id resolution.
+`--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —
+never past it. Part A's steps 0 / 0.5 / 1 / 1a (the subagent stop, the
+live-claims fence, the ownership check) run BEFORE any write, and a
+path-addressed door finishes exactly the id it is given, so a wrong id, or a
+session still holding claims, is still a wrong finish. `/finish-session` then
+runs the transport cascade, and its first rung (Part B Step 1) is the runner's
+path-addressed door: the target is the URL path, and it names no work unit.
 
-If you write it directly instead, **pass `claude_code_session_id` explicitly**,
+That rung is shown here for reference only, so the door is visible from this
+step. **Do not run it yourself** — `/finish-session` Part B Step 1 makes exactly
+this call, behind a `/health` probe, after Part A:
+
+```text
+POST http://127.0.0.1:9876/sessions/<your-own-harness-session-id>/finish
+     {"reason": "unattended: <N> units, all landed"}      # --undo: {"finished": false}
+```
+
+Its answer is read by `/finish-session` Part B Step 1's table, not by its
+status line, branching on `changed` first. `changed: "marker"` with
+`coord.queued: true`, read back `finishSynced: true` (after the table's
+wait-and-re-read when the first read-back shows the write re-queued), is done,
+and so is a `"none"` / `"reason_only"` with `finishSynced: true` (already
+finished and synced). A `404`, a `"marker"` with `coord.queued: false`, a
+`"none"` / `"reason_only"` with `finishSynced: false` and `coord.queued: false`,
+a `finishSynced` still false after that re-read, a body with no `coord` key, or any other status or an empty
+body means the coord half is still owed, and the cascade continues. `9876` is the primary runner's port; Part B Step 1 says when to use
+another.
+
+If you write the coord half directly with `coord_report_status` instead, make
+it progress-only (`session_status` plus the id, no `work_unit_id`,
+`correlation_topic` or `status_text`). If that is refused
+`missing required argument`, pass all three for what this session was actually
+working on, never a placeholder. And **pass `claude_code_session_id` explicitly**,
 and pass **your own** — not whatever `~/.qontinui/agent_session_id` happens to
 hold, which is box-global and has twice been measured pointing at a live peer.
 An unscoped call is refused outright (`harness_session_id_required`); there is no
@@ -2128,13 +2245,23 @@ their resume set.
 
 **When that scoped write is refused, read WHICH refusal you got.** Since
 `qontinui-coord#2052` there are two strings with two different remedies:
-`caller_owns_no_active_session` (absence — *"Register one with `POST /sessions`
-and re-report"*) and `session_not_owned_by_caller` (you own rows, this id
+`caller_owns_no_active_session` (absence — as served at `qontinui-coord`
+`07a192bae`: *"Register one YOURSELF: call `coord_bind_self_session` with that
+same `claude_code_session_id` and `create_if_absent: true`, then re-report"*,
+and it warns that hand-registering through `POST /sessions` takes device and
+tenant from the request body, so a guessed value makes a row your own reads
+never see) and `session_not_owned_by_caller` (you own rows, this id
 resolved to none — *"a row whose `claude_code_session_id` is still NULL is
-invisible to this resolver, and is repaired by
-`POST /coord/sessions/bind-harness-session`"*). The second no longer means "owns
-no row for this device"; that gloss predates `#2052`. Both are expanded, with the
-terminal state to report, in the two-failure split at the end of this step.
+invisible to this resolver, and is repaired by `coord_bind_self_session` (or its
+HTTP twin `POST /coord/sessions/bind-harness-session`)"*). The second no longer
+means "owns no row for this device"; that gloss predates `#2052`. Either way the
+next move is the same. For a runner-hosted session whose `/finish-session`
+run has NOT already taken the runner rung, take it (through `/finish-session`,
+not by hand), which does not consult this predicate. When that rung left the
+coord half owed, a runner-hosted session does NOT create a row — `/finish-session`
+Part A step 1b's runner-hosted arm is the terminal state. An operator-launched
+session **binds its own row, then re-issues the write** — the same step 1b. Both strings are expanded, with the remedy and
+the terminal state that remains, in the two-failure split at the end of this step.
 
 ### What this step is NOT
 
@@ -2159,7 +2286,11 @@ or, when Step 4.9 held it:
 
 > **Session left UNFINISHED** — Step 4.9 headline `<NOT SAFE | UNKNOWN>`: <the trees>.
 
-All three are complete outcomes. A session left unfinished because work genuinely
+All of these, and the terminal lines further down ("Session NOT finished — bind
+attempted and failed" and, runner-hosted, "Session coord half NOT written —
+runner-hosted, own row unbound"), are complete outcomes. When the runner rung
+marked the session but coord was not told, add *"resume set corrected locally;
+coord NOT told"* to whichever line you write. A session left unfinished because work genuinely
 remains is this step working, not failing.
 
 **Bookkeeping, so it never blocks.** This write is visibility, not correctness.
@@ -2169,13 +2300,23 @@ a session reported finished on the strength of an unverified write is exactly
 the false-completeness this whole command exists to prevent.
 
 ⚠️ **"Every rung probed and unavailable" is not one failure — say which of two
-you hit.** `/finish-session`'s cascade is **two** rungs, not three (the
-runner-local `POST /sessions/<id>/finish` was deleted 2026-09-05: it existed on
-no runner build, upstream included — plan
-`2026-09-03-a-finished-session-cannot-record-that-it-finished`). Both remaining
-rungs carry the SAME tool to the SAME server over different transports, so a
-cascade that ends without a write means one of two things, with different
-remedies and different write-ups:
+you hit.** `/finish-session`'s cascade is **three** rungs, runner-local first:
+`POST /sessions/<id>/finish` on the runner, then `coord_report_status` natively,
+then the same tool over the loopback proxy. The dated history: the runner route
+was absent from every build on 2026-09-05, so plan
+`2026-09-03-a-finished-session-cannot-record-that-it-finished` removed it from
+the commands. It landed on 2026-09-10 as `qontinui-runner` `44870ff25` (#1271).
+Plan
+`2026-09-20-the-one-finish-door-that-names-its-target-in-the-path-is-disowned-by-both-closeout-commands`
+put it back first, and makes it coord-reaching and self-describing on a runner
+build carrying that plan's Phase 1. An older build answers with no `coord` key,
+and its coord half is UNKNOWN. The last two
+rungs carry the SAME tool to the SAME server over different transports. So once
+the runner rung is absent (`404`, not runner-hosted) or has left the coord half
+owed, a cascade that ends without a coord write means one of two things, with
+different remedies and different write-ups. When the runner rung answered
+`coord.queued: false`, say *"resume set corrected locally; coord NOT told"*
+beside whichever of the two it was:
 
 - **A transport floor** — no door answered. Run `/coord-revive`, re-issue over
   the door it reports LIVE, and treat a `"Command failed with no output"` write
@@ -2193,14 +2334,29 @@ remedies and different write-ups:
     active `coord.sessions` row at all, so nothing here is a permission problem.
     Coord's own hint: *"this is ABSENCE, not an authorization violation: there is
     no peer's row you reached for … The usual cause is a session that was not
-    runner-spawned, so coord was never told it exists. **Register one with
-    `POST /sessions` and re-report.** Do NOT retry without the argument."*
+    runner-spawned, so coord was never told it exists. **Register one YOURSELF:
+    call `coord_bind_self_session` with that same `claude_code_session_id` and
+    `create_if_absent: true`, then re-report.** … Do NOT retry without the
+    argument."* (as served at `qontinui-coord` `07a192bae`). Never hand-register
+    a row through `POST /sessions`: it takes device and tenant from the request
+    body, and a guessed value creates a row your own reads cannot see. On the
+    runner-hosted arm, `/finish-session` step 1b still does not create (it says
+    why); the remedy above is the operator-launched arm's.
   - **`session_not_owned_by_caller`** — you own rows; this id resolved to none of
-    them. Coord's own hint: *"If you DO own an active session, check whether its
-    row is simply UNBOUND before assuming you mistyped the id: a row whose
-    `claude_code_session_id` is still NULL is invisible to this resolver, and is
-    **repaired by `POST /coord/sessions/bind-harness-session`** — not by
-    re-sending a different UUID."*
+    them. Coord's own hint (served from `qontinui-coord` `59fcdb564` and still served
+at `07a192bae`, until qontinui-coord#2608 lands): *"If you
+    DO own an active session, check whether its row is simply UNBOUND before
+    assuming you mistyped the id: a row whose `claude_code_session_id` is still
+    NULL is invisible to this resolver, and is **repaired by
+    `coord_bind_self_session` (or its HTTP twin
+    `POST /coord/sessions/bind-harness-session`)** NAMING THAT ROW as
+    `coord_session_id` — not by re-sending a different UUID."* That same hint
+    goes on to argue against the create arm on the strength of
+    the device owning rows at all. The device's rows are not the question; an
+    unbound row belonging to THIS session is, and only a runner-hosted session
+    can have one. The discriminator is the `$QONTINUI_RUNNER_CONTEXT` branch
+    before the call and `unbound_sibling_rows` after it — `/finish-session`
+    Part A step 1b.
 
   ⚠️ **This string no longer means "owns no row for this device."** That was true
   before `#2052` (landed `3014d7c6`, 2026-09-09) split absence out, and it is the
@@ -2209,20 +2365,59 @@ remedies and different write-ups:
   `session_not_owned_by_caller` carries **no** diagnostic weight and the split
   above does not apply — check the serving build before reading it as "owns rows".
 
-**On the authorization verdict, record the honest terminal state — this is a
-CHECKED step, not prose.** When the refusal is `session_not_owned_by_caller` and
-the id you sent was your own `$CLAUDE_CODE_SESSION_ID`, the outcome line is:
+**On the authorization verdict, BIND FIRST — this is a CHECKED step, not
+prose.** When either refusal came back for your own `$CLAUDE_CODE_SESSION_ID`,
+first make sure the runner rung above was tried if you are runner-hosted. A
+`coord.queued: true` there, read back `finishSynced: true`, settles the coord
+half with no bind and no fork risk. Otherwise run `/finish-session` Part A
+step 1b before writing any outcome line. In one
+line: branch on `$QONTINUI_RUNNER_CONTEXT` (empty: call
+`coord_bind_self_session` with `create_if_absent: true`, read `unbound_sibling_rows`
+in the answer and name a non-zero value as a possible fork; non-empty: do NOT
+create — the runner binds its own row, as Step 4.9 says — and report the session
+not finished, runner-hosted, own row unbound). Never bind a row picked out of
+`coord_orient`'s `session_activity` — those rows carry no harness id, so a pick
+can bind a PEER. Read the binding back with `coord_orient`
+(`your_session.coord_session_id` non-null), re-run Step 4.9's
+`worktree-handoff.sh` for any tree it reported `coord_row_unbound` (and re-print
+the verdict with the re-run's `transcript:` line in place of the old one), then
+re-issue the finish. The full recipe — including the `coord-revive.sh call` fallback and its
+cwd trap — lives there, once; do not copy it here.
 
-> **Session NOT finished — owns rows, none bound.** `<session id>` on device
-> `<device id>`; coord answered `session_not_owned_by_caller`. The remedy
-> (`POST /coord/sessions/bind-harness-session`) needs the `coord_session_id`
-> this caller cannot learn. Dossier
+**The terminal state is what remains after that attempt**, and it has four
+shapes: the session is runner-hosted (no create, by rule), the bind itself was
+refused, no door carried it, or the bind answered and yet the read-back after
+it still does not resolve `your_session` (including a
+`subject_already_registered: true` whose row is not yours to write). Name that
+fourth shape "bind's read-back did not resolve" in the line below. The outcome line
+is then:
+
+> **Session NOT finished — bind attempted and failed.** `<session id>` on device
+> `<device id>`; the finish write was refused `<reason>`, and
+> `coord_bind_self_session` was then <refused `<its reason>` | not carried:
+> `<the door failure>` | answered, but its read-back did not resolve:
+> `<coord_orient's your_session.reason>`>. Dossier
 > `finish-session-no-safe-rung-for-unregistered-session`.
 
-Record it on that dossier as the next occurrence — a finding ON the dossier, not
-a fresh unattached one; this condition has recurred a dozen times across two
-devices and an unattached finding starts the count over. Quote the reason string,
-the serving build id, and the transport that carried the call.
+On the runner-hosted arm, where no bind is attempted, the line is instead:
+
+> **Session coord half NOT written — runner-hosted, own row unbound.** `<session
+> id>` on device `<device id>`; runner rung: `<Step 1's answer — coord.reason or
+> status; "resume set corrected locally; coord NOT told" when it marked>`; the
+> finish write was refused `<reason>`, and the runner's own row is not bound to
+> this harness id. No row was created (Step 4.9's rule).
+> Dossier `finish-session-no-safe-rung-for-unregistered-session`.
+
+A bind that succeeded on the operator-launched arm but reported a non-zero
+`unbound_sibling_rows` is not a terminal state — it is a finished session with a
+possible fork to name in the report beside it.
+
+Only then, record it on that dossier as the next occurrence — a finding ON the
+dossier, not a fresh unattached one; this condition has recurred across devices
+and an unattached finding starts the count over. Quote the finish write's reason
+string, the bind's reason or door failure, the serving build id, and the
+transport that carried each call. A dossier occurrence recorded **instead of**
+attempting the bind is the failure this step exists to stop.
 
 ⛔ **Do not reach for `~/.qontinui/agent_session_id` to make the write succeed.**
 It is box-global and has twice resolved to a LIVE peer; `/finish-session` step 1a

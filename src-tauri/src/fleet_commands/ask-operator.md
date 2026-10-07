@@ -12,6 +12,14 @@ Use it for a genuine decision you would otherwise escalate AND that the
 operator's priority sets could plausibly govern (an engineering trade-off, a UX
 choice, a deploy/infra call). Don't use it for trivia or pure information.
 
+If what you would ask is permission for an action you believe is closed to
+agents (merging a PR, a runner restart, an operator-gated write), that is not a
+decision between options. Read the served catalog first, with
+`/policy get policy agent-restricted-actions`. A clause that matches names the
+sanctioned hand-off for that one step. Take it, then continue everything else.
+If no clause matches, find the policy clause that would forbid the step before
+you ask. Without one, the step is most likely within your autonomy.
+
 ## Arguments
 
 `<the decision>` — a one-line description of what's being decided. If omitted,

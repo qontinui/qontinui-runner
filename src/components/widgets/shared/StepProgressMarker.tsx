@@ -18,6 +18,7 @@ import { ProgressBar, InlineProgressBar, type ProgressType } from "@/components/
 import { ProgressErrorBoundary } from "@/components/ui/ProgressErrorBoundary";
 import { Loader2 } from "lucide-react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Progress marker data from the API.
@@ -119,7 +120,7 @@ export function useStepProgressMarkers(
       setLatest(data.latest);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      setError(describeThrown(e, "Unknown error"));
     } finally {
       setIsLoading(false);
     }

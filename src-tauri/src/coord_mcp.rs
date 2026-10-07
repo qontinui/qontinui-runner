@@ -897,17 +897,26 @@ static MARKER_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// RAII handle for [`MARKER_OVERRIDE`]: holds the serialization lock for the
 /// test's whole body and restores "no override" on drop, so a panicking test
 /// cannot leak the override into the rest of the suite.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy: `set` takes the env lock
+/// FIRST and holds it beneath the override lock (field `1`, dropped last, so
+/// the `Drop` restore runs with both held). Every holder also holds
+/// `isolated_ambient()`, so either call order nests rather than deadlocks.
 #[cfg(test)]
-struct MarkerOverride(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct MarkerOverride(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    #[allow(dead_code)] crate::test_env::EnvLockGuard,
+);
 
 #[cfg(test)]
 impl MarkerOverride {
     fn set(present: bool) -> Self {
+        let env = crate::test_env::env_lock();
         let guard = MARKER_OVERRIDE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         MARKER_OVERRIDE.store(i8::from(present), std::sync::atomic::Ordering::SeqCst);
-        MarkerOverride(guard)
+        MarkerOverride(guard, env)
     }
 
     /// Flip the operator's switch mid-test — this is what makes "deleting the
@@ -1603,7 +1612,7 @@ pub(crate) fn runner_credential_refusal_body(
         "code": code,
         "since": since,
         "remedy": runner_credential_remedy(status.posture),
-        "error": status.posture.message(),
+        "error": status.reason(),
         "layer": ProxyFailureLayer::RunnerCredential.as_str(),
         "cause": code,
         "next_door": ProxyFailureLayer::RunnerCredential.next_door(),
@@ -6322,11 +6331,14 @@ mod session_tenant_resolution_tests {
         let start = text
             .find("async fn session_bearer_and_tenant_or_refuse(")
             .expect("session_bearer_and_tenant_or_refuse exists");
-        let end = text[start..]
-            .find("\n}\n")
+        let end = text
+            .get(start..)
+            .and_then(|rest| rest.find("\n}\n"))
             .map(|i| start + i)
             .expect("its body ends");
-        let code: String = text[start..end]
+        let code: String = text
+            .get(start..end)
+            .expect("the body is a char-boundary slice")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -13669,13 +13681,12 @@ mod tests {
     /// triggers a restore, not only in the ones that read the log back.
     static RESTORE_FORENSICS_LOCK: Mutex<()> = Mutex::new(());
 
-    pub(super) fn restore_forensics_lock() -> std::sync::MutexGuard<'static, ()> {
-        // A panicking peer test must not cascade into unrelated failures here:
-        // the guard protects an ordering, not an invariant, so poison is
-        // recovered rather than propagated.
-        RESTORE_FORENSICS_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    pub(super) fn restore_forensics_lock() -> crate::test_env::TestLockGuard {
+        // A CHILD of `env_lock` in the test-lock hierarchy: every holder also
+        // holds `isolated_ambient()`, so `hierarchy_lock` takes the env lock
+        // first and either call order nests. Poison is recovered there — the
+        // guard protects an ordering, not an invariant.
+        crate::test_env::hierarchy_lock(&RESTORE_FORENSICS_LOCK)
     }
 
     /// Build one persisted-store value in whatever shape the store currently
@@ -23857,6 +23868,8 @@ mod spawn_tenant_credential_tests {
             since: 0,
             observed_at_unix: 0,
             attributable: true,
+            composed_reason: None,
+            pinned_tenant: false,
         };
 
         let b_path =
