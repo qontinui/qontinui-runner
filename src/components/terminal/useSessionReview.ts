@@ -275,12 +275,15 @@ export function useSessionFileChanges(
   // A pending debounce belongs to the id it was armed for: cleared on every id
   // change (and on unmount), so session A's timer never fires after the
   // surface moved to B. `refresh` also refuses a stale id, as a second line.
+  // Keyed on `sessionId` ONLY: keying on `refreshIfVisible` would silently
+  // cancel a pending debounce whenever a caller passed an unstable fetcher or
+  // fallback, and the cross-session case is already covered by the id key.
   useEffect(
     () => () => {
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = null;
     },
-    [sessionId, refreshIfVisible],
+    [sessionId],
   );
   useSessionEvent("commit-state-changed", "task_run_id", sessionId, onCommitState);
 
