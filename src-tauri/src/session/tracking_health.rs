@@ -699,15 +699,29 @@ pub fn primary_boot_unix_millis() -> Option<i64> {
     PRIMARY_BOOT_UNIX_MILLIS.get().copied()
 }
 
-/// This process generation's boot instant, initializing it to `now()` if
-/// startup has not set it (first writer wins, so every caller agrees on one
-/// value). The gate-continuation generation stamp and the close observer's
-/// prior-generation test (plan
-/// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`) key
-/// on THIS instant — the same one the PID-reuse guard uses — rather than a
-/// second clock. In production startup sets it before any spawn can run.
-pub fn primary_boot_unix_millis_or_init() -> i64 {
-    set_primary_boot_unix_millis(chrono::Utc::now().timestamp_millis())
+/// This process generation's identity: a random v4 UUID minted on first read
+/// and fixed for the life of the process.
+static PROCESS_GENERATION: OnceLock<String> = OnceLock::new();
+
+/// The identity of THIS runner process generation (plan
+/// `2026-10-07-a-resumed-gate-continuation-loses-its-reporter-…`, D1).
+///
+/// Durable records stamp it to say "this process bound / restored me", and
+/// every reader compares it for EQUALITY: a stamp equal to this value was
+/// written by this process, any other stamp by a prior one.
+///
+/// ## Why an id and not an instant
+///
+/// The generation used to be the boot's wall-clock millis, ordered with `<`.
+/// A wall clock is not monotonic across processes: a backwards step across a
+/// reboot (NTP correction, RTC reset, a VM restore) made every record bound by
+/// the PREVIOUS process read as this one, so a lost continuation was silently
+/// never reported and a restored one never re-adopted. A generation is an
+/// identity, not an order, so it is minted at random and only ever compared
+/// for equality. Startup reads it once (`main.rs`) so it is minted before any
+/// spawn or restore can stamp a record.
+pub fn process_generation() -> &'static str {
+    PROCESS_GENERATION.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
 /// Latest completed report — `/health` reads this; the periodic task is the
@@ -1385,7 +1399,8 @@ mod tests {
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
         }
     }
 
