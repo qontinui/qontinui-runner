@@ -2807,6 +2807,56 @@ struct ContinuationSession {
     /// [`load_local_device_id`] (see [`outcome_device_for`]). `None` for a
     /// continuation this process spawned, whose claimer IS the local device.
     consuming_device_id: Option<uuid::Uuid>,
+    /// The pane's PTY child is a SHELL with `claude --resume` typed into it,
+    /// not the agent itself: true only for a continuation a boot restore
+    /// re-registered ([`register_restored_continuation`], plan `2026-10-03-…`
+    /// D3), whose pane `terminal_create` made. The pane's exit facts then
+    /// describe the shell, so [`agent_exit_facts`] withholds its code and the
+    /// outcome classifies `unknown` (or `closed`), never `crashed`/`clean` on
+    /// the shell's say-so. A SUCCESSFUL account-migration hop respawns the
+    /// agent as the direct child and clears it (`account_migration.rs`); a
+    /// failed hop re-pins onto the old shell pane and keeps it.
+    ///
+    /// Known limit: every adoption sets it, including the rare adoption of a
+    /// pane `create_terminal_session_backend` spawned directly (a restored
+    /// continuation migrated before either adoption door fired). That errs to
+    /// `exit=unknown`, which coord never re-delivers.
+    shell_hosted: bool,
+}
+
+/// The `work_unreported` detail BOTH outcome producers post for `session`
+/// ([`prune_dead_continuations`], [`notify_continuation_terminal_exit`]): the
+/// pane's exit facts masked by [`agent_exit_facts`], the lifetime from
+/// registration, and the terminal id. One function so the two cannot drift on
+/// the mask.
+fn continuation_exit_detail(
+    session: &ContinuationSession,
+    exit: Option<crate::terminal::session::PaneExitFacts>,
+    exited_at: Option<std::time::Instant>,
+) -> String {
+    work_unreported_detail(
+        exit.map(|f| agent_exit_facts(session, f)),
+        session_lifetime(session.registered_at, exited_at),
+        &session.terminal_id,
+    )
+}
+
+/// The exit facts that describe the AGENT for `session`: the pane's own facts,
+/// except that a [`ContinuationSession::shell_hosted`] pane's exit CODE is the
+/// shell's and is withheld (`code: None`). `close_requested` is kept — a
+/// runner-initiated close of the pane is still the close it was.
+fn agent_exit_facts(
+    session: &ContinuationSession,
+    facts: crate::terminal::session::PaneExitFacts,
+) -> crate::terminal::session::PaneExitFacts {
+    if session.shell_hosted {
+        crate::terminal::session::PaneExitFacts {
+            code: None,
+            close_requested: facts.close_requested,
+        }
+    } else {
+        facts
+    }
 }
 
 /// The device id a work-outcome POST for `session` must present: the
@@ -2883,6 +2933,7 @@ impl ContinuationRegistry {
         anchor_key: Option<String>,
         gate_id: Option<uuid::Uuid>,
         consuming_device_id: Option<uuid::Uuid>,
+        shell_hosted: bool,
     ) {
         self.live.insert(
             terminal_id.clone(),
@@ -2892,6 +2943,7 @@ impl ContinuationRegistry {
                 gate_id,
                 registered_at: std::time::Instant::now(),
                 consuming_device_id,
+                shell_hosted,
             },
         );
     }
@@ -3164,10 +3216,10 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     let local_device_id = load_local_device_id();
     for session in &reaped {
         let snapshot = pane_exit_facts(&session.terminal_id);
-        let detail = work_unreported_detail(
+        let detail = continuation_exit_detail(
+            session,
             snapshot.map(|(f, _)| f),
-            session_lifetime(session.registered_at, snapshot.map(|(_, at)| at)),
-            &session.terminal_id,
+            snapshot.map(|(_, at)| at),
         );
         // A restored continuation reports under its stored CONSUMING device,
         // never this boot's (plan 2026-10-03 D3).
@@ -3682,11 +3734,30 @@ fn register_continuation_session_with_device(
     gate_id: Option<uuid::Uuid>,
     consuming_device_id: Option<uuid::Uuid>,
 ) {
+    register_continuation_session_hosted(
+        terminal_id,
+        anchor_key,
+        gate_id,
+        consuming_device_id,
+        false,
+    );
+}
+
+/// [`register_continuation_session_with_device`] plus the pane's hosting
+/// ([`ContinuationSession::shell_hosted`]).
+fn register_continuation_session_hosted(
+    terminal_id: String,
+    anchor_key: Option<String>,
+    gate_id: Option<uuid::Uuid>,
+    consuming_device_id: Option<uuid::Uuid>,
+    shell_hosted: bool,
+) {
     lock_recover(continuation_sessions(), "continuation_sessions").insert_live(
         terminal_id,
         anchor_key,
         gate_id,
         consuming_device_id,
+        shell_hosted,
     );
 }
 
@@ -3795,7 +3866,7 @@ impl AnchorReservation {
         let held = self.held.take();
         let anchor_key = held.as_ref().map(|(anchor, _)| anchor.clone());
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
-        registry.insert_live(terminal_id, anchor_key, gate_id, consuming_device_id);
+        registry.insert_live(terminal_id, anchor_key, gate_id, consuming_device_id, false);
         if let Some((anchor, token)) = held {
             // Owner-checked like every other removal, through the SAME
             // comparison — `release_owned` is the only remover there is, so
@@ -3866,11 +3937,7 @@ pub(crate) fn notify_continuation_terminal_exit(
             None => (None, None),
         },
     };
-    let detail = work_unreported_detail(
-        exit,
-        session_lifetime(session.registered_at, exited_at),
-        terminal_id,
-    );
+    let detail = continuation_exit_detail(&session, exit, exited_at);
     let local_device_id = load_local_device_id();
     // The outcome goes out under the continuation's CONSUMING device (a
     // boot-restored session's may not be this boot's — plan 2026-10-03 D3);
@@ -4194,11 +4261,14 @@ pub(crate) fn register_restored_continuation(
     gate_id: uuid::Uuid,
     consuming_device_id: Option<uuid::Uuid>,
 ) {
-    register_continuation_session_with_device(
+    // The resumed pane is a `terminal_create` shell with the resume typed into
+    // it, so its exit facts are the shell's (see `shell_hosted`).
+    register_continuation_session_hosted(
         terminal_id,
         None,
         Some(gate_id),
         consuming_device_id,
+        true,
     );
 }
 
@@ -4292,6 +4362,11 @@ pub(crate) struct CarriedContinuation {
     /// The device that claimed that gate, when it may not be this boot's (a
     /// boot-restored continuation — plan 2026-10-03 D3).
     pub consuming_device_id: Option<uuid::Uuid>,
+    /// The lifted entry's [`ContinuationSession::shell_hosted`]: still true of
+    /// the OLD pane. A hop that respawns the agent as the new pane's direct
+    /// child clears it before the re-pin; a hop that fails and re-pins onto
+    /// the old pane keeps it.
+    pub shell_hosted: bool,
 }
 
 /// Lift a continuation's registry entry off `terminal_id` WITHOUT treating the
@@ -4335,6 +4410,7 @@ pub(crate) fn take_continuation_registration(
                 anchor_key: session.anchor_key,
                 gate_id: session.gate_id,
                 consuming_device_id: session.consuming_device_id,
+                shell_hosted: session.shell_hosted,
             },
             reservation,
         )
@@ -4396,16 +4472,23 @@ pub(crate) fn restore_continuation_registration(
         );
     }
     if reservation.held.is_some() {
+        // Only a dispatched continuation holds an anchor permit, and its pane
+        // runs the agent directly; a restored one has no anchor.
+        debug_assert!(
+            !carried.shell_hosted,
+            "a shell-hosted (restored) continuation carries no anchor permit"
+        );
         reservation.handed_to_registry(terminal_id, carried.gate_id, carried.consuming_device_id);
     } else {
         // A permit over nothing: its drop is a no-op, and the anchor the
         // session actually had lives on `carried`.
         drop(reservation);
-        register_continuation_session_with_device(
+        register_continuation_session_hosted(
             terminal_id,
             carried.anchor_key,
             carried.gate_id,
             carried.consuming_device_id,
+            carried.shell_hosted,
         );
     }
 }
@@ -16958,12 +17041,77 @@ mod tests {
             gate_id: Some(uuid::Uuid::now_v7()),
             registered_at: std::time::Instant::now(),
             consuming_device_id: Some(claimer),
+            shell_hosted: false,
         };
         assert_eq!(outcome_device_for(&s, Some(local)), Some(claimer));
         assert_eq!(outcome_device_for(&s, None), Some(claimer));
         s.consuming_device_id = None;
         assert_eq!(outcome_device_for(&s, Some(local)), Some(local));
         assert_eq!(outcome_device_for(&s, None), None);
+    }
+
+    /// Review of the rebase onto main's exit facts, item 1: a boot-restored
+    /// continuation's pane is a shell, so its exit code is the shell's and must
+    /// not classify the agent's end as `crashed` / `clean`.
+    #[test]
+    fn a_shell_hosted_continuation_withholds_the_shells_exit_code() {
+        use crate::terminal::session::PaneExitFacts;
+        let mut s = ContinuationSession {
+            terminal_id: "t".into(),
+            anchor_key: None,
+            gate_id: Some(uuid::Uuid::now_v7()),
+            registered_at: std::time::Instant::now(),
+            consuming_device_id: None,
+            shell_hosted: true,
+        };
+        let crashed_shell = PaneExitFacts {
+            code: Some(1),
+            close_requested: false,
+        };
+        let closed_tab = PaneExitFacts {
+            code: Some(0),
+            close_requested: true,
+        };
+        assert_eq!(
+            WorkExit::classify(Some(agent_exit_facts(&s, crashed_shell))),
+            WorkExit::Unknown
+        );
+        assert_eq!(
+            WorkExit::classify(Some(agent_exit_facts(&s, closed_tab))),
+            WorkExit::Closed
+        );
+        // At the producers' shared boundary, too.
+        assert!(continuation_exit_detail(&s, Some(crashed_shell), None)
+            .starts_with("exit=unknown code=none "));
+        s.shell_hosted = false;
+        assert_eq!(
+            WorkExit::classify(Some(agent_exit_facts(&s, crashed_shell))),
+            WorkExit::Crashed
+        );
+        assert!(continuation_exit_detail(&s, Some(crashed_shell), None)
+            .starts_with("exit=crashed code=1 "));
+    }
+
+    /// Only the boot-restore door registers a shell-hosted entry; the
+    /// migration / dispatch door does not.
+    #[test]
+    fn only_a_restored_continuation_is_shell_hosted() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::now_v7();
+        register_restored_continuation("term-restored-sh".into(), gate, None);
+        register_continuation_session_with_device("term-direct-sh".into(), None, Some(gate), None);
+        let reg = lock_recover(continuation_sessions(), "continuation_sessions");
+        assert!(
+            reg.live
+                .get("term-restored-sh")
+                .expect("restored")
+                .shell_hosted
+        );
+        assert!(!reg.live.get("term-direct-sh").expect("direct").shell_hosted);
+        drop(reg);
+        clear_continuation_registry();
     }
 
     /// Review r1 item 2: the consuming device survives the account-migration
@@ -16976,10 +17124,33 @@ mod tests {
         let device = uuid::Uuid::now_v7();
         register_restored_continuation("term-r-old".into(), gate, Some(device));
         let (carried, reservation) = take_continuation_registration("term-r-old").unwrap();
+        assert!(
+            carried.shell_hosted,
+            "the lift carries the old pane's hosting"
+        );
+        // Failed hop: back onto the OLD shell pane, still shell-hosted.
+        restore_continuation_registration("term-r-old".into(), carried, reservation);
+        assert!(
+            lock_recover(continuation_sessions(), "continuation_sessions")
+                .live
+                .get("term-r-old")
+                .expect("re-pinned")
+                .shell_hosted
+        );
+        // Successful hop: the respawned pane runs the agent directly.
+        let (mut carried, reservation) = take_continuation_registration("term-r-old").unwrap();
+        carried.shell_hosted = false;
         restore_continuation_registration("term-r-new".into(), carried, reservation);
         assert_eq!(
             registered_continuation_gate("term-r-new"),
             Some((Some(gate), Some(device)))
+        );
+        assert!(
+            !lock_recover(continuation_sessions(), "continuation_sessions")
+                .live
+                .get("term-r-new")
+                .expect("re-pinned")
+                .shell_hosted
         );
         clear_continuation_registry();
     }

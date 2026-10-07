@@ -2886,7 +2886,8 @@ impl SessionLifecycleStore {
     /// current_boot_ms`.
     ///
     /// `None` — and no write — for a record that is closed, absent, carries no
-    /// gate, was not restored by this boot, or is already bound to this
+    /// gate, was not restored by this boot, was restored `terminal-only` (no
+    /// agent is running in the pane), or is already bound to this
     /// generation. That last arm makes the call idempotent.
     pub fn adopt_restored_gate(
         &self,
@@ -2909,6 +2910,18 @@ impl SessionLifecycleStore {
                 .restored_from_boot_at
                 .is_some_and(|t| t >= current_boot_ms)
             {
+                return None;
+            }
+            // A terminal-only restore brought back no conversation and types
+            // no resume: adopting its bare shell would hold a cap slot for
+            // nothing and re-stamp the generation, so its eventual
+            // `terminal-only-idle` close (D2) could not report.
+            //
+            // `failed` is deliberately NOT refused: `mark_restore_pending`
+            // stamps it BEFORE the resume is typed and only a verified
+            // handshake promotes it to `resumed`, so it is the tier every
+            // adoption door sees for a resume that is in fact running.
+            if rec.restore_tier.as_deref() == Some(RESTORE_TIER_TERMINAL_ONLY) {
                 return None;
             }
             let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
@@ -9331,6 +9344,39 @@ mod gate_continuation_tests {
         assert_eq!(s.adopt_restored_gate(&csid, 300), None);
     }
 
+    /// Review of the rebase, item 2: a terminal-only restore of a gate record
+    /// (stamped the way `terminal_session_rebind_terminal` stamps it) is never
+    /// adopted, so its later `terminal-only-idle` close still reports through
+    /// D2 as the prior generation's.
+    #[test]
+    fn a_terminal_only_restore_is_not_adopted_and_still_reports() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        s.record_open(gate_row(100));
+        s.mark_restored_from_boot(&csid, RESTORE_TIER_TERMINAL_ONLY);
+        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
+        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
+        s.record_close(&csid, "terminal-only-idle");
+        let rec = s.get(&csid).unwrap();
+        assert!(runner_restart_unreported_report(&rec, 200).is_some());
+    }
+
+    /// The real resume sequence: `mark_restore_pending` stamps `failed` before
+    /// the resume is typed, and the adoption doors fire before any verified
+    /// handshake promotes it — so `failed` must still adopt.
+    #[test]
+    fn a_pending_resume_tier_failed_still_adopts() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        s.record_open(gate_row(100));
+        s.mark_restore_pending(&csid);
+        assert_eq!(
+            s.get(&csid).unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED)
+        );
+        assert!(s.adopt_restored_gate(&csid, 200).is_some());
+    }
+
     // (g)
     #[test]
     fn non_restorable_close_reasons_exclude_poll_dead() {
@@ -9341,8 +9387,11 @@ mod gate_continuation_tests {
         // Every reason the dead-shell mapping can produce that the restore
         // pass will NOT pick up must be reportable, or a prior-generation
         // continuation closed under it stays `spawned` forever.
-        assert!(NON_RESTORABLE_CLOSE_REASONS
-            .contains(&close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY))));
+        assert!(
+            NON_RESTORABLE_CLOSE_REASONS.contains(&close_reason_for_dead_shell(Some(
+                RESTORE_TIER_TERMINAL_ONLY
+            )))
+        );
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"poll-dead"));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
     }

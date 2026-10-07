@@ -877,7 +877,11 @@ pub fn migrate_session(
             // handed on here: the live row replaces the reservation under one
             // lock, so the anchor moves from held-by-permit to
             // held-by-session with no gap.
-            if let Some((carried, reservation)) = carried_continuation {
+            if let Some((mut carried, reservation)) = carried_continuation {
+                // The respawned pane runs `claude --resume` as its direct
+                // child, so its exit facts are the agent's even when the old
+                // pane was a restored shell.
+                carried.shell_hosted = false;
                 crate::agent_runtime::restore_continuation_registration(
                     terminal_id.clone(),
                     carried,
@@ -1003,6 +1007,7 @@ mod tests {
             anchor_key: None,
             gate_id: Some(gate),
             consuming_device_id: Some(claimer),
+            shell_hosted: false,
         };
         let id = super::carried_gate_identity_for(&carried, Some(local)).expect("identity");
         assert_eq!(id.gate_id, gate);
@@ -1014,6 +1019,7 @@ mod tests {
             anchor_key: None,
             gate_id: Some(gate),
             consuming_device_id: None,
+            shell_hosted: false,
         };
         assert_eq!(
             super::carried_gate_identity_for(&fresh, Some(local)).map(|i| i.consuming_device_id),
@@ -1024,6 +1030,7 @@ mod tests {
             anchor_key: None,
             gate_id: None,
             consuming_device_id: Some(claimer),
+            shell_hosted: false,
         };
         assert!(super::carried_gate_identity_for(&no_gate, Some(local)).is_none());
     }
