@@ -3710,6 +3710,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             session::tracking_health::set_primary_boot_unix_millis(
                 chrono::Utc::now().timestamp_millis(),
             );
+            // Mint this process generation's identity now, before any spawn
+            // or boot restore can stamp a record with it (plan
+            // 2026-10-07-a-resumed-gate-continuation-…, D1). Random, compared
+            // for equality — never ordered by a clock.
+            info!(
+                generation = session::tracking_health::process_generation(),
+                "runner process generation minted"
+            );
 
             // Announce the agent-registry break-glass ONCE, loudly, if it is
             // set. A per-spawn warn in a busy log is not discoverable; an
@@ -4261,7 +4269,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             session::session_lifecycle_store::runner_restart_report_on_close(
                                 &store,
                                 csid,
-                                session::tracking_health::primary_boot_unix_millis_or_init(),
+                                session::tracking_health::process_generation(),
                             );
                         if let Some(report) = report {
                             tracing::info!(
