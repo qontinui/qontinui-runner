@@ -1,0 +1,178 @@
+{
+  "_comment": "Wire fixtures for the fan-out routes (GET /fanout, PATCH /fanout/{id}, POST /fanout/{id}/cancel, POST /fanout) in the runner's ApiResponse envelope, as fanout/model.rs serialises them. Read by StatusStrip.multiZone.test.tsx and PromptModal.test.tsx.",
+  "activeRunList": {
+    "success": true,
+    "data": [
+      {
+        "id": "7f3c9a21-5b6d-4e0f-9a1b-2c3d4e5f6a7b",
+        "tenantId": null,
+        "templateSlug": "review-sweep",
+        "templateVersion": 4,
+        "maxConcurrent": 4,
+        "configDirPolicy": { "kind": "bestHeadroom" },
+        "workingDir": "/work/repo",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "state": "active",
+        "counts": { "queued": 1, "admitted": 1, "released": 0, "cancelled": 0, "refused": 1 },
+        "members": [
+          {
+            "index": 0,
+            "previewIndex": 0,
+            "title": "review-sweep — iOS",
+            "prompt": "Review iOS",
+            "state": "admitted",
+            "terminalId": "term-1",
+            "claudeSessionId": null,
+            "reason": null,
+            "admittedAt": "2026-01-01T00:00:05Z",
+            "releasedAt": null
+          },
+          {
+            "index": 1,
+            "previewIndex": 2,
+            "title": "review-sweep — Android",
+            "prompt": "Review Android",
+            "state": "queued",
+            "terminalId": null,
+            "claudeSessionId": null,
+            "reason": "runner_draining",
+            "admittedAt": null,
+            "releasedAt": null
+          },
+          {
+            "index": 2,
+            "previewIndex": 3,
+            "title": "review-sweep — Web",
+            "prompt": "Review Web",
+            "state": "refused",
+            "terminalId": null,
+            "claudeSessionId": null,
+            "reason": "fanout_bound_occupied",
+            "admittedAt": null,
+            "releasedAt": null,
+            "refusals": 1,
+            "nextRetryAt": null
+          }
+        ]
+      }
+    ]
+  },
+  "capClamped": {
+    "success": true,
+    "data": {
+      "run": {
+        "id": "7f3c9a21-5b6d-4e0f-9a1b-2c3d4e5f6a7b",
+        "tenantId": null,
+        "templateSlug": "review-sweep",
+        "templateVersion": 4,
+        "maxConcurrent": 4,
+        "configDirPolicy": { "kind": "bestHeadroom" },
+        "workingDir": "/work/repo",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "state": "active",
+        "counts": { "queued": 1, "admitted": 1, "released": 0, "cancelled": 0, "refused": 1 },
+        "members": []
+      },
+      "fanoutBound": 4,
+      "clampedFrom": 5
+    }
+  },
+  "afterCancel": {
+    "success": true,
+    "data": {
+      "id": "7f3c9a21-5b6d-4e0f-9a1b-2c3d4e5f6a7b",
+      "tenantId": null,
+      "templateSlug": "review-sweep",
+      "templateVersion": 4,
+      "maxConcurrent": 4,
+      "configDirPolicy": { "kind": "bestHeadroom" },
+      "workingDir": "/work/repo",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "state": "active",
+      "counts": { "queued": 0, "admitted": 1, "released": 0, "cancelled": 2, "refused": 0 },
+      "members": [
+        {
+          "index": 0,
+          "previewIndex": 0,
+          "title": "review-sweep — iOS",
+          "prompt": "Review iOS",
+          "state": "admitted",
+          "terminalId": "term-1",
+          "claudeSessionId": null,
+          "reason": null,
+          "admittedAt": "2026-01-01T00:00:05Z",
+          "releasedAt": null
+        },
+        {
+          "index": 1,
+          "previewIndex": 2,
+          "title": "review-sweep — Android",
+          "prompt": "Review Android",
+          "state": "cancelled",
+          "terminalId": null,
+          "claudeSessionId": null,
+          "reason": "cancelled",
+          "admittedAt": null,
+          "releasedAt": null
+        },
+        {
+          "index": 2,
+          "previewIndex": 3,
+          "title": "review-sweep — Web",
+          "prompt": "Review Web",
+          "state": "cancelled",
+          "terminalId": null,
+          "claudeSessionId": null,
+          "reason": "cancelled",
+          "admittedAt": null,
+          "releasedAt": null
+        }
+      ]
+    }
+  },
+  "createdTwo": {
+    "success": true,
+    "data": {
+      "run": {
+        "id": "c0ffee00-1111-4222-8333-444455556666",
+        "tenantId": null,
+        "templateSlug": "ship-notes",
+        "templateVersion": 2,
+        "maxConcurrent": 3,
+        "configDirPolicy": { "kind": "bestHeadroom" },
+        "workingDir": "/work/repo",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "state": "active",
+        "counts": { "queued": 2, "admitted": 0, "released": 0, "cancelled": 0, "refused": 0 },
+        "members": [
+          {
+            "index": 0,
+            "previewIndex": 0,
+            "title": "ship-notes — iOS",
+            "prompt": "Write release notes for iOS",
+            "state": "queued",
+            "terminalId": null,
+            "claudeSessionId": null,
+            "reason": null,
+            "admittedAt": null,
+            "releasedAt": null
+          },
+          {
+            "index": 1,
+            "previewIndex": 1,
+            "title": "ship-notes — Android",
+            "prompt": "Write release notes for Android",
+            "state": "queued",
+            "terminalId": null,
+            "claudeSessionId": null,
+            "reason": null,
+            "admittedAt": null,
+            "releasedAt": null
+          }
+        ]
+      },
+      "fanoutBound": 6,
+      "clampedFrom": null
+    }
+  }
+}
