@@ -149,7 +149,10 @@ impl TrackedPaths {
 ///   polling loop the moment git's output exceeded the pipe buffer, since
 ///   nothing drains it while we wait — and the whole point of the loop is to be
 ///   able to kill a child that does not finish.
-/// - `GIT_DIR` / `GIT_WORK_TREE` are REMOVED from the child's environment.
+/// - The repository-local git environment (`GIT_DIR`, `GIT_WORK_TREE`,
+///   `GIT_INDEX_FILE`, …) is REMOVED from the child's environment by
+///   [`crate::process_helpers::no_window`], which applies the one shared
+///   scrub (`git_posture::scrub_repo_local_git_env`) to every git it builds.
 ///   `git -C` does not override an inherited `GIT_DIR`, so a runner spawned from
 ///   a hook or a wrapper that exports one would otherwise have the probe consult
 ///   the WRONG repository — and a false "tracked" silently drops a command from
@@ -171,8 +174,6 @@ fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
         .arg("-z")
         .arg("--")
         .arg(".")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .stdin(Stdio::null())
         .stdout(Stdio::from(handle))
         .stderr(Stdio::null())

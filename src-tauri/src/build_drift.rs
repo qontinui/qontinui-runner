@@ -259,10 +259,10 @@ const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
 ///
 /// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]) and
 /// starts from the fleet's single-source credential posture
-/// ([`crate::process_helpers::no_window`] — never a second copy here) with the
-/// repository-local environment scrubbed by ONE shared function,
-/// [`crate::git_trunk::scrub_repo_local_git_env`]: this module's own calls are
-/// built by [`drift_git`], and the trunk-name read
+/// ([`crate::process_helpers::no_window`] — never a second copy here), which
+/// also scrubs the repository-local environment with ONE shared function,
+/// [`qontinui_runner_lib::git_posture::scrub_repo_local_git_env`]: this
+/// module's own calls are built by [`drift_git`], and the trunk-name read
 /// ([`crate::git_trunk::resolve_trunk_branch`]) applies the same scrub inside
 /// its resolver.
 /// `--no-write-fetch-head` keeps the fetch from rewriting the source
@@ -440,16 +440,15 @@ fn candidate_repo_dir() -> Option<PathBuf> {
 }
 
 /// The one `git` command every drift probe starts from:
-/// [`crate::process_helpers::no_window`]'s posture with the repository-local
-/// environment scrubbed ([`crate::git_trunk::scrub_repo_local_git_env`], the
-/// same scrub the trunk resolver applies). `git -C` / `current_dir` do not
+/// [`crate::process_helpers::no_window`]'s posture, which scrubs the
+/// repository-local environment
+/// ([`qontinui_runner_lib::git_posture::scrub_repo_local_git_env`], the same
+/// scrub the trunk resolver applies). `git -C` / `current_dir` do not
 /// override an inherited `GIT_DIR`, so without it a runner started from a git
 /// hook would measure drift — and read the tool policy — from the caller's
 /// repo instead of [`candidate_repo_dir`].
 fn drift_git() -> std::process::Command {
-    let mut cmd = crate::process_helpers::no_window("git");
-    crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
-    cmd
+    crate::process_helpers::no_window("git")
 }
 
 /// Run `git <args>` in `repo`, returning trimmed stdout on success. Any
@@ -1047,7 +1046,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         // Run under a git hook (or any caller that exported them), these
         // would point the fixture's git at the CALLER's repo and index
         // instead of the tempdir — the same scrub production applies.
-        crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
         let out = cmd.output().expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -1169,7 +1168,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
     /// repository-local variable is REMOVED on the command (`get_envs`
     /// reports a removal as `None`), so an inherited value never reaches the
     /// child. That the list is git's own is pinned beside it
-    /// (`git_trunk`'s `repo_local_git_env_covers_gits_own_list`).
+    /// (`git_posture`'s `repo_local_git_env_covers_gits_own_list`).
     #[test]
     fn drift_git_removes_every_repo_local_variable() {
         let cmd = drift_git();
@@ -1178,7 +1177,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             .filter(|(_, value)| value.is_none())
             .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect();
-        for var in crate::git_trunk::REPO_LOCAL_GIT_ENV {
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
             assert!(
                 removed.iter().any(|r| r == var),
                 "drift_git must remove {var}; removed: {removed:?}"
@@ -1201,7 +1200,7 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
                 .current_dir(target.path())
                 .env("GIT_DIR", decoy.path().join(".git"));
             if scrub {
-                crate::git_trunk::scrub_repo_local_git_env(&mut cmd);
+                qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
             }
             let out = cmd.output().expect("git runs");
             assert!(out.status.success(), "{out:?}");
@@ -1239,9 +1238,10 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         reexec::assert_inherited_git_dir(&input("GIT_DIR"));
         let target = Path::new(&target);
 
-        // Control: the production posture UNscrubbed, in the same
-        // `current_dir`, answers for the inherited decoy.
-        let out = crate::process_helpers::no_window("git")
+        // Control: a raw, UNscrubbed git (the production posture now scrubs
+        // at construction), in the same `current_dir`, answers for the
+        // inherited decoy.
+        let out = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(target)
             .output()
