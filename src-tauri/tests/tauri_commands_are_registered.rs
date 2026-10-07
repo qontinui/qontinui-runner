@@ -32,8 +32,12 @@
 //! Every `#[tauri::command]` fn under the scanned roots must be registered
 //! EITHER:
 //!
-//! 1. in `main.rs`'s central `tauri::generate_handler![...]` block (the normal
-//!    path — the frontend invokes these bare, e.g. `invoke("save_settings")`), OR
+//! 1. in its owning module's `crate::ipc_group!(...)` list (the normal path —
+//!    `ipc_registry` routes the bare name, e.g. `invoke("save_settings")`, to
+//!    that module's handler), OR in `main.rs`'s central
+//!    `tauri::generate_handler![...]` block while it still exists (plan
+//!    `2026-10-02-split-run-app-invoke-handler` moves every module onto
+//!    `ipc_group!` and then deletes it), OR
 //! 2. in a plugin that is **actually mounted** on the Tauri builder via
 //!    `.plugin(<module>::init())` in `main.rs` (today: `ui_bridge_plugin`). Those
 //!    commands are reachable under the `plugin:<name>|<cmd>` prefix, so their
@@ -53,9 +57,17 @@
 //!
 //! ## Fixing a failure
 //!
-//! Add the command to the central `generate_handler![...]` block in `main.rs`
-//! (keep it in the block's alphabetical-within-module order). If the command is
-//! dead, delete it instead.
+//! Add the command to the `crate::ipc_group!(...)` list in the module that
+//! defines it (a module with no list yet gets one, plus an entry in
+//! `ipc_registry::GROUPS`). If the command is dead, delete it instead.
+//!
+//! ## Also guarded here
+//!
+//! - **No name is registered twice** — in two groups, or in a group AND the
+//!   central list. The router would silently pick one.
+//! - **No `#[tauri::command(rename = ...)]`.** `ipc_group!` builds each group's
+//!   routing names with `stringify!` on the fn ident, which equals the name
+//!   Tauri registers only when there is no `rename`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -82,6 +94,11 @@ const SCAN_FILES: &[&str] = &[
     "src/mcp_api.rs",
     "src/ui_bridge_plugin.rs",
     "src/lib.rs",
+    "src/config_report_cmd.rs",
+    "src/coord_doctor_cmd.rs",
+    "src/coord_drain_state.rs",
+    "src/prompt_library.rs",
+    "src/repo_detection.rs",
 ];
 
 fn crate_root() -> PathBuf {
@@ -283,6 +300,51 @@ fn handler_list(source: &str) -> BTreeSet<String> {
     out
 }
 
+/// Every bare command ident listed in any `ipc_group!(...)` invocation in
+/// `source`, e.g. `crate::ipc_group!(a11y_capture, a11y_click);`.
+///
+/// `//` comments are stripped first, so prose and doc examples mentioning the
+/// macro never contribute names.
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets come from `find` on ASCII delimiters, so every slice is on a char boundary"
+)]
+fn ipc_group_lists(source: &str) -> Vec<String> {
+    let decommented: String = source
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = decommented[cursor..].find("ipc_group!(") {
+        let body_start = cursor + rel + "ipc_group!(".len();
+        let Some(end_rel) = decommented[body_start..].find(')') else {
+            break;
+        };
+        let body = &decommented[body_start..body_start + end_rel];
+        cursor = body_start + end_rel;
+        for raw in body.split(',') {
+            let ident = raw.trim();
+            if !ident.is_empty() && ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                out.push(ident.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Every `.rs` file under `src/` — `ipc_group!` lists are collected crate-wide,
+/// not only from the scan roots, so a group can never be invisible here.
+fn all_src_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    walk(&crate_root().join("src"), &mut files);
+    files
+}
+
 /// Crate-local plugin modules ACTUALLY mounted on the Tauri builder in `main.rs`
 /// via `.plugin(<module>::init())`. External `tauri_plugin_*` crates are skipped —
 /// they define no commands in this crate.
@@ -339,11 +401,50 @@ fn every_tauri_command_is_registered() {
         fs::read_to_string(root.join("src/main.rs")).expect("failed to read src/main.rs");
 
     let central = handler_list(&main_src);
+
+    // name -> every file whose `ipc_group!` lists it
+    let mut grouped: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for file in all_src_files() {
+        let Ok(src) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(crate_root())
+            .unwrap_or(&file)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        for name in ipc_group_lists(&src) {
+            grouped.entry(name).or_default().push(rel.clone());
+        }
+    }
     assert!(
-        central.len() > 500,
-        "sanity check failed: only parsed {} commands out of main.rs's central \
-         generate_handler! block — the parser is broken, not the codebase",
-        central.len()
+        central.len() + grouped.len() > 500,
+        "sanity check failed: only parsed {} central + {} ipc_group! commands — \
+         the parser is broken, not the codebase",
+        central.len(),
+        grouped.len()
+    );
+
+    let double_registered: Vec<String> = grouped
+        .iter()
+        .filter(|(name, files)| files.len() > 1 || central.contains(*name))
+        .map(|(name, files)| {
+            let central_note = if central.contains(name) {
+                " + main.rs central list"
+            } else {
+                ""
+            };
+            format!("  - {name}  ({}{central_note})", files.join(", "))
+        })
+        .collect();
+    assert!(
+        double_registered.is_empty(),
+        "\n{} command name(s) are registered more than once — the IPC router \
+         would silently pick one registration:\n\n{}\n\nKeep exactly one: the \
+         `ipc_group!` list in the module that defines the command.\n",
+        double_registered.len(),
+        double_registered.join("\n"),
     );
 
     let via_mounted_plugin = mounted_plugin_commands(&main_src);
@@ -361,7 +462,10 @@ fn every_tauri_command_is_registered() {
             .replace('\\', "/");
 
         for name in defined_commands(&src) {
-            if !central.contains(&name) && !via_mounted_plugin.contains(&name) {
+            if !central.contains(&name)
+                && !grouped.contains_key(&name)
+                && !via_mounted_plugin.contains(&name)
+            {
                 unregistered.push((name, rel.clone()));
             }
         }
@@ -371,18 +475,45 @@ fn every_tauri_command_is_registered() {
         unregistered.is_empty(),
         "\n{} `#[tauri::command]` fn(s) are defined but NEVER registered — the \
          frontend cannot invoke them, and calling one fails at runtime with \
-         `Command <name> not found`:\n\n{}\n\nFix: add each to the central \
-         `tauri::generate_handler![...]` block in `src-tauri/src/main.rs` \
-         (alphabetical within its module). If the command is dead, DELETE it — \
-         do not add an allowlist here.\n\nNOTE: adding it to a `commands/*.rs` \
-         `plugin()` fn does NOT register it. Those plugins are not mounted \
-         (see commit 1f1d807f); only `main.rs`'s central handler and plugins \
-         actually mounted via `.plugin(...)` count.\n",
+         `Command <name> not found`:\n\n{}\n\nFix: add each to the \
+         `crate::ipc_group!(...)` list in the module that defines it (see \
+         `src-tauri/src/ipc_registry.rs`). If the command is dead, DELETE it — \
+         do not add an allowlist here.\n\nNOTE: a Tauri *plugin* does NOT \
+         register a bare command — plugin commands are reachable only as \
+         `plugin:<name>|<cmd>` (see commit 1f1d807f); only `ipc_group!` lists, \
+         the central handler and plugins mounted via `.plugin(...)` count.\n",
         unregistered.len(),
         unregistered
             .iter()
             .map(|(name, file)| format!("  - {name}  ({file})"))
             .collect::<Vec<_>>()
             .join("\n"),
+    );
+}
+
+/// `ipc_group!` routes by `stringify!(<fn>)`, which is the registered name only
+/// when the command carries no `rename`. A renamed command would route
+/// nowhere, so the attribute is refused outright.
+#[test]
+fn no_tauri_command_is_renamed() {
+    let mut renamed = Vec::new();
+    for file in all_src_files() {
+        let Ok(src) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim_start();
+            if l.starts_with("#[tauri::command(")
+                && l.replace("rename_all", "").contains("rename")
+            {
+                renamed.push(format!("  - {}:{}", file.display(), i + 1));
+            }
+        }
+    }
+    assert!(
+        renamed.is_empty(),
+        "\n`#[tauri::command(rename = ...)]` is not supported — `ipc_group!` routes \
+         by the fn name. Rename the fn instead:\n\n{}\n",
+        renamed.join("\n"),
     );
 }

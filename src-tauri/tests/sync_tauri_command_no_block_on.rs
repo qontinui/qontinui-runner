@@ -70,6 +70,11 @@ const SCAN_FILES: &[&str] = &[
     "src/mcp_api.rs",
     "src/ui_bridge_plugin.rs",
     "src/lib.rs",
+    "src/config_report_cmd.rs",
+    "src/coord_doctor_cmd.rs",
+    "src/coord_drain_state.rs",
+    "src/prompt_library.rs",
+    "src/repo_detection.rs",
 ];
 
 fn crate_root() -> PathBuf {
