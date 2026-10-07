@@ -158,6 +158,12 @@ pub enum SkipReason {
     Absent,
     /// The caller named an id that is not in the current reapable set.
     NotReapable,
+    /// Another checkout of the SAME allocation (a sibling under the agent's
+    /// `<worktree-root>/<agent-uuid>/` dir) is dirty, unreadable or building
+    /// right now — [`reclaim::busy_allocation_sibling`]. Runner-local and
+    /// execution-time only: the survey never carries it, because only the live
+    /// re-check probes the siblings.
+    SiblingBusy,
 }
 
 impl SkipReason {
@@ -179,6 +185,7 @@ impl SkipReason {
             SkipReason::CoordUnreachable => "coord-unreachable",
             SkipReason::Absent => "absent",
             SkipReason::NotReapable => "not-reapable",
+            SkipReason::SiblingBusy => "sibling-busy",
         }
     }
 
@@ -229,6 +236,10 @@ impl SkipReason {
             }
             SkipReason::Absent => "No longer present on disk.",
             SkipReason::NotReapable => "Not in the reapable set at execution time.",
+            SkipReason::SiblingBusy => {
+                "Another checkout of this allocation is dirty, unreadable or building — \
+                 the removal waits until every sibling is clean and idle."
+            }
         }
     }
 
@@ -1641,6 +1652,27 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
                 worktree_path: item.worktree_path.clone(),
                 reason: reason.as_str(),
                 detail: reason.detail().to_string(),
+            });
+            continue;
+        }
+
+        // The allocation's OTHER checkouts — live, like every guard above, and
+        // only once the target itself passed (each sibling costs a bounded
+        // `git status`). Checked before the dry-run branch so a dry run
+        // reports the same refusal a real run would make.
+        if let Some((sibling, busy)) = reclaim::busy_allocation_sibling(&path) {
+            reclaim::log_busy_sibling_skip(&path, &sibling, busy);
+            let reason = SkipReason::SiblingBusy;
+            outcome.skipped.push(SkippedItem {
+                id: item.id.clone(),
+                worktree_path: item.worktree_path.clone(),
+                reason: reason.as_str(),
+                detail: format!(
+                    "{} ({} is {})",
+                    reason.detail(),
+                    sibling.display(),
+                    busy.as_str()
+                ),
             });
             continue;
         }
@@ -3099,6 +3131,69 @@ mod tests {
         assert!(!outcome.skipped[0].detail.is_empty(), "never a silent drop");
     }
 
+    /// The allocation-sibling guard on the on-demand path: a target that
+    /// passes every one of its OWN live guards (clean, idle, present) is still
+    /// refused while another checkout of the same allocation holds work — as
+    /// `sibling-busy`, naming the sibling, and never removed.
+    #[test]
+    fn removal_waits_while_an_allocation_sibling_is_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("019fbb24-1c2d-7b3e-9f40-5a6b7c8d9e0f");
+        let target = agent_dir.join("qontinui-runner");
+        let sibling = agent_dir.join("qontinui-schemas");
+        for repo in [&target, &sibling] {
+            std::fs::create_dir_all(repo).unwrap();
+            let out = std::process::Command::new("git")
+                .args(["-c", "init.defaultBranch=main", "init", "-q"])
+                .arg(repo)
+                .output()
+                .expect("git on PATH");
+            assert!(out.status.success(), "git init: {out:?}");
+        }
+        // Sibling: a STAGED file, so it is dirty under any ambient config.
+        std::fs::write(sibling.join("wip.txt"), "uncommitted").unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&sibling)
+            .args(["add", "wip.txt"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git add: {out:?}");
+        // Target: clean, and aged past the G6 activity window so the target's
+        // own `building` guard does not answer first.
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&target, old).unwrap();
+
+        let wt = target.to_string_lossy().to_string();
+        let item = SurveyItem {
+            id: norm_path(&wt),
+            worktree_path: wt.clone(),
+            repo: "qontinui-runner".to_string(),
+            branch: None,
+            status: "reapable",
+            reason: None,
+            reason_detail: None,
+            is_dirty: false,
+            building: false,
+            pinned: false,
+            landed_in_main: Some(true),
+            attributable_bytes: 4096,
+            junctioned_paths: Vec::new(),
+            coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
+            ..unattributed_item_fields()
+        };
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        assert!(outcome.removed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.skipped[0].reason, "sibling-busy");
+        assert!(
+            outcome.skipped[0].detail.contains("qontinui-schemas is dirty"),
+            "{}",
+            outcome.skipped[0].detail
+        );
+        assert!(target.exists(), "the target must not be touched");
+    }
+
     // -----------------------------------------------------------------------
     // Phase 3 — WIP custody attribution (plan
     // `2026-08-22-wip-custody-rebuild-survivable-attribution`)
@@ -3967,7 +4062,7 @@ mod tests {
     }
 
     /// Every `SkipReason` variant — the list the per-variant tests iterate.
-    const ALL_SKIP_REASONS: [SkipReason; 16] = [
+    const ALL_SKIP_REASONS: [SkipReason; 17] = [
         SkipReason::Dirty,
         SkipReason::DirtinessUnknown,
         SkipReason::Pinned,
@@ -3984,6 +4079,7 @@ mod tests {
         SkipReason::CoordUnreachable,
         SkipReason::Absent,
         SkipReason::NotReapable,
+        SkipReason::SiblingBusy,
     ];
 
     #[test]
