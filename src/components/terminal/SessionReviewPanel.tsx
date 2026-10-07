@@ -32,7 +32,7 @@ import {
   TextCursorInput,
   X,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, describeThrown } from "@/lib/utils";
 import { FileChangesPanel, type HunkReview, type NoteDraftTarget } from "./FileChangesView";
 import { REVIEW_PANEL_GEOMETRY } from "./promptsPanelLayout";
 import { ORPHAN_LABEL } from "./sessionReview";
@@ -61,8 +61,9 @@ import {
 import type { SessionReviewHandle } from "./useSessionReview";
 import type { PromptsPanelOrientation } from "./ZonePromptsPanel";
 
+/** The bare cause of a rejection; every caller prefixes its own context. */
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return describeThrown(err, "unknown error");
 }
 
 // ---------------------------------------------------------------------------
