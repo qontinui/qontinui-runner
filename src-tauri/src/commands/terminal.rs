@@ -368,7 +368,7 @@ pub async fn terminal_create(
 
             // Store the coord session id on the terminal so close can clean up.
             if let Some(session) = terminal_manager.get(&info.id) {
-                session.set_coord_session_id(coord_id);
+                terminal_manager.bind_coord_session(&session, coord_id);
 
                 // R1 — install the on-exit hook so the PTY waiter thread
                 // closes the coord session mirror the instant the process
@@ -384,7 +384,7 @@ pub async fn terminal_create(
                 // which fires once the session's identity is long past
                 // changing.
                 let exit_pinned_session_id = session.pinned_session_id().to_string();
-                session.set_on_exit(Box::new(move |coord_id, exit_code| {
+                session.set_on_exit(Box::new(move |coord_id, exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -399,7 +399,7 @@ pub async fn terminal_create(
                         &close_registry,
                         coord_id,
                         Some(&exit_pinned_session_id),
-                        exit_code,
+                        exit.agent_exit_code(),
                     );
                 }));
 
@@ -573,6 +573,11 @@ pub async fn terminal_close(
     })
 }
 
+/// Event announcing a runner-spawned session's `claude --name`:
+/// `{ terminalId, spawnName }`, emitted right after `terminal-created`. The
+/// frontend stores it as the immutable `TerminalTab.spawnName`.
+pub const SPAWN_NAME_EVENT: &str = "terminal-spawn-name";
+
 /// List all terminal sessions.
 ///
 /// Alongside the `terminals` array (`TerminalInfo`, which structurally does
@@ -605,6 +610,18 @@ pub fn terminal_list(
 ) -> Result<CommandResponse, String> {
     let terminals = terminal_manager.list();
 
+    // `{ terminal_id -> spawnName }` for runner-spawned sessions, so a
+    // reconnecting webview that missed `terminal-spawn-name` still gets it.
+    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = terminals
+        .iter()
+        .filter_map(|info| {
+            terminal_manager
+                .get(&info.id)
+                .and_then(|s| s.spawn_name())
+                .map(|n| (info.id.clone(), serde_json::Value::String(n)))
+        })
+        .collect();
+
     let mut session_ids_by_terminal = serde_json::Map::new();
     if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
         for info in &terminals {
@@ -626,6 +643,7 @@ pub fn terminal_list(
         data: Some(serde_json::json!({
             "terminals": terminals,
             "sessionIdsByTerminal": serde_json::Value::Object(session_ids_by_terminal),
+            "spawnNamesByTerminal": serde_json::Value::Object(spawn_names_by_terminal),
         })),
     })
 }
@@ -703,6 +721,82 @@ pub fn terminal_get_bracketed_paste(
         success: true,
         message: None,
         data: Some(serde_json::json!({ "bracketedPaste": bracketed })),
+    })
+}
+
+/// Is a `claude` process running in this pane's process subtree right now,
+/// and which session id was it launched with?
+///
+/// WHY. The resume path (boot-restore retype and the "Retry resume" banner)
+/// types `claude --permission-mode bypassPermissions --resume <id>` into the
+/// pane on the assumption it is sitting at a shell prompt. When the handshake
+/// scrape false-negatives, claude IS already running there, and the command
+/// lands as a prompt in the live session. The process table answers "is there
+/// a claude in this pane" without scraping the screen, so the frontend asks
+/// here before every resume write.
+///
+/// `state`:
+/// - `live` / `absent` — readings of the process table. On `live`,
+///   `sessionIds` carries the `--resume` / `--session-id` value parsed from
+///   each claude's command line (one targeted query, only the claude pids);
+///   a claude started with neither, or whose command line was unreadable,
+///   contributes nothing, so a requested id missing from the list is NOT
+///   evidence that a different session runs.
+/// - `remote` — the pane has no local pid; the subtree cannot be observed.
+/// - `unknown` — a LOCAL pane whose process table could not be read. Says
+///   nothing either way, and the caller must not treat it as `absent`.
+#[tauri::command]
+pub async fn terminal_probe_claude(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    use crate::terminal::graceful_exit::{probe_claude_under, ClaudeProbe};
+
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+    let Some(root_pid) = session.child_pid() else {
+        return Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::json!({
+                "state": "remote",
+                "claudePids": [],
+                "sessionIds": [],
+            })),
+        });
+    };
+    let data = match probe_claude_under(Some(root_pid), Vec::new()).await {
+        ClaudeProbe::Readable(p) => {
+            let pids: Vec<u32> = p.subtree_claude.iter().map(|id| id.pid).collect();
+            let session_ids: Vec<String> = if pids.is_empty() {
+                Vec::new()
+            } else {
+                crate::process_capture::process_tree::command_lines_for_pids(&pids)
+                    .await
+                    .values()
+                    .filter_map(|cl| {
+                        crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
+                    })
+                    .collect()
+            };
+            serde_json::json!({
+                "state": if pids.is_empty() { "absent" } else { "live" },
+                "claudePids": pids,
+                "sessionIds": session_ids,
+            })
+        }
+        ClaudeProbe::Unreadable(detail) => serde_json::json!({
+            "state": "unknown",
+            "claudePids": [],
+            "sessionIds": [],
+            "detail": detail,
+        }),
+    };
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(data),
     })
 }
 
@@ -1254,6 +1348,7 @@ pub fn terminal_session_record_open(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -1461,10 +1556,16 @@ pub fn terminal_session_record_close(
 ///
 /// Reversible: pass `finished: false` to unmark.
 ///
-/// `success: false` with `data: null` means the session id is unknown OR the
-/// marker was already in the requested state — the store reports a no-op as
-/// `None`, and reporting a no-op as a successful write would let a caller
-/// believe it changed something it did not.
+/// `success: false` with `data: null` means the session id is unknown — and
+/// only that: an unreadable (lock-poisoned) registry is an `Err`, never an
+/// unknown id. For a
+/// known id `data` is the same body `POST /sessions/{id}/finish` answers
+/// ([`FinishOutcome::response_json`]): what changed (`"marker"`,
+/// `"reason_only"`, or `"none"` for a no-op that wrote nothing) and whether
+/// coord was told (`coord.queued` / `coordSessionId` / `reason`), so neither a
+/// no-op nor a local-only mark can read as a coord write.
+///
+/// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
 #[tauri::command]
 pub fn terminal_session_set_finished(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1472,19 +1573,23 @@ pub fn terminal_session_set_finished(
     finished: bool,
     reason: Option<String>,
 ) -> Result<CommandResponse, String> {
+    use crate::session::session_lifecycle_store::SetFinishedError;
     match store.set_finished(&claude_session_id, finished, reason) {
-        Some(rec) => Ok(CommandResponse {
+        Ok(outcome) => Ok(CommandResponse {
             success: true,
             message: None,
-            data: serde_json::to_value(&rec).ok(),
+            data: Some(outcome.response_json()),
         }),
-        None => Ok(CommandResponse {
+        Err(SetFinishedError::UnknownSession) => Ok(CommandResponse {
             success: false,
-            message: Some(
-                "no such session, or the finished marker was already in that state".to_string(),
-            ),
+            message: Some("no such session in the lifecycle registry".to_string()),
             data: None,
         }),
+        Err(SetFinishedError::Unavailable) => Err(
+            "session lifecycle registry unavailable (lock poisoned) — whether the \
+             session exists is unknown"
+                .to_string(),
+        ),
     }
 }
 
@@ -1876,6 +1981,13 @@ pub(crate) struct SessionCaptureHint {
     pub working_dir: String,
     /// Human-readable title for the restored grid tile.
     pub title: String,
+    /// The `claude --name` this spawn was launched with (already sanitised), or
+    /// `None` when it carries no name. At spawn it is (a) recorded as the commit
+    /// `Session-Name` trailer file for `claude_session_id`, (b) parked on the
+    /// terminal session, and (c) announced to the webview as
+    /// [`SPAWN_NAME_EVENT`] / `terminal_list`'s `spawnNamesByTerminal`, which the
+    /// frontend folds into the immutable `TerminalTab.spawnName`.
+    pub spawn_name: Option<String>,
     /// Page the session should land on (and be durably recorded against) so a
     /// restart re-lands the continuation on its page. `None` → `"default"`.
     pub page_id: Option<String>,
@@ -2193,6 +2305,7 @@ pub(crate) fn create_terminal_session_backend(
     // Keep a handle for the (optional) durable-record poller below, since the
     // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
     let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
+    let app_handle_for_spawn_name = app_handle.clone();
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -2212,6 +2325,30 @@ pub(crate) fn create_terminal_session_backend(
         // A gate continuation is coord-spawned: no picker chose a tenant.
         None,
     )?;
+
+    // Spawn name: park it on the session (so `terminal_list` and a reconnecting
+    // webview can read it), record the commit `Session-Name` trailer file for the
+    // pinned id, and announce it to the webview beside `terminal-created`.
+    if let Some(name) = capture_hint.as_ref().and_then(|h| h.spawn_name.clone()) {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_spawn_name(name.clone());
+        }
+        if let Some(sid) = capture_hint
+            .as_ref()
+            .and_then(|h| h.claude_session_id.as_deref())
+        {
+            if let Err(e) = crate::agent_worktree::custody::write_session_name(sid, &name) {
+                warn!(session_id = %sid, error = %e, "spawn name: trailer file write failed");
+            }
+        }
+        if let Err(e) = tauri::Emitter::emit(
+            &app_handle_for_spawn_name,
+            SPAWN_NAME_EVENT,
+            serde_json::json!({ "terminalId": info.id, "spawnName": name }),
+        ) {
+            warn!(error = %e, "spawn name: terminal-spawn-name emit failed");
+        }
+    }
 
     // Park the pre-acquired isolated edit context on the session so its
     // heartbeat + claim live as long as the PTY and release on close — the
@@ -2264,7 +2401,7 @@ pub(crate) fn create_terminal_session_backend(
         Ok(coord_id) => {
             coord_session_id = Some(coord_id);
             if let Some(session) = terminal_manager.get(&info.id) {
-                session.set_coord_session_id(coord_id);
+                terminal_manager.bind_coord_session(&session, coord_id);
                 let close_registry = session_registry.clone();
                 // Capacity-freed re-poll: capture this terminal's id so the exit
                 // hook can tell `agent_runtime` a continuation slot just freed and
@@ -2278,7 +2415,7 @@ pub(crate) fn create_terminal_session_backend(
                 let exited_terminal_id = info.id.clone();
                 let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
                 let exit_pinned_session_id = session.pinned_session_id().to_string();
-                session.set_on_exit(Box::new(move |coord_id, exit_code| {
+                session.set_on_exit(Box::new(move |coord_id, exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -2289,6 +2426,7 @@ pub(crate) fn create_terminal_session_backend(
                     crate::agent_runtime::notify_continuation_terminal_exit(
                         &exited_terminal_id,
                         exit_rt_handle.as_ref(),
+                        Some(exit),
                     );
                     // Trigger 4 (session_exit) — plan
                     // 2026-08-27-operator-touch-observation-runner-emitter,
@@ -2297,7 +2435,7 @@ pub(crate) fn create_terminal_session_backend(
                         &close_registry,
                         coord_id,
                         Some(&exit_pinned_session_id),
-                        exit_code,
+                        exit.agent_exit_code(),
                     );
                 }));
                 let rx = session.subscribe_output();
@@ -2333,6 +2471,8 @@ pub(crate) fn create_terminal_session_backend(
                 config_dir,
                 working_dir,
                 title,
+                // Consumed earlier (session park + trailer file + event).
+                spawn_name: _,
                 page_id: hint_page_id,
                 claude_session_id: pinned_session_id,
                 zone_index: hint_zone_index,
@@ -2520,6 +2660,7 @@ async fn poll_and_record_session<F>(
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                adopted_from: None,
             };
             store.record_open(record);
             info!(
@@ -2612,6 +2753,7 @@ pub(crate) fn record_pinned_session_open(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2808,6 +2950,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
@@ -3003,6 +3146,7 @@ mod tests {
             config_dir: None,
             working_dir: "/work/dir".to_string(),
             title: "t".to_string(),
+            spawn_name: None,
             page_id: None,
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,
@@ -3049,6 +3193,7 @@ mod tests {
             config_dir: None,
             working_dir: "/work/dir".to_string(),
             title: "Hinted".to_string(),
+            spawn_name: None,
             page_id: None,
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,

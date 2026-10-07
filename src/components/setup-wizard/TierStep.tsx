@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Monitor, KeyRound, Cloud, AlertTriangle } from "lucide-react";
 import { useState } from "react";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
+import { describeThrown } from "@/lib/utils";
 
 interface TierStepProps {
   onNext: () => void;
@@ -123,7 +124,7 @@ export function TierStep({ onNext, onNotice }: TierStepProps) {
       onNext();
     } catch (err) {
       console.error("[TierStep] set_runner_tier failed:", err);
-      setError({ tier, message: err instanceof Error ? err.message : String(err) });
+      setError({ tier, message: describeThrown(err, "Failed to set runner tier") });
     } finally {
       // ALWAYS clear `busy` — including on the success path, where the wizard
       // may or may not still be mounted, and including on a timeout, which the

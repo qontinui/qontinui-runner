@@ -166,6 +166,7 @@ pub(crate) fn apply_typed_resume_effects(
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                adopted_from: None,
             });
             info!(
                 terminal_id = %terminal_id,

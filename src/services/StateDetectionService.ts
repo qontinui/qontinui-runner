@@ -7,7 +7,7 @@
  * as it runs in the Vite frontend environment.
  */
 
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Represents a detected UI element within a state.
@@ -296,7 +296,7 @@ export class StateDetectionService {
 
       throw new StateDetectionError(
         StateDetectionErrorType.INVALID_JSON,
-        `Failed to parse Python bridge output: ${getErrorMessage(error)}`,
+        `Failed to parse Python bridge output: ${describeThrown(error, "unknown error")}`,
         { output, error },
       );
     }

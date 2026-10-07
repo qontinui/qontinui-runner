@@ -61,6 +61,12 @@ export interface HandshakePatterns {
   successPatterns?: RegExp[];
   /** Regex markers unioned with {@link HandshakePatterns.failure}. */
   failurePatterns?: RegExp[];
+  /**
+   * Regexes matched against the pane's CURRENT window title only, never its
+   * body. A title the provider sets at launch is evidence the body cannot
+   * fake, provided the pattern is anchored to the provider's own title.
+   */
+  titlePatterns?: RegExp[];
 }
 
 /**
@@ -72,14 +78,38 @@ export interface HandshakePatterns {
  * The interactive resume-size picker ("Resume from summary?") is itself
  * Claude UI — a pane wedged on it still counts as HANDSHAKE OK (the resume
  * landed; answering the picker is a separate concern).
+ *
+ * Claude Code v2 (measured on 2.1.286) dropped the rounded `╭───╮` input box
+ * for plain `────` rules around a `❯` prompt. Its first paint of a resumed
+ * session in a small pane showed NONE of the older markers: no shortcuts hint,
+ * no status line, no banner. Every boot-restore resume therefore timed out and
+ * was retyped into the live session's prompt. The v2 markers below match
+ * that first paint, and each is anchored against a known false positive:
+ * - "Claude Code" alone also appears in CLI errors printed to the shell
+ *   ("Claude Code requires Node.js …") and in the folder-trust dialog, so the
+ *   logo marker needs the version. The window title is matched separately
+ *   ({@link CLAUDE_TITLE_REGEXES}).
+ * - `❯` is a common shell prompt glyph, and some two-line prompts end their
+ *   first line in a `─` fill. The frame marker needs a rule that starts its
+ *   line, the prompt on the next line, and a closing rule below it.
  */
 export const CLAUDE_HANDSHAKE_REGEXES: RegExp[] = [
   /\? for shortcuts/i, // persistent status-line hint under the input box
   /esc to interrupt/i, // shown while Claude is actively working
   /bypass permissions/i, // permission-mode indicator in the status line
   /Welcome (?:back )?to Claude/i, // launch banner
+  /Claude Code v\d/, // v2 logo line ("▛███▛█ Claude Code v2.1.286")
   /[╭╰]─{3,}/, // rounded input-box / dialog frame
+  /(?:^|\n)[ \t]*─{3,}[ \t]*\r?\n[ \t]*❯[^\n]*\n[ \t]*─{3,}/, // v2 input box: `❯` between two `────` rules
 ];
+
+/**
+ * Claude Code's own window title at launch: a spinner glyph, then
+ * `Claude Code` (`✳ Claude Code`). Matched against the current OSC title
+ * only. The glyph is required because the shell titles the window too, and a
+ * shell title can be a bare path such as `~/Claude Code`.
+ */
+export const CLAUDE_TITLE_REGEXES: RegExp[] = [/^[✳✢✶✻✽·*]\s*Claude Code$/];
 
 /**
  * Definitive evidence that the REQUESTED session did NOT resume — evaluated
@@ -135,6 +165,7 @@ export const claudeDescriptor: SessionProviderDescriptor = {
     success: [],
     failure: [],
     successPatterns: CLAUDE_HANDSHAKE_REGEXES,
+    titlePatterns: CLAUDE_TITLE_REGEXES,
     failurePatterns: CLAUDE_RESUME_FAILURE_REGEXES,
   }),
   restoreTier: () => "full",

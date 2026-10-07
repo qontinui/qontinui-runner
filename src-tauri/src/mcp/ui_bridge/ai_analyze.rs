@@ -261,9 +261,23 @@ pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/ai/recovery/attempt` re-attempts a failed action: ONE `batch_action` (`recovery_attempt`).
+pub async fn ui_bridge_ai_recovery_attempt_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind("recovery_attempt", None);
+    let result =
+        ui_bridge_ai_recovery_attempt_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// `POST /ui-bridge/ai/recovery/attempt` — hand-written rather than
 /// macro-generated so the response passes through [`as_recovery_failure`].
-pub async fn ui_bridge_ai_recovery_attempt_handler(
+async fn ui_bridge_ai_recovery_attempt_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> BridgeResult {

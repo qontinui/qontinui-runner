@@ -33,6 +33,7 @@ import type {
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { invokeOperatorDoor } from "@/lib/operatorDoors";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Service for accessing AI data viewer data via Tauri commands.
@@ -120,7 +121,7 @@ export const aiDataService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to generate summary",
+        error: describeThrown(error, "Failed to generate summary"),
       };
     }
   },

@@ -982,8 +982,10 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
       // so it goes through the same spawn-time resource gate the PTY seam uses.
       // A CRITICAL refusal becomes the "Start anyway" dialog; declining
       // re-throws and lands in the catch below as a normal launch failure.
-      await spawnWithResourceGuard((resourceOverride) =>
-        invoke("launch_runner_instance", { id: instance.id, resourceOverride }),
+      await spawnWithResourceGuard(
+        (resourceOverride) =>
+          invoke("launch_runner_instance", { id: instance.id, resourceOverride }),
+        { label: `runner instance launch (${instance.name})` },
       );
       onLog("success", `Instance '${instance.name}' launched on port ${instance.port}`);
       await loadInstances();

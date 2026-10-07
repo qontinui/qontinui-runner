@@ -371,7 +371,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
     // an IIFE returning a Promise), resolve it before reporting the value.
     // When false, keep the pre-existing direct-path semantics: send the
     // raw return value straight through (non-resolved Promises become
-    // `"[object Promise]"` after JSON.stringify), so existing callers see
+    // `"{}"` after JSON.stringify), so existing callers see
     // no behavior change beyond the newline/escape bugfix.
     let eval_inner = if await_promise {
         format!("await Promise.resolve(eval({}))", expr_literal)

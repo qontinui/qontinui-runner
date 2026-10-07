@@ -807,7 +807,7 @@ pub fn record_suppression(delivery: PingDelivery) {
 pub fn fd_pressure_snapshot_now() -> (FdPressureInputs, u64) {
     let headroom = crate::util::egress_context::fd_headroom();
     let (fd_exhausted_errors, last_exhausted_ms) =
-        qontinui_runner_lib::util::fd_exhaustion::fd_exhaustion_report();
+        qontinui_runner_lib::util::resource_exhaustion::fd_exhaustion_report();
     (
         FdPressureInputs {
             open: headroom.open.counted(),
@@ -862,7 +862,7 @@ pub struct PingDeliveryInputs {
 // The property tested is "could this runner have RECEIVED a pong during the
 // window it is calling the UI dead for?" — answered from two independent
 // authorities: measured headroom (soft RLIMIT_NOFILE − open count) and the
-// EMFILE/ENFILE stamp (`qontinui_runner_lib::util::fd_exhaustion`).
+// EMFILE/ENFILE stamp (`qontinui_runner_lib::util::resource_exhaustion`).
 
 /// Everything [`classify_fd_pressure`] decides from. Every field is either a
 /// measurement or an explicit absence — never a `0` standing in for "did not

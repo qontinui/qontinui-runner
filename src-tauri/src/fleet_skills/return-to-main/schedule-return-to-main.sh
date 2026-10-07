@@ -3,7 +3,9 @@
 # /return-to-main session as ONE task, named `return-to-main`, in the RUNNER'S
 # OWN SCHEDULER.
 #
-# Plan: 2026-09-13-nightly-return-to-main-sweep (Phase 5c).
+# Plan: 2026-09-13-nightly-return-to-main-sweep (Phase 5c); opportunistic
+# scheduling by plan 2026-09-29-quiet-is-measured-by-session-existence-and-
+# machine-wide-so-a-24x7-box-never-gets-one (Phase 5).
 #
 # ascii-only-source
 #
@@ -25,6 +27,38 @@
 # there is DRIFT: --check names it, and the next --install puts the intended
 # body back.
 #
+# -- TWO MODES: A PROBE-GATED CONDITION, OR THE INTERIM CRON -------------------
+# A box that is never empty of sessions has no quiet hour to aim a clock at
+# (measured 2026-09-29: no local hour ever idle, the old 04:20 slot busier than
+# the 07:00-09:00 trough). So where the runner can run a probe, the task is not
+# a clock at all:
+#   condition  schedule {"type":"Condition","value":{"rearmDelayMinutes":120}}
+#              with conditions {"requireProbe":{"enabled":true,"command":[
+#              <bash>, <machine-quiesce-check.sh>, --for, checkout-ff,
+#              --exit-quiet-if-any-repo, --root, <root>],"pollSeconds":300,
+#              "timeoutSeconds":120}} -- the runner runs the quiet check every
+#              5 minutes and fires the job whenever it exits 0 (some repo is
+#              QUIET for a fast-forward AND has something to do), then waits
+#              2 h before looking again. The prompt carries --daily-cap N
+#              (default 3) instead of --not-after: a job that can fire at any
+#              hour is bounded by a count, which the skill enforces (Step 1a).
+#   cron       the interim clock: 07:20 local (the measured trough), prompt
+#              --not-after 09:30. Registered whenever the condition form is
+#              not PROVEN safe.
+# WHICH ONE IS A CAPABILITY READ, NEVER A VERSION GUESS. The runner's serde
+# silently DROPS an unknown `requireProbe`, so a Condition schedule posted to a
+# build that does not enforce it loses its only gate and fires every 2 h around
+# the clock. --install / --check / --dry-run therefore read GET <runner>/health
+# first and take the condition form ONLY when its `schedulerConditions` array
+# (top level or under `data`) contains "require_probe" -- which the runner
+# advertises only when it both evaluates the probe and persists a task's
+# conditions. No answer, a non-2xx, no such field, a field that is not an
+# array, or an array without the entry is UNKNOWN, and UNKNOWN installs the
+# cron and says why. --mode cron forces the cron (there is no forcing the
+# condition form). --check repeats the read: a Condition task on a runner that
+# no longer advertises require_probe is exit 3 (UNGATED), and one on a runner
+# whose capability could not be read is exit 2.
+#
 # -- WHAT IT REGISTERS --------------------------------------------------------
 # API: runner src-tauri/src/mcp/scheduler.rs (routes /scheduler/tasks[/{id}]);
 # shapes: qontinui-schemas rust/src/scheduler.rs (ScheduleExpression,
@@ -32,15 +66,29 @@
 #   name              return-to-main   -- the UPSERT KEY. The runner has no
 #                     unique name, so the helper finds the task by name through
 #                     GET /scheduler/tasks and refuses (exit 3) when two exist.
-#   schedule          {"type":"Cron","value":"<MM> <HH> * * *"} from --at
-#                     (default 04:20). The runner prepends the seconds field of
-#                     a 5-field cron itself (scheduler.rs compute_next_run).
+#   schedule          cron mode: {"type":"Cron","value":"<MM> <HH> * * *"} from
+#                     --at (default 07:20). The runner prepends the seconds
+#                     field of a 5-field cron itself (scheduler.rs
+#                     compute_next_run). Condition mode: see above.
+#   conditions        condition mode: the requireProbe above. Cron mode: `{}`,
+#                     the one spelling that clears a probe a previous
+#                     condition-mode install left behind.
 #   task              {"task_type":"RemoteAgent", prompt, working_directory,
-#                     max_turns 200, timeout_seconds 3600}. The runner's own
+#                     max_turns 400, timeout_seconds 10800}. The runner's own
 #                     defaults (50 turns, 600 s) apply only when these are unset,
-#                     and a sweep plus adjudication does not fit in them.
-#   prompt            /return-to-main --shadow --not-after 06:30  (default)
-#                     /return-to-main --act --not-after 06:30     (--act)
+#                     and a sweep plus adjudication does not fit in them. 10800
+#                     because a dry-run pass A alone measured 15-100 min on the
+#                     Windows operator box (2026-09-26..30) and a 3600 s bound
+#                     killed one night outright; the skill stops WAITING two
+#                     hours in (RTM_WAIT_DEADLINE) and keeps the third hour to
+#                     adjudicate and post the night's finding. 400 turns
+#                     because each bounded 100 s wait on a long pass is a turn
+#                     of its own: about 72 across a full 2 h wait budget,
+#                     plus Step 3's calls for each abstained repo.
+#   prompt            cron:      /return-to-main --shadow --not-after 09:30
+#                                (--act: /return-to-main --act --not-after 09:30)
+#                     condition: /return-to-main --shadow --daily-cap 3
+#                                (--act: /return-to-main --act --daily-cap 3)
 #                     The skill runs in SHADOW unless --act is passed, so arming
 #                     the job means the prompt CONTAINS --act; omitting --shadow
 #                     alone would leave it in shadow.
@@ -48,7 +96,7 @@
 #                     spelling on Windows, because the runner hands it to a
 #                     native process.
 #   catchUpPolicy     run_once, stated explicitly although it is the default: a
-#                     runner that was down at 04:20 fires ONE late run at start,
+#                     runner that was down at 07:20 fires ONE late run at start,
 #                     and --not-after is what bounds that late fire.
 #   skipIfCompleted   false and autoFixOnFailure false, stated explicitly -- a
 #                     skip-after-first-success task would run exactly once.
@@ -84,12 +132,21 @@
 #                                            TZ_DRIFT, drift vs the intended body
 #   schedule-return-to-main.sh --uninstall   delete every task named
 #                                            return-to-main (exit 0 when none remain)
-#   schedule-return-to-main.sh --dry-run     print the request bodies; no network
+#   schedule-return-to-main.sh --dry-run     print the request bodies; the only
+#                                            request is the read-only GET /health
+#                                            that picks the mode
 # Options (any verb; --uninstall ignores them):
-#   --at HH:MM          daily fire time, local, 24 h (default 04:20)
+#   --at HH:MM          cron mode: daily fire time, local, 24 h (default 07:20)
 #   --act               arm the job: the prompt carries --act instead of --shadow
-#   --not-after HH:MM   handed to /return-to-main (default 06:30): a late
-#                       catch-up fire after this local time reports and exits
+#   --not-after HH:MM   cron mode: handed to /return-to-main (default 09:30): a
+#                       late catch-up fire after this local time reports and exits
+#   --daily-cap N       condition mode: handed to /return-to-main (default 3,
+#                       1..24): the most runs the skill starts in one local day
+#   --mode auto|cron    auto (default): condition when the runner advertises
+#                       require_probe, else cron. cron: always the interim cron.
+#   --probe-script PATH condition mode: the machine-quiesce-check.sh the probe
+#                       runs (default: the one this helper was copied from, per
+#                       the run's RESOLVED list, else the one beside it)
 #   --root DIR          workspace root (default: $QONTINUI_ROOT, else resolved
 #                       from this script's own checkout)
 #   --disabled          register the task DISABLED. The create route has no
@@ -165,8 +222,11 @@ fi
 
 # ---- arguments --------------------------------------------------------------
 VERB=""
-AT="04:20"
-NOT_AFTER="06:30"
+AT="07:20"
+NOT_AFTER="09:30"
+DAILY_CAP=3
+MODE_ARG=auto
+PROBE_SCRIPT_ARG=""
 ACT=0
 DISABLED=0
 ROOT_ARG=""
@@ -177,6 +237,12 @@ while [ $# -gt 0 ]; do
         --at=*) AT="${1#*=}" ;;
         --not-after) shift; [ $# -gt 0 ] || usage_die "--not-after needs HH:MM"; NOT_AFTER="$1" ;;
         --not-after=*) NOT_AFTER="${1#*=}" ;;
+        --daily-cap) shift; [ $# -gt 0 ] || usage_die "--daily-cap needs a number"; DAILY_CAP="$1" ;;
+        --daily-cap=*) DAILY_CAP="${1#*=}" ;;
+        --mode) shift; [ $# -gt 0 ] || usage_die "--mode needs auto or cron"; MODE_ARG="$1" ;;
+        --mode=*) MODE_ARG="${1#*=}" ;;
+        --probe-script) shift; [ $# -gt 0 ] || usage_die "--probe-script needs a path"; PROBE_SCRIPT_ARG="$1" ;;
+        --probe-script=*) PROBE_SCRIPT_ARG="${1#*=}" ;;
         --act) ACT=1 ;;
         --disabled) DISABLED=1 ;;
         --root) shift; [ $# -gt 0 ] || usage_die "--root needs a directory"; ROOT_ARG="$1" ;;
@@ -190,6 +256,10 @@ done
 
 valid_hhmm "$AT" || usage_die "--at must be HH:MM (24 h, local), got '$AT'"
 valid_hhmm "$NOT_AFTER" || usage_die "--not-after must be HH:MM (24 h, local), got '$NOT_AFTER'"
+[[ $DAILY_CAP =~ ^[0-9]+$ ]] && [ "$((10#$DAILY_CAP))" -ge 1 ] && [ "$((10#$DAILY_CAP))" -le 24 ] \
+    || usage_die "--daily-cap must be a whole number 1..24, got '$DAILY_CAP'"
+DAILY_CAP="$((10#$DAILY_CAP))"
+case "$MODE_ARG" in auto|cron) ;; *) usage_die "--mode takes auto or cron (the condition form is never forced: it needs the runner's capability), got '$MODE_ARG'" ;; esac
 
 ROOT=""
 WORKDIR=""
@@ -197,16 +267,162 @@ if [ "$VERB" != uninstall ]; then
     rs_resolve_workdir
 fi
 
+# ---- which mode: the runner's own capability, read, never assumed -----------
+# CAP_STATE: advertised | not_advertised | unknown; CAP_WHY says what was read.
+CAP_STATE=unknown
+CAP_WHY=""
+read_capability() {
+    local list
+    if ! api GET /health; then
+        CAP_WHY="the runner at $BASE did not answer GET /health (curl exit $API_RC)"; return
+    fi
+    if [ "$API_CODE" != 200 ]; then
+        CAP_WHY="GET $BASE/health answered HTTP $API_CODE"; return
+    fi
+    case "$API_BODY" in
+        *'"schedulerConditions":'*) ;;
+        *) CAP_WHY="GET $BASE/health carries no schedulerConditions field (a runner build predating the capability, which would run a probe-gated task UNGATED)"; return ;;
+    esac
+    if [[ $API_BODY =~ \"schedulerConditions\":\[([^]]*)\] ]]; then
+        list="${BASH_REMATCH[1]}"
+    else
+        CAP_WHY="GET $BASE/health: schedulerConditions is not an array"; return
+    fi
+    case ",$list," in
+        *',"require_probe",'*) CAP_STATE=advertised; CAP_WHY="GET $BASE/health schedulerConditions [$list] includes require_probe" ;;
+        *) CAP_STATE=not_advertised; CAP_WHY="GET $BASE/health schedulerConditions [$list] does not include require_probe" ;;
+    esac
+}
+
+# The probe's quiet check: an explicit --probe-script; else, when this helper
+# is a night's private copy (Step 0's $RUN_DIR/bin, marked by its RESOLVED
+# list), the file that copy was taken from -- never the frozen copy itself;
+# else the one beside this helper.
+probe_script() {
+    local p="" src
+    if [ -n "$PROBE_SCRIPT_ARG" ]; then
+        p="$PROBE_SCRIPT_ARG"
+    elif [ -f "$SCRIPT_DIR/RESOLVED" ]; then
+        src="$(awk -F '\t' '$1 == "machine-quiesce-check.sh" { print $2; exit }' "$SCRIPT_DIR/RESOLVED" 2>/dev/null)"
+        [ -n "$src" ] && [ "$src" != MISSING ] && p="$src"
+    fi
+    [ -n "$p" ] || p="$SCRIPT_DIR/machine-quiesce-check.sh"
+    [ -f "$p" ] || return 1
+    (cd "$(dirname "$p")" && printf '%s/%s' "$(pwd)" "$(basename "$p")")
+}
+
+SCHED_MODE=cron
+MODE_WHY=""
+PROBE_ARGV=()
+if [ "$VERB" != uninstall ]; then
+    if [ "$MODE_ARG" = cron ]; then
+        MODE_WHY="--mode cron"
+    else
+        read_capability
+        if [ "$CAP_STATE" = advertised ]; then
+            if PROBE_PATH="$(probe_script)"; then
+                SCHED_MODE=condition
+                MODE_WHY="$CAP_WHY"
+                BASH_BIN="$(command -v bash 2>/dev/null)"; [ -n "$BASH_BIN" ] || BASH_BIN=bash
+                PROBE_ARGV=("$(to_native "$BASH_BIN")" "$(to_native "$PROBE_PATH")" --for checkout-ff --exit-quiet-if-any-repo --root "$WORKDIR")
+            else
+                MODE_WHY="$CAP_WHY, but the quiet check the probe would run was not found (${PROBE_SCRIPT_ARG:-beside this helper}); a probe that cannot run is no gate"
+            fi
+        else
+            MODE_WHY="$CAP_WHY -- UNKNOWN whether a probe gate would hold, so the interim cron"
+        fi
+    fi
+fi
+
 # ---- the intended body ------------------------------------------------------
 if [ "$ACT" = 1 ]; then MODE_FLAG=--act; else MODE_FLAG=--shadow; fi
-PROMPT="/return-to-main $MODE_FLAG --not-after $NOT_AFTER"
-MAX_TURNS=200
-TIMEOUT_SECONDS=3600
-DESC="Nightly /return-to-main for this device (plan 2026-09-13-nightly-return-to-main-sweep). Managed by qontinui-claude-config/scripts/schedule-return-to-main.sh; --check reports an edit made here as drift and the next --install reverts it."
+MAX_TURNS=400
+TIMEOUT_SECONDS=10800
+PROBE_POLL_SECONDS=300
+PROBE_TIMEOUT_SECONDS=120
+REARM_DELAY_MINUTES=120
+if [ "$SCHED_MODE" = condition ]; then
+    PROMPT="/return-to-main $MODE_FLAG --daily-cap $DAILY_CAP"
+    RS_SCHEDULE_JSON="{\"type\":\"Condition\",\"value\":{\"rearmDelayMinutes\":$REARM_DELAY_MINUTES}}"
+    _cmd=""
+    for _a in "${PROBE_ARGV[@]}"; do _cmd="${_cmd:+$_cmd,}\"$(jesc "$_a")\""; done
+    RS_CONDITIONS_JSON="{\"requireProbe\":{\"enabled\":true,\"command\":[$_cmd],\"pollSeconds\":$PROBE_POLL_SECONDS,\"timeoutSeconds\":$PROBE_TIMEOUT_SECONDS}}"
+    DESC="Opportunistic /return-to-main for this device: fires when machine-quiesce-check.sh --for checkout-ff --exit-quiet-if-any-repo exits 0, at most $DAILY_CAP run(s) a day (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one). Managed by the return-to-main skill's schedule-return-to-main.sh; --check reports an edit made here as drift and the next --install reverts it."
+else
+    PROMPT="/return-to-main $MODE_FLAG --not-after $NOT_AFTER"
+    RS_CONDITIONS_JSON="{}"
+    DESC="Nightly /return-to-main for this device (plan 2026-09-13-nightly-return-to-main-sweep). Managed by the return-to-main skill's schedule-return-to-main.sh; --check reports an edit made here as drift and the next --install reverts it."
+fi
 rs_build_bodies
 
-if [ "$VERB" = install ] && { [ "$NOT_AFTER" \< "$AT" ] || [ "$NOT_AFTER" = "$AT" ]; }; then
+if [ "$VERB" = install ] && [ "$SCHED_MODE" = cron ] && { [ "$NOT_AFTER" \< "$AT" ] || [ "$NOT_AFTER" = "$AT" ]; }; then
     printf 'schedule-return-to-main: warning: --not-after %s is not later than --at %s on the same day; a fire at %s may report and exit at once\n' "$NOT_AFTER" "$AT" "$AT" >&2
 fi
 
+# The stored requireProbe, read FIELD BY FIELD: the runner serializes it from
+# its own struct, and a key order this helper does not control must never read
+# as drift (or hide one). Sets PROBE_BODY (the object's inside) or returns 1.
+PROBE_BODY=""
+stored_probe() {
+    PROBE_BODY=""
+    [[ $1 =~ \"requireProbe\":\{([^{}]*)\} ]] || return 1
+    PROBE_BODY="${BASH_REMATCH[1]}"
+}
+probe_field() { # <key> -> the stored value (scalar, or the raw [ ... ] of an array)
+    local re
+    if [ "$1" = command ]; then re='(^|,)"command":\[([^]]*)\]'; else re="(^|,)\"$1\":([^,]*)"; fi
+    [[ $PROBE_BODY =~ $re ]] || return 1
+    printf '%s' "${BASH_REMATCH[2]}"
+}
+rs_conditions_drift() {
+    local c="$1" want_cmd v k
+    if ! stored_probe "$c"; then
+        drift_add "the task carries no requireProbe (intended the quiet-check probe)"
+        return 0
+    fi
+    want_cmd="${RS_CONDITIONS_JSON#*\"command\":[}"; want_cmd="${want_cmd%%]*}"
+    v="$(probe_field enabled)" || v="<absent>"
+    [ "$v" = true ] || drift_add "requireProbe.enabled is $v, intended true"
+    v="$(probe_field command)" || v="<absent>"
+    [ "$v" = "$want_cmd" ] || drift_add "requireProbe.command is [$v], intended [$want_cmd]"
+    v="$(probe_field pollSeconds)" || v="<absent>"
+    [ "$v" = "$PROBE_POLL_SECONDS" ] || drift_add "requireProbe.pollSeconds is $v, intended $PROBE_POLL_SECONDS"
+    v="$(probe_field timeoutSeconds)" || v="<absent>"
+    [ "$v" = "$PROBE_TIMEOUT_SECONDS" ] || drift_add "requireProbe.timeoutSeconds is $v, intended $PROBE_TIMEOUT_SECONDS"
+    for k in requireIdle requireRepoInactive timeoutMinutes; do
+        case "$c" in *"\"$k\":{"*|*"\"$k\":"[0-9]*) drift_add "the task carries conditions.$k, which the intended body leaves unset" ;; esac
+    done
+}
+
+# --check: a probe-gated task is only as safe as the runner's enforcement of
+# the probe -- AND only gated at all if the stored task carries an ENABLED
+# requireProbe. Read against the capability read above, AFTER the report.
+rs_check_extra() {
+    case "$1" in
+        *'"schedule":{"type":"Condition"'*) ;;
+        *) return 0 ;;
+    esac
+    if ! stored_probe "$1" || [ "$(probe_field enabled)" != true ]; then
+        say "UNGATED -- this return-to-main task is a Condition schedule with no ENABLED requireProbe: nothing gates it, so it fires every ${REARM_DELAY_MINUTES} min. --install puts the probe back."
+        exit 3
+    fi
+    if [ "$CAP_STATE" = advertised ]; then
+        printf '  gate:              the runner advertises require_probe, and the task carries an enabled requireProbe; this Condition task is gated\n'
+        return 0
+    fi
+    if [ "$MODE_ARG" = cron ]; then
+        printf '  gate:              not read (--mode cron); run --check without it to verify this Condition task is gated\n'
+        return 0
+    fi
+    if [ "$CAP_STATE" = not_advertised ]; then
+        say "UNGATED -- this return-to-main task is a Condition schedule, but $CAP_WHY: it fires every ${REARM_DELAY_MINUTES} min whether or not the machine is quiet. --install replaces it with the interim cron."
+        exit 3
+    fi
+    say "UNKNOWN -- this return-to-main task is a Condition schedule, and whether the runner enforces its probe could not be read: $CAP_WHY"
+    exit 2
+}
+
+if [ "$VERB" != uninstall ]; then
+    say "scheduling mode: $SCHED_MODE ($MODE_WHY)"
+fi
 rs_dispatch "$VERB"

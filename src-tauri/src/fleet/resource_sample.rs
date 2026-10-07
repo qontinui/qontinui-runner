@@ -267,11 +267,18 @@ pub(crate) struct ResourceSample {
     /// see it yet — so a consumer's grade of this number may disagree with
     /// the guard's
     ///
-    /// `resource_guard` re-bases each machine's thread ladder onto its own
-    /// measured at-rest floor, so on a high-core box the runner may enforce
-    /// e.g. 507 / 651 while coord's `DEFAULT_THREAD_WARN_COUNT` /
-    /// `DEFAULT_THREAD_CRITICAL_COUNT` still grade at 256 / 400. **That
-    /// divergence is real, known, and not closed by this field.**
+    /// `resource_guard` derives each machine's thread ceilings from the box —
+    /// session capacity from cores and `MemTotal`, min'd with constant
+    /// blocking-pool headroom above the measured at-rest floor, floored at the
+    /// shipped 256 / 400 plus that floor's shift, and replaceable by the
+    /// operator in either direction (plan `2026-10-01-runner-thread-ceilings-
+    /// ignore-the-machine-and-the-guard-dialog-says-low-memory`) — so on a
+    /// 48-core box under load the runner may enforce e.g. 555 / 747 while
+    /// coord's `DEFAULT_THREAD_WARN_COUNT` / `DEFAULT_THREAD_CRITICAL_COUNT`
+    /// still grade at 256 / 400. **That divergence is real, known, WIDENED by
+    /// that plan, and not closed by this field.** A red coord tile on a scaled
+    /// box is this gap, not a regression; `/health` `threadCeilings` names the
+    /// enforced pair and where each number came from.
     ///
     /// Publishing the effective ceilings beside the reading is the fix, and it
     /// is deliberately NOT done here yet, because it would be inert and noisy:
@@ -290,9 +297,8 @@ pub(crate) struct ResourceSample {
     /// [`crate::settings::SessionGuardSettings`] … so the dashboard's verdict
     /// and the local spawn gate's cannot drift into two opinions." That was
     /// true only while the ceilings were absolute constants. They are now
-    /// re-based onto each machine's measured at-rest thread floor
-    /// ([`crate::resource_guard::machine_thread_shift`]), so a
-    /// 48-core box enforces a different pair from a 4-core one and a hardcoded
+    /// derived per machine ([`crate::resource_guard::merge_thread_ceilings`]),
+    /// so a 48-core box enforces a different pair from a 4-core one and a hardcoded
     /// 256/400 on the reader's side IS the drift that sentence promised could
     /// not happen. Publishing the pair beside the reading is what keeps the
     /// promise; hardcoding it is what breaks it.
@@ -733,7 +739,42 @@ struct MemoryStatus {
 
 /// Both memory pairs in bytes, from ONE OS call. `None` when the call fails —
 /// callers fail OPEN.
+///
+/// Every successful reading is also handed to
+/// `qontinui_runner_lib::util::resource_exhaustion::note_memory_reading`, so
+/// the allocation-failure breadcrumb — which runs inside a failing allocator
+/// and may not call the OS or allocate — can report the last reading this
+/// runner took (plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0). Zero extra syscalls: it records what the spawn gate and the
+/// publisher were reading anyway.
 fn memory_status() -> Option<MemoryStatus> {
+    let m = read_memory_status()?;
+    qontinui_runner_lib::util::resource_exhaustion::note_memory_reading(m.into());
+    Some(m)
+}
+
+impl From<MemoryStatus> for qontinui_runner_lib::util::resource_exhaustion::MemoryReading {
+    fn from(m: MemoryStatus) -> Self {
+        Self {
+            free_commit: m.commit_available,
+            commit_limit: m.commit_total,
+            free_phys: m.phys_available,
+        }
+    }
+}
+
+/// A live reading in the shape the spawn-failure classifier's edge event
+/// carries — registered with
+/// `resource_exhaustion::register_memory_reader` at startup, because the lib
+/// cannot name this bin-only module. Reading it also refreshes the cache.
+pub(crate) fn exhaustion_memory_reading(
+) -> Option<qontinui_runner_lib::util::resource_exhaustion::MemoryReading> {
+    memory_status().map(Into::into)
+}
+
+/// The OS call behind [`memory_status`].
+fn read_memory_status() -> Option<MemoryStatus> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -2839,8 +2880,20 @@ MemAvailable:   15335424 kB
                  gate's own doc argues it does not pay"
             );
         }
+        // `memory_status` is the recording wrapper (it hands each reading to
+        // the allocation-failure breadcrumb's cache — plan
+        // `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+        // Phase 0): it must make exactly ONE read, so wrapping added no
+        // syscall.
+        assert_eq!(
+            body_of("fn memory_status()")
+                .matches("read_memory_status()")
+                .count(),
+            1,
+            "memory_status must take exactly ONE OS reading"
+        );
         // And the probe itself makes exactly one OS call per platform arm.
-        let probe = body_of("fn memory_status()");
+        let probe = body_of("fn read_memory_status()");
         assert_eq!(
             probe.matches("GlobalMemoryStatusEx(").count(),
             1,

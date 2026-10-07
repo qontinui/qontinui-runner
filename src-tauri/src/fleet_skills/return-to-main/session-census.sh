@@ -160,19 +160,67 @@
 # Cursor extension host launching its bundled rust-analyzer (the chain BELOW
 # rust-analyzer is what decides, and that is what was measured), and Linux.
 #
+# ACTIVITY -- OPEN IS NOT WORKING. Every agent row carries `activity`
+# (working | idle | stale | unknown), `session_id` and `activity_evidence`
+# {status, status_age_s, last_message_age_s, subagent_message_age_s, cpu_delta, children, reason,
+# session_id_source}. Plan 2026-09-29-quiet-is-measured-by-session-existence-
+# and-machine-wide-so-a-24x7-box-never-gets-one, Phase 1: on the operator's
+# Linux box that day 245 sessions were open and 8 had exchanged a message in the last hour,
+# so a census that can only say "open" blocks every night. Three signals,
+# cross-checked because each alone can be stale:
+#   1. Claude Code's own record <config-dir>/sessions/<pid>.json -- `status`
+#      (busy | shell | idle | waiting), `statusUpdatedAt`, `sessionId`. The
+#      directories come from `claude_registry_dirs` (the fleet's one locator,
+#      claude-registry-name.sh in this skill's lib/), plus the process's
+#      own $CLAUDE_CONFIG_DIR. The record binds to THIS process only when its
+#      `procStart` equals /proc/<pid>/stat's starttime (a crashed session
+#      leaves its file behind, and pids are reused).
+#   2. The timestamp of the last real `user`/`assistant` line in the session's
+#      transcript or in one of its subagents' (<sid>/subagents/*.jsonl -- a
+#      session waiting on background agents is working) -- NOT the file mtime (`idle_min`, kept as-is), which tool
+#      output and hook writes also bump.
+#   3. The process tree's CPU over ONE shared window (default 5 s) for every
+#      process together, plus its live descendants. A nested agent's subtree
+#      is its own, not its parent's.
+# busy/shell is a candidate: `working` needs a message within
+# --active-minutes (30) OR CPU above --cpu-floor-pct (10) of one core; both
+# arms observed negative is `stale`; an arm that could not be observed is
+# `unknown`. idle/waiting is `idle` -- UNLESS a subagent transcript carries a
+# message within the window or the tree's CPU clears the floor (background
+# agents or a background build run while the main loop sits at a turn
+# boundary), which is `working`. The main transcript's own last message never
+# upgrades an idle record: a turn that has just ended wrote one. No record, an unparseable one, one bound
+# to an earlier process, or any other status value is `unknown` -- the record
+# is a Claude Code INTERNAL file, so a format change must read UNKNOWN (which
+# blocks), never idle. codex/pi read `unknown` (no reader for them). The axis is
+# Linux-only: elsewhere every row reads `unknown` and `activity.status` says why.
+# Measured on that box 2026-09-29: one run over ~250 claude processes costs
+# the 5 s window plus ~0.6 s; CPU over 5 s was 0.01-0.34 s for 224 idle
+# sessions, which is what the 10% floor clears.
+#
 # WHAT A RUNNER RESTART ACTUALLY KILLS: the `runner`-origin sessions. Sessions
 # you started yourself survive it. They die only to a blanket `pkill node` /
 # `pkill claude`, which is separately forbidden [policy: production-and-cost
 # runner-lifecycle].
 #
 # Usage:  session-census.sh [--json] [--quiet] [--self-pid PID[,PID...]]
+#                           [--active-minutes N] [--cpu-sample-seconds N]
+#                           [--cpu-floor-pct N]
 #   --json       one JSON object on stdout (the contract machine-quiesce-check.sh
 #                reads): {as_of, host, os, source, self:{resolved, starts, pids,
 #                agent_pids}, total, runner_spawned, external, restart_kills,
 #                self_agents, builds, runners, processes:[{pid, ppid, kind,
 #                name, origin, age_s, nested_under_agent, launched_by,
 #                ide_check (true | false on a build row, null otherwise),
-#                ancestry, account, cwd, idle_min}], unreadable_nodes:{count,
+#                build_attribution (a non-IDE build row: {pid, name, cwd,
+#                manifest_path, target_dir, target_dir_source, env_read} of
+#                its build ROOT -- see build_attribution(); null otherwise),
+#                ancestry, account, cwd, idle_min, session_id, activity,
+#                activity_evidence}], activity:{status (ok |
+#                not_observable_on_this_os), counts:{working, idle, stale,
+#                unknown} over non-self agents, active_minutes,
+#                cpu_sample_seconds, cpu_floor_pct, cpu_sampled,
+#                registry:{status, dirs}}, unreadable_nodes:{count,
 #                pids, processes:[{pid, ppid, name, age_s, win_session,
 #                runner_descended, ancestry, not_a_service?}]},
 #                service_nodes_ignored:{count, pids, processes:[same shape, with
@@ -185,6 +233,10 @@
 #                plus every descendant of that agent.
 #   --quiet      print nothing; the exit code is the answer.
 #   --self-pid   start the self walk here instead of at this process.
+#   --active-minutes N      a message this recent makes busy/shell `working` (30)
+#   --cpu-sample-seconds N  the one shared CPU window (5; 0 = no sample, so a
+#                           busy/shell session with no recent message is `unknown`)
+#   --cpu-floor-pct N       CPU above N% of one core over the window is working (10)
 #
 # Fixture inputs (tests; no live system needed):
 #   SESSION_CENSUS_OS        linux | macos | windows   (default: uname)
@@ -192,6 +244,10 @@
 #   SESSION_CENSUS_SELF_PID  self-walk start pid(s), in the table's pid space
 #   SESSION_CENSUS_PROC      a /proc root for the Linux environ/cwd reads
 #   SESSION_CENSUS_NOW       epoch seconds used as "now"
+#   SESSION_CENSUS_REGISTRY_DIRS  colon-separated session-record dirs (a fixture
+#                            run reads none unless this is set)
+#   SESSION_CENSUS_PROC_AFTER     a second /proc root: the CPU window's closing
+#                            snapshot, read instead of sleeping
 #   PYTHON                   interpreter to try first
 #
 # Exit:   0 = no runner-hosted agent session other than self
@@ -202,6 +258,7 @@
 set -u
 
 JSON=0; QUIET=0; SELF_PID_ARG=""
+ACTIVE_MINUTES=30; CPU_SAMPLE_S=5; CPU_FLOOR_PCT=10
 while [ $# -gt 0 ]; do
   case "$1" in
     --json)  JSON=1 ;;
@@ -209,6 +266,14 @@ while [ $# -gt 0 ]; do
     --self-pid)
       shift; [ $# -gt 0 ] || { echo "session-census: --self-pid needs a pid" >&2; exit 2; }
       SELF_PID_ARG="$1" ;;
+    --active-minutes|--cpu-sample-seconds|--cpu-floor-pct)
+      _f="$1"; shift
+      case "${1:-}" in ''|*[!0-9]*) echo "session-census: $_f needs a non-negative integer" >&2; exit 2 ;; esac
+      case "$_f" in
+        --active-minutes) ACTIVE_MINUTES="$1" ;;
+        --cpu-sample-seconds) CPU_SAMPLE_S="$1" ;;
+        --cpu-floor-pct) CPU_FLOOR_PCT="$1" ;;
+      esac ;;
     -h|--help) sed -n '2,/^set -u$/{/^set -u$/d;p;}' "$0"; exit 0 ;;
     *) echo "session-census: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -308,8 +373,34 @@ fi
 
 MODE=text; [ "$JSON" = 1 ] && MODE=json; [ "$QUIET" = 1 ] && [ "$JSON" = 0 ] && MODE=quiet
 
+# THE SESSION-RECORD DIRECTORIES for the activity axis (see ACTIVITY in the
+# header). One locator for the whole fleet: `claude_registry_dirs` in
+# claude-registry-name.sh in this skill's lib/ (a private copy, byte-identical to
+# scripts/lib/ -- return-to-main-skill-test.sh section I pins that). A fixture
+# run (SESSION_CENSUS_PS_FILE) reads NO live directory unless
+# SESSION_CENSUS_REGISTRY_DIRS names some: a canned pid must never bind to this
+# box's real record for the same number. A missing locator is not "no records":
+# it is reported, and every claude reads `unknown`.
+REGISTRY_DIRS=""; REGISTRY_STATUS="ok"
+if [ -n "${SESSION_CENSUS_REGISTRY_DIRS+set}" ]; then
+  REGISTRY_DIRS="$(printf '%s' "$SESSION_CENSUS_REGISTRY_DIRS" | tr ':' '\n')"
+elif [ -n "${SESSION_CENSUS_PS_FILE:-}" ]; then
+  REGISTRY_STATUS="fixture: no registry directory given"
+else
+  _sc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # The same lib/-else-config-repo fallback recovery-ref-census.sh uses.
+  if [ -d "$_sc_dir/lib" ]; then _sc_libdir="$_sc_dir/lib"; else _sc_libdir="$_sc_dir/../../../scripts/lib"; fi
+  _sc_lib="$_sc_libdir/claude-registry-name.sh"
+  # shellcheck disable=SC1090
+  if [ -r "$_sc_lib" ] && . "$_sc_lib" && declare -F claude_registry_dirs >/dev/null 2>&1; then
+    REGISTRY_DIRS="$(claude_registry_dirs 2>/dev/null)"
+  else
+    REGISTRY_STATUS="the session-record locator (claude-registry-name.sh) is not in $_sc_libdir"
+  fi
+fi
+
 cat >"$WORK/census.py" <<'PYEOF'
-import json, os, re, socket, sys, time
+import json, os, re, shlex, socket, sys, time
 from datetime import datetime, timezone
 
 os_name, raw_path, self_starts, proc_root, mode, source = sys.argv[1:7]
@@ -583,23 +674,43 @@ def linux_cwd(pid):
         return None
 
 
-def linux_idle_min(pid, acct):
-    # The session holds its scratchpad open, and the scratchpad path carries
-    # the session UUID, which names the transcript.
+# The session holds its scratchpad open, and the scratchpad path carries the
+# session UUID: `<tmp>/claude-<uid>/<project>/<uuid>/...`. <tmp> is /tmp by
+# default and $TMPDIR when a launcher sets one (measured on the operator's
+# Linux box 2026-09-29: `~/.qontinui/scratch/.claude-<acct>/claude-1000/...`, which the
+# `/tmp/`-anchored spelling this replaced never matched -- so idle_min was
+# null for every session there).
+SCRATCH_SID_RE = re.compile(
+    r"/claude-\d+/[^/]+/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/|$)")
+
+
+# `claude --session-id <uuid>` (how the runner spawns a session): a third
+# source for the id when the process has no record and no scratchpad fd.
+ARGV_SID_RE = re.compile(
+    r"(?:^|\s)--session-id[\s=]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\s|$)")
+
+
+def linux_fd_session_id(pid):
     fd_dir = os.path.join(proc_root, str(pid), "fd")
-    sid = None
     try:
-        for fd in os.listdir(fd_dir):
-            try:
-                tgt = os.readlink(os.path.join(fd_dir, fd))
-            except OSError:
-                continue
-            m = re.search(r"/tmp/claude-\d+/[^/]*/([0-9a-f-]{36})/", tgt)
-            if m:
-                sid = m.group(1)
-                break
+        fds = os.listdir(fd_dir)
     except OSError:
         return None
+    for fd in fds:
+        try:
+            tgt = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        m = SCRATCH_SID_RE.search(tgt)
+        if m:
+            return m.group(1)
+    return None
+
+
+def linux_idle_min(sid, acct):
+    """Minutes since the transcript file was last WRITTEN (mtime). Kept as-is
+    for its readers; the activity axis uses the last MESSAGE instead, because
+    tool output and hook writes bump the mtime too."""
     if not sid or not acct or not os.path.isdir(os.path.join(acct, "projects")):
         return None
     for dp, _dn, fn in os.walk(os.path.join(acct, "projects")):
@@ -609,6 +720,290 @@ def linux_idle_min(pid, acct):
             except OSError:
                 return None
     return None
+
+
+# ---- ACTIVITY: is this session WORKING, or merely open? ---------------------
+# (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-
+# a-24x7-box-never-gets-one, Phase 1 / section 2). The table, exactly:
+#   record status busy | shell  -> a CANDIDATE; it is `working` iff
+#        a real user/assistant message landed within --active-minutes, OR
+#        its process tree burned more than --cpu-floor-pct of one core over
+#        the --cpu-sample-seconds window;
+#     `stale` iff BOTH arms were observed and both are negative;
+#     `unknown` iff an arm that could have said working was unobservable.
+#   record status idle | waiting -> `idle`
+#   no record, an unparseable one, one bound to an earlier process with this
+#   pid, or a status value outside those four -> `unknown`
+#   codex / pi -> `unknown` (no activity reader for those harnesses)
+#   any OS but Linux -> `unknown` (the pid binding and the CPU arm need /proc)
+# UNKNOWN is never folded into idle: a Claude Code format change must degrade
+# to today's behaviour (block), not to a false QUIET.
+ACTIVE_MINUTES = int(os.environ.get("QSC_ACTIVE_MINUTES") or 30)
+CPU_SAMPLE_S = int(os.environ.get("QSC_CPU_SAMPLE_S") or 0)
+CPU_FLOOR_PCT = int(os.environ.get("QSC_CPU_FLOOR_PCT") or 10)
+CPU_FLOOR_S = CPU_SAMPLE_S * CPU_FLOOR_PCT / 100.0
+REGISTRY_STATUS = os.environ.get("QSC_REGISTRY_STATUS") or "ok"
+REGISTRY_DIRS = [d for d in (os.environ.get("QSC_REGISTRY_DIRS") or "").splitlines() if d.strip()]
+CANDIDATE_STATUSES = {"busy", "shell"}
+IDLE_STATUSES = {"idle", "waiting"}
+# The tail of a transcript read for the last message. A session whose last
+# message is further back than this many bytes has not spoken for a long time;
+# the arm then reads UNOBSERVED (never "no message"), so it cannot make a
+# session `stale` on its own.
+TRANSCRIPT_TAIL_MAX = 8 * 1024 * 1024
+try:
+    CLK_TCK = os.sysconf("SC_CLK_TCK")
+except (AttributeError, ValueError, OSError):
+    CLK_TCK = 100
+
+
+def proc_stat_table(root):
+    """{pid: (ppid, cumulative cpu seconds incl. reaped children, starttime)}
+    over every numeric entry of a /proc root. ONE pass for the whole box."""
+    out = {}
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            with open(os.path.join(root, n, "stat"), "rb") as fh:
+                raw = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        rest = raw.rsplit(")", 1)[-1].split()
+        try:
+            ppid = int(rest[1])
+            cpu = sum(int(x) for x in rest[11:15]) / float(CLK_TCK)  # utime stime cutime cstime
+            start = rest[19]
+        except (IndexError, ValueError):
+            continue
+        out[int(n)] = (ppid, cpu, start)
+    return out
+
+
+def read_record(path):
+    try:
+        with open(path, "rb") as fh:
+            rec = json.loads(fh.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def find_record(pid, acct, starttime, created):
+    """(record, path, None) for the record bound to THIS process, else
+    (None, path-or-None, reason)."""
+    dirs = []
+    if acct:
+        dirs.append(os.path.join(acct.rstrip("/"), "sessions"))
+    dirs += REGISTRY_DIRS
+    seen, paths = set(), []
+    for d in dirs:
+        d = os.path.normpath(d)
+        if d in seen:
+            continue
+        seen.add(d)
+        f = os.path.join(d, "%d.json" % pid)
+        if os.path.isfile(f):
+            paths.append(f)
+    if not paths:
+        if REGISTRY_STATUS != "ok" and not acct:
+            return None, None, "no session record: %s" % REGISTRY_STATUS
+        return None, None, "no session record <config-dir>/sessions/%d.json in %d searched director%s" % (
+            pid, len(seen), "y" if len(seen) == 1 else "ies")
+    bound, why = [], []
+    for f in paths:
+        rec = read_record(f)
+        if rec is None:
+            why.append("%s is unparseable" % f)
+            continue
+        if rec.get("pid") != pid:
+            why.append("%s names pid %r" % (f, rec.get("pid")))
+            continue
+        ps = rec.get("procStart")
+        if ps is not None and starttime is not None and str(ps) != str(starttime):
+            why.append("%s belongs to an earlier process with this pid (procStart %s, live %s)" % (f, ps, starttime))
+            continue
+        sa = rec.get("startedAt")
+        if (ps is None and isinstance(sa, (int, float)) and not isinstance(sa, bool)
+                and created is not None and sa / 1000.0 < created - 5):
+            why.append("%s predates this process (startedAt before its start)" % f)
+            continue
+        bound.append((rec, f))
+    if not bound:
+        return None, paths[0], "; ".join(why)
+    sids = {str(r.get("sessionId")) for r, _ in bound}
+    if len(sids) > 1:
+        return None, bound[0][1], "%d records bind this pid to different sessions" % len(bound)
+    return bound[0][0], bound[0][1], None
+
+
+_project_index = {}
+
+
+def transcript_path(cfg_dir, cwd, sid):
+    projects = os.path.join(cfg_dir, "projects")
+    if isinstance(cwd, str) and cwd:
+        cand = os.path.join(projects, re.sub(r"[^A-Za-z0-9]", "-", cwd), sid + ".jsonl")
+        if os.path.isfile(cand):
+            return cand
+    # Claude Code shortens a long project-dir name, so fall back to an index of
+    # this config dir's project folders -- built once per config dir.
+    idx = _project_index.get(projects)
+    if idx is None:
+        idx = {}
+        try:
+            for pd in os.listdir(projects):
+                try:
+                    for fn in os.listdir(os.path.join(projects, pd)):
+                        if fn.endswith(".jsonl"):
+                            idx.setdefault(fn[:-6], os.path.join(projects, pd, fn))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        _project_index[projects] = idx
+    return idx.get(sid)
+
+
+def iso_epoch(v):
+    if not isinstance(v, str):
+        return None
+    m = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$", v)
+    if not m:
+        return None
+    base = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    return base + (float("0." + m.group(2)) if m.group(2) else 0.0)
+
+
+def last_message_epoch(path):
+    """(epoch of the last real user/assistant line, complete). `complete` is
+    True when the whole file was scanned, so a None epoch then means "none
+    ever" rather than "not within the tail read"."""
+    try:
+        size = os.path.getsize(path)
+        fh = open(path, "rb")
+    except OSError:
+        return None, False
+    with fh:
+        block, buf, pos = 65536, b"", size
+        while pos > 0 and size - pos < TRANSCRIPT_TAIL_MAX:
+            step = min(block, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + buf
+            lines = buf.split(b"\n")
+            # lines[0] may be a partial line unless the read reached the start.
+            head, body = (lines[0], lines[1:]) if pos > 0 else (b"", lines)
+            for ln in reversed(body):
+                if b'"type":"user"' not in ln and b'"type":"assistant"' not in ln:
+                    continue
+                try:
+                    d = json.loads(ln.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if not isinstance(d, dict) or d.get("type") not in ("user", "assistant") or d.get("isMeta") is True:
+                    continue
+                ts = iso_epoch(d.get("timestamp"))
+                if ts is not None:
+                    return ts, True
+            buf = head
+            block = min(block * 2, 1024 * 1024)
+        return None, pos == 0
+
+
+def tree_of(pid, table, stop):
+    """pid plus every descendant in `table`, not descending into a pid in
+    `stop` (a nested agent owns its own subtree)."""
+    kids = {}
+    for c, (pp, _cpu, _st) in table.items():
+        kids.setdefault(pp, []).append(c)
+    out, stack = [], [pid]
+    while stack:
+        x = stack.pop()
+        out.append(x)
+        for c in kids.get(x, ()):
+            if c not in stop and c not in out:
+                stack.append(c)
+    return out
+
+
+def classify_activity(rec, rec_why, msg_age, msg_observed, cpu_delta, sub_age=None):
+    if rec is None:
+        return "unknown", rec_why
+    st = rec.get("status")
+    if st in IDLE_STATUSES:
+        # `idle` / `waiting` describe the MAIN loop only: a session at a turn
+        # boundary whose background subagents are still talking, or whose tree
+        # is burning CPU (a run_in_background build), is working. The main
+        # transcript's own last message is deliberately NOT an upgrade -- a turn
+        # that just ended wrote one.
+        if sub_age is not None and sub_age <= ACTIVE_MINUTES * 60:
+            return "working", "record status %s, but a subagent message %ds ago (within %d min)" % (st, sub_age, ACTIVE_MINUTES)
+        if cpu_delta is not None and cpu_delta > CPU_FLOOR_S:
+            return "working", "record status %s, but %.2f cpu-s over %ds (floor %.2f)" % (st, cpu_delta, CPU_SAMPLE_S, CPU_FLOOR_S)
+        return "idle", "record status %s" % st
+    if st not in CANDIDATE_STATUSES:
+        return "unknown", "record status %r is not one of busy/shell/idle/waiting" % (st,)
+    if msg_age is not None and msg_age <= ACTIVE_MINUTES * 60:
+        return "working", "record status %s and a message %ds ago (within %d min)" % (st, msg_age, ACTIVE_MINUTES)
+    if cpu_delta is not None and cpu_delta > CPU_FLOOR_S:
+        return "working", "record status %s and %.2f cpu-s over %ds (floor %.2f)" % (st, cpu_delta, CPU_SAMPLE_S, CPU_FLOOR_S)
+    if msg_observed and cpu_delta is not None:
+        return "stale", "record status %s but no message within %d min and %.2f cpu-s over %ds (floor %.2f)" % (
+            st, ACTIVE_MINUTES, cpu_delta, CPU_SAMPLE_S, CPU_FLOOR_S)
+    return "unknown", "record status %s, no message within %d min, and the %s could not be observed" % (
+        st, ACTIVE_MINUTES, "CPU sample" if cpu_delta is None else "last message")
+
+
+# A build's ATTRIBUTION -- which checkout it reads and writes -- comes from its
+# build ROOT: the outermost process on its chain that is still part of the
+# build (the `cargo` above a `rustc` or a build script; a rustc's own cwd is
+# often a registry crate's). Read there: the cwd (Linux /proc only), a
+# `--manifest-path` / `--target-dir` on its command line, and CARGO_TARGET_DIR
+# / CARGO_BUILD_TARGET_DIR in its environment (Linux only). A field that could
+# not be read is null -- the consumer decides what an unattributable build
+# blocks; this census never guesses.
+def _flag_value(tokens, flag):
+    for i, t in enumerate(tokens):
+        if t == flag and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if t.startswith(flag + "="):
+            return t[len(flag) + 1:]
+    return None
+
+
+def build_attribution(p, anc):
+    top = p
+    for a in anc:
+        if a["kind"] == "build" or a["norm"] in BUILD_HOPS or a["norm"].startswith("build-script-"):
+            top = a
+            continue
+        break
+    try:
+        toks = shlex.split(top["cmd"] or "", posix=(os_name != "windows"))
+    except ValueError:
+        toks = (top["cmd"] or "").split()
+    toks = [t.strip('"') for t in toks]
+    target, source = _flag_value(toks, "--target-dir"), None
+    if target:
+        source = "flag"
+    env = linux_env(top["pid"]) if os_name == "linux" else {}
+    if not target:
+        for k in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+            if env.get(k):
+                target, source = env[k], "env:" + k
+                break
+    return {"pid": top["pid"], "name": top["name"],
+            "cwd": linux_cwd(top["pid"]) if os_name == "linux" else None,
+            "manifest_path": _flag_value(toks, "--manifest-path"),
+            "target_dir": target, "target_dir_source": source,
+            # Whether the ENVIRONMENT was readable at all: a null target_dir
+            # with env_read true means cargo's default (<workspace>/target).
+            "env_read": bool(env) if os_name == "linux" else False}
 
 
 rows = []
@@ -652,6 +1047,9 @@ for p in sorted(procs.values(), key=lambda x: x["pid"]):
             launched_by = "%s(%d)" % (a["name"], a["pid"])
             break
     acct = env.get("CLAUDE_CONFIG_DIR") if env else None
+    fd_sid = linux_fd_session_id(p["pid"]) if os_name == "linux" and kind == "claude" else None
+    m = ARGV_SID_RE.search(p["cmd"] or "") if kind == "claude" else None
+    argv_sid = m.group(1) if m else None
     rows.append({
         "pid": p["pid"],
         "ppid": p["ppid"],
@@ -662,11 +1060,134 @@ for p in sorted(procs.values(), key=lambda x: x["pid"]):
         "nested_under_agent": nested,
         "launched_by": launched_by,
         "ide_check": ide_check,
+        "build_attribution": build_attribution(p, anc) if kind == "build" and not ide_check else None,
         "ancestry": ["%s(%d)" % (a["name"], a["pid"]) for a in anc[:8]],
         "account": os.path.basename(acct.rstrip("/")) if acct else None,
         "cwd": linux_cwd(p["pid"]) if os_name == "linux" and kind in AGENTS else None,
-        "idle_min": linux_idle_min(p["pid"], acct) if os_name == "linux" and kind in AGENTS else None,
+        "idle_min": linux_idle_min(fd_sid, acct) if os_name == "linux" and kind == "claude" else None,
+        "session_id": None,
+        "activity": None,
+        "activity_evidence": None,
+        "_acct": acct,
+        "_fd_sid": fd_sid,
+        "_argv_sid": argv_sid,
+        "_created": p["created"],
     })
+
+
+# ---- the activity pass (see ACTIVITY above) --------------------------------
+agent_pids = {r["pid"] for r in rows if r["kind"] in AGENTS}
+activity_status = "ok" if os_name == "linux" else "not_observable_on_this_os"
+t0_stat = proc_stat_table(proc_root) if os_name == "linux" else None
+t0_clock = time.time()
+pending = []
+for r in rows:
+    if r["kind"] not in AGENTS:
+        continue
+    ev = {"status": None, "status_age_s": None, "last_message_age_s": None,
+          "cpu_delta": None, "children": None, "reason": None, "session_id_source": None}
+    r["activity_evidence"] = ev
+    if r["kind"] != "claude":
+        r["activity"] = "unknown"
+        ev["reason"] = "no activity reader for a %s session" % r["kind"]
+        continue
+    if os_name != "linux":
+        r["activity"] = "unknown"
+        ev["reason"] = ("the activity axis is Linux-only: the record's pid binding and the CPU arm read /proc, "
+                        "which %s does not have" % os_name)
+        continue
+    start = t0_stat.get(r["pid"], (None, None, None))[2] if t0_stat else None
+    rec, _path, why = find_record(r["pid"], r["_acct"], start, r["_created"])
+    if rec is not None:
+        ev["status"] = rec.get("status") if isinstance(rec.get("status"), str) else repr(rec.get("status"))
+        su = rec.get("statusUpdatedAt")
+        if isinstance(su, (int, float)) and not isinstance(su, bool):
+            ev["status_age_s"] = int(now - su / 1000.0)
+        rsid = rec.get("sessionId") if isinstance(rec.get("sessionId"), str) else None
+        if rsid and r["_fd_sid"] and rsid != r["_fd_sid"]:
+            # The record is rewritten by the live process; the scratchpad fd can
+            # lag a /clear or an in-process /resume. The record wins, and the
+            # disagreement is shown rather than hidden.
+            ev["session_id_fd"] = r["_fd_sid"]
+        msg_age, msg_observed, sub_age = None, False, None
+        if rsid:
+            tp = transcript_path(os.path.dirname(os.path.dirname(_path)), rec.get("cwd"), rsid)
+            if tp:
+                ts, complete = last_message_epoch(tp)
+                # A session waiting on its own background subagents talks in
+                # <sid>/subagents/*.jsonl, not in its main transcript. Only a
+                # file WRITTEN inside the window can hold a message inside it,
+                # so the mtime filter keeps this to the live few.
+                sub = os.path.join(tp[:-6], "subagents")
+                try:
+                    subs = [os.path.join(sub, f) for f in os.listdir(sub) if f.endswith(".jsonl")]
+                except OSError:
+                    subs = []
+                for sf in subs:
+                    try:
+                        if os.stat(sf).st_mtime < now - ACTIVE_MINUTES * 60:
+                            continue
+                    except OSError:
+                        continue
+                    sts, _c = last_message_epoch(sf)
+                    if sts is not None and (ts is None or sts > ts):
+                        ts = sts
+                    if sts is not None and (sub_age is None or now - sts < sub_age):
+                        sub_age = max(0, int(now - sts))
+                if ts is not None:
+                    msg_age, msg_observed = max(0, int(now - ts)), True
+                elif complete:
+                    msg_observed = True  # the whole transcript holds no message yet
+        ev["last_message_age_s"] = msg_age
+        ev["subagent_message_age_s"] = sub_age
+        r["_rec"], r["_why"], r["_msg"] = rec, None, (msg_age, msg_observed, sub_age)
+    else:
+        rsid = None
+        r["_rec"], r["_why"], r["_msg"] = None, why, (None, False, None)
+    for src, v in (("record", rsid), ("scratchpad_fd", r["_fd_sid"]), ("argv", r["_argv_sid"])):
+        if v:
+            r["session_id"], ev["session_id_source"] = v, src
+            break
+    pending.append(r)
+
+# ONE CPU window for every process together -- never a window per process
+# (~250 of them on a busy box). It is opened by t0_stat above, overlaps the
+# record and transcript reads, and is only waited out when some candidate
+# still needs it; SESSION_CENSUS_PROC_AFTER supplies the second snapshot in a
+# fixture (no sleep).
+# Every bound record needs it: busy/shell to tell working from stale, and
+# idle/waiting for the cross-check (a background build under an idle session).
+need_cpu = any(r["_rec"] is not None for r in pending)
+t1_stat = None
+if pending and t0_stat is not None and CPU_SAMPLE_S > 0 and need_cpu:
+    after = os.environ.get("SESSION_CENSUS_PROC_AFTER")
+    if after:
+        t1_stat = proc_stat_table(after)
+    else:
+        rest = CPU_SAMPLE_S - (time.time() - t0_clock)
+        if rest > 0:
+            time.sleep(rest)
+        t1_stat = proc_stat_table(proc_root)
+for r in pending:
+    ev = r["activity_evidence"]
+    cpu = None
+    if t1_stat is not None and r["pid"] in t1_stat and r["pid"] in t0_stat:
+        tree = tree_of(r["pid"], t1_stat, agent_pids - {r["pid"]})
+        cpu = 0.0
+        for x in tree:
+            b = t1_stat.get(x)
+            a = t0_stat.get(x)
+            cpu += b[1] - (a[1] if a is not None and a[2] == b[2] else 0.0)
+        cpu = round(max(cpu, 0.0), 3)
+        ev["children"] = len(tree) - 1
+    elif t0_stat is not None and r["pid"] in t0_stat:
+        ev["children"] = len(tree_of(r["pid"], t0_stat, agent_pids - {r["pid"]})) - 1
+    ev["cpu_delta"] = cpu
+    msg_age, msg_observed, sub_age = r["_msg"]
+    r["activity"], ev["reason"] = classify_activity(r["_rec"], r["_why"], msg_age, msg_observed, cpu, sub_age)
+for r in rows:
+    for k in [k for k in r if k.startswith("_")]:
+        del r[k]
 
 # A `node` is an agent only by its command line; one whose command line could
 # not be read can be neither classified nor ruled out. Inside self it is self's
@@ -786,6 +1307,10 @@ self_n = sum(1 for r in agents if r["origin"] == "self")
 ide_checks = [r for r in rows if r["kind"] == "build" and r["origin"] != "self" and r["ide_check"]]
 builds_n = sum(1 for r in rows if r["kind"] == "build" and r["origin"] != "self" and not r["ide_check"])
 runners_n = sum(1 for r in rows if r["kind"] == "runner")
+act_counts = {k: 0 for k in ("working", "idle", "stale", "unknown")}
+for r in agents:
+    if r["origin"] != "self":
+        act_counts[r["activity"]] += 1
 
 doc = {
     "as_of": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -802,6 +1327,10 @@ doc = {
     "builds": builds_n,
     "runners": runners_n,
     "processes": rows,
+    "activity": {"status": activity_status, "counts": act_counts,
+                 "active_minutes": ACTIVE_MINUTES, "cpu_sample_seconds": CPU_SAMPLE_S,
+                 "cpu_floor_pct": CPU_FLOOR_PCT, "cpu_sampled": t1_stat is not None,
+                 "registry": {"status": REGISTRY_STATUS, "dirs": len(REGISTRY_DIRS)}},
     "unreadable_nodes": {"count": len(unreadable), "pids": [u["pid"] for u in unreadable],
                          "processes": unreadable},
     "service_nodes_ignored": {"count": len(service_nodes), "pids": [u["pid"] for u in service_nodes],
@@ -832,6 +1361,13 @@ elif mode == "text":
             print("    pid=%-8s %-7s up=%-8s via %s" % (
                 r["pid"], r["kind"], ("%dm" % (r["age_s"] // 60)) if r["age_s"] is not None else "?",
                 " <- ".join(r["ancestry"][:3]) or "?"))
+    print("\n  ACTIVITY (non-self agents; a session record + last message + one %ds CPU window): "
+          "working %d, idle %d, stale %d, unknown %d%s" % (
+              CPU_SAMPLE_S, act_counts["working"], act_counts["idle"], act_counts["stale"], act_counts["unknown"],
+              "" if activity_status == "ok" else "  (%s)" % activity_status))
+    for r in agents:
+        if r["origin"] != "self" and r["activity"] in ("working", "stale"):
+            print("    pid=%-8s %-7s %-7s %s" % (r["pid"], r["activity"], r["origin"], r["activity_evidence"]["reason"]))
     bl = [r for r in rows if r["kind"] == "build" and r["origin"] != "self" and not r["ide_check"]]
     print("\n  BUILDS (cargo/rustc): %s" % (len(bl) if bl else "none"))
     for r in bl:
@@ -863,6 +1399,8 @@ elif mode == "text":
 sys.exit(rc)
 PYEOF
 
+QSC_REGISTRY_DIRS="$REGISTRY_DIRS" QSC_REGISTRY_STATUS="$REGISTRY_STATUS" \
+QSC_ACTIVE_MINUTES="$ACTIVE_MINUTES" QSC_CPU_SAMPLE_S="$CPU_SAMPLE_S" QSC_CPU_FLOOR_PCT="$CPU_FLOOR_PCT" \
 "$PY" "$(native "$WORK/census.py")" "$OS" "$(native "$RAW")" "$SELF_STARTS" \
   "${SESSION_CENSUS_PROC:-/proc}" "$MODE" "$SOURCE"
 exit $?

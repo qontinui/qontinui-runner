@@ -2445,6 +2445,236 @@ mod tests {
     }
 }
 
+/// The bash shim templates' bounded real-tool resolve wait, exercised by
+/// RUNNING the rendered templates (2026-10-01: a runner-spawned gate
+/// continuation's `claude` was on no PATH entry for the ~2 s of an npm reify,
+/// the identity shim scanned once, fell through to `exec claude`, and the
+/// continuation was lost 73 ms after spawn).
+#[cfg(all(test, unix))]
+mod resolve_wait_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// Writing an executable while another test thread forks can leave the
+    /// write fd open in the child and make the exec fail `ETXTBSY`; serialize.
+    static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const BUDGET: Duration = Duration::from_secs(40);
+
+    /// Write `body` as an executable at `path`, atomically (temp + rename) so a
+    /// concurrently scanning shim never sees a half-written file.
+    fn write_exe(path: &Path, body: &str) {
+        let tmp = path.with_extension("partial");
+        std::fs::write(&tmp, body).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    /// A real `claude` that records it ran.
+    fn fake_claude_body(marker: &Path) -> String {
+        format!("#!/bin/sh\necho ran > '{}'\n", marker.display())
+    }
+
+    /// Skip when a real `claude` sits on the system dirs these tests put on
+    /// PATH — it would satisfy the scan and mask the behaviour under test.
+    fn system_claude_present() -> bool {
+        ["/usr/bin/claude", "/bin/claude"]
+            .iter()
+            .any(|p| Path::new(p).exists())
+    }
+
+    /// `bash` by ABSOLUTE path: these tests clear the env and set a PATH that
+    /// may hold no bash, and `Command` resolves a bare program name against
+    /// the CHILD's PATH once one is set.
+    fn bash() -> &'static str {
+        ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap_or("/bin/bash")
+    }
+
+    fn identity_cmd(shim_dir: &Path, real_dir: &Path, wait: &str) -> Command {
+        let shim = shim_dir.join("claude");
+        write_exe(&shim, &render_identity_for_test("claude", shim_dir));
+        let mut cmd = Command::new(bash());
+        cmd.arg(&shim)
+            .arg("--version")
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir.display(),
+                    real_dir.display()
+                ),
+            )
+            .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", wait);
+        cmd
+    }
+
+    #[test]
+    fn identity_shim_waits_out_a_reinstall_window_and_runs_the_real_tool() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let marker = tmp.path().join("ran");
+        let cmd = identity_cmd(&shim_dir, &real_dir, "10");
+
+        // The tool reappears ~1.5 s into the shim's wait, as after a reify.
+        let reappear = {
+            let real = real_dir.join("claude");
+            let body = fake_claude_body(&marker);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                write_exe(&real, &body);
+            })
+        };
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        reappear.join().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "shim failed: {stderr}");
+        assert!(marker.exists(), "the real claude never ran: {stderr}");
+        assert!(
+            stderr.contains("claude not found on PATH") && stderr.contains("waiting up to 10s"),
+            "the wait must be announced on stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn identity_shim_names_the_tool_and_path_when_it_gives_up() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let begun = Instant::now();
+        let out = crate::process_helpers::output_with_timeout(
+            identity_cmd(&shim_dir, &real_dir, "1"),
+            BUDGET,
+        )
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "nothing to run must not look like success"
+        );
+        assert!(
+            stderr.contains("the real claude was not found on PATH after waiting 1s"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&real_dir.display().to_string()),
+            "the diagnostic must name the PATH searched: {stderr}"
+        );
+        assert!(
+            begun.elapsed() < Duration::from_secs(15),
+            "the wait must be bounded by QONTINUI_SHIM_RESOLVE_WAIT_SECS"
+        );
+    }
+
+    #[test]
+    fn identity_shim_resolved_tool_never_waits_or_writes_stderr() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let marker = tmp.path().join("ran");
+        write_exe(&real_dir.join("claude"), &fake_claude_body(&marker));
+        let out = crate::process_helpers::output_with_timeout(
+            identity_cmd(&shim_dir, &real_dir, "10"),
+            BUDGET,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert!(marker.exists());
+        assert!(
+            out.stderr.is_empty(),
+            "TRANSPARENT: a hit adds no output: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `01` must read as one second (`08` would otherwise be an invalid octal
+    /// literal in the shim's arithmetic).
+    #[test]
+    fn identity_shim_wait_accepts_leading_zeros() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        for wait in ["01", "08"] {
+            let out = crate::process_helpers::output_with_timeout(
+                identity_cmd(&shim_dir, &real_dir, wait),
+                BUDGET,
+            )
+            .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let secs = wait.trim_start_matches('0');
+            assert!(
+                stderr.contains(&format!("after waiting {secs}s")),
+                "{wait}: {stderr}"
+            );
+            assert!(!stderr.contains("value too great"), "{wait}: {stderr}");
+        }
+    }
+
+    /// The install shim: an unresolved real tool on the INSTALL path used to run
+    /// `"" install …` (the empty name). It now takes the PATH-stripped
+    /// fall-through, with the diagnostic, and propagates `not found` (127).
+    #[test]
+    fn install_shim_unresolved_tool_reports_and_exits_127() {
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, empty_dir) = (tmp.path().join("shim"), tmp.path().join("empty"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let shim = shim_dir.join("npm");
+        write_exe(&shim, &render_for_test(SHIM_BASH, ShimTool::Npm, &shim_dir));
+        for args in [&["--version"][..], &["install", "left-pad"][..]] {
+            let mut cmd = Command::new(bash());
+            // PATH holds no npm at all, so nothing real can ever run here.
+            cmd.arg(&shim)
+                .args(args)
+                .current_dir(tmp.path())
+                .env_clear()
+                .env(
+                    "PATH",
+                    format!("{}:{}", shim_dir.display(), empty_dir.display()),
+                )
+                .env("QONTINUI_SHIM_RESOLVE_WAIT_SECS", "0");
+            let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(127), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("the real npm was not found on PATH after waiting 0s"),
+                "{args:?}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("waiting up to"),
+                "0 disables the wait: {stderr}"
+            );
+        }
+    }
+}
+
 /// The session-CLI publication guard (plan
 /// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
 /// coord dossier `qontinui-pr-shim-zero-byte-opens-no-pr`). Every test here

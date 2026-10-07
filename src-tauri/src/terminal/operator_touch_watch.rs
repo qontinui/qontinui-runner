@@ -39,6 +39,28 @@
 //! wasted HTTP round trip (plan §2a's resolution: "a latch at the source is
 //! cheaper... but the idempotency key's epoch bucket bounds it").
 //!
+//! ## Only a pane that hosts `claude` counts
+//!
+//! The idle heuristic (`snapshot_looks_idle`) keys on Claude Code's `❯`
+//! input caret, and plain shell prompts draw the same glyph (starship,
+//! zsh-pure). Every terminal created through `terminal_create` gets a coord
+//! mirror, so a bare shell tab sitting at its prompt would otherwise read as
+//! an agent waiting on the operator and be recorded as one — inflating the
+//! very metric this store exists to measure. So before a candidate fires,
+//! the scan proves a `claude` process lives in the pane's inclusive process
+//! subtree (`mcp::steward::pane_hosts_claude`, the probe the steward already
+//! uses). The process-table snapshot is taken at most once per tick and ONLY
+//! when some pane is about to fire, so the steady-state tick stays as cheap
+//! as before.
+//!
+//! Three outcomes, see [`decide_candidate`]: proven `claude` → emit; proven
+//! no `claude` → the episode is settled without a touch (no re-probe until
+//! the pane's next idle episode); could not tell → no touch, episode left
+//! open. A pane with no local pid (a remote pane) is never a candidate here,
+//! and an unreadable table decides nothing and backs further probes off for
+//! [`UNREADABLE_PROBE_BACKOFF_MS`]. "Could not look" is never recorded as a
+//! touch.
+//!
 //! ## The threshold
 //!
 //! 60 seconds — the same width as [`crate::session::operator_touch`]'s dedup
@@ -58,23 +80,66 @@ use tracing::warn;
 /// docs for why.
 const IDLE_THRESHOLD_MS: i64 = crate::session::operator_touch::BUCKET_WIDTH_SECS * 1000;
 
-/// Per-terminal `since_ms` of the idle episode this watcher last fired a
-/// touch for. `None` recorded for a terminal not yet fired for its CURRENT
-/// episode is represented by simple absence from the map; a present entry
-/// whose value differs from the current `since_ms` means a NEW episode has
-/// started (see module docs). Never pruned except for terminals no longer
-/// live — mirrors `context_watcher::SCAN_GATE`'s own liveness prune.
-static LAST_FIRED_SINCE_MS: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+/// Per-terminal `since_ms` of the idle episode this watcher last SETTLED —
+/// fired a touch for, or proved hosts no `claude` (module docs). A terminal
+/// whose CURRENT episode is unsettled is simply absent, or present with a
+/// different `since_ms` (a NEW episode has started). Never pruned except for
+/// terminals no longer live — mirrors `context_watcher::SCAN_GATE`'s own
+/// liveness prune.
+static LAST_SETTLED_SINCE_MS: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// How long to wait before re-taking the process-table snapshot after one
+/// came back unreadable. On Windows a snapshot is a PowerShell/WMI spawn
+/// bounded by its own timeout; without this a persistently failing table
+/// would cost one such spawn on every grid-scan tick.
+const UNREADABLE_PROBE_BACKOFF_MS: i64 = 60_000;
+
+/// Wall-clock millis before which no process-table snapshot is taken (the
+/// backoff above). `0` = no backoff in force.
+static PROBE_NOT_BEFORE_MS: Mutex<i64> = Mutex::new(0);
+
+/// What one idle candidate's episode resolves to, given whether its pane is
+/// proven to host a `claude` process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateDecision {
+    /// A `claude` is in the pane — record the `idle_at_prompt` touch.
+    Emit,
+    /// Proven no `claude` (a shell at its own `❯` prompt) — settle the
+    /// episode without a touch, so it is not re-probed every tick.
+    SettleWithoutTouch,
+    /// Could not tell — no touch, episode left open for a later tick.
+    Undecided,
+}
+
+/// Pure: map `pane_hosts_claude`'s three-valued answer to a decision.
+fn decide_candidate(hosts_claude: Option<bool>) -> CandidateDecision {
+    match hosts_claude {
+        Some(true) => CandidateDecision::Emit,
+        Some(false) => CandidateDecision::SettleWithoutTouch,
+        None => CandidateDecision::Undecided,
+    }
+}
+
+fn settle_episode(tid: String, since_ms: i64) {
+    let mut guard = LAST_SETTLED_SINCE_MS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashMap::new).insert(tid, since_ms);
+}
 
 /// One grid-scan tick: evaluate every live terminal's tracked idle window and
 /// emit an `idle_at_prompt` touch for any terminal that just crossed
-/// [`IDLE_THRESHOLD_MS`] in its CURRENT idle episode. Called from the same
-/// tick as `context_watcher::scan_terminals_once` — see
+/// [`IDLE_THRESHOLD_MS`] in its CURRENT idle episode and whose pane is proven
+/// to host a `claude` process (module docs). Called from the same tick as
+/// `context_watcher::scan_terminals_once` — see
 /// `terminal::auto_response::scan_once_blocking`.
 ///
-/// Best-effort and non-blocking by construction: every underlying call
-/// (`observe_grid_idle`, `operator_touch::emit`) is synchronous and
-/// lock-bounded, matching the tick's existing cost profile.
+/// Best-effort by construction: `observe_grid_idle` and `operator_touch::emit`
+/// are synchronous and lock-bounded. The one heavier call, the process-table
+/// snapshot, runs only on a tick where some pane is about to fire, at most
+/// once per tick, and is itself timeout-bounded. The tick already runs on a
+/// blocking-pool thread (`auto_response::scan_once_blocking`), so blocking on
+/// it here never parks an async worker.
 pub fn scan_idle_touches_once() {
     use tauri::Manager;
 
@@ -98,7 +163,7 @@ pub fn scan_idle_touches_once() {
     // `context_watcher::SCAN_GATE::retain_live`).
     {
         let live: std::collections::HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
-        let mut guard = LAST_FIRED_SINCE_MS
+        let mut guard = LAST_SETTLED_SINCE_MS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(map) = guard.as_mut() {
@@ -106,11 +171,21 @@ pub fn scan_idle_touches_once() {
         }
     }
 
+    // Candidates: live, coord-mirrored, idle past the threshold, and not yet
+    // settled for this episode. Collected first so the process-table snapshot
+    // below is taken only when at least one exists.
+    let mut candidates = Vec::new();
     for (tid, session) in sessions {
         // An exited pane stays in the snapshot (a non-zero exit is kept
         // visible), and its frozen last frame can read as "idle at the
         // prompt" forever. A dead process is not waiting on the operator.
         if !session.is_alive() {
+            continue;
+        }
+        // No local pid (a remote pane) ⇒ the `claude`-host proof below can
+        // never be made here, and skipping now keeps such a pane from
+        // forcing a process-table snapshot on every tick.
+        if session.child_pid().is_none() {
             continue;
         }
         let Some(coord_session_id) = session.coord_session_id() else {
@@ -129,17 +204,58 @@ pub fn scan_idle_touches_once() {
             continue;
         }
 
-        let already_fired_this_episode = {
-            let guard = LAST_FIRED_SINCE_MS
+        let already_settled_this_episode = {
+            let guard = LAST_SETTLED_SINCE_MS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .and_then(|m| m.get(&tid))
-                .is_some_and(|&fired_since| fired_since == since_ms)
+                .is_some_and(|&settled_since| settled_since == since_ms)
         };
-        if already_fired_this_episode {
+        if already_settled_this_episode {
             continue;
+        }
+        candidates.push((tid, session, coord_session_id, since_ms));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if now_ms
+        < *PROBE_NOT_BEFORE_MS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    {
+        return;
+    }
+    let snapshot = tauri::async_runtime::block_on(
+        crate::process_capture::process_tree::snapshot_process_table_public(),
+    );
+    if snapshot.parent_map.is_empty() {
+        // Unreadable table: nothing can be proven for any candidate this tick.
+        *PROBE_NOT_BEFORE_MS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = now_ms + UNREADABLE_PROBE_BACKOFF_MS;
+        warn!(
+            candidates = candidates.len(),
+            "operator_touch_watch: process table unreadable — idle_at_prompt candidates left undecided, retrying after backoff"
+        );
+        return;
+    }
+
+    for (tid, session, coord_session_id, since_ms) in candidates {
+        match decide_candidate(crate::mcp::steward::pane_hosts_claude(
+            &snapshot,
+            session.child_pid(),
+        )) {
+            CandidateDecision::Emit => {}
+            CandidateDecision::SettleWithoutTouch => {
+                settle_episode(tid, since_ms);
+                continue;
+            }
+            CandidateDecision::Undecided => continue,
         }
 
         // `&str`, not `Option` — a terminal with no identity-seam pin reports
@@ -158,12 +274,7 @@ pub fn scan_idle_touches_once() {
             crate::session::operator_touch::KIND_IDLE_AT_PROMPT,
             Some(session.pinned_session_id()),
         ) {
-            Ok(()) => {
-                let mut guard = LAST_FIRED_SINCE_MS
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                guard.get_or_insert_with(HashMap::new).insert(tid, since_ms);
-            }
+            Ok(()) => settle_episode(tid, since_ms),
             Err(e) => {
                 warn!(
                     terminal_id = %tid,
@@ -212,10 +323,12 @@ pub struct NotificationOutcome {
     pub reason: String,
 }
 
-/// Handle one `Notification` hook POST for terminal/session key `key` — the
-/// SAME key space `context_watcher::on_precompact_signal` uses (the runner
-/// terminal id the hook script sends, falling back to the Claude session
-/// id). Fail-open at every step: a hook that cannot be attributed to a live
+/// Handle one `Notification` hook POST for terminal key `key` — the runner
+/// terminal id (`QONTINUI_TERMINAL_ID`) the hook script sends, looked up with
+/// a plain `TerminalManager::get`. There is deliberately NO Claude
+/// session-id fallback (plan vet D1): the hook keys on the terminal id only
+/// and stands down when it has none. Fail-open at every step: a hook that
+/// cannot be attributed to a live
 /// terminal, a coord mirror, or a registry records nothing rather than
 /// erroring, matching `on_precompact_signal`'s own posture (a broken watcher
 /// must never break a hook).
@@ -291,6 +404,21 @@ mod tests {
             crate::session::operator_touch::BUCKET_WIDTH_SECS * 1000
         );
         assert_eq!(IDLE_THRESHOLD_MS, 60_000);
+    }
+
+    #[test]
+    fn only_a_proven_claude_pane_emits_an_idle_touch() {
+        assert_eq!(decide_candidate(Some(true)), CandidateDecision::Emit);
+        assert_eq!(
+            decide_candidate(Some(false)),
+            CandidateDecision::SettleWithoutTouch,
+            "a shell at its own ❯ prompt is not an agent waiting on the operator"
+        );
+        assert_eq!(
+            decide_candidate(None),
+            CandidateDecision::Undecided,
+            "could-not-look is never recorded as a touch, nor settled"
+        );
     }
 
     #[test]

@@ -66,6 +66,7 @@ import {
   subscribe,
 } from "./commands";
 import { noMatchEnterIsInert, tier3Eligible } from "./tier3EnterGate";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * How many argument slots the winning tier actually CAPTURED.
@@ -111,7 +112,6 @@ function optionId(actionId: string): string {
 function suggestionElementId(slash: string): string {
   return `command-bar-suggestion-${slash.replace(/^\//, "")}`;
 }
-
 
 /**
  * Author-controlled control id for the command bar's text input. Exported so
@@ -545,7 +545,7 @@ export function CommandBar() {
           source: resolution.kind === "ai" ? "ai" : "slash",
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = describeThrown(err, "command failed");
         setStatus({ kind: "error", text: withHint(`${action.slash}: ${message}`) });
         return;
       }

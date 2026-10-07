@@ -152,6 +152,13 @@ pub async fn remote_attach_preference_set(
 pub(crate) struct AttachGrantResponse {
     pub grant: String,
     pub grant_jti: String,
+    /// The device coord minted this grant TO — the principal it verified, i.e.
+    /// this device as coord knows it. The interactivity reporter files it as
+    /// `source_device_id`, so a source report agrees with the grant row coord
+    /// checks it against. Absent from a coord that predates the field; the
+    /// reporter then falls back to `machine.json`.
+    #[serde(default)]
+    pub source_device_id: Option<String>,
     #[serde(default)]
     pub target_device_id: Option<String>,
     #[serde(default)]
@@ -179,6 +186,24 @@ pub(crate) struct TargetRunner {
     /// `2026-09-20-fleet-tab-attach-loses-the-grant-push-race`, item 3).
     #[serde(default)]
     pub served_sha: Option<String>,
+    /// Whether the target is known to ACKNOWLEDGE remote input (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// the `RemoteCapability::InputAck` floor). Coord does not serve this yet —
+    /// the floor is a deferred coord follow-up — so it is absent today, which
+    /// reads as UNKNOWN: the probe sweep then sends no write probe. Same
+    /// `{state, reason}` shape as the block it sits in.
+    #[serde(default)]
+    pub input_ack: Option<CapabilityReadiness>,
+}
+
+/// One capability's readiness on the target, as coord would state it:
+/// `supports`, `predates` or `unknown`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct CapabilityReadiness {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Explain a relay timeout — the target never answered — with what is actually
@@ -272,7 +297,7 @@ pub(crate) async fn mint_attach_grant_awaiting_session(
     ))
 }
 
-async fn mint_attach_grant(
+pub(crate) async fn mint_attach_grant(
     coord_base: &str,
     session_id: uuid::Uuid,
 ) -> Result<AttachGrantResponse, String> {
@@ -387,6 +412,7 @@ pub async fn terminal_attach_remote(
     let rows = rows.unwrap_or(30);
 
     let base = coord_base_for(&app_handle);
+    crate::mcp::remote_interactivity::set_coord_base(&base);
     let minted = mint_attach_grant(&base, session_uuid).await?;
     if !coord_places_session_on(&device_id, minted.target_device_id.as_deref()) {
         let target = minted.target_device_id.as_deref().unwrap_or("<unreported>");
@@ -729,6 +755,27 @@ pub(crate) async fn open_remote_tab(
     )
     .await;
     waiting.settle(started.elapsed(), GRANT_LEARN_WINDOW);
+    // What this SOURCE measures about the session (plan
+    // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    // A2). `None` when an id is not a UUID — coord would refuse the report.
+    let report_ctx = crate::mcp::remote_interactivity::SourceReportContext::parse(
+        &session_id,
+        &minted.grant_jti,
+        minted.source_device_id.as_deref(),
+        crate::mcp::remote_interactivity::Via::Traffic,
+    );
+    if let (Err(e), Some(ctx)) = (&presented, report_ctx.as_ref()) {
+        // A refused attach means neither half works from here under this
+        // grant: filed on both, classified (a busy terminal or an unreachable
+        // target is `unknown`, a local code files nothing).
+        for obs in ctx.refusal(
+            &e.code,
+            &crate::mcp::remote_interactivity::Half::BOTH,
+            chrono::Utc::now(),
+        ) {
+            crate::mcp::remote_interactivity::reporter().observe(obs);
+        }
+    }
     let attached = presented.map_err(|mut e| {
         if e.code == "timeout" {
             e.message = explain_relay_timeout(
@@ -760,6 +807,12 @@ pub(crate) async fn open_remote_tab(
         rows,
         attached.ring,
     ));
+    // The report context goes on BEFORE the pane is routable, so no frame
+    // routed to it (buffered output flushed by `register_pane`, or the first
+    // live chunk) can be spliced before the read half is being measured.
+    if let Some(ctx) = report_ctx {
+        pane.attach_report_context(ctx);
+    }
     client().register_pane(pane.clone());
 
     let target_id = minted
@@ -1055,6 +1108,34 @@ pub(crate) fn remote_interactivity_response(
     })
 }
 
+/// Probe the interactivity of every not-fresh remote session on `device_id`
+/// and report what was measured to coord (plan
+/// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+/// A3). Mint → probe-only attach (no tab) → empty-range read probe → a
+/// zero-byte write probe only against a target known to acknowledge input →
+/// honest detach → report, one row at a time.
+///
+/// `trigger` is `fleet_view` (the Fleet view loading that device — also
+/// stamps the device so the runner's scheduler keeps sweeping it for seven
+/// days), `scheduler`, `manual` (an explicit request: bypasses the per-session
+/// attempt memory), or absent (`unspecified`, which does not). Returns the per-row outcome
+/// list plus the fleet flags the sweep read; `Err` names the door that failed
+/// (`remote_interactivity_probe:<door>: …`). Proxied for headless agents
+/// (`mcp/tauri_proxy.rs`).
+#[tauri::command]
+pub async fn remote_interactivity_probe(
+    app_handle: tauri::AppHandle,
+    device_id: String,
+    trigger: Option<String>,
+) -> Result<Value, String> {
+    super::remote_interactivity_probe::run_probe_command(
+        &app_handle,
+        &device_id,
+        trigger.as_deref(),
+    )
+    .await
+}
+
 /// How long a history request waits for the target's ring range.
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -1181,6 +1262,7 @@ mod relay_timeout_tests {
             reason: Some("served-sha heartbeat is STALE".into()),
             required_sha: Some("f521e1012e1e".into()),
             served_sha: None,
+            input_ack: None,
         };
         for tr in [None, Some(&supports), Some(&unknown)] {
             let m = explain_relay_timeout("remote_terminal_attached", DEV, tr, 20);
@@ -1197,6 +1279,7 @@ mod relay_timeout_tests {
             reason: Some("served-sha heartbeat is STALE".into()),
             required_sha: Some("f521e1012e1e".into()),
             served_sha: None,
+            input_ack: None,
         };
         let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&tr), 20);
         assert!(m.contains("served-sha heartbeat is STALE"), "{m}");
@@ -1213,6 +1296,7 @@ mod relay_timeout_tests {
             reason: Some("served-sha heartbeat is STALE".into()),
             required_sha: Some("f521e1012e1e".into()),
             served_sha: Some("3472fc6a1c58".into()),
+            input_ack: None,
         };
         let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&unknown), 20);
         assert!(m.contains("last reported serving 3472fc6a1c58"), "{m}");

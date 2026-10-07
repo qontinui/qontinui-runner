@@ -35,6 +35,7 @@ import type {
 import { CONTRACT_CONFIG_VERSION, validateContractConfig } from "@qontinui/ui-bridge/contracts";
 import type { SpecAssertion } from "@qontinui/ui-bridge";
 import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // State management
@@ -627,7 +628,7 @@ export function ContractBuilder() {
       dispatch({
         type: "SET_SAVE_STATUS",
         status: "error",
-        error: err instanceof Error ? err.message : "Save failed",
+        error: describeThrown(err, "Save failed"),
       });
     }
   }, [config, filePath, validate, activeContract]);
@@ -662,7 +663,7 @@ export function ContractBuilder() {
       dispatch({
         type: "SET_SAVE_STATUS",
         status: "error",
-        error: err instanceof Error ? err.message : "Load failed",
+        error: describeThrown(err, "Load failed"),
       });
     }
   }, []);

@@ -38,7 +38,7 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -255,6 +255,15 @@ pub struct RemotePaneIo {
     history_start: Option<u64>,
     /// Input seq + the read/write receipts. See [`RemoteInteractivity`].
     interactivity: Arc<Mutex<InteractivityState>>,
+    /// Where this pane REPORTS what it measures (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A2): set once, by the attach flow that knows the coord session and the
+    /// grant. Unset — a test pane, or the probe sweep, which reports its own
+    /// outcome explicitly — reports nothing.
+    report: OnceLock<(
+        crate::mcp::remote_interactivity::SourceReportContext,
+        Arc<crate::mcp::remote_interactivity::Reporter>,
+    )>,
 }
 
 impl RemotePaneIo {
@@ -315,6 +324,37 @@ impl RemotePaneIo {
                     }),
                 },
             })),
+            report: OnceLock::new(),
+        }
+    }
+
+    /// Start reporting this pane's measurements to coord through the
+    /// process-wide reporter. See [`Self::attach_report_context_to`].
+    pub fn attach_report_context(
+        &self,
+        ctx: crate::mcp::remote_interactivity::SourceReportContext,
+    ) {
+        self.attach_report_context_to(ctx, crate::mcp::remote_interactivity::reporter().clone());
+    }
+
+    /// Start reporting to `reporter`. The attach reply that built this pane IS
+    /// a frame from the target, so the read half is reported at once; every
+    /// later spliced frame offers another `read: ok`, which the reporter
+    /// coalesces to one row per `REPORT_EVERY` — never one per frame. A second
+    /// call is ignored (the context is the grant's, and a pane has one grant).
+    pub fn attach_report_context_to(
+        &self,
+        ctx: crate::mcp::remote_interactivity::SourceReportContext,
+        reporter: Arc<crate::mcp::remote_interactivity::Reporter>,
+    ) {
+        if self.report.set((ctx, reporter)).is_ok() {
+            self.report_read_ok();
+        }
+    }
+
+    fn report_read_ok(&self) {
+        if let Some((ctx, reporter)) = self.report.get() {
+            reporter.observe(ctx.read_ok(chrono::Utc::now()));
         }
     }
 
@@ -404,8 +444,17 @@ impl RemotePaneIo {
     /// phantom turns that slot exists to catch. Only a target that has ALREADY
     /// acked on this attachment is known to honour the flag.
     pub fn send_input_probe(&self) -> Result<u64, String> {
+        self.send_input_probe_given(false)
+    }
+
+    /// [`Self::send_input_probe`], with `target_known_to_ack` standing in for
+    /// the prior ack when something OTHER than this attachment has positively
+    /// established that the target honours `probe` — coord's target readiness
+    /// answering `supports` for input acknowledgement. An unknown capability
+    /// is `false`, never a guess: the probe sweep passes exactly that.
+    pub fn send_input_probe_given(&self, target_known_to_ack: bool) -> Result<u64, String> {
         let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
-        if g.snapshot.acks_since_attach == 0 {
+        if g.snapshot.acks_since_attach == 0 && !target_known_to_ack {
             return Err(format!(
                 "{TARGET_PREDATES_INPUT_ACK}: no input ack has been received on this attachment, \
                  so the target is not known to honour `probe` — an older build would write the \
@@ -433,11 +482,14 @@ impl RemotePaneIo {
     /// Stamp the read half: a frame from the target was just spliced.
     fn note_frame_received(&self) {
         let through_offset = self.remote_offset();
-        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
-        g.snapshot.last_frame_received = Some(FrameReceived {
-            at_ms: now_epoch_ms(),
-            through_offset,
-        });
+        {
+            let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
+            g.snapshot.last_frame_received = Some(FrameReceived {
+                at_ms: now_epoch_ms(),
+                through_offset,
+            });
+        }
+        self.report_read_ok();
     }
 
     /// The `[from, to)` target range OLDER than the attach seed that the
@@ -589,6 +641,20 @@ impl RemotePaneIo {
             message,
             "remote pane: target reported an error — closing the pane"
         );
+        // Only FATAL codes reach here (`settle_pane_error`), i.e. the
+        // attachment is gone: neither half works from this source any more.
+        // The reporter's classifier files a wire refusal as `failed`, a busy
+        // terminal / unreachable target as `unknown`, and a local code not at
+        // all.
+        if let Some((ctx, reporter)) = self.report.get() {
+            for obs in ctx.refusal(
+                code,
+                &crate::mcp::remote_interactivity::Half::BOTH,
+                chrono::Utc::now(),
+            ) {
+                reporter.observe(obs);
+            }
+        }
         self.mark_exit(ERROR_EXIT_CODE);
     }
 
@@ -1075,6 +1141,85 @@ pub(crate) mod tests {
             pane.interactivity().acks_received,
             1,
             "lifetime count survives"
+        );
+    }
+
+    /// A2 SOURCE role: a tab pane with a report context files `read: ok`
+    /// (via traffic, under its grant, as this device) on attach, and a burst
+    /// of spliced frames is ONE report, not one per frame; a fatal refusal
+    /// files `failed` on both halves with the wire code verbatim.
+    #[tokio::test]
+    async fn a_reporting_pane_files_read_ok_coalesced_and_refusals_on_both_halves() {
+        use crate::mcp::remote_interactivity::{
+            FactState, Half, Observation, ObservationSender, Reporter, Role, SourceReportContext,
+            Via, REPORT_EVERY,
+        };
+        #[derive(Default)]
+        struct Rec(Mutex<Vec<Observation>>);
+        #[async_trait::async_trait]
+        impl ObservationSender for Rec {
+            async fn send(&self, obs: &Observation) -> Result<(), String> {
+                self.0.lock().unwrap().push(obs.clone());
+                Ok(())
+            }
+        }
+        let rec = Arc::new(Rec::default());
+        let reporter = Reporter::new(rec.clone(), REPORT_EVERY, 64, false);
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let ctx = SourceReportContext {
+            session_id: uuid::Uuid::from_u128(1),
+            grant_jti: uuid::Uuid::from_u128(2),
+            source_device_id: uuid::Uuid::from_u128(3),
+            via: Via::Traffic,
+        };
+        pane.attach_report_context_to(ctx.clone(), reporter.clone());
+        for _ in 0..500 {
+            pane.push_output(b"x");
+        }
+        pane.mark_error(
+            "session_not_local",
+            "no local terminal hosts that coord session",
+        );
+        while reporter.drain_once().await.is_some() {}
+        let sent = rec.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "one read-ok + two refusals: {sent:?}");
+        assert_eq!(
+            (sent[0].role, sent[0].half, sent[0].state, sent[0].via),
+            (Role::Source, Half::Read, FactState::Ok, Some(Via::Traffic))
+        );
+        assert_eq!(sent[0].grant_jti, Some(ctx.grant_jti));
+        assert_eq!(sent[0].source_device_id, ctx.source_device_id);
+        for (o, half) in sent[1..].iter().zip([Half::Read, Half::Write]) {
+            assert_eq!(o.half, half);
+            assert_eq!(o.state, FactState::Failed);
+            assert_eq!(o.reason.as_deref(), Some("session_not_local"));
+        }
+    }
+
+    /// A pane with NO report context (a test pane, a probe pane) reports
+    /// nothing — the probe sweep files its own outcome explicitly.
+    #[test]
+    fn a_pane_without_a_context_reports_nothing() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        pane.push_output(b"x");
+        pane.mark_error("session_not_local", "gone");
+        assert!(pane.report.get().is_none());
+    }
+
+    /// The write probe may go to a target that has not acked on this
+    /// attachment only when the caller KNOWS it acks.
+    #[test]
+    fn a_probe_to_a_known_acker_needs_no_prior_ack() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        assert!(pane.send_input_probe_given(false).is_err());
+        let seq = pane.send_input_probe_given(true).expect("known acker");
+        let f = sink.frames().last().cloned().unwrap();
+        assert_eq!(
+            (f["probe"].clone(), f["data"].clone(), f["seq"].clone()),
+            (json!(true), json!(""), json!(seq))
         );
     }
 

@@ -22,14 +22,6 @@
     {
       "class": "dev_ports",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"trigger_auto_continue...",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "dev_ports",
-      "file": "src/mcp/ai_session.rs",
       "symbol": "generate_mcp_tool_context",
       "excerpt": "{\"tool\": \"mcp__qontinui__sdk_connect\", \"url\": \"http://localhost:3001\"}",
       "count": 1,
@@ -597,7 +589,7 @@
       "class": "os_bound_tooling",
       "file": "src/crash_observability.rs",
       "symbol": "format_harvest_breadcrumb",
-      "excerpt": "flipping its shutdown marker to clean:true (crash, OOM kill, taskkill /F,\\n\\",
+      "excerpt": "abort, OOM kill, taskkill /F, or power loss). This artifact was\\n\\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -820,8 +812,8 @@
     {
       "class": "os_bound_tooling",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "```powershell",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `Invoke-WebRequest`), or use `Invoke-RestMethod -Method Pos...",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1492,8 +1484,24 @@
     {
       "class": "plans_dir",
       "file": "src/plans_dir_migration.rs",
-      "symbol": "persist_env_plans_dir",
-      "excerpt": "\"plans_dir_migration: recorded paths.plans_dir = {value:?} from the retired env \\",
+      "symbol": "outcome_message",
+      "excerpt": "\"plans_dir_migration: kept existing setting: paths.plans_dir is already set, \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "plans_dir",
+      "file": "src/plans_dir_migration.rs",
+      "symbol": "outcome_message",
+      "excerpt": "\"plans_dir_migration: seeded from {var}: recorded paths.plans_dir = {value:?}. \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "plans_dir",
+      "file": "src/plans_dir_migration.rs",
+      "symbol": "outcome_message",
+      "excerpt": "{PLANS_DIR_ENV}{ignored}). paths.plans_dir stays unset, so the \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -2078,38 +2086,65 @@
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "**Supervisor API (port 9875):**",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervi...",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"rebuild\": true, \"trig...",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "**About `\"rebuild\": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (it can ...",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"trigger_auto_continue...",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "**Supervisor API ({{supervisor_base}}):**",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo ...",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"rebuild\": true}'",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true}'",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "reject_legacy_supervisor_body",
+      "excerpt": "fn reject_legacy_supervisor_body(",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Refuses a served ai-session-rules body that still carries the legacy supervisor recipe, so the supervisor-available arm renders only the gated compiled-in addendum."
     },
     {
       "class": "supervisor_dependency",
@@ -2119,6 +2154,42 @@
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Runs check_supervisor_available on a blocking thread and passes == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent, unknown (None) or a failed join selects the supervisor-DOWN rules block."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "runner_rules_prefix",
+      "excerpt": "let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "runner_rules_prefix",
+      "excerpt": "let served = reject_legacy_supervisor_body(",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "supervisor_restart_recipe",
+      "excerpt": ".replace(\"{{supervisor_base}}\", supervisor_base.trim_end_matches('/'))",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "supervisor_restart_recipe",
+      "excerpt": "pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm."
     },
     {
       "class": "supervisor_dependency",

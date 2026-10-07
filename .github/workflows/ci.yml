@@ -109,13 +109,14 @@ permissions:
   contents: read
   pull-requests: read
 
-# Cancel ONLY superseded `pull_request` runs, one group per PR number. A PR
-# amended mid-run otherwise pays the full ~144 job-min matrix for a head sha
-# nobody will ever land. Plan: 2026-09-25-fleet-bundle-sync-residual-gaps
+# Cancel ONLY superseded FIRST-ATTEMPT `pull_request` runs, one group per PR
+# number. A PR amended mid-run otherwise pays the full ~144 job-min matrix for
+# a head sha nobody will ever land. Plan: 2026-09-25-fleet-bundle-sync-residual-gaps
 # (Phase 3 / Gap 3).
 #
-# `push` (main, develop, merge-candidate*/**) and `workflow_dispatch` runs are
-# NEVER grouped or cancelled: each keys on its own `github.run_id`, so it is
+# `push` (main, develop, merge-candidate*/**), `workflow_dispatch` and EVERY
+# re-run (run_attempt > 1) are NEVER grouped or cancelled: each keys on its own
+# `github.run_id` + `github.run_attempt`, so it is
 # the sole member of its group, and `cancel-in-progress` is false for them
 # anyway. coord lands on those push refs and redispatches this file on the
 # default branch, so a cancelled run there would be a missing verdict.
@@ -127,20 +128,29 @@ permissions:
 # view ranks `cancelled` last per (repo, head_sha, name), so a cancelled row
 # only counts when it is the sole row for that check on that sha.
 #
-# ⚠️ The group is keyed on the PR, NOT the sha: the NEWEST entrant cancels
-# whatever else is in the group, whichever sha it is for. A re-run of an OLDER
-# sha's run (the UI "Re-run" button, or ci-rerun-on-declaration.yml) therefore
-# cancels the CURRENT head's run and leaves a lone `cancelled` on it — red, with
-# nothing re-firing CI. ci-rerun-on-declaration.yml re-checks the PR head before
-# re-running for exactly this reason; do not re-run a superseded run by hand.
+# The group is keyed on the PR, NOT the sha: the NEWEST first-attempt entrant
+# cancels whatever else is in the group, whichever sha it is for. A RE-RUN used
+# to join the same group, so a re-run of an OLDER sha's run (the UI "Re-run"
+# button, or ci-rerun-on-declaration.yml) cancelled the CURRENT head's run and
+# left a lone `cancelled` on it. Since 2026-10-05 a re-run (run_attempt > 1)
+# gets a per-run group instead (pattern: qontinui-claude-config#1475), so it can
+# neither cancel nor be cancelled; the cost is that a re-run of a superseded
+# head runs to completion, so still do not re-run a superseded run by hand.
+# RESIDUAL: two pushes seconds apart can have their runs CREATED out of order,
+# so the older head's run cancels the newer head's; the next push heals it.
+#
+# The group is one expression, so coord models it as "" (never reaper-at-risk).
+# KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
+# compares groups with `=`, so every "" group matches every other one and
+# suppresses its auto re-run; the fix belongs in coord.
 #
 # `github.workflow` is in the key so the group cannot collide with another
 # workflow's group (concurrency groups are repo-wide). Do NOT add a `paths:`
 # filter as a cheaper alternative: the fleet bundle is compiled into the binary
 # via `include_dir!` (fleet_skills.rs), and coord counts `skipped` as passing.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -874,10 +884,11 @@ jobs:
       #   Dirty qontinui-runner: the file
       #   `src-tauri\binaries\qontinui_profile-x86_64-pc-windows-msvc.exe`
       #   has changed (…, 24036100ns after last build at …)
-      # (`tauri.conf.json` `bundle.externalBin`, which this repo's own build.rs
-      # self-provisions as placeholder stubs). Same defect CLASS — the package
-      # is an input to itself — two different files. The conclusion is identical
-      # on both legs and is what this step acts on: never invoke cargo twice.
+      # (`tauri.conf.json` `bundle.externalBin`, which this repo's build.rs
+      # used to self-provision as placeholder stubs). Same defect CLASS — the
+      # package is an input to itself — two different files. The conclusion
+      # is identical on both legs and is what this step acts on: never invoke
+      # cargo twice.
       # A single `cargo test` never notices, because it only checks freshness
       # once. Splitting into two invocations makes cargo check twice, and the
       # second check always fails. Measured on the ubuntu leg: `Compiling
@@ -890,23 +901,25 @@ jobs:
       # wrong. THE UBUNTU DIRTY WE MEASURED is not our build script's —
       # `src-tauri/build.rs` emits no `rerun-if-changed` into `OUT_DIR`, and the
       # path cargo named there is an `OUT_DIR` codegen asset, so that observed
-      # failure is `tauri-build`/`tauri-codegen` (2.5) and is upstream. Scoped
+      # failure is `tauri-build`/`tauri-codegen` (2.6.2) and is upstream. Scoped
       # to the observation rather than to the leg, because the ours-half
-      # mechanism below exists on ubuntu too: the same
-      # `ensure_sidecar_placeholders()` writes
-      # `qontinui_profile-x86_64-unknown-linux-gnu` under the same gitignore
-      # glob. Ubuntu simply tripped the upstream one first. **The WINDOWS half
-      # IS ours.** That sidecar stub is written by our own
-      # `ensure_sidecar_placeholders()`. It is touch-if-absent rather than an
-      # unconditional rewrite (`if path.exists() { continue; }`), and
-      # `src-tauri/binaries/qontinui_profile-*` is gitignored — so on a fresh CI
-      # checkout it is ALWAYS absent, invocation 1's build script creates it
-      # inside the fingerprint window, and invocation 2 sees it changed.
-      # One-shot rather than perpetual, which is exactly why it never surfaced
-      # under a single `cargo test` and appeared the moment the step was split.
-      # Cheap for us to fix (write the stub before the fingerprint window, or
-      # emit it into `OUT_DIR`) and NOT blocked on upstream, unlike the ubuntu
-      # half. Both recorded as follow-ups rather than worked around silently.
+      # mechanism below existed on ubuntu too. **The WINDOWS half WAS ours, and
+      # is closed.** Its sidecar stub was written by our own
+      # `ensure_sidecar_placeholders()`, touch-if-absent into
+      # `src-tauri/binaries/` under its gitignored `qontinui_profile-*` glob,
+      # so on a fresh CI checkout invocation 1's build script created it
+      # inside the fingerprint window and invocation 2 saw it changed
+      # (one-shot, which is why a single `cargo test` never surfaced it). Plan
+      # `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`
+      # replaced that function with `hide_external_bin_from_tauri_build()`,
+      # which merges `bundle.externalBin: null` into tauri-build's
+      # `TAURI_CONFIG` and writes nothing into `binaries/`, so tauri-build no
+      # longer validates, copies or fingerprints the sidecars at all. The
+      # upstream half (the tauri-codegen `OUT_DIR` asset, observed on ubuntu
+      # but written on every target) is still open, which is why the run half
+      # below still never invokes cargo.
+      # (The build/run split itself exists for the separate bounds described
+      # above, not for this.)
       #
       # So the run half executes the binaries the build half ALREADY produced.
       # cargo prints one `Executable \`<path>\`` line per test target under

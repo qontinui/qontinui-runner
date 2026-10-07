@@ -251,6 +251,10 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // transcript above. Bounded per file / per report, but a bound on volume is
     // not a bound on who may read it.
     "GET /sessions/{id}/file-changes",
+    // Reads a local Claude Code transcript and queues it for coord: it decides
+    // whose conversation leaves the machine. Authorized on the coord-mcp proxy
+    // nonce in the handler; no browser caller has any business here.
+    "POST /sessions/transcript-bind",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
@@ -328,6 +332,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "GET /hooks/{id}",
     // a browser origin must never be able to widen browser trust
     "/settings/api/allowed-origins",
+    // re-points which tenant this device's new sessions, device-level surfaces
+    // and running UNPINNED sessions write into (`mcp::tenant`, plan
+    // `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+    // Phase 4) — a credential-selection change, so every method is a door
+    "/tenant/active",
     // server-side request to a caller-chosen URL whose response is returned:
     // aimed at 127.0.0.1 it launders a browser request into a NonBrowser one
     "POST /api-request/test",

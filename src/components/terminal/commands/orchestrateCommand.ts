@@ -38,6 +38,7 @@ import { useCommandAction } from "./useCommandAction";
 // file's `ok<T>` took a value while `usePromptLibraryCommands`'s took none,
 // so a prompt action structurally could not report anything about itself.
 import { fail, ok } from "./verdict";
+import { describeThrown } from "@/lib/utils";
 
 /** The `Run` row returned by `start_orchestration_run` (serde snake_case). */
 interface OrchestrationRun {
@@ -176,7 +177,7 @@ export function useOrchestrateCommand(): void {
         openRunPage(runId, plan.goal);
         return ok({ runId });
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = describeThrown(e, "unknown error");
         return fail("start-failed", `failed to start orchestration run: ${msg}`);
       }
     },

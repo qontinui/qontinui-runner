@@ -13,6 +13,7 @@ import {
 } from "recharts";
 import { RefreshCw } from "lucide-react";
 import { fetchApi, type EditAnalysis } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 const COLORS = ["#8b5cf6", "#ef4444", "#f59e0b", "#10b981", "#06b6d4"];
 
@@ -32,7 +33,7 @@ export function EditAnalysisTab() {
       const result = await fetchApi<EditAnalysis>("/generator-eval/edit-analysis");
       setData(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load");
+      setError(describeThrown(e, "Failed to load"));
     } finally {
       setLoading(false);
     }

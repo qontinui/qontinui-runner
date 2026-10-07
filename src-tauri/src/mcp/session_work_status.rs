@@ -118,8 +118,15 @@ struct WireResponse {
     unknown: Vec<String>,
     #[serde(default)]
     invalid: Vec<String>,
-    #[serde(default)]
-    truncated: bool,
+    /// coord cut the INPUT id list (more ids than its per-request cap). Wire
+    /// name `input_truncated` since plan
+    /// `2026-09-12-fleet-principal-session-routes-disagree-about-being-capped`
+    /// Phase 3; the legacy `truncated` is accepted as an alias so this build
+    /// reads a coord from either side of the rename. It says nothing about a
+    /// capped RESULT page — that is what `truncated` meant on the sibling
+    /// routes, and why coord renamed it.
+    #[serde(default, alias = "truncated")]
+    input_truncated: bool,
     /// `false` means the join could not be expressed on that database at all —
     /// so every `statuses` entry it did or did not return is meaningless.
     #[serde(rename = "sessionBridgeColumnPresent", default = "default_true")]
@@ -250,8 +257,12 @@ fn map_from_body(body: &WireResponse) -> (HashMap<String, SessionWorkStatus>, St
     if !body.invalid.is_empty() {
         notes.push(format!("{} id(s) were not UUIDs", body.invalid.len()));
     }
-    if body.truncated {
-        notes.push("coord truncated the request (over its id cap)".to_string());
+    if body.input_truncated {
+        notes.push(
+            "coord truncated the INPUT id list (over its per-request id cap), so ids past \
+             the cap were not asked about"
+                .to_string(),
+        );
     }
     (out, notes.join("; "))
 }
@@ -453,7 +464,7 @@ mod tests {
                 "e": {"session_status": "finished"},
                 "f": {"session_status": "done"},
             },
-            "unknown": [], "invalid": [], "accepted": 6, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 6, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         })));
         assert_eq!(m.get("a"), Some(&SessionWorkStatus::Working));
@@ -476,7 +487,7 @@ mod tests {
                 "no-since": {"session_status": "finished"},
                 "bad-since": {"session_status": "finished", "since": "yesterday"},
             },
-            "unknown": [], "invalid": [], "accepted": 5, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 5, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         }));
         let m = finished_at_from_body(&b);
@@ -548,7 +559,32 @@ mod tests {
         assert!(m.is_empty());
         assert!(note.contains("2 id(s) resolved to no coord session"));
         assert!(note.contains("1 id(s) were not UUIDs"));
-        assert!(note.contains("truncated"));
+        assert!(note.contains("truncated the INPUT id list"));
+    }
+
+    /// Phase 3 of plan `2026-09-12-fleet-principal-session-routes-…` renames
+    /// the wire field `truncated` → `input_truncated`. This build must read
+    /// BOTH, because it may meet a coord from either side of that rename.
+    #[test]
+    fn input_truncated_is_read_under_both_the_new_and_the_legacy_name() {
+        for key in ["input_truncated", "truncated"] {
+            let mut v = serde_json::json!({
+                "statuses": {}, "unknown": [], "invalid": [], "accepted": 500,
+                "sessionBridgeColumnPresent": true
+            });
+            v[key] = serde_json::json!(true);
+            let b = body(v);
+            assert!(b.input_truncated, "`{key}: true` must be read");
+            let (_, note) = map_from_body(&b);
+            assert!(
+                note.contains("truncated the INPUT id list"),
+                "{key}: {note}"
+            );
+        }
+        // Absent under either name -> false, and no note.
+        let b = body(serde_json::json!({"statuses": {}, "sessionBridgeColumnPresent": true}));
+        assert!(!b.input_truncated);
+        assert!(map_from_body(&b).1.is_empty());
     }
 
     #[tokio::test]

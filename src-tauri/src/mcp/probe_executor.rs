@@ -214,7 +214,11 @@ fn git_read(worktree: &Path, args: &[&str]) -> Option<String> {
 fn git_read_outcome(worktree: &Path, args: &[&str]) -> ProbeOutcome {
     match args.first() {
         Some(sub) if READ_ONLY_GIT.contains(sub) => {}
-        _ => return ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::SpawnError),
+        _ => {
+            return ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::SpawnError(
+                qontinui_runner_lib::util::resource_exhaustion::SpawnFailure::NOT_ATTEMPTED,
+            ))
+        }
     }
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.arg("-C").arg(worktree).args(args);
@@ -311,7 +315,9 @@ async fn probe_path_activity(args: &Value) -> ProbeResultBody {
 ///
 /// * exit 0 → `Some(true)`  — the ref resolves.
 /// * exit non-zero → `Some(false)` — git answered, and the ref does not exist.
-/// * timed out / could not spawn → `None` — **cannot tell**. Coord's
+/// * timed out / could not spawn / exited non-zero because its own child
+///   launch failed for want of commit (`CommitExhaustionSuspected`) → `None`
+///   — **cannot tell**. Coord's
 ///   expectation supervisor reads a `Some(false)` as a definite fact about the
 ///   branch; a killed child has established nothing, and the module's own
 ///   contract for the sibling `has_unpushed` already says a safety predicate
@@ -706,9 +712,22 @@ mod tests {
             "a killed child has established nothing about the branch"
         );
         assert_eq!(
-            branch_exists_from(&ProbeOutcome::Degraded(DegradeReason::SpawnError)),
+            branch_exists_from(&ProbeOutcome::Degraded(DegradeReason::SpawnError(
+                qontinui_runner_lib::util::resource_exhaustion::SpawnFailure::NOT_ATTEMPTED
+            ))),
             None,
             "a git we could not even start has established nothing"
+        );
+        // A git that ran but whose own child launch failed for want of commit
+        // exited non-zero WITHOUT answering — it must not read as "the ref
+        // does not exist" (plan `2026-09-23-resource-guard-floors-are-
+        // constants-and-the-runners-own-git-spawns-are-ungated` Phase 0).
+        assert_eq!(
+            branch_exists_from(&ProbeOutcome::Degraded(
+                DegradeReason::CommitExhaustionSuspected { os_code: 1455 }
+            )),
+            None,
+            "commit exhaustion is not git's answer"
         );
         // The genuine negative survives: git RAN and said the ref does not
         // resolve. Collapsing this to `None` would be the opposite defect.
@@ -756,7 +775,9 @@ mod tests {
         let outcome = git_read_outcome(&PathBuf::from("."), &["push", "--force"]);
         assert!(matches!(
             outcome,
-            ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::SpawnError)
+            ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::SpawnError(
+                qontinui_runner_lib::util::resource_exhaustion::SpawnFailure::NOT_ATTEMPTED
+            ))
         ));
         assert_eq!(branch_exists_from(&outcome), None);
     }

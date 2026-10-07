@@ -28,6 +28,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { createLogger } from "@/lib/logger";
 import type { SavedProject } from "@/hooks/useSavedProjects";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("FrontPageAddress");
 
@@ -101,7 +102,7 @@ export function FrontPageAddress({ project, onSaved }: FrontPageAddressProps) {
       setSaved(true);
       await onSaved?.(trimmed || null);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to save front page address");
       log.error("set_project_front_page failed", msg);
       setError(msg);
     } finally {

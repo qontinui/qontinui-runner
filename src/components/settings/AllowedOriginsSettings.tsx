@@ -19,6 +19,7 @@ import { Globe, Plus, Trash2 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface AllowedOriginsSettingsProps {
   onLog: LogFunction;
@@ -63,7 +64,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
       setDefaults(body.data?.defaults ?? []);
       if (body.data?.envVar) setEnvVar(body.data.envVar);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "unknown error");
       setError(msg);
       onLog("error", `Failed to load allowed origins: ${msg}`);
     } finally {
@@ -81,8 +82,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     };
   }, [load]);
 
-  const hasChanges =
-    origins.length !== initial.length || origins.some((o, i) => o !== initial[i]);
+  const hasChanges = origins.length !== initial.length || origins.some((o, i) => o !== initial[i]);
 
   const add = () => {
     const value = input.trim();
@@ -109,7 +109,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
       setInitial(saved);
       onLog("success", `Saved ${saved.length} allowed browser origin(s)`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "unknown error");
       setError(msg);
       onLog("error", `Failed to save allowed origins: ${msg}`);
     } finally {

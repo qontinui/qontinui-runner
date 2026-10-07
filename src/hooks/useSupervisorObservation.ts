@@ -25,6 +25,7 @@
 
 import { useSyncExternalStore } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 /** Wire shape of `GET /supervisor/observation` (inside the `ApiResponse` envelope). */
 export interface SupervisorObservation {
@@ -155,7 +156,7 @@ async function readOnce() {
     const observation = await fetchSupervisorObservation();
     publish(nextObservationState(sharedState, { ok: true, observation }));
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = describeThrown(err, "supervisor observation read failed");
     publish(nextObservationState(sharedState, { ok: false, message }));
   } finally {
     inFlight = false;

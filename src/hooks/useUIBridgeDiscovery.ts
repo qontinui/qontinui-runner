@@ -15,6 +15,7 @@ import type { UseStateMachineConfigReturn } from "./useStateMachineConfig";
 import type { ShowToastFn } from "./useToast";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumePendingCaptureScreenshots } from "./useSdkUIBridge";
+import { describeThrown } from "@/lib/utils";
 
 // Discovery result from the fingerprint-based discovery Tauri command.
 // Must match the Rust structs serialized with #[serde(rename_all = "camelCase")].
@@ -177,7 +178,7 @@ export function useUIBridgeDiscovery(
       showToast?.(`Discovered ${result.states.length} states`, "success");
       return result;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = describeThrown(err, "State discovery failed");
       showToast?.(message, "error");
       console.warn("[useUIBridgeDiscovery]", message);
       return null;
@@ -224,7 +225,7 @@ export function useUIBridgeDiscovery(
           "success",
         );
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to save config";
+        const message = describeThrown(err, "Failed to save config");
         showToast?.(message, "error");
         console.warn("[useUIBridgeDiscovery] Config creation failed:", message);
         setIsSaving(false);

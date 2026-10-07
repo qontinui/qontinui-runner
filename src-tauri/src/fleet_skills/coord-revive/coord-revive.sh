@@ -1066,6 +1066,34 @@ fi
 # shellcheck source=../../../scripts/lib/envelope.sh
 . "$ENVELOPE_LIB"
 
+# `${NAME:-default}` expansion for every nonce read out of a .mcp.json (read_cfg
+# below): the runner writes the coord-mcp entry as
+# `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}`, and this script must
+# expand it from ITS OWN environment exactly as Claude Code does, or it would
+# replay the literal reference as a bearer and read the 401 as a stale nonce.
+# Plan 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages.
+# NOT fatal when unresolvable (a bundle that predates the render): a literal
+# nonce needs no expansion, so only a value that actually carries a reference is
+# refused - typed, and never sent.
+__resolve_fleet_script "lib/mcp-env-ref.sh"; MCP_ENV_REF_LIB="$__RFS_PATH"
+if [ -n "$MCP_ENV_REF_LIB" ]; then
+  # shellcheck source=../../../scripts/lib/mcp-env-ref.sh
+  . "$MCP_ENV_REF_LIB"
+else
+  mcp_expand_env_ref_to() {
+    case "$2" in
+      *'${'*'}'*)
+        echo "UNEXPANDED_ENV_REF (helper absent): the .mcp.json value carries a \${...} reference and scripts/lib/mcp-env-ref.sh was not found - $(__fleet_script_searched "lib/mcp-env-ref.sh"). Refusing to send it literally (LOCAL fault, not a coord verdict)." >&2
+        printf -v "$1" '%s' ""; return 4 ;;
+    esac
+    printf -v "$1" '%s' "$2"
+  }
+  mcp_env_ref_default_to() { mcp_expand_env_ref_to "$@"; }
+  # No helper, no loopback predicate: refusing every reference is the safe
+  # reading for any URL, so the URL is ignored here.
+  mcp_expand_env_ref_for_url() { mcp_expand_env_ref_to "$1" "$3"; }
+fi
+
 # Named loudly: every probe stages its auth header here, so a silent failure
 # would surface later as AUTH_HEADER_STAGING_FAILED with an empty path — the
 # symptom without the cause.
@@ -1627,6 +1655,21 @@ print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$1" 2>/dev/null
   fi
   case "$CFG_URL" in *"/coord-mcp"*) ;; *) return 1 ;; esac
   [ -n "$CFG_KEY" ] || return 1
+  # Expand `${NAME:-default}` from THIS process's environment (see the
+  # mcp-env-ref.sh sourcing above), so a runner env-ref config and its literal
+  # twin carry the same key into probe_door AND into seen_endpoint's (url, key)
+  # dedup. An unset no-default reference is refused with its typed reason in
+  # $CFG_ENVREF_ERR - cfg_shape reports it - and nothing is sent.
+  # The URL gate lives in the helper (mcp_expand_env_ref_for_url): only a
+  # strictly-loopback CFG_URL reads the environment; any other URL resolves on
+  # the reference's DEFAULT arm, so no environment value is sent off-box.
+  CFG_ENVREF_ERR=""
+  if ! mcp_expand_env_ref_for_url CFG_KEY "$CFG_URL" "$CFG_KEY" 2>"$TMPD/envref.err"; then
+    CFG_ENVREF_ERR="$(head -n 1 "$TMPD/envref.err" 2>/dev/null)"
+    CFG_ENVREF_FILE="$1"
+    return 1
+  fi
+  [ -n "$CFG_KEY" ] || return 1
 }
 
 # cfg_shape <file> -> a precise one-line reason this file is not a probeable door.
@@ -1686,6 +1729,12 @@ else:
 }
 
 cfg_shape() {
+  # read_cfg refused this file's key as an unexpandable env reference: that is
+  # the precise reason, and the shape probe below would call it "complete".
+  if [ -n "${CFG_ENVREF_ERR:-}" ] && [ "${CFG_ENVREF_FILE:-}" = "$1" ]; then
+    echo "$CFG_ENVREF_ERR"
+    return 0
+  fi
   local tok
   [ -r "$1" ] || { echo "missing or unreadable"; return; }
   tok="$(cfg_shape_token "$1")"
@@ -2000,7 +2049,7 @@ PARTIAL: PATH-KEYED reads (coord_pr_status, /pr-merge/.../reevaluate) are unaffe
 # The bootstrap token is an AGENT principal minted against a device UUID, not a
 # device principal, and this script asserts nothing beyond what its control read
 # actually measured.
-PARTIAL_BOOTSTRAP="PARTIAL: the url= above is the MINT, not a door to re-issue a write over. This rung yields a BEARER; spend it on the device-authed hand-written \${COORD_HTTP_URL}/coord/... REST routes, which /gate's write-forwarder REST rung spells out. It is NOT carried onto \${COORD_HTTP_URL}/mcp - that door's device-JWT-only constraint is unchanged.
+PARTIAL_BOOTSTRAP="PARTIAL: the url= above is the MINT, not a door to re-issue a write over. This rung yields a BEARER; spend it on the device-authed hand-written \${COORD_HTTP_URL}/coord/... REST routes, which /gate's write-forwarder REST rung spells out. \${COORD_HTTP_URL}/mcp DOES accept it, as principal_kind=agent (measured 2026-09-26 and 2026-10-02: HTTP 200, isError:false); which tools that principal may call is tools/list's answer over the same bearer. This script does not probe /mcp with it.
 PARTIAL: this bearer is sub_type=agent with a DEVICE subject (sub=device:<uuid>) and NO agent_id claim - measured 2026-09-04 - so it is scoped by whatever coord grants such a principal in this tenant, which is not the same set the L1/L2 proxy or an L4 device JWT carries. coord's own agent-refresh helper will not refresh it for that reason (agent-only route); re-mint instead.
 PARTIAL: VERIFIED here: the control read GET \${COORD_HTTP_URL}/coord/agent-findings?limit=1 answered 200. Measured 2026-09-04 the same bearer also read \${COORD_HTTP_URL}/coord/agent-prompt-documents and one policy document at 200, so tenant resolution DID work on those routes - but that is those routes' evidence, not a general guarantee: a 403 cannot-resolve-tenant elsewhere is THAT route's verdict, not a refutation of the credential.
 PARTIAL: it is SHORT-LIVED - ~4h (14400s, measured). It is NOT over-broad: measured 2026-09-04 every scope in the minted token was empty or false (git_push [], merge_propose false, build_submit false, strategy_admin false, introspect false, no NATS subjects), which is NARROWER than the sibling allocate route's token (that one carries git_push scoped to the reserved branch plus agent NATS subjects; neither mints merge_propose). Use it for the read or write you came for and DISCARD it: never persist it, never print it, never put it on any process's argv.
@@ -2148,27 +2197,229 @@ usage: coord-revive.sh                          run the transport cascade (defau
        coord-revive.sh call <tool> ['<json-object>']
                                                 EXECUTE one coord MCP tool over that nonce - whatever
                                                 it is allowed, reads AND writes; verify a write by read
-Both verbs read the nearest .mcp.json above $PWD and never mint a nonce.
+Both verbs read the nearest .mcp.json above $PWD and never mint a nonce. Its
+coord-mcp entry may be PROXY-shaped (loopback url + nonce header) or a STDIO
+coord-mcp-shim.py entry (command/args naming --credential <file>): the shim's own
+--print-door mode reads that credential file, re-read on every call.
 EOF
 }
 
 # find_own_cfg -> sets CFG_URL / CFG_KEY / CFG_KEY_HEADER / OWN_CFG_PATH from the
-# first proxy-shaped .mcp.json on the walk up from $PWD; 1 (with the shapes of
-# every rejected candidate in $CFG_TRIED) when none.
+# first proxy-shaped .mcp.json on the walk up from $PWD -- OR, for a STDIO
+# coord-mcp-shim entry, sets OWN_CFG_KIND=stdio plus CFG_CRED_PATH /
+# CFG_ENTRY_SHIM (read_stdio_cfg) and leaves the url and headers to
+# stdio_door, which asks the shim. 1 (with the shapes of every rejected
+# candidate in $CFG_TRIED) when neither.
+#
+# The NEAREST entry wins, whichever shape. But a stdio entry does not end the
+# walk: it keeps going for a proxy-shaped one above it and records that as
+# PX_URL / PX_KEY / PX_KEY_HEADER / PX_PATH. The verb falls back to that proxy
+# door - the one it used before stdio entries were understood at all, so a
+# layout that worked before this change keeps working - in exactly two cases:
+#   1. the stdio door cannot be OPENED (stdio_door fails: credential file gone
+#      or refused, no shim with --print-door, no python, header staging), so
+#      nothing was sent; or
+#   2. the stdio request was provably NOT CARRIED: HTTP 401 (the forwarder
+#      refuses before dispatch - a stale credential on a rebound slot) or a
+#      curl connect-class failure (exit 6 resolve / 7 connect: no connection,
+#      so no handler). Retried ONCE over the proxy, said on stderr, and the
+#      proxy's outcome is the one reported.
+# Never on anything else - a JSON-RPC answer or error, any other HTTP status,
+# a timeout (exit 28 cannot tell connect from read) - since the call may have
+# reached a handler and a retry could double a write.
 find_own_cfg() {
   local d="$PWD" f p
-  OWN_CFG_PATH=""; CFG_TRIED=""
+  OWN_CFG_PATH=""; OWN_CFG_KIND=""; CFG_TRIED=""
+  PX_URL=""; PX_KEY=""; PX_KEY_HEADER=""; PX_PATH=""
   while [ -n "$d" ]; do
     f="$d/.mcp.json"
     if [ -r "$f" ]; then
-      if read_cfg "$f"; then OWN_CFG_PATH="$f"; return 0; fi
-      CFG_TRIED="$CFG_TRIED
+      if read_cfg "$f"; then
+        if [ "$OWN_CFG_KIND" = stdio ]; then
+          PX_URL="$CFG_URL"; PX_KEY="$CFG_KEY"; PX_KEY_HEADER="$CFG_KEY_HEADER"; PX_PATH="$f"
+          return 0
+        fi
+        OWN_CFG_PATH="$f"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""; CFG_ENTRY_SHIM=""; return 0
+      fi
+      if [ -z "$OWN_CFG_KIND" ] && read_stdio_cfg "$f"; then
+        OWN_CFG_PATH="$f"; OWN_CFG_KIND=stdio
+      elif [ -z "$OWN_CFG_KIND" ]; then
+        CFG_TRIED="$CFG_TRIED
   $f: $(cfg_shape "$f")"
+      fi
     fi
     p="$(dirname "$d")"
     [ "$p" = "$d" ] && break
     d="$p"
   done
+  [ -n "$OWN_CFG_KIND" ]
+}
+
+# read_stdio_cfg <file> -> 0 and sets CFG_CRED_PATH (the `--credential` value)
+# and CFG_ENTRY_SHIM (the args entry ending in coord-mcp-shim.py) when the
+# file's `coord-mcp` entry is a STDIO shim entry - both present; 1 otherwise.
+# CFG_ENTRY_SHIM is a SHAPE test only and is never executed (see stdio_door).
+#
+# Plan `2026-10-01-coord-revive-call-cannot-ride-a-stdio-shim-mcp-json`. The
+# runner provisions `{"command": <python>, "args": [<...>/coord-mcp-shim.py,
+# "--credential", <file>]}`, which carries no url and no nonce: both live in
+# the credential FILE, which the shim re-reads per request. This function reads
+# only the PATH out of .mcp.json. It never parses the credential itself --
+# stdio_door asks the shim to, so there is one credential grammar, not three.
+# Config on STDIN for the MSYS_NO_PATHCONV reason read_cfg spells out.
+read_stdio_cfg() {
+  local _pair
+  CFG_CRED_PATH=""; CFG_ENTRY_SHIM=""
+  if [ "$JSON_READER" = jq ]; then
+    _pair=$(jq -r '
+      (.mcpServers // {}) as $s
+      | if ($s | type) != "object" then empty else
+        ($s["coord-mcp"] // null) as $c
+        | if ($c | type) != "object" or (($c.command // "") | tostring) == ""
+             or (($c.args // null) | type) != "array" then empty
+          else ($c.args | map(tostring)) as $a
+            | ([range(0; ($a | length) - 1) | select($a[.] == "--credential") | $a[. + 1]][0] // ""),
+              ([$a[] | select(test("coord-mcp-shim\\.py$"))][0] // "")
+          end
+        end' < "$1" 2>/dev/null)
+  else
+    _pair=$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+s=d.get("mcpServers") if isinstance(d,dict) else None
+c=s.get("coord-mcp") if isinstance(s,dict) else None
+if not (isinstance(c,dict) and c.get("command") and isinstance(c.get("args"),list)): sys.exit(0)
+a=[str(x) for x in c["args"]]
+cred=next((a[i+1] for i in range(len(a)-1) if a[i]=="--credential"),"")
+print(cred)
+print(next((x for x in a if x.endswith("coord-mcp-shim.py")),""))' < "$1" 2>/dev/null)
+  fi
+  CFG_CRED_PATH=$(printf '%s\n' "$_pair" | sed -n '1p' | tr -d '\r')
+  CFG_ENTRY_SHIM=$(printf '%s\n' "$_pair" | sed -n '2p' | tr -d '\r')
+  if [ -n "$CFG_CRED_PATH" ] && [ -n "$CFG_ENTRY_SHIM" ]; then return 0; fi
+  # Rejected: leave NOTHING behind. The proxy path's failure messages read
+  # CFG_CRED_PATH to name where the nonce came from, so a half-parsed nearer
+  # entry would otherwise name a credential file that was never used.
+  CFG_CRED_PATH=""; CFG_ENTRY_SHIM=""
+  return 1
+}
+
+# door_python -> sets DOOR_PY to an interpreter that can run the shim, or "".
+# The JSON reader when it is already a python (smoke-tested at startup);
+# otherwise the same output-checked probe the reader selection uses, for the
+# same reason -- a resolving-but-broken python (a Windows App Execution Alias
+# stub) must not read as "the credential is unusable".
+#
+# PYTHON 3 IS REQUIRED and probed for: the JSON reader prefers `python`, which on
+# some boxes is still Python 2 - fine for reading JSON, fatal for the shim
+# (`from urllib.parse import` fails), and that death would otherwise surface as
+# a verdict about the CREDENTIAL. So the reader is re-probed here rather than
+# trusted, and a python 2 is skipped for the next candidate. The probe PRINTS
+# its verdict rather than asserting it: PYTHONOPTIMIZE strips `assert`, so an
+# assert-based probe passes any interpreter under -O.
+door_python() {
+  local c
+  DOOR_PY=""
+  for c in "$JSON_READER" python3 python; do
+    [ "$c" = jq ] && continue
+    if command -v "$c" >/dev/null 2>&1 \
+       && [ "$("$c" -c 'import json,sys;print(1 if sys.version_info>=(3,6) else 0)' </dev/null 2>/dev/null | tr -d '\r\n')" = "1" ]; then
+      DOOR_PY="$c"; return 0
+    fi
+  done
+  return 1
+}
+
+# stdio_door <header-out> -> 0 with CFG_URL set and the credential's headers
+# written to <header-out>; 1 with the typed reason already on stderr.
+#
+# The parser is coord-mcp-shim.py's own `--print-door` mode, so the url
+# normalisation, the loopback / provision-session refusal and the header
+# allowlist are EXACTLY rung 1's (`load_credential`), and a nonce rotated since
+# the session started is picked up: the credential file is read afresh by every
+# call. The headers land in <header-out> (0600, inside the private $TMPD) for
+# `curl -H @file`; the nonce never touches argv or stdout.
+#
+# WHICH shim: ONLY the one this script resolves for itself (the fleet
+# config checkout's scripts/, or the skill's `_scripts/` render) -- NEVER
+# the path the .mcp.json entry names. That entry comes from whatever directory
+# the walk up from $PWD reached; executing a file it names would run code from
+# an arbitrary cloned repo without the approval Claude Code shows before it
+# starts a project MCP server. A resolved shim that predates --print-door is
+# reported, never guessed around. STATED LIMIT: the skill's `_scripts/` render
+# does not carry coord-mcp-shim.py yet (check #64's roster), so a device with
+# no checkout reads STDIO_SHIM_PARSER_ABSENT here.
+stdio_door() {
+  local out="$1" shim rc tried=""
+  if ! door_python; then
+    echo "coord-revive: $VERB -> STDIO_DOOR_NO_PYTHON (the .mcp.json at $OWN_CFG_PATH is a stdio coord-mcp-shim entry; reading its credential needs the shim, and no working Python >= 3.6 was found - LOCAL fault, not a coord verdict)" >&2
+    return 1
+  fi
+  __resolve_fleet_script "coord-mcp-shim.py"
+  for shim in "$__RFS_PATH"; do
+    [ -n "$shim" ] && [ -f "$shim" ] && [ -r "$shim" ] || continue
+    if ! grep -q -- '--print-door' "$shim" 2>/dev/null; then
+      tried="$tried $shim(no --print-door)"
+      continue
+    fi
+    rm -f "$out"
+    "$DOOR_PY" "$(curl_path "$shim")" --credential "$(curl_path "$CFG_CRED_PATH")" --print-door "$(curl_path "$out")" \
+      > "$TMPD/vdoorurl" 2> "$TMPD/vdoorerr" < /dev/null
+    rc=$?
+    # The shim's DOCUMENTED exits only: 3 = it refused the credential, 2 =
+    # usage (which includes a --credential path that is not a readable file),
+    # 4 = it ran but could not create/write its OUTPUT file
+    # (AUTH_HEADER_STAGING_FAILED: a disk-full or locked $TMPD is neither a
+    # credential verdict nor a shim that failed to run). Anything else - a
+    # traceback (1), a killed interpreter - means the shim did not RUN, and
+    # must not be reported as a verdict on a credential that may be perfectly
+    # good.
+    case "$rc" in
+      0) ;;
+      3)
+        rm -f "$out"
+        echo "coord-revive: $VERB -> STDIO_CREDENTIAL_UNUSABLE (the shim refused the credential named by $OWN_CFG_PATH, exit 3: $(one_line 300 < "$TMPD/vdoorerr")). Nothing was sent - a LOCAL fact about the credential file, not a coord verdict." >&2
+        return 1 ;;
+      2)
+        rm -f "$out"
+        echo "coord-revive: $VERB -> STDIO_CREDENTIAL_UNUSABLE (the shim rejected its arguments, exit 2 - most often the --credential path $CFG_CRED_PATH named by $OWN_CFG_PATH is not a readable file: $(one_line 300 < "$TMPD/vdoorerr")). Nothing was sent - a LOCAL fact, not a coord verdict." >&2
+        return 1 ;;
+      4)
+        # The shim RAN and judged nothing wrong with the credential; it could
+        # not create or write the header file under $TMPD (disk full, a locked
+        # or vanished temp dir). Same verdict as the empty-file check below.
+        rm -f "$out"
+        echo "coord-revive: $VERB -> AUTH_HEADER_STAGING_FAILED (the shim could not write its header file under $TMPD, exit 4: $(one_line 300 < "$TMPD/vdoorerr")). A LOCAL write fault - says nothing about the credential named by $OWN_CFG_PATH or about coord; nothing was sent." >&2
+        return 1 ;;
+      *)
+        rm -f "$out"
+        echo "coord-revive: $VERB -> STDIO_SHIM_FAILED (the shim $shim failed to RUN under $DOOR_PY, exit $rc: $(one_line 300 < "$TMPD/vdoorerr")). This says nothing about the credential named by $OWN_CFG_PATH, which was never judged; nothing was sent - a LOCAL fault, not a coord verdict." >&2
+        return 1 ;;
+    esac
+    CFG_URL="$(sed -n '1p' "$TMPD/vdoorurl" | tr -d '\r')"
+    # Belt and braces over the shim's own refusal: the url this verb will POST
+    # the nonce to must be the loopback runner, whatever the shim printed. The
+    # port is DIGITS ONLY: a `*` there would accept
+    # `http://127.0.0.1:1@evil.example/coord-mcp`, whose host is evil.example.
+    case "$CFG_URL" in
+      *@*|*provision-session*) CFG_URL_OK=0 ;;
+      *) if printf '%s' "$CFG_URL" | grep -Eq '^http://(127\.0\.0\.1|\[::1\]):[0-9]+/coord-mcp(/[^[:space:]]*)?$'; then CFG_URL_OK=1; else CFG_URL_OK=0; fi ;;
+    esac
+    case "$CFG_URL_OK" in
+      1) ;;
+      *)
+        rm -f "$out"
+        echo "coord-revive: $VERB -> STDIO_CREDENTIAL_UNUSABLE (the shim printed a door this verb refuses - non-loopback, not a digits-port 127.0.0.1/[::1] http url, or provision-session: '$CFG_URL' for $OWN_CFG_PATH - refused, nothing sent)" >&2
+        return 1 ;;
+    esac
+    if [ ! -s "$out" ]; then
+      echo "coord-revive: $VERB -> AUTH_HEADER_STAGING_FAILED (the shim wrote no header file under $TMPD - LOCAL fault, says nothing about coord)" >&2
+      return 1
+    fi
+    CFG_DOOR_SHIM="$shim"
+    return 0
+  done
+  echo "coord-revive: $VERB -> STDIO_SHIM_PARSER_ABSENT (the .mcp.json at $OWN_CFG_PATH is a stdio coord-mcp-shim entry, and no coord-mcp-shim.py carrying --print-door was found:${tried:- none resolved}). Update the fleet config checkout this script resolves its helpers from; nothing was sent." >&2
   return 1
 }
 
@@ -2301,10 +2552,37 @@ if [ $# -gt 0 ]; then
   fi
 
   if ! find_own_cfg; then
-    echo "coord-revive: $VERB -> NO_PROXY_CONFIG (no proxy-shaped coord-mcp .mcp.json with a key on the walk up from $PWD).${CFG_TRIED}" >&2
+    echo "coord-revive: $VERB -> NO_PROXY_CONFIG (no proxy-shaped coord-mcp .mcp.json with a key, and no stdio coord-mcp-shim entry naming --credential, on the walk up from $PWD).${CFG_TRIED}" >&2
     echo "  This session has no provisioned nonce to ride - a LOCAL fact, not a coord verdict. This verb does not mint one (that would evict a live peer's workdir slot): use a session the runner provisioned, /gate for a gate write, or the PowerShell coord-read.ps1 read verbs." >&2
     exit 1
   fi
+
+  # A STDIO shim entry: the shim stages the credential's headers into a private
+  # file and names the door; the block below appends the caller session to it.
+  V_DOOR_HDRS=""
+  if [ "$OWN_CFG_KIND" = stdio ]; then
+    if stdio_door "$TMPD/vdoorhdr"; then
+      V_DOOR_HDRS="$TMPD/vdoorhdr"
+      CFG_KEY_HEADER="the shim's allowlisted credential headers"
+    elif [ -n "$PX_PATH" ]; then
+      # The stdio verdict is already on stderr; ride the proxy entry above it,
+      # exactly as this verb did before it understood stdio entries.
+      echo "coord-revive: $VERB -> falling back to the proxy-shaped entry in $PX_PATH (above the stdio entry in $OWN_CFG_PATH)" >&2
+      CFG_URL="$PX_URL"; CFG_KEY="$PX_KEY"; CFG_KEY_HEADER="$PX_KEY_HEADER"
+      OWN_CFG_PATH="$PX_PATH"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""
+    else
+      exit 1
+    fi
+  fi
+
+  # At most TWO passes: the second only when a stdio request was provably not
+  # carried and a proxy entry sits above it (see find_own_cfg). The body below
+  # is deliberately NOT re-indented under the loop: scripts/
+  # caller-session-header-test.sh locates the staging group by its two-space
+  # `{` / `} ... > "$TMPD/vhdr"` lines.
+  V_POST_ATTEMPT=0
+  while :; do
+  V_POST_ATTEMPT=$((V_POST_ATTEMPT + 1))
 
   # The nonce and, when this session can prove one, its own caller-session id.
   # Both go in the SAME file because the nonce must never reach argv (served
@@ -2313,7 +2591,11 @@ if [ $# -gt 0 ]; then
   # but splitting it onto a second `-H` would buy nothing and lose the single
   # staging failure mode below.
   {
-    printf '%s: %s\n' "$CFG_KEY_HEADER" "$CFG_KEY"
+    if [ -n "${V_DOOR_HDRS:-}" ]; then
+      cat "$V_DOOR_HDRS"
+    else
+      printf '%s: %s\n' "$CFG_KEY_HEADER" "$CFG_KEY"
+    fi
     if V_CALLER_SESSION="$(caller_session_id)"; then
       printf 'X-Coord-Caller-Session: %s\n' "$V_CALLER_SESSION"
     fi
@@ -2334,10 +2616,22 @@ if [ $# -gt 0 ]; then
     -X POST "$CFG_URL" -H "Content-Type: application/json" \
     -H "@$(curl_path "$TMPD/vhdr")" --data-binary "@$(curl_path "$TMPD/rpc")" 2>"$TMPD/verr")
   VCE=$?
-  rm -f "$TMPD/vhdr"
+  rm -f "$TMPD/vhdr" "$TMPD/vdoorhdr"
   VBODY="$(cat "$TMPD/vbody" 2>/dev/null)"
   VCURLERR="$(one_line 200 < "$TMPD/verr")"
   [ -n "$VCODE" ] || VCODE="000"
+  if [ "$V_POST_ATTEMPT" -eq 1 ] && [ "$OWN_CFG_KIND" = stdio ] && [ -n "$PX_PATH" ]; then
+    # Write-safe: only an outcome that provably reached NO handler is retried.
+    case "$VCE:$VCODE" in
+      0:401|6:*|7:*)
+        echo "coord-revive: $VERB -> the stdio door $CFG_URL (credential $CFG_CRED_PATH) did NOT carry the call (curl exit $VCE, HTTP $VCODE: refused before dispatch or never connected) - retrying ONCE over the proxy-shaped entry in $PX_PATH; its outcome is the one reported below" >&2
+        CFG_URL="$PX_URL"; CFG_KEY="$PX_KEY"; CFG_KEY_HEADER="$PX_KEY_HEADER"
+        OWN_CFG_PATH="$PX_PATH"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""; V_DOOR_HDRS=""
+        continue ;;
+    esac
+  fi
+  break
+  done
   case "$VCE:$VCODE" in
     0:200)
       # A JSON-RPC surface answers 200 for in-band errors too; the reader
@@ -2355,6 +2649,9 @@ if [ $# -gt 0 ]; then
           # nothing either way and prints nothing.
           if [ "$(printf '%s' "$VBODY" | rpc_result_rows)" = "0" ]; then
             echo "coord-revive: $VERB -> 0 rows under known list keys (hits/records/results/items/findings/documents/work_units/gates/tools/alerts) - UNKNOWN(envelope) until confirmed against a known-present record; do not read this as an empty corpus" >&2
+          fi
+          if [ "$OWN_CFG_KIND" = stdio ]; then
+            echo "coord-revive: $VERB -> OK over $CFG_URL (credential $CFG_CRED_PATH named by the stdio shim entry in $OWN_CFG_PATH, read by $CFG_DOOR_SHIM --print-door; source=own-mcp-json-stdio-shim, nothing minted)" >&2; exit 0
           fi
           echo "coord-revive: $VERB -> OK over $CFG_URL (nonce from $OWN_CFG_PATH, header $CFG_KEY_HEADER; source=own-mcp-json, nothing minted)" >&2; exit 0 ;;
         3) echo "coord-revive: $VERB -> RPC_ERROR (the tool answered with a JSON-RPC error - printed above; that is ITS answer, the door carried the call)" >&2; exit 3 ;;
@@ -2374,17 +2671,21 @@ if [ $# -gt 0 ]; then
           [ -n "$VRC_POSTURE" ] || VRC_POSTURE="unstated"
           VRC_SINCE="$(runner_credential_field "$VBODY" since)"
           VRC_REMEDY="$(runner_credential_field "$VBODY" remedy)"
-          echo "coord-revive: $VERB -> RUNNER_CREDENTIAL_$(printf '%s' "$VRC_POSTURE" | tr '[:lower:]' '[:upper:]') (the forwarder at $CFG_URL answered 401 ITSELF; HTTP 401 with code=runner_credential_$VRC_POSTURE since ${VRC_SINCE:-unstated}). The nonce in $OWN_CFG_PATH is FINE and the TRANSPORT is healthy - what is dead is THIS RUNNER's own coord credential." >&2
+          echo "coord-revive: $VERB -> RUNNER_CREDENTIAL_$(printf '%s' "$VRC_POSTURE" | tr '[:lower:]' '[:upper:]') (the forwarder at $CFG_URL answered 401 ITSELF; HTTP 401 with code=runner_credential_$VRC_POSTURE since ${VRC_SINCE:-unstated}). The nonce in ${CFG_CRED_PATH:-$OWN_CFG_PATH} is FINE and the TRANSPORT is healthy - what is dead is THIS RUNNER's own coord credential." >&2
           echo "  Next: the nonce is fine; the runner's credential is $VRC_POSTURE; the L4/L5 doors will work and a re-provision will NOT. Run 'bash coord-revive.sh' (no verb) and re-issue over the bearer rung it names - L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the runner mint) and L5 (the bootstrap credential) carry their OWN credentials and do not go through this forwarder. A new session will not help either: every session on this box shares the runner that is refusing. Do NOT rotate the key, do NOT re-provision (it mints a fresh nonce for a credential that stays dead and evicts whatever holds this workdir's slot), and do NOT restart the runner (served policy production-and-cost runner-lifecycle). remedy=${VRC_REMEDY:-unstated}" >&2
           exit 1 ;;
       esac
-      echo "coord-revive: $VERB -> COORD_MCP_PROXY_UNAUTHORIZED (the forwarder at $CFG_URL rejected the nonce in $OWN_CFG_PATH; HTTP 401). The BINDING was superseded or never registered - the TRANSPORT is healthy." >&2
+      echo "coord-revive: $VERB -> COORD_MCP_PROXY_UNAUTHORIZED (the forwarder at $CFG_URL rejected the nonce in ${CFG_CRED_PATH:-$OWN_CFG_PATH}; HTTP 401). The BINDING was superseded or never registered - the TRANSPORT is healthy." >&2
+      if [ "$OWN_CFG_KIND" = stdio ]; then
+        echo "  Recovery for THIS caller: the credential file was re-read just now, so the key on disk is itself stale - run 'bash coord-revive.sh' (no verb) for the full cascade, which finds a sibling key or a bearer. The NATIVE MCP client here is the stdio shim, which re-reads the same file per request: it recovers by itself if the runner rewrites the file, and is dead with it otherwise. NEVER restart the runner over this, and this verb never mints (a /coord-mcp/provision-session mint evicts the live peer holding this workdir's slot)." >&2
+        exit 1
+      fi
       echo "  Recovery for THIS caller: the file was re-read just now, so the key on disk is itself stale - run 'bash coord-revive.sh' (no verb) for the full cascade, which finds a sibling key or a bearer. Recovery for the NATIVE MCP client: it cannot re-read .mcp.json, so start a NEW SESSION. NEVER restart the runner over this, and this verb never mints (a /coord-mcp/provision-session mint evicts the live peer holding this workdir's slot)." >&2
       exit 1 ;;
     *)
       VV="$(classify "$VCE" "$VCODE" "$VBODY" "$PROBE_CONNECT_TIMEOUT" "$CALL_TIMEOUT" "$VCURLERR")"
       [ -n "$VCURLERR" ] && VV="$VV [curl: $VCURLERR]"
-      echo "coord-revive: $VERB -> $VV (door $CFG_URL from $OWN_CFG_PATH; the call was NOT carried - a write here is presumed LOST, re-issue and verify by read)" >&2
+      echo "coord-revive: $VERB -> $VV (door $CFG_URL from ${CFG_CRED_PATH:-$OWN_CFG_PATH}; the call was NOT carried - a write here is presumed LOST, re-issue and verify by read)" >&2
       exit 1 ;;
   esac
 fi
@@ -3445,7 +3746,13 @@ for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
   [ -r "$f" ] || continue
   L2_SEEN=$((L2_SEEN + 1))
   seen_door "$f" && continue # canonical-path dedup: L1 (or an earlier glob hit) already probed it
-  read_cfg "$f" || continue
+  if ! read_cfg "$f"; then
+    # Only an unexpandable env reference is worth a line: every other miss is a
+    # file that simply is not a proxy-shaped door, which the sweep skips quietly.
+    [ -n "${CFG_ENVREF_ERR:-}" ] && [ "${CFG_ENVREF_FILE:-}" = "$f" ] \
+      && echo "L2: $f -> $CFG_ENVREF_ERR" >&2
+    continue
+  fi
   # (url, auth) dedup — a DIFFERENT file naming a door already probed is not a
   # second door. Must follow read_cfg (it sets CFG_*) and precede probe_door.
   if seen_endpoint "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY"; then

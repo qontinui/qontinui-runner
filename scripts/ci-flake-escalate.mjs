@@ -846,8 +846,9 @@ async function main(argv) {
       error(
         `coord could not serve a flake history for ${repo} after ${read.ms}ms — ${verdict.reason}. ` +
           `Filing nothing: this is UNKNOWN, not "no flaky tests". A read that fails server-side ` +
-          `is a coord-side condition (see the header of scripts/ci-flake-escalate.mjs and coord ` +
-          `finding e5311ec9-1592-430e-a7f8-9cc6eb84032e, topic test-flakiness), not this repo's.`,
+          `is a coord-side condition (see the header of scripts/ci-flake-escalate.mjs, and plan ` +
+          `2026-09-28-coord-test-flakiness-history-read-still-hits-the-statement-timeout in ` +
+          `qontinui-dev-notes/plans), not this repo's.`,
       );
       return 1;
     }

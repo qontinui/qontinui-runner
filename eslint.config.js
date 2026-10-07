@@ -59,6 +59,35 @@ const TERMINAL_POPULATION_NAME_SELECTORS = [
   `JSXAttribute > JSXIdentifier.name[name=${BANNED_POPULATION_NAMES}]`,
 ].map((selector) => ({ selector, message: POPULATION_NAME_MESSAGE }));
 
+/**
+ * Plan `2026-09-09-catch-site-discard-is-repo-wide-and-the-deferral-was-never-measured`
+ * — the catch-site discard guard.
+ *
+ * `x instanceof Error ? x.message : <anything>` throws the cause away on every
+ * real Tauri failure: `invoke()` rejects with a plain STRING, so the `else`
+ * arm is the one taken, and a bare constant (or `String(obj)` ->
+ * `[object Object]`) is all the operator sees. `describeThrown(err, fallback)`
+ * in `src/lib/utils.ts` is the one helper that keeps the cause.
+ *
+ * Deliberately NARROW: only the message-extracting shape is banned. The
+ * value-preserving shapes stay legal — `err instanceof Error ? err : new
+ * Error(String(err))` (normalisation) and `q.error instanceof Error ? q.error
+ * : null`. A site whose constant is load-bearing (the raw cause would leak a
+ * secret, or the swallow is deliberate) keeps it with an
+ * `eslint-disable-next-line no-restricted-syntax -- <reason>` comment;
+ * `--report-unused-disable-directives-severity error` fails a stale one.
+ *
+ * Flat config REPLACES `no-restricted-syntax` options across blocks (see the
+ * population-name note above), so the terminal block spreads BOTH lists.
+ */
+const CATCH_SITE_DISCARD_MESSAGE =
+  "Hand-rolled `x instanceof Error ? x.message : …` discards the cause of every non-Error " +
+  "rejection (Tauri `invoke()` rejects with a STRING). Use `describeThrown(err, \"<what failed>\")` " +
+  "from `@/lib/utils` (plan 2026-09-09-catch-site-discard-is-repo-wide-and-the-deferral-was-never-measured).";
+const CATCH_SITE_DISCARD_SELECTORS = [
+  'ConditionalExpression[test.type="BinaryExpression"][test.operator="instanceof"][test.right.name="Error"][consequent.type="MemberExpression"][consequent.property.name="message"]',
+].map((selector) => ({ selector, message: CATCH_SITE_DISCARD_MESSAGE }));
+
 export default [
   js.configs.recommended,
   {
@@ -158,10 +187,25 @@ export default [
     },
   },
   {
+    // Catch-site discard guard — see CATCH_SITE_DISCARD_SELECTORS above.
+    files: ["src/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": ["error", ...CATCH_SITE_DISCARD_SELECTORS],
+    },
+  },
+  {
     // Population-name guard — see TERMINAL_POPULATION_NAME_SELECTORS above.
+    // Spreads CATCH_SITE_DISCARD_SELECTORS too: flat config REPLACES this
+    // rule's options, so omitting it would switch the catch-site guard off
+    // under src/components/terminal/** (pinned by
+    // src/lib/eslintConfig.catchSiteGuard.test.ts).
     files: ["src/components/terminal/**/*.{ts,tsx}"],
     rules: {
-      "no-restricted-syntax": ["error", ...TERMINAL_POPULATION_NAME_SELECTORS],
+      "no-restricted-syntax": [
+        "error",
+        ...TERMINAL_POPULATION_NAME_SELECTORS,
+        ...CATCH_SITE_DISCARD_SELECTORS,
+      ],
     },
   },
   {

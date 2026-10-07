@@ -1005,6 +1005,40 @@ impl PgDb {
         // instead of binding the leftover copy.
         let _moved = atlas_managed_move::migrate_atlas_managed_tables(&mut conn).await;
 
+        // project.scheduled_tasks.conditions (JSONB) — the task's
+        // ScheduleConditions. AUTHORED by qontinui-web alembic revision
+        // `sched_cond_01_scheduled_tasks_conditions` (the table is in web's
+        // chain, not the runner's); mirrored here as a gated
+        // `ADD COLUMN IF NOT EXISTS` because an embedded Postgres (an end-user
+        // install) has no alembic and was provisioned from the bundled schema
+        // dump once, at creation — without this, a runner reading the column
+        // would fail every scheduled-task query on every such existing install.
+        // The alembic revision is itself `IF NOT EXISTS`, so whichever runs
+        // first, the other is a no-op. Gated on the table existing (on a
+        // database with no canonical schema yet this is skipped, and the
+        // schema apply creates the column) AND on the column being absent:
+        // `ALTER TABLE` takes an ACCESS EXCLUSIVE lock and needs table
+        // ownership even when `IF NOT EXISTS` makes it a no-op, so on every
+        // boot after the first it must not run at all.
+        conn.batch_execute(
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
+                   AND column_name = 'conditions'
+               ) THEN
+                 ALTER TABLE project.scheduled_tasks
+                     ADD COLUMN IF NOT EXISTS conditions JSONB;
+               END IF;
+             END $$;",
+        )
+        .await
+        .map_err(|e| format!("scheduled_tasks.conditions self-heal failed: {}", e))?;
+
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // atlas_managed.proposal_events. The table predates the multi-tenant
         // model, so existing rows are migrated under the bootstrap app_id
@@ -1327,6 +1361,10 @@ impl PgDb {
     /// "Cannot start a runtime from within a runtime" — use
     /// [`new_for_test`](Self::new_for_test) there.
     #[cfg(test)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "owned tokio Runtime predates the disallowed_types gate — dropping one from an async context panics; hold a Handle or use tauri::async_runtime; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+    )]
     pub fn new_blocking_for_test() -> std::sync::Arc<Self> {
         let url = Self::test_database_url();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");

@@ -16,6 +16,7 @@ import type {
   UseLogContentReturn,
 } from "./types";
 import { convertRawContentToTypescript } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 interface UseLogContentProps {
   config: ProjectLogConfig | null;
@@ -99,7 +100,7 @@ export function useLogContent({ config }: UseLogContentProps): UseLogContentRetu
       setLogsState((prev) => ({
         ...prev,
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: describeThrown(err, "Failed to read logs"),
       }));
     }
   }, [config]);

@@ -15,10 +15,15 @@ import type {
 import { extractFingerprintHashes } from "../../lib/ui-bridge/fingerprintGenerator";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { readVerdict, relayVerdict } from "./actionOutcome";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useCommands");
 
 const MAX_COMMAND_HISTORY = 50;
+
+/** `sendCommand` actions whose reply is an ACTION result (read strictly). */
+const ACTION_COMMANDS: ReadonlySet<string> = new Set(["executeAction", "aiExecute"]);
 
 export interface UseCommandsReturn {
   lastCommandResult: CommandResult | null;
@@ -73,10 +78,10 @@ export function useCommands(
         );
 
         const json = await resp.json();
+        // Strict: a reply with no boolean `success` is NOT a success.
         const result: CommandResult = {
-          success: json.success !== false,
-          data: json.data,
-          error: json.error,
+          ...relayVerdict(json, resp),
+          data: json?.data,
           duration: Date.now() - startTime,
         };
 
@@ -136,7 +141,7 @@ export function useCommands(
       } catch (e) {
         const result: CommandResult = {
           success: false,
-          error: e instanceof Error ? e.message : "Action failed",
+          error: describeThrown(e, "Action failed"),
           duration: Date.now() - startTime,
         };
         setLastCommandResult(result);
@@ -226,10 +231,20 @@ export function useCommands(
 
         const json = await resp.json();
         const duration = Date.now() - startTime;
+        // Two definitions of success, by what the route returns:
+        // - ACTION routes (`executeAction`, `aiExecute` — both answer an
+        //   envelope with an explicit `success`) are read STRICTLY: no boolean
+        //   `success` is an INDETERMINATE failure, never a pass.
+        // - READ routes (snapshot, elements, health, metrics, …) legitimately
+        //   forward raw app JSON with no `success` key (`handle_snapshot`), so
+        //   a read succeeds when the transport is OK and the body is not an
+        //   explicit failure. Strictness there would fail every good read.
+        const verdict = ACTION_COMMANDS.has(action)
+          ? relayVerdict(json, resp)
+          : readVerdict(json, resp);
         const result: CommandResult<T> = {
-          success: json.success !== false,
-          data: (json.data ?? json) as T,
-          error: json.error,
+          ...verdict,
+          data: (json?.data ?? json) as T,
           duration,
         };
 
@@ -252,7 +267,7 @@ export function useCommands(
         const duration = Date.now() - startTime;
         const result: CommandResult<T> = {
           success: false,
-          error: e instanceof Error ? e.message : "Command failed",
+          error: describeThrown(e, "Command failed"),
           duration,
         };
 

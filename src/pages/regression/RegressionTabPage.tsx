@@ -16,14 +16,12 @@ import { Activity, Loader2, Play, RefreshCw } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 
-import {
-  deserializeSuite,
-  type RegressionSuite,
-} from "@qontinui/ui-bridge-auto/regression";
+import { deserializeSuite, type RegressionSuite } from "@qontinui/ui-bridge-auto/regression";
 import type { IRDocument } from "@qontinui/shared-types/ui-bridge-ir";
 
 import { CoveragePanel } from "./CoveragePanel";
 import { RegressionRunPage } from "./RegressionRunPage";
+import { describeThrown } from "@/lib/utils";
 
 type SubTab = "run" | "coverage";
 
@@ -109,8 +107,7 @@ function CoverageSubTab(): React.JSX.Element {
     refetch: refetchSuites,
   } = useQuery<SuiteCatalogRow[]>({
     queryKey: ["regression", "list_regression_suites"],
-    queryFn: () =>
-      invoke<SuiteCatalogRow[]>("list_regression_suites", { limit: 50 }),
+    queryFn: () => invoke<SuiteCatalogRow[]>("list_regression_suites", { limit: 50 }),
     refetchOnWindowFocus: false,
   });
 
@@ -119,8 +116,7 @@ function CoverageSubTab(): React.JSX.Element {
   // Effective selection: user pick if any, else the newest suite from the
   // server query (which is sorted by `created_at DESC`). Derived rather
   // than stored — avoids the setState-in-effect pattern.
-  const selectedSuiteId =
-    explicitSelection ?? (suites && suites.length > 0 ? suites[0].id : null);
+  const selectedSuiteId = explicitSelection ?? (suites && suites.length > 0 ? suites[0].id : null);
 
   if (suitesLoading) return <CenteredSpinner label="Loading suites..." />;
 
@@ -128,7 +124,7 @@ function CoverageSubTab(): React.JSX.Element {
     return (
       <CenteredCard
         title="Failed to load suites"
-        description={suitesError instanceof Error ? suitesError.message : String(suitesError)}
+        description={describeThrown(suitesError, "Failed to load suites")}
         action={{ label: "Retry", onClick: () => void refetchSuites() }}
       />
     );
@@ -174,10 +170,7 @@ function CoverageSuitePicker({
 }: PickerProps): React.JSX.Element {
   return (
     <div className="flex items-center gap-3 border-b border-border-primary px-4 py-3">
-      <label
-        htmlFor="suite-select"
-        className="text-sm font-medium text-text-muted"
-      >
+      <label htmlFor="suite-select" className="text-sm font-medium text-text-muted">
         Suite:
       </label>
       <select
@@ -205,19 +198,14 @@ function CoverageSuitePicker({
   );
 }
 
-function SuiteCoverageLoader({
-  suiteId,
-}: {
-  suiteId: string;
-}): React.JSX.Element {
+function SuiteCoverageLoader({ suiteId }: { suiteId: string }): React.JSX.Element {
   const {
     data: full,
     isLoading,
     error,
   } = useQuery<SuiteFullRow | null>({
     queryKey: ["regression", "get_regression_suite_by_id", suiteId],
-    queryFn: () =>
-      invoke<SuiteFullRow | null>("get_regression_suite_by_id", { suiteId }),
+    queryFn: () => invoke<SuiteFullRow | null>("get_regression_suite_by_id", { suiteId }),
     refetchOnWindowFocus: false,
   });
 
@@ -227,9 +215,7 @@ function SuiteCoverageLoader({
     if (!full?.suite_json) return null;
     try {
       const json =
-        typeof full.suite_json === "string"
-          ? full.suite_json
-          : JSON.stringify(full.suite_json);
+        typeof full.suite_json === "string" ? full.suite_json : JSON.stringify(full.suite_json);
       return deserializeSuite(json) as RegressionSuite;
     } catch {
       return null;
@@ -249,9 +235,7 @@ function SuiteCoverageLoader({
     enabled: typeof full?.ir_doc_id === "string" && full.ir_doc_id.length > 0,
     queryFn: async () => {
       const irDocId = full!.ir_doc_id;
-      const resp = await fetch(
-        `http://localhost:9876/spec/page/${encodeURIComponent(irDocId)}`,
-      );
+      const resp = await fetch(`http://localhost:9876/spec/page/${encodeURIComponent(irDocId)}`);
       if (!resp.ok) {
         throw new Error(`spec/page returned ${resp.status}`);
       }
@@ -264,14 +248,13 @@ function SuiteCoverageLoader({
     refetchOnWindowFocus: false,
   });
 
-  if (isLoading || irLoading)
-    return <CenteredSpinner label="Loading suite + IR..." />;
+  if (isLoading || irLoading) return <CenteredSpinner label="Loading suite + IR..." />;
 
   if (error)
     return (
       <CenteredCard
         title="Failed to load suite"
-        description={error instanceof Error ? error.message : String(error)}
+        description={describeThrown(error, "Failed to load suite")}
       />
     );
 
@@ -287,11 +270,10 @@ function SuiteCoverageLoader({
     return (
       <CenteredCard
         title="Failed to load IR document"
-        description={
-          irError instanceof Error
-            ? irError.message
-            : "The IR document for this suite is missing from the Spec API. The suite may reference an IR that has been deleted."
-        }
+        description={describeThrown(
+          irError,
+          "The IR document for this suite is missing from the Spec API. The suite may reference an IR that has been deleted.",
+        )}
       />
     );
 
@@ -317,18 +299,12 @@ interface CenteredCardProps {
   action?: { label: string; onClick: () => void };
 }
 
-function CenteredCard({
-  title,
-  description,
-  action,
-}: CenteredCardProps): React.JSX.Element {
+function CenteredCard({ title, description, action }: CenteredCardProps): React.JSX.Element {
   return (
     <div className="flex h-full items-center justify-center p-6">
       <div className="max-w-md rounded-lg border border-border-primary bg-surface-secondary p-6 text-center">
         <Activity className="mx-auto mb-3 size-8 text-text-muted" />
-        <h3 className="mb-2 text-base font-semibold text-text-primary">
-          {title}
-        </h3>
+        <h3 className="mb-2 text-base font-semibold text-text-primary">{title}</h3>
         <p className="text-sm text-text-muted">{description}</p>
         {action && (
           <button

@@ -483,7 +483,10 @@ mod tests {
     fn every_degrade_on_a_git_bearing_tree_is_unknown() {
         for reason in [
             DegradeReason::Status,
-            DegradeReason::SpawnError,
+            DegradeReason::SpawnError(
+                qontinui_runner_lib::util::resource_exhaustion::SpawnFailure::NOT_ATTEMPTED,
+            ),
+            DegradeReason::CommitExhaustionSuspected { os_code: 1455 },
             DegradeReason::TimedOut {
                 pid: 1,
                 reaped: false,
