@@ -3143,7 +3143,7 @@ mod tests {
         let sibling = agent_dir.join("qontinui-schemas");
         for repo in [&target, &sibling] {
             std::fs::create_dir_all(repo).unwrap();
-            let out = std::process::Command::new("git")
+            let out = crate::agent_worktree::reclaim::tests::hermetic_git()
                 .args(["-c", "init.defaultBranch=main", "init", "-q"])
                 .arg(repo)
                 .output()
@@ -3152,7 +3152,7 @@ mod tests {
         }
         // Sibling: a STAGED file, so it is dirty under any ambient config.
         std::fs::write(sibling.join("wip.txt"), "uncommitted").unwrap();
-        let out = std::process::Command::new("git")
+        let out = crate::agent_worktree::reclaim::tests::hermetic_git()
             .arg("-C")
             .arg(&sibling)
             .args(["add", "wip.txt"])
@@ -3186,11 +3186,10 @@ mod tests {
         assert!(outcome.removed.is_empty(), "{outcome:?}");
         assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
         assert_eq!(outcome.skipped[0].reason, "sibling-busy");
-        assert!(
-            outcome.skipped[0].detail.contains("qontinui-schemas is dirty"),
-            "{}",
-            outcome.skipped[0].detail
-        );
+        // The skipped row names the busy sibling and its state (read through
+        // Debug so the assertion does not depend on the row's field layout).
+        let row = format!("{:?}", outcome.skipped[0]);
+        assert!(row.contains("qontinui-schemas is dirty"), "{row}");
         assert!(target.exists(), "the target must not be touched");
     }
 
