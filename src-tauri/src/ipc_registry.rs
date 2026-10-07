@@ -27,8 +27,11 @@
 //! split reverted at `1f1d807f6`.
 //!
 //! Adding a command: add its fn name to the `ipc_group!` list in the module
-//! that defines it. `tests/tauri_commands_are_registered.rs` fails for any
-//! `#[tauri::command]` fn that no `ipc_group!` lists.
+//! that defines it (a module's FIRST command also needs its `GROUPS` entry
+//! below). `tests/tauri_commands_are_registered.rs` fails for any
+//! `#[tauri::command]` fn that no `ipc_group!` lists, for any module whose
+//! `ipc_group!` has no `GROUPS` entry (its commands would compile and then
+//! answer "Command not found"), and for any name registered twice.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
