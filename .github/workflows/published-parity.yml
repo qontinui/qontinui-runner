@@ -150,7 +150,9 @@ jobs:
     # runs the negative-control job below instead.
     if: github.event_name != 'pull_request'
     runs-on: windows-latest
-    # 150, matching ci.yml's windows leg, which runs this SAME
+    # 150, sized like ci.yml's pre-split windows cap (ci.yml's `test` job is
+    # now 180 because its two bounded Rust steps plus measured overhead need
+    # it; this job has no such steps and keeps 150), and that leg runs this SAME
     # `pnpm run tauri build --debug --no-bundle` and sized itself from 90
     # sampled successful runs (windows p90 87.2m, max 110.6m). This job's
     # first revision said "dev build ~25m worst case" and budgeted 75m; that
