@@ -23,7 +23,10 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
-unreviewed_ceiling = 239
+# 239 -> 238 (qontinui-runner#2071): the WSL lane's decode_utf16le row is gone
+# (replaced by the cfg-free decode_wsl_listing) and its two new cfg(windows)
+# fns are reviewed below, not left unreviewed.
+unreviewed_ceiling = 238
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -529,3 +532,23 @@ file = "src/reflection/workflow.rs"
 symbol = "build_ui_bridge_completion_steps"
 disposition = "unreviewed"
 note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/resource_sample.rs"
+symbol = "wsl_distro_running"
+disposition = "fallback_correct"
+note = "Asks `wsl --list --running` whether the WSL lane's distro is up so the sampler never boots a stopped one; WSL exists only on Windows, and collect_wsl_lane's cfg(not(windows)) arm returns no lane."
+reviewed = [
+    "cfg(windows)-only fn `wsl_distro_running` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/resource_sample.rs"
+symbol = "note_wsl_lane_gate"
+disposition = "fallback_correct"
+note = "Logs the WSL lane's run/skip gate on change; Windows-only because the WSL lane is, and collect_wsl_lane's cfg(not(windows)) arm returns no lane."
+reviewed = [
+    "cfg(windows)-only fn `note_wsl_lane_gate` has no cfg(not(windows)) sibling in this file",
+]
