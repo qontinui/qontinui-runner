@@ -123,8 +123,8 @@ src/components/terminal/commands/uibridge.test.ts:270	fixture	free	test.bare	sch
 src/components/terminal/commands/uibridge.test.ts:300	fixture	free	test.proto	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:330	fixture	free	test.flagged	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:404	fixture	free	test.ai-text	schema=yes	arity=0	effect=-
-src/components/terminal/commands/usePromptLibraryCommands.test.ts:85	fixture	free	terminal.help	schema=no	arity=0	effect=-
-src/components/terminal/commands/usePromptLibraryCommands.test.ts:113	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
+src/components/terminal/commands/usePromptLibraryCommands.test.ts:90	fixture	free	terminal.help	schema=no	arity=0	effect=-
+src/components/terminal/commands/usePromptLibraryCommands.test.ts:118	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.ts:130	registry	free	-	schema=yes	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.ts:177	registry	free	-	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:654	registry	free	terminal.focus	schema=yes	arity=1	effect=-
