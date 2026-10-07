@@ -8953,8 +8953,7 @@ pub(crate) fn write_degraded_breadcrumb(
     // Temp-then-rename, never `fs::write`: that truncates first, so a reader
     // racing a rewrite (`/gate`, `/coord-revive`, the probe re-stamping it) read
     // an EMPTY breadcrumb -- a verdict that was never written.
-    if let Err(e) =
-        crate::fs_atomic::atomic_write(&path, format!("{line1}\n{line2}\n").as_bytes())
+    if let Err(e) = crate::fs_atomic::atomic_write(&path, format!("{line1}\n{line2}\n").as_bytes())
     {
         warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
     }
