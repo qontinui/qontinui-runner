@@ -16956,6 +16956,7 @@ mod tests {
             terminal_id: "t".into(),
             anchor_key: None,
             gate_id: Some(uuid::Uuid::now_v7()),
+            registered_at: std::time::Instant::now(),
             consuming_device_id: Some(claimer),
         };
         assert_eq!(outcome_device_for(&s, Some(local)), Some(claimer));

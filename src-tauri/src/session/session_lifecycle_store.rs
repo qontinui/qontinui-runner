@@ -849,13 +849,16 @@ pub struct TerminalSessionRecord {
 
 /// Close reasons after which a record is FINAL — never resumed by a boot
 /// restore (`restorable_records` grace-matches only `pty-exit` / `poll-dead`).
+/// `terminal-only-idle` ([`close_reason_for_dead_shell`]) is one of them: it
+/// exists precisely so that the next restore pass does NOT pick the record up.
 ///
 /// A gate continuation whose record closes with one of these, and whose gate
 /// was bound by a PRIOR process generation, has no producer left that could
 /// report its outcome; the close observer reports it `work_unreported`
 /// (see [`runner_restart_unreported_report`]). `poll-dead` is deliberately
 /// ABSENT: it is restorable, so the session may still be resumed.
-pub const NON_RESTORABLE_CLOSE_REASONS: &[&str] = &["no-terminal", "never-started"];
+pub const NON_RESTORABLE_CLOSE_REASONS: &[&str] =
+    &["no-terminal", "never-started", "terminal-only-idle"];
 
 /// What the close observer posts for a continuation lost to a runner restart:
 /// the gate, the device that claimed it, and the outcome detail.
@@ -4529,6 +4532,9 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        gate_id: None,
+        gate_consuming_device_id: None,
+        gate_bound_boot_ms: None,
     }
 }
 
@@ -9330,8 +9336,13 @@ mod gate_continuation_tests {
     fn non_restorable_close_reasons_exclude_poll_dead() {
         assert_eq!(
             NON_RESTORABLE_CLOSE_REASONS,
-            &["no-terminal", "never-started"]
+            &["no-terminal", "never-started", "terminal-only-idle"]
         );
+        // Every reason the dead-shell mapping can produce that the restore
+        // pass will NOT pick up must be reportable, or a prior-generation
+        // continuation closed under it stays `spawned` forever.
+        assert!(NON_RESTORABLE_CLOSE_REASONS
+            .contains(&close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY))));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"poll-dead"));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
     }
