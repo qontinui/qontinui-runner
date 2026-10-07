@@ -861,7 +861,9 @@ impl SiblingBusy {
 ///
 /// Per sibling directory (the target itself, `.cargo/`, stray files and
 /// symlinks are skipped): a sibling MEASURED to have no `.git` is not a
-/// checkout and is skipped. That is deliberate rather than leaning on
+/// checkout, so git has nothing to report on it — it is skipped once the
+/// activity check finds it idle (a non-git build output can still be
+/// building). Skipping it is deliberate rather than leaning on
 /// [`super::dirty::verdict_from_outcome`]'s carve-out: the carve-out only fires
 /// when `git status` DEGRADES, and a no-`.git` dir nested in an enclosing repo
 /// gets that repo's porcelain instead. Otherwise the tri-state dirty probe
@@ -919,7 +921,15 @@ fn busy_allocation_sibling_with(
             Err(_) => return Some((path, SiblingBusy::Unreadable)),
         }
         match super::dirty::probe_git_presence(&path) {
-            GitPresence::Absent => continue, // not a checkout
+            // Not a checkout, so there is nothing for git to report — but a
+            // non-git build output (or a half-materialised sibling) can still
+            // be mid-build, so the activity check runs before it is skipped.
+            GitPresence::Absent => {
+                if worktree_is_building(&path, window) {
+                    return Some((path, SiblingBusy::Building));
+                }
+                continue;
+            }
             GitPresence::Undetermined => return Some((path, SiblingBusy::Unreadable)),
             GitPresence::Present => {}
         }
@@ -941,13 +951,16 @@ fn busy_allocation_sibling_with(
 
 /// The one log line every removal path emits when [`busy_allocation_sibling`]
 /// holds a remove back.
+///
+/// `unreadable` logs at WARN: a sibling that can never be read holds its whole
+/// allocation back indefinitely, and that should be visible, not routine.
 pub(super) fn log_busy_sibling_skip(worktree: &Path, sibling: &Path, busy: SiblingBusy) {
-    info!(
-        "worktree_reclaim: {} — skipping remove: allocation sibling {} is {}",
-        worktree.display(),
-        sibling.display(),
-        busy.as_str()
-    );
+    let (w, s, b) = (worktree.display(), sibling.display(), busy.as_str());
+    if busy == SiblingBusy::Unreadable {
+        warn!("worktree_reclaim: {w} — skipping remove: allocation sibling {s} is {b}");
+    } else {
+        info!("worktree_reclaim: {w} — skipping remove: allocation sibling {s} is {b}");
+    }
 }
 
 /// Execute all instructions in one pull.
@@ -1774,7 +1787,7 @@ pub fn spawn_reclaim() {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(in crate::agent_worktree) mod tests {
     use super::*;
 
     /// The health signal must separate "idle" from "dead". This is the single
@@ -2064,11 +2077,31 @@ mod tests {
     const NO_WINDOW: Duration = Duration::from_secs(0);
     const PROBE_BUDGET: Duration = Duration::from_secs(30);
 
+    /// A `git` command that cannot reach an outer repository: an inherited
+    /// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / object-directory
+    /// override (a test run from a git hook exports them) overrides `-C`, and would point `init`/`add` at the
+    /// enclosing repo instead of the temp dir.
+    pub(in crate::agent_worktree) fn hermetic_git() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd
+    }
+
     /// `git init` a repo at `dir` — hermetic: no commit is made, so no
     /// identity or ambient config is consulted beyond `git status`'s own.
     fn git_init(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        let out = std::process::Command::new("git")
+        let out = hermetic_git()
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .arg(dir)
             .output()
@@ -2080,7 +2113,7 @@ mod tests {
     /// under an ambient `status.showUntrackedFiles=no`.
     fn make_dirty(repo: &Path) {
         std::fs::write(repo.join("wip.txt"), "uncommitted").unwrap();
-        let out = std::process::Command::new("git")
+        let out = hermetic_git()
             .arg("-C")
             .arg(repo)
             .args(["add", "wip.txt"])
@@ -2156,6 +2189,21 @@ mod tests {
         assert_eq!(
             busy_allocation_sibling_with(&a, NO_WINDOW, PROBE_BUDGET),
             None
+        );
+    }
+
+    #[test]
+    fn a_building_sibling_with_no_git_still_holds_the_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join(ALLOC_SESSION).join("a");
+        git_init(&a);
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&a, old).unwrap();
+        let scratch = dir.path().join(ALLOC_SESSION).join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert_eq!(
+            busy_allocation_sibling_with(&a, Duration::from_secs(600), PROBE_BUDGET),
+            Some((scratch, SiblingBusy::Building))
         );
     }
 
