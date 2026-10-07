@@ -56,11 +56,11 @@ pub const AUTONOMY_CREDENTIAL_DARK_EVENT: &str = "autonomy-credential-dark";
 /// log + back off).
 ///
 /// CRITICAL INVARIANT (Phase 5.2): a non-2xx coord response MUST map to
-/// [`RefreshOutcome::KeptExisting`], NEVER to a code path that clears the
-/// JWT. A 401 from coord means "this runner_token is stale"; if we
-/// cleared the access_token slot in response, the relay would lose its
-/// valid (just-not-yet-expired) device-JWT and the next user-flow would
-/// be forced into a fresh browser-pair. The refresher's job is to
+/// [`RefreshOutcome::KeptExisting`] or [`RefreshOutcome::BearerRejected`],
+/// NEVER to a code path that clears the JWT. A 401 from coord means "this
+/// runner_token is stale"; if we cleared the access_token slot in response,
+/// the relay would lose its valid (just-not-yet-expired) device-JWT and the
+/// next user-flow would be forced into a fresh browser-pair. The refresher's job is to
 /// REPLACE, not REVOKE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
@@ -68,11 +68,21 @@ pub(crate) enum RefreshOutcome {
     /// access_token slot. Carries the new JWT so the runtime loop can
     /// log its jti/exp without re-reading from disk.
     Replaced { new_jwt: String },
-    /// Coord returned a non-2xx (401, 503, anything else), OR the
-    /// network call failed, OR the spawn_blocking handle joined with
-    /// an error. The existing JWT in the access_token slot is left
-    /// untouched.
+    /// Coord returned a non-2xx that is NOT a verdict on the bearer (5xx,
+    /// 404, 429, anything else), OR the network call failed, OR the
+    /// spawn_blocking handle joined with an error. The existing JWT in the
+    /// access_token slot is left untouched. This is the TRANSIENT outcome: a
+    /// retry can help.
     KeptExisting,
+    /// pair-cli answered 401/403 — a verdict on the USER bearer we presented
+    /// (a revoked Cognito token, or a device JWT that cannot authorise a
+    /// user-scoped route at all). Not transient: re-presenting the same bearer
+    /// gets the same answer, so only a sign-in recovers it. The existing JWT is
+    /// left untouched exactly as for [`RefreshOutcome::KeptExisting`] —
+    /// REPLACE-not-REVOKE still holds; what changes is the classification the
+    /// posture and the banner read (plan
+    /// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover` D2).
+    BearerRejected { status: u16 },
     /// Coord returned a fresh JWT but persistence to AuthManager
     /// failed. The existing JWT in the access_token slot is left
     /// untouched (store_tokens is atomic; a failure aborts before
@@ -517,6 +527,13 @@ pub(crate) enum PairProgress {
     /// credential-dark even though it tried. Degraded, not gate-blocking-by-
     /// config: the tenant resolved, the mint just failed.
     BailRefreshFailedExpired,
+    /// The slot JWT is expired/opaque and NO usable user bearer exists to
+    /// re-mint it: either there was none to present (no Cognito session, so
+    /// pair-cli was SKIPPED rather than handed the dead device JWT —
+    /// `rejected_status: None`), or pair-cli refused the one presented
+    /// (`Some(401|403)`). Only a sign-in recovers this; the device-machine-key
+    /// exchange is still tried, because it needs no user at all.
+    BailNeedsSignIn { rejected_status: Option<u16> },
     /// `try_refresh_once` returned [`RefreshOutcome::TenantMismatch`]: coord
     /// minted a JWT for a DIFFERENT tenant than the one requested, and it was
     /// refused rather than persisted. Terminal for the tick — D3 of plan
@@ -624,6 +641,18 @@ pub(crate) fn coord_credential_health(
                 "device-JWT re-mint failed (coord non-2xx or persist error) and the \
                  existing JWT is expired — runner is credential-dark",
             ),
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: None,
+            }) => CoordCredentialHealth::bad(
+                "device-JWT is expired and there is no Cognito session to re-mint it — \
+                 user must sign in",
+            ),
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: Some(status),
+            }) => CoordCredentialHealth::bad(format!(
+                "device-JWT is expired and pair-cli rejected the user bearer (HTTP {status}) \
+                 — user must sign in"
+            )),
             Some(PairProgress::BailTenantMismatch { expected, returned }) => {
                 CoordCredentialHealth::bad(format!(
                     "device-JWT re-mint returned tenant {returned:?} but {expected} was \
@@ -892,10 +921,57 @@ impl RefresherState {
 
     /// Kick the refresher: interrupt any in-progress sleep so the next
     /// iteration runs immediately, re-reading settings + tokens.
-    pub fn kick(&self) {
-        let current = *self.kick_tx.borrow();
-        let _ = self.kick_tx.send(current.wrapping_add(1));
+    ///
+    /// Returns this kick's sequence number: the first pass that STARTS after
+    /// it reports that number (or a later one) when it concludes — see
+    /// [`commands::kick_device_jwt_refresher_and_wait`].
+    pub fn kick(&self) -> u64 {
+        let seq = KICK_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let _ = self.kick_tx.send(seq);
+        seq
     }
+}
+
+/// Every kick ever issued in this process, numbered. Process-global (not per
+/// [`RefresherState`]) so a refresher respawn cannot reset it under a waiter.
+static KICK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The kick sequence number the pass now running STARTED on — read at the top
+/// of each `refresher_loop` iteration, so every kick at or below it happened
+/// before the pass read any state.
+static PASS_IN_FLIGHT_KICK_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The pass-concluded signal (plan
+/// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`
+/// D5): the highest kick sequence number a CONCLUDED pass started on. A waiter
+/// that kicked with sequence `n` knows the pass it asked for has finished —
+/// and published its posture — once this reaches `n`.
+fn pass_concluded_cell() -> &'static watch::Sender<u64> {
+    static CELL: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| watch::channel(0u64).0)
+}
+
+/// Mark the pass now running as concluded. Called wherever a pass ends: every
+/// iteration of `refresher_loop` ends in a wait, so the wait is where it goes.
+fn note_pass_concluded() {
+    let seq = PASS_IN_FLIGHT_KICK_SEQ.load(std::sync::atomic::Ordering::SeqCst);
+    pass_concluded_cell().send_if_modified(|v| {
+        if seq > *v {
+            *v = seq;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Wait until a pass that started on kick `seq` (or later) has concluded.
+/// Returns `false` on timeout — UNKNOWN, never success.
+async fn wait_for_pass_concluded(seq: u64, timeout: Duration) -> bool {
+    let mut rx = pass_concluded_cell().subscribe();
+    let waited = tokio::time::timeout(timeout, rx.wait_for(|v| *v >= seq)).await;
+    matches!(waited, Ok(Ok(_)))
 }
 
 /// Spawn the refresher task. Returns the state handle so the caller can
@@ -1012,10 +1088,10 @@ pub(crate) fn resolve_pair_tenant_id(
 /// device-JWT claim → machine.json) — see that function + the call site for
 /// the prod-breakage rationale.
 ///
-/// Invariant: a non-2xx HTTP response, a network error, or a
-/// spawn_blocking join failure all collapse to
-/// [`RefreshOutcome::KeptExisting`]. The caller MUST NOT clear the JWT
-/// in response to that variant — see the doc-comment on
+/// Invariant: a 401/403 maps to [`RefreshOutcome::BearerRejected`]; any other
+/// non-2xx HTTP response, a network error, or a spawn_blocking join failure
+/// collapses to [`RefreshOutcome::KeptExisting`]. The caller MUST NOT clear the
+/// JWT in response to either variant — see the doc-comment on
 /// [`RefreshOutcome`].
 pub(crate) async fn try_refresh_once(
     auth_manager: &crate::auth::AuthManager,
@@ -1075,7 +1151,7 @@ pub(crate) async fn try_refresh_once(
     // pair_with_auth_token_with_ids is reqwest::blocking — must run via
     // spawn_blocking or it stalls the tokio runtime.
     let pair_join = spawn_blocking_tracked(move || {
-        qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
+        qontinui_runner_lib::pair::pair_with_auth_token_with_ids_typed(
             &base, &token, &did, &uid, tenant_id, &origin,
         )
     })
@@ -1109,7 +1185,15 @@ pub(crate) async fn try_refresh_once(
                     crate::util::egress_context::EgressClient::DeviceJwtRefresher
                 )
             );
-            return RefreshOutcome::KeptExisting;
+            // D2: the status is typed (`PairCliError::status`), never parsed
+            // out of the message. The predicate is the slot pass's own narrow
+            // 401/403 gate, so the two paths agree on what "rejected" means.
+            return match e.status {
+                Some(status) if slot_refresh_is_credential_rejection(status) => {
+                    RefreshOutcome::BearerRejected { status }
+                }
+                _ => RefreshOutcome::KeptExisting,
+            };
         }
     };
 
@@ -1146,6 +1230,242 @@ pub(crate) async fn try_refresh_once(
                 RefreshOutcome::PersistFailed(e.to_string())
             }
         }
+    }
+}
+
+/// Which bearer the `Pair` arm may present to pair-cli this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PairBearer {
+    /// A bearer worth presenting: the Cognito access token, or — on a legacy
+    /// install with no Cognito session — the slot value, when it is NOT a
+    /// device JWT whose `exp` has passed (a legacy opaque `qontinui_runner_*`
+    /// user token is still presented: it is the migration path pair-cli heals).
+    Present(String),
+    /// No Cognito bearer, and the slot holds a device JWT whose decoded `exp`
+    /// is in the past. D1: it is NEVER presented to pair-cli — pair-cli
+    /// authenticates a user, and a dead device JWT can only ever earn a 401.
+    /// Carried only as the tenant-resolution hint for the dmk exchange.
+    DeadSlot(String),
+    /// No Cognito bearer and nothing in the slot.
+    Nothing,
+}
+
+/// Pure bearer choice for the `Pair` arm (D1). `slot` is the raw
+/// `access_token` slot value; `now` is unix seconds.
+pub(crate) fn pair_bearer_for(
+    cognito: Option<String>,
+    slot: Option<String>,
+    now: i64,
+) -> PairBearer {
+    if let Some(t) = cognito.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        return PairBearer::Present(t);
+    }
+    match slot.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        None => PairBearer::Nothing,
+        Some(t) => match crate::auth::decode_jwt_exp(&t) {
+            Some(exp) if now >= exp => PairBearer::DeadSlot(t),
+            _ => PairBearer::Present(t),
+        },
+    }
+}
+
+/// Latch for D1's once-per-entry warning — see the `Pair` arm.
+static DEAD_SLOT_SKIP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The inputs to one [`attempt_pair_mint`], resolved by the `Pair` arm.
+pub(crate) struct PairMintRequest<'a> {
+    pub pair_base: &'a str,
+    pub pair_base_arm: Option<crate::api_config::ApiBaseUrlArm>,
+    pub bearer: &'a PairBearer,
+    pub refresh_class: RefreshClass,
+    pub device_id: &'a str,
+    pub user_id: &'a str,
+    pub machine_tenant: Option<uuid::Uuid>,
+    /// Device id for the device-machine-key fallback; `None` disables it.
+    pub dmk_device_id: Option<&'a str>,
+}
+
+/// What one `Pair`-arm mint attempt concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PairMintAttempt {
+    /// `None` = pair-cli was NOT called (D1: no bearer worth presenting).
+    pub outcome: Option<RefreshOutcome>,
+    /// How far the arm got, for the heartbeat's `coord_credential` health.
+    pub progress: PairProgress,
+    /// `Some` = the device-machine-key exchange recovered the slot; the new
+    /// JWT is already persisted.
+    pub dmk_jwt: Option<String>,
+}
+
+impl PairMintAttempt {
+    /// The default slot's concluded recovery verdict (D3) — what the posture
+    /// reads to decide between `expired` (a retry can help) and
+    /// `unrefreshable` (only a sign-in can).
+    pub(crate) fn verdict(&self) -> DefaultSlotRecovery {
+        if self.dmk_jwt.is_some() || matches!(self.outcome, Some(RefreshOutcome::Replaced { .. }))
+        {
+            return DefaultSlotRecovery::Refreshed;
+        }
+        match (&self.progress, &self.outcome) {
+            (PairProgress::BailNeedsSignIn { rejected_status: None }, _) => {
+                DefaultSlotRecovery::NeedsSignIn
+            }
+            (PairProgress::BailNeedsSignIn { .. }, _)
+            | (_, Some(RefreshOutcome::BearerRejected { .. })) => {
+                DefaultSlotRecovery::BearerRejected
+            }
+            _ => DefaultSlotRecovery::KeptExisting,
+        }
+    }
+}
+
+/// The `Pair` arm's mint attempt, after 4a self-refresh declined: pair-cli
+/// with the user bearer (or, D1, no pair-cli at all when the only bearer is an
+/// expired device JWT), then — when that did not advance the slot — the
+/// Phase 4b device-machine-key exchange.
+///
+/// Factored out of `refresher_loop` so the D1 skip and the fallback ordering
+/// are testable against an in-process mock backend; the loop keeps the
+/// logging, the relay kick, the publishes and the wait.
+pub(crate) async fn attempt_pair_mint(
+    auth_manager: &crate::auth::AuthManager,
+    req: PairMintRequest<'_>,
+) -> PairMintAttempt {
+    // Phase 1b: resolve the tenant ONCE up front so the post-outcome health
+    // mapping can distinguish "no tenant resolved" (gate-blocking config) from
+    // "tenant fine, the mint just failed" (degraded). `try_refresh_once`
+    // re-resolves internally; the two resolutions agree because both call the
+    // same OAuth/outgoing-JWT/machine.json fallback chain.
+    let hint = match req.bearer {
+        PairBearer::Present(t) | PairBearer::DeadSlot(t) => t.as_str(),
+        PairBearer::Nothing => "",
+    };
+    let outgoing_jwt = auth_manager.get_access_token().ok();
+    let resolved_tenant = resolve_pair_tenant_id(hint, outgoing_jwt.as_deref(), req.machine_tenant);
+    let tenant_resolved = resolved_tenant.is_some();
+
+    // Phase 5.2: try_refresh_once encapsulates the pair-cli HTTP call + JWT
+    // persistence. It preserves the existing JWT on any non-2xx outcome.
+    let outcome = match req.bearer {
+        PairBearer::Present(t) => Some(
+            try_refresh_once(
+                auth_manager,
+                req.pair_base,
+                t,
+                req.device_id,
+                req.user_id,
+                req.machine_tenant,
+                req.pair_base_arm,
+            )
+            .await,
+        ),
+        PairBearer::DeadSlot(_) | PairBearer::Nothing => None,
+    };
+    let progress = match &outcome {
+        // D1: pair-cli skipped. A transient Cognito blip may still hand us a
+        // bearer next tick, so that case stays the retryable bail; otherwise
+        // only a sign-in (or the dmk exchange below) can recover.
+        None if req.refresh_class == RefreshClass::Transient => {
+            PairProgress::BailRefreshFailedExpired
+        }
+        None => PairProgress::BailNeedsSignIn {
+            rejected_status: None,
+        },
+        Some(RefreshOutcome::Replaced { .. }) => PairProgress::Healthy,
+        Some(RefreshOutcome::KeptExisting) | Some(RefreshOutcome::PersistFailed(_)) => {
+            if let Some(RefreshOutcome::PersistFailed(e)) = &outcome {
+                warn!("device_jwt_refresher: persist new JWT failed: {e}");
+            }
+            // The mint did NOT advance the slot. Classify why:
+            //   - no tenant resolvable → gate-blocking config red,
+            //   - tenant fine but the slot JWT is now expired/absent
+            //     → degraded "credential-dark" red,
+            //   - tenant fine and the slot JWT is still valid →
+            //     healthy (a transient coord 5xx we'll retry).
+            if !tenant_resolved {
+                PairProgress::BailNoTenant
+            } else if slot_jwt_is_expired_or_absent(auth_manager) {
+                PairProgress::BailRefreshFailedExpired
+            } else {
+                PairProgress::Healthy
+            }
+        }
+        // D2: the bearer was refused. Dark only once the slot itself is dead;
+        // while it is still valid the runner is healthy for now, and the
+        // recorded verdict says what the next expiry will need.
+        Some(RefreshOutcome::BearerRejected { status }) => {
+            if slot_jwt_is_expired_or_absent(auth_manager) {
+                PairProgress::BailNeedsSignIn {
+                    rejected_status: Some(*status),
+                }
+            } else {
+                PairProgress::Healthy
+            }
+        }
+        // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
+        // Deliberately NOT `PersistFailed`'s arm: that path still falls
+        // through to the dmk-exchange fallback below, which this must not.
+        Some(RefreshOutcome::TenantMismatch { expected, returned }) => {
+            warn_tenant_mismatch_once(*expected, *returned);
+            PairProgress::BailTenantMismatch {
+                expected: *expected,
+                returned: *returned,
+            }
+        }
+    };
+
+    // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the Cognito
+    // pair-cli path have BOTH failed to advance the slot this tick. If a
+    // device machine key (`dmk_`) is stored, exchange it with web for a fresh
+    // device JWT — this recovers a runner offline past both the device-JWT TTL
+    // and the Cognito refresh-token window (>30d) with no user session.
+    // REPLACE-not-REVOKE: a miss never clears the existing JWT.
+    //
+    // D3: gated on the SPECIFIC bail reasons this fallback answers — NOT a
+    // blanket "anything but Healthy". `BailTenantMismatch` is deliberately
+    // excluded: coord already minted for the wrong tenant once this tick, and
+    // a dmk exchange mints from the SAME `coord.devices.tenant_id` column that
+    // wrong mint may have just overwritten, so falling through here would
+    // repeat the incident rather than recover from it. `BailNeedsSignIn` is
+    // included: the exchange needs no user, which is exactly the case it is.
+    let mut dmk_jwt = None;
+    if matches!(
+        progress,
+        PairProgress::BailNoTenant
+            | PairProgress::BailRefreshFailedExpired
+            | PairProgress::BailNeedsSignIn { .. }
+    ) {
+        if let Some(did) = req.dmk_device_id {
+            dmk_jwt = try_device_machine_key_exchange(
+                auth_manager,
+                req.pair_base,
+                did,
+                resolved_tenant.map(|(t, _)| t),
+            )
+            .await;
+        }
+    }
+    PairMintAttempt {
+        outcome,
+        progress,
+        dmk_jwt,
+    }
+}
+
+/// Record how the `Pair` arm's recovery of the default slot concluded, and —
+/// on a runner whose coord credential IS that slot (`publish_legacy`, i.e. no
+/// per-tenant slot exists) — re-publish the posture from it.
+fn conclude_default_slot_recovery(
+    auth_manager: &crate::auth::AuthManager,
+    verdict: DefaultSlotRecovery,
+    publish_legacy: bool,
+    pins: PosturePinInputs,
+    app: Option<&tauri::AppHandle>,
+) {
+    record_default_slot_recovery(verdict, auth_manager.access_token_exp());
+    if publish_legacy {
+        derive_and_publish_legacy_posture(auth_manager, pins, app);
     }
 }
 
@@ -1661,7 +1981,9 @@ pub enum CoordCredentialPosture {
     /// The runner held a dead credential, the automatic exit RAN
     /// (clear + device-machine-key re-derive), and it did not put a working
     /// credential back. This is the terminal state the operator must act on —
-    /// no further automatic rung exists.
+    /// no further automatic rung exists. For the LEGACY default slot (which no
+    /// slot pass clears) it is a dead credential whose `Pair`-arm recovery
+    /// concluded needing a sign-in — see [`DefaultSlotRecovery`].
     Unrefreshable,
     /// The credential looks alive locally but coord will not accept it.
     Dark(DarkCause),
@@ -1797,6 +2119,12 @@ pub(crate) struct SlotObservation {
     /// What the pass then DID with it. `None` = the pass has not concluded for
     /// this slot — which is the BOOT observation (DD2, below).
     pub outcome: Option<TenantSlotOutcome>,
+    /// The LEGACY default slot only: the most recent CONCLUDED automatic
+    /// recovery verdict for the credential this slot holds (the `Pair` arm's,
+    /// see [`DefaultSlotRecovery`]). `None` = no recovery has concluded for it
+    /// yet — the boot case — or this is a per-tenant slot, whose recovery is
+    /// already carried by [`Self::outcome`].
+    pub recovery: Option<DefaultSlotRecovery>,
 }
 
 impl SlotObservation {
@@ -1809,6 +2137,7 @@ impl SlotObservation {
                 present: true,
                 unknown: false,
                 outcome: None,
+                recovery: None,
             },
             None => Self {
                 tenant_id,
@@ -1816,6 +2145,7 @@ impl SlotObservation {
                 present: false,
                 unknown: false,
                 outcome: None,
+                recovery: None,
             },
         }
     }
@@ -1828,8 +2158,115 @@ impl SlotObservation {
             present: false,
             unknown: true,
             outcome: None,
+            recovery: None,
         }
     }
+}
+
+/// How the `Pair` arm's automatic recovery of the LEGACY default
+/// (`access_token`) slot CONCLUDED — the default-slot twin of the per-tenant
+/// pass's [`TenantSlotOutcome`].
+///
+/// It exists because the default slot's posture was derived from `exp` alone:
+/// a present-but-dead credential read `expired` (CTA "Retry refresh now")
+/// however many times recovery had already failed in a way no retry can fix.
+/// On 2026-10-07 that offered the operator a button that could never work —
+/// there was no Cognito session, so every pass presented the dead device JWT to
+/// pair-cli and got a 401 — while hiding the one that could (sign in). Plan
+/// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`
+/// D3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultSlotRecovery {
+    /// A mint put a working credential in the slot (self-refresh, pair-cli,
+    /// or the device-machine-key exchange).
+    Refreshed,
+    /// The mint failed in a way that says nothing about the bearer — a 5xx,
+    /// a transport fault, a transient Cognito refresh. A retry can help.
+    KeptExisting,
+    /// No usable user bearer existed, so pair-cli was skipped (D1), and the
+    /// device-machine-key exchange did not recover the slot either.
+    NeedsSignIn,
+    /// pair-cli refused the presented user bearer (401/403, D2), and the
+    /// device-machine-key exchange did not recover the slot either.
+    BearerRejected,
+}
+
+/// The two outcome tokens the per-tenant pass and the default slot share — ONE
+/// spelling, so `/health` `lastRefreshOutcome` cannot mean two things.
+const OUTCOME_TOKEN_REFRESHED: &str = "refreshed";
+const OUTCOME_TOKEN_KEPT_EXISTING: &str = "kept-existing";
+
+impl DefaultSlotRecovery {
+    /// Did every automatic rung fail in a way only a sign-in can fix?
+    pub(crate) fn needs_sign_in(self) -> bool {
+        matches!(
+            self,
+            DefaultSlotRecovery::NeedsSignIn | DefaultSlotRecovery::BearerRejected
+        )
+    }
+
+    /// Stable token for `/health` `lastRefreshOutcome`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DefaultSlotRecovery::Refreshed => OUTCOME_TOKEN_REFRESHED,
+            DefaultSlotRecovery::KeptExisting => OUTCOME_TOKEN_KEPT_EXISTING,
+            DefaultSlotRecovery::NeedsSignIn => "needs-sign-in",
+            DefaultSlotRecovery::BearerRejected => "bearer-rejected",
+        }
+    }
+}
+
+/// The last concluded default-slot verdict, and WHICH credential it judged —
+/// the decoded `exp` the slot held when the verdict was recorded. A verdict
+/// describes one credential: once the slot holds a different one (a sign-in,
+/// a pair-code redeem) the old verdict must not colour it, so a lookup only
+/// answers for a matching `exp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DefaultSlotRecoveryRecord {
+    verdict: DefaultSlotRecovery,
+    judged_exp: Option<i64>,
+}
+
+static DEFAULT_SLOT_RECOVERY: std::sync::Mutex<Option<DefaultSlotRecoveryRecord>> =
+    std::sync::Mutex::new(None);
+
+/// Record how the `Pair` arm's recovery of the default slot concluded.
+/// `slot_exp` is the decoded `exp` of what the slot holds NOW, after the
+/// attempt — the new credential on success, the unchanged dead one otherwise.
+pub(crate) fn record_default_slot_recovery(verdict: DefaultSlotRecovery, slot_exp: Option<i64>) {
+    *DEFAULT_SLOT_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(DefaultSlotRecoveryRecord {
+        verdict,
+        judged_exp: slot_exp,
+    });
+}
+
+/// The recorded verdict, if it was about the credential whose `exp` is
+/// `slot_exp`. `None` = no recovery has concluded for this credential.
+pub(crate) fn default_slot_recovery_for(slot_exp: Option<i64>) -> Option<DefaultSlotRecovery> {
+    DEFAULT_SLOT_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|r| r.judged_exp == slot_exp)
+        .map(|r| r.verdict)
+}
+
+/// The LEGACY default slot's observation, from the tri-state store probe,
+/// carrying the last concluded recovery verdict for the credential it holds.
+pub(crate) fn legacy_slot_observation(
+    read: crate::secure_storage::StoredTokenRead,
+) -> SlotObservation {
+    use crate::secure_storage::StoredTokenRead;
+    let mut obs = match read {
+        StoredTokenRead::Present(t) => SlotObservation::observed(None, Some(t.as_str())),
+        StoredTokenRead::Absent => SlotObservation::observed(None, None),
+        StoredTokenRead::Unreadable(_) => SlotObservation::unreadable(None),
+    };
+    if obs.present {
+        obs.recovery = default_slot_recovery_for(obs.exp);
+    }
+    obs
 }
 
 /// The upstream half of the derivation: what COORD said about the credential
@@ -3496,10 +3933,19 @@ fn upstream_signal_for_observation(tenant_id: Option<&str>, fold_default: bool) 
 ///    `unrefreshable`. The slot is empty and the one recovery rung that needs
 ///    no user session has already refused.
 /// 3. **The runner HOLDS a dead credential** (decoded `exp` in the past, or an
-///    opaque value) → `expired`. This is the boot case: the observation is
-///    published before the pass's recovery concludes, so a runner that
-///    restored a dead credential says so immediately rather than one recovery
-///    round-trip later (DD2 — *"Boot is a transition"*).
+///    opaque value):
+///    - whose last CONCLUDED automatic recovery ended needing a sign-in
+///      ([`DefaultSlotRecovery::needs_sign_in`]: no user bearer to present and
+///      no device-machine-key recovery, or pair-cli rejected the bearer) →
+///      `unrefreshable`. Every automatic rung has failed in a way a retry
+///      cannot fix, so the CTA must be the sign-in, not "Retry refresh now" —
+///      and a later pass that finds the same dead credential still present
+///      must NOT regress this to `expired` (the 2026-10-07 incident);
+///    - otherwise → `expired`. This is the boot case: the observation is
+///      published before the pass's recovery concludes, so a runner that
+///      restored a dead credential says so immediately rather than one
+///      recovery round-trip later (DD2 — *"Boot is a transition"*). It is also
+///      the transient case (a 5xx, a transport fault), where a retry can help.
 /// 4. **Nothing held at all** → `absent`.
 /// 5. **Coord keeps refusing a locally-valid credential**
 ///    (`>= UPSTREAM_DARK_THRESHOLD` consecutive credential-attributed
@@ -3536,6 +3982,9 @@ pub(crate) fn derive_coord_credential_posture(
             Some(e) => now >= e, // already expired
         };
         if dead {
+            if obs.recovery.is_some_and(DefaultSlotRecovery::needs_sign_in) {
+                return CoordCredentialPosture::Unrefreshable;
+            }
             return CoordCredentialPosture::Expired;
         }
     } else {
@@ -3810,6 +4259,9 @@ pub(crate) fn reset_coord_credential_posture_for_test() {
     *DEFAULT_BINDING_VERDICT
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
+    *DEFAULT_SLOT_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     POSTURE_TRANSITIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -4034,6 +4486,7 @@ pub(crate) fn derive_and_publish_posture_with(
         tenant_id: Option<String>,
         exp: Option<i64>,
         outcome: Option<TenantSlotOutcome>,
+        recovery: Option<DefaultSlotRecovery>,
         signal: UpstreamSignal,
         /// The unserved pin only — see [`PinArm`].
         pin_arm: Option<PinArm>,
@@ -4099,6 +4552,7 @@ pub(crate) fn derive_and_publish_posture_with(
             tenant_id: Some(key),
             exp: None,
             outcome: None,
+            recovery: None,
             signal,
             pin_arm: Some(PinArm {
                 reason: pinned_tenant_reason(&pinned, &cause),
@@ -4120,6 +4574,7 @@ pub(crate) fn derive_and_publish_posture_with(
                 tenant_id: o.tenant_id.clone(),
                 exp: o.exp,
                 outcome: o.outcome,
+                recovery: o.recovery,
                 signal,
                 pin_arm: None,
                 detail: None,
@@ -4218,7 +4673,12 @@ pub(crate) fn derive_and_publish_posture_with(
         worst.posture,
         worst.tenant_id,
         worst.exp,
-        worst.outcome.map(tenant_slot_outcome_token),
+        // The per-tenant pass's outcome, or — for the legacy default slot,
+        // which no slot pass walks — the `Pair` arm's concluded verdict (D4).
+        worst
+            .outcome
+            .map(tenant_slot_outcome_token)
+            .or_else(|| worst.recovery.map(|r| r.as_str().to_string())),
         worst.signal,
         // ATTRIBUTABLE: `worst` is a real slot candidate (or the unserved
         // pin), so `tenant_id` names the slot this posture is about —
@@ -4253,15 +4713,42 @@ pub(crate) fn pinned_tenant_reason(
     )
 }
 
+/// Derive and publish the posture of a runner with NO per-tenant slot — whose
+/// coord credential is therefore the LEGACY `access_token` slot — and notify
+/// the banner on a change.
+///
+/// Called at the top of every pass that finds no tenant slot, AND again when
+/// the `Pair` arm concludes its recovery of that slot, so the published posture
+/// carries the verdict of the pass that just ran rather than the one before
+/// it. Without the second call a kicked "Retry refresh now" pass would conclude
+/// with the banner still showing what the PREVIOUS pass knew.
+///
+/// Read through the TRI-STATE probe, not `get_access_token`: that returns
+/// `Err` both for a never-paired runner and for a present-but-undecryptable
+/// store, and collapsing the two would fire a "you have no coord credential"
+/// banner at a paired runner whose store merely failed to decrypt this tick.
+fn derive_and_publish_legacy_posture(
+    auth_manager: &crate::auth::AuthManager,
+    pins: PosturePinInputs,
+    app: Option<&tauri::AppHandle>,
+) {
+    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    if let Some(transition) =
+        derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
+    {
+        notify_posture_transition(app, transition);
+    }
+}
+
 /// Stable token for a slot outcome, shared by the health row and the posture's
 /// `last_refresh_outcome` so the two can never drift into different spellings.
 pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
     match outcome {
-        TenantSlotOutcome::Refreshed => "refreshed",
+        TenantSlotOutcome::Refreshed => OUTCOME_TOKEN_REFRESHED,
         TenantSlotOutcome::SkippedFresh => "skipped-fresh",
         TenantSlotOutcome::SkippedNoToken => "skipped-no-token",
         TenantSlotOutcome::Cleared { .. } => "cleared",
-        TenantSlotOutcome::KeptExisting => "kept-existing",
+        TenantSlotOutcome::KeptExisting => OUTCOME_TOKEN_KEPT_EXISTING,
     }
     .to_string()
 }
@@ -4737,6 +5224,7 @@ pub(crate) async fn refresh_tenant_slots(
                 present,
                 unknown: *unknown,
                 outcome: Some(*o),
+                recovery: None,
             }
         })
         .collect();
@@ -5224,6 +5712,12 @@ async fn refresher_loop(
             info!("Device-JWT refresher shutting down");
             return;
         }
+        // D5: every kick numbered at or below this was issued before this pass
+        // read any state, so this pass answers it.
+        PASS_IN_FLIGHT_KICK_SEQ.store(
+            KICK_SEQ.load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::Ordering::SeqCst,
+        );
 
         // Heal a vanished `paired_user.json` from valid per-tenant slots
         // BEFORE anything below reads it, so the tier (`device_is_paired`),
@@ -5390,32 +5884,19 @@ async fn refresher_loop(
             // LEGACY `access_token` slot, and a runner holding a dead one (or
             // none at all) is exactly the silent case this posture exists to
             // end — a never-paired runner must read `absent`, not UNKNOWN
-            // forever. Derived from the same pure ladder; no pass outcome
-            // exists, so the derivation sees `None` and speaks from `exp`.
+            // forever. Derived from the same pure ladder; no slot-pass outcome
+            // exists, so the derivation speaks from `exp` (read through the
+            // tri-state probe — see `derive_and_publish_legacy_posture`).
             //
-            // Read through the TRI-STATE probe, not `get_access_token`: that
-            // returns `Err` both for a never-paired runner and for a
-            // present-but-undecryptable store, and collapsing the two would
-            // fire a "you have no coord credential" banner at a paired runner
-            // whose store merely failed to decrypt this tick.
-            let obs = match auth_manager.probe_access_token() {
-                crate::secure_storage::StoredTokenRead::Present(t) => {
-                    SlotObservation::observed(None, Some(t.as_str()))
-                }
-                crate::secure_storage::StoredTokenRead::Absent => {
-                    SlotObservation::observed(None, None)
-                }
-                crate::secure_storage::StoredTokenRead::Unreadable(_) => {
-                    SlotObservation::unreadable(None)
-                }
-            };
-            if let Some(transition) = derive_and_publish_posture(
-                &[obs],
+            // The observation carries the `Pair` arm's last CONCLUDED verdict
+            // for the credential it holds (D3), so a dead slot whose recovery
+            // already ended needing a sign-in stays `unrefreshable` here rather
+            // than regressing to `expired` on every pass.
+            derive_and_publish_legacy_posture(
+                &auth_manager,
                 sweep_inputs.posture_pin_inputs(),
-                chrono::Utc::now().timestamp(),
-            ) {
-                notify_posture_transition(Some(&api_state.app_handle), transition);
-            }
+                Some(&api_state.app_handle),
+            );
         }
 
         match decision {
@@ -5443,6 +5924,7 @@ async fn refresher_loop(
                 }
                 // Nothing to do until tier changes. Block on shutdown or
                 // kick (set_runner_tier kicks us on every transition).
+                note_pass_concluded();
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
@@ -5497,6 +5979,13 @@ async fn refresher_loop(
                         // wake the relay so it reconnects with the new JWT, publish
                         // healthy, reset backoff, and fall to the steady cadence.
                         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                        conclude_default_slot_recovery(
+                            &auth_manager,
+                            DefaultSlotRecovery::Refreshed,
+                            !has_tenant_slots,
+                            sweep_inputs.posture_pin_inputs(),
+                            Some(&api_state.app_handle),
+                        );
                         publish_coord_credential_status(
                             &auth_manager,
                             &coord_credential_health(decision, Some(PairProgress::Healthy)),
@@ -5522,48 +6011,58 @@ async fn refresher_loop(
                 // refreshed first if it's stale (so the re-bind presents a
                 // valid user token). For legacy/local-login installs there's
                 // no Cognito session, so we fall back to the device-JWT slot
-                // bearer (the historical Phase-2 source).
+                // bearer (the historical Phase-2 source) — unless that slot
+                // holds a device JWT whose `exp` has passed, which can never
+                // authorise pair-cli (D1, see [`pair_bearer_for`]).
                 // Phase 2: classify the Cognito refresh so we can back off on a
                 // transient blip and fire the credential-dark notification on a
                 // dead refresh token (`invalid_grant`) instead of silently
                 // stalling. `refresh_class` drives the wait + notification at
                 // each exit below.
                 let (cognito_bearer, refresh_class) = refresh_cognito_bearer(&auth_manager).await;
-                let bearer_token = match cognito_bearer {
-                    Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    _ => match auth_manager.get_access_token() {
-                        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-                        _ => {
-                            warn!(
-                                "device_jwt_refresher: no Cognito session and access_token slot \
-                                 empty — user must sign in to Qontinui before the refresher can pair"
-                            );
-                            // Phase 1b: credential-dark (not signed in).
-                            publish_coord_credential_status(
-                                &auth_manager,
-                                &coord_credential_health(
-                                    decision,
-                                    Some(PairProgress::BailNoBearer),
-                                ),
-                            )
-                            .await;
-                            // Phase 2: if the refresh token is dead
-                            // (`invalid_grant`) and we also have no device-JWT
-                            // bearer, fire the credential-dark notification +
-                            // back off per classification; otherwise (no session)
-                            // fall to the steady cadence.
-                            let action = plan_refresh_wait(&mut backoff, refresh_class);
-                            if action.notify_dark {
-                                emit_credential_dark(&api_state.app_handle, true);
-                            }
-                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                    },
-                };
+                let bearer = pair_bearer_for(
+                    cognito_bearer,
+                    auth_manager.get_access_token().ok(),
+                    chrono::Utc::now().timestamp(),
+                );
+                if bearer == PairBearer::Nothing {
+                    warn!(
+                        "device_jwt_refresher: no Cognito session and access_token slot \
+                         empty — user must sign in to Qontinui before the refresher can pair"
+                    );
+                    // Phase 1b: credential-dark (not signed in).
+                    publish_coord_credential_status(
+                        &auth_manager,
+                        &coord_credential_health(decision, Some(PairProgress::BailNoBearer)),
+                    )
+                    .await;
+                    // D3/D4: this pass concluded with nothing to present. A
+                    // transient Cognito blip is still worth retrying.
+                    conclude_default_slot_recovery(
+                        &auth_manager,
+                        if refresh_class == RefreshClass::Transient {
+                            DefaultSlotRecovery::KeptExisting
+                        } else {
+                            DefaultSlotRecovery::NeedsSignIn
+                        },
+                        !has_tenant_slots,
+                        sweep_inputs.posture_pin_inputs(),
+                        Some(&api_state.app_handle),
+                    );
+                    // Phase 2: if the refresh token is dead
+                    // (`invalid_grant`) and we also have no device-JWT
+                    // bearer, fire the credential-dark notification +
+                    // back off per classification; otherwise (no session)
+                    // fall to the steady cadence.
+                    let action = plan_refresh_wait(&mut backoff, refresh_class);
+                    if action.notify_dark {
+                        emit_credential_dark(&api_state.app_handle, true);
+                    }
+                    if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
+                        return;
+                    }
+                    continue;
+                }
                 // The base a device JWT is MINTED against must be the base the
                 // relay DIALS, or the runner presents a credential to a backend
                 // that never issued it.
@@ -5644,6 +6143,14 @@ async fn refresher_loop(
                             &coord_credential_health(decision, Some(progress)),
                         )
                         .await;
+                        // D3/D4: nothing to re-mint until a pairing — a sign-in.
+                        conclude_default_slot_recovery(
+                            &auth_manager,
+                            DefaultSlotRecovery::NeedsSignIn,
+                            !has_tenant_slots,
+                            sweep_inputs.posture_pin_inputs(),
+                            Some(&api_state.app_handle),
+                        );
                         if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                             .await
                         {
@@ -5653,131 +6160,84 @@ async fn refresher_loop(
                     }
                 };
 
-                // Phase 1b: resolve the tenant ONCE up front so the post-outcome
-                // health mapping can distinguish "no tenant resolved" (gate-
-                // blocking config) from "tenant fine, the mint just failed"
-                // (degraded). `try_refresh_once` re-resolves internally; the two
-                // resolutions agree because both call `resolve_active_tenant_id`
-                // + the same OAuth/outgoing-JWT fallback chain.
-                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
-                let outgoing_jwt = auth_manager.get_access_token().ok();
-                let resolved_tenant =
-                    resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant);
-                let tenant_resolved = resolved_tenant.is_some();
+                // D1: an expired device JWT is never a pair-cli bearer. Said
+                // ONCE per entry into this state, not every tick — on
+                // 2026-10-07 the old path logged a pair-cli 401 181 times in a
+                // day, which read as a backend fault rather than "sign in".
+                if matches!(bearer, PairBearer::DeadSlot(_)) {
+                    if !DEAD_SLOT_SKIP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!(
+                            "device_jwt_refresher: no Cognito session and the device-JWT slot \
+                             holds an EXPIRED token — skipping pair-cli (an expired device JWT \
+                             cannot authorise it); only the device-machine-key exchange or a \
+                             sign-in can recover this runner's coord credential"
+                        );
+                    }
+                } else {
+                    DEAD_SLOT_SKIP_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
 
-                // Phase 5.2: try_refresh_once encapsulates the
-                // pair-cli HTTP call + JWT persistence. It preserves
-                // the existing JWT on any non-2xx outcome.
-                let outcome = try_refresh_once(
+                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
+                let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                let attempt = attempt_pair_mint(
                     &auth_manager,
-                    &pair_base,
-                    &bearer_token,
-                    &device_id,
-                    &user_id,
-                    machine_tenant,
-                    pair_base_arm,
+                    PairMintRequest {
+                        pair_base: &pair_base,
+                        pair_base_arm,
+                        bearer: &bearer,
+                        refresh_class,
+                        device_id: &device_id,
+                        user_id: &user_id,
+                        machine_tenant,
+                        dmk_device_id: dmk_device_id.as_deref(),
+                    },
                 )
                 .await;
-                let progress = match &outcome {
-                    RefreshOutcome::Replaced { new_jwt } => {
-                        info!(
-                            "device_jwt_refresher: device-JWT refreshed (len={})",
-                            new_jwt.len()
-                        );
-                        // Wake the relay so it reconnects with the new JWT.
-                        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                        PairProgress::Healthy
-                    }
-                    RefreshOutcome::KeptExisting | RefreshOutcome::PersistFailed(_) => {
-                        if let RefreshOutcome::PersistFailed(e) = &outcome {
-                            warn!("device_jwt_refresher: persist new JWT failed: {e}");
-                        }
-                        // The mint did NOT advance the slot. Classify why:
-                        //   - no tenant resolvable → gate-blocking config red,
-                        //   - tenant fine but the slot JWT is now expired/absent
-                        //     → degraded "credential-dark" red,
-                        //   - tenant fine and the slot JWT is still valid →
-                        //     healthy (a transient coord 5xx we'll retry).
-                        if !tenant_resolved {
-                            PairProgress::BailNoTenant
-                        } else if slot_jwt_is_expired_or_absent(&auth_manager) {
-                            PairProgress::BailRefreshFailedExpired
-                        } else {
-                            PairProgress::Healthy
-                        }
-                    }
-                    // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
-                    // Deliberately NOT `PersistFailed`'s arm: that path still falls
-                    // through to the dmk-exchange fallback below, which this must not.
-                    RefreshOutcome::TenantMismatch { expected, returned } => {
-                        warn_tenant_mismatch_once(*expected, *returned);
-                        PairProgress::BailTenantMismatch {
-                            expected: *expected,
-                            returned: *returned,
-                        }
-                    }
-                };
-
-                // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the
-                // Cognito pair-cli path have BOTH failed to advance the slot this
-                // tick. If a device machine key (`dmk_`) is stored, exchange it
-                // with web for a fresh device JWT — this recovers a runner offline
-                // past both the device-JWT TTL and the Cognito refresh-token window
-                // (>30d) with no user session. On success: same healthy-tick
-                // handling as the other re-mints (kick relay, publish healthy,
-                // reset backoff, emit "resumed" if we were dark, continue). On
-                // None: fall through to the existing bail.
-                // REPLACE-not-REVOKE: a miss never clears the existing JWT.
-                //
-                // D3: gated on the SPECIFIC bail reasons this fallback answers —
-                // NOT a blanket "anything but Healthy". `BailTenantMismatch` is
-                // deliberately excluded: coord already minted for the wrong
-                // tenant once this tick, and a dmk exchange mints from the SAME
-                // `coord.devices.tenant_id` column that wrong mint may have just
-                // overwritten, so falling through here would repeat the incident
-                // this plan closes rather than recover from it.
-                if matches!(
-                    progress,
-                    PairProgress::BailNoTenant | PairProgress::BailRefreshFailedExpired
-                ) {
-                    let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_string())
-                        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
-                    if let Some(did) = dmk_device_id {
-                        if let Some(new_jwt) = try_device_machine_key_exchange(
-                            &auth_manager,
-                            &pair_base,
-                            &did,
-                            resolved_tenant.map(|(t, _)| t),
-                        )
-                        .await
-                        {
-                            info!(
-                                "device_jwt_refresher: device JWT recovered via \
-                                 device-machine-key exchange (len={}) — self-refresh + \
-                                 Cognito both failed this tick",
-                                new_jwt.len()
-                            );
-                            crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                            publish_coord_credential_status(
-                                &auth_manager,
-                                &coord_credential_health(decision, Some(PairProgress::Healthy)),
-                            )
-                            .await;
-                            let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
-                            if action.notify_recovered {
-                                emit_credential_dark(&api_state.app_handle, false);
-                            }
-                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                    }
+                // D3/D4: record how this pass's recovery concluded, and (on a
+                // legacy-slot runner) re-publish the posture from it NOW, so a
+                // kicked retry concludes with the banner showing ITS verdict.
+                conclude_default_slot_recovery(
+                    &auth_manager,
+                    attempt.verdict(),
+                    !has_tenant_slots,
+                    sweep_inputs.posture_pin_inputs(),
+                    Some(&api_state.app_handle),
+                );
+                if let Some(RefreshOutcome::Replaced { new_jwt }) = &attempt.outcome {
+                    info!(
+                        "device_jwt_refresher: device-JWT refreshed (len={})",
+                        new_jwt.len()
+                    );
+                    // Wake the relay so it reconnects with the new JWT.
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
                 }
+                if let Some(new_jwt) = &attempt.dmk_jwt {
+                    info!(
+                        "device_jwt_refresher: device JWT recovered via \
+                         device-machine-key exchange (len={}) — self-refresh + \
+                         Cognito both failed this tick",
+                        new_jwt.len()
+                    );
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                    publish_coord_credential_status(
+                        &auth_manager,
+                        &coord_credential_health(decision, Some(PairProgress::Healthy)),
+                    )
+                    .await;
+                    let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+                    if action.notify_recovered {
+                        emit_credential_dark(&api_state.app_handle, false);
+                    }
+                    if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
+                        return;
+                    }
+                    continue;
+                }
+                let progress = attempt.progress;
 
                 publish_coord_credential_status(
                     &auth_manager,
@@ -5808,11 +6268,15 @@ async fn refresher_loop(
 
 /// Sleep `dur`, but wake early on shutdown or kick. Returns `true` iff
 /// the loop should `return` (shutdown received).
+///
+/// Every pass of `refresher_loop` ends here, so this is also where the pass is
+/// marked CONCLUDED for a kick-and-wait caller ([`note_pass_concluded`]).
 async fn wait_with_signals(
     dur: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
     kick_rx: &mut watch::Receiver<u64>,
 ) -> bool {
+    note_pass_concluded();
     tokio::select! {
         _ = shutdown_rx.changed() => true,
         _ = kick_rx.changed() => false,
@@ -5866,6 +6330,49 @@ pub mod commands {
         let guard = get_holder().lock().await;
         if let Some(ref state) = *guard {
             state.kick();
+        }
+    }
+
+    /// Kick the refresher and wait — at most `timeout` — for the pass it
+    /// triggers to CONCLUDE, then return the posture that pass left behind.
+    ///
+    /// D5: "Retry refresh now" used to return `Ok(())` whatever happened, so
+    /// a retry that could never work looked exactly like one that had not
+    /// finished yet. `concluded: false` means the pass is still running (or no
+    /// refresher is registered): the posture returned is whatever was last
+    /// published, and the caller must read it as UNKNOWN, never as success.
+    pub async fn kick_device_jwt_refresher_and_wait(timeout: Duration) -> KickOutcome {
+        let seq = {
+            let guard = get_holder().lock().await;
+            guard.as_ref().map(|state| state.kick())
+        };
+        let concluded = match seq {
+            Some(seq) => wait_for_pass_concluded(seq, timeout).await,
+            None => false,
+        };
+        KickOutcome {
+            concluded,
+            posture: coord_credential_posture(),
+        }
+    }
+
+    /// What [`kick_device_jwt_refresher_and_wait`] observed.
+    #[derive(Debug, Clone)]
+    pub struct KickOutcome {
+        /// Did the kicked pass conclude inside the bound?
+        pub concluded: bool,
+        /// The posture as published when the wait ended (`None` = UNKNOWN).
+        pub posture: Option<CoordCredentialStatus>,
+    }
+
+    impl KickOutcome {
+        /// The command's wire shape: `{ concluded, posture }`, where `posture`
+        /// is the same object `get_coord_credential_posture` returns.
+        pub fn to_json(&self) -> serde_json::Value {
+            serde_json::json!({
+                "concluded": self.concluded,
+                "posture": self.posture.as_ref().map(CoordCredentialStatus::to_json),
+            })
         }
     }
 }
@@ -6445,7 +6952,10 @@ mod try_refresh_once_tests {
         // Setup: AuthManager holds a valid-shape (not-yet-expired) JWT.
         // Run: mock web backend returns 401 on pair-cli.
         // Assert: access_token slot STILL holds the original JWT (not
-        // cleared) AND the outcome is KeptExisting.
+        // cleared) AND the outcome is BearerRejected — a 401 is a verdict on
+        // the bearer, not a transient fault (plan
+        // 2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover
+        // D2), but REPLACE-not-REVOKE still holds.
         let mgr = test_auth_manager("handles_coord_401_without_clearing");
         let existing_jwt = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
         mgr.store_tokens(&existing_jwt, "").expect("store");
@@ -6458,8 +6968,8 @@ mod try_refresh_once_tests {
         let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
         assert_eq!(
             outcome,
-            RefreshOutcome::KeptExisting,
-            "401 must yield KeptExisting (not Replaced, not PersistFailed)"
+            RefreshOutcome::BearerRejected { status: 401 },
+            "401 must yield BearerRejected (not KeptExisting, not Replaced)"
         );
         assert_eq!(
             *cap.hits.lock().unwrap(),
@@ -7735,6 +8245,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         // No upstream evidence: `exp` says live, and live is what we report.
         assert_eq!(
@@ -7772,6 +8283,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let posture = || derive_coord_credential_posture(&live_slot, upstream_signal(), now);
 
@@ -8018,6 +8530,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(outcome),
+            recovery: None,
         };
         assert_eq!(
             derive_coord_credential_posture(
@@ -8255,6 +8768,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         assert_eq!(
             derive_coord_credential_posture(&obs, upstream_signal_for(Some(&t.to_string())), now),
@@ -8313,6 +8827,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -8384,6 +8899,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -8457,6 +8973,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
 
         // Interleaved exactly as a live box would produce them: A refused, B
@@ -8535,6 +9052,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
@@ -8608,6 +9126,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy_slot(tenant(0)), healthy_slot(tenant(1))];
 
@@ -8771,6 +9290,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy(tenant(1)), healthy(tenant(2))];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
@@ -8936,6 +9456,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy(y), healthy(z)];
 
@@ -9043,6 +9564,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [slot(a), slot(b)];
         for _ in 0..5 {
@@ -9181,6 +9703,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(Some(pinned), true, 401, br#"{"code":"token_revoked"}"#);
@@ -9253,6 +9776,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }
     }
 
@@ -9444,6 +9968,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::KeptExisting),
+            recovery: None,
         };
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
@@ -9573,6 +10098,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: None,
+            recovery: None,
         }
     }
 
@@ -10602,6 +11128,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(Some(t), true, 401, br#"{"code":"token_revoked"}"#);
@@ -10728,6 +11255,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy(tenant(4)), healthy(tenant(5))];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
@@ -12768,5 +13296,481 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_slot_recovery_tests {
+    //! Plan `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`.
+    //!
+    //! The incident: no Cognito session, an expired device JWT in the default
+    //! slot. Every pass handed that dead JWT to pair-cli (181 HTTP 401s in a
+    //! day), classified the 401 as "kept existing — transient", and the posture
+    //! read `expired` with a "Retry refresh now" button that could never work.
+    //!
+    //! - D1: an expired device JWT is never presented to pair-cli; the
+    //!   device-machine-key exchange is still tried.
+    //! - D2: a pair-cli 401/403 is `BearerRejected`, not `KeptExisting`.
+    //! - D3/D4: a present-dead default slot whose last concluded recovery
+    //!   needs a sign-in is `unrefreshable` (CTA `re_pair`), does not regress
+    //!   to `expired` on a later pass, and names its `lastRefreshOutcome`.
+    //! - D5: the pass-concluded signal a kick-and-wait reads.
+
+    use super::*;
+    use crate::secure_storage::StoredTokenRead;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const TENANT: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// A device-JWT-shaped token with `exp` and the fixture tenant.
+    fn device_jwt(exp: i64) -> String {
+        let header = b64url(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = b64url(format!(r#"{{"exp":{exp},"tenant_id":"{TENANT}"}}"#).as_bytes());
+        format!("{header}.{payload}.{}", b64url(b"fake-sig"))
+    }
+
+    /// A Cognito-shaped user bearer carrying the fixture tenant.
+    fn user_bearer() -> String {
+        let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = b64url(format!(r#"{{"sub":"runner","tenant_id":"{TENANT}"}}"#).as_bytes());
+        format!("{header}.{payload}.test-signature")
+    }
+
+    fn setup(name: &str, slot: Option<&str>, dmk: Option<&str>) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_default_slot_recovery");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let seed = crate::secure_storage::SecureStorage::with_path(path.clone()).expect("seed");
+        if let Some(t) = slot {
+            seed.store_tokens(t, "").expect("seed slot");
+        }
+        if let Some(k) = dmk {
+            seed.store_device_machine_key(k).expect("seed dmk");
+        }
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    #[derive(Clone)]
+    struct Mock {
+        pair_status: StatusCode,
+        pair_body: String,
+        dmk_status: StatusCode,
+        dmk_body: String,
+        pair_hits: Arc<Mutex<u32>>,
+        dmk_hits: Arc<Mutex<u32>>,
+    }
+
+    async fn pair_cli(State(m): State<Mock>) -> (StatusCode, String) {
+        *m.pair_hits.lock().unwrap() += 1;
+        (m.pair_status, m.pair_body.clone())
+    }
+
+    async fn dmk_exchange(State(m): State<Mock>, Path(_d): Path<String>) -> (StatusCode, String) {
+        *m.dmk_hits.lock().unwrap() += 1;
+        (m.dmk_status, m.dmk_body.clone())
+    }
+
+    /// One in-process web backend serving BOTH routes the `Pair` arm can
+    /// reach, so a test can assert which of them a tick actually hit.
+    fn spawn_web(
+        pair: (StatusCode, String),
+        dmk: (StatusCode, String),
+    ) -> (String, Mock, tokio::sync::oneshot::Sender<()>) {
+        let mock = Mock {
+            pair_status: pair.0,
+            pair_body: pair.1,
+            dmk_status: dmk.0,
+            dmk_body: dmk.1,
+            pair_hits: Arc::new(Mutex::new(0)),
+            dmk_hits: Arc::new(Mutex::new(0)),
+        };
+        let state = mock.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route("/api/v1/devices/pair-cli", post(pair_cli))
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(dmk_exchange),
+                    )
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), mock, tx)
+    }
+
+    fn token_body(jwt: &str) -> String {
+        serde_json::json!({ "token": jwt, "user_id": UID }).to_string()
+    }
+
+    async fn attempt(
+        mgr: &crate::auth::AuthManager,
+        base: &str,
+        bearer: &PairBearer,
+        refresh_class: RefreshClass,
+    ) -> PairMintAttempt {
+        attempt_pair_mint(
+            mgr,
+            PairMintRequest {
+                pair_base: base,
+                pair_base_arm: None,
+                bearer,
+                refresh_class,
+                device_id: DID,
+                user_id: UID,
+                machine_tenant: None,
+                dmk_device_id: Some(DID),
+            },
+        )
+        .await
+    }
+
+    // ---- D1: the bearer choice --------------------------------------------
+
+    #[test]
+    fn an_expired_device_jwt_is_never_a_pair_cli_bearer() {
+        let now = 1_800_000_000;
+        let dead = device_jwt(now - 60);
+        assert_eq!(
+            pair_bearer_for(None, Some(dead.clone()), now),
+            PairBearer::DeadSlot(dead),
+            "no Cognito session + an expired device JWT must NOT be presented to pair-cli"
+        );
+        // A Cognito bearer always wins, whatever the slot holds.
+        assert_eq!(
+            pair_bearer_for(Some("cog".into()), Some(device_jwt(now - 60)), now),
+            PairBearer::Present("cog".into())
+        );
+        // A still-valid slot value is presented (the historical Phase-2 path).
+        let live = device_jwt(now + 600);
+        assert_eq!(
+            pair_bearer_for(None, Some(live.clone()), now),
+            PairBearer::Present(live)
+        );
+        // A legacy opaque `qontinui_runner_*` user token is the migration path
+        // pair-cli heals — it is NOT a dead device JWT and is still presented.
+        assert_eq!(
+            pair_bearer_for(None, Some("qontinui_runner_legacy_abc".into()), now),
+            PairBearer::Present("qontinui_runner_legacy_abc".into())
+        );
+        assert_eq!(pair_bearer_for(None, Some("  ".into()), now), PairBearer::Nothing);
+        assert_eq!(pair_bearer_for(Some(" ".into()), None, now), PairBearer::Nothing);
+    }
+
+    #[tokio::test]
+    async fn expired_slot_without_cognito_sends_no_pair_cli_and_tries_the_dmk_exchange() {
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d1_dmk_recovers", Some(&dead), Some("dmk_unit_fixture"));
+        let fresh = device_jwt(now + 4 * 60 * 60);
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::OK, token_body(&device_jwt(now + 60))),
+            (StatusCode::OK, token_body(&fresh)),
+        );
+
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::NoSession).await;
+
+        assert_eq!(*mock.pair_hits.lock().unwrap(), 0, "D1: zero pair-cli requests");
+        assert_eq!(
+            *mock.dmk_hits.lock().unwrap(),
+            1,
+            "the dmk exchange is still attempted"
+        );
+        assert_eq!(got.outcome, None, "pair-cli was not called at all");
+        assert_eq!(got.dmk_jwt.as_deref(), Some(fresh.as_str()));
+        assert_eq!(got.verdict(), DefaultSlotRecovery::Refreshed);
+        assert_eq!(mgr.get_access_token().unwrap(), fresh);
+    }
+
+    #[tokio::test]
+    async fn expired_slot_without_cognito_or_dmk_concludes_needs_sign_in() {
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d1_needs_sign_in", Some(&dead), None);
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::UNAUTHORIZED, "{}".into()),
+            (StatusCode::OK, token_body(&device_jwt(now + 600))),
+        );
+
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::NoSession).await;
+
+        assert_eq!(*mock.pair_hits.lock().unwrap(), 0, "D1: zero pair-cli requests");
+        assert_eq!(
+            *mock.dmk_hits.lock().unwrap(),
+            0,
+            "no dmk_ stored → no exchange call"
+        );
+        assert_eq!(
+            got.progress,
+            PairProgress::BailNeedsSignIn {
+                rejected_status: None
+            }
+        );
+        assert_eq!(got.verdict(), DefaultSlotRecovery::NeedsSignIn);
+        assert_eq!(mgr.get_access_token().unwrap(), dead, "REPLACE-not-REVOKE");
+    }
+
+    #[tokio::test]
+    async fn a_transient_cognito_blip_with_a_dead_slot_stays_retryable() {
+        let now = chrono::Utc::now().timestamp();
+        let mgr = setup("d1_transient", Some(&device_jwt(now - 60)), None);
+        let (base, _mock, _stop) = spawn_web(
+            (StatusCode::OK, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::Transient).await;
+        assert_eq!(got.progress, PairProgress::BailRefreshFailedExpired);
+        assert_eq!(got.verdict(), DefaultSlotRecovery::KeptExisting);
+    }
+
+    // ---- D2: a 401/403 is a rejection, 5xx stays transient -----------------
+
+    #[tokio::test]
+    async fn pair_cli_401_with_a_dead_slot_is_bearer_rejected_and_still_tries_dmk() {
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d2_401", Some(&dead), Some("dmk_unit_fixture"));
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::UNAUTHORIZED, r#"{"error":"UNAUTHORIZED"}"#.into()),
+            (StatusCode::FORBIDDEN, r#"{"error":"revoked"}"#.into()),
+        );
+
+        let bearer = PairBearer::Present(user_bearer());
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::Ok).await;
+
+        assert_eq!(*mock.pair_hits.lock().unwrap(), 1);
+        assert_eq!(
+            *mock.dmk_hits.lock().unwrap(),
+            1,
+            "the dmk exchange needs no user"
+        );
+        assert_eq!(
+            got.outcome,
+            Some(RefreshOutcome::BearerRejected { status: 401 })
+        );
+        assert_eq!(
+            got.progress,
+            PairProgress::BailNeedsSignIn {
+                rejected_status: Some(401)
+            }
+        );
+        assert_eq!(got.verdict(), DefaultSlotRecovery::BearerRejected);
+        assert_eq!(mgr.get_access_token().unwrap(), dead, "REPLACE-not-REVOKE");
+    }
+
+    #[tokio::test]
+    async fn pair_cli_403_is_bearer_rejected_too() {
+        let now = chrono::Utc::now().timestamp();
+        let mgr = setup("d2_403", Some(&device_jwt(now + 30 * 60)), None);
+        let (base, _mock, _stop) = spawn_web(
+            (StatusCode::FORBIDDEN, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+        let outcome = try_refresh_once(&mgr, &base, &user_bearer(), DID, UID, None, None).await;
+        assert_eq!(outcome, RefreshOutcome::BearerRejected { status: 403 });
+    }
+
+    #[tokio::test]
+    async fn pair_cli_503_stays_kept_existing_and_the_pin_is_unchanged() {
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d2_503", Some(&dead), None);
+        let (base, _mock, _stop) = spawn_web(
+            (StatusCode::SERVICE_UNAVAILABLE, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+        let bearer = PairBearer::Present(user_bearer());
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::Ok).await;
+        assert_eq!(got.outcome, Some(RefreshOutcome::KeptExisting));
+        assert_eq!(got.progress, PairProgress::BailRefreshFailedExpired);
+        assert_eq!(
+            got.verdict(),
+            DefaultSlotRecovery::KeptExisting,
+            "a 5xx says nothing about the bearer — a retry can help"
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), dead);
+    }
+
+    #[test]
+    fn needs_sign_in_health_names_the_remedy() {
+        let skipped = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: None,
+            }),
+        );
+        assert!(!skipped.ok);
+        assert!(skipped.reason.unwrap().contains("must sign in"));
+        let rejected = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: Some(401),
+            }),
+        );
+        assert!(!rejected.ok);
+        assert!(rejected.reason.unwrap().contains("HTTP 401"));
+    }
+
+    // ---- D3/D4: the posture ------------------------------------------------
+
+    fn legacy(token: &str) -> SlotObservation {
+        legacy_slot_observation(StoredTokenRead::Present(token.to_string()))
+    }
+
+    fn publish(obs: SlotObservation, now: i64) -> CoordCredentialStatus {
+        let _ = derive_and_publish_posture(&[obs], PosturePinInputs::UNPINNED, now);
+        coord_credential_posture().expect("a posture was published")
+    }
+
+    /// The 2026-10-07 incident, pass by pass, on the default slot.
+    #[test]
+    fn the_incident_sequence_reads_unrefreshable_and_never_regresses_to_expired() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let dead_exp = now - 60;
+        let dead = device_jwt(dead_exp);
+
+        // Boot: a dead slot, no recovery concluded yet → `expired`.
+        let boot = publish(legacy(&dead), now);
+        assert_eq!(boot.posture, CoordCredentialPosture::Expired);
+        assert_eq!(boot.posture.cta(), Some("retry_refresh"));
+        assert_eq!(boot.last_refresh_outcome, None, "boot: no pass has concluded");
+
+        // The pass concludes: no bearer, no dmk recovery → `unrefreshable`.
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(dead_exp));
+        let concluded = publish(legacy(&dead), now);
+        assert_eq!(concluded.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(concluded.posture.cta(), Some("re_pair"));
+        assert_eq!(
+            concluded.last_refresh_outcome.as_deref(),
+            Some("needs-sign-in")
+        );
+
+        // A LATER pass finds the same dead token still present: it must NOT
+        // regress to `expired` (the 03:57 regression).
+        let later = publish(legacy(&dead), now + 300);
+        assert_eq!(later.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(later.last_refresh_outcome.as_deref(), Some("needs-sign-in"));
+        assert_eq!(
+            later.since, concluded.since,
+            "an unchanged posture keeps its `since`"
+        );
+
+        // pair-cli rejecting the bearer is the same verdict class.
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(dead_exp));
+        let rejected = publish(legacy(&dead), now + 600);
+        assert_eq!(rejected.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(
+            rejected.last_refresh_outcome.as_deref(),
+            Some("bearer-rejected")
+        );
+
+        // A transient failure → `expired` again: a retry CAN help there.
+        record_default_slot_recovery(DefaultSlotRecovery::KeptExisting, Some(dead_exp));
+        let transient = publish(legacy(&dead), now + 900);
+        assert_eq!(transient.posture, CoordCredentialPosture::Expired);
+        assert_eq!(transient.posture.cta(), Some("retry_refresh"));
+        assert_eq!(
+            transient.last_refresh_outcome.as_deref(),
+            Some("kept-existing")
+        );
+
+        // A successful mint → `live`, naming the outcome.
+        let fresh_exp = now + 4 * 60 * 60;
+        record_default_slot_recovery(DefaultSlotRecovery::Refreshed, Some(fresh_exp));
+        let healed = publish(legacy(&device_jwt(fresh_exp)), now + 1200);
+        assert_eq!(healed.posture, CoordCredentialPosture::Live);
+        assert_eq!(healed.last_refresh_outcome.as_deref(), Some("refreshed"));
+        assert_eq!(
+            healed.to_json()["lastRefreshOutcome"],
+            serde_json::json!("refreshed"),
+            "`/health` carries the outcome"
+        );
+    }
+
+    #[test]
+    fn a_verdict_about_one_credential_does_not_colour_another() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(now - 600));
+        // A DIFFERENT dead credential (another exp) has no concluded recovery.
+        let other = publish(legacy(&device_jwt(now - 60)), now);
+        assert_eq!(other.posture, CoordCredentialPosture::Expired);
+        assert_eq!(other.last_refresh_outcome, None);
+        assert_eq!(default_slot_recovery_for(Some(now - 60)), None);
+        assert_eq!(
+            default_slot_recovery_for(Some(now - 600)),
+            Some(DefaultSlotRecovery::NeedsSignIn)
+        );
+    }
+
+    #[test]
+    fn a_needs_sign_in_verdict_never_darkens_a_live_credential() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let exp = now + 4 * 60 * 60;
+        // D2's healthy-for-now case: pair-cli rejected the bearer while the slot
+        // was still valid. The ladder only consults the verdict for a DEAD slot.
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(exp));
+        let live = publish(legacy(&device_jwt(exp)), now);
+        assert_eq!(live.posture, CoordCredentialPosture::Live);
+    }
+
+    // ---- D5: the pass-concluded signal -------------------------------------
+
+    #[tokio::test]
+    async fn a_kick_waiter_wakes_only_when_its_pass_concludes() {
+        use std::sync::atomic::Ordering;
+        let seq = KICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        // Not concluded yet → the bounded wait reports UNKNOWN, not success.
+        assert!(
+            !wait_for_pass_concluded(seq, Duration::from_millis(50)).await,
+            "a pass that has not concluded must not read as concluded"
+        );
+        // The pass that started on this kick concludes.
+        PASS_IN_FLIGHT_KICK_SEQ.store(seq, Ordering::SeqCst);
+        let waiter = tokio::spawn(wait_for_pass_concluded(seq, Duration::from_secs(5)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        note_pass_concluded();
+        assert!(waiter.await.unwrap(), "the waiter wakes on its own pass");
+        // A later kick is not answered by an earlier pass.
+        assert!(!wait_for_pass_concluded(seq + 1_000_000, Duration::from_millis(50)).await);
     }
 }
