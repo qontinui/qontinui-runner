@@ -360,6 +360,16 @@ describe("collision probes", () => {
     expect(promptsToProbe(["a"], "/other", answered, inFlight)).toEqual(["a"]);
   });
 
+  it("re-probes a prompt whose last probe failed", () => {
+    const answered = {
+      [probeKey("/w", "a")]: { kind: "ok" },
+      [probeKey("/w", "b")]: { kind: "unknown", error: "HTTP 503" },
+    };
+    expect(promptsToProbe(["a", "b"], "/w", answered, new Set())).toEqual(["b"]);
+    // …unless a retry is already in flight.
+    expect(promptsToProbe(["a", "b"], "/w", answered, new Set([probeKey("/w", "b")]))).toEqual([]);
+  });
+
   it("runs at most `limit` at once and every item once", async () => {
     let live = 0;
     let peak = 0;

@@ -18,12 +18,13 @@
 //! * The ledger is `database::pg::fanout`; the HTTP door is `mcp::fanout`.
 //!
 //! Recovery lives inside the runner process: [`start`] reloads this instance's
-//! active runs and reconciles them at boot. A run idle for longer than
-//! `dispatcher::STALE_RUN_AGE` (24 h) when it is loaded — typically a torn-down
-//! temp runner's run, found by a later runner reusing its instance name — is not
-//! resumed: its waiting members are cancelled with `stale_after_restart`, and
-//! the operator re-creates the run if it is still wanted. Nothing here touches
-//! the supervisor.
+//! active runs and reconciles them at boot. A run with no write of any kind for
+//! longer than `dispatcher::STALE_RUN_AGE` (24 h) when it is loaded — typically a
+//! torn-down temp runner's run, found by a later runner reusing its instance
+//! name — is not resumed: its waiting members are cancelled with
+//! `stale_after_restart`, and the operator re-creates the run if it is still
+//! wanted. A run with a live member, or one paused by coord's device drain, is
+//! never treated as stale. Nothing here touches the supervisor.
 
 pub(crate) mod dispatcher;
 pub(crate) mod host;

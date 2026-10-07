@@ -2238,7 +2238,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     page_id: Option<String>,
     resource_override: bool,
     tenant_id: Option<uuid::Uuid>,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), crate::terminal::CreateError> {
     create_terminal_session_backend(
         terminal_manager,
         session_registry,
@@ -2272,6 +2272,12 @@ pub(crate) fn create_tracked_terminal_session_backend(
 /// (and the heartbeat) transfers to the terminal session. Returns the new
 /// terminal id and the coord session id (when registration succeeded).
 ///
+/// The only error is [`TerminalManager::create`]'s, typed so a caller can tell
+/// a refusal made before any child existed
+/// ([`crate::terminal::CreateError::BeforeChild`]) from a child that was
+/// spawned and then killed. Once `create` succeeds nothing here fails: the
+/// coord registration is best-effort.
+///
 /// Prefer [`create_tracked_terminal_session_backend`] — the `capture_hint:
 /// Option<_>` shape here exists only for a path that genuinely cannot know
 /// the session id at spawn time; a `None` trips the untracked-backend-spawn
@@ -2304,7 +2310,7 @@ pub(crate) fn create_terminal_session_backend(
     // fan-out dispatcher passes the tenant its run was admitted under, so a
     // member admitted an hour after the click still spawns under it.
     tenant_id: Option<uuid::Uuid>,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), crate::terminal::CreateError> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
     // the pre-acquired context + the configured plan directories), derived

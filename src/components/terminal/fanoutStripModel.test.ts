@@ -10,6 +10,7 @@ import {
 } from "./fanoutApi";
 import {
   activeFanoutRuns,
+  applyRunUpdateGated,
   canReleaseMember,
   cancellableCount,
   cancelledNote,
@@ -141,6 +142,26 @@ describe("unknownStripText", () => {
     );
     expect(long.startsWith("fan-out UNKNOWN — ")).toBe(true);
     expect(long.endsWith("…")).toBe(true);
+  });
+});
+
+describe("applyRunUpdateGated", () => {
+  it("marks the gate synchronously, so a poll begun before the event is dropped", () => {
+    const gate = createFreshnessGate();
+    const stamp = gate.begin();
+    const a = run([member(0, "queued")], { id: "a" });
+    const next = applyRunUpdateGated({ kind: "ok", runs: [] }, a, gate);
+    expect(next.kind === "ok" && next.runs.map((r) => r.id)).toEqual(["a"]);
+    // No render has happened; the gate already knows.
+    expect(gate.acceptPoll(stamp)).toBe(false);
+  });
+
+  it("leaves the gate alone when nothing changed", () => {
+    const gate = createFreshnessGate();
+    const stamp = gate.begin();
+    const l = { kind: "loading" } as const;
+    expect(applyRunUpdateGated(l, run([]), gate)).toBe(l);
+    expect(gate.acceptPoll(stamp)).toBe(true);
   });
 });
 

@@ -9,6 +9,7 @@
 //! spawn seam. The dispatcher's [`FanoutHost::drain_deferral`] pre-check only
 //! keeps a drained tick from churning the ledger; this gate is the authority.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,8 +111,20 @@ impl FanoutHost for TauriFanoutHost {
             None => StoreRead::Unreadable,
             Some(s) => match s.get_checked(claude_session_id) {
                 Err(e) => {
-                    warn!(session = %claude_session_id, error = %e,
-                        "fanout: lifecycle store unreadable — liveness UNKNOWN");
+                    // Asked once per admitted member per tick: a store that
+                    // stays poisoned would otherwise warn every 5 s per member.
+                    if take_warn_slot(
+                        &LAST_UNREADABLE_WARN,
+                        chrono::Utc::now().timestamp(),
+                        UNREADABLE_WARN_INTERVAL_SECS,
+                    ) {
+                        warn!(session = %claude_session_id, error = %e,
+                            "fanout: lifecycle store unreadable — liveness UNKNOWN \
+                             (repeats suppressed for {UNREADABLE_WARN_INTERVAL_SECS}s)");
+                    } else {
+                        tracing::debug!(session = %claude_session_id, error = %e,
+                            "fanout: lifecycle store unreadable — liveness UNKNOWN");
+                    }
                     StoreRead::Unreadable
                 }
                 Ok(None) => StoreRead::Absent,
@@ -134,6 +147,23 @@ impl FanoutHost for TauriFanoutHost {
             terminal_id,
         )
     }
+}
+
+/// At most one "lifecycle store unreadable" warning per this many seconds.
+const UNREADABLE_WARN_INTERVAL_SECS: i64 = 300;
+
+/// When the last "lifecycle store unreadable" warning was logged (unix secs).
+static LAST_UNREADABLE_WARN: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Whether a rate-limited warning may be logged at `now` (unix secs), claiming
+/// the slot if so. Racing callers: exactly one wins a given slot.
+fn take_warn_slot(last: &AtomicI64, now: i64, interval_secs: i64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    if prev != i64::MIN && now.saturating_sub(prev) < interval_secs {
+        return false;
+    }
+    last.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// What the lifecycle store says about one session.
@@ -293,12 +323,42 @@ async fn spawn_member_terminal(
             isolated_ctx,
         },
     );
-    if let (Err(why), Some(handback)) = (&result, handback) {
-        // The seam refused before a PTY child existed (its only error path),
-        // so nothing ever ran in the worktree: hand it back now.
-        handback.abandon(why).await;
+    let err = match result {
+        Ok(terminal_id) => return Ok(terminal_id),
+        Err(err) => err,
+    };
+    match (on_launch_failure(&err), handback) {
+        (LaunchFailure::HandBack, Some(handback)) => {
+            // Refused before a PTY child existed, so nothing ever ran in the
+            // worktree: hand it back now.
+            handback.abandon(err.message()).await;
+        }
+        (LaunchFailure::LeaveForReclaim, Some(_)) => {
+            warn!(run_id = %req.run_id, index = req.index, error = %err,
+                "fanout: a member's child was spawned and then killed — its worktree is \
+                 left for the reclaim engine, not handed back");
+        }
+        (_, None) => {}
     }
-    result
+    Err(err.into())
+}
+
+/// What a failed launch does with the allocation acquired for it.
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchFailure {
+    /// No child ever existed: remove the worktree and retire the allocation.
+    HandBack,
+    /// A child existed (and was killed): something may have run in the
+    /// worktree, so it is the reclaim engine's to judge, never removed here.
+    LeaveForReclaim,
+}
+
+fn on_launch_failure(err: &crate::terminal::CreateError) -> LaunchFailure {
+    if err.child_spawned() {
+        LaunchFailure::LeaveForReclaim
+    } else {
+        LaunchFailure::HandBack
+    }
 }
 
 /// Everything [`launch_member`] needs that [`spawn_member_terminal`] resolved.
@@ -314,12 +374,15 @@ struct LaunchInputs {
 }
 
 /// Build the member's argv and hand it to the shared spawn seam. Its only
-/// error is the seam's own refusal, which happens before a PTY child exists.
+/// error is the seam's, typed by whether a PTY child ever existed: a refusal
+/// made before the child, or a child spawned and then killed because its
+/// session could not be built ([`crate::terminal::CreateError`]). The seam
+/// never returns an error with a child still running.
 fn launch_member(
     app: &tauri::AppHandle,
     req: &MemberSpawnRequest,
     inputs: LaunchInputs,
-) -> Result<String, String> {
+) -> Result<String, crate::terminal::CreateError> {
     let LaunchInputs {
         terminal_manager,
         session_registry,
@@ -507,6 +570,35 @@ mod tests {
         assert_eq!(
             classify(record(true, true, "t1"), &[("t1", true)], Some("t1")),
             Liveness::Finished
+        );
+    }
+
+    /// Only a refusal made before any child existed hands the worktree back;
+    /// a child that was spawned (then killed) leaves it for reclaim.
+    #[test]
+    fn fanout_handback_runs_only_for_a_refusal_before_the_child() {
+        use crate::terminal::CreateError;
+        assert_eq!(
+            on_launch_failure(&CreateError::BeforeChild("trust gate".into())),
+            LaunchFailure::HandBack
+        );
+        assert_eq!(
+            on_launch_failure(&CreateError::ChildKilled("no writer".into())),
+            LaunchFailure::LeaveForReclaim
+        );
+    }
+
+    /// A persistently unreadable lifecycle store warns once per interval, not
+    /// once per member per tick.
+    #[test]
+    fn fanout_unreadable_store_warning_is_rate_limited() {
+        let last = AtomicI64::new(i64::MIN);
+        assert!(take_warn_slot(&last, 1_000, 300), "the first one is logged");
+        assert!(!take_warn_slot(&last, 1_005, 300));
+        assert!(!take_warn_slot(&last, 1_299, 300));
+        assert!(
+            take_warn_slot(&last, 1_300, 300),
+            "the next interval logs again"
         );
     }
 
