@@ -935,7 +935,7 @@ pub fn next_release_slot(
 /// up — each holding a `WorkflowDropGuard` and a task-run row that reads
 /// *running* with no progress. `tx.send_replace` then wakes ALL N in the same
 /// instant. The machine-load backstop (`agent_runtime::admit_launch` /
-/// `evaluate_load_guard`) sits on the COORD-LAUNCH path and does not see this
+/// `resource_guard::probe_for_spawn`) sits on the COORD-LAUNCH path and does not see this
 /// one, so nothing downstream bounds the wave.
 ///
 /// **What bounds it here, exactly:** the release RATE, to one task per
