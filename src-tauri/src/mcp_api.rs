@@ -4917,6 +4917,20 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// Forwarding a name coord does not yet serve is harmless — coord answers it as
 /// an unknown tool — so these entries may land ahead of the coord side.
 ///
+/// **The agent policy doors** — `coord_agent_policy_create` /
+/// `coord_agent_policy_tighten`, the MCP twins of coord's
+/// `POST|PATCH /coord/agent-policies` (coord plan
+/// `2026-09-06-decision-policy-rows-are-operator-only-to-create`;
+/// qontinui-coord#2932 adds them to coord's device floor, each with a
+/// device-admitting HTTP twin, and this change is sequenced after it). Coord
+/// enforces every bound itself (domain allowlist, v1 refusal, credential floor,
+/// the announcing finding as a precondition, tighten-only PATCH), so
+/// withholding them here would only make a proxied session — which holds MCP
+/// and no raw bearer — unable to reach a door its own device may call over
+/// HTTP. A proxied write goes upstream under this runner's DEVICE credential
+/// (attributed to the session coord can prove), so it is never stronger than
+/// what that device may already do directly.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4934,6 +4948,8 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
     "coord_adopt_pr",
+    "coord_agent_policy_create",
+    "coord_agent_policy_tighten",
     "coord_agent_registry_effective",
     "coord_alert_claim",
     "coord_alert_queue",
@@ -16759,6 +16775,12 @@ mod coord_mcp_body_gate_tests {
             // receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
             // Phase 1), pinned with the coord tool rather than after a -32601.
             "coord_memory_get",
+            // The agent policy doors (coord plan 2026-09-06-decision-policy-
+            // rows-are-operator-only-to-create), pinned WITH the coord tools
+            // (qontinui-coord#2932, device floor + device-admitting HTTP twin)
+            // rather than after a -32601.
+            "coord_agent_policy_create",
+            "coord_agent_policy_tighten",
         ] {
             assert!(
                 gate(serde_json::json!({
