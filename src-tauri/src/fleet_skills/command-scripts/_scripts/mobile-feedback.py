@@ -14,6 +14,7 @@ Usage:
     python mobile-feedback.py start-emulator      # Start the default emulator
 """
 
+import shutil
 import subprocess
 import sys
 import os
@@ -31,15 +32,20 @@ MOBILE_LOGS = Path(os.environ.get("MOBILE_FEEDBACK_DIR") or Path.cwd() / ".dev-l
 MOBILE_SCREENSHOTS = MOBILE_LOGS / "screenshots"
 MOBILE_LOGCAT = MOBILE_LOGS / "logcat"
 
-# Ensure directories exist
-MOBILE_SCREENSHOTS.mkdir(parents=True, exist_ok=True)
-MOBILE_LOGCAT.mkdir(parents=True, exist_ok=True)
+
+def ensure_dir(path: Path) -> Path:
+    """Create an output directory at the moment a capture writes into it.
+
+    Never at import: `--help`, `devices` or a failed ADB lookup must not leave
+    an empty `.dev-logs/mobile/` tree in whatever directory the script ran from.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def get_adb_path() -> str:
     """Find ADB executable path."""
     # Check if adb is in PATH
-    import shutil
     adb_in_path = shutil.which("adb")
     if adb_in_path:
         return adb_in_path
@@ -60,7 +66,6 @@ def get_adb_path() -> str:
 
 def get_emulator_path() -> str:
     """Find emulator executable path."""
-    import shutil
     emulator_in_path = shutil.which("emulator")
     if emulator_in_path:
         return emulator_in_path
@@ -145,7 +150,7 @@ def capture_screenshot(device_id: str = None, suffix: str = "") -> Path:
     """Capture a screenshot from the device."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"screenshot_{timestamp}{suffix}.png"
-    output_path = MOBILE_SCREENSHOTS / filename
+    output_path = ensure_dir(MOBILE_SCREENSHOTS) / filename
 
     # Capture to device temp, then pull
     device_path = "/sdcard/qontinui_screenshot.png"
@@ -164,7 +169,9 @@ def capture_screenshot(device_id: str = None, suffix: str = "") -> Path:
     latest_path = MOBILE_SCREENSHOTS / "latest.png"
     if latest_path.exists():
         latest_path.unlink()
-    output_path.link_to(latest_path) if os.name != 'nt' else __import__('shutil').copy(output_path, latest_path)
+    # A copy on every OS: `Path.link_to` was removed in Python 3.12, and a hard
+    # link would be rewritten in place by the next pull anyway.
+    shutil.copy(output_path, latest_path)
 
     return output_path
 
@@ -173,7 +180,7 @@ def capture_logs(device_id: str = None, lines: int = 500, filter_app: bool = Tru
     """Capture recent logcat output."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"logcat_{timestamp}.txt"
-    output_path = MOBILE_LOGCAT / filename
+    output_path = ensure_dir(MOBILE_LOGCAT) / filename
 
     adb_args = []
     if device_id:
@@ -212,7 +219,7 @@ def capture_all(device_id: str = None) -> dict:
         "logs": str(logs_path),
     }
 
-    summary_path = MOBILE_LOGS / "latest_capture.json"
+    summary_path = ensure_dir(MOBILE_LOGS) / "latest_capture.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
     print(f"\nCapture complete. Summary: {summary_path}")
@@ -309,7 +316,7 @@ def clear_logs():
 
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         print(__doc__)
         sys.exit(0)
 
