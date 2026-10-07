@@ -197,22 +197,29 @@ jobs:
     # still takes 84 min. What moved is the WORST BOUNDED Rust time, from 90 to
     # 90 + 20 = 110. So the sentence above is not wrong; it simply answers a
     # different question from the one the next person sizing this cap needs.
+    # (Its "150 min" is the pre-split cap; the value below is re-derived.)
     #
-    # Compute from 110, not 90. Attempt 1 of run 35043646051 ran 100m43s with
-    # the 90-min step, i.e. 10m43s outside it, so the same shape under the split
-    # reaches ~121m. The historical max windows job (110.6m) reaches ~130m ONLY
-    # IF its Rust step consumed the full 90 — an assumption, not a measurement.
-    # Substituting the step's own max(success) of 82 gives ~139m instead, but
-    # that figure is ALSO an assumption and a weaker one: 82 is recorded in the
-    # `Build Rust tests` step comment below, from "44 windows samples after
-    # 2026-09-08", while the 110.6m job max above is from "90 sampled
-    # successful job runs, 2026-08-08..08-20" — two disjoint windows, so the
-    # two numbers were never measured on the same run. Every one of ~121m,
-    # ~130m and ~139m still fits under 150, which is why this cap is NOT
-    # changed here; Phase 5 should re-measure both ends on one window rather
-    # than combining these. Re-sizing against a re-measured window is Phase 5 of
-    # 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound.
-    timeout-minutes: 150
+    # Compute from 110, not 90 — and add the MEASURED time outside the two
+    # Rust steps rather than projecting it. Re-measured on ONE window (Phase 5a
+    # of 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound),
+    # 881 successful windows `test` jobs, 2026-09-24..10-07: job p50 90.8 /
+    # p90 106.4 / max 143.2 min; time OUTSIDE `Build Rust tests` + `Run Rust
+    # tests` p50 36.4 / p99 45.7 / max 49.0 min. So the worst bounded case is
+    # 90 (build) + 20 (run) + 49 (measured overhead) = 159 min, which a 150 cap
+    # does NOT contain: a build that ran to its own bound became a JOB timeout,
+    # which GitHub concludes `cancelled` — and the `if: failure()` expiry
+    # summariser below never runs on a cancel, so the attribution the split
+    # bought was erased one level up. An outer cap must contain the inner
+    # bounds plus their measured overhead, or the inner bounds stop naming
+    # their own expiries.
+    #
+    # 180 = 90 + 20 + 10 (allowance for an `if: failure()` failure-path
+    # classifier with a 600 s budget, proposed in open PRs #1655/#1769) + 49
+    # (measured overhead max) ≈ 169, plus ~10% for overhead growth. The cap
+    # still bounds a genuine hang at 3 h, half GitHub's 360-minute default.
+    # `ci_rust_test_steps_split.rs` pins this cap >= build + run + 50 so a
+    # future change to either step bound has to move this line too.
+    timeout-minutes: 180
 
     steps:
       # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
@@ -1109,6 +1116,18 @@ jobs:
       # from 2 toward cargo's default) is Phase 3 step 2 and waits on a soak
       # window of these readings; tuning first against an unmeasured quantity
       # is how the current value went stale.
+      #
+      # The reading goes to the job LOG as well as the summary (Phase 3 step
+      # 1b). A job summary is exposed by NO API — `gh api .../check-runs/<id>`
+      # returns `output.summary: ""`, the job log carries only the command
+      # text, and the web `summary_raw` URL 404s — so ~1,050 summary-only runs
+      # (2026-09-24..10-07) produced no peak anyone could collect, and the soak
+      # this step exists for could never complete. `tee -a` keeps the summary
+      # and puts every line in the log too; each pagefile also gets one
+      # greppable line,
+      #   MEMPEAK name=<path> alloc_mb=<n> peak_mb=<n> current_mb=<n> free_phys_kb=<n> build=<outcome> run=<outcome>
+      # so the soak is `gh api .../actions/jobs/<id>/logs | grep MEMPEAK`.
+      # A missing reading prints `MEMPEAK unknown=1 ...`, never a zero.
       # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
       # other Windows gate in this file spells it that way (see `Configure
       # pagefile`), and one idiom is one grep.
@@ -1117,6 +1136,11 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          # An outcome that did not resolve is UNKNOWN, never an empty field.
+          BUILD_OUTCOME="${{ steps.build_rust_tests.outcome }}"
+          RUN_OUTCOME="${{ steps.run_rust_tests.outcome }}"
+          BUILD_OUTCOME="${BUILD_OUTCOME:-unknown}"
+          RUN_OUTCOME="${RUN_OUTCOME:-unknown}"
           {
             echo "### Windows memory after the Rust test steps"
             echo
@@ -1128,9 +1152,21 @@ jobs:
             powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Select-Object Name,AllocatedBaseSize,CurrentUsage,PeakUsage | Format-List; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List" || echo "(sampler failed: powershell exited non-zero — this is UNKNOWN, not a zero peak)"
             echo '```'
             echo
-            echo "build step outcome: ${{ steps.build_rust_tests.outcome }} - run step outcome: ${{ steps.run_rust_tests.outcome }}"
+            echo "build step outcome: ${BUILD_OUTCOME} - run step outcome: ${RUN_OUTCOME}"
             echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo
+            echo '```'
+            # One machine-greppable line per pagefile. `tr -d '\r'` because
+            # powershell emits CRLF; an empty capture (no pagefile rows, or
+            # powershell failed) is reported as UNKNOWN, never as a zero peak.
+            mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$os.FreePhysicalMemory }' | tr -d '\r')" || mem=""
+            if [ -n "$mem" ]; then
+              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME}/"
+            else
+              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME}"
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Best-effort, non-gating: pushes this job's per-test outcomes into
       # coord.test_results so coord's already-shipped `flakiness_priors` has a
