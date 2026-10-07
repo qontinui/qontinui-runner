@@ -2561,11 +2561,38 @@ mod file_changes_tests {
         git2::Signature::now("t", "t@example.invalid").expect("signature")
     }
 
-    /// A repository whose initial branch is `main`.
+    /// A repository whose initial branch is `main`, with every config key the
+    /// base-side read consults pinned in the repository's own config.
+    ///
+    /// The production read honours the host's global/system git config, as a
+    /// real checkout would — so without these pins a host default leaks into
+    /// the fixture: GitHub's Windows runners set `core.autocrlf=true`
+    /// globally, which smudges every LF base blob to CRLF against the LF
+    /// files these tests write, and `git init` probes `core.ignorecase` from
+    /// the filesystem (true on Windows/macOS). A global
+    /// `core.attributesFile` (or the XDG `git/attributes` default) could add a
+    /// `text`/`eol` rule the same way, so it is pointed at a file that does not
+    /// exist. Tests exercising a conversion or case-folding set it themselves.
     fn init_repo(dir: &Path) -> git2::Repository {
         let mut opts = git2::RepositoryInitOptions::new();
         opts.initial_head("main");
-        git2::Repository::init_opts(dir, &opts).expect("init")
+        let repo = git2::Repository::init_opts(dir, &opts).expect("init");
+        let mut config = repo.config().expect("config");
+        config
+            .set_str("core.autocrlf", "false")
+            .expect("pin autocrlf");
+        config.set_str("core.eol", "lf").expect("pin eol");
+        config
+            .set_bool("core.ignorecase", false)
+            .expect("pin ignorecase");
+        let no_attributes = repo.path().join("no-host-attributes");
+        config
+            .set_str(
+                "core.attributesFile",
+                no_attributes.to_str().expect("utf-8 path"),
+            )
+            .expect("pin attributesFile");
+        repo
     }
 
     fn write(root: &Path, rel: &str, body: &[u8]) -> String {
