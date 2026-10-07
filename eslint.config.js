@@ -209,6 +209,52 @@ export default [
     },
   },
   {
+    // Output-text boundary — plan
+    // `2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task`.
+    //
+    // These two files turn raw AI and terminal (PTY) output text into findings.
+    // That text is untrusted: any program in any terminal tab can print it, so
+    // parsing it must stay display-only. A `[VERIFICATION:PENDING]` line once
+    // reached disk through `invoke` here and launched an unattended AI task on
+    // the next webview mount. So these files may not import an IPC door, an
+    // HTTP client, or the AI-task launchers.
+    //
+    // `patterns`, not exact `paths` alone: `operatorDoors.ts` is a bare
+    // `invoke`, and `executeAiTask` is reachable through the `hooks` barrel,
+    // so an exact-alias list is bypassable by a relative spelling.
+    // `../findings/FindingsPersistence` stays allowed — it stores display data.
+    // Pinned by src/lib/eslintConfig.findingsBoundary.test.ts.
+    files: ["src/services/FindingsTracker.ts", "src/components/terminal/useTerminalFindings.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "@tauri-apps/api/core",
+              message:
+                "Output-text parsing is display-only: no IPC from FindingsTracker / useTerminalFindings (plan 2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task).",
+            },
+          ],
+          patterns: [
+            {
+              group: [
+                "**/lib/operatorDoors",
+                "**/hooks",
+                "**/hooks/index",
+                "**/hooks/useAiTaskPolling",
+                "**/lib/runner-api",
+                "**/*VerificationService*",
+              ],
+              message:
+                "Output-text parsing is display-only: no operator door, HTTP client or AI-task launcher from FindingsTracker / useTerminalFindings (plan 2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task).",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     // Configuration for browser extension files (service workers)
     files: ["extension/**/*.js"],
     languageOptions: {
