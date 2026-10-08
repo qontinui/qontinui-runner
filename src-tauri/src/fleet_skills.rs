@@ -186,9 +186,10 @@ fn collect_text_files(
 /// propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_skills_into`] and
-/// [`crate::provision_guard`]). **A tracked file outranks a served override**:
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one (then a skill whose
+/// `SKILL.md` exists is kept whole); both are skipped (see
+/// [`provision_fleet_skills_into`] and [`crate::provision_guard`]). **A tracked file outranks a served override**:
 /// the account layer decides what this binary would write, not whether it may
 /// replace a repository's committed content.
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
@@ -305,9 +306,13 @@ fn embedded_skill_file_count() -> usize {
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE for the whole tree, not
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), a skill whose `SKILL.md` already exists is kept WHOLE and every
+/// other skill is written whole, helpers included (see that module's "UNKNOWN inside a
+/// repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE for the whole tree, not
 /// once per file, so this costs one process spawn rather than ~15.
 fn provision_fleet_skills_into(
     skills_dir: &Path,
@@ -388,6 +393,31 @@ fn provision_fleet_skills_into(
             continue;
         }
 
+        // UNKNOWN inside a repository: keep an existing skill WHOLE. Per-file
+        // keeping would write only the files new in this build beside the old
+        // ones and hand the session a skill that disagrees with itself (an old
+        // SKILL.md naming helpers that changed). An absent skill is written.
+        // Keyed on the skill's own SKILL.md, not the bare directory: an empty
+        // or half-written directory (a parent created, then the write failed)
+        // holds no skill a session could be using, so it is provisioned.
+        if tracked.is_unknown_in_repo()
+            && skills_dir
+                .join(skill.dir_name())
+                .join(SKILL_MANIFEST)
+                .exists()
+        {
+            info!(
+                "fleet_skills: keeping skill {:?} as it is on disk — {}",
+                skill.name,
+                capability_manifest::SkipReason::ProbeUnknownInRepo.describe()
+            );
+            out.skip(
+                format!("{}/*", skill.name),
+                capability_manifest::SkipReason::ProbeUnknownInRepo,
+            );
+            continue;
+        }
+
         for (rel_path, text) in &skill.files {
             // `include_dir` and the `files` map share one key space, relative to
             // the skills dir — which is exactly what `TrackedPaths` reports.
@@ -395,17 +425,22 @@ fn provision_fleet_skills_into(
             let dst = skills_dir.join(&relative);
             // Before `create_dir_all`: a skill whose every file is tracked must
             // not leave a new empty directory in the repository's working tree.
-            if tracked.should_skip(&dst, &relative) {
+            // A per-file ProbeUnknownInRepo keep is dropped HERE: the whole-skill
+            // decision above already chose to write this skill (its SKILL.md is
+            // absent), and keeping some of its files would mix builds — exactly
+            // what the whole-skill keep prevents. A GitTracked skip still holds.
+            let reason = match tracked.skip_reason(&dst, &relative) {
+                Some(capability_manifest::SkipReason::ProbeUnknownInRepo) => None,
+                other => other,
+            };
+            if let Some(reason) = reason {
                 info!(
-                    "fleet_skills: skipping {} — it is tracked by the enclosing git \
-                     repository, and overwriting it would silently replace that repo's \
-                     own content and dirty its tree",
-                    dst.display()
+                    "fleet_skills: skipping {} — {}; overwriting it could silently \
+                     replace the enclosing repo's own content and dirty its tree",
+                    dst.display(),
+                    reason.describe()
                 );
-                out.skip(
-                    relative.display().to_string(),
-                    capability_manifest::SkipReason::GitTracked,
-                );
+                out.skip(relative.display().to_string(), reason);
                 continue;
             }
             // Per-FILE IO failures are skips, never `?`. Propagating here would
@@ -576,6 +611,86 @@ mod tests {
         assert_ne!(
             restored, b"CLOBBERED",
             "re-provisioning must overwrite a modified file, not leave it"
+        );
+    }
+
+    /// UNKNOWN inside a repository (a linked-worktree `.git` FILE pointing at a
+    /// gitdir that does not exist, so `git ls-files` fails): a skill whose
+    /// `SKILL.md` already exists is kept WHOLE — none of its files is written, so a session can
+    /// never get an old `SKILL.md` beside new helpers — while skills absent on
+    /// disk are still provisioned. Plan
+    /// `2026-10-04-shared-checkouts-pull-deterministically` Phase 2.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_an_existing_skill_whole() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-test\n",
+        )
+        .unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let kept_dir = skills_dir.join("coord-revive");
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        let manifest = kept_dir.join(SKILL_MANIFEST);
+        std::fs::write(&manifest, b"# an older skill body\n").unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+            .expect("provision");
+
+        assert!(
+            out.skipped.iter().any(|s| s.unit == "coord-revive/*"
+                && s.reason == crate::capability_manifest::SkipReason::ProbeUnknownInRepo),
+            "the existing skill is kept whole, got {:?}",
+            out.skipped
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "# an older skill body\n",
+            "an existing skill file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            std::fs::read_dir(&kept_dir).unwrap().count(),
+            1,
+            "no new file may be written into a kept skill"
+        );
+        assert!(out.written > 0, "absent skills are still provisioned");
+    }
+
+    /// The other half of the per-skill rule: with the probe UNKNOWN inside a
+    /// repository, a skill directory holding a helper but NO `SKILL.md` is not
+    /// kept — it is written whole, the stale helper overwritten, and no
+    /// `ProbeUnknownInRepo` skip is recorded for it.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_writes_a_skill_without_a_manifest_whole() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-test\n",
+        )
+        .unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let dir = skills_dir.join("coord-revive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("coord-revive.sh");
+        std::fs::write(&helper, b"# stale helper\n").unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+            .expect("provision");
+
+        assert!(
+            !out.skipped
+                .iter()
+                .any(|s| s.unit.starts_with("coord-revive")),
+            "a skill with no SKILL.md is written whole, got {:?}",
+            out.skipped
+        );
+        assert!(dir.join(SKILL_MANIFEST).exists(), "its SKILL.md is written");
+        assert_ne!(
+            std::fs::read_to_string(&helper).unwrap(),
+            "# stale helper\n",
+            "the stale helper is overwritten so the skill is one build"
         );
     }
 

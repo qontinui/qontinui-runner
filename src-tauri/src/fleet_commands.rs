@@ -648,9 +648,9 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// broken cache each degrade one step and warn, never propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_commands_into`] and
-/// [`crate::provision_guard`]).
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one; both are skipped (see
+/// [`provision_fleet_commands_into`] and [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
@@ -720,9 +720,12 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE per pass, not once per
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), only ABSENT files are written and existing ones are kept
+/// (see that module's "UNKNOWN inside a repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE per pass, not once per
 /// file, so this costs one process spawn rather than seven.
 fn provision_fleet_commands_into(
     commands_dir: &Path,
@@ -744,14 +747,14 @@ fn provision_fleet_commands_into(
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
-        if tracked.should_skip(&dst, Path::new(&file_name)) {
+        if let Some(reason) = tracked.skip_reason(&dst, Path::new(&file_name)) {
             info!(
-                "fleet_commands: skipping {} — it is tracked by the enclosing git \
-                 repository, and overwriting it would silently replace that repo's \
-                 own content and dirty its tree",
-                dst.display()
+                "fleet_commands: skipping {} — {}; overwriting it could silently \
+                 replace the enclosing repo's own content and dirty its tree",
+                dst.display(),
+                reason.describe()
             );
-            out.skip(file_name, capability_manifest::SkipReason::GitTracked);
+            out.skip(file_name, reason);
             continue;
         }
         // The write below is still unconditional — this reads the OUTGOING file
@@ -961,6 +964,51 @@ mod tests {
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
             "a tracked destination must keep the repo's content, not the embedded copy"
+        );
+    }
+
+    /// Entering where a spawn enters: inside a repository whose git cannot be
+    /// asked (a linked-worktree `.git` FILE pointing at a gitdir that does not
+    /// exist), an EXISTING command file is kept with
+    /// [`SkipReason::ProbeUnknownInRepo`] and every absent one is still written.
+    /// Before plan `2026-10-04-shared-checkouts-pull-deterministically` Phase 2
+    /// the failed probe read "nothing tracked" and the existing file was
+    /// overwritten.
+    ///
+    /// [`SkipReason::ProbeUnknownInRepo`]: crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_existing_commands() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-commands-test\n",
+        )
+        .unwrap();
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+
+        let (existing_name, _) = FLEET_COMMANDS[0];
+        let existing = commands_dir.join(format!("{existing_name}.md"));
+        std::fs::write(&existing, b"# a body git could not vouch for\n").unwrap();
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped.len(), 1, "only the existing file is kept");
+        assert_eq!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "# a body git could not vouch for\n",
+            "an existing file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            out.written,
+            FLEET_COMMANDS.len() - 1,
+            "every absent command is still written"
         );
     }
 
