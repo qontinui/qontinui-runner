@@ -7750,8 +7750,9 @@ async fn coord_mcp_proxy_handler(
 /// settled answer is returned as is; a transient unknown is returned at once
 /// and, once its retry window has passed, retried in a background task — a
 /// retry never delays a `tools/call`. A key with no live
-/// binding — a superseded key inside its grace window — carries no
-/// expectation, which is UNKNOWN and said, never agreement.
+/// binding and no grace entry carries no expectation, which is UNKNOWN and
+/// said, never agreement. A superseded key inside its grace window shares its
+/// evicted binding's expectation.
 async fn coord_mcp_apply_tenant_verdict(
     nonce: Option<&str>,
     request: &[u8],
@@ -7771,8 +7772,8 @@ async fn coord_mcp_apply_tenant_verdict(
             ),
             None => (
                 qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
-                    "this proxy key has no live binding to carry an expectation \
-                     (a superseded key inside its grace window)",
+                    "this proxy key has no live binding or grace entry to carry an \
+                     expectation",
                 ),
                 None,
             ),
