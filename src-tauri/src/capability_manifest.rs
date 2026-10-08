@@ -972,7 +972,9 @@ pub enum SkipReason {
     /// missing, failed or timed out), and the destination sits inside a git
     /// repository — so it was kept rather than overwritten, since nothing could
     /// say it is safe to replace. See [`crate::provision_guard`]'s "UNKNOWN
-    /// inside a repository" section. Absent destinations are still written.
+    /// inside a repository" section. Absent destinations are still written, and
+    /// `fleet_skills` applies it per skill (a skill without `SKILL.md` is
+    /// written whole, so this reason never lands on one of its files).
     ProbeUnknownInRepo,
     /// The write itself failed. Fail-soft: the pass continues and the spawn
     /// proceeds; the session simply lacks this unit.

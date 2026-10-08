@@ -77,7 +77,8 @@
 //!   never a second git spawn, so it cannot itself fail or hang. It is a
 //!   heuristic: a `.git` that is not a usable repository still counts, which
 //!   errs toward not overwriting.
-//! - **The cost, stated:** in that arm an existing but STALE untracked file is
+//! - **The cost, stated (`fleet_commands`; skills are below):** in that arm an
+//!   existing but STALE untracked file is
 //!   not refreshed — the session gets the copy already on disk rather than the
 //!   binary's. Missing files are still written, so no session loses a command
 //!   it would otherwise have had, and the spawn still never aborts.
@@ -148,8 +149,9 @@ impl TrackedPaths {
     ///
     /// Returns an EMPTY set on every failure — see the module doc's fail-soft
     /// contract — and, when that failure happened inside a repository, marks
-    /// the result UNKNOWN-in-repo so [`Self::should_skip`] protects existing
-    /// files. This function never panics and never propagates.
+    /// the result UNKNOWN-in-repo so [`Self::should_skip`] reports existing
+    /// files as keepable (each provisioner decides how it uses that — see the
+    /// module doc). This function never panics and never propagates.
     pub(crate) fn probe(root: &Path) -> Self {
         if !root.is_dir() {
             return Self::default();
@@ -161,7 +163,7 @@ impl TrackedPaths {
                 unknown_in_repo,
                 "provision guard: tracked-file probe did not answer (git missing, failed or timed out); {}",
                 if unknown_in_repo {
-                    "root is inside a repository, so only ABSENT destinations will be written"
+                    "root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
                 } else {
                     "root is not inside a repository, so destinations are written as before"
                 }
