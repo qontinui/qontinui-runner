@@ -559,6 +559,13 @@ fn write_vocabulary() -> Value {
 /// [`write_correction`] is dropped in one place when that PR is deployed.
 const EDGE_CORRECTION_WEB_PR: &str = "qontinui-web PR #1459";
 
+/// The qontinui-web PR that adds the upstream soft-delete route
+/// `DELETE /plan-library/artifacts/{id}` forwards to
+/// (`DELETE /api/v1/plan-library/{id}`). Named ONCE, like
+/// [`EDGE_CORRECTION_WEB_PR`], so the caveat in [`write_correction`] is dropped
+/// in one place when that PR is deployed.
+const ARTIFACT_ARCHIVE_WEB_PR: &str = "qontinui-web PR #1545";
+
 /// `writeCorrection`: per write door, how a WRONG durable write is corrected,
 /// in plan `2026-09-20-nothing-checks-that-an-agent-writable-evidence-store-ships-its-vocabulary-and-a-correction-verb`'s
 /// posture arms (`Verb` / `SupersedeArg` / `AppendOnlyByDesign` / `Gap`).
@@ -576,16 +583,27 @@ fn write_correction() -> Value {
          correction: it asserts that one \
          artifact REPLACES another (a newer version of the same thing)."
     );
-    let artifacts = "AppendOnlyByDesign for content: re-POST the same (kind, slug, source_repo) \
-         to replace metadata and append a body version. Gap for a wrong `kind`: `kind` is part of \
-         the row's identity and the kind-override route is operator-only by design, so the \
-         correction is to soft-delete the mis-kinded agent-written row and re-upsert under the \
-         right kind. That needs BOTH the web soft-delete, pending qontinui-web #1545 (plan \
-         2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent), AND a loopback \
-         soft-delete forwarder, which this door does not have yet (it serves no artifact DELETE). \
-         Until both exist, a wrong `kind` is PERMANENT through this door. `writeVocabulary.kind` \
-         only rules out an INVALID kind; a valid-but-wrong kind is the permanent case, so choose \
-         it deliberately.";
+    let artifacts = format!(
+        "AppendOnlyByDesign for content: re-POST the same (kind, slug, source_repo) \
+         to replace metadata and append a body version. Gap until the web backend carries \
+         artifact soft-delete, then Verb for a wrong `kind`: `kind` is part of the row's \
+         identity and the kind-override route is operator-only by design, so the correction is, \
+         in THIS order: (1) re-upsert under the right kind FIRST — POST /plan-library/artifacts \
+         with the same slug and source_repo; (2) re-point every edge INTO the wrong-kind row at \
+         the new one with PUT /plan-library/links/{{id}} (or retract it with \
+         DELETE /plan-library/links/{{id}}); (3) soft-delete the wrong-kind row with \
+         DELETE /plan-library/artifacts/{{id}} (body {{\"reason\", \"session_id\"?}}, a \
+         non-empty `reason`). The order is enforced upstream, not advice: archiving first is \
+         refused 409 `file_backed` / `file_backing_unknown` for a scanned row (only a live \
+         sibling of the right kind exempts the wrong-kind duplicate) and 409 `inbound_edges` \
+         while edges still point at it. The DELETE forwards to \
+         DELETE /api/v1/plan-library/{{id}}, which exists only on OPEN {ARTIFACT_ARCHIVE_WEB_PR} \
+         (plan 2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent). Until a backend \
+         carrying it is deployed, the soft-delete answers 405 Method Not Allowed: step (1) still \
+         lands, but the wrong-kind row stays live beside the right one — a kind fork — and is \
+         PERMANENT through this door. `writeVocabulary.kind` only rules out an INVALID kind; a \
+         valid-but-wrong kind is the case this correction exists for, so choose it deliberately."
+    );
     serde_json::json!({
         "/plan-library/links": links,
         "/plan-library/artifacts": artifacts,
@@ -640,9 +658,12 @@ by-id read still returns it. The forwarded reason (on this and on the edge retra
 carries this door's principal and the optional `session_id` label, and a reason that \
 exceeds 2000 characters once that attribution is appended is refused with a 400 — \
 shorten the reason or the label. Upstream refuses with 409 while a scanned FILE still backs the row \
-(`file_backed`, or `file_backing_unknown` when the scan census is withheld — delete the file \
-first, or the next scan resurrects the row) and while live inbound edges point at it \
-(`inbound_edges` — retract them first through `DELETE /plan-library/links/{id}`). \
+(`file_backed`, or `file_backing_unknown` when the scan census is withheld — to retire the \
+artifact delete the file first, or the next scan resurrects the row; to correct a wrong \
+`kind`, upsert the right kind first, which exempts the wrong-kind duplicate — see \
+`writeCorrection`) and while live inbound edges point at it (`inbound_edges` — retract them \
+through `DELETE /plan-library/links/{id}` or re-point them with `PUT /plan-library/links/{id}` \
+first). \
 Archiving an already-archived row is idempotent; verify by read. \
 POST /plan-library/artifacts identity is (organization, kind, slug, source_repo) — \
 `source_repo` is part of the key, so omitting it does NOT update an artifact that has \
@@ -3243,17 +3264,47 @@ mod tests {
             let artifacts = correction["/plan-library/artifacts"].as_str().unwrap();
             for claim in [
                 "soft-delete",
-                "re-upsert",
+                "re-upsert under the right kind FIRST",
+                "PUT /plan-library/links/{id}",
+                "DELETE /plan-library/artifacts/{id}",
+                "DELETE /api/v1/plan-library/{id}",
                 "#1545",
-                "loopback",
-                "forwarder",
+                "405",
                 "PERMANENT",
+                "`inbound_edges`",
+                "`file_backed`",
                 "valid-but-wrong",
                 "2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent",
             ] {
                 assert!(
                     artifacts.contains(claim),
                     "artifacts correction omits `{claim}`: {artifacts}"
+                );
+            }
+            // The sentence names a verb on THIS door, so the door must serve it
+            // as a nonce-gated write — and must no longer deny serving it.
+            assert!(
+                route_entries().contains(&("DELETE", "/plan-library/artifacts/{id}", true)),
+                "writeCorrection names an artifact DELETE this door does not register"
+            );
+            let upsert = artifacts
+                .find("re-upsert under the right kind FIRST")
+                .expect("upsert step");
+            let archive = artifacts
+                .find("soft-delete the wrong-kind row")
+                .expect("archive step");
+            assert!(
+                upsert < archive,
+                "upstream refuses archive-first, so the sentence must order upsert before archive: {artifacts}"
+            );
+            for stale in [
+                "does not have yet",
+                "serves no artifact DELETE",
+                "forwarder",
+            ] {
+                assert!(
+                    !artifacts.contains(stale),
+                    "artifacts correction still denies the soft-delete verb (`{stale}`): {artifacts}"
                 );
             }
         }
