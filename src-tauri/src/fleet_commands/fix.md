@@ -141,23 +141,21 @@ SKIP_WEB_SERVER=1 npx playwright test <test-file> --project=chromium
 
 ### Step 7: Restart Server (if needed)
 
-Use the restart-services.sh script for reliable restarts:
+Restart your project's affected services the way your project documents
+(its `CLAUDE.md`, `README`, dev script or process manager) — the frontend with
+a build-cache clean if the change touched build output, the backend, or all of
+them. Restart only the services your change affects.
 
-```bash
-BASE="$PWD"
-
-# Restart frontend (with cache clean)
-"$BASE/qontinui-claude-config/scripts/restart-services.sh" frontend clean
-
-# Restart backend
-"$BASE/qontinui-claude-config/scripts/restart-services.sh" backend
-
-# Restart all web services
-"$BASE/qontinui-claude-config/scripts/restart-services.sh" all
-
-# Restart runner (if Python code changed)
-powershell.exe -Command "Stop-Process -Name qontinui-runner -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; cd '$PWD\qontinui-runner'; Start-Process -FilePath 'npm.cmd' -ArgumentList 'run','tauri','dev' -WindowStyle Normal"
-```
+Never stop or restart a process that hosts live agent sessions — the Qontinui
+runner above all, which may be hosting this very session. If the fix touched
+runner code, either the user restarts the runner (do not restart it yourself),
+or you verify on a secondary instance: `POST http://127.0.0.1:9876/instances/spawn`
+with `{"name":"<label>"}` (the port is auto-allocated unless you pass `"port"`;
+the response's `data.port` is the one to test against), or Settings > Runner
+Instances. A spawned secondary always launches the running primary's own
+executable, never a rebuilt one, so it verifies Python and config changes only.
+A change to the runner's own Rust or frontend code is verified only by the user
+running the rebuilt runner (the user-restart route).
 
 ### Step 8: Re-run Test
 ```bash

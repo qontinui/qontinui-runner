@@ -1,5 +1,5 @@
 ---
-description: One transport-agnostic read-only door to list or fetch coord prompt documents (the fleet policies) — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), the generic remote MCP door (POST /mcp, device JWT), or the device-authed HTTP agent routes, with the local steering cache as the last rung for the six intent kinds and the qontinui-dev-notes policy mirrors as the last rung for `policy` (both disclosed; `mirrors` reports the mirrors' drift) — so you never touch ports, nonces, or proxies. Use it whenever coord_list_prompt_documents is not a visible tool.
+description: One transport-agnostic read-only door to list or fetch coord prompt documents (the fleet policies) — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), the generic remote MCP door (POST /mcp, device JWT), or the device-authed HTTP agent routes, with the local steering cache as the last rung for the six intent kinds and the checked-out policy mirrors as the last rung for `policy` (both disclosed; `mirrors` reports the mirrors' drift) — so you never touch ports, nonces, or proxies. Use it whenever coord_list_prompt_documents is not a visible tool.
 argument-hint: "list | get <kind> <name> | mirrors"
 allowed-tools: Read, Bash, PowerShell, Glob, Grep, ToolSearch
 ---
@@ -128,8 +128,8 @@ Candidate order (cwd → repo root → siblings):
 
 ```bash
 COORD_RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-# Workspace root = the directory containing the repo checkouts. $QONTINUI_ROOT
-# overrides; otherwise the parent of the MAIN checkout via `--git-common-dir`;
+# Workspace root = the directory containing your repo checkouts. $WORKSPACE_ROOT,
+# else the runner's $QONTINUI_ROOT, overrides; otherwise the parent of the MAIN checkout via `--git-common-dir`;
 # from a non-git cwd (e.g. the workspace root itself) fall back to $PWD.
 #
 # NOT `--show-toplevel`: inside a LINKED GIT WORKTREE that returns the worktree
@@ -139,7 +139,7 @@ COORD_RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 # real root. Sessions run under QONTINUI_AGENT_WORKTREE_MODE=1, so this is the
 # common path, not an edge case. `--git-common-dir` resolves to the MAIN repo's
 # .git from a worktree and the canonical checkout alike.
-ROOT="${QONTINUI_ROOT:-}"
+ROOT="${WORKSPACE_ROOT:-${QONTINUI_ROOT:-}}"
 if [ -z "$ROOT" ]; then
   GC="$(git rev-parse --git-common-dir 2>/dev/null)"
   [ -n "$GC" ] && GC="$(cd "$GC" 2>/dev/null && pwd)"
@@ -491,12 +491,17 @@ deployment predates it. Only a curl that fails to **connect** leaves the
 deployment in question, and then the verdict is **UNKNOWN**, never "coord is
 down". Whatever you conclude, name both probes in the rung-3 line of your
 report — and never let a rung-3 failure be reported as a policy answer. The
-stamped form of that line is `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim`:
+stamped form of that line is `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim`:
 it runs this same probe as one door of its cascade and prints a `FLOOR-CLAIM:`
 block (probe time, runner build, this box's load, one line per door) — paste
 that block; a `verdict=UNKNOWN` there (sampled under own load) means the
 rung-3 line is UNKNOWN, and "coord is down" is written from a `verdict=FLOOR`
-block or not at all.
+block or not at all. `<session-workdir>` is the coord-revive skill directory's root: the session
+workdir the runner provisioned the skill into, else — for a hand-started session
+whose cwd carries no copy, as most agent worktrees do not — a checked-out copy
+of your deployment's agent config. Substitute it; an unsubstituted
+`<session-workdir>` produces `No such file or directory`, which is a paste
+error, not a missing door.
 
 ### Step 4 — Direct device-authed HTTP, hand-written routes (probe: the GET itself)
 
@@ -583,7 +588,7 @@ pass a tenant argument.
 #### Step 4b — the bootstrap credential: LIVE on this tenant (re-measured 2026-09-10)
 
 **This rung works. Try it before falling through to the mirrors.** Measured
-against production coord on 2026-09-04 from `merytshost` and **re-measured
+against production coord on 2026-09-04 from a Linux fleet box and **re-measured
 2026-09-10**: the anonymous `POST $COORD_HTTP_URL/agents/credential` answered
 **`200`** with `{token, token_exp, token_jti}`, and that bearer read
 `GET $COORD_HTTP_URL/coord/agent-prompt-documents` and one policy document at
@@ -707,7 +712,9 @@ building, only how it must behave. Plan
 `2026-09-02-steering-layers-unreadable-without-a-credential` Phase 1f adds the
 local **steering cache** — rendered detached at every SessionStart by
 `.claude/hooks/render-steering-cache.sh` → `scripts/render-steering-cache.ps1`,
-in `$QONTINUI_STEERING_CACHE_DIR` (default `C:/claude/steering-cache`) — and
+in `$QONTINUI_STEERING_CACHE_DIR` (unset: the platform default the one cache-dir
+resolver `scripts/lib/resolve-powershell.sh` exports, and where that resolver is
+absent, `${XDG_CACHE_HOME:-~/.cache}/qontinui/steering-cache`) — and
 this rung reads it. **For the six intent kinds only.** A `get` for `policy` or
 any other kind skips this rung and falls to Step 5 unchanged.
 
@@ -716,7 +723,12 @@ a cache is as old as its Rendered stamp, **stale or absent is UNKNOWN, never
 empty**, and every answer served from here says so:
 
 ```bash
-STEERING="${QONTINUI_STEERING_CACHE_DIR:-C:/claude/steering-cache}"
+# The directory the renderer writes: the variable, else the ONE resolver's
+# platform default (sourced best-effort; $ROOT as in Step 2), else XDG.
+if [ -z "${QONTINUI_STEERING_CACHE_DIR:-}" ]; then
+  . "$ROOT/qontinui-claude-config/scripts/lib/resolve-powershell.sh" 2>/dev/null || true
+fi
+STEERING="${QONTINUI_STEERING_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/qontinui/steering-cache}"
 # Absent is a rung-4c FAILURE, not an empty corpus. Say which.
 if [ ! -f "$STEERING/STEERING-CACHE.json" ]; then
   echo "rung 4c UNAVAILABLE: no steering cache at $STEERING (never rendered on this box, or a different QONTINUI_STEERING_CACHE_DIR) - UNKNOWN, not 'no intent documents'" >&2
@@ -787,8 +799,9 @@ Rules for this rung, in addition to Step 5's:
 Only when rungs 1–4 **all** fail — **Step 4b included**, since a live read beats
 an unverifiable mirror and 4b is the one rung a dead runner cannot take down —
 and, for the six intent kinds, after Step 4c — read the mirrors at
-`$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0/*.md` (derive `$ROOT`
-exactly as the Step-2 block does). This rung is not an invention:
+`<mirror-repo>/prompts/policy-bodies-phase0/*.md` — `<mirror-repo>` is
+`$POLICY_MIRROR_REPO` when set, else the first checkout under `$ROOT` that
+carries that directory (derive `$ROOT` exactly as the Step-2 block does). This rung is not an invention:
 `policy/session-protocol` blesses exactly this fallback — with a **mandatory
 staleness disclosure**.
 
@@ -927,15 +940,30 @@ rung-5 response**, not once at the top:
   cache, the file mirrors — and say which you never asked.
 
 ```bash
-MIRRORS="$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0"
-DN="$ROOT/qontinui-dev-notes"
+# The mirror repo: $POLICY_MIRROR_REPO, else the first PRIMARY checkout under
+# $ROOT (byte-sorted, so the pick does not depend on locale) whose tree carries
+# prompts/policy-bodies-phase0. A LINKED worktree is skipped: its --git-dir is
+# not its --git-common-dir, and it may be parked on a stale branch. Not found
+# leaves DN empty, and the absence guard below reports it.
+DN="${POLICY_MIRROR_REPO:-}"
+if [ -z "$DN" ]; then
+  while IFS= read -r d; do
+    [ -d "$d/prompts/policy-bodies-phase0" ] || continue
+    gd=$(cd "$d" 2>/dev/null && git rev-parse --absolute-git-dir 2>/dev/null) || continue
+    gc=$(cd "$d" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || continue
+    gdp=$(cd "$gd" 2>/dev/null && pwd -P) || continue
+    [ "$gdp" = "$gc" ] || continue   # [unconditional-verdict-lint: allow -- both operands were assigned under `|| continue`, so a failed probe skips the candidate rather than reaching this compare]
+    DN="$d"; break
+  done < <(for d in "$ROOT"/*/; do printf "%s\n" "${d%/}"; done | LC_ALL=C sort)
+fi
+MIRRORS="$DN/prompts/policy-bodies-phase0"
 
 # The directory ABSENT is a rung-5 failure, not "a mirror set of size zero".
 # Without this guard the count below prints 0 and reads as "there are no
 # mirrors" — absence reported as emptiness, the exact thing this rung is
 # supposed to be honest about.
 if [ ! -d "$MIRRORS" ]; then
-  echo "rung 5 UNAVAILABLE: no mirror directory at $MIRRORS (no qontinui-dev-notes checkout?)" >&2
+  echo "rung 5 UNAVAILABLE: no mirror directory at $MIRRORS (no checkout under $ROOT carries prompts/policy-bodies-phase0, and POLICY_MIRROR_REPO is unset)" >&2
   echo "this is a LOCAL fault — report it as such, never as 'no policy found'" >&2
   exit 1
 fi
@@ -945,7 +973,7 @@ fi
 # There is a second axis, and it is the one that actually bit: the path above
 # is a plain filesystem read of the WORKING TREE, so it serves whatever branch
 # this shared checkout happens to be parked on. Measured 2026-08-31 on
-# merytshost: dev-notes sat on a peer's branch 466 commits behind origin/main,
+# a fleet box: the mirror checkout sat on a peer's branch 466 commits behind origin/main,
 # and rung 5 served verification-and-evidence v2 while BOTH origin/main and the
 # served store were at v7. Nothing warned — the version stamp is honest about
 # the mirror it came from and says nothing about which COMMIT that mirror is,
@@ -1170,7 +1198,8 @@ Rules for this path:
   count rule above governs here too.) Before reporting drift, call
   **`coord_recent_findings`** with `topic: "policy-mirrors"`, or with
   `resource_keys` naming the mirror paths
-  (`qontinui-dev-notes/prompts/policy-bodies-phase0/<name>.md`). Findings are
+  (`<mirror-repo>/prompts/policy-bodies-phase0/<name>.md`, with the mirror
+  checkout's directory name as `<mirror-repo>`). Findings are
   pull-by-relevance — nothing pushes one at you, so a session that never asks is
   told nothing, and a peer's correction from yesterday is invisible while you
   re-derive it. The HTTP twin, for a masked tool or a dead transport, is `GET
@@ -1184,7 +1213,7 @@ Rules for this path:
 
 ### Honest failure (never a silent no-op)
 
-If all rungs fail (mirrors absent too — e.g. no `qontinui-dev-notes`
+If all rungs fail (mirrors absent too — e.g. no policy-mirror
 checkout), **do not pretend**. Report exactly which link failed at each rung:
 native tools not visible; per-candidate `.mcp.json` probe results (file → HTTP
 code, or "no `.mcp.json` readable anywhere"); the remote MCP door's status
@@ -1242,8 +1271,8 @@ of what you observed, not as a conclusion about coord now, and if line 2's
 evidence. Its **absence** is UNKNOWN too, not health: a healthy provision writes
 nothing either, and the runner writes into the workdir IT provisioned, which
 from a linked worktree is often the primary checkout. Reason table, the stamp
-and the freshness rule:
-`qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`.
+and the freshness rule: your deployment's coord gates-and-access reference,
+where it ships one.
 
 ---
 
@@ -1279,17 +1308,19 @@ exist" are searches, and a cascade of probes is a sample:
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run
-> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
-> — spelled absolutely, because a bare `scripts/...` resolves only from a
-> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> that a capability is ABSENT, run the route census,
+> `coord-route-census.sh <fragment>`, from wherever your deployment installs
+> it — spelled by its absolute path, because a bare relative path resolves
+> only from the checkout that ships it, and a session standing anywhere else
 > gets exit 127
 > (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
 > a working tree and never a live host) — and paste its trailer verbatim
 > beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under `CENSUS_TRAILER_RE` in
-> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+> Where no census tool is reachable at all, the negative cannot be settled and
+> is UNVERIFIED.
+> A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
 > `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
 > trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
