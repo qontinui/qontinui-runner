@@ -1,4 +1,4 @@
-//! `POST /control/sessions/resume {ids?, generation?}` — the runner's own door
+//! `POST /control/sessions/resume {ids | all: true, generation?}` — the runner's own door
 //! for re-launching CLOSED sessions on THIS device.
 //!
 //! Plan `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
@@ -13,8 +13,30 @@
 //! It is a backend route, deliberately independent of any mounted React
 //! frontend (an HTTP door must work on a headless runner).
 //!
+//! ## It is a credential door
+//!
+//! The route spawns `claude` processes with the user's account on the user's
+//! behalf, so it is on `origin_guard::CREDENTIAL_DOORS`: a browser origin the
+//! guard does not trust never reaches it. Inside the handler the request must
+//! also be unambiguous — a JSON body naming non-empty `ids`, or the explicit
+//! flag `all: true`. An empty or bare body is a 400, never "everything", and a
+//! non-JSON content type is a 415, so a cross-site form POST (which can send
+//! neither) cannot trigger a fleet-wide resume.
+//!
+//! ## Why a call cannot double-spawn
+//!
+//! Three independent guards sit between a request and a spawn: a per-session
+//! in-flight set (two concurrent calls naming one id: the second is
+//! `skipped(in_flight)`), a process-table read that refuses an id some live
+//! `claude` already holds (`skipped(live_process)`), and the batch itself runs
+//! in a DETACHED task, so a caller that disconnects mid-batch neither cancels
+//! the remaining ids nor leaves a half-verified spawn behind — every id still
+//! gets its verdict, in the log if nobody is waiting for the response.
+//!
 //! ## Per-id flow ([`resume_one`])
 //!
+//! 0. no other call is already resuming the id, and no live `claude` process
+//!    already holds it ([`InFlight`], [`live_holder`]);
 //! 1. the id is well-formed, has a lifecycle row, the row is `closed`, not
 //!    marked finished, owned by the claude provider, with a known config dir and
 //!    a cwd that still exists;
@@ -81,11 +103,17 @@ pub fn routes() -> Router<Arc<ApiState>> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeRequest {
-    /// Claude session ids to resume. Absent = every closed, unfinished claude
-    /// session this device's lifecycle store holds.
+    /// Claude session ids to resume. Must be non-empty when present; exclusive
+    /// with `all`.
     #[serde(default)]
     pub ids: Option<Vec<String>>,
+    /// Explicitly resume every closed, unfinished claude session this
+    /// device's lifecycle store holds. Without it (or `ids`) the request is
+    /// refused: an empty body must never mean "all".
+    #[serde(default)]
+    pub all: Option<bool>,
     /// The rebuild plan's ledger generation. Accepted and echoed; see the
     /// module docs.
     #[serde(default)]
@@ -223,18 +251,41 @@ fn classify(id: &str, rec: Option<&TerminalSessionRecord>) -> Result<Candidate, 
     })
 }
 
+/// What a request asked for, once validated.
+#[derive(Debug, PartialEq, Eq)]
+enum Scope {
+    Ids(Vec<String>),
+    All,
+}
+
+impl ResumeRequest {
+    /// An explicit scope or an error — never a default of "everything".
+    fn scope(&self) -> Result<Scope, String> {
+        let all = self.all == Some(true);
+        match (&self.ids, all) {
+            (Some(_), true) => Err("`ids` and `all: true` are mutually exclusive".to_string()),
+            (Some(ids), false) if ids.iter().all(|i| i.trim().is_empty()) => {
+                Err("`ids` is empty — name at least one id, or send `all: true`".to_string())
+            }
+            (Some(ids), false) => Ok(Scope::Ids(ids.clone())),
+            (None, true) => Ok(Scope::All),
+            (None, false) => Err("body must name non-empty `ids` or `all: true`".to_string()),
+        }
+    }
+}
+
 /// The ids this call acts on: the caller's, de-duplicated in order, or every
-/// closed unfinished claude row when none were given.
-fn select_ids(req: &ResumeRequest, all: &[TerminalSessionRecord]) -> Vec<String> {
-    match &req.ids {
-        Some(ids) => {
+/// closed unfinished claude row for [`Scope::All`].
+fn select_ids(scope: &Scope, all: &[TerminalSessionRecord]) -> Vec<String> {
+    match scope {
+        Scope::Ids(ids) => {
             let mut seen = std::collections::HashSet::new();
             ids.iter()
                 .map(|i| i.trim().to_string())
-                .filter(|i| seen.insert(i.clone()))
+                .filter(|i| !i.is_empty() && seen.insert(i.clone()))
                 .collect()
         }
-        None => {
+        Scope::All => {
             let mut rows: Vec<&TerminalSessionRecord> = all
                 .iter()
                 .filter(|r| {
@@ -322,17 +373,25 @@ fn judge(
 }
 
 /// Path equality tolerant of trailing separators, `\` vs `/`, and symlinks
-/// where both sides resolve.
+/// where both sides resolve. Case-insensitive only where the filesystem is
+/// (Windows, macOS): on Linux `/Work` and `/work` are different directories,
+/// and calling them equal would pass a resume pinned to the wrong tree.
 fn same_path(a: &str, b: &str) -> bool {
-    fn norm(s: &str) -> String {
+    same_path_with(a, b, cfg!(any(windows, target_os = "macos")))
+}
+
+fn same_path_with(a: &str, b: &str, case_insensitive: bool) -> bool {
+    let norm = |s: &str| {
         let canon = std::fs::canonicalize(s)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| s.to_string());
-        canon
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-    }
+        let canon = canon.replace('\\', "/").trim_end_matches('/').to_string();
+        if case_insensitive {
+            canon.to_lowercase()
+        } else {
+            canon
+        }
+    };
     norm(a) == norm(b)
 }
 
@@ -351,6 +410,70 @@ fn config_dir_of_pid(pid: u32) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn config_dir_of_pid(_pid: u32) -> Option<String> {
     None
+}
+
+// ---------------------------------------------------------------------------
+// Double-spawn guards
+// ---------------------------------------------------------------------------
+
+/// Session ids a call is resuming RIGHT NOW. Process-wide: two concurrent
+/// requests naming one id would otherwise each pass the (read-only)
+/// preconditions and each spawn.
+static IN_FLIGHT: std::sync::Mutex<std::collections::HashSet<String>> =
+    std::sync::Mutex::new(std::collections::HashSet::new());
+
+/// RAII claim on one id in [`IN_FLIGHT`]; released on drop, including on a
+/// panic or a cancelled future.
+struct InFlight(String);
+
+impl InFlight {
+    /// `None` when another call already holds `id`.
+    fn claim(id: &str) -> Option<Self> {
+        let mut g = IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.insert(id.to_string()).then(|| Self(id.to_string()))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Pure: the pid of a `claude` among `procs` (`(pid, cmdline)`) that is
+/// already running session `id`.
+fn holder_of(procs: &[(u32, String)], id: &str) -> Option<u32> {
+    procs.iter().find_map(|(pid, cmd)| {
+        (crate::process_capture::process_tree::parse_session_id_from_cmdline(cmd).as_deref()
+            == Some(id))
+        .then_some(*pid)
+    })
+}
+
+/// Is any live `claude` on this machine already running session `id`
+/// (`--resume <id>` or `--session-id <id>`)? `Err` when the process table
+/// could not be read — which must NOT read as "nobody holds it": a resume of a
+/// live session is a second process writing one transcript.
+async fn live_holder(id: &str) -> Result<Option<u32>, String> {
+    use crate::process_capture::process_tree as pt;
+    let snap = pt::snapshot_process_table_public().await;
+    if snap.names.is_empty() {
+        return Err("process_table_unreadable".to_string());
+    }
+    let pids: Vec<u32> = snap
+        .names
+        .keys()
+        .copied()
+        .filter(|p| pt::is_countable_claude(*p, &snap))
+        .collect();
+    let cmdlines = pt::command_lines_for_pids(&pids).await;
+    let procs: Vec<(u32, String)> = cmdlines.into_iter().collect();
+    Ok(holder_of(&procs, id))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +539,17 @@ async fn resume_one(
     registry: &Arc<SessionRegistry>,
     cand: Candidate,
 ) -> ResumeRow {
+    // One call per id at a time, held through spawn AND verify.
+    let Some(_in_flight) = InFlight::claim(&cand.id) else {
+        return ResumeRow::skipped(&cand.id, "in_flight");
+    };
+    // A live claude already running this id: resuming would be a second
+    // process on one transcript.
+    match live_holder(&cand.id).await {
+        Ok(None) => {}
+        Ok(Some(pid)) => return ResumeRow::skipped(&cand.id, format!("live_process(pid {pid})")),
+        Err(why) => return ResumeRow::skipped(&cand.id, why),
+    }
     // The transcript, local — a missing one must never become `--resume` of
     // nothing.
     let transcript = crate::terminal::transcript::session_transcript_path(
@@ -515,30 +649,79 @@ fn tally(generation: Option<String>, requested: usize, results: Vec<ResumeRow>) 
     }
 }
 
+/// Run the batch to completion, one id at a time. Spawned DETACHED by the
+/// handler: it owns everything it needs and is not tied to the request future.
+async fn run_batch(
+    app: tauri::AppHandle,
+    tm: Arc<TerminalManager>,
+    registry: Arc<SessionRegistry>,
+    store: Arc<SessionLifecycleStore>,
+    ids: Vec<String>,
+) -> Vec<ResumeRow> {
+    let mut results = Vec::new();
+    for id in &ids {
+        let row = match classify(id, store.get(id).as_ref()) {
+            Err(why) => ResumeRow::skipped(id, why),
+            Ok(cand) => resume_one(&app, &tm, &registry, cand).await,
+        };
+        info!(id = %row.id, verdict = %row.verdict, "resume_door: verdict");
+        results.push(row);
+    }
+    results
+}
+
+/// `true` when the `Content-Type` header names JSON (`application/json`, with
+/// or without parameters, any case, or a `+json` suffix type).
+fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let essence = v
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            essence == "application/json" || essence.ends_with("+json")
+        })
+        .unwrap_or(false)
+}
+
 async fn post_sessions_resume(
     State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Json<ApiResponse<ResumeReport>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
     use axum::http::StatusCode;
     use tauri::Manager;
 
-    let req: ResumeRequest = if body.iter().all(u8::is_ascii_whitespace) {
-        ResumeRequest::default()
-    } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
-                    "body must be {{ids?, generation?}}: {e}"
-                ))),
-            )
-        })?
-    };
-    if req.ids.as_ref().is_some_and(|i| i.len() > MAX_IDS) {
+    if !is_json_content_type(&headers) {
         return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!("at most {MAX_IDS} ids per call"))),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(api_error(
+                "Content-Type must be application/json — NOTHING was resumed".to_string(),
+            )),
         ));
+    }
+    let req: ResumeRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "body must be {{ids | all: true, generation?}}: {e}"
+            ))),
+        )
+    })?;
+    let scope = req
+        .scope()
+        .map_err(|why| (StatusCode::BAD_REQUEST, Json(api_error(why))))?;
+    if let Scope::Ids(ids) = &scope {
+        if ids.len() > MAX_IDS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("at most {MAX_IDS} ids per call"))),
+            ));
+        }
     }
     let unavailable = |what: &str| {
         (
@@ -564,12 +747,13 @@ async fn post_sessions_resume(
         .map(|s| s.inner().clone())
         .ok_or_else(|| unavailable("session registry"))?;
 
-    let ids = select_ids(&req, &store.all_records());
+    let mut ids = select_ids(&scope, &store.all_records());
     if ids.len() > MAX_IDS {
         warn!(
             n = ids.len(),
             "resume_door: more unfinished sessions than one call takes; acting on the first {MAX_IDS}"
         );
+        ids.truncate(MAX_IDS);
     }
     info!(
         requested = ids.len(),
@@ -577,18 +761,29 @@ async fn post_sessions_resume(
         "resume_door: resuming closed sessions"
     );
 
-    let mut results = Vec::new();
-    for id in ids.iter().take(MAX_IDS) {
-        let row = match classify(id, store.get(id).as_ref()) {
-            Err(why) => ResumeRow::skipped(id, why),
-            Ok(cand) => resume_one(&state.app_handle, &tm, &registry, cand).await,
-        };
-        info!(id = %row.id, verdict = %row.verdict, "resume_door: verdict");
-        results.push(row);
-    }
+    let requested = ids.len();
+    // Detached: a caller that hangs up mid-batch must not cancel the ids still
+    // to come (nor orphan a spawn between its start and its verification).
+    // Every id's verdict is logged by `run_batch` whether or not anyone is
+    // still waiting for the response.
+    let batch = tokio::spawn(run_batch(
+        state.app_handle.clone(),
+        tm,
+        registry,
+        store,
+        ids,
+    ));
+    let results = batch.await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "resume batch task failed ({e}) — see the per-id verdicts in the runner log"
+            ))),
+        )
+    })?;
     Ok(Json(ApiResponse::success(tally(
         req.generation,
-        ids.len().min(MAX_IDS),
+        requested,
         results,
     ))))
 }
@@ -679,12 +874,97 @@ mod tests {
         let mut open = rec("open");
         open.claude_session_id = "open".into();
         let all = [a, b, fin, open];
-        assert_eq!(select_ids(&ResumeRequest::default(), &all), ["b", "a"]);
-        let explicit = ResumeRequest {
-            ids: Some(vec![" x ".into(), "x".into(), "y".into()]),
-            generation: None,
-        };
+        assert_eq!(select_ids(&Scope::All, &all), ["b", "a"]);
+        let explicit = Scope::Ids(vec![" x ".into(), "x".into(), "y".into()]);
         assert_eq!(select_ids(&explicit, &all), ["x", "y"]);
+    }
+
+    fn req(json: serde_json::Value) -> ResumeRequest {
+        serde_json::from_value(json).expect("decode")
+    }
+
+    #[test]
+    fn an_empty_or_bare_request_never_means_all() {
+        for bare in [
+            serde_json::json!({}),
+            serde_json::json!({"generation": "g"}),
+            serde_json::json!({"all": false}),
+            serde_json::json!({"ids": []}),
+            serde_json::json!({"ids": ["  "]}),
+        ] {
+            assert!(
+                req(bare.clone()).scope().is_err(),
+                "{bare} must be refused, not widened to all"
+            );
+        }
+        assert_eq!(
+            req(serde_json::json!({"all": true})).scope(),
+            Ok(Scope::All)
+        );
+        assert_eq!(
+            req(serde_json::json!({"ids": ["a"]})).scope(),
+            Ok(Scope::Ids(vec!["a".into()]))
+        );
+        // Ambiguity is refused too.
+        assert!(req(serde_json::json!({"ids": ["a"], "all": true}))
+            .scope()
+            .is_err());
+        // An unknown field (a typo of `all`) is a decode error, not a bare body.
+        assert!(serde_json::from_value::<ResumeRequest>(serde_json::json!({"al": true})).is_err());
+    }
+
+    #[test]
+    fn only_a_json_content_type_is_accepted() {
+        use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(CONTENT_TYPE, HeaderValue::from_str(v).unwrap());
+            h
+        };
+        assert!(is_json_content_type(&with("application/json")));
+        assert!(is_json_content_type(&with(
+            "Application/JSON; charset=utf-8"
+        )));
+        assert!(!is_json_content_type(&with("text/plain")));
+        assert!(!is_json_content_type(&with(
+            "application/x-www-form-urlencoded"
+        )));
+        assert!(!is_json_content_type(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_second_claim_on_one_id_is_refused_until_the_first_is_released() {
+        let id = "in-flight-test-3f2a-resume-door";
+        let first = InFlight::claim(id).expect("first claim");
+        assert!(InFlight::claim(id).is_none(), "concurrent call must lose");
+        assert!(InFlight::claim("another-id-resume-door").is_some());
+        drop(first);
+        assert!(InFlight::claim(id).is_some(), "released on drop");
+    }
+
+    #[test]
+    fn a_live_claude_on_the_id_is_found_by_its_cmdline() {
+        let procs = vec![
+            (
+                7,
+                "/bin/claude --resume 11111111-1111-4111-8111-111111111111".to_string(),
+            ),
+            (9, format!("/bin/claude --session-id {ID}")),
+        ];
+        assert_eq!(holder_of(&procs, ID), Some(9));
+        assert_eq!(holder_of(&procs[..1], ID), None);
+        assert_eq!(holder_of(&[], ID), None);
+    }
+
+    #[test]
+    fn path_case_folds_only_where_the_filesystem_does() {
+        assert!(same_path_with("/Work/Proj", "/work/proj", true));
+        assert!(!same_path_with("/Work/Proj", "/work/proj", false));
+        assert!(same_path_with("/work/proj/", "/work/proj", false));
+        assert_eq!(
+            same_path("/Work/Proj", "/work/proj"),
+            cfg!(any(windows, target_os = "macos"))
+        );
     }
 
     #[test]
