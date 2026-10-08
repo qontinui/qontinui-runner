@@ -51,6 +51,7 @@ as free text. Map what you are waiting on to exactly one kind:
 | A PR merging | `pr_merged` | identify the PR (`repo` + `pr` number). It **does** clear on a coord-orchestrated repo: `gates::pr_merged_verdict` never reads GitHub's `merged` bool, it reads coord's OWN land record — `pr_state = 'merged'` **or** `close_cause ∈ {merged, commits_landed_via_other_pr}` — so **both** land shapes clear, and registration emits an informational steer, not a rejection. Two qualifications, both load-bearing: an explicitly `open`/`draft` `pr_state` carrying a land cause hits the **contradiction guard** and returns `Open` (not a clear — it converges once the PR leaves open/draft); and a **dying land** can leave it terminally `Failed` on work that is provably on `main`, whose discriminator is a `merged` `coord.merge_proposals` row for **this** PR — no merged proposal ⇒ the `Failed` is genuine (`author_closed` reaches `Failed` too, and its content is on `main` as well). Canonical: `_gate-registration`. ⚠️ The older *"never fires on a coord-orchestrated repo"* advice is **STALE** — true when learned (2026-07-11, on runner PR #744), fixed in coord days later by the land-aware `pr_merged_verdict`. **Before registering, apply `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch whose PR may already have landed"** (`gh pr view <n> --json state,headRefOid`). This gate clears on the land, so a commit pushed after coord lands the PR is watched by nothing. If that section says the PR no longer carries your commits, take its fresh-branch path and gate the new PR instead, unless the close was deliberate. If nothing is unlanded, the wait is over: register no `pr_merged` gate. If the PR does carry them but its head is not your local tip, push (or reconcile) first, then apply the section's after-push re-check before registering. Decide what is unlanded by content, not ancestry: after a rebase-land your SHA is never on `main` (`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Ancestry is a one-way signal") |
 | Work landing on main of a **coord-orchestrated repo** | `commit_live` | `{repo, commit_sha, on_ref?}` — ancestor-of-main check; anchor a **post-land main SHA** (or use `unit_status` — **not `file_exists`, which is broken**), NEVER the pre-land branch-head SHA. That anchor **is** a coin-flip: it clears only if the rebase preserved the sha, and whether `main` moves between your read and coord's land is not predictable at registration time — so on a rewrite the SHA never becomes an ancestor and the gate rots open (gate `c14d103c`, 2026-07-11). The hazard is the pre-land SHA, **not** `pr_merged` |
 | A specific **device's running build** being at-or-past a SHA | `runner_served_sha` | `{device_id, repo, expected_sha}` — device-scoped, and NOT interchangeable with `commit_live`: `commit_live` only checks repo-main ancestry (the code has landed), while `runner_served_sha` checks that THAT device's currently-running binary is at-or-past `expected_sha` (the code has been rebuilt onto). Stays `open` while the commit has landed but the device hasn't restarted onto it — `verdict_reason` names the device's current build id when open (canonical: `_gate-registration`) |
+| **Verify a runner fix once the device serves it** | `runner_served_sha` + a typed `continuation` | `{device_id, repo, expected_sha}` plus `continuation {action:"run_skill", skill, hint, target_device_id, repos}` and an `expires_at`. It replaces the `[VERIFICATION:PENDING]` output-text marker the runner deleted: output text never schedules verification. Register BEFORE the device rebuilds (a `continuation_dropped_born_cleared:` response means verify now, in-session); the `hint` opens with a device-identity guard, worded to run BEFORE the skill, because `target_device_id` is only a preference (canonical: `_gate-registration` → "Predicate choice guidance") |
 | A **fault firing** (an alert going open) | `alert_open` | `{alert_kind, alert_key?, alert_id?}` — clears while a `coord.alerts` row of `alert_kind` is UNRESOLVED: *"resume when X breaks"*, not *"resume when X is fixed"* (the negated form was deliberately not added). `alert_key` narrows to one watcher's dedupe key, `alert_id` to one episode — and a resolved/absent/wrong-kind `alert_id` REGISTERS `misconfigured` rather than being refused, so read the verdict back. The evaluator never returns `Failed`, but the sweep's unevaluable escalation still can, from outside it. Omit `tenant_id` — coord stamps it; another tenant's is refused, your own is accepted. Landed qontinui-coord#2239, 2026-09-19 (canonical: `_gate-registration`) |
 | A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — **both required**, and it is a CONJUNCTION: healthy AND the deployed rev *includes* `expected_rev`, never a health-only check. `service` is an EXACT vocabulary, not free text — `coord` or `web`, **no variants**: not `qontinui-web`, not `qontinui-staging/web` (the target `coord_query_release_state` prints). The three lookups this predicate conjoins normalize differently and the health one does raw `==` on an alert key segment, so a near-miss spelling names an observation but no alert and the health half is SILENTLY SKIPPED — the gate could clear while a critical deploy alert was open. A service coord does not observe at all used to register cleanly and then fail closed on every tick forever, silently. Both are REFUSED at the door — **once the coord answering you is SERVING qontinui-coord#2315**, which landed on coord `main` 2026-09-21 (`72c50b3f`); landed is not serving, which is this table's own subject. Until then a near-miss spelling is accepted and silently half-evaluates. Canonical: `_gate-registration` → "Merged is not deployed" |
 | **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Registering `pr_merged` on a deploy-shaped `phase_name` answers with a non-blocking `deploy_order_predicate_weaker:` steer (same coord#2315, same caveat — landed on coord `main`, serving unconfirmed) (branch on the **prefix**, never on `warnings[].is_empty()`). That steer reads the ANCHOR's `phase_name`, so a **claim-anchored** registration (`claim_kind` + `resource_key`) carries none and gets no steer at all — at this door, which registers claim-anchored gates routinely, the choice is entirely yours. For a SCHEMA change this is a third question again — `migration_at_head` is single-schema; for "table X exists on database Y" use `schema_object_exists`. Canonical: `_gate-registration` → "Merged is not deployed" |
@@ -345,11 +346,17 @@ as "no such tool"). If the call fails as unknown / method-not-found:
 - Fall back to the HTTP route (Step 5: device-authed `POST /coord/work-units/upsert`
   then `POST /coord/work-units/<slug>/register-gate` for a plan-anchored agent
   session, else `POST /coord/gates/register` for a claim-anchored gate), OR —
-  only once `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd has
+  only once `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd has
   printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — surface the blocker
   to the operator **with that block pasted verbatim**. The block carries the
   probe time, the runner build, this box's load and a per-door table; the bare
   sentence "HTTP is also unavailable" carries none of them and is not written.
+  `<session-workdir>` is the coord-revive skill directory's root: the session
+  workdir the runner provisioned the skill into, else — for a hand-started session
+  whose cwd carries no copy, as most agent worktrees do not — a checked-out copy
+  of your deployment's agent config. Substitute it; an unsubstituted
+  `<session-workdir>` produces `No such file or directory`, which is a paste
+  error, not a missing door.
   A `verdict=UNKNOWN` (exit 5: sampled under this box's own load, or an
   unreadable load) is reported as UNKNOWN with its reason — re-run after the
   builds finish — never as "unavailable".
@@ -361,17 +368,19 @@ Enumerate before you conclude —
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run
-> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
-> — spelled absolutely, because a bare `scripts/...` resolves only from a
-> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> that a capability is ABSENT, run the route census,
+> `coord-route-census.sh <fragment>`, from wherever your deployment installs
+> it — spelled by its absolute path, because a bare relative path resolves
+> only from the checkout that ships it, and a session standing anywhere else
 > gets exit 127
 > (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
 > a working tree and never a live host) — and paste its trailer verbatim
 > beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under `CENSUS_TRAILER_RE` in
-> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+> Where no census tool is reachable at all, the negative cannot be settled and
+> is UNVERIFIED.
+> A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
 > `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
 > trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
@@ -474,7 +483,7 @@ In your session-close report, list for each blocker either:
 the `gate_id` it reported against and the `outcome_recorded` coord echoed back —
 or **"work outcome NOT reported"** plus the failure you actually saw (variables
 absent, a non-2xx, a mismatched echo — or coord unreachable, which is only ever
-the `FLOOR-CLAIM: verdict=FLOOR` block that `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim`
+the `FLOOR-CLAIM: verdict=FLOOR` block that `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim`
 printed, pasted verbatim, never the bare phrase). "Not a continuation" is
 also an outcome: when both variables were absent, say the step did not apply
 rather than leaving the reader to guess whether it was skipped or failed.

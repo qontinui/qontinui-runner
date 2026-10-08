@@ -360,8 +360,8 @@ trigger is NOT a gate; skip those and just report the blocker.
   omitting is safe and never a loophole, and a guessed class is worse than none.
   ⚠️ **The old "`agent_non_author` means nobody may attest — this is a ONE-DEVICE
   fleet" warning is SUPERSEDED (re-verified 2026-08-30).** Both premises changed:
-  the fleet has **four** device ids (`eb2155ed4152`, `c79a07d57e40`,
-  `84c0229232cb`, `3e7e4b0475de`), and `non_author_allows_identities` is now a
+  a tenant's fleet can have **several** device ids (this device's is in
+  `~/.qontinui/machine.json`), and `non_author_allows_identities` is now a
   six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
   device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
   only in tier 6 — same device, no proven session on one or both sides. So
