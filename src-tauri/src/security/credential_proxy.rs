@@ -193,9 +193,9 @@ fn env_var_name_for_credential(name: &str) -> String {
 fn resolve_credential(source: &CredentialSource) -> Option<String> {
     match source {
         CredentialSource::Keychain { service, key } => {
-            // The keychain gate (`instance_env::keychain_allowed`): a gated
+            // The keychain gate (`instance_env::os_keychain_allowed`): a gated
             // read resolves nothing, exactly like a missing entry.
-            if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
                 debug!("Credential proxy: OS keychain disabled for this runner");
                 return None;
             }

@@ -119,18 +119,24 @@ pub fn is_secondary_from(name: Option<&str>, instance_root: Option<&Path>) -> bo
 ///
 /// A named secondary resolves the primary's shared `settings.json` unless its
 /// launcher redirected it, so those guards keep the conservative
-/// [`is_secondary`] answer for it — unchanged. A runner under an instance root
-/// is the exception: its config is `<root>/config` by construction (the launcher
-/// may only point `QONTINUI_CONFIG_DIR` inside the root, and startup defaults it
-/// there), so it can never clobber the harness's file, and it must be able to
-/// persist its own sign-in and tier like any installation.
+/// [`is_secondary`] answer for it — unchanged. The ONE exception is a NAMELESS
+/// runner under an instance root: its config is `<root>/config` by
+/// construction (the launcher may only point `QONTINUI_CONFIG_DIR` inside the
+/// root, and startup defaults it there), so it can never clobber the harness's
+/// file, and it must be able to persist its own sign-in and tier like any
+/// installation.
+///
+/// A NAMED runner under a root still refuses: `InstanceManager` hands a child
+/// its parent's environment, so a subject's named child inherits the root AND
+/// the subject's `QONTINUI_CONFIG_DIR` — it would be writing the SUBJECT's
+/// `settings.json`, the same footgun one level down.
 pub fn shares_primary_settings() -> bool {
     shares_primary_settings_from(instance_name().as_deref(), instance_root().as_deref())
 }
 
 /// Env-free core of [`shares_primary_settings`].
 pub fn shares_primary_settings_from(name: Option<&str>, instance_root: Option<&Path>) -> bool {
-    is_secondary_from(name, instance_root) && instance_root.is_none()
+    name.is_some() || (instance_root.is_none() && is_secondary_from(name, instance_root))
 }
 
 /// `QONTINUI_SERVER_MODE` — was this process launched headless (`1` / `true`,
@@ -163,42 +169,42 @@ pub fn server_mode() -> bool {
 // The OS keychain gate
 // ============================================================================
 
-/// May this process touch the OS keychain at all?
+/// May this process touch the machine-shared OS keychain stores OTHER than
+/// `auth`'s token backup?
 ///
-/// `false` when `QONTINUI_DISABLE_KEYCHAIN` is set (any value — the long-standing
-/// meaning of the switch in `auth`) or when this runner is under an instance
-/// root (D2 of plan
+/// `false` exactly when this runner is under an instance root (D2 of plan
 /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`):
-/// keychain entries are keyed on fixed service names (`com.qontinui.runner`,
-/// `com.qontinui.runner.ai`, …) SHARED by every runner on the box, so a subject
-/// reading one would act on the harness's secrets and writing one would
-/// overwrite them.
+/// keychain entries are keyed on fixed service names (`com.qontinui.runner.ai`,
+/// `.self_healing`, the wrapper and registry services, …) SHARED by every runner
+/// on the box, so a subject reading one would act on the harness's secrets and
+/// writing one would overwrite them. Without a root the answer is always
+/// `true` — those stores never consulted `QONTINUI_DISABLE_KEYCHAIN` and still
+/// do not, so a primary's behaviour is unchanged.
 ///
-/// Every `keyring::Entry::new` outside `auth.rs` sits behind this gate — the
-/// `ambient` source-scan test `every_keyring_entry_is_behind_the_keychain_gate`
-/// enforces it. A gated read answers "no entry", a gated delete is a no-op, and
-/// a gated write fails with [`keychain_disabled_error`].
-pub fn keychain_allowed() -> bool {
-    keychain_allowed_from(
-        std::env::var_os("QONTINUI_DISABLE_KEYCHAIN"),
-        instance_root().as_deref(),
-    )
+/// `auth.rs` keeps its own switch (`AuthManager::keychain_enabled`, reading
+/// `QONTINUI_DISABLE_KEYCHAIN`), which every binary's startup exports as `1`
+/// under a root ([`instance_root_defaults`]).
+///
+/// Every `keyring::Entry::new*` in production code sits behind this gate or,
+/// in `auth.rs`, behind `keychain_enabled` in the same fn — the `ambient`
+/// source-scan test `every_keyring_entry_is_behind_the_keychain_gate` enforces
+/// it. A gated read answers "no entry", a gated delete is a no-op, and a gated
+/// write fails with [`keychain_disabled_error`].
+pub fn os_keychain_allowed() -> bool {
+    os_keychain_allowed_from(instance_root().as_deref())
 }
 
-/// Env-free core of [`keychain_allowed`].
-pub fn keychain_allowed_from(
-    disable_keychain: Option<OsString>,
-    instance_root: Option<&Path>,
-) -> bool {
-    disable_keychain.is_none() && instance_root.is_none()
+/// Env-free core of [`os_keychain_allowed`].
+pub fn os_keychain_allowed_from(instance_root: Option<&Path>) -> bool {
+    instance_root.is_none()
 }
 
 /// The error a gated keychain WRITE returns: a clear refusal rather than a
 /// silent success that would lose the secret.
 pub fn keychain_disabled_error() -> keyring::Error {
     keyring::Error::NoStorageAccess(
-        "the OS keychain is disabled for this runner (QONTINUI_DISABLE_KEYCHAIN is set, or it \
-         runs under QONTINUI_INSTANCE_ROOT and must not share the machine keychain)"
+        "the OS keychain is disabled for this runner: it runs under QONTINUI_INSTANCE_ROOT and \
+         must not share the machine keychain with the runner that launched it"
             .into(),
     )
 }
@@ -273,13 +279,53 @@ fn has_parent_dir(path: &Path) -> bool {
     path.components().any(|c| c == Component::ParentDir)
 }
 
+/// Whether this OS's default filesystems compare path components
+/// case-insensitively (NTFS, APFS / HFS+). Containment and the rooted id fold
+/// case there, so `C:\Subject\config` is inside `c:\subject`.
+pub const PATH_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// `path` without a Windows verbatim prefix: `\\?\UNC\server\share` →
+/// `\\server\share`, `\\?\C:\x` → `C:\x`. A launcher that canonicalized its
+/// root gets the verbatim spelling, and it must compare equal to the plain one.
+/// Pure string surgery, so it behaves the same on every OS.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// The form two paths are compared in: verbatim prefix stripped,
+/// [`lexically_normalized`], and case-folded when `case_insensitive`.
+pub fn comparable_path(path: &Path, case_insensitive: bool) -> PathBuf {
+    let normalized = lexically_normalized(&strip_verbatim_prefix(path));
+    if case_insensitive {
+        PathBuf::from(normalized.to_string_lossy().to_lowercase())
+    } else {
+        normalized
+    }
+}
+
 /// The stable instance id of a root: `root-<16 hex>`, a 64-bit FNV-1a over the
-/// root's [`lexically_normalized`] path, so a trailing separator or a `./`
-/// does not change it. FNV rather than `DefaultHasher` because the id names
-/// on-disk state and must not move between Rust releases.
+/// root's [`comparable_path`], so a trailing separator, a `./`, a verbatim
+/// prefix or (on a case-insensitive OS) a case difference does not change it.
+/// FNV rather than `DefaultHasher` because the id names on-disk state and must
+/// not move between Rust releases.
 pub fn rooted_instance_id(root: &Path) -> String {
+    rooted_instance_id_with(root, PATH_CASE_INSENSITIVE)
+}
+
+/// Env-free, OS-free core of [`rooted_instance_id`].
+pub fn rooted_instance_id_with(root: &Path, case_insensitive: bool) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in lexically_normalized(root).to_string_lossy().as_bytes() {
+    for byte in comparable_path(root, case_insensitive)
+        .to_string_lossy()
+        .as_bytes()
+    {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -315,6 +361,9 @@ pub fn machine_global_dirs() -> Vec<PathBuf> {
 /// - `overrides`: each [`ROOT_CONFINED_ENV_KEYS`] key with its raw value; a
 ///   non-blank value must be absolute, carry no `..`, and lie lexically inside
 ///   `root` (the root itself counts).
+/// - `case_insensitive`: compare in [`comparable_path`] form with case folded —
+///   [`PATH_CASE_INSENSITIVE`] in production; a parameter so every OS's rule is
+///   testable on every OS.
 ///
 /// Every problem is reported, not only the first, so one refused launch names
 /// everything the launcher has to fix.
@@ -323,8 +372,9 @@ pub fn validate_instance_root(
     port: PortCheck<'_>,
     overrides: &[(&str, Option<OsString>)],
     machine_dirs: &[PathBuf],
+    case_insensitive: bool,
 ) -> Result<(), String> {
-    if let Some(problem) = root_problem(root, machine_dirs) {
+    if let Some(problem) = root_problem(root, machine_dirs, case_insensitive) {
         return Err(problem);
     }
     let mut problems: Vec<String> = Vec::new();
@@ -351,15 +401,16 @@ pub fn validate_instance_root(
         }
     }
 
-    let normalized_root = lexically_normalized(root);
+    let comparable_root = comparable_path(root, case_insensitive);
     for (key, value) in overrides {
         let Some(value) = value.as_ref().filter(|v| !is_blank(Some(v))) else {
             continue;
         };
         let path = Path::new(value);
-        if !path.is_absolute()
-            || has_parent_dir(path)
-            || !lexically_normalized(path).starts_with(&normalized_root)
+        let stripped = strip_verbatim_prefix(path);
+        if !stripped.is_absolute()
+            || has_parent_dir(&stripped)
+            || !comparable_path(path, case_insensitive).starts_with(&comparable_root)
         {
             problems.push(format!(
                 "{key}={path:?} is outside the instance root {root:?} (it must be an absolute \
@@ -378,18 +429,19 @@ pub fn validate_instance_root(
 /// The root-level refusals: why `root` itself cannot be an instance root, if
 /// it cannot. Separate from the rest of [`validate_instance_root`] because a
 /// root that passes these is safe to write a refusal log into.
-fn root_problem(root: &Path, machine_dirs: &[PathBuf]) -> Option<String> {
-    if !root.is_absolute() {
+fn root_problem(root: &Path, machine_dirs: &[PathBuf], case_insensitive: bool) -> Option<String> {
+    let stripped = strip_verbatim_prefix(root);
+    if !stripped.is_absolute() {
         return Some(format!(
             "QONTINUI_INSTANCE_ROOT must be an absolute path, got {root:?}"
         ));
     }
-    if has_parent_dir(root) {
+    if has_parent_dir(&stripped) {
         return Some(format!(
             "QONTINUI_INSTANCE_ROOT must not contain `..`, got {root:?}"
         ));
     }
-    let normalized = lexically_normalized(root);
+    let normalized = comparable_path(root, case_insensitive);
     if !normalized
         .components()
         .any(|c| matches!(c, Component::Normal(_)))
@@ -399,7 +451,7 @@ fn root_problem(root: &Path, machine_dirs: &[PathBuf]) -> Option<String> {
         ));
     }
     for dir in machine_dirs {
-        if lexically_normalized(dir).starts_with(&normalized) {
+        if comparable_path(dir, case_insensitive).starts_with(&normalized) {
             return Some(format!(
                 "QONTINUI_INSTANCE_ROOT {root:?} contains the machine-global directory {dir:?}; \
                  a subject's root must hold only its own state"
@@ -427,10 +479,10 @@ pub struct InstanceRootDefault {
 /// - `QONTINUI_EMBEDDED_PG_DIR` → `<root>/embedded-pg` (a private cluster)
 /// - `QONTINUI_RUNNER_LOG_DIR`, `QONTINUI_PANIC_LOG_DIR` → `<root>/logs`
 /// - `WEBVIEW2_USER_DATA_FOLDER` → `<root>/webview`
-/// - `QONTINUI_DISABLE_KEYCHAIN` → `1`. [`keychain_allowed`] already answers
-///   `false` under a root; exporting the switch as well carries that to `auth`
-///   (whose own `keychain_enabled_env` reads only the switch) and to every
-///   child the subject spawns (D5).
+/// - `QONTINUI_DISABLE_KEYCHAIN` → `1`: `auth`'s own keychain switch
+///   (`keychain_enabled_env` reads only it). [`os_keychain_allowed`] covers the
+///   other stores; exporting the switch carries `auth`'s half to this process
+///   and to every child the subject spawns (D5).
 ///
 /// `current(key)` is the key's present value. A path key counts as unset when
 /// blank (its readers ignore a blank value); the keychain switch only when
@@ -483,16 +535,19 @@ pub struct InstanceRootRefusal {
 /// default is exported and its directory created.
 ///
 /// Mutates the process environment, so it must run while the process is still
-/// effectively single-threaded — first thing in `main`, before anything else
-/// reads a path. In a `#[tokio::main]` binary the runtime's workers already
-/// exist but have run nothing, so none of them can be mid-read of the env.
+/// single-threaded — first thing in `main`, before anything else reads a path
+/// or spawns a thread. The one async binary that calls it
+/// (`bin/qontinui_specs.rs`) uses a `current_thread` runtime, which has no
+/// worker threads. NEVER call it from a multi-threaded `#[tokio::main]`: its
+/// workers exist before `main`'s body runs, and a `set_var` racing a `getenv`
+/// on another thread is undefined behaviour on Unix.
 pub fn apply_instance_root_env(require_port: bool) -> Result<Option<PathBuf>, InstanceRootRefusal> {
     let Some(root) = instance_root() else {
         return Ok(None);
     };
     let machine_dirs = machine_global_dirs();
     let refusal = |reason: String| InstanceRootRefusal {
-        root_usable: root_problem(&root, &machine_dirs).is_none(),
+        root_usable: root_problem(&root, &machine_dirs, PATH_CASE_INSENSITIVE).is_none(),
         root: root.clone(),
         reason,
     };
@@ -506,7 +561,14 @@ pub fn apply_instance_root_env(require_port: bool) -> Result<Option<PathBuf>, In
     } else {
         PortCheck::NotApplicable
     };
-    validate_instance_root(&root, port, &overrides, &machine_dirs).map_err(&refusal)?;
+    validate_instance_root(
+        &root,
+        port,
+        &overrides,
+        &machine_dirs,
+        PATH_CASE_INSENSITIVE,
+    )
+    .map_err(&refusal)?;
     for default in instance_root_defaults(&root, &|key| std::env::var_os(key)) {
         if default.is_dir {
             std::fs::create_dir_all(&default.value).map_err(|e| {
@@ -596,38 +658,80 @@ mod tests {
     }
 
     #[test]
-    fn only_a_rootless_secondary_shares_the_primarys_settings() {
+    fn only_a_nameless_rooted_runner_escapes_the_shared_settings_guard() {
         let root = Path::new("/srv/subject-1");
         assert!(!shares_primary_settings_from(None, None), "the primary");
         assert!(
             shares_primary_settings_from(Some("test-1"), None),
             "a named secondary, unchanged"
         );
-        assert!(!shares_primary_settings_from(None, Some(root)));
-        assert!(!shares_primary_settings_from(Some("test-1"), Some(root)));
+        assert!(
+            !shares_primary_settings_from(None, Some(root)),
+            "a nameless subject persists its own settings"
+        );
+        assert!(
+            shares_primary_settings_from(Some("child"), Some(root)),
+            "a named child that inherited a subject's root + config dir must not write it"
+        );
     }
 
     #[test]
-    fn the_keychain_gate_is_closed_by_the_switch_or_a_root() {
-        let root = Path::new("/srv/subject-1");
-        assert!(
-            keychain_allowed_from(None, None),
-            "the primary keeps its keychain"
-        );
-        assert!(!keychain_allowed_from(Some(OsString::from("1")), None));
-        assert!(
-            !keychain_allowed_from(Some(OsString::new()), None),
-            "any value disables"
-        );
-        assert!(!keychain_allowed_from(None, Some(root)));
-        assert!(!keychain_allowed_from(
-            Some(OsString::from("0")),
-            Some(root)
-        ));
+    fn the_os_keychain_gate_closes_on_a_root_and_only_on_a_root() {
+        assert!(os_keychain_allowed_from(None), "no root: unchanged, open");
+        assert!(!os_keychain_allowed_from(Some(Path::new("/srv/subject-1"))));
         assert!(matches!(
             keychain_disabled_error(),
             keyring::Error::NoStorageAccess(_)
         ));
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_on_every_os() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\subjects\a")),
+            PathBuf::from(r"C:\subjects\a")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\host\share\a")),
+            PathBuf::from(r"\\host\share\a")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new("/srv/a")),
+            PathBuf::from("/srv/a")
+        );
+    }
+
+    /// The case-insensitive rule (Windows, macOS), exercised on every OS
+    /// through the flag: containment, the machine-dir check and the id all
+    /// fold case; with the flag off (Linux) they do not.
+    #[test]
+    fn case_folding_follows_the_flag_in_containment_machine_dirs_and_the_id() {
+        let root = abs("Subject-Case");
+        let lower = PathBuf::from(root.to_string_lossy().to_lowercase());
+        let inside = with_override("QONTINUI_CONFIG_DIR", os(&lower.join("config")));
+        assert_eq!(
+            validate_instance_root(&root, PORT, &inside, &[], true),
+            Ok(())
+        );
+        assert!(validate_instance_root(&root, PORT, &inside, &[], false).is_err());
+
+        let machine = vec![PathBuf::from(
+            root.join("Home").to_string_lossy().to_uppercase(),
+        )];
+        assert!(validate_instance_root(&root, PORT, &no_overrides(), &machine, true).is_err());
+        assert_eq!(
+            validate_instance_root(&root, PORT, &no_overrides(), &machine, false),
+            Ok(())
+        );
+
+        assert_eq!(
+            rooted_instance_id_with(&root, true),
+            rooted_instance_id_with(&lower, true)
+        );
+        assert_ne!(
+            rooted_instance_id_with(&root, false),
+            rooted_instance_id_with(&lower, false)
+        );
     }
 
     // -- validate_instance_root -------------------------------------------
@@ -663,14 +767,17 @@ mod tests {
     fn validate_accepts_an_absolute_root_with_its_own_port_and_inside_overrides() {
         let root = abs("subject-ok");
         assert_eq!(
-            validate_instance_root(&root, PORT, &no_overrides(), &[]),
+            validate_instance_root(&root, PORT, &no_overrides(), &[], false),
             Ok(())
         );
         let inside: Vec<(&'static str, Option<OsString>)> = ROOT_CONFINED_ENV_KEYS
             .iter()
             .map(|k| (*k, os(&root.join("deep").join(k.to_ascii_lowercase()))))
             .collect();
-        assert_eq!(validate_instance_root(&root, PORT, &inside, &[]), Ok(()));
+        assert_eq!(
+            validate_instance_root(&root, PORT, &inside, &[], false),
+            Ok(())
+        );
         // The root itself, `.` components and a trailing separator are inside.
         let dotted = root.join(".").join("config");
         assert_eq!(
@@ -678,12 +785,19 @@ mod tests {
                 &root,
                 PORT,
                 &with_override("QONTINUI_CONFIG_DIR", os(&dotted)),
-                &[]
+                &[],
+                false
             ),
             Ok(())
         );
         assert_eq!(
-            validate_instance_root(&root, PORT, &with_override("QONTINUI_HOME", os(&root)), &[]),
+            validate_instance_root(
+                &root,
+                PORT,
+                &with_override("QONTINUI_HOME", os(&root)),
+                &[],
+                false
+            ),
             Ok(())
         );
         // Blank overrides are no overrides.
@@ -692,27 +806,28 @@ mod tests {
                 &root,
                 PORT,
                 &with_override("QONTINUI_HOME", Some(OsString::from("  "))),
-                &[]
+                &[],
+                false
             ),
             Ok(())
         );
         // A CLI bin needs no port at all.
         assert_eq!(
-            validate_instance_root(&root, PortCheck::NotApplicable, &no_overrides(), &[]),
+            validate_instance_root(&root, PortCheck::NotApplicable, &no_overrides(), &[], false),
             Ok(())
         );
     }
 
     #[test]
     fn validate_refuses_a_relative_dotted_or_filesystem_root() {
-        let err =
-            validate_instance_root(Path::new("subject"), PORT, &no_overrides(), &[]).unwrap_err();
+        let err = validate_instance_root(Path::new("subject"), PORT, &no_overrides(), &[], false)
+            .unwrap_err();
         assert!(err.contains("absolute"), "{err}");
         let dotted = abs("a").join("..").join("subject");
-        let err = validate_instance_root(&dotted, PORT, &no_overrides(), &[]).unwrap_err();
+        let err = validate_instance_root(&dotted, PORT, &no_overrides(), &[], false).unwrap_err();
         assert!(err.contains("`..`"), "{err}");
         let fs_root: PathBuf = abs("x").ancestors().last().unwrap().to_path_buf();
-        let err = validate_instance_root(&fs_root, PORT, &no_overrides(), &[]).unwrap_err();
+        let err = validate_instance_root(&fs_root, PORT, &no_overrides(), &[], false).unwrap_err();
         assert!(err.contains("filesystem root"), "{err}");
     }
 
@@ -725,7 +840,8 @@ mod tests {
             abs(""),
             PathBuf::from(format!("{}/", home.display())),
         ] {
-            let err = validate_instance_root(&root, PORT, &no_overrides(), &machine).unwrap_err();
+            let err =
+                validate_instance_root(&root, PORT, &no_overrides(), &machine, false).unwrap_err();
             assert!(err.contains("machine-global"), "{root:?}: {err}");
         }
         // A root BELOW home is fine — that is where subjects live.
@@ -734,7 +850,8 @@ mod tests {
                 &home.join("subjects").join("a"),
                 PORT,
                 &no_overrides(),
-                &machine
+                &machine,
+                false
             ),
             Ok(())
         );
@@ -744,9 +861,14 @@ mod tests {
     fn validate_refuses_a_missing_invalid_or_primary_port_exactly_as_the_runtime_parses() {
         let root = abs("subject-port");
         for port in [None, Some("")] {
-            let err =
-                validate_instance_root(&root, PortCheck::Required(port), &no_overrides(), &[])
-                    .unwrap_err();
+            let err = validate_instance_root(
+                &root,
+                PortCheck::Required(port),
+                &no_overrides(),
+                &[],
+                false,
+            )
+            .unwrap_err();
             assert!(err.contains("QONTINUI_PORT is unset"), "{port:?}: {err}");
         }
         // The runtime's `parse()` rejects surrounding whitespace and falls back
@@ -757,13 +879,19 @@ mod tests {
                 PortCheck::Required(Some(port)),
                 &no_overrides(),
                 &[],
+                false,
             )
             .unwrap_err();
             assert!(err.contains("not a valid port"), "{port:?}: {err}");
         }
-        let err =
-            validate_instance_root(&root, PortCheck::Required(Some("0")), &no_overrides(), &[])
-                .unwrap_err();
+        let err = validate_instance_root(
+            &root,
+            PortCheck::Required(Some("0")),
+            &no_overrides(),
+            &[],
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("not a fixed port"), "{err}");
         let primary = crate::runner_breadcrumb::PRIMARY_PORT.to_string();
         let err = validate_instance_root(
@@ -771,6 +899,7 @@ mod tests {
             PortCheck::Required(Some(&primary)),
             &no_overrides(),
             &[],
+            false,
         )
         .unwrap_err();
         assert!(err.contains("primary runner's port"), "{err}");
@@ -781,8 +910,9 @@ mod tests {
         let root = abs("subject-confined");
         let outside = abs("harness-state");
         for key in ROOT_CONFINED_ENV_KEYS {
-            let err = validate_instance_root(&root, PORT, &with_override(key, os(&outside)), &[])
-                .unwrap_err();
+            let err =
+                validate_instance_root(&root, PORT, &with_override(key, os(&outside)), &[], false)
+                    .unwrap_err();
             assert!(
                 err.contains(key) && err.contains("outside the instance root"),
                 "{err}"
@@ -802,6 +932,7 @@ mod tests {
                 PORT,
                 &with_override("QONTINUI_SECURE_STORAGE_DIR", os(&path)),
                 &[],
+                false,
             );
             assert!(got.is_err(), "{path:?} must be refused");
         }
@@ -812,8 +943,8 @@ mod tests {
         let root = abs("subject-many");
         let mut overrides = with_override("QONTINUI_CONFIG_DIR", os(&abs("elsewhere")));
         overrides.push(("QONTINUI_HOME", os(&abs("elsewhere-home"))));
-        let err =
-            validate_instance_root(&root, PortCheck::Required(None), &overrides, &[]).unwrap_err();
+        let err = validate_instance_root(&root, PortCheck::Required(None), &overrides, &[], false)
+            .unwrap_err();
         assert!(err.contains("QONTINUI_PORT"), "{err}");
         assert!(err.contains("QONTINUI_CONFIG_DIR"), "{err}");
         assert!(err.contains("QONTINUI_HOME"), "{err}");
@@ -850,7 +981,10 @@ mod tests {
             .filter(|d| d.is_dir)
             .map(|d| (d.key, Some(d.value.clone())))
             .collect();
-        assert_eq!(validate_instance_root(&root, PORT, &applied, &[]), Ok(()));
+        assert_eq!(
+            validate_instance_root(&root, PORT, &applied, &[], false),
+            Ok(())
+        );
     }
 
     #[test]
@@ -939,7 +1073,7 @@ mod tests {
         }
         // The rest of the process now reads the subject's own locations.
         assert_eq!(crate::ambient::qontinui_dir(), Some(root.join("home")));
-        assert!(!keychain_allowed());
+        assert!(!os_keychain_allowed());
         assert!(is_secondary());
         assert!(!shares_primary_settings());
     }
@@ -984,7 +1118,6 @@ mod tests {
         assert_eq!(before, after);
         assert!(!is_secondary());
         assert!(!shares_primary_settings());
-        std::env::remove_var("QONTINUI_DISABLE_KEYCHAIN");
-        assert!(keychain_allowed());
+        assert!(os_keychain_allowed());
     }
 }

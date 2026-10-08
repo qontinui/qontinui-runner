@@ -133,7 +133,7 @@ enum MigrationOutcome {
 /// Failures are non-fatal: a runner that cannot write its settings still
 /// boots, and the tier is simply off until the operator sets the field.
 pub fn persist_env_plans_dir() -> Result<(), String> {
-    if crate::instance::is_secondary() {
+    if crate::instance::shares_primary_settings() {
         return Ok(());
     }
 
@@ -513,5 +513,30 @@ mod tests {
                 "an exported env var must not arm a tier the setting leaves off"
             );
         });
+    }
+
+    /// Plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`,
+    /// through the real entry point: a nameless subject under an instance root
+    /// seeds `paths.plans_dir` into ITS OWN `<root>/config/settings.json`.
+    #[test]
+    fn a_rooted_subject_persists_its_plans_dir_into_its_own_config() {
+        let amb = crate::test_env::isolated_ambient();
+        let (root, _restore) = crate::instance::enter_rooted_subject_for_test(&amb);
+        let plans = amb.dir().join("plans");
+        std::env::remove_var(RUNNER_CONTEXT_ENV);
+        std::env::remove_var(PLAN_ADAPTER_DIR_ENV);
+        std::env::set_var(PLANS_DIR_ENV, &plans);
+
+        persist_env_plans_dir().expect("a subject may write its own settings");
+
+        let file = root.join("config").join("settings.json");
+        let doc: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&file).expect("settings.json written in the root"),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["paths"]["plans_dir"].as_str(),
+            Some(plans.to_string_lossy().as_ref())
+        );
     }
 }

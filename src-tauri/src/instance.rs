@@ -226,6 +226,34 @@ pub fn api_ports_to_try(port: u16) -> Vec<u16> {
     api_ports_to_try_for(port, instance_root().is_some())
 }
 
+/// Test support: turn an [`crate::test_env::IsolatedAmbient`] into a NAMELESS
+/// subject launch — a root at `<fixture>/subject`, the fixture's own
+/// out-of-root dir keys and any instance name cleared, then the real lib
+/// startup contract (`apply_instance_root_env`, CLI form) applied, exactly as a
+/// binary's `main` would. Returns the root and a restore guard for the one
+/// default the fixture does not capture (`WEBVIEW2_USER_DATA_FOLDER`).
+#[cfg(test)]
+pub(crate) fn enter_rooted_subject_for_test(
+    amb: &crate::test_env::IsolatedAmbient,
+) -> (PathBuf, crate::test_env::EnvVarRestore) {
+    let restore = crate::test_env::EnvVarRestore::capture(&["WEBVIEW2_USER_DATA_FOLDER"]);
+    std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
+    for key in [
+        "QONTINUI_HOME",
+        "QONTINUI_CONFIG_DIR",
+        "QONTINUI_SECURE_STORAGE_DIR",
+        "QONTINUI_INSTANCE_NAME",
+    ] {
+        std::env::remove_var(key);
+    }
+    let root = amb.dir().join("subject");
+    std::env::set_var("QONTINUI_INSTANCE_ROOT", &root);
+    let applied = qontinui_runner_lib::instance_env::apply_instance_root_env(false)
+        .expect("the fixture's subject launch must satisfy the contract");
+    assert_eq!(applied.as_deref(), Some(root.as_path()));
+    (root, restore)
+}
+
 /// Env-free core of [`api_ports_to_try`].
 fn api_ports_to_try_for(port: u16, under_instance_root: bool) -> Vec<u16> {
     if under_instance_root {
@@ -667,6 +695,24 @@ mod tests {
             RunnerKind::Named { name: "n".into() }
         );
         assert_eq!(runner_kind_from(None, None), RunnerKind::Primary);
+    }
+
+    /// The MCP API bind loop must take its port list from [`api_ports_to_try`];
+    /// a bind loop that rebuilt `[port, port + 1, port + 2]` inline would
+    /// silently re-open the fallback for a subject. Source-level, because the
+    /// loop itself binds real sockets.
+    #[test]
+    fn the_mcp_api_bind_loop_takes_its_ports_from_api_ports_to_try() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_api.rs"))
+            .expect("mcp_api.rs is readable");
+        assert!(
+            src.contains("let ports_to_try = crate::instance::api_ports_to_try(port);"),
+            "the bind loop no longer asks instance::api_ports_to_try for its ports"
+        );
+        assert!(
+            !src.contains("[port, port + 1, port + 2]"),
+            "an inline fallback port list is back in mcp_api.rs"
+        );
     }
 
     #[test]
