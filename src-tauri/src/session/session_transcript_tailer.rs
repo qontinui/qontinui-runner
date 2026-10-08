@@ -626,6 +626,12 @@ impl SessionTranscriptTailer {
         self.registrar.session_id_for(session_key).is_some()
     }
 
+    /// An undelivered `Started` row for `session_key` already in the outbox
+    /// (see [`AiCoordRegistrar::pending_started_session_for`]). Blocking.
+    pub fn pending_started_row(&self, session_key: &str) -> Option<Uuid> {
+        self.registrar.pending_started_session_for(session_key)
+    }
+
     /// Record that the watcher SAW `session_key` and it has no binding, so the
     /// coverage report counts it in `sessions_unbound` even before it appends
     /// a byte — an idle, closed transcript is exactly the session the

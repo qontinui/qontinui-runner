@@ -1420,7 +1420,7 @@ async fn tail_session(
     // best-effort, it never fails the tail. Retried below when an append finds
     // the session still unbound.
     if let Some(t) = tailer.as_ref() {
-        crate::session::transcript_autobind::ensure_bound(t, &path).await;
+        crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
     }
 
     debug!(
@@ -1596,7 +1596,7 @@ async fn tail_session(
             // tail start, or the throttle window had not elapsed): retry the
             // bind, which is a cheap no-op inside its throttle window.
             if !t.is_bound(&session_id) {
-                crate::session::transcript_autobind::ensure_bound(t, &path).await;
+                crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
             }
             let verdict = t.admit(
                 &session_id,

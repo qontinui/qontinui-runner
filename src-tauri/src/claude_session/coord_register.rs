@@ -440,6 +440,27 @@ impl AiCoordRegistrar {
             .and_then(|g| g.get(session_key).copied())
     }
 
+    /// The coord session id of a `Started` row for `claude_session_id` that is
+    /// still sitting UNDELIVERED in the outbox, if any. The R4 index is empty
+    /// after a restart, so a pane whose `Started` was written before the
+    /// restart and not yet drained is invisible to [`Self::session_id_for`]
+    /// while coord (which has not received it) answers `unknown` — minting then
+    /// would create a second row beside it. A caller about to mint asks this
+    /// first and ADOPTS the answer instead.
+    pub fn pending_started_session_for(&self, claude_session_id: &str) -> Option<Uuid> {
+        let pending = self.inner.outbox.pending().ok()?;
+        pending
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+            .find(|r| {
+                r.payload
+                    .get("claude_code_session_id")
+                    .and_then(|v| v.as_str())
+                    == Some(claude_session_id)
+            })
+            .map(|r| r.session_id)
+    }
+
     /// R1/R2 — register (or idempotently re-register) an authenticated AI
     /// session with coord. Mints a fresh coord `session_id` (UUIDv7), writes a
     /// `Started` outbox row carrying `task_run_id`, and records the R4 index.
