@@ -300,18 +300,16 @@ fn handler_list(source: &str) -> BTreeSet<String> {
     out
 }
 
-/// `source` with every `//` comment removed, line structure preserved.
-#[expect(
-    clippy::string_slice,
-    reason = "the cut is at a `find` of ASCII `//`, so it is on a char boundary"
-)]
+/// `source` with every `//` line comment removed, line structure preserved.
+///
+/// Line comments only, and string-unaware: a `//` inside a string literal
+/// (`"https://…"`) also cuts the line. Harmless for what this file scans —
+/// `ipc_group!` lists, `GROUPS` entries and `#[tauri::command(...)]`
+/// attributes carry no string literals containing `//`.
 fn decomment(source: &str) -> String {
     source
         .lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        })
+        .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -319,32 +317,28 @@ fn decomment(source: &str) -> String {
 /// The bodies of every `ipc_group!` invocation in `source`, whichever of the
 /// three macro delimiters it uses (`(…)`, `[…]`, `{…}`). Comments are stripped
 /// first, so prose and doc examples mentioning the macro never contribute.
-#[expect(
-    clippy::string_slice,
-    reason = "byte offsets come from `find` on ASCII delimiters, so every slice is on a char boundary"
-)]
 fn ipc_group_bodies(source: &str) -> Vec<String> {
     let decommented = decomment(source);
     let mut out = Vec::new();
-    let mut cursor = 0;
-    while let Some(rel) = decommented[cursor..].find("ipc_group!") {
-        let after = cursor + rel + "ipc_group!".len();
-        cursor = after;
-        let rest = decommented[after..].trim_start();
-        let open_at = after + (decommented[after..].len() - rest.len());
-        let close = match rest.chars().next() {
+    let mut rest = decommented.as_str();
+    while let Some((_, after)) = rest.split_once("ipc_group!") {
+        let after = after.trim_start();
+        let mut chars = after.chars();
+        let close = match chars.next() {
             Some('(') => ')',
             Some('[') => ']',
             Some('{') => '}',
             // `macro_rules! ipc_group` itself, or a non-invocation mention.
-            _ => continue,
+            _ => {
+                rest = after;
+                continue;
+            }
         };
-        let body_start = open_at + 1;
-        let Some(end_rel) = decommented[body_start..].find(close) else {
+        let Some((body, more)) = chars.as_str().split_once(close) else {
             break;
         };
-        out.push(decommented[body_start..body_start + end_rel].to_string());
-        cursor = body_start + end_rel;
+        out.push(body.to_string());
+        rest = more;
     }
     out
 }
@@ -371,26 +365,26 @@ fn module_path_of(rel_from_src: &str) -> String {
     p.replace('/', "::")
 }
 
-/// Module paths named in `ipc_registry::GROUPS`, read from the
-/// `crate::<path>::IPC_NAMES` entries of `src/ipc_registry.rs`.
-#[expect(
-    clippy::string_slice,
-    reason = "byte offsets come from `find` on ASCII markers, so every slice is on a char boundary"
-)]
+/// Module paths named in `ipc_registry::GROUPS`, read from its
+/// `crate::<path>::IPC_GROUP` entries in `src/ipc_registry.rs`.
 fn groups_registry_modules() -> BTreeSet<String> {
     let src = fs::read_to_string(crate_root().join("src/ipc_registry.rs"))
         .expect("failed to read src/ipc_registry.rs");
     let decommented = decomment(&src);
+    let pieces: Vec<&str> = decommented.split("::IPC_GROUP").collect();
     let mut out = BTreeSet::new();
-    let mut cursor = 0;
-    while let Some(rel) = decommented[cursor..].find("::IPC_NAMES") {
-        let end = cursor + rel;
-        cursor = end + "::IPC_NAMES".len();
-        let start = decommented[..end]
-            .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
-            .map_or(0, |i| i + 1);
-        if let Some(path) = decommented[start..end].strip_prefix("crate::") {
-            out.insert(path.to_string());
+    // Every piece but the last ends where a `::IPC_GROUP` began; its trailing
+    // path characters are the module path.
+    for piece in pieces.iter().take(pieces.len().saturating_sub(1)) {
+        let mut path: Vec<char> = piece
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        path.reverse();
+        let path: String = path.into_iter().collect();
+        if let Some(module) = path.strip_prefix("crate::") {
+            out.insert(module.to_string());
         }
     }
     out
@@ -493,8 +487,8 @@ fn every_tauri_command_is_registered() {
         unrouted.is_empty(),
         "\nmodule(s) invoke `ipc_group!` but have no entry in `ipc_registry::GROUPS`, \
          so the router never reaches their commands (\"Command not found\" at \
-         runtime): {unrouted:?}\n\nFix: add `(crate::<module>::IPC_NAMES, \
-         crate::<module>::ipc_handle)` to `GROUPS` in src-tauri/src/ipc_registry.rs.\n"
+         runtime): {unrouted:?}\n\nFix: add `crate::<module>::IPC_GROUP` to `GROUPS` \
+         in src-tauri/src/ipc_registry.rs.\n"
     );
     assert!(
         central.len() + grouped.len() > 500,
@@ -574,10 +568,6 @@ fn every_tauri_command_is_registered() {
 /// nowhere, so the attribute is refused outright — in both the
 /// `#[tauri::command(...)]` and the imported `#[command(...)]` spelling, and
 /// across a multi-line attribute.
-#[expect(
-    clippy::string_slice,
-    reason = "byte offsets come from `find` on ASCII markers, so every slice is on a char boundary"
-)]
 #[test]
 fn no_tauri_command_is_renamed() {
     let mut renamed = Vec::new();
@@ -587,13 +577,11 @@ fn no_tauri_command_is_renamed() {
         };
         let src = decomment(&src);
         for marker in ["#[tauri::command(", "#[command("] {
-            let mut cursor = 0;
-            while let Some(rel) = src[cursor..].find(marker) {
-                let start = cursor + rel;
-                let end = src[start..].find(")]").map_or(src.len(), |i| start + i);
-                cursor = start + marker.len();
-                if src[start..end].replace("rename_all", "").contains("rename") {
-                    let line = src[..start].matches('\n').count() + 1;
+            for (start, _) in src.match_indices(marker) {
+                let tail = src.get(start..).unwrap_or_default();
+                let attr = tail.split_once(")]").map_or(tail, |(attr, _)| attr);
+                if attr.replace("rename_all", "").contains("rename") {
+                    let line = src.get(..start).map_or(0, |s| s.matches('\n').count()) + 1;
                     renamed.push(format!("  - {}:{line}", file.display()));
                 }
             }

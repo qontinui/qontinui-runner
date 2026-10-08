@@ -3659,16 +3659,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(std::sync::Arc::new(
             commands::spec_sync_state::SpecSyncStateBus::new(),
         )) // P2 SSE remediation: useSpecSync progress mirror, consumed by /ui-bridge/sdk/spec-sync/{status,stream}
-        // Tauri command handlers are registered via the central
-        // `tauri::generate_handler![...]` block above. Each command module
-        // (`commands/*.rs` and a few subsystem `commands.rs` files) ALSO
-        // exposes a `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` for
-        // future plugin-based registration, but those are not currently
-        // wired — Tauri 2's plugin path requires `plugin:<name>|<cmd>`
-        // invoke prefixes and the frontend invokes commands bare, so the
-        // plugin form was rolled back to the central handler at commit
-        // `1f1d807f6`. The `plugin()` fns are kept as ready-to-go scaffolding
-        // for any future migration that updates the frontend invoke sites.
+        // Tauri command handlers are registered through `.invoke_handler`
+        // above: modules moved onto `crate::ipc_group!` are routed by
+        // `ipc_registry`, the rest by the central `generate_handler!` list
+        // until plan 2026-10-02-split-run-app-invoke-handler moves them too.
+        // The remaining per-module `plugin()` fns are dead — Tauri 2 plugin
+        // commands are reachable only as `plugin:<name>|<cmd>` and the
+        // frontend invokes bare names (rolled back at `1f1d807f6`) — and are
+        // deleted as each module moves.
         .setup(|app| {
             info!("Tauri application setup starting");
 
