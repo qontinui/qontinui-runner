@@ -23,6 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import type { Finding, FindingStatus, FindingSeverity } from "@/types/findings";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("useApiFindings");
 
@@ -155,9 +156,9 @@ export function useApiFindings(options: UseApiFindingsOptions = {}): UseApiFindi
         setCount(list.count ?? list.items?.length ?? 0);
       } catch (err) {
         if (cancelled) return;
-        if ((err as Error).name === "AbortError") return;
+        if (err instanceof Error && err.name === "AbortError") return;
         logger.warn("useApiFindings fetch failed", err);
-        setError(String((err as Error).message ?? err));
+        setError(describeThrown(err, "Failed to load findings"));
         setFindings([]);
       } finally {
         if (!cancelled) setIsLoading(false);
@@ -248,8 +249,8 @@ export function useApiFinding(findingId: string | null): {
         setFinding(body.data);
       } catch (err) {
         if (cancelled) return;
-        if ((err as Error).name === "AbortError") return;
-        setError(String((err as Error).message ?? err));
+        if (err instanceof Error && err.name === "AbortError") return;
+        setError(describeThrown(err, "Failed to load finding"));
         setFinding(null);
       } finally {
         if (!cancelled) setIsLoading(false);

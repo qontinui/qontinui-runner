@@ -32,6 +32,7 @@ import {
   type RegisterAppPayload,
 } from "@/hooks/useAppDiscovery";
 import { emitToast, useUIComponent } from "@qontinui/ui-bridge";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // ProcessConfig type (from process manager)
@@ -924,7 +925,7 @@ function AddApplicationForm({
       } catch (err) {
         setStatusAndEmit({
           kind: "error",
-          message: `Probe failed (${(err as Error).message}). Try "Add without probing".`,
+          message: `Probe failed (${describeThrown(err, "no reason given")}). Try "Add without probing".`,
         });
         return;
       }

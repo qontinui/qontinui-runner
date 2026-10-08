@@ -26,6 +26,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
 import { createLogger } from "../logger";
+import { describeThrown } from "../utils";
 
 const log = createLogger("scripted-output-handler.telemetry");
 
@@ -56,15 +57,10 @@ export function emitScriptedOutputEvent(
     metadata,
     taskRunId: taskRunId ?? null,
   }).catch((err) => {
-    log.debug("scripted-output telemetry write failed for %s: %s", name, describeError(err));
+    log.debug(
+      "scripted-output telemetry write failed for %s: %s",
+      name,
+      describeThrown(err, "unknown error"),
+    );
   });
-}
-
-function describeError(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  try {
-    return String(err);
-  } catch {
-    return "<unknown error>";
-  }
 }
