@@ -277,7 +277,15 @@ fn respond(config: &Config, pairs: &HashMap<String, String>) -> Option<String> {
 fn main() -> ExitCode {
     // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
     // defaults exported before anything here reads a path; no-op otherwise.
-    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
+    // FAIL OPEN: every `git` call in a registered repo runs this helper, so a
+    // refused root answers git's "no credential" (empty output, exit 0) rather
+    // than an exit 78 git would surface as a failed fetch / push.
+    if let Some(line) = qontinui_runner_lib::instance_env::apply_instance_root_env_fail_open(
+        "qontinui-git-credential",
+    ) {
+        eprintln!("{line}");
+        return ExitCode::SUCCESS;
+    }
     let args: Vec<String> = std::env::args().collect();
 
     // Git calls the credential helper with an action: get, store, or erase.
