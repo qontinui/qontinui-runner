@@ -1618,6 +1618,11 @@ static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
     qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
 
 fn main() {
+    // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env
+    // and roots its locations BEFORE anything below reads a path; a no-op for
+    // the primary. First, while still single-threaded — see the fn's doc.
+    instance::enforce_instance_root_at_startup();
+
     // The capability manifest (`--capability-manifest[ --json]`,
     // `--capability-manifest-doc`). Same posture as the `env …` CLI below and
     // for the same reason: it must run BEFORE the single-instance plugin, or a
