@@ -425,7 +425,15 @@ fn provision_fleet_skills_into(
             let dst = skills_dir.join(&relative);
             // Before `create_dir_all`: a skill whose every file is tracked must
             // not leave a new empty directory in the repository's working tree.
-            if let Some(reason) = tracked.skip_reason(&dst, &relative) {
+            // A per-file ProbeUnknownInRepo keep is dropped HERE: the whole-skill
+            // decision above already chose to write this skill (its SKILL.md is
+            // absent), and keeping some of its files would mix builds — exactly
+            // what the whole-skill keep prevents. A GitTracked skip still holds.
+            let reason = match tracked.skip_reason(&dst, &relative) {
+                Some(capability_manifest::SkipReason::ProbeUnknownInRepo) => None,
+                other => other,
+            };
+            if let Some(reason) = reason {
                 info!(
                     "fleet_skills: skipping {} — {}; overwriting it could silently \
                      replace the enclosing repo's own content and dirty its tree",
@@ -607,8 +615,8 @@ mod tests {
     }
 
     /// UNKNOWN inside a repository (a linked-worktree `.git` FILE pointing at a
-    /// gitdir that does not exist, so `git ls-files` fails): an EXISTING skill
-    /// directory is kept WHOLE — none of its files is written, so a session can
+    /// gitdir that does not exist, so `git ls-files` fails): a skill whose
+    /// `SKILL.md` already exists is kept WHOLE — none of its files is written, so a session can
     /// never get an old `SKILL.md` beside new helpers — while skills absent on
     /// disk are still provisioned. Plan
     /// `2026-10-04-shared-checkouts-pull-deterministically` Phase 2.
