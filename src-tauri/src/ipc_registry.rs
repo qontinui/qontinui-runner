@@ -42,6 +42,11 @@ use tauri::Wry;
 /// A group's dispatch entry point.
 pub(crate) type GroupHandler = fn(Invoke<Wry>) -> bool;
 
+/// One `GROUPS` entry: a module's command names and the handler that owns
+/// them. `ipc_group!` emits it as the module's `IPC_GROUP`, so names and
+/// handler can never be paired across two different modules.
+pub(crate) type GroupEntry = (&'static [&'static str], GroupHandler);
+
 /// Declare the Tauri commands a module owns. Invoke it once, in the module
 /// that defines the commands, with the bare fn names:
 ///
@@ -68,17 +73,15 @@ macro_rules! ipc_group {
                 ::tauri::generate_handler![$($cmd),+];
             handler(invoke)
         }
+
+        /// This module's `ipc_registry::GROUPS` entry.
+        pub(crate) const IPC_GROUP: $crate::ipc_registry::GroupEntry = (IPC_NAMES, ipc_handle);
     };
 }
 
-/// Every command group, as `(names, handler)`. One entry per module that
+/// Every command group. One `crate::<module>::IPC_GROUP` per module that
 /// invokes [`ipc_group!`](crate::ipc_group).
-const GROUPS: &[(&[&str], GroupHandler)] = &[
-    (
-        crate::commands::meta_optimizer::IPC_NAMES,
-        crate::commands::meta_optimizer::ipc_handle,
-    ),
-];
+const GROUPS: &[GroupEntry] = &[crate::commands::meta_optimizer::IPC_GROUP];
 
 /// Name -> owning group's handler, built once on first use.
 fn routes() -> &'static HashMap<&'static str, GroupHandler> {
@@ -123,7 +126,10 @@ mod tests {
             .flat_map(|(names, _)| names.iter().copied())
             .filter(|name| !seen.insert(*name))
             .collect();
-        assert!(dupes.is_empty(), "command names registered by more than one group: {dupes:?}");
+        assert!(
+            dupes.is_empty(),
+            "command names registered by more than one group: {dupes:?}"
+        );
     }
 
     #[test]
