@@ -2081,6 +2081,51 @@ mod tests {
         }
     }
 
+    /// The index of the `fn` keyword whose body (its first top-level `{…}`
+    /// after the signature) contains leaf `at`, innermost first; `None` when
+    /// `at` is inside no fn body at all.
+    fn enclosing_fn(leaves: &[Leaf], at: usize) -> Option<usize> {
+        (0..at)
+            .rev()
+            .filter(|&j| leaves[j].is_ident("fn"))
+            .find(|&j| {
+                // Find the body's opening brace: the first `{` at paren/bracket
+                // depth 0 before any `;` at that depth (a bodiless `fn x();`).
+                let mut depth = 0i32;
+                let mut open = None;
+                for (k, leaf) in leaves.iter().enumerate().skip(j + 1) {
+                    if leaf.is_open(Delimiter::Parenthesis) || leaf.is_open(Delimiter::Bracket) {
+                        depth += 1;
+                    } else if leaf.is_close(Delimiter::Parenthesis)
+                        || leaf.is_close(Delimiter::Bracket)
+                    {
+                        depth -= 1;
+                    } else if depth == 0 && leaf.is_punct(';') {
+                        return false;
+                    } else if depth == 0 && leaf.is_open(Delimiter::Brace) {
+                        open = Some(k);
+                        break;
+                    }
+                }
+                let Some(open) = open else { return false };
+                if open > at {
+                    return false;
+                }
+                let mut braces = 0i32;
+                for (k, leaf) in leaves.iter().enumerate().skip(open) {
+                    if leaf.is_open(Delimiter::Brace) {
+                        braces += 1;
+                    } else if leaf.is_close(Delimiter::Brace) {
+                        braces -= 1;
+                        if braces == 0 {
+                            return k > at;
+                        }
+                    }
+                }
+                false
+            })
+    }
+
     /// Drift guard (c), plan
     /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
     /// D2: keychain service names are machine-wide, so an ungated entry lets a
@@ -2088,8 +2133,9 @@ mod tests {
     /// code:
     ///
     /// - every `Entry::new*` (`new`, `new_with_target`, `new_with_credential`, …)
-    ///   names [`KEYCHAIN_GATE`] — or its file's [`KEYCHAIN_GATE_EXCEPTIONS`]
-    ///   gate — in the same fn, BEFORE the entry is built;
+    ///   sits inside a fn body (never a `static` / `Lazy` initialiser) and names
+    ///   [`KEYCHAIN_GATE`] — or its file's [`KEYCHAIN_GATE_EXCEPTIONS`] gate — in
+    ///   that fn, BEFORE the entry is built;
     /// - nothing swaps the credential builder (`set_default_credential_builder`
     ///   / `default_credential_builder`), which would re-route every entry;
     /// - nothing aliases the crate or its items with `use keyring… as …`, which
@@ -2141,11 +2187,17 @@ mod tests {
                 if let Some((f, _, _)) = exception {
                     exceptions_used.insert(f);
                 }
-                // The enclosing fn: the nearest preceding `fn` keyword.
-                let fn_start = (0..i).rev().find(|&j| leaves[j].is_ident("fn"));
-                let gated =
-                    fn_start.is_some_and(|start| leaves[start..i].iter().any(|l| l.is_ident(gate)));
-                if !gated {
+                // The enclosing fn: the nearest preceding `fn` whose BODY
+                // contains this call. None (a `static` / `Lazy` initialiser, a
+                // `const`) is a violation in itself: there is no fn to gate in.
+                let Some(fn_start) = enclosing_fn(&leaves, i) else {
+                    violations.push(format!(
+                        "{rel}:{} Entry::new* outside any fn (a static initialiser cannot be gated)",
+                        leaves[i].line
+                    ));
+                    continue;
+                };
+                if !leaves[fn_start..i].iter().any(|l| l.is_ident(gate)) {
                     violations.push(format!(
                         "{rel}:{} Entry::new* without `{gate}`",
                         leaves[i].line
@@ -2174,5 +2226,32 @@ mod tests {
             stale.is_empty(),
             "stale KEYCHAIN_GATE_EXCEPTIONS entries: {stale:?}"
         );
+    }
+
+    /// The scope finder behind the keychain guard: an `Entry::new` in a
+    /// `static` initialiser has NO enclosing fn (so the guard refuses it), and
+    /// one in a fn body is attributed to that fn, not to an earlier one.
+    #[test]
+    fn enclosing_fn_sees_fn_bodies_and_not_static_initialisers() {
+        let src = r#"
+            fn earlier() { let _ = 1; }
+            static E: Lazy<Entry> = Lazy::new(|| Entry::new("s", "k").unwrap());
+            trait T { fn bodiless(&self); }
+            fn later(x: u8) -> u8 { if os_keychain_allowed() { Entry::new("s", "k"); } x }
+        "#;
+        let leaves = prod_tokens(src, "synthetic.rs").leaves;
+        let entries: Vec<usize> = (0..leaves.len())
+            .filter(|&i| {
+                leaves[i].is_ident("Entry") && leaves.get(i + 3).is_some_and(|l| l.is_ident("new"))
+            })
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            enclosing_fn(&leaves, entries[0]),
+            None,
+            "a static initialiser"
+        );
+        let in_later = enclosing_fn(&leaves, entries[1]).expect("inside `later`");
+        assert!(leaves[in_later + 1].is_ident("later"));
     }
 }

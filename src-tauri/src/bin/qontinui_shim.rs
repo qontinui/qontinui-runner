@@ -125,7 +125,16 @@ const PROVISION_SESSION_PATH: &str = "/coord-mcp/provision-session";
 fn main() -> std::process::ExitCode {
     // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
     // defaults exported before anything here reads a path; no-op otherwise.
-    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
+    // FAIL OPEN (the hard invariant above): a refused root never exits — it is
+    // reported and the stub becomes a pure passthrough via the recursion guard,
+    // so no runner is contacted and the real tool still runs. Single-threaded
+    // here, so setting the guard cannot race a reader.
+    if let Some(line) =
+        qontinui_runner_lib::instance_env::apply_instance_root_env_fail_open("qontinui-shim")
+    {
+        let _ = writeln!(std::io::stderr(), "{line}");
+        env::set_var(GUARD_ENV, "1");
+    }
     // argv[0] → which tool we are impersonating. Fail-open to passthrough on
     // anything we don't recognize.
     let raw_args: Vec<String> = env::args().collect();
