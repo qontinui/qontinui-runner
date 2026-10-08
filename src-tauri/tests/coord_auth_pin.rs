@@ -177,6 +177,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("credential_helper.rs", "device-jwt-required", 1),
     ("dirty_poller/mod.rs", "agent-jwt", 1),
     ("env_agent/enroll.rs", "not-coord", 1),
+    // Plan 2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity…:
+    // `POST /coord/computers/report`, the resource sample's sibling — same
+    // device-JWT-or-skip shape (`read_usable_device_jwt`, early return
+    // without one), so it is never sent anonymously.
+    ("fleet/computer/mod.rs", "device-jwt-required", 1),
     ("fleet/resource_sample.rs", "device-jwt-required", 1),
     // Relocated, not added: this is the same single loopback POST telling the
     // PRIMARY instance that a secondary is stopping. It moved out of `main.rs`

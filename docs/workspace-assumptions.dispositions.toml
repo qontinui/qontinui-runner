@@ -529,3 +529,33 @@ file = "src/reflection/workflow.rs"
 symbol = "build_ui_bridge_completion_steps"
 disposition = "unreviewed"
 note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/services.rs"
+symbol = "sc"
+disposition = "fallback_correct"
+note = "The Windows service watcher's `sc query`/`sc qc` probe, inside `mod windows` and called only from cfg(windows) code. On Linux the systemd collector in the same file watches the units; other non-Windows targets report no service scan (units unknown, nothing deleted)."
+reviewed = [
+    "cfg(windows)-only fn `sc` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/wsl_guest.rs"
+symbol = "collect"
+disposition = "fallback_correct"
+note = "Probes the WSL2 guests of a Windows host; its only caller (fleet/computer/mod.rs) is cfg(windows). A WSL guest exists only under a Windows host, and a Linux box reports itself through the host collector."
+reviewed = [
+    "cfg(windows)-only fn `collect` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/wsl_guest.rs"
+symbol = "running"
+disposition = "fallback_correct"
+note = "Lists running WSL distros for `collect` (`wsl --list --running`); Windows-only by nature, reached only through the cfg(windows) caller of `collect`."
+reviewed = [
+    "cfg(windows)-only fn `running` has no cfg(not(windows)) sibling in this file",
+]

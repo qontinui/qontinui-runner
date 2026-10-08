@@ -556,6 +556,33 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/fleet/computer/services.rs",
+      "symbol": "sc",
+      "excerpt": "cfg(windows)-only fn `sc` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows service watcher's `sc query`/`sc qc` probe, inside `mod windows` and called only from cfg(windows) code. On Linux the systemd collector in the same file watches the units; other non-Windows targets report no service scan (units unknown, nothing deleted)."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/computer/wsl_guest.rs",
+      "symbol": "collect",
+      "excerpt": "cfg(windows)-only fn `collect` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Probes the WSL2 guests of a Windows host; its only caller (fleet/computer/mod.rs) is cfg(windows). A WSL guest exists only under a Windows host, and a Linux box reports itself through the host collector."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/computer/wsl_guest.rs",
+      "symbol": "running",
+      "excerpt": "cfg(windows)-only fn `running` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Lists running WSL distros for `collect` (`wsl --list --running`); Windows-only by nature, reached only through the cfg(windows) caller of `collect`."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/fleet/resource_sample.rs",
       "symbol": "attach_wsl_disk",
       "excerpt": "cfg(windows)-only fn `attach_wsl_disk` has no cfg(not(windows)) sibling in this file",
