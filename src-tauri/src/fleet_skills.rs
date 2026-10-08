@@ -186,9 +186,10 @@ fn collect_text_files(
 /// propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_skills_into`] and
-/// [`crate::provision_guard`]). **A tracked file outranks a served override**:
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one (then an existing skill
+/// directory is kept whole); both are skipped (see
+/// [`provision_fleet_skills_into`] and [`crate::provision_guard`]). **A tracked file outranks a served override**:
 /// the account layer decides what this binary would write, not whether it may
 /// replace a repository's committed content.
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
@@ -391,6 +392,23 @@ fn provision_fleet_skills_into(
             continue;
         }
 
+        // UNKNOWN inside a repository: keep an existing skill WHOLE. Per-file
+        // keeping would write only the files new in this build beside the old
+        // ones and hand the session a skill that disagrees with itself (an old
+        // SKILL.md naming helpers that changed). An absent skill is written.
+        if tracked.is_unknown_in_repo() && skills_dir.join(skill.dir_name()).exists() {
+            info!(
+                "fleet_skills: keeping skill {:?} as it is on disk — {}",
+                skill.name,
+                capability_manifest::SkipReason::ProbeUnknownInRepo.describe()
+            );
+            out.skip(
+                format!("{}/*", skill.dir_name()),
+                capability_manifest::SkipReason::ProbeUnknownInRepo,
+            );
+            continue;
+        }
+
         for (rel_path, text) in &skill.files {
             // `include_dir` and the `files` map share one key space, relative to
             // the skills dir — which is exactly what `TrackedPaths` reports.
@@ -577,6 +595,49 @@ mod tests {
             restored, b"CLOBBERED",
             "re-provisioning must overwrite a modified file, not leave it"
         );
+    }
+
+    /// UNKNOWN inside a repository (a linked-worktree `.git` FILE pointing at a
+    /// gitdir that does not exist, so `git ls-files` fails): an EXISTING skill
+    /// directory is kept WHOLE — none of its files is written, so a session can
+    /// never get an old `SKILL.md` beside new helpers — while skills absent on
+    /// disk are still provisioned. Plan
+    /// `2026-10-04-shared-checkouts-pull-deterministically` Phase 2.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_an_existing_skill_whole() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-test\n",
+        )
+        .unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let kept_dir = skills_dir.join("coord-revive");
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        let manifest = kept_dir.join(SKILL_MANIFEST);
+        std::fs::write(&manifest, b"# an older skill body\n").unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+            .expect("provision");
+
+        assert!(
+            out.skipped.iter().any(|s| s.unit == "coord-revive/*"
+                && s.reason == crate::capability_manifest::SkipReason::ProbeUnknownInRepo),
+            "the existing skill is kept whole, got {:?}",
+            out.skipped
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "# an older skill body\n",
+            "an existing skill file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            std::fs::read_dir(&kept_dir).unwrap().count(),
+            1,
+            "no new file may be written into a kept skill"
+        );
+        assert!(out.written > 0, "absent skills are still provisioned");
     }
 
     /// A destination that is TRACKED by the enclosing git repository must be

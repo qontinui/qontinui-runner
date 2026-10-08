@@ -648,9 +648,9 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// broken cache each degrade one step and warn, never propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_commands_into`] and
-/// [`crate::provision_guard`]).
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one; both are skipped (see
+/// [`provision_fleet_commands_into`] and [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");

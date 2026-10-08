@@ -80,6 +80,14 @@
 //!   not refreshed — the session gets the copy already on disk rather than the
 //!   binary's. Missing files are still written, so no session loses a command
 //!   it would otherwise have had, and the spawn still never aborts.
+//! - A failure that is not transient — git's `safe.directory` "dubious
+//!   ownership" refusal (exit 128) is one — puts the repository in this arm on
+//!   EVERY spawn, so its provisioned files stop refreshing across runner
+//!   upgrades until the cause is fixed. It is visible, not silent: each pass
+//!   logs a `warn` and records `probe_unknown_in_repo` skips in its report.
+//! - `fleet_skills` applies this arm per SKILL, not per file: a skill whose
+//!   directory already exists is kept whole, so a session never gets an old
+//!   `SKILL.md` beside new helper files.
 //! - The probe failure is logged once per probe at `warn`, naming the root and
 //!   which arm it resolved to, so an UNKNOWN never passes silently.
 //!
@@ -101,7 +109,7 @@ use crate::capability_manifest::SkipReason;
 
 /// Wall-clock bound on the one `git ls-files` the probe runs. Generous relative
 /// to a local index read (milliseconds), tight relative to a spawn the operator
-/// is waiting on. Expiry is a fail-soft "nothing tracked", never an error.
+/// is waiting on. Expiry is a fail-soft UNKNOWN (see the module doc), never an error.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the probe checks whether the child has exited.
@@ -111,9 +119,10 @@ const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// RELATIVE to that directory.
 ///
 /// Built once per provisioning pass by [`TrackedPaths::probe`]. An empty set is
-/// the fail-soft answer to every failure, and is indistinguishable from a
-/// genuinely untracked directory — deliberately, since both mean "write as
-/// before".
+/// the fail-soft answer to every failure. Outside a repository it is
+/// indistinguishable from a genuinely untracked directory — deliberately, since
+/// both mean "write as before"; inside one, a failure also sets
+/// `unknown_in_repo`, which keeps existing destinations.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TrackedPaths {
     relative: HashSet<PathBuf>,
@@ -170,7 +179,6 @@ impl TrackedPaths {
     }
 
     /// True iff the probe could not answer for a root inside a repository.
-    #[cfg(test)]
     pub(crate) fn is_unknown_in_repo(&self) -> bool {
         self.unknown_in_repo
     }
@@ -180,8 +188,9 @@ impl TrackedPaths {
         self.relative.contains(relative)
     }
 
-    /// True iff `dst` should be SKIPPED: it already exists on disk AND git
-    /// tracks it. `relative` is `dst`'s path relative to the probed root.
+    /// True iff `dst` should be SKIPPED: it already exists on disk AND either git
+    /// tracks it or the probe was UNKNOWN inside a repository. `relative` is
+    /// `dst`'s path relative to the probed root.
     ///
     /// The existence half matters because a tracked path the user has DELETED
     /// is not content this guard can clobber, and skipping it would leave the
