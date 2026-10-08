@@ -97,6 +97,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use crate::capability_manifest::SkipReason;
+
 /// Wall-clock bound on the one `git ls-files` the probe runs. Generous relative
 /// to a local index read (milliseconds), tight relative to a spawn the operator
 /// is waiting on. Expiry is a fail-soft "nothing tracked", never an error.
@@ -193,7 +195,25 @@ impl TrackedPaths {
     /// skipped whether or not it is tracked: nothing could say it is safe to
     /// overwrite. An absent `dst` is still written.
     pub(crate) fn should_skip(&self, dst: &Path, relative: &Path) -> bool {
-        dst.exists() && (self.unknown_in_repo || self.contains(relative))
+        self.skip_reason(dst, relative).is_some()
+    }
+
+    /// Why `dst` is skipped, or `None` when it should be written. The two arms
+    /// of [`Self::should_skip`] carry DIFFERENT reasons into the provisioning
+    /// report: a tracked destination is [`SkipReason::GitTracked`], an existing
+    /// destination kept only because the probe could not answer inside a
+    /// repository is [`SkipReason::ProbeUnknownInRepo`].
+    pub(crate) fn skip_reason(&self, dst: &Path, relative: &Path) -> Option<SkipReason> {
+        if !dst.exists() {
+            return None;
+        }
+        if self.contains(relative) {
+            Some(SkipReason::GitTracked)
+        } else if self.unknown_in_repo {
+            Some(SkipReason::ProbeUnknownInRepo)
+        } else {
+            None
+        }
     }
 }
 

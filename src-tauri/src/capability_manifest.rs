@@ -968,6 +968,12 @@ pub enum SkipReason {
     /// The intended outcome, not a fault — see [`crate::provision_guard`] — but
     /// it still means the session did not get this unit.
     GitTracked,
+    /// The destination exists, the tracked-file probe could NOT answer (git
+    /// missing, failed or timed out), and the destination sits inside a git
+    /// repository — so it was kept rather than overwritten, since nothing could
+    /// say it is safe to replace. See [`crate::provision_guard`]'s "UNKNOWN
+    /// inside a repository" section. Absent destinations are still written.
+    ProbeUnknownInRepo,
     /// The write itself failed. Fail-soft: the pass continues and the spawn
     /// proceeds; the session simply lacks this unit.
     WriteFailed(String),
@@ -994,6 +1000,7 @@ impl SkipReason {
     pub fn wire(&self) -> &'static str {
         match self {
             SkipReason::GitTracked => "git_tracked",
+            SkipReason::ProbeUnknownInRepo => "probe_unknown_in_repo",
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
@@ -1007,6 +1014,9 @@ impl SkipReason {
             SkipReason::GitTracked => {
                 "tracked by the enclosing git repository — left alone deliberately".to_string()
             }
+            SkipReason::ProbeUnknownInRepo => "kept: inside a git repository whose tracked-file \
+                 probe could not answer, so the existing file was not overwritten"
+                .to_string(),
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),

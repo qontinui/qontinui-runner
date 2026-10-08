@@ -398,17 +398,14 @@ fn provision_fleet_skills_into(
             let dst = skills_dir.join(&relative);
             // Before `create_dir_all`: a skill whose every file is tracked must
             // not leave a new empty directory in the repository's working tree.
-            if tracked.should_skip(&dst, &relative) {
+            if let Some(reason) = tracked.skip_reason(&dst, &relative) {
                 info!(
-                    "fleet_skills: skipping {} — it is tracked by the enclosing git \
-                     repository, and overwriting it would silently replace that repo's \
-                     own content and dirty its tree",
-                    dst.display()
+                    "fleet_skills: skipping {} — {}; overwriting it could silently \
+                     replace the enclosing repo's own content and dirty its tree",
+                    dst.display(),
+                    reason.describe()
                 );
-                out.skip(
-                    relative.display().to_string(),
-                    capability_manifest::SkipReason::GitTracked,
-                );
+                out.skip(relative.display().to_string(), reason);
                 continue;
             }
             // Per-FILE IO failures are skips, never `?`. Propagating here would
