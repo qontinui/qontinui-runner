@@ -128,11 +128,16 @@ pub struct LiveClaudeSession {
     pub kind: String,
     pub started_at: i64,
     pub updated_at: i64,
-    /// Ready-to-run: `cd '<dir>' && <wrapper> --resume <id>`.
+    /// Ready-to-run, from the shared
+    /// [`crate::session::session_ledger::resume_command_for`]:
+    /// `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>`, the
+    /// config dir being the one this registry file lives under.
     ///
-    /// The `cd` is **not** cosmetic — Claude Code scopes sessions by project
-    /// directory, so resuming from the wrong cwd does not find the session.
-    pub resume_command: String,
+    /// `None` when the row carries no `cwd` (or a path that cannot be quoted
+    /// safely): the `cd` is **not** cosmetic — Claude Code scopes sessions by
+    /// project directory, so a resume from the wrong cwd does not find the
+    /// session — and the line is omitted rather than guessed.
+    pub resume_command: Option<String>,
 }
 
 impl LiveClaudeSession {
@@ -180,14 +185,11 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     // Normalize separators so the emitted `cd` works verbatim in the POSIX-ish
     // shells the operator pastes into (Git Bash, the runner's own PTY).
     let working_dir = raw.cwd.unwrap_or_default().replace('\\', "/");
-    let resume_command = if working_dir.is_empty() {
-        format!("{} --resume {}", account.wrapper, raw.session_id)
-    } else {
-        format!(
-            "cd '{}' && {} --resume {}",
-            working_dir, account.wrapper, raw.session_id
-        )
-    };
+    let resume_command = crate::session::session_ledger::resume_command_for(
+        Some(working_dir.as_str()),
+        config_dir.to_str(),
+        &raw.session_id,
+    );
     Some(LiveClaudeSession {
         session_id: raw.session_id,
         name,
@@ -366,8 +368,11 @@ mod tests {
         assert_eq!(s.working_dir, "D:/qontinui-root");
         assert_eq!(s.status, "idle");
         assert_eq!(
-            s.resume_command,
-            "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            s.resume_command.as_deref(),
+            Some(
+                "cd \"D:/qontinui-root\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-paktis\" \
+                 claude --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            )
         );
     }
 
@@ -535,7 +540,10 @@ mod tests {
         let s = parse_registry_file(nameless, Path::new(".claude-gmail")).unwrap();
         assert_eq!(s.session_id, "s");
         assert_eq!(s.name, "");
-        assert_eq!(s.resume_command, "cd '/x' && clg --resume s");
+        assert_eq!(
+            s.resume_command.as_deref(),
+            Some("cd \"/x\" && CLAUDE_CONFIG_DIR=\".claude-gmail\" claude --resume s")
+        );
     }
 
     #[test]
@@ -572,11 +580,32 @@ mod tests {
         assert_eq!(pids.len(), 1);
     }
 
+    /// No `cwd` ⇒ no resume line: a resume from the wrong directory cannot
+    /// find the session, so the line is omitted rather than guessed. The row
+    /// itself is kept — it still proves liveness.
     #[test]
-    fn omits_cd_when_cwd_is_absent() {
+    fn omits_the_resume_line_when_cwd_is_absent() {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n"}"#;
         let s = parse_registry_file(json, Path::new(".claude-gmail")).unwrap();
-        assert_eq!(s.resume_command, "clg --resume abc");
+        assert_eq!(s.session_id, "abc");
+        assert_eq!(s.resume_command, None);
+    }
+
+    /// An account outside the five the wrapper table knew resumes under its
+    /// own config dir — the wrapper table gave it a bare `claude`, i.e. the
+    /// DEFAULT account.
+    #[test]
+    fn an_account_outside_the_wrapper_table_resumes_under_its_own_dir() {
+        let s = parse_registry_file(SAMPLE, Path::new("C:/claude/.claude-niklas")).unwrap();
+        assert_eq!(s.account.label, "niklas");
+        assert_eq!(s.account.wrapper, "claude");
+        assert_eq!(
+            s.resume_command.as_deref(),
+            Some(
+                "cd \"D:/qontinui-root\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-niklas\" \
+                 claude --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            )
+        );
     }
 
     #[test]

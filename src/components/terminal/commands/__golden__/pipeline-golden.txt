@@ -185,7 +185,7 @@
 /conduct 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 /conduct 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 /conduct 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
-/copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy names "1 gmail fix the bug"	none	-	null	none	-
 /copy names "1 gmail fix the bug" --tenant	none	-	null	none	-
 /copy names "3 best"	none	-	null	none	-
@@ -195,7 +195,7 @@
 /copy names 1 gmail fix the bug --tenant	none	-	null	none	-
 /copy names 3 best	none	-	null	none	-
 /copy names 3 best --tenant	none	-	null	none	-
-/copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy sessions "1 gmail fix the bug"	none	-	null	none	-
 /copy sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
 /copy sessions "3 best"	none	-	null	none	-
@@ -205,7 +205,7 @@
 /copy sessions 1 gmail fix the bug --tenant	none	-	null	none	-
 /copy sessions 3 best	none	-	null	none	-
 /copy sessions 3 best --tenant	none	-	null	none	-
-/copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 /copy-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 /copy-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -215,7 +215,7 @@
 /copy-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound	-
 /copy-names 3 best	literal	terminal.copy-names	[]	unbound	-
 /copy-names 3 best --tenant	literal	terminal.copy-names	[]	unbound	-
-/copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy-sessions "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 /copy-sessions "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 /copy-sessions "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -809,7 +809,7 @@
 /select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 /select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 /select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /session names "1 gmail fix the bug"	none	-	null	none	-
 /session names "1 gmail fix the bug" --tenant	none	-	null	none	-
 /session names "3 best"	none	-	null	none	-
@@ -819,7 +819,7 @@
 /session names 1 gmail fix the bug --tenant	none	-	null	none	-
 /session names 3 best	none	-	null	none	-
 /session names 3 best --tenant	none	-	null	none	-
-/session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /session-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 /session-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 /session-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -1373,7 +1373,7 @@ conduct 1 gmail fix the bug	literal	terminal.orchestrate	[["goal","1 gmail fix t
 conduct 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 conduct 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 conduct 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
-copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy names "1 gmail fix the bug"	none	-	null	none	-
 copy names "1 gmail fix the bug" --tenant	none	-	null	none	-
 copy names "3 best"	none	-	null	none	-
@@ -1383,7 +1383,7 @@ copy names 1 gmail fix the bug	none	-	null	none	-
 copy names 1 gmail fix the bug --tenant	none	-	null	none	-
 copy names 3 best	none	-	null	none	-
 copy names 3 best --tenant	none	-	null	none	-
-copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy sessions "1 gmail fix the bug"	none	-	null	none	-
 copy sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
 copy sessions "3 best"	none	-	null	none	-
@@ -1393,7 +1393,7 @@ copy sessions 1 gmail fix the bug	none	-	null	none	-
 copy sessions 1 gmail fix the bug --tenant	none	-	null	none	-
 copy sessions 3 best	none	-	null	none	-
 copy sessions 3 best --tenant	none	-	null	none	-
-copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 copy-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 copy-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -1403,7 +1403,7 @@ copy-names 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound	-
 copy-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound	-
 copy-names 3 best	literal	terminal.copy-names	[]	unbound	-
 copy-names 3 best --tenant	literal	terminal.copy-names	[]	unbound	-
-copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy-sessions "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 copy-sessions "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 copy-sessions "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -1997,7 +1997,7 @@ select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 g
 select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 session names "1 gmail fix the bug"	none	-	null	none	-
 session names "1 gmail fix the bug" --tenant	none	-	null	none	-
 session names "3 best"	none	-	null	none	-
@@ -2007,7 +2007,7 @@ session names 1 gmail fix the bug	none	-	null	none	-
 session names 1 gmail fix the bug --tenant	none	-	null	none	-
 session names 3 best	none	-	null	none	-
 session names 3 best --tenant	none	-	null	none	-
-session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 session-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 session-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 session-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -2427,8 +2427,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.close [valid] do the thing	ai	terminal.close	[["tabId","tab-1"],["zone",1]]	error:unknown-tab	error /close: "tab-1" is not an open tab id
 «ai» terminal.copy-names [alien] do the thing	ai	terminal.copy-names	[["nonsense","x"]]	refused	error /copy-names: takes no arguments (got "nonsense")
 «ai» terminal.copy-names [bool] do the thing	ai	terminal.copy-names	[]	refused	error /copy-names: "count" must be text or a number (got true/false)
-«ai» terminal.copy-names [empty] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
-«ai» terminal.copy-names [valid] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+«ai» terminal.copy-names [empty] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
+«ai» terminal.copy-names [valid] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 «ai» terminal.doc-finder [alien] do the thing	ai	terminal.doc-finder	[["nonsense","x"]]	refused	error /doc-finder: takes no arguments (got "nonsense")
 «ai» terminal.doc-finder [bool] do the thing	ai	terminal.doc-finder	[]	refused	error /doc-finder: "count" must be text or a number (got true/false)
 «ai» terminal.doc-finder [empty] do the thing	ai	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
@@ -2587,8 +2587,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.close [valid]	direct	terminal.close	[["tabId","tab-1"],["zone",1]]	threw	error /close: "tab-1" is not an open tab id
 «direct» terminal.copy-names [alien]	direct	terminal.copy-names	[["nonsense","x"]]	threw	error /copy-names: takes no arguments (got "nonsense")
 «direct» terminal.copy-names [bool]	direct	terminal.copy-names	[["count",true]]	threw	error /copy-names: "count" must be text or a number (got true/false)
-«direct» terminal.copy-names [empty]	direct	terminal.copy-names	[]	threw	error /copy-names: no live Claude Code sessions found
-«direct» terminal.copy-names [valid]	direct	terminal.copy-names	[]	threw	error /copy-names: no live Claude Code sessions found
+«direct» terminal.copy-names [empty]	direct	terminal.copy-names	[]	threw	error /copy-names: no sessions on the runner's roster
+«direct» terminal.copy-names [valid]	direct	terminal.copy-names	[]	threw	error /copy-names: no sessions on the runner's roster
 «direct» terminal.doc-finder [alien]	direct	terminal.doc-finder	[["nonsense","x"]]	threw	error /doc-finder: takes no arguments (got "nonsense")
 «direct» terminal.doc-finder [bool]	direct	terminal.doc-finder	[["count",true]]	threw	error /doc-finder: "count" must be text or a number (got true/false)
 «direct» terminal.doc-finder [empty]	direct	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder

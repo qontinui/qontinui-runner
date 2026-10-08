@@ -14128,6 +14128,7 @@ mod self_id_chain_tests {
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,

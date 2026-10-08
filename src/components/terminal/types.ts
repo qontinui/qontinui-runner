@@ -27,8 +27,17 @@ export interface TerminalSessionRecord {
   pageId: string;
   /** Recorded zone index (-1 when unassigned). */
   zoneIndex: number;
-  /** Tab title at record time. */
+  /** Tab title at record time — the runner tab label, often just `"claude"`. */
   title?: string;
+  /**
+   * The in-provider session name (`/rename`, or Claude Code's own auto-name).
+   * The restored tab is named by `displayNameOf` (`src/lib/session-ledger.ts`)
+   * over this, `nameSource` and `title`.
+   */
+  sessionName?: string;
+  /** Provenance of `sessionName`: `"derived"` = Claude Code's auto-name;
+   * anything else (or absent) = operator-chosen. */
+  nameSource?: string;
   /** Ephemeral terminal/tab id at the time the record was last written. */
   terminalId: string;
   /**
@@ -80,6 +89,12 @@ export interface TerminalSessionRecord {
    */
   restorePendingAt?: number;
   /**
+   * Epoch ms of the row's original last-seen when it started waiting for an
+   * account choice (backend-owned). The liveness poll holds it no longer than
+   * the open-row prune age (7 days) from this instant.
+   */
+  awaitingAccountSince?: number;
+  /**
    * Epoch ms a provider's SessionStart hook (or the process-start-anchored
    * reconcile backstop) CONFIRMED that a real provider session actually
    * started in this terminal. `undefined`/absent ⇒ PROVISIONAL — a spawn-time
@@ -108,4 +123,22 @@ export interface TerminalSessionRecord {
    * this field for exactly that reason.
    */
   transcriptExists?: boolean;
+  /**
+   * The account EVIDENCE for a record with no `configDir`, probed backend-side
+   * at list time alongside `transcriptExists` (plan
+   * `2026-10-04-runner-session-roster-restore-picker`, Phase 3): how many
+   * Claude config dirs hold this session's transcript. `undefined` ⇒ NOT
+   * PROBED (UNKNOWN), never zero.
+   */
+  transcriptConfigDirCount?: number;
+  /** The ONE config dir holding the transcript — present only when exactly
+   * one does. Several holders are ambiguous and name none. */
+  transcriptConfigDir?: string;
+  /**
+   * Present with `transcriptConfigDir`: true when it is the DEFAULT home
+   * (`~/.claude`), which resumes with NO `CLAUDE_CONFIG_DIR` — typing the
+   * variable would swap the default account's `~/.claude.json` for
+   * `~/.claude/.claude.json`.
+   */
+  transcriptConfigDirIsDefault?: boolean;
 }

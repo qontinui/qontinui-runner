@@ -22,6 +22,13 @@ import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds } from "./useTerminalPages";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
+import {
+  loadDefaultConfigHome,
+  resolveAccountDir,
+  sanitizeConfigDir,
+  typedConfigDir,
+} from "./defaultConfigHome";
+import { displayNameOf } from "@/lib/session-ledger";
 
 /**
  * Fetch the durable RESTORABLE session records for `pageId` from the backend
@@ -112,8 +119,9 @@ export async function fetchRestoreSet(
  * - Its `pageId` names NO live page (an ORPHAN — e.g. the hook-confirm path
  *   wrote its hardcoded "default" onto a layout whose default page was
  *   replaced) ⇒ adopted by the FIRST page to restore (`adoptOrphans`), but
- *   ONLY when the record classifies `auto-resume` (a confirmed, resumable
- *   provider session someone would actually miss). Unconfirmed shells and
+ *   ONLY when the record classifies `auto-resume` or `needs-account` (a
+ *   confirmed, resumable provider session someone would actually miss — the
+ *   latter waiting only for its account). Unconfirmed shells and
  *   quarantine-tier guesses are never adopted — restoring a stale agent
  *   shell into the operator's page would be noise, not recovery.
  *
@@ -132,7 +140,13 @@ export function recordBelongsToRestore(
   if (recPage === pageId) return true;
   if (!adoptOrphans) return false;
   if (knownPageIds.includes(recPage)) return false;
-  return classifyRestoreAction(rec) === "auto-resume";
+  // A confirmed resumable session whose ACCOUNT is unknown is adopted too: it
+  // is just as missed, and adopting it is what surfaces it for an account
+  // choice instead of leaving it on no page at all. The default home only
+  // decides between those two (an unknown home can make a dir needs-account),
+  // and both are adopted, so it is not needed here.
+  const action = classifyRestoreAction(rec, null);
+  return action === "auto-resume" || action === "needs-account";
 }
 
 /**
@@ -230,6 +244,8 @@ export async function runVerifiedResume(params: {
    */
   recordOpen?: SessionOpenArgs;
   verifyOptions?: TypeAndVerifyOptions;
+  /** Injectable for tests: the default Claude home (see `defaultConfigHome.ts`). */
+  defaultConfigHome?: () => Promise<string | null>;
 }): Promise<ResumeOutcome> {
   const {
     terminalRefs,
@@ -242,7 +258,16 @@ export async function runVerifiedResume(params: {
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  // THE choke point every typed resume goes through: the default home is never
+  // typed as `CLAUDE_CONFIG_DIR` (it would swap `~/.claude.json` for
+  // `~/.claude/.claude.json`). Records keep the explicit path.
+  const home = await (params.defaultConfigHome ?? loadDefaultConfigHome)();
+  const resumeCmd = buildResumeCmd(
+    claudeSessionId,
+    typedConfigDir(configDir, home),
+    policy,
+    provider,
+  );
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -485,6 +510,28 @@ export function decideColdResume(
 }
 
 /**
+ * The live reconnected tab a record re-attaches to on a React remount (restore
+ * branch (a)), or `null` when it has none.
+ *
+ * A record held for an account choice (`awaitingAccountSince` set) has NO pane
+ * by design: the backend detaches its terminal when it holds it, because its
+ * old terminal id may already host another session. Matching it by
+ * `terminalId` would stamp that live tab with the held session's id, so a held
+ * record never reconnects — whatever `terminalId` it carries. A blank
+ * `terminalId` (unbound) names no tab either.
+ *
+ * Pure + exported for direct unit tests.
+ */
+export function reconnectedTabFor(
+  rec: Pick<TerminalSessionRecord, "terminalId" | "awaitingAccountSince">,
+  reconnectedTabIds: ReadonlySet<string>,
+): string | null {
+  if (rec.awaitingAccountSince != null) return null;
+  if (!rec.terminalId.trim()) return null;
+  return reconnectedTabIds.has(rec.terminalId) ? rec.terminalId : null;
+}
+
+/**
  * What a DRAIN-TIME skip must do to the record + tab it is walking away from.
  *
  * ## THE DEFECT (the loop's oldest, and the reason this is a pure function)
@@ -673,6 +720,16 @@ function isValidSessionId(id: string): boolean {
  *   restore, identical to any other unresumable row.
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
  *   typed, nothing actionable.
+ * - `"needs-account"`: a Claude record that would otherwise auto-resume, but
+ *   whose ACCOUNT cannot be established (see {@link resolveRestoreAccount}):
+ *   its recorded `configDir` was rejected by `sanitizeConfigDir`, or may be
+ *   the default home while that home is unreadable, or it has none and zero /
+ *   several config dirs hold its transcript. NOT auto-resumed
+ *   — a `--resume` under a guessed (default) account fails with "No
+ *   conversation found", which reads exactly like a session that never
+ *   existed. The hook surfaces it instead (`needsAccountRecords`) for the
+ *   operator to resume under a chosen account (plan
+ *   `2026-10-04-runner-session-roster-restore-picker`, Phase 3).
  *
  * The auto-resume GATE lives here on the frontend as
  * `(origin === "authoritative" || origin === "observed") && confirmed &&
@@ -685,13 +742,185 @@ function isValidSessionId(id: string): boolean {
  * (cold boot, no live process) still can't be auto-resumed. Pure + exported so
  * the gate is unit-testable without React.
  */
-export type RestoreAction = "auto-resume" | "terminal-only" | "skip-invalid";
+export type RestoreAction = "auto-resume" | "terminal-only" | "skip-invalid" | "needs-account";
+
+/** Why a record's account could not be established. */
+export type NeedsAccountReason =
+  /** The recorded (or the transcript-located) config dir failed `sanitizeConfigDir`. */
+  | "config-dir-rejected"
+  /** The default home is unreadable and the recorded dir may be it — never typed on a guess. */
+  | "default-home-unknown"
+  /** No recorded dir, and no config dir holds the transcript. */
+  | "no-transcript-holder"
+  /** No recorded dir, and SEVERAL config dirs hold the transcript. */
+  | "ambiguous-transcript"
+  /** No recorded dir, and the backend did not probe where the transcript lives. */
+  | "transcript-unprobed";
+
+/**
+ * The account a restore resumes under, resolved from evidence:
+ * - `resolved` — the recorded `configDir`, else the UNIQUE config dir holding
+ *   the transcript. `recordDir` is the explicit path the REGISTRY record keeps
+ *   (`undefined` only when no path is known at all); `typedDir` is what the
+ *   resume types as `CLAUDE_CONFIG_DIR` and what the tab carries — `undefined`
+ *   for the default home (`~/.claude`), see `resolveAccountDir`;
+ * - `unknown` — the account cannot be named: the evidence says so, or there is
+ *   none at all (no recorded dir AND no transcript probe). A resume under the
+ *   default account in that case is a guess, and a wrong guess fails as "No
+ *   conversation found" — so it is asked, never assumed.
+ */
+export type RestoreAccount =
+  | { kind: "resolved"; recordDir: string | undefined; typedDir: string | undefined }
+  | { kind: "unknown"; reason: NeedsAccountReason };
+
+type RestoreAccountFields = Pick<
+  TerminalSessionRecord,
+  "configDir" | "transcriptConfigDir" | "transcriptConfigDirCount" | "transcriptConfigDirIsDefault"
+>;
+
+/**
+ * Resolve a record's account: recorded `configDir` first, then a unique
+ * `transcriptConfigDir`. The same order as the Rust
+ * `session_ledger::resolve_config_dir`, which builds every copy-able resume
+ * line. A recorded dir goes through `resolveAccountDir` against the default
+ * home `home` (`null` = unreadable). Pure + exported for unit tests.
+ */
+export function resolveRestoreAccount(
+  rec: RestoreAccountFields,
+  home: string | null,
+): RestoreAccount {
+  const recorded = rec.configDir?.trim();
+  if (recorded) {
+    const dir = resolveAccountDir(recorded, home);
+    return dir.kind === "resolved"
+      ? { kind: "resolved", recordDir: dir.recordDir, typedDir: dir.typedDir }
+      : { kind: "unknown", reason: dir.reason };
+  }
+  const holders = rec.transcriptConfigDirCount;
+  if (holders === undefined) return { kind: "unknown", reason: "transcript-unprobed" };
+  if (holders === 0) return { kind: "unknown", reason: "no-transcript-holder" };
+  if (holders > 1) return { kind: "unknown", reason: "ambiguous-transcript" };
+  const transcriptDir = rec.transcriptConfigDir?.trim() || undefined;
+  // The backend judged the holder to be the default home: never typed, so it
+  // needs no shell-safety check.
+  if (rec.transcriptConfigDirIsDefault === true) {
+    return { kind: "resolved", recordDir: transcriptDir, typedDir: undefined };
+  }
+  const located = sanitizeConfigDir(transcriptDir);
+  return located
+    ? { kind: "resolved", recordDir: located, typedDir: located }
+    : { kind: "unknown", reason: "config-dir-rejected" };
+}
+
+/**
+ * The restored tab's name: THE display-name rule (`displayNameOf`, mirroring
+ * Rust `session_ledger::display_name`) — an operator-chosen `/rename` name
+ * wins, a `derived` auto-name falls back behind the tab title. Not the bare
+ * `title`, which is just `"claude"` for about half of all rows.
+ */
+export function restoreTabName(
+  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "sessionName" | "nameSource" | "title">,
+): string {
+  return displayNameOf({
+    claudeSessionId: rec.claudeSessionId,
+    sessionName: rec.sessionName ?? null,
+    nameSource: rec.nameSource ?? null,
+    title: rec.title ?? null,
+  });
+}
+
+/** A restore candidate the boot restore did NOT resume because its account is unknown. */
+export interface NeedsAccountRecord {
+  record: TerminalSessionRecord;
+  reason: NeedsAccountReason;
+}
+
+/**
+ * Hold a `needs-account` record for an account choice — but NEVER a session a
+ * live Claude process already hosts. Holding marks the row awaiting-account,
+ * which DETACHES it from its terminal; doing that to a live session would cut
+ * it off its own pane. So the same liveness gate the cold auto-resume path
+ * uses runs first, and only a `"respawn"` verdict (registry read, id not live)
+ * lets the hold through. `"skip-alive"` leaves the row untouched and surfaces
+ * nothing. `"skip-unknown"` (registry unreadable) still SURFACES the record for
+ * an account choice but does not re-mark it: the boot hold may already have
+ * held it, and hiding it would leave a held row with no chooser until the hold
+ * ages out. Not marking can detach nothing; its cost is that a row no earlier
+ * hold covers may be closed `no-terminal` by the liveness poll and so miss the
+ * NEXT boot's restore set (this boot's chooser still lists it).
+ *
+ * Returns the liveness decision. Pure wiring with injected effects, exported
+ * so the gate — not just `decideColdResume` — is unit-testable.
+ */
+export async function holdNeedsAccountIfNotLive(params: {
+  entry: NeedsAccountRecord;
+  getLiveSessionIds: () => Promise<ReadonlySet<string> | null>;
+  noteNeedsAccount: (entry: NeedsAccountRecord, opts: { mark: boolean }) => void;
+}): Promise<ColdResumeDecision> {
+  const { entry } = params;
+  const decision = decideColdResume(await params.getLiveSessionIds(), entry.record.claudeSessionId);
+  if (decision === "skip-alive") {
+    console.warn(
+      `[TerminalPage] not holding needs-account session ${entry.record.claudeSessionId}: ` +
+        "a live Claude process already hosts this id",
+    );
+    return decision;
+  }
+  if (decision === "skip-unknown") {
+    console.warn(
+      `[TerminalPage] live-session registry unreadable — surfacing needs-account session ` +
+        `${entry.record.claudeSessionId} without re-marking it`,
+    );
+    params.noteNeedsAccount(entry, { mark: false });
+    return decision;
+  }
+  params.noteNeedsAccount(entry, { mark: true });
+  return decision;
+}
+
+/**
+ * Record a `needs-account` entry for the account chooser and, only when
+ * `mark` is set, ask the backend to hold its registry row awaiting an account
+ * (`terminal_session_mark_awaiting_account`: stamps the hold and DETACHES the
+ * row from its terminal, keeping it open and on the roster instead of being
+ * closed `no-terminal` by the liveness poll; the backend declines a row bound
+ * to a live PTY, ignores a closed or finished row, and keeps a running
+ * hold's stamp on a re-mark (an expired stamp is re-stamped)). With
+ * `mark: false` the row is left untouched. Effects
+ * injected so the suppression is unit-testable.
+ */
+export function applyNeedsAccountNote(
+  entry: NeedsAccountRecord,
+  opts: { mark: boolean },
+  effects: {
+    setRecords: (update: (prev: NeedsAccountRecord[]) => NeedsAccountRecord[]) => void;
+    invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown>;
+  },
+): void {
+  effects.setRecords((prev) => [
+    ...prev.filter((e) => e.record.claudeSessionId !== entry.record.claudeSessionId),
+    entry,
+  ]);
+  if (!opts.mark) return;
+  effects
+    .invoke("terminal_session_mark_awaiting_account", {
+      claudeSessionId: entry.record.claudeSessionId,
+    })
+    .catch((err) =>
+      console.warn(
+        `[TerminalPage] could not hold needs-account session ${entry.record.claudeSessionId}:`,
+        err,
+      ),
+    );
+}
 
 export function classifyRestoreAction(
   rec: Pick<
     TerminalSessionRecord,
     "claudeSessionId" | "origin" | "confirmedAt" | "provider" | "transcriptExists"
-  >,
+  > &
+    RestoreAccountFields,
+  home: string | null,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
   if (rec.origin === "authoritative" || rec.origin === "observed") {
@@ -715,9 +944,14 @@ export function classifyRestoreAction(
     // re-open the terminal but not the chat, so a CONFIRMED row of that provider
     // restores terminal-only (honest "fresh conversation"), never a resume typed
     // against an id the provider can't resume by `--resume`.
-    return providerDescriptorFor(rec.provider).restoreTier() === "full"
-      ? "auto-resume"
-      : "terminal-only";
+    const descriptor = providerDescriptorFor(rec.provider);
+    if (descriptor.restoreTier() !== "full") return "terminal-only";
+    // The account gate (Claude only — the account is Claude's
+    // `CLAUDE_CONFIG_DIR`): a resume under a guessed account is refused.
+    if (descriptor.provider === "claude" && resolveRestoreAccount(rec, home).kind === "unknown") {
+      return "needs-account";
+    }
+    return "auto-resume";
   }
   // Reconciled / pre-field origin: a backstop guess that can name a foreign
   // session — not strong enough to act on. Restore the terminal only, same as
@@ -732,13 +966,6 @@ export function classifyRestoreAction(
  */
 export function isWorkerRecord(rec: Pick<TerminalSessionRecord, "taskRunId">): boolean {
   return typeof rec.taskRunId === "string" && rec.taskRunId.length > 0;
-}
-
-/** Validate config dir paths — reject shell metacharacters. */
-const SAFE_PATH_RE = /^[a-zA-Z0-9_\-./\\: ]+$/;
-function sanitizeConfigDir(dir: string | undefined): string | undefined {
-  if (!dir) return undefined;
-  return SAFE_PATH_RE.test(dir) ? dir : undefined;
 }
 
 interface UseTerminalInitializationParams {
@@ -779,6 +1006,7 @@ interface UseTerminalInitializationParams {
     updates: Partial<{
       claudeSessionId?: string;
       claudeConfigDir?: string;
+      claudeRecordConfigDir?: string;
       isReconnecting?: boolean;
       resumeFailed?: boolean;
       restoreTerminalOnly?: boolean;
@@ -914,6 +1142,18 @@ export function useTerminalInitialization({
   // auto-save runs in the single page instance for whichever page is active.
   const restoreCompletePages = useRef<Set<string>>(new Set());
 
+  // Restore candidates NOT resumed because their account is unknown
+  // (`needs-account`), keyed by `claudeSessionId` so a page's re-run never
+  // lists one twice. Returned from the hook for the "Since restart" panel to
+  // offer an account chooser. See `applyNeedsAccountNote` for what happens to
+  // the registry row on each path.
+  const [needsAccountRecords, setNeedsAccountRecords] = useState<NeedsAccountRecord[]>([]);
+  const noteNeedsAccount = useCallback(
+    (entry: NeedsAccountRecord, opts: { mark: boolean }) =>
+      applyNeedsAccountNote(entry, opts, { setRecords: setNeedsAccountRecords, invoke }),
+    [],
+  );
+
   // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
   // Phase 3): bumped each time autonomous spawns become allowed again. The init
   // effect below depends on it, so a restore the drain deferred (which released
@@ -928,6 +1168,23 @@ export function useTerminalInitialization({
   // Pages whose restore the drain deferred, so their re-run merges into the
   // tabs that exist by then instead of re-laying the page out.
   const drainDeferredPages = useRef<Set<string>>(new Set());
+
+  // The two page sets above, PUBLISHED as state for the "Since restart" strip
+  // (plan `2026-10-04-runner-session-roster-restore-picker`, Phase 4): it
+  // speaks only once every page holding a prior-ledger row has settled, which
+  // is this per-page completion — never the boot census latch, which runs
+  // before any restore. A new Set identity is published only when a page's
+  // status actually moves.
+  const [publishedCompletePages, setPublishedCompletePages] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [publishedDeferredPages, setPublishedDeferredPages] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const publishRestorePages = useCallback(() => {
+    setPublishedCompletePages(new Set(restoreCompletePages.current));
+    setPublishedDeferredPages(new Set(drainDeferredPages.current));
+  }, []);
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).
   const liveTabsRef = useRef(tabs);
@@ -977,6 +1234,8 @@ export function useTerminalInitialization({
     }> = [];
 
     (async () => {
+      // A drain re-run moved this page out of both sets above.
+      if (isDrainRerun) publishRestorePages();
       // True once a deferred resume/scrollback drain timer is scheduled. When
       // set, that timer owns flipping the per-page restore-complete gate (after
       // it issues the resume commands); the `finally` below only opens the gate
@@ -1049,6 +1308,9 @@ export function useTerminalInitialization({
           return;
         }
         const openRecords = restoreSet.records;
+        // The default Claude home, for the account rule (`resolveAccountDir`):
+        // `null` = unreadable, which makes a dir that may be it needs-account.
+        const defaultHome = await loadDefaultConfigHome();
 
         // P1 defect (b): before ANY cold `claude --resume`, read which session
         // ids are ALREADY hosted by a live Claude process (Claude Code's own
@@ -1128,23 +1390,31 @@ export function useTerminalInitialization({
             adoptWorkerTab(rec);
             continue;
           }
-          const safeConfigDir = sanitizeConfigDir(rec.configDir);
-          const restoreAction = classifyRestoreAction(rec);
+          const account = resolveRestoreAccount(rec, defaultHome);
+          // What the tab, the last-known id and the typed resume carry — never
+          // the default home's explicit path (that goes to the record only).
+          const typedDir = account.kind === "resolved" ? account.typedDir : undefined;
+          // The explicit path, for the registry record only (a Retry's too).
+          const recordDir = account.kind === "resolved" ? account.recordDir : undefined;
+          const restoreAction = classifyRestoreAction(rec, defaultHome);
 
           // a) A live reconnected PTY is already running this session (React
           //    remount): match by the record's stable terminalId. Just rebind
-          //    the zone + re-attach the claudeSessionId; no resume needed.
-          if (reconnectedSet.has(rec.terminalId)) {
-            const tabId = rec.terminalId;
+          //    the zone + re-attach the claudeSessionId; no resume needed. A
+          //    record held for an account choice has no pane and never matches.
+          const reconnectedTabId = reconnectedTabFor(rec, reconnectedSet);
+          if (reconnectedTabId !== null) {
+            const tabId = reconnectedTabId;
             if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
               zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
             updateTab(tabId, {
               claudeSessionId: rec.claudeSessionId,
-              claudeConfigDir: safeConfigDir,
+              claudeConfigDir: typedDir,
+              claudeRecordConfigDir: recordDir,
             });
-            rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
+            rememberSessionId(tabId, rec.claudeSessionId, typedDir);
             continue;
           }
 
@@ -1174,6 +1444,25 @@ export function useTerminalInitialization({
             }
           }
 
+          // An unknown account is never guessed: no pane, no resume, the
+          // registry row untouched (like the skip-alive branch above). The
+          // hook surfaces the record for an account choice instead.
+          if (restoreAction === "needs-account") {
+            if (account.kind === "unknown") {
+              console.warn(
+                `[TerminalPage] not resuming session ${rec.claudeSessionId}: account unknown ` +
+                  `(${account.reason}) — a resume under a guessed account fails as "No conversation found"`,
+              );
+              // Never hold (and so detach) a session that is alive.
+              await holdNeedsAccountIfNotLive({
+                entry: { record: rec, reason: account.reason },
+                getLiveSessionIds,
+                noteNeedsAccount,
+              });
+            }
+            continue;
+          }
+
           // A drain re-run never duplicates a session a live tab already shows.
           if (
             isDrainRerun &&
@@ -1191,7 +1480,8 @@ export function useTerminalInitialization({
           // The source names this restore in the resource-guard dialog. `queued`
           // counts the records still ahead, this one included — an upper bound,
           // since reconnected and live records ahead will be skipped.
-          const tabId = await createTerminal(rec.title, rec.workingDir, undefined, {
+          const tabName = restoreTabName(rec);
+          const tabId = await createTerminal(tabName, rec.workingDir, undefined, {
             label: "session restore",
             queued: openRecords.length - recIndex,
           });
@@ -1215,7 +1505,8 @@ export function useTerminalInitialization({
           }
           updateTab(tabId, {
             claudeSessionId: rec.claudeSessionId,
-            claudeConfigDir: safeConfigDir,
+            claudeConfigDir: typedDir,
+            claudeRecordConfigDir: recordDir,
             // Show a "resuming" affordance until the resume lands; cleared in
             // the drain loop after the resume command is written. Phase 4:
             // CONFIRMED authoritative rows of a FULL-tier provider auto-resume
@@ -1237,7 +1528,7 @@ export function useTerminalInitialization({
             // the honest, clutter-free outcome.
             restoreTerminalOnly: restoreAction === "terminal-only" && rec.confirmedAt != null,
           });
-          rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
+          rememberSessionId(tabId, rec.claudeSessionId, typedDir);
 
           // Re-point the record at the tab we JUST created for it.
           //
@@ -1282,6 +1573,7 @@ export function useTerminalInitialization({
             // the poll once it sees the session confidently alive).
             invoke("terminal_session_mark_restore_pending", {
               claudeSessionId: rec.claudeSessionId,
+              boot: true,
             }).catch((err) => {
               console.warn(
                 `[TerminalPage] mark restore-pending failed for ${rec.claudeSessionId}:`,
@@ -1300,7 +1592,7 @@ export function useTerminalInitialization({
                 rec.zoneIndex >= 0 ? cosmeticsByZone.get(rec.zoneIndex)?.scrollbackPath : undefined,
               isClaudeSession: restoreAction === "auto-resume",
               claudeSessionId: rec.claudeSessionId,
-              claudeConfigDir: safeConfigDir,
+              claudeConfigDir: typedDir,
               // Provider drives the adapter-supplied resume command + handshake
               // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
               provider: rec.provider,
@@ -1311,11 +1603,16 @@ export function useTerminalInitialization({
                 restoreAction === "auto-resume"
                   ? {
                       claudeSessionId: rec.claudeSessionId,
-                      configDir: rec.configDir,
+                      // The RESOLVED account's explicit path (the default
+                      // home's too), so a record whose dir came from
+                      // transcript evidence carries it from now on.
+                      configDir: recordDir,
                       workingDir: rec.workingDir,
                       pageId,
                       zoneIndex: rec.zoneIndex,
-                      title: rec.title,
+                      // Re-assert the name the tab now shows, not the bare
+                      // `"claude"` label the row may carry.
+                      title: tabName,
                       terminalId: tabId,
                     }
                   : undefined,
@@ -1457,6 +1754,7 @@ export function useTerminalInitialization({
               // Restored tabs now carry their claudeSessionId / scrollback —
               // safe to let the debounced auto-save persist this page's layout.
               restoreCompletePages.current.add(initPageId);
+              publishRestorePages();
             }
           }, 1500);
         }
@@ -1486,6 +1784,8 @@ export function useTerminalInitialization({
         if (!drainScheduled && !restoreAborted) {
           restoreCompletePages.current.add(initPageId);
         }
+        // Publishes the deferral too (set before the early return above).
+        publishRestorePages();
         // ALWAYS leave the loading state, even if restore threw. `initialized`
         // gates the whole page behind a "Loading terminals..." spinner, and the
         // once-per-pageId guard above has already consumed `initPageId` — so a
@@ -1510,6 +1810,8 @@ export function useTerminalInitialization({
     labelsAndTags,
     updateTab,
     terminalRefs,
+    noteNeedsAccount,
+    publishRestorePages,
   ]);
 
   // Auto-save session layout for persistence across app restarts
@@ -1628,4 +1930,22 @@ export function useTerminalInitialization({
       unlisten?.();
     };
   }, [handleWindowClose]);
+
+  return {
+    /**
+     * Boot-restore candidates NOT resumed because their account is unknown
+     * (`needs-account`), each with why. The record is left in the registry;
+     * resume it under an operator-chosen account.
+     */
+    needsAccountRecords,
+    /**
+     * Pages whose boot restore has fully drained (resume commands issued). A
+     * page restores lazily, the first time it is opened. A drain-DEFERRED page
+     * is in here too (its auto-save gate opened) — read it together with
+     * {@link restoreDeferredPages}.
+     */
+    restoreCompletePages: publishedCompletePages,
+    /** Pages whose restore the coord device drain deferred; they re-run when it lifts. */
+    restoreDeferredPages: publishedDeferredPages,
+  };
 }

@@ -209,8 +209,9 @@ pub struct SessionName {
 #[serde(rename_all = "camelCase")]
 pub struct SessionAccount {
     pub label: Option<String>,
-    /// CLI wrapper (`clp`, `clg`, …) — the half of the resume command that
-    /// names the account.
+    /// CLI wrapper (`clp`, `clg`, …) — a DISPLAY fact about the account. No
+    /// resume line is built from it: those name the account by its config dir
+    /// (`session_ledger::resume_command_for`).
     pub wrapper: Option<String>,
     pub config_dir: Option<String>,
 }
@@ -1395,6 +1396,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(1_500),
             handle: Some("fsh_abc".to_string()),
             account_label: Some("paktis".to_string()),

@@ -1331,6 +1331,7 @@ pub fn terminal_session_record_open(
         // record_open normalizes any legacy value passed in.
         origin,
         restore_pending_at: None,
+        awaiting_account_since: None,
         confirmed_at: None,
         handle: None,
         account_label: None,
@@ -1480,24 +1481,95 @@ pub fn terminal_session_rebind_terminal(
     })
 }
 
-/// Mark a session restore-pending in the lifecycle registry: the boot-restore
-/// drain is about to type `claude --resume` into a freshly-created plain shell
-/// and the handshake is not yet verified. While the marker is set the
-/// backend liveness poll never flips the record `poll-dead` (a failed restore
-/// must leave the durable `open` record intact for the next attempt). The
-/// marker is backend-owned + durable so a frontend crash mid-restore can't
-/// lose it. No-op (still succeeds) if the session is absent.
+/// Mark a session restore-pending in the lifecycle registry: a resume is
+/// about to type `claude --resume` into a freshly-created plain shell and the
+/// handshake is not yet verified. While the marker is set the backend liveness
+/// poll never flips the record `poll-dead` (a failed restore must leave the
+/// durable `open` record intact for the next attempt). The marker is
+/// backend-owned + durable so a frontend crash mid-restore can't lose it.
+/// No-op (still succeeds) if the session is absent.
+///
+/// `boot` names the caller: `true` for the boot-restore drain, which also
+/// stamps the boot-restore census markers; `false` for an operator-initiated
+/// resume (a zone-profile resume), which sets only the pending marker and
+/// only on an OPEN row — see [`SessionLifecycleStore::mark_restore_pending`].
 #[tauri::command]
 pub fn terminal_session_mark_restore_pending(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
     claude_session_id: String,
+    boot: bool,
 ) -> Result<CommandResponse, String> {
-    store.mark_restore_pending(&claude_session_id);
+    store.mark_restore_pending(&claude_session_id, boot);
     Ok(CommandResponse {
         success: true,
         message: None,
         data: None,
     })
+}
+
+/// Note that a restore left `claude_session_id` UNRESUMED because its
+/// account is unknown (`needs-account`) and is waiting for the operator to
+/// choose one. Until a verified resume, a close or Finish ends the wait, the
+/// liveness poll keeps the row open and on the roster instead of closing it
+/// `no-terminal` (see `SessionLifecycleStore::poll_hold_awaiting_account`).
+/// No-op (still succeeds) if the session is absent or not open, and DECLINED
+/// (still succeeds) when the row's terminal is a live PTY: a live session is
+/// never held or detached.
+#[tauri::command]
+pub fn terminal_session_mark_awaiting_account(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    claude_session_id: String,
+) -> Result<CommandResponse, String> {
+    mark_awaiting_account_unless_live(
+        &store,
+        &terminal_manager,
+        &claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// [`terminal_session_mark_awaiting_account`]'s body: the store's mark, given
+/// the `TerminalManager`'s live PTYs so a row still bound to one is declined.
+/// The live set is snapshotted BEFORE the store's lock is taken, so the two
+/// locks are never held together. Known window: a PTY spawned and bound to
+/// this row (`record_open`) between the snapshot and the mark is not in the
+/// snapshot. It needs a resume of the SAME session to race its own
+/// needs-account mark, which the frontend issues once per record. The poll's
+/// direct terminal match cannot heal it, because the held row has no
+/// `terminal_id`. But the periodic reconcile pass's command-line bind
+/// (`reconcile.rs` rung 2, which writes via `record_open`) normally rebinds
+/// the row and ends the hold within one tick. Only when that bind is
+/// unavailable (no AI process detected, or the command-line query failed)
+/// does the row stay detached until a later `record_open`. The window existed
+/// before this branch (the old snapshot-then-lock ordering).
+fn mark_awaiting_account_unless_live(
+    store: &SessionLifecycleStore,
+    terminal_manager: &TerminalManager,
+    claude_session_id: &str,
+    now_ms: i64,
+) {
+    let live: std::collections::HashSet<String> = terminal_manager
+        .sessions_snapshot()
+        .into_iter()
+        .filter(|(_, session)| session.is_alive())
+        .map(|(id, _)| id)
+        .collect();
+    store.mark_awaiting_account(claude_session_id, now_ms, &|t: &str| live.contains(t));
+}
+
+/// The DEFAULT Claude account home (`<home>/.claude`), or `null` when the home
+/// directory cannot be resolved. A resume under it must type NO
+/// `CLAUDE_CONFIG_DIR` (see `discovery::is_default_config_home`), so every
+/// frontend resume normalises against THIS path rather than guessing `$HOME`.
+#[tauri::command]
+pub fn claude_default_config_home() -> Option<String> {
+    dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
 }
 
 /// Clear a session's restore-pending marker: the restore drain verified the
@@ -1649,7 +1721,6 @@ pub fn terminal_session_list_open(
             })),
         });
     }
-    let now = chrono::Utc::now().timestamp_millis();
     // The prior shutdown marker's `at` is one input to the anchor. It is
     // captured ONCE at boot (main.rs setup, before this command can run) —
     // the on-disk marker itself already says `clean:false` for the NOW-
@@ -1662,7 +1733,7 @@ pub fn terminal_session_list_open(
     // 2026-07-19 anchor ~1h46m past the crash band and stranded 81 sessions).
     // Only a CLEAN shutdown marker is an honest last-moment-of-life signal.
     let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
-    let rows = restore_candidates(&store, now, prior_marker_at, boot_was_clean);
+    let rows = restore_candidates(&store, prior_marker_at, boot_was_clean);
 
     Ok(CommandResponse {
         success: true,
@@ -1683,6 +1754,60 @@ struct RestoreCandidate {
     /// rather than "no transcript".
     #[serde(rename = "transcriptExists", skip_serializing_if = "Option::is_none")]
     transcript_exists: Option<bool>,
+    /// The account evidence: the transcript location, resolved by
+    /// [`TranscriptLocation::from_holders`]. Absent fields mean "not probed"
+    /// (UNKNOWN), never "no account".
+    #[serde(flatten)]
+    location: TranscriptLocation,
+}
+
+/// Where a restore candidate's transcript was found, for resolving the account
+/// a record with no `config_dir` ran under (plan
+/// `2026-10-04-runner-session-roster-restore-picker`, Phase 3). The frontend
+/// (`resolveRestoreAccount` in `useTerminalInitialization.ts`) takes the
+/// recorded `configDir` first, then a UNIQUE `transcriptConfigDir`, and refuses
+/// to auto-resume (`needs-account`) when zero or several dirs hold it.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+struct TranscriptLocation {
+    /// How many config dirs hold the transcript. Absent = not probed.
+    #[serde(
+        rename = "transcriptConfigDirCount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    holder_count: Option<usize>,
+    /// The ONE config dir holding it — present only when exactly one does.
+    #[serde(
+        rename = "transcriptConfigDir",
+        skip_serializing_if = "Option::is_none"
+    )]
+    config_dir: Option<String>,
+    /// Present with `config_dir`: it is the DEFAULT home (`~/.claude`), which
+    /// resumes with NO `CLAUDE_CONFIG_DIR` (see
+    /// `discovery::is_default_config_home`).
+    #[serde(
+        rename = "transcriptConfigDirIsDefault",
+        skip_serializing_if = "Option::is_none"
+    )]
+    config_dir_is_default: Option<bool>,
+}
+
+impl TranscriptLocation {
+    fn from_holders(holders: Option<Vec<std::path::PathBuf>>) -> Self {
+        let Some(holders) = holders else {
+            return Self::default();
+        };
+        let unique = match holders.as_slice() {
+            [only] => only.to_str().map(str::to_string),
+            _ => None,
+        };
+        Self {
+            holder_count: Some(holders.len()),
+            config_dir_is_default: unique.as_deref().map(
+                qontinui_runner_lib::session_archive::discovery::is_default_config_home_from_env,
+            ),
+            config_dir: unique,
+        }
+    }
 }
 
 /// The boot-restore set [`terminal_session_list_open`] returns: exactly the
@@ -1704,19 +1829,24 @@ struct RestoreCandidate {
 /// which cases read UNKNOWN.
 fn restore_candidates(
     store: &SessionLifecycleStore,
-    now_ms: i64,
     prior_marker_at: Option<i64>,
     boot_was_clean: bool,
 ) -> Vec<RestoreCandidate> {
     store
-        .restorable_records(now_ms, prior_marker_at, boot_was_clean)
+        .restorable_records(prior_marker_at, boot_was_clean)
         .into_iter()
         .map(|rec| {
             let transcript_exists =
                 store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+            let location =
+                TranscriptLocation::from_holders(store.probe_transcript_config_dirs(
+                    &rec.claude_session_id,
+                    rec.working_dir.as_deref(),
+                ));
             RestoreCandidate {
                 record: rec,
                 transcript_exists,
+                location,
             }
         })
         .collect()
@@ -1753,6 +1883,55 @@ pub fn terminal_session_list_history(
         message: None,
         data: Some(serde_json::json!({ "sessions": sessions })),
     })
+}
+
+/// The session roster report — the rebuild-safe ledger's prior generations
+/// diffed against what is back now, plus the current roster (plan
+/// `2026-10-04-runner-session-roster-restore-picker`, Phase 2).
+///
+/// The body is [`crate::session::session_ledger::report`], the SAME builder
+/// `GET /control/sessions/ledger` calls, so the UI and the HTTP route cannot
+/// disagree. Read through `try_state` like that route: a store missing from
+/// Tauri state yields `status: "unavailable"` WITH a reason, never an error
+/// that reads like "nothing was open". Runs off the IPC thread — it stats
+/// transcripts and custody records.
+#[tauri::command]
+pub async fn session_ledger_report(
+    app: tauri::AppHandle,
+) -> Result<crate::session::session_ledger::LedgerReport, String> {
+    let store = app
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let live = crate::session::session_ledger::live_terminal_ids(&app);
+    spawn_blocking_tracked(move || {
+        crate::session::session_ledger::report(store.as_deref(), live.as_ref())
+    })
+    .await
+    .map_err(|e| format!("session ledger report failed: {e}"))
+}
+
+/// The operator's "Capture now": capture the current roster with reason
+/// [`crate::session::session_ledger::REASON_OPERATOR`] through the SAME
+/// [`crate::session::session_ledger::capture_now`] that
+/// `POST /control/sessions/ledger/capture` calls (so an empty capture can never
+/// erase a non-empty prior). An error — never a silent empty capture — when
+/// the lifecycle store is not available.
+#[tauri::command]
+pub async fn session_ledger_capture(
+    app: tauri::AppHandle,
+) -> Result<crate::session::session_ledger::LedgerCapture, String> {
+    let store = app
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| "lifecycle store not available — NOTHING was captured".to_string())?;
+    spawn_blocking_tracked(move || {
+        crate::session::session_ledger::capture_now(
+            &store,
+            crate::session::session_ledger::REASON_OPERATOR,
+        )
+    })
+    .await
+    .map_err(|e| format!("session ledger capture failed — NOTHING may have been captured: {e}"))
 }
 
 /// Report a mount of the terminal page tree (P0 tree-reset observability).
@@ -2643,6 +2822,7 @@ async fn poll_and_record_session<F>(
                     crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string(),
                 ),
                 restore_pending_at: None,
+                awaiting_account_since: None,
                 confirmed_at: None,
                 handle: None,
                 account_label: None,
@@ -2735,6 +2915,7 @@ pub(crate) fn record_pinned_session_open(
         // typed flag / a hook POSTed it). Authoritative ⇒ auto-resume safe.
         origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
+        awaiting_account_since: None,
         confirmed_at: None,
         handle: None,
         account_label: account.as_ref().map(|a| a.label.clone()),
@@ -2916,6 +3097,52 @@ mod tests {
         }
     }
 
+    /// Review fixes 6, item 1 (command layer): the mark declines a row whose
+    /// terminal is a LIVE PTY in the `TerminalManager`, and holds (detaching)
+    /// a row whose terminal is not.
+    #[test]
+    fn mark_awaiting_account_declines_a_row_on_a_live_manager_pty() {
+        /// Restores the fixture to dead before it drops (else `Drop` closes it),
+        /// including on an assertion panic.
+        struct DeadOnDrop(Arc<crate::terminal::session::TerminalSession>);
+        impl Drop for DeadOnDrop {
+            fn drop(&mut self) {
+                self.0.set_alive_for_test(false);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut alive = restore_candidate_record("alive");
+        alive.terminal_id = "term-live".to_string();
+        let mut gone = restore_candidate_record("gone");
+        gone.terminal_id = "term-gone".to_string();
+        store.record_open(alive);
+        store.record_open(gone);
+
+        let tm = TerminalManager::new();
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let _guard = DeadOnDrop(session.clone());
+        session.set_alive_for_test(true);
+        tm.insert_for_test("term-live", session.clone());
+
+        let now = chrono::Utc::now().timestamp_millis();
+        mark_awaiting_account_unless_live(&store, &tm, "alive", now);
+        mark_awaiting_account_unless_live(&store, &tm, "gone", now);
+
+        let alive = store.get("alive").unwrap();
+        assert_eq!(
+            alive.terminal_id, "term-live",
+            "a live session is never detached"
+        );
+        assert_eq!(alive.awaiting_account_since, None, "nor held");
+        let gone = store.get("gone").unwrap();
+        assert_eq!(gone.terminal_id, "", "held and detached");
+        assert!(gone.awaiting_account_since.is_some());
+    }
+
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
@@ -2933,6 +3160,7 @@ mod tests {
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(3),
             handle: None,
             account_label: None,
@@ -2966,6 +3194,7 @@ mod tests {
         let probed_absent = serde_json::to_value(RestoreCandidate {
             record: restore_candidate_record("sess-absent"),
             transcript_exists: Some(false),
+            location: TranscriptLocation::default(),
         })
         .expect("probed-absent candidate serializes");
         assert_eq!(probed_absent["claudeSessionId"], "sess-absent");
@@ -2978,6 +3207,7 @@ mod tests {
         let probed_present = serde_json::to_value(RestoreCandidate {
             record: restore_candidate_record("sess-present"),
             transcript_exists: Some(true),
+            location: TranscriptLocation::default(),
         })
         .expect("probed-present candidate serializes");
         assert_eq!(
@@ -2988,6 +3218,7 @@ mod tests {
         let unprobed = serde_json::to_value(RestoreCandidate {
             record: restore_candidate_record("sess-unprobed"),
             transcript_exists: None,
+            location: TranscriptLocation::default(),
         })
         .expect("unprobed candidate serializes");
         assert_eq!(
@@ -2998,6 +3229,53 @@ mod tests {
             unprobed.get("transcriptExists").is_none(),
             "no probe attached must OMIT the field, never emit false: {unprobed}"
         );
+    }
+
+    /// The account evidence on a restore candidate: absent when unprobed, a
+    /// count always when probed, and a dir ONLY when exactly one holds the
+    /// transcript — two holders are ambiguous, not a pick.
+    #[test]
+    fn transcript_location_names_a_dir_only_for_a_unique_holder() {
+        use std::path::PathBuf;
+        assert_eq!(
+            TranscriptLocation::from_holders(None),
+            TranscriptLocation::default()
+        );
+        let unprobed = serde_json::to_value(RestoreCandidate {
+            record: restore_candidate_record("s"),
+            transcript_exists: None,
+            location: TranscriptLocation::from_holders(None),
+        })
+        .unwrap();
+        assert!(unprobed.get("transcriptConfigDirCount").is_none());
+        assert!(unprobed.get("transcriptConfigDir").is_none());
+
+        let none = TranscriptLocation::from_holders(Some(Vec::new()));
+        assert_eq!(none.holder_count, Some(0));
+        assert_eq!(none.config_dir, None);
+
+        let one =
+            TranscriptLocation::from_holders(Some(vec![PathBuf::from("/accounts/.claude-zed")]));
+        assert_eq!(one.holder_count, Some(1));
+        assert_eq!(one.config_dir.as_deref(), Some("/accounts/.claude-zed"));
+        assert_eq!(one.config_dir_is_default, Some(false));
+        let wire = serde_json::to_value(RestoreCandidate {
+            record: restore_candidate_record("s"),
+            transcript_exists: Some(true),
+            location: one,
+        })
+        .unwrap();
+        assert_eq!(wire["transcriptConfigDir"], "/accounts/.claude-zed");
+        assert_eq!(wire["transcriptConfigDirCount"], 1);
+        assert_eq!(wire["transcriptConfigDirIsDefault"], false);
+
+        let two = TranscriptLocation::from_holders(Some(vec![
+            PathBuf::from("/a/.claude-x"),
+            PathBuf::from("/a/.claude-y"),
+        ]));
+        assert_eq!(two.holder_count, Some(2));
+        assert_eq!(two.config_dir, None, "ambiguous evidence names no dir");
+        assert_eq!(two.config_dir_is_default, None);
     }
 
     /// The boot-restore set is the REGISTRY and nothing else: a fresh,
@@ -3043,14 +3321,13 @@ mod tests {
         let store = SessionLifecycleStore::open(amb.dir().join("terminal-sessions.json"))
             .expect("store opens");
         store.record_open(restore_candidate_record("registry-sess"));
-        let now = chrono::Utc::now().timestamp_millis();
 
-        let offered: Vec<String> = restore_candidates(&store, now, None, false)
+        let offered: Vec<String> = restore_candidates(&store, None, false)
             .into_iter()
             .map(|c| c.record.claude_session_id)
             .collect();
         let registry: Vec<String> = store
-            .restorable_records(now, None, false)
+            .restorable_records(None, false)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();

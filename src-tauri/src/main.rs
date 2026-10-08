@@ -3551,8 +3551,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_session_clear_restore_pending,
             commands::terminal::terminal_claude_session_list_live,
             commands::terminal::terminal_session_list_history,
+            commands::terminal::session_ledger_report,
+            commands::terminal::session_ledger_capture,
             commands::terminal::terminal_session_list_open,
             commands::terminal::terminal_session_mark_restore_pending,
+            commands::terminal::terminal_session_mark_awaiting_account,
+            commands::terminal::claude_default_config_home,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_set_finished,
             commands::terminal::terminal_session_record_open,
@@ -4379,6 +4383,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     session::shutdown_marker::boot_classification(),
                 );
 
+                // Hold every restore candidate whose account cannot be
+                // resolved BEFORE the liveness poll starts: restore is lazy per
+                // page, so a page opened more than ~3 minutes from now would
+                // otherwise find its needs-account rows already closed
+                // `no-terminal`. Same boot inputs as the restore read itself.
+                {
+                    let boot = session::shutdown_marker::boot_classification();
+                    let held = lifecycle_store.hold_unresolved_account_candidates(
+                        boot.and_then(|c| c.prior_marker_at),
+                        boot.map(|c| !c.crash_recovery).unwrap_or(false),
+                        transcript_index.as_ref(),
+                    );
+                    if !held.is_empty() {
+                        tracing::info!(
+                            count = held.len(),
+                            "session: holding restore candidates whose account is unknown until the operator chooses one"
+                        );
+                    }
+                }
+
                 // Phase 4 of `2026-08-22-wip-custody-rebuild-survivable-
                 // attribution` — the DISK half of the same set.
                 //
@@ -4732,16 +4756,44 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
-                            let info = live_by_id
-                                .get(rec.terminal_id.as_str())
-                                .copied()
-                                .or_else(|| {
+                            let direct = live_by_id.get(rec.terminal_id.as_str()).copied();
+                            let info = direct.or_else(|| {
                                     let title = rec.title.as_deref()?;
                                     let working_dir = rec.working_dir.as_deref()?;
                                     live_by_triple
                                         .get(&(rec.page_id.as_str(), title, working_dir))
                                         .copied()
                                 });
+
+                            // A `needs-account` row the boot restore left for
+                            // the operator has no terminal BY DESIGN. Closing it
+                            // `no-terminal` would drop it from the roster and
+                            // from the next boot's restore set while the
+                            // operator is still being asked about it, so the
+                            // poll holds it (never refreshed, counters reset) until
+                            // a verified resume, a close or Finish ends the wait.
+                            // Only a match on the row's OWN terminal_id releases
+                            // the hold; a (page_id, title, working_dir) fallback
+                            // match is another tab, not this row's resume.
+                            // A held row is unbound, so it never matches
+                            // `Direct` through an old terminal id that now
+                            // hosts another session.
+                            let terminal_match =
+                                session::session_lifecycle_store::PollTerminalMatch::for_record(
+                                    rec,
+                                    |t| live_by_id.contains_key(t),
+                                    info.is_some(),
+                                );
+                            if session::session_lifecycle_store::poll_holds_unmatched_row(
+                                &poll_lifecycle_store,
+                                &rec.claude_session_id,
+                                terminal_match,
+                                chrono::Utc::now().timestamp_millis(),
+                                &mut consecutive_dead,
+                                &mut consecutive_no_match,
+                            ) {
+                                continue;
+                            }
 
                             let (live_is_alive, claude_present, snapshot_ok) = match info {
                                 // No matching terminal — orphan detection is

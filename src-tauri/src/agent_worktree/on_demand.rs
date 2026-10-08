@@ -2024,20 +2024,17 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             // DELIBERATELY still offered: it is the one line that answers the
             // question the row is actually asking.
             let dirtiness_measured = item.is_dirty_known;
-            let resume_command = match (
-                item.session_id.as_deref(),
-                item.config_dir.as_deref(),
-                quoted_path.as_deref(),
-            ) {
-                (Some(id), Some(dir), Some(path))
-                    if dirtiness_measured && custody::is_shell_safe_token(id) =>
-                {
-                    custody::shell_quote_path(dir).map(|dir| {
-                        format!("cd \"{path}\" && CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {id}")
-                    })
+            // The shared resume line (`session_ledger::resume_command_for`):
+            // `None` for a ghost, or an id whose account root we could not
+            // establish — NEVER guessed, see the field docs.
+            let resume_command = match item.session_id.as_deref() {
+                Some(id) if dirtiness_measured && quoted_path.is_some() => {
+                    crate::session::session_ledger::resume_command_for(
+                        Some(&item.worktree_path),
+                        item.config_dir.as_deref(),
+                        id,
+                    )
                 }
-                // A ghost, or an id whose account root we could not establish.
-                // NEVER guessed — see the field docs.
                 _ => None,
             };
             // GATED ON `captured`, not on the commit merely existing. A record

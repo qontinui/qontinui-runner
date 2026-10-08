@@ -4,8 +4,12 @@ import { useUIComponent } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
-import { SessionManagerPanel } from "./SessionManagerPanel";
+import { SessionManagerPanel, type SessionPanelView } from "./SessionManagerPanel";
+import { SinceRestartProvider } from "./SinceRestartContext";
+import { SinceRestartStrip } from "./SinceRestartStrip";
 import type { PastSession } from "./usePastSessions";
+import { pastSessionResumeNotice, retryResumeArgs } from "./resumeInNewTab";
+import { requestTerminalView } from "./sinceRestart";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
 import { useTenant } from "@/contexts/TenantContext";
@@ -927,26 +931,33 @@ function TerminalPageInner({
 
   const { workflowGen, sessionManager, shellIntegration } = session;
 
-  // Resume a historical (Previous Sessions) record by id. Reuses the exact live
-  // resume path (`handleResumeSession`): create a tab and queue
-  // `claude --resume <id>` with the session's config dir. We synthesize the
-  // minimal `TranscriptSession` shape it consumes from the PastSession fields.
+  // Resume a historical (Previous Sessions) record — THE resume path
+  // (`resumeTarget` → `resumeInNewTab`), shared with the "Since restart" bulk
+  // resume. Under the session's RESOLVED account only: the card disables
+  // Resume when that account is unknown, and this re-checks, because a resume
+  // under the default account fails as "No conversation found".
+  const { resumeTarget } = shellIntegration;
+  const { setNotification } = workflowGen;
   const handleResumePastSession = useCallback(
     (ps: PastSession) => {
-      shellIntegration.handleResumeSession({
-        session_id: ps.claudeSessionId,
-        project_path: ps.workingDir ?? "",
-        config_dir: ps.configDir ?? "",
-        message_count: 0,
-        last_modified: "",
-        started_at: null,
-        first_message_preview: null,
-        has_plans: false,
-        display_name: ps.resumeName,
+      void pastSessionResumeNotice(ps, resumeTarget).then((notice) => {
+        if (notice) setNotification({ message: notice, type: "error" });
       });
     },
-    [shellIntegration],
+    [resumeTarget, setNotification],
   );
+
+  // The session sidebar's view, owned here so the "Since restart" strip's
+  // Review can open Previous Sessions on the roster section. The strip sits in
+  // the app-wide advisory column, so Review may be clicked from ANY main view:
+  // it brings the Terminal view up first (`requestTerminalView`).
+  const [sessionPanelView, setSessionPanelView] = useState<SessionPanelView>("live");
+  const { setShowSidebar } = workflowGen;
+  const openPreviousSessions = useCallback(() => {
+    requestTerminalView();
+    setShowSidebar(true);
+    setSessionPanelView("previous");
+  }, [setShowSidebar, setSessionPanelView]);
 
   const {
     state: uiState,
@@ -958,28 +969,29 @@ function TerminalPageInner({
     // useKeyboardShortcuts.
   } = useUIStateCx();
 
-  useTerminalInitialization({
-    pageId,
-    authenticated: authStatus?.authenticated,
-    tabs,
-    terminalRefs,
-    reconnectToExistingSessions,
-    createTerminal,
-    createPlanTab,
-    adoptWorkerTab,
-    setInitialized,
-    updateTab,
-    zoneLayout,
-    labelsAndTags,
-    sessionPersistence,
-    layoutState: {
-      layoutId: zoneLayout.layoutId,
-      zoneLabels: labelsAndTags.zoneLabels,
-      zoneNotes: labelsAndTags.zoneNotes,
-      pinnedZones: labelsAndTags.pinnedZones,
-      focusedZone: zoneLayout.focusedZone,
-    },
-  });
+  const { needsAccountRecords, restoreCompletePages, restoreDeferredPages } =
+    useTerminalInitialization({
+      pageId,
+      authenticated: authStatus?.authenticated,
+      tabs,
+      terminalRefs,
+      reconnectToExistingSessions,
+      createTerminal,
+      createPlanTab,
+      adoptWorkerTab,
+      setInitialized,
+      updateTab,
+      zoneLayout,
+      labelsAndTags,
+      sessionPersistence,
+      layoutState: {
+        layoutId: zoneLayout.layoutId,
+        zoneLabels: labelsAndTags.zoneLabels,
+        zoneNotes: labelsAndTags.zoneNotes,
+        pinnedZones: labelsAndTags.pinnedZones,
+        focusedZone: zoneLayout.focusedZone,
+      },
+    });
 
   // Operator-clickable retry for a restored tab whose resume verification
   // failed (Phase 3, #548): re-run the same type-and-verify path. The durable
@@ -991,24 +1003,22 @@ function TerminalPageInner({
   const handleRetryResume = useCallback(
     (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (!tab?.claudeSessionId) return;
+      if (!tab) return;
+      // The typed dir for the command, the never-typed record dir for the
+      // verified re-assert (no origin — the backend preserves the row's).
+      const retry = retryResumeArgs({
+        tab,
+        assignments: assignmentsRef.current,
+        tabs: tabsRef.current,
+        pageId,
+      });
+      if (!retry) return;
       updateTab(tabId, { resumeFailed: false, isReconnecting: true });
       void runVerifiedResume({
         terminalRefs: terminalRefs.current,
         tabId,
-        claudeSessionId: tab.claudeSessionId,
-        configDir: tab.claudeConfigDir,
+        ...retry,
         updateTab,
-        // Re-assert payload for the verified branch — no origin, so the
-        // backend preserves the record's existing origin.
-        recordOpen: buildSessionOpenArgs({
-          assignments: assignmentsRef.current,
-          tabs: tabsRef.current,
-          tabId,
-          claudeSessionId: tab.claudeSessionId,
-          configDir: tab.claudeConfigDir,
-          pageId,
-        }),
       });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1397,22 +1407,29 @@ function TerminalPageInner({
   }
 
   return (
-    <UIBridgeComponentScope componentId="terminal-page">
-      <div ref={pageRootRef} className="h-full flex flex-col bg-[#1a1b26]">
-        {/* Phase 6 — top status strip. Renders nothing when no signal
+    <SinceRestartProvider
+      needsAccountRecords={needsAccountRecords}
+      restoreCompletePages={restoreCompletePages}
+      restoreDeferredPages={restoreDeferredPages}
+      resume={resumeTarget}
+      openPrevious={openPreviousSessions}
+    >
+      <UIBridgeComponentScope componentId="terminal-page">
+        <div ref={pageRootRef} className="h-full flex flex-col bg-[#1a1b26]">
+          {/* Phase 6 — top status strip. Renders nothing when no signal
             requires attention, keeping the top of viewport clean by
             default. Phase 9c demolition removed `TerminalTabBar` (was
             mounted directly below this); the registry + CommandBar +
             ZoneHoverActions + StatusStrip now cover its surface. */}
-        <StatusStrip />
-        {/* Approach-D Conductor (Phase 5) — conductor run status strip.
+          <StatusStrip />
+          {/* Approach-D Conductor (Phase 5) — conductor run status strip.
             Mounted with the active page id; when that page id is a live
             conductor run (page_id == run_id, where /orchestrate's workers
             land), it polls `orchestration_run_status` and surfaces the live
             LoopPhase + per-subtask state summary + the DAG. Self-hides on any
             non-run page (a plain terminal page yields not-found → null). */}
-        <ConductorStatusStrip runId={pageId} />
-        {/* Layout-independent terminal-session roster marker (UI Bridge
+          <ConductorStatusStrip runId={pageId} />
+          {/* Layout-independent terminal-session roster marker (UI Bridge
             ground truth). Its textContent is the JSON census of every
             tracked session — read via `POST
             /ui-bridge/control/page/read-value
@@ -1420,160 +1437,162 @@ function TerminalPageInner({
             Visually hidden; not interactive. Lists ALL sessions regardless
             of which zones are currently mounted, so verification never
             depends on the active layout preset. */}
-        <span data-page-element="terminal-session-roster" style={{ display: "none" }} aria-hidden>
-          {terminalSessionRoster}
-        </span>
-        {/* Phase 2 — honesty backstop for sessions past the zone ceiling.
+          <span data-page-element="terminal-session-roster" style={{ display: "none" }} aria-hidden>
+            {terminalSessionRoster}
+          </span>
+          {/* Phase 2 — honesty backstop for sessions past the zone ceiling.
             Renders nothing when every tab is visible; otherwise a "N more"
             chip that opens the ZoneControlPanel's Unassigned (N) list. */}
-        <UnzonedChip
-          unassignedCount={zoneLayout.unassignedTabIds.length}
-          onOpen={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: true })}
-        />
-        {/* The way back from closing a Conductor worker's cell. Renders
+          <UnzonedChip
+            unassignedCount={zoneLayout.unassignedTabIds.length}
+            onOpen={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: true })}
+          />
+          {/* The way back from closing a Conductor worker's cell. Renders
             nothing when no worker view is hidden. */}
-        <HiddenWorkersChip
-          hidden={hiddenWorkers}
-          onRestoreAll={() => void restoreHiddenWorkers()}
-        />
-
-        {showDocFinder && (
-          <DocFinderModal
-            // The active terminal's cwd is the right place to start looking —
-            // and it is a real path on THIS machine, unlike the literal
-            // operator profile the modal used to fall back to.
-            defaultRoot={activeTab?.workingDir || undefined}
-            onSelect={(filePath) => {
-              handleOpenDocFile(filePath);
-              setShowDocFinder(false);
-            }}
-            onClose={() => setShowDocFinder(false)}
+          <HiddenWorkersChip
+            hidden={hiddenWorkers}
+            onRestoreAll={() => void restoreHiddenWorkers()}
           />
-        )}
-        {showPrompt && (
-          <PromptModal
-            prompts={promptLibrary.prompts}
-            auth={promptLibrary.auth}
-            reason={promptLibrary.reason}
-            loading={promptLibrary.loading}
-            onRefresh={promptLibrary.refresh}
-            initialSlug={promptFocusSlug}
-            sessions={tabs.map((t) => ({ id: t.id, title: t.title }))}
-            focusedSessionId={activeId}
-            onSpawn={spawnWithPromptText}
-            onInsert={insertPromptText}
-            onClose={() => setShowPrompt(false)}
-          />
-        )}
-        <TerminalNotification
-          message={workflowGen.notification?.message ?? null}
-          type={workflowGen.notification?.type ?? "success"}
-          onDismiss={() => workflowGen.setNotification(null)}
-        />
-        <FileConflictBanner
-          conflicts={fileConflicts.conflicts}
-          recentAlert={fileConflicts.recentAlert}
-          onDismissAlert={fileConflicts.dismissAlert}
-        />
 
-        {/* Many-sessions plan Phase 8 — soft advisory past
+          {showDocFinder && (
+            <DocFinderModal
+              // The active terminal's cwd is the right place to start looking —
+              // and it is a real path on THIS machine, unlike the literal
+              // operator profile the modal used to fall back to.
+              defaultRoot={activeTab?.workingDir || undefined}
+              onSelect={(filePath) => {
+                handleOpenDocFile(filePath);
+                setShowDocFinder(false);
+              }}
+              onClose={() => setShowDocFinder(false)}
+            />
+          )}
+          {showPrompt && (
+            <PromptModal
+              prompts={promptLibrary.prompts}
+              auth={promptLibrary.auth}
+              reason={promptLibrary.reason}
+              loading={promptLibrary.loading}
+              onRefresh={promptLibrary.refresh}
+              initialSlug={promptFocusSlug}
+              sessions={tabs.map((t) => ({ id: t.id, title: t.title }))}
+              focusedSessionId={activeId}
+              onSpawn={spawnWithPromptText}
+              onInsert={insertPromptText}
+              onClose={() => setShowPrompt(false)}
+            />
+          )}
+          <TerminalNotification
+            message={workflowGen.notification?.message ?? null}
+            type={workflowGen.notification?.type ?? "success"}
+            onDismiss={() => workflowGen.setNotification(null)}
+          />
+          <FileConflictBanner
+            conflicts={fileConflicts.conflicts}
+            recentAlert={fileConflicts.recentAlert}
+            onDismissAlert={fileConflicts.dismissAlert}
+          />
+
+          {/* Many-sessions plan Phase 8 — soft advisory past
             `settings.performance.max_sessions_warn` (default 30). Warn only:
             §5 of that plan rejects a hard session cap, so this never gates a
             spawn and nothing reads it on a create path. Dismissible, and
             re-arms once the count drops back under the threshold. The banner
             reads the threshold from the caps store itself, so this page does
             not subscribe to it. */}
-        <SessionCountBanner openPaneCount={tabs.length} />
+          <SessionCountBanner openPaneCount={tabs.length} />
 
-        {uiState.showTimeline && zoneLayout.isMultiZone && (
-          <ZoneTimeline
-            tabs={tabs}
-            assignments={zoneLayout.assignments}
-            sessionStates={stateTracking.sessionStates}
-            eventHistory={eventHistory}
-            onClose={() => dispatch({ type: "SET_SHOW_TIMELINE", payload: false })}
-          />
-        )}
+          {uiState.showTimeline && zoneLayout.isMultiZone && (
+            <ZoneTimeline
+              tabs={tabs}
+              assignments={zoneLayout.assignments}
+              sessionStates={stateTracking.sessionStates}
+              eventHistory={eventHistory}
+              onClose={() => dispatch({ type: "SET_SHOW_TIMELINE", payload: false })}
+            />
+          )}
 
-        {uiState.showOutputSearch && (
-          <OutputSearchBar
-            outputSearch={uiState.outputSearch}
-            onSearchChange={(v) => dispatch({ type: "SET_OUTPUT_SEARCH", payload: v })}
-            onClose={() => dispatch({ type: "SET_SHOW_OUTPUT_SEARCH", payload: false })}
-            pageId={pageId}
-          />
-        )}
+          {uiState.showOutputSearch && (
+            <OutputSearchBar
+              outputSearch={uiState.outputSearch}
+              onSearchChange={(v) => dispatch({ type: "SET_OUTPUT_SEARCH", payload: v })}
+              onClose={() => dispatch({ type: "SET_SHOW_OUTPUT_SEARCH", payload: false })}
+              pageId={pageId}
+            />
+          )}
 
-        {/* A remote tab whose close did not demonstrably hand the target's
+          {/* A remote tab whose close did not demonstrably hand the target's
             terminal back. IN-FLOW (a sibling of OutputSearchBar), not an
             overlay: it describes a tab that no longer exists, so floating it
             over the zone grid would occlude a pane it does not describe —
             and both corners of that container are already contended. See the
             component's own docstring. Not gated on `activeId` for the same
             reason: the tab it refers to is gone by now. */}
-        {remoteCloseNotice && (
-          <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
-        )}
-
-        <div className="flex-1 flex flex-row overflow-hidden">
-          {workflowGen.showSidebar && (
-            <SessionManagerPanel
-              manager={sessionManager}
-              selectedSessionId={workflowGen.selectedTranscriptSessionId}
-              sessionConflictCounts={fileConflicts.sessionConflictCounts}
-              sessionLockStates={sessionLockStates}
-              onResumePastSession={handleResumePastSession}
-            />
+          {remoteCloseNotice && (
+            <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
           )}
 
-          <div className="flex-1 relative overflow-hidden">
-            {tabs.length > 0 ? (
-              /* Every prop here is identity-stable (useZoneActions callbacks,
-                 the memoized handleExit, and useMidSessionProbe's stable
-                 `feed`), which is what makes ZoneGrid's React.memo hold. */
-              <ZoneGrid
-                onZoneClick={handleZoneClick}
-                onZoneDoubleClick={handleZoneDoubleClick}
-                onExit={handleExit}
-                onExportZone={handleExportZone}
-                onUserInputLine={midSessionProbe.feed}
+          <div className="flex-1 flex flex-row overflow-hidden">
+            {workflowGen.showSidebar && (
+              <SessionManagerPanel
+                manager={sessionManager}
+                selectedSessionId={workflowGen.selectedTranscriptSessionId}
+                sessionConflictCounts={fileConflicts.sessionConflictCounts}
+                sessionLockStates={sessionLockStates}
+                onResumePastSession={handleResumePastSession}
+                view={sessionPanelView}
+                onViewChange={setSessionPanelView}
               />
-            ) : (
-              <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
-                <span className="text-sm">
-                  No terminals open. Press{" "}
-                  <kbd className="px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#a9b1d6] text-xs font-mono">
-                    Ctrl+Shift+T
-                  </kbd>{" "}
-                  or click + to create one.
-                </span>
-              </div>
             )}
 
-            {zoneLayout.isMultiZone && <ZoneMinimap />}
+            <div className="flex-1 relative overflow-hidden">
+              {tabs.length > 0 ? (
+                /* Every prop here is identity-stable (useZoneActions callbacks,
+                 the memoized handleExit, and useMidSessionProbe's stable
+                 `feed`), which is what makes ZoneGrid's React.memo hold. */
+                <ZoneGrid
+                  onZoneClick={handleZoneClick}
+                  onZoneDoubleClick={handleZoneDoubleClick}
+                  onExit={handleExit}
+                  onExportZone={handleExportZone}
+                  onUserInputLine={midSessionProbe.feed}
+                />
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
+                  <span className="text-sm">
+                    No terminals open. Press{" "}
+                    <kbd className="px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#a9b1d6] text-xs font-mono">
+                      Ctrl+Shift+T
+                    </kbd>{" "}
+                    or click + to create one.
+                  </span>
+                </div>
+              )}
 
-            {/* Bulk approve/reject/broadcast now lives inline in the top
+              {zoneLayout.isMultiZone && <ZoneMinimap />}
+
+              {/* Bulk approve/reject/broadcast now lives inline in the top
                 StatusStrip (see `BatchActions`), so it no longer floats over
                 the zone grid. */}
 
-            {/* Mid-session predicted-collision toast (Phase 3). Overlays
+              {/* Mid-session predicted-collision toast (Phase 3). Overlays
                 the active terminal — positioned top-right of the
                 flex-1 container so it sits over the zone grid, not
                 the chrome. Jump-to-holder: focus the tab whose title
                 matches the holder name, mirroring LaunchMenu's
                 `onJumpToHolder` semantics. */}
-            {activeId && midSessionProbe.states[activeId] && (
-              <MidSessionToast
-                state={midSessionProbe.states[activeId]}
-                onDismiss={() => midSessionProbe.dismiss(activeId)}
-                onJumpToHolder={(name) => {
-                  const target = tabs.find((t) => t.title === name);
-                  if (target) setActiveId(target.id);
-                }}
-              />
-            )}
+              {activeId && midSessionProbe.states[activeId] && (
+                <MidSessionToast
+                  state={midSessionProbe.states[activeId]}
+                  onDismiss={() => midSessionProbe.dismiss(activeId)}
+                  onJumpToHolder={(name) => {
+                    const target = tabs.find((t) => t.title === name);
+                    if (target) setActiveId(target.id);
+                  }}
+                />
+              )}
 
-            {/* Lock-Yield Protocol Phase 2 — hold-side yield banner.
+              {/* Lock-Yield Protocol Phase 2 — hold-side yield banner.
                 Renders ONLY when the active tab is holding a file lock
                 AND at least one OTHER session is waiting on it. Same
                 overlay placement as MidSessionToast above. Uses
@@ -1583,32 +1602,32 @@ function TerminalPageInner({
                 a tab has no `claudeSessionId` yet (pre-spawn), the
                 banner stays hidden because the POST has nowhere
                 meaningful to land. */}
-            {showHoldingBanner &&
-              activeTab &&
-              activeId &&
-              activeLockState?.kind === "holding" &&
-              activeLockState.filePath &&
-              activeLockState.sinceMs !== undefined &&
-              activeTab.claudeSessionId && (
-                <HoldingLockBanner
-                  taskRunId={activeTab.claudeSessionId}
-                  taskRunName={activeTab.title}
-                  filePath={activeLockState.filePath}
-                  waiterName={activeLockState.counterpartyName}
-                  sinceMs={activeLockState.sinceMs}
-                  waiterCount={activeLockState.waiterCount ?? 0}
-                  incomingRequests={activeIncomingRequests}
-                  onDismissLocal={() => {
-                    setDismissedBanners((prev) => {
-                      const next = new Set(prev);
-                      next.add(`${activeId}:${activeLockState.filePath}`);
-                      return next;
-                    });
-                  }}
-                />
-              )}
+              {showHoldingBanner &&
+                activeTab &&
+                activeId &&
+                activeLockState?.kind === "holding" &&
+                activeLockState.filePath &&
+                activeLockState.sinceMs !== undefined &&
+                activeTab.claudeSessionId && (
+                  <HoldingLockBanner
+                    taskRunId={activeTab.claudeSessionId}
+                    taskRunName={activeTab.title}
+                    filePath={activeLockState.filePath}
+                    waiterName={activeLockState.counterpartyName}
+                    sinceMs={activeLockState.sinceMs}
+                    waiterCount={activeLockState.waiterCount ?? 0}
+                    incomingRequests={activeIncomingRequests}
+                    onDismissLocal={() => {
+                      setDismissedBanners((prev) => {
+                        const next = new Set(prev);
+                        next.add(`${activeId}:${activeLockState.filePath}`);
+                        return next;
+                      });
+                    }}
+                  />
+                )}
 
-            {/* Lock-Yield Protocol Phase 3 — wait-side yield-request
+              {/* Lock-Yield Protocol Phase 3 — wait-side yield-request
                 banner. Mutually exclusive with the holding banner above
                 (a tab is either holding OR waiting on a given path,
                 never both for the same file). Renders ONLY when the
@@ -1617,48 +1636,48 @@ function TerminalPageInner({
                 `tab.title === counterpartyName` (option (b) per the
                 plan; avoids exporting `findTabByHolderName` from the
                 hook). */}
-            {showWaitingBanner &&
-              activeTab &&
-              activeLockState?.kind === "waiting" &&
-              activeLockState.filePath &&
-              activeLockState.sinceMs !== undefined &&
-              activeTab.claudeSessionId && (
-                <WaitingLockBanner
-                  taskRunId={activeTab.claudeSessionId}
-                  taskRunName={activeTab.title}
-                  filePath={activeLockState.filePath}
-                  blockerName={activeLockState.counterpartyName}
-                  blockerTaskRunId={blockerTaskRunId}
-                  sinceMs={activeLockState.sinceMs}
-                  // Phase 2 (stuck-session heartbeat) — joined from
-                  // `/sessions/idle-status` by useFileLockTracking's
-                  // 10s poll; threaded through as a prop so the banner
-                  // surfaces "(holder idle Xm)" inline on the headline.
-                  // Undefined on holding/idle branches by design (the
-                  // hook only attaches it to the waiting branch).
-                  holderIdleMs={activeLockState.holderIdleMs}
-                  longWaitSignal={(() => {
-                    // Phase 3 (stuck-session heartbeat): surface the
-                    // most-recent long-wait signal targeting this
-                    // waiter for the contested file. The hook dedups
-                    // by `(holderTaskRunId, filePath)` so the list is
-                    // already keyed cleanly; picking [0] yields the
-                    // first-arrived entry, but for the banner copy any
-                    // matching entry is acceptable since a new signal
-                    // for the same pair replaces in place.
-                    const signals = (activeId && pendingLongWaitSignals?.[activeId]) || [];
-                    const match = signals.find((s) => s.filePath === activeLockState.filePath);
-                    if (!match) return undefined;
-                    return {
-                      holderName: match.holderName,
-                      estimatedRemainingMs: match.estimatedRemainingMs,
-                      signaledAtMs: match.signaledAtMs,
-                    };
-                  })()}
-                />
-              )}
+              {showWaitingBanner &&
+                activeTab &&
+                activeLockState?.kind === "waiting" &&
+                activeLockState.filePath &&
+                activeLockState.sinceMs !== undefined &&
+                activeTab.claudeSessionId && (
+                  <WaitingLockBanner
+                    taskRunId={activeTab.claudeSessionId}
+                    taskRunName={activeTab.title}
+                    filePath={activeLockState.filePath}
+                    blockerName={activeLockState.counterpartyName}
+                    blockerTaskRunId={blockerTaskRunId}
+                    sinceMs={activeLockState.sinceMs}
+                    // Phase 2 (stuck-session heartbeat) — joined from
+                    // `/sessions/idle-status` by useFileLockTracking's
+                    // 10s poll; threaded through as a prop so the banner
+                    // surfaces "(holder idle Xm)" inline on the headline.
+                    // Undefined on holding/idle branches by design (the
+                    // hook only attaches it to the waiting branch).
+                    holderIdleMs={activeLockState.holderIdleMs}
+                    longWaitSignal={(() => {
+                      // Phase 3 (stuck-session heartbeat): surface the
+                      // most-recent long-wait signal targeting this
+                      // waiter for the contested file. The hook dedups
+                      // by `(holderTaskRunId, filePath)` so the list is
+                      // already keyed cleanly; picking [0] yields the
+                      // first-arrived entry, but for the banner copy any
+                      // matching entry is acceptable since a new signal
+                      // for the same pair replaces in place.
+                      const signals = (activeId && pendingLongWaitSignals?.[activeId]) || [];
+                      const match = signals.find((s) => s.filePath === activeLockState.filePath);
+                      if (!match) return undefined;
+                      return {
+                        holderName: match.holderName,
+                        estimatedRemainingMs: match.estimatedRemainingMs,
+                        signaledAtMs: match.signaledAtMs,
+                      };
+                    })()}
+                  />
+                )}
 
-            {/* Coord-as-Deconflicter Phase 1 (§4.4) — in-session
+              {/* Coord-as-Deconflicter Phase 1 (§4.4) — in-session
                 advisory banner that surfaces `project.coordinator_decisions`
                 rows fired by the Rust deconflicter loop. Gated on
                 `claudeSessionId` per `proj_holding_banner_pty_gate` — the
@@ -1671,11 +1690,11 @@ function TerminalPageInner({
                 `AdvisorySlot`, the same as the lock-yield banners above, so
                 it never overlaps them regardless of where in this tree it's
                 declared. */}
-            {activeTab?.claudeSessionId && (
-              <DeconflictAdvisoryBanner taskRunId={activeTab.claudeSessionId} />
-            )}
+              {activeTab?.claudeSessionId && (
+                <DeconflictAdvisoryBanner taskRunId={activeTab.claudeSessionId} />
+              )}
 
-            {/* L3 (shared-checkout coordination gap fix) — soft warning
+              {/* L3 (shared-checkout coordination gap fix) — soft warning
                 when branch-mutating git is typed into THIS terminal's PTY
                 while a coord peer holds the worktree claim on the repo.
                 NOT gated on `claudeSessionId` (it applies to any terminal,
@@ -1684,59 +1703,65 @@ function TerminalPageInner({
                 equals the backend terminal id (ZoneGrid passes
                 `terminalId={zoneTab.id}`). Soft + dismissible; never
                 blocks input. */}
-            <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
+              <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
 
-            {/* Projects dashboard §7.2 step 4 — activating a project must
+              {/* Projects dashboard §7.2 step 4 — activating a project must
                 never re-`cd` a live shell (an agent may be mid-edit). This
                 chip is the honest alternative: it reports how many live
                 terminals sit outside the active project's root and offers
                 [Move them] (open replacements, then close the originals) /
                 [Leave them]. Renders nothing when no project is active or
                 every terminal is already at the root. */}
-            <ProjectFolderChip />
+              <ProjectFolderChip />
 
-            {/* Honest restore-status banner (Phase 5 + #548): restored tabs
+              {/* Honest restore-status banner (Phase 5 + #548): restored tabs
                 whose `--resume` failed (operator retry), reconciled best-effort
                 matches (one-click confirm), and terminal-only / fresh-
                 conversation restores (informational, dismissible) — instead of
                 any of these silently posing as a fully resumed conversation.
                 Same top-right advisory column. */}
-            <ResumeFailedBanner
-              tabs={tabs}
-              onRetryResume={handleRetryResume}
-              onDismissTerminalOnly={handleDismissTerminalOnly}
-            />
+              <ResumeFailedBanner
+                tabs={tabs}
+                onRetryResume={handleRetryResume}
+                onDismissTerminalOnly={handleDismissTerminalOnly}
+              />
 
-            {/* Remote tabs from before a restart (remote-session-tabs plan,
+              {/* "Since restart" (plan 2026-10-04-runner-session-roster-restore-
+                picker): once every page's restore has settled, says how many
+                sessions from before the restart came back — and opens the
+                review on the ones that did not. Same advisory column. */}
+              <SinceRestartStrip />
+
+              {/* Remote tabs from before a restart (remote-session-tabs plan,
                 Phase 4): placeholders with a Reattach action, never a
                 respawned local shell. */}
-            <RemoteRestoreBanner />
-          </div>
+              <RemoteRestoreBanner />
+            </div>
 
-          {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list
+            {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list
               shows in `single` layout too. Past the 9-zone `full-grid` ceiling
               the only honest surface for hidden sessions is this panel's
               Unassigned list; the UnzonedChip near the StatusStrip opens it. */}
-          {uiState.showControlPanel && (
-            <ZoneControlPanel
-              onCreateTerminal={() =>
-                createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn())
-              }
-            />
-          )}
+            {uiState.showControlPanel && (
+              <ZoneControlPanel
+                onCreateTerminal={() =>
+                  createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn())
+                }
+              />
+            )}
 
-          <TerminalRightPanel />
-        </div>
+            <TerminalRightPanel />
+          </div>
 
-        <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
+          <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
 
-        {/* Phase 2 — slash-command bar pinned to the bottom of the
+          {/* Phase 2 — slash-command bar pinned to the bottom of the
             page chrome. Reads from the command registry populated by
             `useTerminalCommands` above; Ctrl+/ focuses from anywhere. */}
-        <CommandBar />
-        <ResultCardMount />
+          <CommandBar />
+          <ResultCardMount />
 
-        {/* Phase 9c — TerminalTabBar demolished. ZoneLayoutPicker and
+          {/* Phase 9c — TerminalTabBar demolished. ZoneLayoutPicker and
             ZoneProfilePicker carry their own `useUIComponent`
             registrations (`zone-layout-picker` and `zone-profile-picker`),
             so external agents discover layout / profile actions through
@@ -1748,26 +1773,27 @@ function TerminalPageInner({
             (`/layout <preset>`, `/profile-load <name>`, etc.) or via
             external automation calling the UI Bridge action endpoints
             directly. */}
-        <div style={{ display: "none" }} aria-hidden>
-          <ZoneLayoutPicker
-            currentLayoutId={zoneLayout.layoutId}
-            onSelectLayout={(id) => zoneLayout.setLayoutId(id)}
-            tabCount={tabs.length}
-          />
-          <ZoneProfilePicker
-            currentLayoutId={zoneLayout.layoutId}
-            zoneLabels={labelsAndTags.zoneLabels}
-            zoneNotes={labelsAndTags.zoneNotes}
-            pinnedZones={labelsAndTags.pinnedZones}
-            autoApprovePatterns={transitionEffects.autoApprovePatterns}
-            pageId={pageId}
-            zoneAssignments={zoneLayout.assignments}
-            tabs={tabs}
-            initialized={initialized}
-            onLoadProfile={applyZoneProfile}
-          />
+          <div style={{ display: "none" }} aria-hidden>
+            <ZoneLayoutPicker
+              currentLayoutId={zoneLayout.layoutId}
+              onSelectLayout={(id) => zoneLayout.setLayoutId(id)}
+              tabCount={tabs.length}
+            />
+            <ZoneProfilePicker
+              currentLayoutId={zoneLayout.layoutId}
+              zoneLabels={labelsAndTags.zoneLabels}
+              zoneNotes={labelsAndTags.zoneNotes}
+              pinnedZones={labelsAndTags.pinnedZones}
+              autoApprovePatterns={transitionEffects.autoApprovePatterns}
+              pageId={pageId}
+              zoneAssignments={zoneLayout.assignments}
+              tabs={tabs}
+              initialized={initialized}
+              onLoadProfile={applyZoneProfile}
+            />
+          </div>
         </div>
-      </div>
-    </UIBridgeComponentScope>
+      </UIBridgeComponentScope>
+    </SinceRestartProvider>
   );
 }
