@@ -606,88 +606,173 @@ pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
     available_bytes / (1024 * 1024 * 1024) < floor_gb
 }
 
-/// The two clocks a queued dispatch carries.
+/// When a queued dispatch arrived, and the two DEADLINES it carries — stored
+/// as expiry instants and compared `<= now`, so no clock is ever reconstructed
+/// by subtracting from an [`Instant`] (on Windows `Instant`'s epoch is boot,
+/// and a subtraction reaching below it had to be clamped to a wrong answer).
 ///
-/// - `queued_since`: when it FIRST entered this device's queue. The
-///   [`queue_release_after`] deadline runs from here.
-/// - `last_renewed`: when coord last confirmed its lease — a `Renewed` queue
-///   heartbeat, or until there is one the lease's own start as the payload's
-///   `lease_expires_at` places it ([`lease_anchor`]), or `queued_since` when
-///   coord sent no deadline. Coord sweeps an unrenewed
-///   row one [`COORD_LEASE`] after its last renewal, so the runner may not hold
-///   a dispatch past [`UNRENEWED_HOLD`] from here (a queue heartbeat that keeps
-///   FAILING must not leave the runner holding a row coord has abandoned).
+/// - `queued_since`: when it FIRST entered this device's queue (for logs).
+/// - `release_at`: the queue deadline — arrival + [`queue_release_after`], or
+///   coord's `queued_renewal_deadline` less [`QUEUE_RELEASE_MARGIN`] when that
+///   is sooner. Past it the dispatch is released as
+///   [`DEFERRED_PAST_LEASE_REASON`].
+/// - `renew_by`: [`UNRENEWED_HOLD`] after coord last confirmed the lease — a
+///   `Renewed` queue heartbeat moves it to that tick + the hold; until one
+///   lands it is arrival + the hold, or coord's `lease_expires_at` less
+///   [`QUEUE_RELEASE_MARGIN`] when that is sooner. Coord sweeps an unrenewed
+///   row when its lease runs out, so a queue heartbeat that keeps FAILING must
+///   not leave the runner holding a row coord has abandoned; past `renew_by`
+///   it is released as [`QUEUED_RENEWAL_LAPSED_REASON`].
 ///
-/// Both survive re-submission: a dispatch popped for re-admission that defers
-/// again goes back in with its original stamp, so a dispatch bounced between
-/// the queue and a failed re-test cannot reset either clock and outlive its
-/// deadline.
+/// Coord's two wall-clock deadlines are AUTHORITATIVE where sent; the
+/// arrival-based values are the fallback and a cap. A coord-derived deadline
+/// is never allowed to fall before [`FIRST_RENEWAL_GRACE`] after arrival for a
+/// dispatch the keeper renews, so the first tick's heartbeat always goes out
+/// before any release such a deadline would cause — see
+/// [`QueueStamp::on_arrival`].
+///
+/// The stamp survives re-submission: a dispatch popped for re-admission that
+/// defers again goes back in with its original stamp, so a dispatch bounced
+/// between the queue and a failed re-test cannot reset either deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QueueStamp {
     queued_since: Instant,
-    last_renewed: Instant,
+    release_at: Instant,
+    renew_by: Instant,
 }
 
 impl QueueStamp {
-    /// A dispatch queued at `now`: its lease was last (re)started by coord's
-    /// dispatch, which is as close to `now` as the runner can know.
-    fn fresh(now: Instant) -> Self {
+    /// A dispatch queued at `now` with no coord-supplied deadline: its lease
+    /// was last (re)started by coord's dispatch, which is as close to `now` as
+    /// the runner can know.
+    fn fresh(payload: &CiDispatchPayload, now: Instant) -> Self {
         Self {
             queued_since: now,
-            last_renewed: now,
+            release_at: now + queue_release_after(payload),
+            renew_by: now + UNRENEWED_HOLD,
         }
     }
 
     /// The stamp a dispatch gets on its FIRST enqueue at `now` (`wall_now` is
-    /// the same moment on the wall clock). With a coord-supplied
-    /// `lease_expires_at`, `last_renewed` is anchored to when coord actually
-    /// (re)started the lease rather than to arrival; without one it is `fresh`.
+    /// the same moment on the wall clock).
+    ///
+    /// Each coord-supplied deadline, less [`QUEUE_RELEASE_MARGIN`], tightens
+    /// its arrival-based counterpart: `lease_expires_at` the `renew_by`,
+    /// `queued_renewal_deadline` the `release_at`. A coord deadline can only
+    /// SHORTEN a hold — one further out than the arrival-based value (clock
+    /// skew, or a longer coord lease) is capped by it.
+    ///
+    /// Floor: for a dispatch the keeper will renew, neither coord-derived
+    /// deadline lands before `now + FIRST_RENEWAL_GRACE`. A runner clock
+    /// AHEAD of coord's inflates the age the wall-clock deadlines imply, and
+    /// without the floor a healthy dispatch could be released as
+    /// `queued_renewal_lapsed` before the runner had asked coord once. With
+    /// it, the first keeper tick (at most one interval away) sends a
+    /// heartbeat first; coord's answer then decides — `Renewed` extends
+    /// `renew_by`, `Terminal` drops a row coord already swept, `Refused`
+    /// releases it. A dispatch the keeper does NOT renew gets no floor: no
+    /// answer is coming, so an already-past deadline releases on the first
+    /// tick.
     fn on_arrival(
         payload: &CiDispatchPayload,
         now: Instant,
         wall_now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let mut stamp = Self::fresh(now);
-        if let Some(deadline) = payload.lease_expires_at {
-            stamp.last_renewed = lease_anchor(deadline, wall_now, now);
+        let mut stamp = Self::fresh(payload, now);
+        let floor = if payload.coord_accepts_queue_heartbeat() {
+            now + FIRST_RENEWAL_GRACE
+        } else {
+            now
+        };
+        let inside = |deadline| margin_inside(deadline, wall_now, now);
+        if let Some(by) = payload.lease_expires_at.and_then(inside) {
+            stamp.renew_by = stamp.renew_by.min(by).max(floor);
+        }
+        if let Some(at) = payload.queued_renewal_deadline.and_then(inside) {
+            stamp.release_at = stamp.release_at.min(at).max(floor);
+        }
+        if let Some(age) = coord_age_at_arrival(payload, wall_now) {
+            if age > COORD_AGE_WARN {
+                warn!(
+                    "ci_node: dispatch {} for {} arrived {}s after coord created or leased \
+                     it, by coord's own deadlines — a late delivery, or this runner's clock \
+                     ahead of coord's; coord-derived queue deadlines are floored at {:?} \
+                     after arrival so a lease renewal is attempted first",
+                    payload.dispatch_id,
+                    payload.repo,
+                    age.num_seconds(),
+                    FIRST_RENEWAL_GRACE
+                );
+            }
         }
         stamp
     }
 }
 
-/// The monotonic instant coord last (re)started a lease that runs out at the
-/// wall-clock `lease_expires_at`: `lease_expires_at - COORD_LEASE`, carried
-/// onto the [`Instant`] clock through the pair (`wall_now`, `now`) that names
-/// the same moment on both clocks.
+/// The monotonic instant [`QUEUE_RELEASE_MARGIN`] before the wall-clock
+/// `deadline`, carried onto the [`Instant`] clock through the pair
+/// (`wall_now`, `now`) that names the same moment on both clocks.
 ///
-/// Clamped to `now`, never later: a deadline more than one lease ahead (clock
-/// skew, or a coord whose lease is longer than [`COORD_LEASE`]) must not
-/// lengthen the hold past what arrival would give. A deadline so far in the
-/// past that it predates the `Instant` epoch anchors one full hold back, which
-/// releases on the first tick — the same verdict the exact anchor would give.
-fn lease_anchor(
-    lease_expires_at: chrono::DateTime<chrono::Utc>,
+/// Only ever ADDS to `now`: a moment at or before `wall_now` maps to `now`
+/// itself, which `<= now` already reads as due — so an arbitrarily old
+/// deadline needs no subtraction below the `Instant` epoch. `None` for a
+/// deadline too far ahead to represent, which bounds nothing.
+fn margin_inside(
+    deadline: chrono::DateTime<chrono::Utc>,
     wall_now: chrono::DateTime<chrono::Utc>,
     now: Instant,
-) -> Instant {
-    let lease = chrono::Duration::seconds(COORD_LEASE.as_secs() as i64);
-    let lease_started = lease_expires_at - lease;
-    match (wall_now - lease_started).to_std() {
-        Ok(age) => now
-            .checked_sub(age)
-            .or_else(|| now.checked_sub(UNRENEWED_HOLD))
-            .unwrap_or(now),
-        // The lease started after `wall_now`: clamp, never anchor in the future.
-        Err(_) => now,
+) -> Option<Instant> {
+    let margin = chrono::Duration::seconds(QUEUE_RELEASE_MARGIN.as_secs() as i64);
+    let Some(target) = deadline.checked_sub_signed(margin) else {
+        return Some(now);
+    };
+    match (target - wall_now).to_std() {
+        Ok(ahead) => now.checked_add(ahead),
+        Err(_) => Some(now),
     }
 }
 
-/// A deferred dispatch, its [`QueueStamp`], and how long it may stay queued
-/// ([`queue_release_after`], fixed at first enqueue).
+/// How long before arrival coord created or (re)leased `payload`, as its own
+/// deadlines imply — from `lease_expires_at` (assuming coord's lease is
+/// [`COORD_LEASE`]) or else from `queued_renewal_deadline` and the advertised
+/// ceiling. Diagnostic only: it names a delivery lag or a runner clock ahead
+/// of coord's, and never feeds a deadline.
+fn coord_age_at_arrival(
+    payload: &CiDispatchPayload,
+    wall_now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::Duration> {
+    let started = match (
+        payload.lease_expires_at,
+        payload.queued_renewal_deadline,
+        payload.queued_renewal_max_age_secs,
+    ) {
+        (Some(lease_end), _, _) => {
+            lease_end.checked_sub_signed(chrono::Duration::seconds(COORD_LEASE.as_secs() as i64))?
+        }
+        (None, Some(ceiling), Some(max_age)) => {
+            ceiling.checked_sub_signed(chrono::Duration::seconds(max_age as i64))?
+        }
+        _ => return None,
+    };
+    Some(wall_now - started)
+}
+
+/// A coord-implied age at arrival past which [`QueueStamp::on_arrival`] warns:
+/// delivery normally takes seconds, so minutes mean a backlog or clock skew.
+const COORD_AGE_WARN: chrono::Duration = chrono::Duration::minutes(3);
+
+/// How far after arrival a coord-derived deadline may fall, at the earliest,
+/// for a dispatch the keeper renews: one [`QUEUE_HEARTBEAT_INTERVAL`] (the
+/// first keeper tick is at most that far away, and its release check runs
+/// strictly before it) plus one [`QUEUE_HEARTBEAT_BATCH_TIMEOUT`] (the
+/// renewal it sends has that long to be answered).
+pub(crate) const FIRST_RENEWAL_GRACE: Duration =
+    QUEUE_HEARTBEAT_INTERVAL.saturating_add(QUEUE_HEARTBEAT_BATCH_TIMEOUT);
+
+/// A deferred dispatch and its [`QueueStamp`].
 struct QueuedDispatch {
     payload: CiDispatchPayload,
     stamp: QueueStamp,
-    release_after: Duration,
 }
 
 struct CiState {
@@ -734,13 +819,23 @@ pub(crate) const QUEUE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// heartbeats a queued dispatch's lease runs out this long after coord created
 /// it (or last renewed it), and coord's sweeper marks it `lost` within the
 /// minute after; see [`UNRENEWED_HOLD`] for how far inside it the runner lets go.
+///
+/// MUST MATCH coord's `LEASE_SECS`. Coord's own values are authoritative
+/// wherever coord sends them — `lease_expires_at` places the first renew-by
+/// deadline and `queued_renewal_deadline` the queue ceiling with no runner
+/// constant at all — but a successful renewal carries no new expiry, so the
+/// renew-by deadline it moves to ([`UNRENEWED_HOLD`] after the renewing tick)
+/// and the arrival-based cap on `lease_expires_at` both assume this length.
 pub(crate) const COORD_LEASE: Duration = Duration::from_secs(15 * 60);
 
 /// How far inside coord's queued-renewal ceiling the runner releases.
 ///
-/// Coord measures its ceiling from `created_at`; the runner measures queue
-/// time from when IT first queued the dispatch, which is later by the delivery
-/// lag. The margin absorbs that lag plus one [`QUEUE_HEARTBEAT_INTERVAL`] (the
+/// Applied to coord's own deadlines when the payload carries them
+/// (`lease_expires_at`, `queued_renewal_deadline`), and otherwise to the
+/// runner's arrival-based estimate of them. Coord measures its ceiling from
+/// `created_at`; that estimate measures queue time from when the runner first
+/// queued the dispatch, which is later by the delivery lag. The margin
+/// absorbs that lag plus one [`QUEUE_HEARTBEAT_INTERVAL`] (the
 /// release is only checked once per tick) plus one
 /// [`QUEUE_HEARTBEAT_BATCH_TIMEOUT`] (the longest a tick's renewals run), with
 /// room to spare: five minutes against a lag of seconds and 90 s of tick.
@@ -760,8 +855,11 @@ pub(crate) const QUEUE_RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// absorbs the delivery lag, one keeper tick, and the release POST itself.
 pub(crate) const UNRENEWED_HOLD: Duration = Duration::from_secs(10 * 60);
 
-/// How long this runner may hold `payload` in its admission queue before
-/// RELEASING it back to coord as `cancelled`/[`DEFERRED_PAST_LEASE_REASON`].
+/// How long after ARRIVAL this runner may hold `payload` in its admission
+/// queue before RELEASING it back to coord as
+/// `cancelled`/[`DEFERRED_PAST_LEASE_REASON`]. When coord sends
+/// `queued_renewal_deadline` that, less [`QUEUE_RELEASE_MARGIN`], is the
+/// authoritative bound and this only caps it ([`QueueStamp::on_arrival`]).
 /// (Independently, [`UNRENEWED_HOLD`] bounds the hold from the last renewal.)
 ///
 /// The goal is that queued work eventually BUILDS, not that its failure gets a
@@ -805,13 +903,14 @@ pub(crate) const QUEUED_RENEWAL_REFUSED_REASON: &str = "queued_renewal_refused";
 /// device credential …), so coord is about to sweep it.
 pub(crate) const QUEUED_RENEWAL_LAPSED_REASON: &str = "queued_renewal_lapsed";
 
-/// Why `q` must leave the queue as of `now`, if it must. The queue deadline is
-/// checked first, so a dispatch that was never renewable (where both clocks
-/// coincide) is named [`DEFERRED_PAST_LEASE_REASON`].
+/// Why `q` must leave the queue as of `now`, if it must. Each deadline is due
+/// AT its instant (`<= now`). The queue deadline is checked first, so a
+/// dispatch that was never renewable (where both deadlines coincide) is named
+/// [`DEFERRED_PAST_LEASE_REASON`].
 fn expiry_reason(q: &QueuedDispatch, now: Instant) -> Option<&'static str> {
-    if now.saturating_duration_since(q.stamp.queued_since) >= q.release_after {
+    if q.stamp.release_at <= now {
         Some(DEFERRED_PAST_LEASE_REASON)
-    } else if now.saturating_duration_since(q.stamp.last_renewed) >= UNRENEWED_HOLD {
+    } else if q.stamp.renew_by <= now {
         Some(QUEUED_RENEWAL_LAPSED_REASON)
     } else {
         None
@@ -838,22 +937,17 @@ fn take_expired(
 }
 
 /// Push a deferred dispatch and arm the queue-keeper if none is running.
-/// `stamp` is `Some` for a RE-queue, which keeps both of its clocks; `None`
-/// stamps it fresh. Returns `(queue depth, keeper newly armed)`; the caller
-/// spawns the keeper OUTSIDE the lock.
+/// `stamp` is `Some` for a RE-queue, which keeps both of its deadlines; `None`
+/// stamps it on arrival. Returns `(queue depth, keeper newly armed)`; the
+/// caller spawns the keeper OUTSIDE the lock.
 fn enqueue_locked(
     state: &mut CiState,
     payload: CiDispatchPayload,
     stamp: Option<QueueStamp>,
 ) -> (usize, bool) {
-    let release_after = queue_release_after(&payload);
     let stamp = stamp
         .unwrap_or_else(|| QueueStamp::on_arrival(&payload, Instant::now(), chrono::Utc::now()));
-    state.queued.push_back(QueuedDispatch {
-        payload,
-        stamp,
-        release_after,
-    });
+    state.queued.push_back(QueuedDispatch { payload, stamp });
     let arm = !state.keeper_armed;
     if arm {
         state.keeper_armed = true;
@@ -901,17 +995,18 @@ impl QueueTransport for CoordQueueTransport {
 /// the dispatch, but only if it is still queued: it may have been admitted
 /// while the POST was in flight, and a running build is not the queue's to
 /// release. A renewal that FAILS keeps the dispatch queued and does not move
-/// its `last_renewed`; the next tick retries, and [`UNRENEWED_HOLD`] releases
-/// it before coord's sweeper would abandon it. A `Renewed` reply moves
-/// `last_renewed` to `now` — the tick's START, which is no later than coord's
-/// own renewal stamp, so the runner's view of the lease errs short.
+/// its `renew_by`; the next tick retries, and `renew_by` releases it before
+/// coord's sweeper would abandon it. A `Renewed` reply moves `renew_by` to
+/// `now` + [`UNRENEWED_HOLD`] — `now` being the tick's START, which is no
+/// later than coord's own renewal stamp, so the runner's view of the lease
+/// errs short.
 ///
 /// Renewals are sent concurrently, at most [`QUEUE_HEARTBEAT_CONCURRENCY`] in
 /// flight, so a queue of N against an unreachable coord costs `ceil(N / 8)`
 /// heartbeat timeouts (each a request timeout plus at most one credential
 /// re-mint) rather than N. That is still unbounded in N, so the whole batch is
 /// cut off at [`QUEUE_HEARTBEAT_BATCH_TIMEOUT`]: a renewal that has not answered
-/// by then is dropped and counts as NOT renewed this tick (its `last_renewed`
+/// by then is dropped and counts as NOT renewed this tick (its `renew_by`
 /// does not move), exactly like a `Failed` one. The tick therefore never
 /// outlasts the batch bound, which [`UNRENEWED_HOLD`]'s margin is sized for.
 ///
@@ -946,13 +1041,17 @@ async fn keeper_tick<T: QueueTransport>(
     for (q, reason) in expired {
         warn!(
             "ci_node: releasing dispatch {} for {} after {:?} queued on this device \
-             ({:?} since coord last renewed it; deadline {:?}) — reporting \
-             cancelled/{reason} so coord can re-dispatch it",
+             (queue deadline {:?} after arrival, renew-by {:?} after arrival) — \
+             reporting cancelled/{reason} so coord can re-dispatch it",
             q.payload.dispatch_id,
             q.payload.repo,
             now.saturating_duration_since(q.stamp.queued_since),
-            now.saturating_duration_since(q.stamp.last_renewed),
-            q.release_after
+            q.stamp
+                .release_at
+                .saturating_duration_since(q.stamp.queued_since),
+            q.stamp
+                .renew_by
+                .saturating_duration_since(q.stamp.queued_since)
         );
         transport.release(&q.payload, reason);
     }
@@ -979,19 +1078,20 @@ async fn keeper_tick<T: QueueTransport>(
         .buffer_unordered(QUEUE_HEARTBEAT_CONCURRENCY);
     let batch_deadline = tokio::time::Instant::now() + QUEUE_HEARTBEAT_BATCH_TIMEOUT;
     loop {
-        let (dispatch_id, reply) = match tokio::time::timeout_at(batch_deadline, replies.next())
-            .await
-        {
-            Ok(Some(next)) => next,
-            Ok(None) => break,
-            Err(_) => {
-                warn!(
-                        "ci_node: {} of {sent} queued-lease renewals unanswered after                          {QUEUE_HEARTBEAT_BATCH_TIMEOUT:?} — dropping them; they count                          as not renewed this tick",
+        let (dispatch_id, reply) =
+            match tokio::time::timeout_at(batch_deadline, replies.next()).await {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(_) => {
+                    warn!(
+                        "ci_node: {} of {sent} queued-lease renewals unanswered after \
+                         {QUEUE_HEARTBEAT_BATCH_TIMEOUT:?} — dropping them; they count \
+                         as not renewed this tick",
                         sent - answered
                     );
-                break;
-            }
-        };
+                    break;
+                }
+            };
         answered += 1;
         let dispatch_id = dispatch_id.as_str();
         match reply {
@@ -1067,8 +1167,9 @@ pub(crate) const QUEUE_HEARTBEAT_CONCURRENCY: usize = 8;
 pub(crate) const QUEUE_HEARTBEAT_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Record a successful lease renewal at `at` on a dispatch that is still
-/// queued. One admitted (or dropped) while the POST was in flight is left
-/// alone — it is no longer the queue's.
+/// queued: its renew-by deadline becomes `at` + [`UNRENEWED_HOLD`], never
+/// earlier than it was. One admitted (or dropped) while the POST was in
+/// flight is left alone — it is no longer the queue's.
 fn mark_renewed(state: &Mutex<CiState>, dispatch_id: &str, at: Instant) {
     let mut guard = state.lock().unwrap();
     if let Some(q) = guard
@@ -1076,7 +1177,7 @@ fn mark_renewed(state: &Mutex<CiState>, dispatch_id: &str, at: Instant) {
         .iter_mut()
         .find(|q| q.payload.dispatch_id == dispatch_id)
     {
-        q.stamp.last_renewed = q.stamp.last_renewed.max(at);
+        q.stamp.renew_by = q.stamp.renew_by.max(at + UNRENEWED_HOLD);
     }
 }
 
@@ -1532,9 +1633,8 @@ mod tests {
 
     fn queued_at(p: CiDispatchPayload, queued_since: Instant) -> QueuedDispatch {
         QueuedDispatch {
-            release_after: queue_release_after(&p),
+            stamp: QueueStamp::fresh(&p, queued_since),
             payload: p,
-            stamp: QueueStamp::fresh(queued_since),
         }
     }
 
@@ -1561,7 +1661,7 @@ mod tests {
             let mut entry = queued_at(p, now - Duration::from_secs(age_secs));
             if entry.payload.coord_accepts_queue_heartbeat() {
                 // Renewed a minute ago, so only the queue deadline is in play.
-                entry.stamp.last_renewed = now - Duration::from_secs(60);
+                entry.stamp.renew_by = now - Duration::from_secs(60) + UNRENEWED_HOLD;
             }
             q.push_back(entry);
         }
@@ -1634,7 +1734,8 @@ mod tests {
         assert_eq!(UNRENEWED_HOLD, COORD_LEASE - QUEUE_RELEASE_MARGIN);
         assert!(
             UNRENEWED_HOLD + QUEUE_HEARTBEAT_INTERVAL + QUEUE_HEARTBEAT_BATCH_TIMEOUT < COORD_LEASE,
-            "the release must be sent before the lease expires, even a tick late              behind a renewal batch that ran to its bound"
+            "the release must be sent before the lease expires, even a tick late \
+             behind a renewal batch that ran to its bound"
         );
         assert!(
             QUEUE_HEARTBEAT_BATCH_TIMEOUT < QUEUE_HEARTBEAT_INTERVAL,
@@ -1932,11 +2033,14 @@ mod tests {
             .unwrap()
             .queued
             .iter()
-            .map(|q| (q.payload.dispatch_id.clone(), q.stamp.last_renewed))
+            .map(|q| (q.payload.dispatch_id.clone(), q.stamp.renew_by))
             .collect();
         assert_eq!(
             renewed,
-            [("fast".to_string(), now), ("hung".to_string(), queued)],
+            [
+                ("fast".to_string(), now + UNRENEWED_HOLD),
+                ("hung".to_string(), queued + UNRENEWED_HOLD)
+            ],
             "the answered renewal lands; the cut-off one stays queued, unrenewed"
         );
     }
@@ -2005,15 +2109,11 @@ mod tests {
     /// the anchor is arrival, as before.
     #[tokio::test]
     async fn a_late_delivered_dispatch_is_released_by_its_lease_deadline_not_its_arrival() {
-        let arrived = Instant::now() + Duration::from_secs(60 * 60);
+        let arrived = Instant::now();
         let wall_arrived = chrono::Utc::now();
         let lease = chrono::Duration::seconds(COORD_LEASE.as_secs() as i64);
         let failed = || reporting::QueueHeartbeat::Failed("transport: unreachable".into());
-        let entry_for = |p: CiDispatchPayload| QueuedDispatch {
-            release_after: queue_release_after(&p),
-            stamp: QueueStamp::on_arrival(&p, arrived, wall_arrived),
-            payload: p,
-        };
+        let entry_for = |p: CiDispatchPayload| arrived_at(p, arrived, wall_arrived);
 
         let mut late = advertising(queued_payload("late"), 1800);
         late.lease_expires_at = Some(wall_arrived - chrono::Duration::minutes(6) + lease);
@@ -2035,25 +2135,189 @@ mod tests {
         );
     }
 
-    /// The anchor is clamped to arrival: a deadline more than one lease ahead
-    /// (clock skew) never lengthens the hold, and one that predates the
-    /// `Instant` epoch still releases on the first tick.
+    /// The entry a dispatch gets on its first enqueue at (`arrived`, `wall`).
+    fn arrived_at(
+        p: CiDispatchPayload,
+        arrived: Instant,
+        wall: chrono::DateTime<chrono::Utc>,
+    ) -> QueuedDispatch {
+        QueuedDispatch {
+            stamp: QueueStamp::on_arrival(&p, arrived, wall),
+            payload: p,
+        }
+    }
+
+    /// A wall-clock deadline maps onto the `Instant` clock by ADDING to `now`
+    /// only: the margin is taken off, a moment already past maps to `now`
+    /// (due), and nothing is ever subtracted from `now`.
     #[test]
-    fn the_lease_anchor_is_never_later_than_arrival() {
-        let now = Instant::now() + Duration::from_secs(60 * 60);
+    fn a_coord_deadline_maps_to_an_instant_without_subtracting_from_now() {
+        let now = Instant::now();
         let wall = chrono::Utc::now();
-        let lease = chrono::Duration::seconds(COORD_LEASE.as_secs() as i64);
+        let margin = chrono::Duration::seconds(QUEUE_RELEASE_MARGIN.as_secs() as i64);
         assert_eq!(
-            lease_anchor(wall + lease + chrono::Duration::minutes(5), wall, now),
-            now
+            margin_inside(wall + margin + chrono::Duration::minutes(7), wall, now),
+            Some(now + Duration::from_secs(7 * 60))
         );
-        assert_eq!(lease_anchor(wall + lease, wall, now), now);
+        assert_eq!(margin_inside(wall + margin, wall, now), Some(now));
         assert_eq!(
-            lease_anchor(wall + lease - chrono::Duration::minutes(3), wall, now),
-            now - Duration::from_secs(3 * 60)
+            margin_inside(wall + chrono::Duration::minutes(1), wall, now),
+            Some(now),
+            "inside the margin is already due"
         );
-        let ancient = lease_anchor(wall - chrono::Duration::days(365 * 100), wall, now);
-        assert!(now.saturating_duration_since(ancient) >= UNRENEWED_HOLD);
+        assert_eq!(
+            margin_inside(wall - chrono::Duration::days(365 * 100), wall, now),
+            Some(now),
+            "a deadline older than any Instant epoch is simply due"
+        );
+    }
+
+    /// REGRESSION (review LOW 1): the hold was kept as a "last renewed"
+    /// instant reconstructed by SUBTRACTING the lease's age from `now`. On
+    /// Windows `Instant`'s epoch is boot, so within one hold of boot that
+    /// subtraction failed and was clamped to arrival — an already-expired
+    /// dispatch was then held a full UNRENEWED_HOLD more. Deadlines are now
+    /// expiry instants built by addition, so `now` here is a bare
+    /// `Instant::now()` with no headroom below it, and the verdict is the
+    /// same however recently the host booted.
+    #[tokio::test]
+    async fn an_already_expired_dispatch_is_not_held_a_full_hold_past_arrival() {
+        let arrived = Instant::now();
+        let wall = chrono::Utc::now();
+        let ancient = wall - chrono::Duration::days(365 * 100);
+
+        // Not renewable (legacy coord): due at arrival, released on the first
+        // tick that sees it.
+        let mut legacy = queued_payload("legacy-expired");
+        legacy.lease_expires_at = Some(ancient);
+        let entry = arrived_at(legacy, arrived, wall);
+        assert_eq!(entry.stamp.renew_by, arrived);
+        let mut q: VecDeque<QueuedDispatch> = VecDeque::from([entry]);
+        let released: Vec<&str> = take_expired(&mut q, arrived)
+            .into_iter()
+            .map(|(_, reason)| reason)
+            .collect();
+        assert_eq!(released, [QUEUED_RENEWAL_LAPSED_REASON]);
+
+        // Renewable: floored at one grace past arrival — coord is asked once,
+        // not held for ten minutes on a guess.
+        let mut current = advertising(queued_payload("expired"), 1800);
+        current.lease_expires_at = Some(ancient);
+        let entry = arrived_at(current.clone(), arrived, wall);
+        assert_eq!(entry.stamp.renew_by, arrived + FIRST_RENEWAL_GRACE);
+
+        // Coord already swept it: the first tick's renewal reads that back and
+        // drops the row, releasing nothing.
+        let state = state_with(vec![entry]);
+        let fake = FakeTransport::new(reporting::QueueHeartbeat::Terminal("lost".into()));
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, arrived, 2, |_| {
+                reporting::QueueHeartbeat::Terminal("lost".into())
+            })
+            .await,
+            None
+        );
+        assert_eq!(*fake.heartbeats.lock().unwrap(), ["expired"]);
+        assert!(state.lock().unwrap().queued.is_empty());
+
+        // Coord unreachable: released on the second tick, not at minute 10.
+        let state = state_with(vec![arrived_at(current, arrived, wall)]);
+        let failed = || reporting::QueueHeartbeat::Failed("transport: unreachable".into());
+        let fake = FakeTransport::new(failed());
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, arrived, 30, |_| failed()).await,
+            Some((2, QUEUED_RENEWAL_LAPSED_REASON.to_string()))
+        );
+    }
+
+    /// Coord's `queued_renewal_deadline` is authoritative for the queue
+    /// ceiling. A dispatch delivered 20 minutes after coord created it (30-min
+    /// ceiling, so coord refuses renewals from 10 minutes after arrival) used
+    /// to be held to its arrival-based 25 minutes and end on coord's
+    /// `queued_renewal_refused`. It is now released at the deadline less the
+    /// margin — minute 5, while every renewal is still accepted — as
+    /// `deferred_past_lease`.
+    #[tokio::test]
+    async fn a_late_delivery_is_released_inside_coords_queued_renewal_deadline() {
+        let arrived = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut late = advertising(queued_payload("late"), 1800);
+        late.lease_expires_at = Some(wall - chrono::Duration::minutes(5));
+        late.queued_renewal_deadline = Some(wall + chrono::Duration::minutes(10));
+        let state = state_with(vec![arrived_at(late, arrived, wall)]);
+        let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
+        let released = run_keeper_minutes(&state, &fake, arrived, 30, |m| {
+            if m < 10 {
+                reporting::QueueHeartbeat::Renewed
+            } else {
+                reporting::QueueHeartbeat::Refused
+            }
+        })
+        .await;
+        assert_eq!(
+            released,
+            Some((5, DEFERRED_PAST_LEASE_REASON.to_string())),
+            "released before coord's ceiling, with the queue-deadline reason"
+        );
+        assert_eq!(
+            fake.heartbeats.lock().unwrap().len(),
+            4,
+            "renewed every tick until the release"
+        );
+    }
+
+    /// REGRESSION (review LOW 2): a runner clock AHEAD of coord's inflates the
+    /// age coord's wall-clock deadlines imply. Here they imply 12 minutes of
+    /// age at arrival (lease ends in 3, ceiling in 18), which without a floor
+    /// put renew-by in the past and released a healthy dispatch as
+    /// `queued_renewal_lapsed` on the first tick, before the runner had asked
+    /// coord anything. The first tick now always sends a renewal first.
+    #[tokio::test]
+    async fn a_skewed_clock_cannot_release_a_dispatch_before_one_renewal_attempt() {
+        let arrived = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut skewed = advertising(queued_payload("skewed"), 1800);
+        skewed.lease_expires_at = Some(wall + chrono::Duration::minutes(3));
+        skewed.queued_renewal_deadline = Some(wall + chrono::Duration::minutes(18));
+        assert_eq!(
+            coord_age_at_arrival(&skewed, wall),
+            Some(chrono::Duration::minutes(12)),
+            "the age the warning reports"
+        );
+
+        // Coord unreachable: one renewal goes out (minute 1) before the
+        // release (minute 2).
+        let failed = || reporting::QueueHeartbeat::Failed("transport: unreachable".into());
+        let state = state_with(vec![arrived_at(skewed.clone(), arrived, wall)]);
+        let fake = FakeTransport::new(failed());
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, arrived, 30, |_| failed()).await,
+            Some((2, QUEUED_RENEWAL_LAPSED_REASON.to_string()))
+        );
+        assert_eq!(*fake.heartbeats.lock().unwrap(), ["skewed"]);
+
+        // Coord renews: held to coord's own ceiling less the margin.
+        let state = state_with(vec![arrived_at(skewed, arrived, wall)]);
+        let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, arrived, 30, |_| {
+                reporting::QueueHeartbeat::Renewed
+            })
+            .await,
+            Some((13, DEFERRED_PAST_LEASE_REASON.to_string()))
+        );
+    }
+
+    /// The grace a coord-derived deadline is floored at outlasts the first
+    /// keeper tick plus its renewal batch, and stays well inside the hold.
+    #[test]
+    fn the_first_renewal_grace_covers_one_tick_and_its_batch() {
+        assert_eq!(
+            FIRST_RENEWAL_GRACE,
+            QUEUE_HEARTBEAT_INTERVAL + QUEUE_HEARTBEAT_BATCH_TIMEOUT
+        );
+        assert!(FIRST_RENEWAL_GRACE > QUEUE_HEARTBEAT_INTERVAL);
+        assert!(FIRST_RENEWAL_GRACE < UNRENEWED_HOLD);
     }
 
     /// `lease_expires_at` is read as RFC 3339; absent or null is `None`; and a
@@ -2081,8 +2345,20 @@ mod tests {
             )
         );
         v["lease_expires_at"] = serde_json::Value::Null;
-        let p: CiDispatchPayload = serde_json::from_value(v).expect("null parses");
+        let p: CiDispatchPayload = serde_json::from_value(v.clone()).expect("null parses");
         assert_eq!(p.lease_expires_at, None);
+        assert_eq!(p.queued_renewal_deadline, None);
+        // Coord's own shape: UTC with microseconds.
+        v["queued_renewal_deadline"] = "2026-10-08T10:30:00.123456Z".into();
+        let p: CiDispatchPayload = serde_json::from_value(v).expect("parses");
+        assert_eq!(
+            p.queued_renewal_deadline,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-08T10:30:00.123456Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
     }
 
     /// Records every re-admission instead of admitting.
@@ -2101,7 +2377,8 @@ mod tests {
         let queued_since = Instant::now();
         QueueStamp {
             queued_since,
-            last_renewed: queued_since + Duration::from_secs(120),
+            release_at: queued_since + Duration::from_secs(1500),
+            renew_by: queued_since + Duration::from_secs(720),
         }
     }
 
@@ -2221,7 +2498,8 @@ mod tests {
         // rather than replaced by `now()`.
         let first = QueueStamp {
             queued_since: Instant::now() + Duration::from_secs(600),
-            last_renewed: Instant::now() + Duration::from_secs(700),
+            release_at: Instant::now() + Duration::from_secs(800),
+            renew_by: Instant::now() + Duration::from_secs(700),
         };
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("a"), Some(first));
         assert_eq!((depth, armed), (1, true));
@@ -2230,8 +2508,10 @@ mod tests {
         assert_eq!((depth, armed), (2, false), "one keeper, ever");
         let fresh = state.queued[1].stamp;
         assert!(
-            fresh.queued_since < first.queued_since && fresh.last_renewed == fresh.queued_since,
-            "a fresh defer is stamped now on both clocks"
+            fresh.queued_since < first.queued_since
+                && fresh.renew_by == fresh.queued_since + UNRENEWED_HOLD
+                && fresh.release_at == fresh.queued_since + UNRENEWED_HOLD,
+            "a fresh defer's deadlines run from now"
         );
     }
 

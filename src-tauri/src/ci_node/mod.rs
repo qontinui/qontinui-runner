@@ -116,14 +116,27 @@ pub(crate) struct CiDispatchPayload {
     /// admission queue derives how long it may hold the dispatch from this.
     #[serde(default)]
     pub queued_renewal_max_age_secs: Option<u64>,
-    /// When coord's lease on this dispatch runs out, as coord stamped it
-    /// (RFC 3339). The admission queue anchors its "last renewed" clock to it
-    /// (`lease_expires_at - COORD_LEASE`) instead of to the moment the message
-    /// ARRIVED, so a late or redelivered `build_requested` is released before
-    /// coord's sweeper instead of after it. Absent on a payload from a coord
-    /// that does not send it; the anchor is then arrival, as before.
+    /// When coord's lease on this dispatch runs out, as coord wrote it at
+    /// insert (RFC 3339). AUTHORITATIVE over any runner arithmetic: the
+    /// admission queue's renew-by deadline is this less
+    /// `admission::QUEUE_RELEASE_MARGIN` (capped by the arrival-based hold),
+    /// rather than counted from the moment the message ARRIVED, so a late or
+    /// redelivered `build_requested` is released before coord's sweeper
+    /// instead of after it. Absent on a payload from a coord that does not
+    /// send it; the deadline is then counted from arrival, as before.
     #[serde(default)]
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The instant from which coord REFUSES a queued renewal
+    /// (`created_at + 2 × LEASE_SECS`, RFC 3339): a renewal before it is
+    /// accepted, one at or after it is answered `409 queued_renewal_refused`.
+    /// AUTHORITATIVE: the admission queue releases this less
+    /// `admission::QUEUE_RELEASE_MARGIN` (or at its arrival-based deadline,
+    /// whichever is sooner), so the ceiling needs no runner-side constant and
+    /// a late delivery is released while coord still accepts the reason.
+    /// Absent on a payload from a coord that does not send it; the release
+    /// deadline is then counted from arrival, as before.
+    #[serde(default)]
+    pub queued_renewal_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl CiDispatchPayload {
