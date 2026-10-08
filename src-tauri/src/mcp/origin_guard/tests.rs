@@ -1239,6 +1239,34 @@ fn second_review_doors() {
     assert!(!is_credential_door("GET", "/state-explorer/history"));
 }
 
+/// `POST /control/sessions/resume` spawns `claude --resume` under the user's
+/// account: it is a credential door, so no browser origin (trusted included)
+/// reaches it, and it sits on no browser allowlist. The read-only siblings
+/// under `/control/sessions/` stay ordinary routes.
+#[test]
+fn resume_door_is_a_credential_door_and_on_no_allowlist() {
+    assert!(is_credential_door("POST", "/control/sessions/resume"));
+    assert!(!is_credential_door("GET", "/control/sessions/restore-census"));
+    for list in [TRUSTED_ROUTES, FOREIGN_ROUTES] {
+        assert!(!list.contains(&("POST", "/control/sessions/resume")));
+    }
+    assert!(!route_allowed(
+        OriginClass::Trusted,
+        "POST",
+        "/control/sessions/resume"
+    ));
+    assert!(!route_allowed(
+        OriginClass::Foreign,
+        "POST",
+        "/control/sessions/resume"
+    ));
+    assert!(route_allowed(
+        OriginClass::NonBrowser,
+        "POST",
+        "/control/sessions/resume"
+    ));
+}
+
 /// Grace tripwire: every graced route is a door and a registered route, and
 /// nothing is both extension-only and allowlisted or a door.
 #[test]

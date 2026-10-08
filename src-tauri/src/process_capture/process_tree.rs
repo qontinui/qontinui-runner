@@ -281,7 +281,7 @@ fn is_claude_image(name: Option<&String>) -> bool {
 /// tree-shape heuristics like parent-is-also-claude, which miscount legitimate
 /// nested claude launches). Fail-open: a pid with no resolved exe path counts
 /// as real.
-fn is_countable_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+pub(crate) fn is_countable_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
     if !is_claude_image(snapshot.names.get(&pid)) {
         return false;
     }

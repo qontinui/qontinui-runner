@@ -309,6 +309,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /ui-bridge/ios/forward",
     "POST /system/windows/activate",
     "POST /control/session-open",
+    // Spawns `claude --resume` processes under the user's account for closed
+    // sessions (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-
+    // found-fleet-wide-and-resumed, Phase 4): it drives processes and spends
+    // quota, the same class as `POST /sessions/spawn` above. No browser origin
+    // has any business here; the caller is the coord-driven sweep or an
+    // operator's curl.
+    "POST /control/sessions/resume",
     "POST /install-effects/observe-verify",
     "POST /code-semantics/typecheck",
     "GET /sse/events",
