@@ -171,6 +171,8 @@ on:
       # job body carries the same path as a `case` arm — a `paths:` entry alone
       # would trigger the run and then be silently dropped by that filter.
       - 'scripts/check_untimed_subprocess.py'
+      - 'scripts/check_helper_redefinition.py'
+      - 'scripts/helper-redefinition-allowlist.txt'
 
 permissions:
   contents: read
@@ -289,6 +291,9 @@ jobs:
               # whole verdict lives in it. Kept in step with the `paths:`
               # trigger above — either half alone guards nothing.
               scripts/check_untimed_subprocess.py) ;;
+              # forbid-helper-redefinition.yml's verdict, and its allowlist (a
+              # widened list is a loosened gate).
+              scripts/check_helper_redefinition.py|scripts/helper-redefinition-allowlist.txt) ;;
               *) continue ;;
             esac
             if grep -qxF "${f}" <<< "${NON_GATING}"; then continue; fi

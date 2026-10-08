@@ -31,14 +31,6 @@ use crate::window_assignments::{
     WindowAssignments, WindowAssignmentsState, WindowGeometry, WindowRecord, MAIN_WINDOW_LABEL,
 };
 
-/// Unix-millis now. (Plain `std::time` — this is Rust, not a workflow script.)
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Set once the app is shutting down (main window closed, or `ExitRequested`).
 /// While true, a pop-out window's `CloseRequested` is the app tearing it down —
 /// NOT the user dismissing it — so [`handle_window_close`] must PRESERVE the
@@ -233,8 +225,13 @@ pub async fn open_terminal_window(
     };
 
     // The webview is real: commit the reserved label as a persisted record.
-    let record =
-        assignments.create_reserved_window(label.clone(), None, None, bound_page.clone(), now_ms());
+    let record = assignments.create_reserved_window(
+        label.clone(),
+        None,
+        None,
+        bound_page.clone(),
+        crate::util::time::now_ms_i64(),
+    );
 
     // Apply placement (physical global coords) when provided; otherwise let the
     // OS place it (cascaded near the focused window).

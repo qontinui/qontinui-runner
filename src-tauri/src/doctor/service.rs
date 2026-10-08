@@ -338,10 +338,7 @@ impl DoctorService {
         // Signal 2: Activity tracker (for SessionStreaming processes)
         if let Some(ref activity_arc) = proc.last_activity {
             let last_activity_secs = activity_arc.load(Ordering::Relaxed);
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now_secs = crate::util::time::now_secs();
             let gap = now_secs.saturating_sub(last_activity_secs);
 
             if gap < config.activity_gap_seconds {

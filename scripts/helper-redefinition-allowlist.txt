@@ -1,0 +1,28 @@
+# Files that still hand-roll a wall-clock read (`duration_since(..UNIX_EPOCH)`).
+# Plan 2026-10-04-runner-time-backoff-and-http-client-helpers-are-re-rolled-per-module.
+# This list must only SHRINK, and must be EXACT (scripts/check_helper_redefinition.py
+# fails on a file listed here that no longer has a hit).  Hot files are converted
+# by a follow-up PR per file after that file's split plan lands (plan D5).
+src-tauri/src/alloc_breadcrumb.rs
+src-tauri/src/auth.rs
+src-tauri/src/commands/ai_settings.rs
+src-tauri/src/commands/file_browser.rs
+src-tauri/src/coord_mcp.rs
+src-tauri/src/fleet.rs
+src-tauri/src/fs_atomic.rs
+src-tauri/src/install_effects_producer/intercept/shim_materializer.rs
+src-tauri/src/main.rs
+src-tauri/src/mcp/ai_session.rs
+src-tauri/src/mcp/backend_relay.rs
+src-tauri/src/mcp/file_browser.rs
+src-tauri/src/mcp/remote_terminal.rs
+src-tauri/src/mcp/sdk_client.rs
+src-tauri/src/mcp/test_fixtures.rs
+src-tauri/src/mcp_api.rs
+src-tauri/src/plan_workunit_adapter/trigger.rs
+src-tauri/src/session/mod.rs
+src-tauri/src/settings.rs
+src-tauri/src/spec_api/storage.rs
+src-tauri/src/terminal/remote_pane_io.rs
+src-tauri/src/terminal/session.rs
+src-tauri/src/terminal/transcript.rs

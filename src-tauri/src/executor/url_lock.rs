@@ -106,10 +106,7 @@ impl UrlLockManager {
             ));
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now = crate::util::time::now_ms();
 
         state.insert(
             normalized.clone(),
@@ -239,10 +236,7 @@ impl UrlLockManager {
     /// legitimately need to hold a URL longer than the threshold should
     /// re-acquire periodically.
     pub async fn cleanup_stale_locks(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now = crate::util::time::now_ms();
 
         let mut state = self.state.write().await;
         let before = state.len();

@@ -250,17 +250,13 @@ impl BackoffState {
 /// starts at the base cadence and doubles per further failure, capped
 /// (with the defaults: 5m→10m→20m→40m→60m, then 60m forever).
 pub fn backoff_delay_secs(base_secs: u64, consecutive_failures: u32, cap_secs: u64) -> u64 {
-    if consecutive_failures == 0 {
-        return 0;
-    }
-    let mut delay = base_secs.min(cap_secs);
-    for _ in 1..consecutive_failures {
-        if delay >= cap_secs {
-            return cap_secs;
-        }
-        delay = delay.saturating_mul(2);
-    }
-    delay.min(cap_secs)
+    use std::time::Duration;
+    crate::util::backoff::capped_doubling(
+        Duration::from_secs(base_secs),
+        consecutive_failures,
+        Duration::from_secs(cap_secs),
+    )
+    .as_secs()
 }
 
 /// Fold one push attempt's outcome into the target's backoff state.
@@ -280,13 +276,6 @@ fn record_outcome(
     }
     b.record_failure(now_secs, base_secs, cap_secs);
     b.consecutive_failures >= NOISY_FAILURE_THRESHOLD
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Spawn the pusher daemon for one agent. Returns immediately;
@@ -457,7 +446,7 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
                 &mut backoff[idx]
             }
         };
-        let now = now_epoch_secs();
+        let now = crate::util::time::now_secs();
         if b.should_skip(now) {
             debug!(
                 "agent_pusher: agent_id={} repo={} branch={} skipping — \

@@ -18,3 +18,6 @@ pub mod egress_context;
 // (`crate_roots_ratchet` fails on that).
 pub use qontinui_runner_lib::util::error_chain;
 pub mod path_extraction;
+// Lib-only helpers, re-exported so both crates spell `crate::util::time` /
+// `crate::util::backoff` without a second compiled copy.
+pub use qontinui_runner_lib::util::{backoff, time};

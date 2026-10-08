@@ -287,7 +287,7 @@ pub fn backoff_after_run(previous: Duration, lived: Duration) -> Duration {
 /// The backoff after one more consecutive panic: doubled, capped at
 /// [`MAX_BACKOFF`].
 pub fn next_backoff(current: Duration) -> Duration {
-    current.saturating_mul(2).min(MAX_BACKOFF)
+    crate::util::backoff::next_doubled(current, MAX_BACKOFF)
 }
 
 /// Render a panic payload the way `std`'s default hook does: the `&str` or

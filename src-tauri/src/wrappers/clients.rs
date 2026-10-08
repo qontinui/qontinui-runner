@@ -21,7 +21,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -459,10 +458,7 @@ fn backup_once(config_path: &Path) -> Result<(), ClientError> {
         }
         guard.insert(canonical);
     }
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let ts = crate::util::time::now_secs();
     let backup_name = format!(
         "{}.qontinui-backup.{}",
         config_path

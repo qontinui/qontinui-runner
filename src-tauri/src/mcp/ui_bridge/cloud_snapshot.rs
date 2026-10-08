@@ -368,10 +368,7 @@ pub async fn ui_bridge_cloud_auth_status_handler(
     let has_token = token_res.is_ok();
     let token_error = token_res.as_ref().err().map(|e| e.to_string());
     let token_exp = auth.access_token_exp();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::util::time::now_secs() as i64;
     let token_expired = token_exp.map(|exp| exp <= now);
     let expires_in_secs = token_exp.map(|exp| exp - now);
 

@@ -276,14 +276,18 @@ const FAILURE_BACKOFF_MAX_SECS: u64 = 300;
 // cases in `failure_backoff_grows_then_caps_and_clears_on_success`. The
 // floor deliberately outranks the cap: the cap exists to stop a fast poller
 // hammering, not to speed a slow one up.
-#[allow(clippy::manual_clamp)]
 fn failure_backoff_secs(interval_secs: u64, streak: u32) -> Option<u64> {
+    use std::time::Duration;
     if streak == 0 {
         return None;
     }
-    let shift = streak.min(16);
-    let scaled = interval_secs.saturating_mul(1u64 << shift);
-    Some(scaled.min(FAILURE_BACKOFF_MAX_SECS).max(interval_secs))
+    let scaled = crate::util::backoff::capped_doubling(
+        Duration::from_secs(interval_secs),
+        streak.saturating_add(1),
+        Duration::from_secs(FAILURE_BACKOFF_MAX_SECS),
+    )
+    .as_secs();
+    Some(scaled.max(interval_secs))
 }
 
 async fn run(state: Arc<DirtyPollerState>, interval_secs: u64, cancel: CancellationToken) {

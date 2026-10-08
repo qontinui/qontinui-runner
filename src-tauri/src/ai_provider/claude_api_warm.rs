@@ -175,10 +175,7 @@ fn resolve_oauth_from_path(creds_path: &Path) -> Option<String> {
     // If the token is expired, attempt a silent refresh before giving up.
     let expires_at_ms = oauth["expiresAt"].as_i64().unwrap_or(0);
     if expires_at_ms > 0 {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_ms = crate::util::time::now_ms_i64();
         if now_ms >= expires_at_ms {
             debug!(
                 "Warm credential: OAuth token expired (expires_at={}, now={}); attempting refresh",

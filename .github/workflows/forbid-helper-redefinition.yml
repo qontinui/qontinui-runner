@@ -1,0 +1,52 @@
+name: forbid re-rolled helpers
+
+# Plan `2026-10-04-runner-time-backoff-and-http-client-helpers-are-re-rolled-per-module`
+# Phase 1 guard.
+#
+# WHAT IT FORBIDS: a hand-rolled wall-clock read — the BODY pattern
+# `duration_since(.. UNIX_EPOCH` — anywhere in `src-tauri/src` except
+# `util/time.rs` (the one home), test code, and the files listed in
+# `scripts/helper-redefinition-allowlist.txt`. The check is keyed on the body, not
+# the name, because a renamed copy (`fn wall_clock_ms`) is as bad as `fn now_ms`.
+#
+# The allowlist must only shrink and must be exact: a listed file with no
+# remaining hit fails the check too.
+#
+# Gate logic lives in `scripts/check_helper_redefinition.py`; that script is
+# listed in ci-integrity.yml so editing it alone is not a silent bypass.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+
+concurrency:
+  group: forbid-helper-redefinition-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  forbid-helper-redefinition:
+    name: Forbid re-rolled wall-clock helpers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan the runner's Rust for hand-rolled wall-clock reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check_helper_redefinition.py --ci

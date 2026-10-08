@@ -85,7 +85,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
@@ -772,10 +772,7 @@ fn outcome_code(outcome: &PollOutcome) -> u8 {
 
 fn record_tick(code: u8) {
     POLLER_LAST_OUTCOME.store(code, Ordering::Relaxed);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now_ms = crate::util::time::now_ms();
     POLLER_LAST_TICK_UNIX_MS.store(now_ms, Ordering::Relaxed);
 }
 

@@ -72,7 +72,7 @@
 //! web route above — and a 401 there now says which credential was presented
 //! instead of pasting the body.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use tokio::sync::watch;
@@ -224,14 +224,6 @@ impl RoutableState {
 static STATE: Lazy<std::sync::RwLock<RoutableState>> =
     Lazy::new(|| std::sync::RwLock::new(RoutableState::default()));
 
-/// Current unix epoch milliseconds.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// The cached routability snapshot. This is the ONLY thing the status
 /// handler calls — it never issues a read-back, so a dashboard hammering
 /// `/web-integration/status` costs nothing upstream.
@@ -254,7 +246,7 @@ pub(crate) fn snapshot() -> RelayRoutableSnapshot {
 /// Fold an outcome into the global cache.
 fn record(outcome: Readback) {
     match STATE.write() {
-        Ok(mut s) => s.record(outcome, Instant::now(), now_ms()),
+        Ok(mut s) => s.record(outcome, Instant::now(), crate::util::time::now_ms()),
         Err(_) => warn!("relay_routable: cache lock poisoned; dropping read-back result"),
     }
 }

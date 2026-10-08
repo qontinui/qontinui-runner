@@ -914,10 +914,7 @@ impl UnifiedSnapshot {
     ) -> Self {
         let total_nodes = root.total_node_count();
         let interactive_nodes = root.interactive_node_count();
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let timestamp_ms = crate::util::time::now_ms();
 
         Self {
             root,

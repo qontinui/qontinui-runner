@@ -281,10 +281,7 @@ pub fn ui_stale(last_pong: u64, pong_age_ms: u64, after_ms: u64) -> bool {
 /// where a plain subtraction would underflow and panic.
 pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
     let last_pong = last_pong.load(std::sync::atomic::Ordering::Relaxed);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::util::time::now_ms();
     let pong_age_ms = if last_pong > 0 {
         now_ms.saturating_sub(last_pong)
     } else {
@@ -365,10 +362,7 @@ static LAST_EVENT_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// it is. [`record_event_pong_at`] is the other writer and takes the same
 /// care.
 pub fn record_event_pong() {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::util::time::now_ms();
     record_event_pong_at(now_ms);
 }
 
@@ -396,10 +390,7 @@ pub fn last_event_pong_age_ms() -> u64 {
     if stamp == 0 {
         return 0;
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::util::time::now_ms();
     now_ms.saturating_sub(stamp)
 }
 
@@ -574,7 +565,7 @@ pub fn ingest_window_pong(
         document,
         event_provenance,
         qontinui_runner_lib::get_main_window_label(),
-        now_ms_epoch(),
+        crate::util::time::now_ms(),
     )
 }
 
@@ -744,13 +735,19 @@ static FALSE_DEATH_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// Stamp a ping emit that returned `Ok`. The ping reached the window layer, so
 /// a pong that does not come back is evidence about the UI.
 pub fn record_ping_emit_ok() {
-    PING_EMIT_OK_MS.store(now_ms_epoch(), std::sync::atomic::Ordering::Relaxed);
+    PING_EMIT_OK_MS.store(
+        crate::util::time::now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Stamp a ping emit that returned `Err`. Nothing asked the UI anything, so a
 /// missing pong is evidence about the TRANSPORT.
 pub fn record_ping_emit_failure() {
-    PING_EMIT_FAIL_MS.store(now_ms_epoch(), std::sync::atomic::Ordering::Relaxed);
+    PING_EMIT_FAIL_MS.store(
+        crate::util::time::now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     PING_EMIT_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -818,17 +815,11 @@ pub fn fd_pressure_snapshot_now() -> (FdPressureInputs, u64) {
     )
 }
 
-/// [`now_ms_epoch`] for callers outside this module that must pin the SAME
-/// instant across several derived values (the `/health` handler does).
+/// Forwarder to `util::time::now_ms` for `mcp_api.rs`'s `/health` handler (a
+/// hot file, repointed after its split — plan D5), which pins the SAME instant
+/// across several derived values.
 pub fn now_ms_epoch_pub() -> u64 {
-    now_ms_epoch()
-}
-
-fn now_ms_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::util::time::now_ms()
 }
 
 /// Everything [`classify_ping_delivery`] decides from.
@@ -1095,7 +1086,7 @@ pub fn ping_delivery_now() -> PingDelivery {
     classify_ping_delivery(PingDeliveryInputs {
         last_emit_ok_ms,
         last_emit_fail_ms,
-        now_ms: now_ms_epoch(),
+        now_ms: crate::util::time::now_ms(),
         fd: fd_pressure_snapshot_now().0,
     })
 }
@@ -1195,7 +1186,7 @@ pub fn ping_delivery_report_now() -> PingDeliveryReport {
         PingDeliveryInputs {
             last_emit_ok_ms,
             last_emit_fail_ms,
-            now_ms: now_ms_epoch(),
+            now_ms: crate::util::time::now_ms(),
             fd,
         },
         PingCounters {
@@ -1358,10 +1349,7 @@ pub fn native_ui_probe_verdict() -> Option<bool> {
 /// clock step can leave a stamp ahead of `now`, and age 0 (maximally fresh) is
 /// the honest reading where a plain subtraction would panic.
 pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> NativeUiLiveness {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::util::time::now_ms();
     let last_pong = last_pong.load(std::sync::atomic::Ordering::Relaxed);
     let last_event_pong = last_event_pong();
     classify_native_ui(NativeUiInputs {

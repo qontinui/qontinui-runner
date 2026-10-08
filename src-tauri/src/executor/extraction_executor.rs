@@ -333,10 +333,7 @@ impl ExtractionExecutor {
             let reset_result = tauri::async_runtime::block_on(async {
                 let lc = lifecycle.read().await;
                 lc.set_state(crate::executor::state::ExecutorState::Initializing {
-                    started_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
+                    started_at: crate::util::time::now_ms(),
                 })
                 .await
             });

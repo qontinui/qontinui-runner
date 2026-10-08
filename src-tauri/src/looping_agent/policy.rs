@@ -136,14 +136,15 @@ pub fn decide(i: &TickInput) -> Action {
 /// otherwise `30 * 2^(failures-1)` seconds, capped at 15 minutes. Saturating
 /// (never overflows).
 pub fn spawn_backoff_secs(consecutive_failures: u32) -> u64 {
+    use std::time::Duration;
     const BASE: u64 = 30;
     const CAP: u64 = 900;
-    if consecutive_failures == 0 {
-        return 0;
-    }
-    let shift = (consecutive_failures - 1).min(63);
-    BASE.saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
-        .min(CAP)
+    crate::util::backoff::capped_doubling(
+        Duration::from_secs(BASE),
+        consecutive_failures,
+        Duration::from_secs(CAP),
+    )
+    .as_secs()
 }
 
 /// Cadence gate: has `cadence_secs` passed since the last cycle START?

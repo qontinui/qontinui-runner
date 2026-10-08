@@ -674,10 +674,7 @@ fn run_claude_session_inline(
     }
 
     // Track activity for timeout (created early so Doctor registration can use it)
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now_secs = crate::util::time::now_secs();
     let last_activity = Arc::new(AtomicU64::new(now_secs));
     let last_activity_stdout = last_activity.clone();
 
@@ -922,10 +919,7 @@ fn run_claude_session_inline(
                 }
 
                 // Update activity time
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = crate::util::time::now_secs();
                 last_activity_stdout.store(now, Ordering::Relaxed);
 
                 // Extract tool activity from assistant messages with tool_use blocks

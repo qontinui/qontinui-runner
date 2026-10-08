@@ -97,10 +97,7 @@ impl StepCache {
         let entry = entries.get(cache_key)?;
 
         // Check TTL
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = crate::util::time::now_ms();
         let age = Duration::from_millis(now - entry.cached_at);
 
         if age > self.max_age {

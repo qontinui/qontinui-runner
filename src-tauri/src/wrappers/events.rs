@@ -47,12 +47,7 @@ pub fn subscribe() -> broadcast::Receiver<WrapperChanged> {
 /// channel just drops the message — that's the broadcast-channel
 /// contract and what we want here).
 pub fn emit() {
-    let _ = sender().send(WrapperChanged { at_ms: now_ms() });
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    let _ = sender().send(WrapperChanged {
+        at_ms: crate::util::time::now_ms(),
+    });
 }

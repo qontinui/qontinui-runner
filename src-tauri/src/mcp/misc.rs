@@ -1602,15 +1602,7 @@ async fn spawn_instance(
     };
 
     // Generate ID
-    let id = format!(
-        "inst-{}-{}",
-        port,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            % 100000
-    );
+    let id = format!("inst-{}-{}", port, crate::util::time::now_ms() % 100000);
 
     let config = RunnerInstanceConfig {
         id: id.clone(),

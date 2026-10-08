@@ -43,14 +43,14 @@ impl ExecutorState {
     #[allow(dead_code)]
     pub fn initializing() -> Self {
         Self::Initializing {
-            started_at: current_timestamp(),
+            started_at: crate::util::time::now_ms(),
         }
     }
 
     /// Creates a new Ready state with current timestamp
     pub fn ready() -> Self {
         Self::Ready {
-            ready_at: current_timestamp(),
+            ready_at: crate::util::time::now_ms(),
         }
     }
 
@@ -58,7 +58,7 @@ impl ExecutorState {
     #[allow(dead_code)]
     pub fn running() -> Self {
         Self::Running {
-            started_at: current_timestamp(),
+            started_at: crate::util::time::now_ms(),
         }
     }
 
@@ -66,14 +66,14 @@ impl ExecutorState {
     pub fn failed(error: String) -> Self {
         Self::Failed {
             error,
-            failed_at: current_timestamp(),
+            failed_at: crate::util::time::now_ms(),
         }
     }
 
     /// Creates a new Shutdown state with current timestamp
     pub fn shutdown() -> Self {
         Self::Shutdown {
-            shutdown_at: current_timestamp(),
+            shutdown_at: crate::util::time::now_ms(),
         }
     }
 
@@ -177,14 +177,6 @@ impl fmt::Display for ExecutorState {
             }
         }
     }
-}
-
-/// Returns current Unix timestamp in milliseconds
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("System time before Unix epoch")
-        .as_millis() as u64
 }
 
 #[cfg(test)]

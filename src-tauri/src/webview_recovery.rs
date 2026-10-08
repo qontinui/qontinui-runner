@@ -46,7 +46,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
@@ -1267,13 +1267,6 @@ pub fn shutdown_diagnostics() -> String {
     )
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Tell the user, natively, that the UI is gone and is not coming back on its
 /// own (plan Phase 3).
 ///
@@ -1654,7 +1647,7 @@ pub async fn trigger_ui_recovery(
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let decision = guard.decide(now_ms());
+        let decision = guard.decide(crate::util::time::now_ms());
         // Any transition OUT of the exhausted state — `decide`'s long-quiet
         // incident reset, or a recovery that later succeeds — re-arms the
         // user-facing notice so a genuinely new incident can speak up again.
@@ -1729,7 +1722,7 @@ pub async fn trigger_ui_recovery(
         // identity afterwards would let a page that came up in between become
         // its own baseline.
         let document_at_dispatch = crate::ui_error::main_document_nonce();
-        let reload_dispatched_ms = now_ms();
+        let reload_dispatched_ms = crate::util::time::now_ms();
         // The sequencing itself is `run_reload_rung`, which is unit-tested
         // over a canned watch; everything Tauri-shaped is inside the future it
         // is handed.
@@ -1777,7 +1770,7 @@ pub async fn trigger_ui_recovery(
             // main window that never ponged an identity has no recorded nonce,
             // and `document_identity_changed` reads that as "no predecessor to
             // be fooled by" rather than as a refusal.
-            let recreate_done_ms = now_ms();
+            let recreate_done_ms = crate::util::time::now_ms();
             match watch_for_main_pong(
                 ui_bridge_last_pong(app),
                 recreate_done_ms,
@@ -2224,13 +2217,13 @@ async fn verify_reload_took(
         document_at_dispatch,
         RELOAD_PONG_DEADLINE_MS,
         document_now,
-        || acceptance.poll(now_ms()),
+        || acceptance.poll(crate::util::time::now_ms()),
     )
     .await;
     // One last read AFTER the verdict. A refusal that raced the settling tick
     // used to die with the receiver; it is hard evidence the rung never ran,
     // and [`run_reload_rung`] escalates on it whatever the pong said.
-    let _ = acceptance.poll(now_ms());
+    let _ = acceptance.poll(crate::util::time::now_ms());
     ReloadWatchResult {
         watch,
         acceptance: acceptance.answer,
@@ -3062,7 +3055,7 @@ mod tests {
         // stamp the PROCESS-GLOBAL event-loop clock, and a stamp from the past
         // would break `ui_error`'s `last_event_pong() >= now` assertion in a
         // sibling test. Every writer in this crate moves that clock forward.
-        let rung_done = now_ms();
+        let rung_done = crate::util::time::now_ms();
         let last_pong = AtomicU64::new(rung_done - 500);
         for deadline in [RECREATE_PONG_DEADLINE_MS, RELOAD_PONG_DEADLINE_MS] {
             // A pop-out (and an unlabeled caller) ponging after the rung.

@@ -291,7 +291,7 @@ mod handler_tests {
             app_id: RUNNER_APP_ID.to_string(),
             page_id: "active".to_string(),
             kind: "ir-and-projection".to_string(),
-            at_ms: events::now_ms(),
+            at_ms: crate::util::time::now_ms(),
         }));
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -782,7 +782,7 @@ mod handler_tests {
             app_id: "qontinui-runner".to_string(),
             page_id: "c8-iso".to_string(),
             kind: "ir-and-projection".to_string(),
-            at_ms: events::now_ms(),
+            at_ms: crate::util::time::now_ms(),
         }));
 
         // The runner subscriber must see it.

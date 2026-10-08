@@ -13,13 +13,6 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
-fn now_epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Map an event row (with Option fields from named row type) to UiBridgeEvent.
 macro_rules! event_row {
     ($r:expr) => {{
@@ -70,7 +63,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let ts = now_epoch_ms();
+        let ts = crate::util::time::now_ms_i64();
         let id = qontinui_db::queries::ui_bridge::insert_ui_bridge_event()
             .bind(
                 &conn,

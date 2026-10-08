@@ -145,7 +145,7 @@ impl ExecutorLifecycle {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(ExecutorState::Initializing {
-                started_at: current_timestamp(),
+                started_at: crate::util::time::now_ms(),
             })),
             event_queue: Arc::new(RwLock::new(Vec::new())),
             ready_tx: None,
@@ -490,14 +490,14 @@ impl ExecutorLifecycle {
                 queue.push(QueuedEvent {
                     event_type: event,
                     data,
-                    queued_at: current_timestamp(),
+                    queued_at: crate::util::time::now_ms(),
                 });
             }
             ExecutorMessage::ImageRecognition { data } => {
                 queue.push(QueuedEvent {
                     event_type: "image_recognition".to_string(),
                     data,
-                    queued_at: current_timestamp(),
+                    queued_at: crate::util::time::now_ms(),
                 });
             }
             _ => {
@@ -594,14 +594,6 @@ pub fn parse_executor_message(line: &str) -> Result<ExecutorMessage, AppError> {
         error!("Failed to parse executor message: {} - Line: {}", e, line);
         AppError::JsonError(e)
     })
-}
-
-/// Returns current Unix timestamp in milliseconds
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("System time before Unix epoch")
-        .as_millis() as u64
 }
 
 #[cfg(test)]

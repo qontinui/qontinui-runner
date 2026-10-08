@@ -237,7 +237,7 @@ pub async fn post_save(
     // db-id wiring so the second pass can resolve `caused_by` references.
     let mut client_to_db: HashMap<String, i64> = HashMap::new();
     let mut inserted: Vec<i64> = Vec::with_capacity(body.events.len());
-    let now_ms = events::now_ms() as i64;
+    let now_ms = crate::util::time::now_ms() as i64;
 
     for (idx, event) in body.events.iter().enumerate() {
         let sequence = event.sequence.unwrap_or(idx as i64);
@@ -283,7 +283,7 @@ pub async fn post_save(
         recording_session_id: session_id.clone(),
         kind: "session-saved".to_string(),
         event_count,
-        at_ms: events::now_ms(),
+        at_ms: crate::util::time::now_ms(),
     });
 
     (

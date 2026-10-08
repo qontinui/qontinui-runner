@@ -645,10 +645,7 @@ fn store_cached(key: &str, expression: &str, model_id: &str) {
     let Ok(mut guard) = tier1_cache().lock() else {
         return;
     };
-    let created_at_epoch_s = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let created_at_epoch_s = crate::util::time::now_secs();
     guard.put(
         key.to_string(),
         CachedEntry {

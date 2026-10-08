@@ -558,10 +558,7 @@ impl ClaudeSession {
         let user_has_interacted = Arc::new(AtomicBool::new(false));
         let shared_output_buf = Arc::new(Mutex::new(String::new()));
 
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_secs = crate::util::time::now_secs();
         let last_activity = Arc::new(AtomicU64::new(now_secs));
         let has_output = Arc::new(AtomicBool::new(false));
 
@@ -754,10 +751,7 @@ impl ClaudeSession {
                             info!("[STDOUT_READER] Line #{}: {}", line_count, preview);
 
                             // Update activity
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
+                            let now = crate::util::time::now_secs();
                             last_activity_stdout.store(now, Ordering::Relaxed);
 
                             // Phase 1b — stream the raw stdout line to coord's

@@ -244,17 +244,10 @@ fn cooldown_key(app_id: &str, page_id: &str) -> String {
     format!("{app_id}\u{1f}{page_id}")
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// True when a spot-check for `(app_id, page_id)` was emitted within
 /// [`EMIT_COOLDOWN`] — the registrar then skips the duplicate emit.
 pub fn emit_cooldown_active(app_id: &str, page_id: &str) -> bool {
-    let now = unix_now();
+    let now = crate::util::time::now_secs();
     store()
         .lock()
         .map(|s| {
@@ -269,7 +262,7 @@ pub fn emit_cooldown_active(app_id: &str, page_id: &str) -> bool {
 /// entries are pruned on each stamp so the map stays bounded to
 /// actively-emitting pages. Persisted with the rest of the store.
 pub fn record_emit_timestamp(app_id: &str, page_id: &str) {
-    let now = unix_now();
+    let now = crate::util::time::now_secs();
     let Ok(mut s) = store().lock() else {
         return;
     };
@@ -550,7 +543,7 @@ mod tests {
         );
         state
             .emit_cooldowns
-            .insert(cooldown_key("app", "page"), unix_now());
+            .insert(cooldown_key("app", "page"), crate::util::time::now_secs());
 
         let json = serde_json::to_string(&state).unwrap();
         let loaded: StoreState = serde_json::from_str(&json).unwrap();

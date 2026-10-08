@@ -47,22 +47,19 @@ pub const REFRESH_ESCALATE_AFTER: u32 = 5;
 /// Delay before the next refresh attempt after `consecutive_failures`
 /// transient failures. Pure — unit-tested without clocks.
 ///
-/// Deliberately *not* shared with `agent_pusher::backoff_delay_secs`:
-/// that ladder governs one push target and has no terminal state, while
-/// this one is paired with the [`RefreshHealth::rejected`] latch below.
-/// They are different abstractions that happen to share a shape.
+/// The delay arithmetic is the shared `util::backoff::capped_doubling`, but
+/// the state machines stay apart: `agent_pusher`'s ladder governs one push
+/// target and has no terminal state, while this one is paired with the
+/// [`RefreshHealth::rejected`] latch below.
 pub fn refresh_backoff_delay_secs(consecutive_failures: u32) -> i64 {
-    if consecutive_failures == 0 {
-        return 0;
-    }
-    let mut delay = REFRESH_BACKOFF_BASE_SECS.min(REFRESH_BACKOFF_CAP_SECS);
-    for _ in 1..consecutive_failures {
-        if delay >= REFRESH_BACKOFF_CAP_SECS {
-            return REFRESH_BACKOFF_CAP_SECS;
-        }
-        delay = delay.saturating_mul(2);
-    }
-    delay.min(REFRESH_BACKOFF_CAP_SECS)
+    use std::time::Duration;
+    // Only the arithmetic is shared; the `rejected` latch stays in this module.
+    crate::util::backoff::capped_doubling(
+        Duration::from_secs(REFRESH_BACKOFF_BASE_SECS as u64),
+        consecutive_failures,
+        Duration::from_secs(REFRESH_BACKOFF_CAP_SECS as u64),
+    )
+    .as_secs() as i64
 }
 
 /// Refresh-loop health for one slot. Default = healthy, never tried.

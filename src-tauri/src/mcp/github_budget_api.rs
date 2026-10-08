@@ -70,7 +70,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -369,10 +369,7 @@ fn ledger() -> &'static Mutex<WatchLedger> {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::util::time::now_secs() as i64
 }
 
 /// Whether [`WATCH_DISABLED_ENV`] disables the loop, given its raw value.

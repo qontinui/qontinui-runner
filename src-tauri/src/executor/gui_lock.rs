@@ -90,10 +90,7 @@ impl GuiLock {
         }
 
         // Acquire the lock
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now = crate::util::time::now_ms();
 
         state.holder = Some(bridge_id.clone());
         state.acquired_at = Some(now);

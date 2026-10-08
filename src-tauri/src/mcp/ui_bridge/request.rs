@@ -672,10 +672,7 @@ pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> Readi
     let available_permits = state.ui_bridge_semaphore.available_permits();
     let process_uptime_ms = state.started_at.elapsed().as_millis() as u64;
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = crate::util::time::now_ms();
 
     let last_pong_age_ms = if last_pong > 0 {
         now_ms.saturating_sub(last_pong)
@@ -852,10 +849,7 @@ pub async fn ui_bridge_request_sync_in_window(
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     if last_pong > 0 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = crate::util::time::now_ms();
         let pong_age = now - last_pong;
         if pong_age > 15000 {
             warn!(

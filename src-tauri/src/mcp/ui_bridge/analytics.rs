@@ -44,10 +44,7 @@ fn default_num_windows() -> i64 {
 }
 
 fn days_to_epoch_ms(days: u32) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now = crate::util::time::now_ms_i64();
     now - (days as i64 * 86_400_000)
 }
 
