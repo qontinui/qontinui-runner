@@ -5118,8 +5118,15 @@ mod pair_code_hang_regression_tests {
 /// is a no-op by construction; with an override set the bare
 /// `data_local_dir()` default is the one other candidate.
 pub fn binding_store_candidate_paths() -> Vec<PathBuf> {
-    binding_store_candidate_paths_with(std::env::var("QONTINUI_SECURE_STORAGE_DIR").ok())
+    subject_isolation::binding_store_candidate_paths_for(
+        std::env::var("QONTINUI_SECURE_STORAGE_DIR").ok(),
+        crate::instance_env::instance_root().as_deref(),
+    )
 }
+
+// Under an instance root the candidate set is the canonical path alone — see
+// `pair/subject_isolation.rs`.
+mod subject_isolation;
 
 /// Env-free core of [`binding_store_candidate_paths`] (same reason
 /// [`paired_user_path_with`] exists — no process-global `set_var` in tests).
