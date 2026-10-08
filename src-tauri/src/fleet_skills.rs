@@ -187,8 +187,8 @@ fn collect_text_files(
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
 /// destination is already tracked by the enclosing git repository, or the
-/// tracked-file probe could not answer inside one (then an existing skill
-/// directory is kept whole); both are skipped (see
+/// tracked-file probe could not answer inside one (then a skill whose
+/// `SKILL.md` exists is kept whole); both are skipped (see
 /// [`provision_fleet_skills_into`] and [`crate::provision_guard`]). **A tracked file outranks a served override**:
 /// the account layer decides what this binary would write, not whether it may
 /// replace a repository's committed content.
@@ -308,8 +308,8 @@ fn embedded_skill_file_count() -> usize {
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
 /// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
 /// narrowing: when that failure happens inside a repository (a `.git` at or
-/// above the dir), a skill whose `SKILL.md` already exists is kept WHOLE and only
-/// skills absent on disk are written (see that module's "UNKNOWN inside a
+/// above the dir), a skill whose `SKILL.md` already exists is kept WHOLE and every
+/// other skill is written whole, helpers included (see that module's "UNKNOWN inside a
 /// repository" section). A skipped write
 /// must never become an aborted spawn, and a failed or slow probe must never
 /// become one either. The probe runs ONCE for the whole tree, not
@@ -655,6 +655,43 @@ mod tests {
             "no new file may be written into a kept skill"
         );
         assert!(out.written > 0, "absent skills are still provisioned");
+    }
+
+    /// The other half of the per-skill rule: with the probe UNKNOWN inside a
+    /// repository, a skill directory holding a helper but NO `SKILL.md` is not
+    /// kept — it is written whole, the stale helper overwritten, and no
+    /// `ProbeUnknownInRepo` skip is recorded for it.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_writes_a_skill_without_a_manifest_whole() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-test\n",
+        )
+        .unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let dir = skills_dir.join("coord-revive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("coord-revive.sh");
+        std::fs::write(&helper, b"# stale helper\n").unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+            .expect("provision");
+
+        assert!(
+            !out.skipped
+                .iter()
+                .any(|s| s.unit.starts_with("coord-revive")),
+            "a skill with no SKILL.md is written whole, got {:?}",
+            out.skipped
+        );
+        assert!(dir.join(SKILL_MANIFEST).exists(), "its SKILL.md is written");
+        assert_ne!(
+            std::fs::read_to_string(&helper).unwrap(),
+            "# stale helper\n",
+            "the stale helper is overwritten so the skill is one build"
+        );
     }
 
     /// A destination that is TRACKED by the enclosing git repository must be

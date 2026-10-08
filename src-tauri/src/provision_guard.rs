@@ -60,7 +60,7 @@
 //! "tracked" would be a session missing its commands. The asymmetry is why the
 //! default is write.
 //!
-//! ## UNKNOWN inside a repository: write only ABSENT destinations
+//! ## UNKNOWN inside a repository: keep what is already on disk
 //!
 //! One failure arm is narrowed rather than written through: the probe did not
 //! answer (spawn error, timeout, non-zero exit) **and** a `.git` entry exists
@@ -68,9 +68,10 @@
 //! could not be asked — exactly the case where an unconditional write is most
 //! likely to overwrite content the repository tracks and leave a dirty tree
 //! that blocks the next pull (plan
-//! `2026-10-04-shared-checkouts-pull-deterministically`, Phase 2). There the
-//! provisioners write a destination only when it does not exist yet; an
-//! existing file is left alone, tracked or not.
+//! `2026-10-04-shared-checkouts-pull-deterministically`, Phase 2). There
+//! `fleet_commands` writes a command only when it does not exist yet (an
+//! existing one is left alone, tracked or not), and `fleet_skills` decides per
+//! skill (below).
 //!
 //! - The repository test is a FILESYSTEM test (`.git` present in an ancestor),
 //!   never a second git spawn, so it cannot itself fail or hang. It is a
@@ -86,8 +87,12 @@
 //!   upgrades until the cause is fixed. It is visible, not silent: each pass
 //!   logs a `warn` and records `probe_unknown_in_repo` skips in its report.
 //! - `fleet_skills` applies this arm per SKILL, not per file: a skill whose
-//!   directory already exists is kept whole, so a session never gets an old
-//!   `SKILL.md` beside new helper files.
+//!   `SKILL.md` already exists is kept whole, and a skill without one is
+//!   written whole (its existing helper files overwritten), so a session never
+//!   gets an old `SKILL.md` beside new helpers or the reverse. The accepted
+//!   cost of the second half: a helper the repository really tracks, with no
+//!   tracked `SKILL.md` beside it, is overwritten in this arm — the one case
+//!   where it can dirty a tracked file.
 //! - The probe failure is logged once per probe at `warn`, naming the root and
 //!   which arm it resolved to, so an UNKNOWN never passes silently.
 //!
