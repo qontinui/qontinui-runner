@@ -68,6 +68,24 @@ Review code changes for:
 - During pull request review
 - When refactoring
 
+## Never touch a process or file you did not start or create
+
+A review READS. It never stops, kills or signals a process it did not start,
+and that includes cleanup at the end; nor does it delete a file it did not
+create. Prefer foreground commands under a `timeout`, so nothing is left to
+clean up. When you must background something, print its PID as you start it
+(`cmd >"$SCRATCH/job.log" 2>&1 & echo "pid=$!"`, since each Bash call is a
+fresh shell and `$!` does not survive to the next one; the redirect keeps the
+job off the tool's own output). Before signalling that recorded PID, confirm
+`ps -p <pid> -o args=` still shows your command, because a PID can be reused. Never kill by name or
+pattern: no `pkill`, no `killall`, no `kill $(pgrep …)`, no `taskkill /IM`. The
+box you review on runs many sessions at once. A pattern like `pkill -f cargo`
+or `pkill -f nextest` matches their builds and test runs too, and `node`
+matches their Claude Code sessions themselves. If a stray process is in your
+way, report it and do not touch it. Served policy `production-and-cost`
+`runner-lifecycle` is the authority for the `node` case. Coord finding
+`b08418e4` records a reviewer that ran a broad `pkill` during cleanup.
+
 ## Review Process
 
 ### Step 1: Measure the tree, THEN understand context
