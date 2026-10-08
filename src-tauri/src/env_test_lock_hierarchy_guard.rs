@@ -28,7 +28,11 @@
 //!   test scope: inside a `#[cfg(test)]`
 //!   item (also `cfg(any(test, …))`), a `mod tests` / `mod test_support`, or a
 //!   `#[test]` fn — at file level OR inside a fn body. `Mutex<()>` only: a
-//!   mutex carrying data is a value, not a serializer.
+//!   mutex carrying data is a value, not a serializer. A whole FILE is test
+//!   scope when the module tree reaches it through an out-of-line
+//!   `#[cfg(test)] mod x;` (or `mod tests;` / `mod test_support;`, `#[path]`
+//!   honoured) — its `cfg` sits in the parent file, so the file alone does not
+//!   say it is test code.
 //! * A **test-lock constructor** is a test-scope fn that acquires a test static
 //!   (`X.lock()`, `X.get_or_init(..).lock()`, or `hierarchy_lock(&X)`) and
 //!   returns the guard: its return type names `MutexGuard`, `EnvLockGuard`,
@@ -47,6 +51,12 @@
 //! * **Inline co-holders**: a test-scope fn that is not a constructor, locks a
 //!   test static directly and ALSO directly calls a hierarchy lock must take
 //!   the hierarchy lock first.
+//! * A **hierarchy wrapper** is a test-scope free fn (not an `impl` method)
+//!   that returns a guard and calls
+//!   (not into `let _ = …`) a root, a child, or another wrapper — e.g.
+//!   `health_lock()` over `posture_test_lock()`. Wrappers count as the
+//!   hierarchy everywhere above, tree-wide, so a co-holder that reaches a
+//!   child only through a wrapper in another file is still checked.
 //!
 //! # Known limits
 //!
@@ -59,6 +69,16 @@
 //!   another file, convert it instead.
 //! * Two STANDALONE locks co-held with each other (neither touching the
 //!   hierarchy) are not checked against each other.
+//! * Wrappers are FREE fns matched tree-wide BY NAME. A non-hierarchy guard fn
+//!   that shares a wrapper's name is treated as the hierarchy too — an
+//!   over-report that fails loudly, never a silent pass; rename one of them.
+//!   `impl` methods are never wrappers: calls match by last path segment, so a
+//!   wrapper named `new` would make every `X::new(..)` the hierarchy. A
+//!   co-holder reaching a child only through a method wrapper is not seen.
+//! * Module-tree scoping starts at `main.rs`, `lib.rs` and `bin/*.rs`, and
+//!   does not follow a `#[path]` on an out-of-line `mod` nested inside an
+//!   inline `mod { … }` block. A file the tree does not reach is scanned as
+//!   non-test, as before.
 //!
 //! Registered in `main.rs` only, like `env_write_lock_guard`: it walks all of
 //! `src`, so a `lib.rs` twin would only double the work.
@@ -338,6 +358,9 @@ struct FnFacts {
     in_test: bool,
     returns_guard: bool,
     marker: bool,
+    /// A method in an `impl` block. Calls are matched by last path segment, so
+    /// a method name (`new`, `set`) would match every `X::new(..)` in the tree.
+    is_method: bool,
     calls: Vec<Call>,
     locks: Vec<StaticLock>,
 }
@@ -436,6 +459,7 @@ impl FnCollector<'_> {
             in_test: test || self.in_test(),
             returns_guard,
             marker: has_marker(&self.lines, line, end),
+            is_method: matches!(self.impl_ty.last(), Some(Some(_))),
             calls,
             locks: scan.locks,
         });
@@ -482,18 +506,185 @@ impl<'ast> Visit<'ast> for FnCollector<'_> {
 
 /// Parse one file's facts. `Err` only when it does not parse.
 fn scan_source(src: &str) -> syn::Result<Vec<FnFacts>> {
+    scan_source_in(src, false)
+}
+
+/// [`scan_source`] for a file whose module is already test scope
+/// (`file_in_test`), because its parent declared it `#[cfg(test)] mod x;`.
+fn scan_source_in(src: &str, file_in_test: bool) -> syn::Result<Vec<FnFacts>> {
     let file = syn::parse_file(src)?;
-    let mut decls = DeclCollector::default();
+    let mut decls = DeclCollector {
+        test_scope: vec![file_in_test],
+        ..DeclCollector::default()
+    };
     decls.visit_file(&file);
     let mut fns = FnCollector {
         lines: src.lines().collect(),
         decls: &decls,
-        test_scope: Vec::new(),
+        test_scope: vec![file_in_test],
         impl_ty: Vec::new(),
         fns: Vec::new(),
     };
     fns.visit_file(&file);
     Ok(fns.fns)
+}
+
+/// Fold `.` / `..` lexically, so `a/../b.rs` and `b.rs` are one key. `None`
+/// when a `..` climbs out of the source root (`#[path = "../build.rs"]` from
+/// a crate root): that file is outside the walk, never a same-named one inside.
+fn normalize(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|a| match &a.meta {
+        syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => Some(s.value()),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Pass 0: the out-of-line `mod x;` declarations in one file, each as
+/// (candidate child files, declared in test scope).
+struct ModDecls {
+    /// The file's own directory, for a top-level `#[path]`.
+    file_dir: PathBuf,
+    /// Where `mod x;` resolves at the current inline-module depth.
+    dirs: Vec<PathBuf>,
+    test_scope: Vec<bool>,
+    out: Vec<(Vec<PathBuf>, bool)>,
+}
+
+impl<'ast> Visit<'ast> for ModDecls {
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        let test = self.test_scope.iter().any(|t| *t)
+            || attrs_are_test(&m.attrs)
+            || m.ident == "tests"
+            || m.ident == "test_support";
+        let dir = self.dirs.last().cloned().unwrap_or_default();
+        let name = m.ident.to_string();
+        if m.content.is_none() {
+            let cands = match path_attr(&m.attrs) {
+                // Top-level `#[path]` is relative to the declaring file's
+                // directory. Inside an inline block it is not followed (see
+                // Known limits): no candidate, rather than a name-based guess
+                // that could match an unrelated file.
+                Some(p) if self.dirs.len() == 1 => {
+                    normalize(&self.file_dir.join(p)).into_iter().collect()
+                }
+                Some(_) => Vec::new(),
+                None => vec![
+                    dir.join(format!("{name}.rs")),
+                    dir.join(&name).join("mod.rs"),
+                ],
+            };
+            self.out.push((cands, test));
+            return;
+        }
+        self.dirs.push(dir.join(&name));
+        self.test_scope.push(test);
+        visit::visit_item_mod(self, m);
+        self.test_scope.pop();
+        self.dirs.pop();
+    }
+    // Item-level `mod x;` inside a fn body is not a module-tree edge we follow.
+    fn visit_item_fn(&mut self, _f: &'ast syn::ItemFn) {}
+}
+
+/// The out-of-line module declarations of `path` (a file under the source
+/// root), resolved to candidate files. `is_root` marks a crate root, whose
+/// `mod x;` resolves beside it rather than in a directory named after it.
+fn mod_decls(path: &Path, src: &str, is_root: bool) -> syn::Result<Vec<(Vec<PathBuf>, bool)>> {
+    let file = syn::parse_file(src)?;
+    let file_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let base = if is_root || stem == "mod" {
+        file_dir.clone()
+    } else {
+        file_dir.join(stem)
+    };
+    let mut v = ModDecls {
+        file_dir,
+        dirs: vec![base],
+        test_scope: Vec::new(),
+        out: Vec::new(),
+    };
+    v.visit_file(&file);
+    Ok(v.out)
+}
+
+/// Every file the module tree reaches through test scope, walking from
+/// `roots`. A file reached by both a test and a non-test path is a test file:
+/// it is compiled into the test binary either way, and scanning more is the
+/// safe direction for a guard.
+/// `Err` names the file that does not parse.
+fn test_files(
+    sources: &HashMap<PathBuf, String>,
+    roots: &[PathBuf],
+) -> Result<HashSet<PathBuf>, String> {
+    // Cheap pre-filter: only a file with a line shaped like `mod x;` can
+    // declare an out-of-line module, so most files are never parsed here.
+    let declares = |src: &str| {
+        src.lines().any(|l| {
+            let t = l.trim();
+            // Drop a trailing `// …` so `mod x; // why` still counts.
+            let t = t.split("//").next().unwrap_or_default().trim_end();
+            t.ends_with(';') && (t.starts_with("mod ") || t.contains(" mod "))
+        })
+    };
+    let mut seen: HashMap<PathBuf, bool> = HashMap::new();
+    let mut work: Vec<(PathBuf, bool)> = roots.iter().map(|r| (r.clone(), false)).collect();
+    while let Some((path, test)) = work.pop() {
+        match seen.get(&path) {
+            Some(&prev) if prev || !test => continue,
+            _ => {}
+        }
+        seen.insert(path.clone(), test);
+        let Some(src) = sources.get(&path) else {
+            continue;
+        };
+        if !declares(src) {
+            continue;
+        }
+        let is_root = roots.contains(&path);
+        let decls = mod_decls(&path, src, is_root).map_err(|e| {
+            format!(
+                "{}:{}: could not parse with syn ({e})",
+                path.display(),
+                e.span().start().line
+            )
+        })?;
+        for (cands, decl_test) in decls {
+            if let Some(child) = cands.into_iter().find(|c| sources.contains_key(c)) {
+                work.push((child, test || decl_test));
+            }
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .filter(|(_, t)| *t)
+        .map(|(p, _)| p)
+        .collect())
 }
 
 /// How a constructor was classified.
@@ -581,7 +772,38 @@ fn evaluate(files: &[(String, Vec<FnFacts>)]) -> Report {
         }
     }
 
-    let is_hierarchy = |name: &str| HIERARCHY_ROOTS.contains(&name) || child_names.contains(name);
+    // Hierarchy wrappers, tree-wide: a test-scope guard fn that holds a root,
+    // a child or another wrapper (`health_lock` over `posture_test_lock`).
+    // Without these a co-holder that reaches a child only through a wrapper
+    // in another file reads as touching no hierarchy at all.
+    let mut hierarchy_names = child_names;
+    loop {
+        let mut changed = false;
+        for f in files.iter().flat_map(|(_, fns)| fns) {
+            if !f.in_test
+                || !f.returns_guard
+                || f.is_method
+                || f.is_constructor()
+                || hierarchy_names.contains(&f.name)
+                || HIERARCHY_ROOTS.contains(&f.name.as_str())
+            {
+                continue;
+            }
+            if f.calls.iter().any(|c| {
+                !c.discarded
+                    && (HIERARCHY_ROOTS.contains(&c.name.as_str())
+                        || hierarchy_names.contains(&c.name))
+            }) {
+                hierarchy_names.insert(f.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let is_hierarchy =
+        |name: &str| HIERARCHY_ROOTS.contains(&name) || hierarchy_names.contains(name);
 
     for (fi, (file, fns)) in files.iter().enumerate() {
         // Same-file closure: which fns reach the hierarchy at all?
@@ -692,20 +914,51 @@ fn every_test_lock_constructor_is_a_child_of_env_lock() {
         paths.len(),
         root.display()
     );
+    // Keyed by the path relative to `src`, so module resolution is lexical.
+    let mut sources: HashMap<PathBuf, String> = HashMap::new();
+    for path in &paths {
+        let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("reading src/{}: {e}", rel.display()));
+        sources.insert(rel, src);
+    }
+    let mut roots = vec![PathBuf::from("main.rs"), PathBuf::from("lib.rs")];
+    roots.extend(
+        sources
+            .keys()
+            .filter(|p| p.parent() == Some(Path::new("bin")))
+            .cloned(),
+    );
+    let in_test_tree = test_files(&sources, &roots).unwrap_or_else(|e| {
+        panic!(
+            "src/{e} — the test-lock hierarchy guard cannot tell which files are test code \
+             without the module tree, so it refuses rather than guessing"
+        )
+    });
+    // Anti-vacuity for the module walk: a plain `#[cfg(test)] mod x;` and a
+    // `#[path]` one must both be seen as test files, or the walk broke.
+    for required in [
+        "env_test_lock_hierarchy_guard.rs",
+        "step_executor/typed_dispatch_corpus_tests.rs",
+    ] {
+        assert!(
+            in_test_tree.contains(Path::new(required)),
+            "the module walk did not classify src/{required} as test scope — it is declared \
+             `#[cfg(test)] mod …;`, so the walk is broken and every separate-file test module is \
+             being scanned as production code"
+        );
+    }
+
     let mut files = Vec::new();
     for path in &paths {
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        let src =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading src/{rel}: {e}"));
+        let rel_path = path.strip_prefix(&root).unwrap_or(path);
+        let rel = rel_path.display().to_string();
+        let src = &sources[rel_path];
         // No `Mutex` in the text ⇒ no test static and no lock to check.
         if !src.contains("Mutex") {
             continue;
         }
-        let fns = scan_source(&src).unwrap_or_else(|e| {
+        let fns = scan_source_in(src, in_test_tree.contains(rel_path)).unwrap_or_else(|e| {
             panic!(
                 "src/{rel}:{}: could not parse with syn ({e}) — the test-lock hierarchy guard \
                  cannot vouch for a file it cannot read, so it refuses rather than skipping it",
@@ -975,4 +1228,178 @@ mod tests {
 #[test]
 fn the_guard_refuses_source_it_cannot_parse() {
     assert!(scan_source("static L: Mutex<()> = Mutex::new(()); fn broken( {").is_err());
+    let sources = HashMap::from([(PathBuf::from("main.rs"), "fn x( {\nmod broken;".to_string())]);
+    let err = test_files(&sources, &[PathBuf::from("main.rs")]).expect_err("must refuse");
+    assert!(err.starts_with("main.rs:"), "{err}");
+}
+
+/// A separate-file test module carries no `cfg(test)` of its own — its parent
+/// does. The module walk must carry that scope into the file, through plain,
+/// `mod.rs`, `#[path]` and nested declarations, and not into production files.
+#[test]
+fn the_module_walk_scopes_separate_file_test_modules() {
+    let src = |s: &str| s.to_string();
+    let sources: HashMap<PathBuf, String> = [
+        ("main.rs", src("mod a;\nmod b;\n#[cfg(test)]\nmod t;\n")),
+        ("lib.rs", src("pub mod a;\n")),
+        ("bin/tool.rs", src("#[path = \"../b.rs\"]\nmod b_again;\n")),
+        // `a` is a non-mod-rs file: its children live in `a/`.
+        (
+            "a.rs",
+            src("#[cfg(test)]\nmod tests;\nmod prod;\nmod inner { mod deep; }\n"),
+        ),
+        ("a/tests.rs", src("mod helper;\n")),
+        ("a/tests/helper.rs", src("")),
+        ("a/prod.rs", src("")),
+        ("a/inner/deep.rs", src("")),
+        // `b` is a mod-rs-style directory module with a `#[path]` test child.
+        (
+            "b/mod.rs",
+            src("#[cfg(any(test, debug_assertions))]\n#[path = \"corpus.rs\"]\nmod c;\n"),
+        ),
+        ("b/corpus.rs", src("")),
+        ("b.rs", src("")),
+        ("t.rs", src("")),
+        ("orphan.rs", src("")),
+    ]
+    .into_iter()
+    .map(|(p, s)| (PathBuf::from(p), s))
+    .collect();
+    let roots = [
+        PathBuf::from("main.rs"),
+        PathBuf::from("lib.rs"),
+        PathBuf::from("bin/tool.rs"),
+    ];
+    let got = test_files(&sources, &roots).expect("parses");
+    let mut got: Vec<String> = got
+        .iter()
+        .map(|p| p.display().to_string().replace('\\', "/"))
+        .collect();
+    got.sort_unstable();
+    // With both `b.rs` and `b/mod.rs` present (an ambiguity rustc rejects),
+    // `b.rs` is tried first, so `b/mod.rs` and its test child go unreached.
+    assert_eq!(got, ["a/tests.rs", "a/tests/helper.rs", "t.rs"]);
+
+    // Without `b.rs`, `b/mod.rs` is the module and its `#[path]` test child
+    // is test scope.
+    let mut sources = sources;
+    sources.remove(Path::new("b.rs"));
+    let got = test_files(&sources, &roots).expect("parses");
+    assert!(got.contains(Path::new("b/corpus.rs")), "{got:?}");
+    assert!(!got.contains(Path::new("a/prod.rs")));
+    assert!(!got.contains(Path::new("a/inner/deep.rs")));
+    assert!(!got.contains(Path::new("orphan.rs")));
+}
+
+/// A whole file in test scope: its statics are test statics with no `cfg` of
+/// their own, so an inverted constructor there is flagged — and the same text
+/// scanned as production is not.
+#[test]
+fn a_test_scope_file_is_scanned_as_test_code() {
+    const SRC: &str = r#"
+static FILE_LEVEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn file_level_inverted() -> std::sync::MutexGuard<'static, ()> {
+    FILE_LEVEL.lock().unwrap()
+}
+"#;
+    let as_test = evaluate(&[(
+        "t.rs".to_string(),
+        scan_source_in(SRC, true).expect("parses"),
+    )]);
+    let flagged: Vec<&str> = as_test.findings.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(flagged, ["file_level_inverted"]);
+    let as_prod = evaluate(&[("p.rs".to_string(), scan_source(SRC).expect("parses"))]);
+    assert!(as_prod.findings.is_empty() && as_prod.constructors.is_empty());
+}
+
+/// A co-holder that reaches a child only through a guard-returning wrapper in
+/// ANOTHER file must still be checked, inline and in the standalone audit.
+#[test]
+fn the_guard_sees_the_hierarchy_through_wrappers_across_files() {
+    const LOCKS: &str = r#"
+#[cfg(test)]
+mod tests {
+    pub(crate) fn posture_like() -> crate::test_env::TestLockGuard {
+        static P: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::test_env::hierarchy_lock(&P)
+    }
+    pub(crate) fn wrapper() -> crate::test_env::TestLockGuard {
+        let g = posture_like();
+        g
+    }
+    pub(crate) fn wrapper_of_wrapper() -> crate::test_env::TestLockGuard {
+        wrapper()
+    }
+    // Shaped like `IsolatedAmbient::new`: a guard-returning METHOD over the
+    // root. Not a wrapper — else every `X::new(..)` would be the hierarchy.
+    pub(crate) struct Fixture {
+        _env: crate::test_env::EnvLockGuard,
+    }
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            Fixture { _env: crate::test_env::env_lock() }
+        }
+    }
+    // Returns a guard but releases the wrapper at once: NOT a wrapper.
+    pub(crate) fn releases_it() -> crate::test_env::TestLockGuard {
+        let _ = wrapper();
+        unimplemented!()
+    }
+}
+"#;
+    const USERS: &str = r#"
+#[cfg(test)]
+mod tests {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // test-lock: standalone — claimed alone, but `co_holds_via_wrapper` disagrees
+    fn local_standalone() -> std::sync::MutexGuard<'static, ()> {
+        static S: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        S.lock().unwrap()
+    }
+
+    #[test]
+    fn inline_inverted_via_wrapper() {
+        let _s = SERIAL.lock().unwrap();
+        let _w = wrapper_of_wrapper();
+    }
+
+    #[test]
+    fn inline_wrapper_first() {
+        let _w = wrapper();
+        let _s = SERIAL.lock().unwrap();
+    }
+
+    #[test]
+    fn co_holds_via_wrapper() {
+        let _l = local_standalone();
+        let _w = wrapper();
+    }
+
+    #[test]
+    fn standalone_then_an_unrelated_new() {
+        let _l = local_standalone();
+        let _v: Vec<u8> = Vec::new();
+    }
+
+    #[test]
+    fn inline_before_a_released_wrapper() {
+        let _s = SERIAL.lock().unwrap();
+        let _r = releases_it();
+    }
+}
+"#;
+    let report = evaluate(&[
+        ("locks.rs".to_string(), scan_source(LOCKS).expect("parses")),
+        ("users.rs".to_string(), scan_source(USERS).expect("parses")),
+    ]);
+    let mut flagged: Vec<&str> = report.findings.iter().map(|f| f.name.as_str()).collect();
+    flagged.sort_unstable();
+    assert_eq!(
+        flagged,
+        ["co_holds_via_wrapper", "inline_inverted_via_wrapper"],
+        "a wrapper (even two deep, even in another file) is the hierarchy; a fn that releases \
+         one into `let _ =` is not, and neither is a guard-returning method like `Fixture::new` \
+         (or every `Vec::new()` would be)"
+    );
 }
