@@ -12,8 +12,8 @@
 //! blocks a pull, muddies a diff, and can be committed by an agent that never
 //! touched the file.
 //!
-//! So: **existing + tracked ⇒ skip.** Untracked, absent, or unknown ⇒ write, as
-//! before.
+//! So: **existing + tracked ⇒ skip.** Untracked or absent ⇒ write, as before.
+//! Unknown ⇒ write, too — EXCEPT inside a repository (next section).
 //!
 //! ## Which repos this actually changes, measured
 //!
@@ -60,6 +60,29 @@
 //! "tracked" would be a session missing its commands. The asymmetry is why the
 //! default is write.
 //!
+//! ## UNKNOWN inside a repository: write only ABSENT destinations
+//!
+//! One failure arm is narrowed rather than written through: the probe did not
+//! answer (spawn error, timeout, non-zero exit) **and** a `.git` entry exists
+//! at the probed root or one of its ancestors. That is a checkout whose git
+//! could not be asked — exactly the case where an unconditional write is most
+//! likely to overwrite content the repository tracks and leave a dirty tree
+//! that blocks the next pull (plan
+//! `2026-10-04-shared-checkouts-pull-deterministically`, Phase 2). There the
+//! provisioners write a destination only when it does not exist yet; an
+//! existing file is left alone, tracked or not.
+//!
+//! - The repository test is a FILESYSTEM test (`.git` present in an ancestor),
+//!   never a second git spawn, so it cannot itself fail or hang. It is a
+//!   heuristic: a `.git` that is not a usable repository still counts, which
+//!   errs toward not overwriting.
+//! - **The cost, stated:** in that arm an existing but STALE untracked file is
+//!   not refreshed — the session gets the copy already on disk rather than the
+//!   binary's. Missing files are still written, so no session loses a command
+//!   it would otherwise have had, and the spawn still never aborts.
+//! - The probe failure is logged once per probe at `warn`, naming the root and
+//!   which arm it resolved to, so an UNKNOWN never passes silently.
+//!
 //! ## One process spawn per provisioning pass, not one per file
 //!
 //! The provisioners write 7 commands and ~13 skill files. Probing each
@@ -92,6 +115,11 @@ const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TrackedPaths {
     relative: HashSet<PathBuf>,
+    /// The probe did NOT answer and the probed root sits inside a repository
+    /// (a `.git` entry at the root or an ancestor). In that state every
+    /// EXISTING destination is skipped — see the module doc's "UNKNOWN inside a
+    /// repository" section.
+    unknown_in_repo: bool,
 }
 
 impl TrackedPaths {
@@ -103,13 +131,29 @@ impl TrackedPaths {
     /// path containing a newline or a quote cannot desync the parse.
     ///
     /// Returns an EMPTY set on every failure — see the module doc's fail-soft
-    /// contract. This function never panics and never propagates.
+    /// contract — and, when that failure happened inside a repository, marks
+    /// the result UNKNOWN-in-repo so [`Self::should_skip`] protects existing
+    /// files. This function never panics and never propagates.
     pub(crate) fn probe(root: &Path) -> Self {
         if !root.is_dir() {
             return Self::default();
         }
         let Some(stdout) = run_bounded_git_ls_files(root) else {
-            return Self::default();
+            let unknown_in_repo = has_git_ancestor(root);
+            tracing::warn!(
+                root = %root.display(),
+                unknown_in_repo,
+                "provision guard: tracked-file probe did not answer (git missing, failed or timed out); {}",
+                if unknown_in_repo {
+                    "root is inside a repository, so only ABSENT destinations will be written"
+                } else {
+                    "root is not inside a repository, so destinations are written as before"
+                }
+            );
+            return Self {
+                relative: HashSet::new(),
+                unknown_in_repo,
+            };
         };
         let relative = stdout
             .split(|b| *b == 0)
@@ -117,7 +161,16 @@ impl TrackedPaths {
             .filter_map(|seg| std::str::from_utf8(seg).ok())
             .map(|s| PathBuf::from(s.trim_end_matches('/')))
             .collect();
-        Self { relative }
+        Self {
+            relative,
+            unknown_in_repo: false,
+        }
+    }
+
+    /// True iff the probe could not answer for a root inside a repository.
+    #[cfg(test)]
+    pub(crate) fn is_unknown_in_repo(&self) -> bool {
+        self.unknown_in_repo
     }
 
     /// True iff git tracks `relative` (a path relative to the probed root).
@@ -135,9 +188,22 @@ impl TrackedPaths {
     /// report it MODIFIED rather than deleted. That is a smaller wrong than
     /// either alternative, but it is not nothing — do not read the existence
     /// check as "restoring a deleted file is harmless".
+    ///
+    /// When the probe was UNKNOWN inside a repository, every EXISTING `dst` is
+    /// skipped whether or not it is tracked: nothing could say it is safe to
+    /// overwrite. An absent `dst` is still written.
     pub(crate) fn should_skip(&self, dst: &Path, relative: &Path) -> bool {
-        dst.exists() && self.contains(relative)
+        dst.exists() && (self.unknown_in_repo || self.contains(relative))
     }
+}
+
+/// True iff `root` or any ancestor carries a `.git` entry (a directory in a
+/// primary checkout, a file in a linked worktree). A pure filesystem test, so it
+/// cannot fail or hang the way a second git spawn could. (`repo_tenant` has the
+/// same predicate, but this module is also compiled into the `qontinui-runner`
+/// binary's own module tree, which does not carry `repo_tenant`.)
+fn has_git_ancestor(root: &Path) -> bool {
+    root.ancestors().any(|dir| dir.join(".git").exists())
 }
 
 /// Spawn `git ls-files` under `root` and return its stdout, or `None` on any
@@ -330,6 +396,55 @@ mod tests {
 
         let tracked = TrackedPaths::probe(tmp.path());
         assert!(!tracked.contains(Path::new("loose.md")));
+        assert!(!tracked.should_skip(&f, Path::new("loose.md")));
+    }
+
+    /// A probe that cannot answer INSIDE a repository protects every existing
+    /// destination (tracked or not) and still lets an absent one be written.
+    /// The repository here has a `.git` FILE pointing at a gitdir that does not
+    /// exist, so `git ls-files` fails while the filesystem test still sees a
+    /// repository — the exact shape of a broken linked worktree.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_writes_only_absent_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-provision-guard-test\n",
+        )
+        .unwrap();
+        let sub = tmp.path().join("commands");
+        std::fs::create_dir_all(&sub).unwrap();
+        let existing = sub.join("existing.md");
+        std::fs::write(&existing, b"body").unwrap();
+        let absent = sub.join("absent.md");
+
+        let tracked = TrackedPaths::probe(&sub);
+        assert!(
+            tracked.is_unknown_in_repo(),
+            "the probe failed inside a repo"
+        );
+        assert!(
+            tracked.should_skip(&existing, Path::new("existing.md")),
+            "an existing file must not be overwritten when git could not be asked"
+        );
+        assert!(
+            !tracked.should_skip(&absent, Path::new("absent.md")),
+            "an absent destination is still written"
+        );
+    }
+
+    /// The narrowed arm must NOT fire outside a repository: there an unanswered
+    /// probe keeps the pre-guard write-everything behaviour.
+    #[test]
+    fn an_unanswered_probe_outside_any_repo_still_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_not_in_any_repo(tmp.path());
+        let f = tmp.path().join("loose.md");
+        std::fs::write(&f, b"body").unwrap();
+
+        let tracked = TrackedPaths::probe(tmp.path());
+        assert!(!tracked.is_unknown_in_repo());
         assert!(!tracked.should_skip(&f, Path::new("loose.md")));
     }
 

@@ -720,9 +720,12 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE per pass, not once per
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), only ABSENT files are written and existing ones are kept
+/// (see that module's "UNKNOWN inside a repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE per pass, not once per
 /// file, so this costs one process spawn rather than seven.
 fn provision_fleet_commands_into(
     commands_dir: &Path,
