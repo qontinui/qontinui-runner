@@ -586,7 +586,9 @@ fn write_correction() -> Value {
     let artifacts = format!(
         "AppendOnlyByDesign for content: re-POST the same (kind, slug, source_repo) \
          to replace metadata and append a body version. Gap until the web backend carries \
-         artifact soft-delete, then Verb for a wrong `kind`: `kind` is part of the row's \
+         artifact soft-delete ({ARTIFACT_ARCHIVE_WEB_PR}) — and, when edges point INTO the \
+         mis-kinded row, edge correction ({EDGE_CORRECTION_WEB_PR}) too — then Verb for a \
+         wrong `kind`: `kind` is part of the row's \
          identity and the kind-override route is operator-only by design, so the correction is, \
          in THIS order: (1) re-upsert under the right kind FIRST — POST /plan-library/artifacts \
          with the same slug and source_repo; (2) re-point every edge INTO the wrong-kind row at \
@@ -594,13 +596,15 @@ fn write_correction() -> Value {
          DELETE /plan-library/links/{{id}}); (3) soft-delete the wrong-kind row with \
          DELETE /plan-library/artifacts/{{id}} (body {{\"reason\", \"session_id\"?}}, a \
          non-empty `reason`). The order is enforced upstream, not advice: archiving first is \
-         refused 409 `file_backed` / `file_backing_unknown` for a scanned row (only a live \
-         sibling of the right kind exempts the wrong-kind duplicate) and 409 `inbound_edges` \
+         refused 409 `file_backed` / `file_backing_unknown` for a scanned row (a live sibling of \
+         another kind exempts the duplicate; a kind_locked row only when the scanner's pick \
+         among those siblings is kind_locked too) and 409 `inbound_edges` \
          while edges still point at it. The DELETE forwards to \
          DELETE /api/v1/plan-library/{{id}}, which exists only on OPEN {ARTIFACT_ARCHIVE_WEB_PR} \
          (plan 2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent). Until a backend \
-         carrying it is deployed, the soft-delete answers 405 Method Not Allowed: step (1) still \
-         lands, but the wrong-kind row stays live beside the right one — a kind fork — and is \
+         carrying it is deployed, the soft-delete answers 405 Method Not Allowed (and step (2) \
+         answers 405 until one carrying {EDGE_CORRECTION_WEB_PR} is): step (1) still lands, \
+         but the wrong-kind row stays live beside the right one — a kind fork — and is \
          PERMANENT through this door. `writeVocabulary.kind` only rules out an INVALID kind; a \
          valid-but-wrong kind is the case this correction exists for, so choose it deliberately."
     );
@@ -3269,6 +3273,7 @@ mod tests {
                 "DELETE /plan-library/artifacts/{id}",
                 "DELETE /api/v1/plan-library/{id}",
                 "#1545",
+                "#1459",
                 "405",
                 "PERMANENT",
                 "`inbound_edges`",
