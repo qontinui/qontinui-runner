@@ -300,6 +300,83 @@ fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
 // The read
 // ---------------------------------------------------------------------------
 
+/// How long a resolved `(coord base, device JWT)` pair is reused. A boot with
+/// dozens of unbound transcripts would otherwise run the blocking credential
+/// resolution (secure storage, then an OS keychain call) once per transcript.
+/// Short, so a rotated or expired token is picked up within the minute; a
+/// failure is never cached.
+const CREDENTIAL_REUSE: Duration = Duration::from_secs(30);
+
+static CREDENTIAL: std::sync::Mutex<Option<(std::time::Instant, String, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Serialises credential RESOLUTION so a burst of concurrent callers does the
+/// blocking work once, then reads the cache.
+static CREDENTIAL_RESOLVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn cached_credential_now() -> Option<(String, String)> {
+    let g = CREDENTIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.as_ref()
+        .filter(|(at, _, _)| at.elapsed() < CREDENTIAL_REUSE)
+        .map(|(_, b, j)| (b.clone(), j.clone()))
+}
+
+/// The coord base + device JWT, reused for [`CREDENTIAL_REUSE`].
+async fn cached_credential() -> Result<(String, String), String> {
+    if let Some(p) = cached_credential_now() {
+        return Ok(p);
+    }
+    let _one_at_a_time = CREDENTIAL_RESOLVE.lock().await;
+    if let Some(p) = cached_credential_now() {
+        return Ok(p);
+    }
+    let parts = tokio::time::timeout(
+        CREDENTIAL_TIMEOUT,
+        tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
+    )
+    .await;
+    let (base, jwt) = match parts {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => return Err(format!("coord work-status: no credential ({e})")),
+        Ok(Err(e)) => {
+            return Err(format!(
+                "coord work-status: credential resolution panicked ({e})"
+            ))
+        }
+        Err(_) => {
+            return Err(format!(
+                "coord work-status: credential resolution timed out after {}s",
+                CREDENTIAL_TIMEOUT.as_secs()
+            ))
+        }
+    };
+    *CREDENTIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((std::time::Instant::now(), base.clone(), jwt.clone()));
+    Ok((base, jwt))
+}
+
+/// One pooled client for every work-status read.
+fn shared_client() -> Result<reqwest::Client, reqwest::Error> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c.clone());
+    }
+    let c = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
+    Ok(CLIENT.get_or_init(|| c).clone())
+}
+
+/// Upper bound on concurrent single-id resolutions ([`resolve_coord_row`]).
+/// A boot storm (every unbound transcript at once) otherwise opens one
+/// connection per transcript against coord.
+pub const MAX_CONCURRENT_RESOLUTIONS: usize = 4;
+
+static RESOLUTION_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_RESOLUTIONS);
+
 /// One raw coord read: the decoded body plus the clamp note, or the note of
 /// whatever degraded it. Shared by [`fetch`] (the work axis) and
 /// [`resolve_coord_rows`] (which row answered) so there is ONE credential /
@@ -326,31 +403,11 @@ async fn fetch_wire(ids: &[String]) -> Result<(WireResponse, String), String> {
     // It is SYNCHRONOUS and can block (file I/O, then a keychain call bounded
     // at 3 s), so it runs on a blocking thread under its own timeout. See
     // `CREDENTIAL_TIMEOUT`.
-    let parts = tokio::time::timeout(
-        CREDENTIAL_TIMEOUT,
-        tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
-    )
-    .await;
-    let (base, jwt) = match parts {
-        Ok(Ok(Ok(p))) => p,
-        Ok(Ok(Err(e))) => {
-            return Err(format!(
-                "coord work-status: no credential ({e}){clamp_note}"
-            ))
-        }
-        Ok(Err(e)) => {
-            return Err(format!(
-                "coord work-status: credential resolution panicked ({e}){clamp_note}"
-            ))
-        }
-        Err(_) => {
-            return Err(format!(
-                "coord work-status: credential resolution timed out after {}s{clamp_note}",
-                CREDENTIAL_TIMEOUT.as_secs()
-            ))
-        }
+    let (base, jwt) = match cached_credential().await {
+        Ok(p) => p,
+        Err(e) => return Err(format!("{e}{clamp_note}")),
     };
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    let client = match shared_client() {
         Ok(c) => c,
         Err(e) => {
             return Err(format!(
@@ -498,6 +555,12 @@ fn resolution_from_body(body: &WireResponse, csid: &str) -> RowResolution {
 /// Ask coord which `coord.sessions` row answers for the harness session id
 /// `csid`. Never errors — see [`RowResolution`].
 pub async fn resolve_coord_row(csid: &str) -> RowResolution {
+    // Bounded: at most MAX_CONCURRENT_RESOLUTIONS reads in flight. The
+    // semaphore is never closed, so an acquire error is unreachable; treat it
+    // as unresolved rather than panic.
+    let Ok(_slot) = RESOLUTION_SLOTS.acquire().await else {
+        return RowResolution::Unresolved("resolution semaphore closed".to_string());
+    };
     match fetch_wire(&[csid.to_string()]).await {
         Ok((body, _)) => resolution_from_body(&body, csid),
         Err(note) => RowResolution::Unresolved(note),
