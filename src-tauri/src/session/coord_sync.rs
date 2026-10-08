@@ -45,7 +45,19 @@
 //!   `last_heartbeat_at = now()`).
 //! - `event_kind = "state_change"` → `PATCH  /sessions/:id` with the
 //!   subset of fields the payload carries (state, repo, branch).
-//! - `event_kind = "closed"`   → `DELETE /sessions/:id`.
+//! - `event_kind = "closed"`   → `PATCH  /sessions/:id` with
+//!   `{state: "closed"}` ([`closed_body`]). Not `DELETE`: coord mounts
+//!   `DELETE /sessions/:id` on its operator-admin router, so a device JWT got
+//!   401 and every close was ACK-dropped (census E2). The PATCH route is
+//!   device-accepted and caller-scoped. As of the companion qontinui-coord
+//!   change (plan
+//!   `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+//!   Phase 3), which this mapping DEPENDS on, a PATCH that moves a row INTO
+//!   `closed` runs coord's `finalize_close` (claim release, scrollback flush,
+//!   `closed` event) — the same finalizer the operator `DELETE` and coord's
+//!   staleness watcher use. Against a coord without that change the PATCH
+//!   only flips `state`/`closed_at` and the Session claim stays held until
+//!   the staleness watcher reaps it.
 //! - `event_kind = "claim_stolen"` → `POST   /sessions/:id/steal` with the
 //!   typed reason payload (best-effort; the audit row is the substrate).
 //! - `event_kind = "gate_registration"` → `POST /coord/work-units/:slug/
@@ -84,9 +96,12 @@
 //! and a tick in which every pending session is sitting out its own backoff
 //! does not reset the loop's outage backoff. A session that keeps failing
 //! while coord keeps taking OTHER rows is quarantined after
-//! [`QUARANTINE_AFTER_SERVING_FAILURES`] such failures (a 429 on
-//! `output_chunk`, the only kind that retries one, never counts — every other
-//! kind treats a 429 as coord refusing the row and ACK-drops it):
+//! [`QUARANTINE_AFTER_SERVING_FAILURES`] such failures (a retried 429 never
+//! counts — coord pacing this runner is not coord refusing the row). The kinds
+//! that retry a 429 are `output_chunk` (any 429 but `warm_quota_exceeded`) and
+//! the session LIFECYCLE kinds `started` / `state_change` / `closed`
+//! ([`is_lifecycle_kind`]), whose loss would leave coord's row wrong for good;
+//! every other kind treats a 429 as coord refusing the row and ACK-drops it:
 //! its rows move to the `<outbox>.quarantine.jsonl` sidecar with a `warn!`,
 //! and stop being retried. Only a row coord itself took counts as "taking" —
 //! a locally ACK-dropped row (spent best-effort budget, a 4xx) does not — so
@@ -1000,6 +1015,19 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
     }
 }
 
+/// Session LIFECYCLE kinds — the rows that define coord's session row itself:
+/// its creation (`started` → `POST /sessions`), its state (`state_change` →
+/// `PATCH`) and its end (`closed` → `PATCH {state:"closed"}`). A 429 on one of
+/// these is retried rather than ACK-dropped (see `push_record`), because each
+/// is a one-shot fact no later row repeats. `heartbeat` is deliberately NOT
+/// here: the next heartbeat supersedes a dropped one within a tick, and
+/// retrying it would only hold the session's chain behind a stale stamp.
+fn is_lifecycle_kind(kind: &str) -> bool {
+    kind == SessionEventKind::Started.as_str()
+        || kind == SessionEventKind::StateChange.as_str()
+        || kind == SessionEventKind::Closed.as_str()
+}
+
 /// Kinds drained under the BEST-EFFORT posture: a transport failure skips the
 /// record instead of breaking the batch, and the record is Ack-dropped once
 /// [`BEST_EFFORT_MAX_ATTEMPTS`] is spent.
@@ -1439,9 +1467,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         });
         entry.failures += 1;
         entry.failed_at_ack_tick = ack_ticks_at_start;
-        // A 429 on the one kind that retries it (`output_chunk`) is coord
-        // pacing this runner, not refusing the row — it never counts toward
-        // quarantine.
+        // A 429 on a kind that retries it (`output_chunk`, and the lifecycle
+        // kinds of `is_lifecycle_kind`) is coord pacing this runner, not
+        // refusing the row — it never counts toward quarantine.
         let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
         if serving && !rate_limited {
             entry.serving_failures += 1;
@@ -1568,7 +1596,8 @@ enum PushOutcome {
     /// The runner flips the session to `PendingResolution` and surfaces
     /// the conflict to the frontend.
     Conflict { row: Option<JsonValue> },
-    /// Network / 5xx / timeout. Re-try next tick.
+    /// Network / 5xx / timeout — or a 429 on a kind that retries one
+    /// (`output_chunk`, the lifecycle kinds). Re-try on the session's backoff.
     Transport(String),
     /// 4xx (other than 409) — coord refuses this payload permanently.
     /// ACK locally so the queue moves forward.
@@ -1621,8 +1650,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .await
         }
         "closed" => {
+            // PATCH, not DELETE — see the module's wire mapping: coord's
+            // `DELETE /sessions/:id` is operator-admin only and 401s a device
+            // JWT, while a PATCH into `closed` runs coord's `finalize_close`
+            // once the companion qontinui-coord change (same plan, Phase 3)
+            // is deployed.
             let url = format!("{base}/sessions/{}", rec.session_id);
-            crate::auth::attach_device_auth_for(inner.http.delete(&url), scope)
+            let body = closed_body();
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -1891,6 +1926,21 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             if status.is_success() {
                 return PushOutcome::Acked;
             }
+            if is_lifecycle_kind(kind) && status == StatusCode::TOO_MANY_REQUESTS {
+                // A rate-limited lifecycle row is coord PACING this runner,
+                // not refusing the row. Dropping it would leave coord's
+                // session row wrong for good (never created, stuck in a
+                // stale state, or never closed — so its claim is held until
+                // the staleness watcher reaps it), so keep the row and retry
+                // on the session's backoff, like `output_chunk`'s non-quota
+                // 429 above. Decided HERE rather than in the shared
+                // `classify_coord_write_status`, whose closeout-spool caller
+                // deliberately keeps 429 permanent. The drain's quarantine
+                // accounting reads the `429` prefix as `rate_limited` and never
+                // counts it.
+                let detail = resp.text().await.unwrap_or_default();
+                return PushOutcome::Transport(format!("{status}: {detail}"));
+            }
             if matches!(kind, "restore-record" | "coord-transport-rung")
                 && matches!(
                     status,
@@ -1978,8 +2028,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             }
             if status == StatusCode::CONFLICT {
                 // Plan §Phase 3 conflict-on-acquire. Only POST
-                // /sessions carries semantic meaning for 409; for
-                // PATCH/DELETE it means "row gone or already in target
+                // /sessions carries semantic meaning for 409; for a PATCH
+                // (heartbeat, state_change, and `closed`, which is a PATCH
+                // into `closed`) it means "row gone or already in target
                 // state", which we treat as success (idempotent).
                 if kind == "started" {
                     let row = resp.json::<JsonValue>().await.ok();
@@ -2617,6 +2668,17 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
         }
     }
     body
+}
+
+/// Body of the `closed` row's `PATCH /sessions/:id`: `{state:"closed"}` only.
+///
+/// The state_change shape ([`state_change_body`]) carrying just the terminal
+/// state. A `closed` outbox row's payload holds no fields coord needs (just the
+/// routing id and the tenant stamp), so the body is fixed. No `heartbeat`:
+/// stamping liveness on the write that ends the session would be a lie coord
+/// has no use for.
+fn closed_body() -> JsonValue {
+    json!({ "state": SessionState::Closed.as_str() })
 }
 
 /// Extract the subset of `state_change` payload fields that map to
@@ -3597,6 +3659,17 @@ mod tests {
         /// so `budget - remaining` counts how many pushes were actually
         /// issued — which is how the bounded-parallel drain is asserted.
         next_patch_5xx: usize,
+        /// When >0, the next N PATCHes return 429 (coord / edge rate limit),
+        /// recording nothing — a PATCH in `patches` is one that was accepted.
+        next_patch_429: usize,
+        /// When >0, the next N `POST /sessions` return 429, recording nothing.
+        next_post_429: usize,
+        /// When true, every PATCH answers coord's 403
+        /// `close_requires_device_identity`, recording nothing.
+        patch_forbidden: bool,
+        /// The `Authorization` header each ACCEPTED `PATCH /sessions/:id`
+        /// carried, index-aligned with `patches` (`None` = unauthenticated).
+        patch_auth: Vec<Option<String>>,
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
@@ -3660,6 +3733,14 @@ mod tests {
                                 .and_then(|v| v.to_str().ok())
                                 .map(str::to_string),
                         );
+                        if g.next_post_429 > 0 {
+                            g.next_post_429 -= 1;
+                            return (
+                                AxumStatus::TOO_MANY_REQUESTS,
+                                Json(json!({"error": "rate_limited"})),
+                            )
+                                .into_response();
+                        }
                         if g.next_post_5xx > 0 {
                             g.next_post_5xx -= 1;
                             return (
@@ -3709,6 +3790,7 @@ mod tests {
                 patch(
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
+                     headers: axum::http::HeaderMap,
                      Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
                         if g.fail_all {
@@ -3726,7 +3808,28 @@ mod tests {
                             )
                                 .into_response();
                         }
+                        if g.next_patch_429 > 0 {
+                            g.next_patch_429 -= 1;
+                            return (
+                                AxumStatus::TOO_MANY_REQUESTS,
+                                Json(json!({"error": "rate_limited"})),
+                            )
+                                .into_response();
+                        }
+                        if g.patch_forbidden {
+                            return (
+                                AxumStatus::FORBIDDEN,
+                                Json(json!({"error": "close_requires_device_identity"})),
+                            )
+                                .into_response();
+                        }
                         g.patches.push((id, body.clone()));
+                        g.patch_auth.push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
                         if g.patch_returns_404 {
                             return (
                                 AxumStatus::NOT_FOUND,
@@ -4737,6 +4840,255 @@ mod tests {
         .await;
     }
 
+    /// Plan `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+    /// Phase 3: a `closed` row goes out as `PATCH /sessions/:id
+    /// {state:"closed"}` — the device-accepted door coord finalizes — and never
+    /// as the operator-admin `DELETE`, which 401s a device JWT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_row_is_a_patch_into_closed_not_a_delete() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        let row = outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
+
+        let outcome = push_record(&coord.inner, &row).await;
+        assert!(matches!(outcome, PushOutcome::Acked), "{outcome:?}");
+
+        let g = rec.lock().await;
+        assert!(
+            g.deletes.is_empty(),
+            "a close must never DELETE: {:?}",
+            g.deletes
+        );
+        assert_eq!(g.patches.len(), 1, "exactly one PATCH: {:?}", g.patches);
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(g.patches[0].1, json!({ "state": "closed" }));
+    }
+
+    /// Phase 3: a 429 on a LIFECYCLE row is coord pacing the runner — the row
+    /// is kept for retry (`Transport`), read as `rate_limited` so it never
+    /// counts toward quarantine, and delivered once coord stops pacing. A
+    /// `heartbeat` 429 keeps the shared ACK-drop rule: the next heartbeat
+    /// supersedes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_429_on_a_lifecycle_row_is_retried_not_dropped() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        for (kind, payload) in [
+            (
+                SessionEventKind::StateChange,
+                json!({ "id": s, "state": "active" }),
+            ),
+            (SessionEventKind::Closed, json!({ "id": s })),
+        ] {
+            rec.lock().await.next_patch_429 = 1;
+            let row = outbox.record(m, s, kind, payload).unwrap();
+            let first = push_record(&coord.inner, &row).await;
+            match &first {
+                PushOutcome::Transport(msg) => assert_eq!(
+                    classify_push_failure(msg, false).0,
+                    "rate_limited",
+                    "{kind:?}: a lifecycle 429 must read as rate_limited so it never \
+                     counts toward quarantine"
+                ),
+                other => panic!("{kind:?}: a 429 must be retried, got {other:?}"),
+            }
+            // The retry lands.
+            let second = push_record(&coord.inner, &row).await;
+            assert!(matches!(second, PushOutcome::Acked), "{kind:?}: {second:?}");
+        }
+        assert_eq!(rec.lock().await.patches.len(), 2);
+
+        // `started` rides POST /sessions and is a lifecycle kind too.
+        rec.lock().await.next_post_429 = 1;
+        let started = outbox
+            .record(m, s, SessionEventKind::Started, json!({ "id": s }))
+            .unwrap();
+        assert!(matches!(
+            push_record(&coord.inner, &started).await,
+            PushOutcome::Transport(_)
+        ));
+
+        // Heartbeat is not: its 429 is still the shared ACK-drop.
+        rec.lock().await.next_patch_429 = 1;
+        let hb = outbox
+            .record(m, s, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+        assert!(matches!(
+            push_record(&coord.inner, &hb).await,
+            PushOutcome::PermanentFailure(_)
+        ));
+    }
+
+    /// Phase 3, drain level: a rate-limited `closed` row stays in the outbox
+    /// through its 429s and is delivered — it is not ACK-dropped, and the
+    /// session is not quarantined for coord pacing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_retries_a_rate_limited_close_until_delivered() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_429 = 2;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert_eq!(g.next_patch_429, 0, "both 429s were served");
+        assert!(
+            g.patches
+                .iter()
+                .any(|(id, body)| *id == s && body == &json!({ "state": "closed" })),
+            "the close was DELIVERED after its 429s, not dropped: {:?}",
+            g.patches
+        );
+    }
+
+    /// Phase 3 review: a rate-limited lifecycle row still BREAKS its session's
+    /// chain — a later row of the same session (here a heartbeat) is not sent
+    /// until the lifecycle row is delivered, so seq order survives the retry.
+    /// With exactly one 429 served, a heartbeat that jumped the queue would be
+    /// the first PATCH coord accepts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rate_limited_close_holds_the_sessions_later_rows_behind_it() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_429 = 1;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let rows = vec![
+            outbox
+                .record(m, s, SessionEventKind::Closed, json!({ "id": s }))
+                .unwrap(),
+            outbox
+                .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                .unwrap(),
+        ];
+
+        // Chain level: the 429 stops the chain at the lifecycle row.
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(coord.inner.clone(), rows, HashMap::new(), abort, true).await;
+        assert!(outcome.blocked_on.is_some(), "the 429 must block the chain");
+        assert!(
+            outcome.succeeded.is_empty(),
+            "nothing after the rate-limited close may be acked: {:?}",
+            outcome.succeeded
+        );
+        assert!(
+            rec.lock().await.patches.is_empty(),
+            "the heartbeat was sent while the close ahead of it was still pending"
+        );
+
+        // Drain level: both rows land, the close first.
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert_eq!(g.patches.len(), 2, "{:?}", g.patches);
+        assert_eq!(g.patches[0].1, json!({ "state": "closed" }));
+        assert_eq!(g.patches[1].1, json!({ "heartbeat": true }));
+    }
+
+    /// Phase 3 review: a 404 on the `closed` PATCH (coord no longer has the
+    /// row) is ACK-dropped, not retried forever — only a 429 is transient for
+    /// lifecycle rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_404_on_the_close_patch_is_acked_not_retried() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        let row = outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                push_record(&coord.inner, &row).await,
+                PushOutcome::PermanentFailure(_)
+            ),
+            "a 404 on the close is permanent"
+        );
+
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(10), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        // A few more ticks: the dropped row must not be re-sent.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            rec.lock().await.patches.len(),
+            2,
+            "one direct push + one drain push, then no retries"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_retries_after_5xx() {
         let _amb = crate::test_env::isolated_ambient();
@@ -5402,6 +5754,139 @@ mod tests {
         );
     }
 
+    /// Phase 3 coord review: coord scopes a PATCH-into-closed to the caller's
+    /// device AND the token's tenant (404 for another tenant's token). So the
+    /// `closed` PATCH must present the SESSION's own tenant slot — the same
+    /// selection its `state_change` gets — and never the device's default
+    /// binding. Fixture: a multi-bound device whose default is T, a session
+    /// owned by the NON-default binding B, distinct JWTs in both slots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_close_patch_presents_the_sessions_own_tenant_credential() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let (t, b) = (Uuid::now_v7(), Uuid::now_v7());
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({
+                "default_tenant_id": t,
+                "bindings": [{ "tenant_id": t }, { "tenant_id": b }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (t_jwt, b_jwt) = (device_jwt_for(&t), device_jwt_for(&b));
+        let auth = crate::auth::AuthManager::new();
+        auth.store_tenant_device_jwt(&t, &t_jwt).expect("T slot");
+        auth.store_tenant_device_jwt(&b, &b_jwt).expect("B slot");
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let registry = build_registry(coord.clone());
+        let mut intent = make_test_intent();
+        intent.tenant_id = Some(b);
+        let handle = registry.start(intent).unwrap();
+        let id = handle.id();
+        // A state_change whose payload carries no tenant (the registry arm
+        // resolves it), then the registry's own close row — the same shape
+        // every production close takes.
+        outbox
+            .record(
+                Uuid::new_v4(),
+                id,
+                SessionEventKind::StateChange,
+                json!({ "id": id, "state": "active" }),
+            )
+            .unwrap();
+        registry.close_by_id(id).unwrap();
+
+        for row in outbox.pending().unwrap().into_iter().filter(|r| {
+            r.event_kind == SessionEventKind::StateChange.as_str()
+                || r.event_kind == SessionEventKind::Closed.as_str()
+        }) {
+            let outcome = push_record(&coord.inner, &row).await;
+            assert!(
+                matches!(outcome, PushOutcome::Acked),
+                "{}: {outcome:?}",
+                row.event_kind
+            );
+        }
+
+        let g = rec.lock().await;
+        assert_eq!(g.patches.len(), 2, "{:?}", g.patches);
+        assert_eq!(
+            g.patches[1].1,
+            json!({ "state": "closed" }),
+            "close is last"
+        );
+        let want = Some(format!("Bearer {b_jwt}"));
+        assert_eq!(
+            g.patch_auth[0], want,
+            "state_change: the session's own B slot"
+        );
+        assert_eq!(
+            g.patch_auth[1], g.patch_auth[0],
+            "the close must use the SAME credential selection as the session's \
+             state_change — never the default binding T"
+        );
+    }
+
+    /// Phase 3 coord review: a 403 on the close (coord's
+    /// `close_requires_device_identity` — a non-paired-device token or no
+    /// bearer) is a credential mismatch, not a transient. It must be classified
+    /// `unauthorized` (so `/health` `sessionOutbox.lastFailure` names it) and
+    /// take the `PermanentFailure` arm, which logs at `error!` with the status
+    /// and body — never a silent drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_403_on_the_close_is_a_loud_permanent_failure() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_forbidden = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        let row = outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Closed,
+                json!({ "id": s }),
+            )
+            .unwrap();
+        match push_record(&coord.inner, &row).await {
+            PushOutcome::PermanentFailure(msg) => {
+                assert_eq!(
+                    classify_push_failure(&msg, true),
+                    ("unauthorized", Some(403)),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("close_requires_device_identity"),
+                    "the refusal body reaches the error! line: {msg}"
+                );
+            }
+            other => panic!("a 403 close must be a PermanentFailure, got {other:?}"),
+        }
+    }
+
     /// Review finding 1: the caller's future is DROPPED mid-confirmation (a
     /// relay reconnect or shutdown). The spawned confirmation still finishes
     /// its cleanup: the session is removed, the unconfirmed `started` row is
@@ -5800,7 +6285,8 @@ mod tests {
     /// Plan A3 — an ABANDONED session (heartbeats ceased) must NOT
     /// self-delete. The runner leaves it for coord's own watcher to age;
     /// the sweep only flips local state to Stale (a UI affordance) and keeps
-    /// emitting heartbeats. It must never emit a `closed`→DELETE.
+    /// emitting heartbeats. It must never emit a `closed` (a PATCH into
+    /// `closed`, or the retired DELETE).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_session_goes_stale_but_never_self_deletes() {
         let _amb = crate::test_env::isolated_ambient();
@@ -5844,10 +6330,16 @@ mod tests {
             !g.deletes.contains(&id),
             "abandoned session must NOT be self-DELETEd by the runner — coord reaps it"
         );
+        assert!(
+            !g.patches
+                .iter()
+                .any(|(pid, body)| *pid == id && body.get("state") == Some(&json!("closed"))),
+            "abandoned session must NOT be self-closed by the runner — coord reaps it"
+        );
         drop(g);
 
         // Local state stays Stale (never Closed) — only an explicit close
-        // would flip it to Closed + emit a DELETE.
+        // would flip it to Closed + emit a `closed` row (PATCH into closed).
         let desc = registry.describe_by_id(id).unwrap();
         assert_eq!(desc.state, SessionState::Stale);
     }

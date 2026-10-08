@@ -3,6 +3,10 @@
 //! Provides full terminal emulation inside the runner via `portable-pty`.
 //! Each session spawns a native shell (PowerShell on Windows, $SHELL on Unix)
 //! with proper environment for running Claude CLI and other dev tools.
+//!
+//! Spawn-path contract: [`runner_context`] renders with zero I/O; the one
+//! bounded I/O a spawn seam performs for it is [`crate::served_corpus::probe`],
+//! whose result the seam passes in beside the per-session `CoordMcpDelivery`.
 
 pub mod account_migration;
 pub mod agent_status_sideband;
@@ -308,9 +312,16 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// 2. line 2 — the provenance label, e.g.
 ///    `[briefing: coord session_briefing/runner-session v7]` or
 ///    `[briefing: builtin-fallback]`;
-/// 3. the base body: the cached coord document with the closed placeholder
+/// 3. the key-addressed header lines: `[coord-credential: …]` when the
+///    runner's credential is not live, then `[served-corpus: …]`, always —
+///    see [`crate::served_corpus`];
+/// 4. the base body: the cached coord document with the closed placeholder
 ///    vocabulary substituted, or the builtin;
-/// 4. the fleet-gated plan-capture clause, on the same condition as before.
+/// 5. the fleet-gated plan-capture clause, on the same condition as before.
+///
+/// The spawn-path I/O this render needs is done by the SEAM, not here: each
+/// seam calls the bounded [`crate::served_corpus::probe`] on its workdir and
+/// passes the result in as `served`, exactly as it passes `coord_mcp`.
 ///
 /// Every degradation — coord unreachable, unpaired runner, absent document, a
 /// body that fails the render-time guard — falls back to the builtin and SAYS
@@ -430,7 +441,11 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// `QONTINUI_PLAN_LIBRARY_WRITE` means — use the backend door, and record any
 /// refusal as DEFERRED-WITH-CAUSE rather than as "capture is impossible" (plan
 /// `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`).
-pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelivery) -> String {
+pub fn runner_context(
+    api_port: u16,
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    served: &crate::served_corpus::ServedCorpus,
+) -> String {
     use crate::coord_mcp::CoordMcpDelivery;
     use crate::mcp::fleet_policy_poller::{BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION};
     use crate::mcp::session_briefing;
@@ -529,8 +544,17 @@ pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelive
         .map(|l| format!("{l}\n"))
         .unwrap_or_default();
 
+    // The served-corpus header line, ALWAYS present: which `.claude/` this
+    // session was served, its drift as of the last fetch, and whether its files
+    // are this build's bundle (plan `2026-09-03-served-corpus-provenance-at-spawn`).
+    // Measured by the SEAM and handed in, like `coord_mcp`; rendering it is a
+    // pure format. It follows the conditional credential line, so it is line 3
+    // or line 4 — readers address it by its `[served-corpus: ` key, never by
+    // position.
+    let served = served.render_line();
+
     format!(
-        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{credential}{}{briefing}",
+        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{credential}{served}\n{}{briefing}",
         base.text
     )
 }
@@ -625,8 +649,10 @@ coord_ask_question(policy_gap={{category, proposed_clause, tier_applied}}). \
 With tier_applied set it records non-blocking (pre-answered) — you do not wait.
 
 Report status transitions via coord_report_status \
-(working | blocked | waiting_human | finished). Set finished only after \
-cleanup (worktrees, branches) is done.
+(working | blocked | waiting_human | finished), always passing \
+claude_code_session_id = $CLAUDE_CODE_SESSION_ID. Set finished only after \
+cleanup (worktrees, branches) is done; to mark yourself finished, run \
+/finish-session.
 
 Before starting new work, check the communal work ledger so you do not \
 duplicate a peer: coord_who_is_working_on, then coord_declare_intent to \
@@ -937,6 +963,7 @@ mod tests {
         briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
         BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION, PLAN_CAPTURE_RECORD,
     };
+    use crate::served_corpus::ServedCorpus;
 
     /// Hold the coord-credential posture at UNKNOWN for the life of the guard.
     ///
@@ -1144,7 +1171,11 @@ mod tests {
         // and running it in an undefined level state is the kind of latent race
         // that only shows up once someone strengthens the assertion.
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert_eq!(
             briefing.lines().next(),
             Some(RUNNER_CONTEXT_SOURCE_MARKER),
@@ -1167,7 +1198,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.contains("/coord/agent-prompt-documents (list, optional ?kind= filter)"),
             "the list fallback must be the agent door: {briefing}"
@@ -1211,7 +1246,11 @@ mod tests {
             ),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             !briefing.contains("/coord/prompt-documents"),
             "an edited body must not be able to advertise the operator door: {briefing}"
@@ -1255,7 +1294,11 @@ mod tests {
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             !briefing.contains(CLAUSE_MARKER),
             "the capture clause must not appear at level off"
@@ -1297,7 +1340,11 @@ mod tests {
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
 
         // The runner door, on the loopback API port the caller passed.
         assert!(briefing.contains("http://127.0.0.1:9876/plan-library/artifacts"));
@@ -1410,7 +1457,11 @@ mod tests {
         let pin = pin_plan_capture_level_for_test("off");
         for level in ["observe", "gate", "recording", "RECORD ", "", "on"] {
             pin.set(level);
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             assert!(
                 !briefing.contains(CLAUSE_MARKER),
                 "level `{level}` must not inject the clause"
@@ -1441,7 +1492,11 @@ mod tests {
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         for forbidden in [
             "tenant_id",
             "organization_id",
@@ -1605,7 +1660,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Provisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Provisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.contains("coord_memory_record"),
             "a provisioned session must be told to author with the tool: {briefing}"
@@ -1629,7 +1688,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::WorkdirDeclared);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::WorkdirDeclared,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.contains("coord_memory_record"),
             "the directive must still reach a workdir-declared session: {briefing}"
@@ -1653,7 +1716,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             !briefing.contains("coord_memory_record"),
             "ungated briefing leaked the memory directive: {briefing}"
@@ -1674,7 +1741,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unknown);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unknown,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.ends_with(&memory_clause_conditional()),
             "Unknown must render the conditional variant: {briefing}"
@@ -1695,7 +1766,11 @@ mod tests {
         let _pin = pin_plan_capture_level_for_test("off");
         let composed = format!(
             "{}{}",
-            runner_context(9876, CoordMcpDelivery::Unprovisioned),
+            runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test")
+            ),
             memory_clause()
         );
         assert!(
@@ -1728,7 +1803,11 @@ mod tests {
                 briefing_for_test(bad, 5, BriefingProvenance::Coord),
             );
 
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             assert!(
                 !briefing.contains("agent_id")
                     && !briefing.contains("01a01eb4-718a-7303-825a-94ec0d0ade91"),
@@ -1768,7 +1847,7 @@ When you would ask the user a question: fetch the relevant policy and DECIDE, re
 
 When no policy clause covers a decision and you apply a category-default tier to proceed, report the gap so a clause can be authored: coord_ask_question(policy_gap={category, proposed_clause, tier_applied}). With tier_applied set it records non-blocking (pre-answered) — you do not wait.
 
-Report status transitions via coord_report_status (working | blocked | waiting_human | finished). Set finished only after cleanup (worktrees, branches) is done.
+Report status transitions via coord_report_status (working | blocked | waiting_human | finished), always passing claude_code_session_id = $CLAUDE_CODE_SESSION_ID. Set finished only after cleanup (worktrees, branches) is done; to mark yourself finished, run /finish-session.
 
 Before starting new work, check the communal work ledger so you do not duplicate a peer: coord_who_is_working_on, then coord_declare_intent to record your own scope.
 
@@ -1796,14 +1875,78 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             .replace("__WEB__", &web_base)
     }
 
-    /// Split a render into (line 1, line 2, everything else).
+    /// Split a render into (line 1, line 2, the body after the header lines).
+    ///
+    /// The key-addressed header lines ([`header_lines`]) sit between line 2
+    /// and the body; they are skipped here so the byte-identical body anchors
+    /// keep pinning the body alone.
     fn split_render(briefing: &str) -> (&str, &str, &str) {
         let mut parts = briefing.splitn(3, '\n');
-        (
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-        )
+        let marker = parts.next().unwrap_or_default();
+        let provenance = parts.next().unwrap_or_default();
+        let mut rest = parts.next().unwrap_or_default();
+        while rest.starts_with('[') {
+            rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or_default();
+        }
+        (marker, provenance, rest)
+    }
+
+    /// The key-addressed header lines: the contiguous `[`-prefixed lines after
+    /// line 2. Readers find a header line by its key, never by its position.
+    fn header_lines(briefing: &str) -> Vec<&str> {
+        briefing
+            .lines()
+            .skip(2)
+            .take_while(|l| l.starts_with('['))
+            .collect()
+    }
+
+    /// The served-corpus line is ALWAYS present, and on a quiet credential
+    /// posture it is the only header line — line 3.
+    #[test]
+    fn the_served_corpus_line_is_always_a_header_line() {
+        let _cred_quiet = quiet_credential_posture();
+        let _pin = pin_plan_capture_level_for_test("off");
+
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
+        assert_eq!(
+            header_lines(&briefing),
+            vec!["[served-corpus: UNKNOWN (test)]"]
+        );
+        // Lines 1 and 2 are untouched by it.
+        assert_eq!(briefing.lines().next(), Some(RUNNER_CONTEXT_SOURCE_MARKER));
+        assert!(briefing
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("[briefing: "));
+    }
+
+    /// With a non-live credential posture the credential line keeps line 3 —
+    /// the position `/whereami` already reads it at — and the served-corpus
+    /// line follows it as line 4.
+    #[test]
+    fn the_credential_line_precedes_the_served_corpus_line() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _cred = crate::mcp::device_jwt_refresher::posture_test_lock();
+        let _pin = pin_plan_capture_level_for_test("off");
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+        publish_posture(P::Expired);
+
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
+        let headers = header_lines(&briefing);
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(headers[0].starts_with("[coord-credential: "), "{headers:?}");
+        assert_eq!(headers[1], "[served-corpus: UNKNOWN (test)]");
     }
 
     /// With nothing cached — the arm EVERY runner runs on until coord's half of
@@ -1823,7 +1966,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         let _amb = crate::test_env::isolated_ambient();
         let _pin = pin_plan_capture_level_for_test("off");
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1847,7 +1994,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         let _amb = crate::test_env::isolated_ambient();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1881,7 +2032,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             ),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1911,7 +2066,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             briefing_for_test("Restored briefing.", 4, BriefingProvenance::Cached),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (_, provenance, body) = split_render(&briefing);
 
         assert_eq!(provenance, "[briefing: cached v4 (stale)]");
@@ -1933,7 +2092,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             briefing_for_test("Edited clause.", 3, BriefingProvenance::Coord),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (_, provenance, body) = split_render(&briefing);
 
         assert_eq!(
@@ -1979,7 +2142,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
                 briefing_for_test(&bad, 11, BriefingProvenance::Coord),
             );
 
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             let (marker, provenance, body) = split_render(&briefing);
 
             assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER, "body: {bad:.48}");
@@ -1998,7 +2165,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     #[test]
     fn the_api_port_reaches_the_rendered_briefing() {
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(41234, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            41234,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(briefing.contains("http://127.0.0.1:41234"), "{briefing}");
         assert!(!briefing.contains("http://127.0.0.1:9876"), "{briefing}");
     }
@@ -2186,7 +2357,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         ] {
             crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
             let since = publish_posture(posture);
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             let line3 = briefing.lines().nth(2).unwrap_or_default();
             assert!(
                 line3.starts_with("[coord-credential: "),
@@ -2227,7 +2402,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             if let Some(p) = seed {
                 publish_posture(p);
             }
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             assert!(
                 !briefing.contains("[coord-credential:"),
                 "seed {seed:?} must add no credential line: {briefing}"

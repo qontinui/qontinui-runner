@@ -58,7 +58,8 @@ esac
 
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
-# Keep in sync with src-tauri/.cargo/config.toml [target.*] rustflags.
+# Keep in sync with src-tauri/.cargo/config.toml [target.*] rustflags. The
+# /STACK value is pinned by build.rs `stack_reserve_tests`.
 declare -a FLAGS
 case "$HOST_TRIPLE" in
     *windows-msvc*)

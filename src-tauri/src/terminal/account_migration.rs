@@ -581,6 +581,8 @@ pub(crate) fn spawn_resumed_pane(
         config_dir: Some(spec.config_dir.to_string()),
         working_dir: spec.working_dir.to_string(),
         title: spec.title.clone(),
+        // `--resume` does not re-pass `--name`; the name persists via the transcript.
+        spawn_name: None,
         page_id: Some(spec.page_id.clone()),
         // `--resume <id>` names the exact session id → synchronous pinned
         // record (same row, new terminal/account/zone) + verification arm.

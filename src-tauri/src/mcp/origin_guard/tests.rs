@@ -1469,6 +1469,9 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("POST", "/reflection/evaluate"),
     ("GET", "/restart-readiness"),
     ("GET", "/restate/workflows/{execution_id}/state"),
+    // Counts and Claude session-id labels from the transcript tailer; no
+    // transcript content, no caller-chosen path, no outbound request.
+    ("GET", "/sessions/transcript-coverage"),
     ("GET", "/sessions/{id}/touched-files"),
     ("GET", "/settings/playwright/has-password"),
     ("GET", "/spawn-placement/preview"),

@@ -48,7 +48,8 @@
 //!   [`AiCoordRegistrar::register_sniffed_session`]).
 //! - **R3 heartbeat** → `Heartbeat` outbox row (`PATCH {heartbeat:true}`) on
 //!   operator interaction only.
-//! - **R5 close** → `Closed` outbox row (`DELETE /sessions/:id`) + index evict.
+//! - **R5 close** → `Closed` outbox row (`PATCH /sessions/:id {state:"closed"}`)
+//!   + index evict.
 //!
 //! ## Gating (P0.3)
 //!
@@ -70,6 +71,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::session::local_store::OutboxWriter;
+use crate::session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
 use crate::session::SessionEventKind;
 
 /// Default-ON env gate for AI-session coord registration (P0.3). Any of
@@ -178,6 +180,25 @@ struct Inner {
     /// ephemeral registrars) → the handle mint/rebind is skipped entirely,
     /// which also keeps unit tests network-silent.
     lifecycle_store: OnceLock<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+    /// The terminal plane's `claude_session_id → coord session id` lookup —
+    /// the SECOND arm of [`AiCoordRegistrar::resolve_coord_session_id`].
+    ///
+    /// A terminal-hosted `claude` registers with coord through
+    /// `SessionRegistry::register_external_with_lineage` (keyed by the harness
+    /// id the PTY child was pinned to), never through this registrar, so
+    /// `reverse` never holds its coord id. The terminal mirrors that id onto
+    /// itself (`TerminalSession::set_coord_session_id`); main.rs injects a
+    /// closure that reads it back by PINNED harness id
+    /// (`TerminalManager::coord_session_id_for_pinned`). A session the
+    /// provider adopted after `/clear` is not looked up by terminal: it
+    /// resolves as its predecessor does
+    /// ([`TerminalSessionRecord::adopted_from`](crate::session::session_lifecycle_store::TerminalSessionRecord::adopted_from),
+    /// walked by [`resolve_adoption_chain`]), so a `/clear` in a typed
+    /// `claude --resume X` reaches X's own row and never the pane's. Injected
+    /// rather than a hard `TerminalManager` dependency, so the registrar stays
+    /// constructible without one (tests, ephemeral registrars). Unattached →
+    /// the arm misses.
+    terminal_coord_lookup: OnceLock<TerminalCoordLookup>,
     /// Test-only observability for the Phase-1 handle hook: counts every
     /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
     /// incremented BEFORE the attached-store gate — so unit tests (which
@@ -185,6 +206,49 @@ struct Inner {
     /// assert the fire/no-fire decision (review W3).
     #[cfg(test)]
     handle_hook_fires: std::sync::atomic::AtomicU64,
+}
+
+/// See [`Inner::terminal_coord_lookup`]. Argument: a harness id; answers the
+/// coord row of the live terminal PINNED to it.
+type TerminalCoordLookup = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
+
+/// How many predecessors [`resolve_adoption_chain`] follows before giving up —
+/// each hop is one `/clear` inside the same provider process.
+pub(crate) const MAX_ADOPTION_DEPTH: usize = 8;
+
+/// Resolve a session's coord row through its ADOPTION chain — the pure rule
+/// behind [`AiCoordRegistrar::forward_finish_change`] and both late-delivery
+/// paths, so production and tests run the same function.
+///
+/// `resolve_link` answers a single harness id's OWN coord row (in production:
+/// this registrar's index, then the terminal pinned to that id). The session
+/// itself is tried first; failing that, its predecessor (`adopted_from`, the
+/// session it was `/clear`ed from), then THAT session's predecessor
+/// (`predecessor_of`), and so on — at most [`MAX_ADOPTION_DEPTH`] hops,
+/// stopping (unresolved) on a cycle. The session's own row always wins over a
+/// predecessor's, so a session that later got its own registration (a typed
+/// `claude --resume Y`) is never routed to the row it was cleared from.
+pub(crate) fn resolve_adoption_chain<T>(
+    claude_session_id: &str,
+    adopted_from: Option<&str>,
+    mut resolve_link: impl FnMut(&str) -> Option<T>,
+    mut predecessor_of: impl FnMut(&str) -> Option<String>,
+) -> Option<T> {
+    let mut seen = std::collections::HashSet::new();
+    let mut link = claude_session_id.to_string();
+    let mut next = adopted_from.map(str::to_string);
+    for _ in 0..=MAX_ADOPTION_DEPTH {
+        if !seen.insert(link.clone()) {
+            return None;
+        }
+        if let Some(found) = resolve_link(&link) {
+            return Some(found);
+        }
+        let pred = next.take().filter(|p| !p.trim().is_empty())?;
+        next = predecessor_of(&pred);
+        link = pred;
+    }
+    None
 }
 
 impl AiCoordRegistrar {
@@ -213,6 +277,7 @@ impl AiCoordRegistrar {
                 tenants: Mutex::new(HashMap::new()),
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
+                terminal_coord_lookup: OnceLock::new(),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -230,6 +295,95 @@ impl AiCoordRegistrar {
     ) {
         if self.inner.lifecycle_store.set(store).is_err() {
             warn!("ai_coord_register: lifecycle store already attached — ignoring");
+        }
+    }
+
+    /// Attach the terminal plane's harness-id → coord-id lookup (once, at
+    /// startup). See [`Inner::terminal_coord_lookup`].
+    pub fn attach_terminal_coord_lookup(
+        &self,
+        f: impl Fn(&str) -> Option<Uuid> + Send + Sync + 'static,
+    ) {
+        if self.inner.terminal_coord_lookup.set(Box::new(f)).is_err() {
+            warn!("ai_coord_register: terminal coord lookup already attached — ignoring");
+        }
+    }
+
+    /// Resolve the coord row of harness id `claude_session_id` ITSELF, across
+    /// every runner-hosted plane:
+    ///
+    /// 1. [`Self::session_id_for`] — sessions THIS registrar registered since
+    ///    boot (the AI/task-run plane and sniffed `--resume` panes);
+    /// 2. the terminal plane ([`Inner::terminal_coord_lookup`]) — the live
+    ///    terminal whose pinned harness id is `claude_session_id`.
+    ///
+    /// `None` when neither arm knows the id. One LINK of
+    /// [`Self::resolve_record`]'s adoption chain.
+    fn resolve_coord_session_id(&self, claude_session_id: &str) -> Option<Uuid> {
+        self.session_id_for(claude_session_id).or_else(|| {
+            self.inner
+                .terminal_coord_lookup
+                .get()
+                .and_then(|lookup| lookup(claude_session_id))
+        })
+    }
+
+    /// Resolve the coord row a lifecycle record's finished marker addresses:
+    /// [`resolve_adoption_chain`] over [`Self::resolve_coord_session_id`] —
+    /// the session's own row, else (for a session adopted after `/clear`)
+    /// its predecessor's, recursively. Predecessors past the first are read
+    /// from the attached lifecycle store (`get`, map lock only); with no
+    /// store attached only the record's own `adopted_from` is followed.
+    ///
+    /// `bound` is a late bind in flight — `(pinned harness id, coord row)` of
+    /// a terminal just wired to coord — consulted after the registrar arm and
+    /// before the terminal lookup, so the bind observer resolves that pinned
+    /// id without relying on the terminal already being visible to the lookup.
+    fn resolve_record(
+        &self,
+        claude_session_id: &str,
+        adopted_from: Option<&str>,
+        bound: Option<(&str, Uuid)>,
+    ) -> Option<Uuid> {
+        let store = self.inner.lifecycle_store.get();
+        resolve_adoption_chain(
+            claude_session_id,
+            adopted_from,
+            |id| {
+                self.session_id_for(id)
+                    .or_else(|| bound.filter(|(pinned, _)| *pinned == id).map(|(_, c)| c))
+                    .or_else(|| {
+                        self.inner
+                            .terminal_coord_lookup
+                            .get()
+                            .and_then(|lookup| lookup(id))
+                    })
+            },
+            |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
+        )
+    }
+
+    /// Forward a lifecycle record's finished-marker state to coord — the
+    /// body of the store's finish observer (main.rs). A marked record
+    /// enqueues `Finished`, an unmarked one a `working` progress row; both
+    /// address the row [`Self::resolve_record`] resolves — the session's own,
+    /// else its `/clear` predecessor's. A typed-resume record on a pane is
+    /// NOT resolved through the pane: it has no predecessor, its own coord
+    /// row is registered separately, and until it is the mark stays
+    /// local-only (`NoCoordSession`) for `register_inner` to re-offer.
+    ///
+    /// Takes the record the observer already holds: the observer runs inside
+    /// `set_finished`, after the map guard is released, so the chain walk's
+    /// store reads cannot deadlock.
+    pub fn forward_finish_change(
+        &self,
+        rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> FinishSync {
+        let resolved =
+            self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
+        match rec.finished_at {
+            Some(at) => self.finish_session_on(&rec.claude_session_id, resolved, Some(at)),
+            None => self.unfinish_session_on(&rec.claude_session_id, resolved),
         }
     }
 
@@ -635,18 +789,11 @@ impl AiCoordRegistrar {
         // A finished marker set while this session had no coord row in this
         // process (before its first registration, or before a runner restart
         // emptied the non-durable R4 index) enqueued nothing. Now that the row
-        // exists, deliver the write it still owes — queued AFTER `Started`, so
-        // the per-session seq chain PATCHes a row coord has created.
-        if let Some(rec) = self
-            .inner
-            .lifecycle_store
-            .get()
-            .and_then(|store| store.get(claude_session_id))
-        {
-            if rec.finished_at.is_some() && !rec.finish_synced {
-                self.finish_session(claude_session_id, rec.finished_at);
-            }
-        }
+        // exists, deliver the write it still owes — this session's own, and
+        // any session `/clear`ed from it whose chain resolves here — queued
+        // AFTER `Started`, so the per-session seq chain PATCHes a row coord
+        // has created.
+        self.deliver_owed_to(session_id, None);
 
         Ok(session_id)
     }
@@ -955,20 +1102,49 @@ impl AiCoordRegistrar {
     /// `finished_at` rides in the payload too, so a late ACK for an older mark
     /// cannot stamp a newer one synced (`mark_finish_synced`).
     ///
-    /// Returns `false` when nothing was enqueued: the session has no R4 index
-    /// entry in this process (never registered since boot, or the
-    /// registration kill switch is on), or the outbox write failed. The local
-    /// marker then stays unsynced, which is the honest state — never a
-    /// fabricated ACK — and [`Self::register_inner`] re-enqueues it if the
-    /// session registers later. Best-effort; never disturbs the session.
-    pub fn finish_session(&self, claude_session_id: &str, finished_at: Option<i64>) -> bool {
-        let Some(session_id) = self.session_id_for(claude_session_id) else {
-            debug!(
-                "ai_coord_register: finished marker for unregistered session {} stays local-only",
+    /// The coord id is resolved across every runner-hosted plane
+    /// ([`Self::resolve_coord_session_id`]). Returns [`FinishSync::Queued`]
+    /// naming the coord row the write is addressed to, or
+    /// [`FinishSync::LocalOnly`] when nothing was enqueued: no plane knows a
+    /// coord session for this id (`NoCoordSession`), or the outbox write
+    /// failed (`OutboxWriteFailed`). The local marker then stays unsynced,
+    /// which is the honest state — never a fabricated ACK — and it is
+    /// re-enqueued when the session later gets a coord row
+    /// ([`Self::register_inner`] for this registrar's planes,
+    /// [`Self::deliver_owed_finish`] for the terminal plane). Best-effort;
+    /// never disturbs the session.
+    pub fn finish_session(&self, claude_session_id: &str, finished_at: Option<i64>) -> FinishSync {
+        let resolved = self.resolve_coord_session_id(claude_session_id);
+        self.finish_session_on(claude_session_id, resolved, finished_at)
+    }
+
+    /// [`Self::finish_session`] against an already-resolved coord row
+    /// (`None` = nothing resolved: the mark stays local-only).
+    fn finish_session_on(
+        &self,
+        claude_session_id: &str,
+        resolved: Option<Uuid>,
+        finished_at: Option<i64>,
+    ) -> FinishSync {
+        let Some(session_id) = resolved else {
+            warn!(
+                "ai_coord_register: finished marker for {} stays local-only — no coord \
+                 session resolves for it on any runner plane",
                 claude_session_id
             );
-            return false;
+            return FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession);
         };
+        self.enqueue_finished(claude_session_id, session_id, finished_at)
+    }
+
+    /// Enqueue the `Finished` row for `claude_session_id`, addressed to the
+    /// already-resolved coord `session_id`.
+    fn enqueue_finished(
+        &self,
+        claude_session_id: &str,
+        session_id: Uuid,
+        finished_at: Option<i64>,
+    ) -> FinishSync {
         let payload = self.stamp_tenant(
             session_id,
             json!({
@@ -988,16 +1164,94 @@ impl AiCoordRegistrar {
                     "ai_coord_register: finished marker queued for {} (coord {})",
                     claude_session_id, session_id
                 );
-                true
+                FinishSync::Queued {
+                    coord_session_id: session_id,
+                }
             }
             Err(e) => {
                 warn!(
                     "ai_coord_register: outbox Finished write failed for {} (best-effort): {}",
                     claude_session_id, e
                 );
-                false
+                FinishSync::LocalOnly(LocalOnlyReason::OutboxWriteFailed)
             }
         }
+    }
+
+    /// Late binding for the TERMINAL plane: terminal `terminal_id` (pinned to
+    /// harness id `pinned_session_id`) has just been wired to coord session
+    /// `coord_session_id`. For every lifecycle record holding a finished mark
+    /// coord has not ACKed whose chain RESOLVES to that pinned id — the
+    /// pinned session's own record, and any session adopted after `/clear`
+    /// from it, directly or through further clears
+    /// ([`resolve_adoption_chain`]) — deliver the write it still owes,
+    /// addressed to that row. The terminal-plane twin of the re-enqueue at
+    /// the end of [`Self::register_inner`].
+    ///
+    /// A record whose chain resolves ELSEWHERE first (its own registrar row,
+    /// or a predecessor's — e.g. a `/clear` in a typed `claude --resume X` on
+    /// this pane, which resolves to X's row) owes this bind nothing.
+    ///
+    /// Covers only the IN-PROCESS window between `record_open` and the coord
+    /// bind (a mark made before the terminal had a coord row). It is not a
+    /// restart path: a finished session is not restored on boot, so no
+    /// terminal re-binds for it after a runner restart.
+    ///
+    /// Returns one verdict per owed write; empty when nothing was owed (no
+    /// store attached, no record, not finished, or already synced).
+    /// Best-effort. Runs from the coord-bind observer, outside every store
+    /// lock, so reading the store here cannot deadlock.
+    ///
+    /// Lock order: this takes the lifecycle store's `finish_forward`, so it
+    /// must never be called from the store's finish observer, nor while
+    /// holding the store map, a registrar map, the TerminalManager `sessions`
+    /// lock or the outbox.
+    pub fn deliver_owed_finish(
+        &self,
+        pinned_session_id: &str,
+        terminal_id: &str,
+        coord_session_id: Uuid,
+    ) -> Vec<FinishSync> {
+        info!(
+            "ai_coord_register: terminal {} (pinned {}) bound to coord session {} — \
+             delivering any owed finished marks",
+            terminal_id, pinned_session_id, coord_session_id
+        );
+        self.deliver_owed_to(
+            coord_session_id,
+            Some((pinned_session_id, coord_session_id)),
+        )
+    }
+
+    /// Deliver every unsynced finished mark whose record resolves
+    /// ([`Self::resolve_record`], with `bound` as the bind in flight) to
+    /// `target` — the shared body of both late-delivery paths. Candidates are
+    /// the records that could resolve through a newly known row: every
+    /// adopted record, and any other (its own id may be the new key).
+    fn deliver_owed_to(&self, target: Uuid, bound: Option<(&str, Uuid)>) -> Vec<FinishSync> {
+        let Some(store) = self.inner.lifecycle_store.get() else {
+            return Vec::new();
+        };
+        // Serialized against `set_finished` (an unmark cannot interleave
+        // between this read and the enqueue): see
+        // `SessionLifecycleStore::with_unsynced_finished_records`.
+        store.with_unsynced_finished_records(|records| {
+            records
+                .into_iter()
+                .filter(|rec| {
+                    self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), bound)
+                        == Some(target)
+                })
+                .map(|rec| {
+                    info!(
+                        "ai_coord_register: session {} has an unsynced finished mark resolving \
+                         to coord session {} — delivering the owed write",
+                        rec.claude_session_id, target
+                    );
+                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                })
+                .collect()
+        })
     }
 
     /// Tell coord an operator UNMARKED this session's finished marker, so
@@ -1009,11 +1263,22 @@ impl AiCoordRegistrar {
     /// {progress:{session_status:"working"}}`, the same body
     /// [`Self::progress_on_interaction`] sends — rather than a new event kind:
     /// "working" is exactly the state an unfinished live session is in.
-    /// Returns `false` when nothing was enqueued (no R4 entry, or the outbox
-    /// write failed). Best-effort; never disturbs the session.
-    pub fn unfinish_session(&self, claude_session_id: &str) -> bool {
-        let Some(session_id) = self.session_id_for(claude_session_id) else {
-            return false;
+    /// Resolves the coord row like [`Self::finish_session`] and reports the
+    /// same [`FinishSync`] verdict. Best-effort; never disturbs the session.
+    pub fn unfinish_session(&self, claude_session_id: &str) -> FinishSync {
+        let resolved = self.resolve_coord_session_id(claude_session_id);
+        self.unfinish_session_on(claude_session_id, resolved)
+    }
+
+    /// [`Self::unfinish_session`] against an already-resolved coord row.
+    fn unfinish_session_on(&self, claude_session_id: &str, resolved: Option<Uuid>) -> FinishSync {
+        let Some(session_id) = resolved else {
+            warn!(
+                "ai_coord_register: unfinish for {} stays local-only — no coord session \
+                 resolves for it on any runner plane",
+                claude_session_id
+            );
+            return FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession);
         };
         let payload = self.stamp_tenant(
             session_id,
@@ -1030,20 +1295,22 @@ impl AiCoordRegistrar {
                     "ai_coord_register: unfinish (working) queued for {} (coord {}) — not yet delivered",
                     claude_session_id, session_id
                 );
-                true
+                FinishSync::Queued {
+                    coord_session_id: session_id,
+                }
             }
             Err(e) => {
                 warn!(
                     "ai_coord_register: outbox unfinish write failed for {} (best-effort): {}",
                     claude_session_id, e
                 );
-                false
+                FinishSync::LocalOnly(LocalOnlyReason::OutboxWriteFailed)
             }
         }
     }
 
-    /// R5 — on AI-session end, emit a `Closed` outbox row (`DELETE
-    /// /sessions/:id`) and evict the R4 index entry so coord.sessions doesn't
+    /// R5 — on AI-session end, emit a `Closed` outbox row (`PATCH
+    /// /sessions/:id {state:"closed"}`) and evict the R4 index entry so coord.sessions doesn't
     /// leak a ghost row and the resolver doesn't keep a dangling mapping.
     /// No-op if the session wasn't registered.
     ///
@@ -1084,8 +1351,12 @@ impl AiCoordRegistrar {
         }
 
         // A `Closed` row carries no body — the drain loop maps it to
-        // `DELETE /sessions/:id`. Best-effort; a missing coord row DELETEs as
-        // idempotent success.
+        // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
+        // close (claim release, `closed` event) as of the companion
+        // qontinui-coord change (plan
+        // `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+        // Phase 3), which this depends on. A 429 is retried; a missing coord
+        // row (404) is ACK-dropped.
         if let Err(e) = self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
@@ -1852,8 +2123,14 @@ mod tests {
 
         reg.heartbeat_on_interaction(&trid);
         reg.progress_on_interaction(&trid);
-        assert!(reg.unfinish_session(&trid));
-        assert!(reg.finish_session(&trid, Some(1)));
+        assert!(matches!(
+            reg.unfinish_session(&trid),
+            FinishSync::Queued { .. }
+        ));
+        assert!(matches!(
+            reg.finish_session(&trid, Some(1)),
+            FinishSync::Queued { .. }
+        ));
         reg.close_session(&trid);
 
         let pending = reg.inner.outbox.pending().unwrap();
@@ -1994,16 +2271,27 @@ mod tests {
         let (reg, _dir) = registrar();
         let csid = Uuid::new_v4().to_string();
 
-        assert!(
-            !reg.finish_session(&csid, Some(1)),
-            "an unregistered session enqueues nothing — its marker stays local-only"
+        assert_eq!(
+            reg.finish_session(&csid, Some(1)),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "an unregistered session (both resolver arms miss) enqueues nothing — \
+             its marker stays local-only"
+        );
+        assert_eq!(
+            reg.unfinish_session(&csid),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
         );
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
 
         let coord_id = reg
             .register_sniffed_session(&csid, "interactive", None)
             .unwrap();
-        assert!(reg.finish_session(&csid, Some(1)));
+        assert_eq!(
+            reg.finish_session(&csid, Some(1)),
+            FinishSync::Queued {
+                coord_session_id: coord_id
+            }
+        );
 
         let pending = reg.inner.outbox.pending().unwrap();
         let finished: Vec<_> = pending
@@ -2022,7 +2310,12 @@ mod tests {
         );
         assert_eq!(finished[0].payload["finished_at"], json!(1));
 
-        assert!(reg.unfinish_session(&csid));
+        assert_eq!(
+            reg.unfinish_session(&csid),
+            FinishSync::Queued {
+                coord_session_id: coord_id
+            }
+        );
         let pending = reg.inner.outbox.pending().unwrap();
         let last = pending.last().unwrap();
         assert_eq!(last.event_kind, SessionEventKind::Progress.as_str());
@@ -2030,6 +2323,552 @@ mod tests {
             last.payload["session_status"],
             json!("working"),
             "an unmark tells coord the session is working again"
+        );
+    }
+
+    /// A terminal-hosted `claude` registers through `SessionRegistry`, never
+    /// through this registrar, so `reverse` never holds its coord id. The
+    /// terminal-plane resolver arm must still address the `Finished` row to
+    /// the coord row the terminal mirrors.
+    #[test]
+    fn finish_for_a_terminal_plane_session_enqueues_a_finished_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let pinned = Uuid::new_v4().to_string();
+        let terminal_coord_id = Uuid::new_v4();
+        {
+            let pinned = pinned.clone();
+            reg.attach_terminal_coord_lookup(move |csid| {
+                (csid == pinned).then_some(terminal_coord_id)
+            });
+        }
+        assert!(
+            reg.session_id_for(&pinned).is_none(),
+            "precondition: the registrar's own index does not know this session"
+        );
+
+        assert_eq!(
+            reg.finish_session(&pinned, Some(7)),
+            FinishSync::Queued {
+                coord_session_id: terminal_coord_id
+            }
+        );
+        let finished: Vec<_> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(finished.len(), 1, "exactly one Finished row");
+        assert_eq!(finished[0].session_id, terminal_coord_id);
+        assert_eq!(finished[0].payload["claude_session_id"], json!(pinned));
+        assert_eq!(finished[0].payload["finished_at"], json!(7));
+
+        // A session neither arm knows still stays local-only.
+        assert_eq!(
+            reg.finish_session("someone-else", Some(7)),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+        );
+    }
+
+    /// A terminal-plane mark made before the terminal had a coord row is
+    /// delivered when the row is bound — and only an UNSYNCED mark is.
+    #[test]
+    fn an_owed_terminal_mark_is_delivered_when_the_coord_row_is_bound() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+                store_dir.path().join("terminal-sessions.json"),
+            )
+            .unwrap(),
+        );
+        reg.attach_lifecycle_store(store.clone());
+        let csid = "terminal-marked-early";
+        let term = format!("term-{csid}");
+        let coord_id = Uuid::new_v4();
+        assert!(
+            reg.deliver_owed_finish(csid, &term, coord_id).is_empty(),
+            "no record — nothing owed"
+        );
+
+        store.record_open(crate::session::session_lifecycle_store::test_open_record(
+            csid,
+        ));
+        assert!(
+            reg.deliver_owed_finish(csid, &term, coord_id).is_empty(),
+            "not finished — nothing owed"
+        );
+
+        let at = store
+            .set_finished(csid, true, None)
+            .unwrap()
+            .record
+            .finished_at;
+        assert_eq!(
+            reg.deliver_owed_finish(csid, &term, coord_id),
+            vec![FinishSync::Queued {
+                coord_session_id: coord_id
+            }],
+            "exactly one write — the pinned record is not delivered twice via its terminal"
+        );
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].session_id, coord_id);
+        assert_eq!(pending[0].event_kind, SessionEventKind::Finished.as_str());
+        assert_eq!(pending[0].payload["finished_at"], json!(at));
+
+        store.mark_finish_synced(csid, at);
+        assert!(
+            reg.deliver_owed_finish(csid, &term, coord_id).is_empty(),
+            "an ACKed mark owes coord nothing"
+        );
+    }
+
+    /// Review (adoption) W1: late delivery resolves and enqueues with the
+    /// store's `finish_forward` held, so an unmark cannot interleave between
+    /// its read of an unsynced mark and its `Finished` enqueue. Pinned at the
+    /// registrar, not only at the store helper: reverting `deliver_owed_to` to
+    /// a bare `unsynced_finished_records()` read fails this.
+    #[test]
+    fn late_delivery_resolves_with_the_forward_serializer_held() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _store_dir) = attach_store(&reg);
+        let held: Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+        {
+            let weak = Arc::downgrade(&store);
+            let held = held.clone();
+            reg.attach_terminal_coord_lookup(move |_csid| {
+                let store = weak.upgrade().expect("store alive");
+                held.lock().unwrap().push(store.finish_forward_held());
+                None
+            });
+        }
+        for id in ["bound-pinned", "other-session"] {
+            store.record_open(crate::session::session_lifecycle_store::test_open_record(
+                id,
+            ));
+            store.set_finished(id, true, None).unwrap();
+        }
+        held.lock().unwrap().clear();
+
+        let coord_id = Uuid::new_v4();
+        assert_eq!(
+            reg.deliver_owed_finish("bound-pinned", "term-x", coord_id),
+            vec![FinishSync::Queued {
+                coord_session_id: coord_id
+            }]
+        );
+        let held = held.lock().unwrap();
+        assert!(
+            !held.is_empty(),
+            "the other session's mark was resolved through the terminal lookup"
+        );
+        assert!(
+            held.iter().all(|h| *h),
+            "every late-delivery resolution ran under finish_forward: {held:?}"
+        );
+    }
+
+    /// The terminal-plane lookup exactly as main.rs wires it, minus the PTY:
+    /// the PRODUCTION rule (`terminal::manager::resolve_pinned_coord`) over
+    /// one live terminal pinned to `pinned` and bound to `coord`.
+    fn attach_one_terminal(reg: &AiCoordRegistrar, pinned: &'static str, coord: Uuid) {
+        reg.attach_terminal_coord_lookup(move |csid| {
+            crate::terminal::manager::resolve_pinned_coord(
+                std::iter::once((pinned, Some(coord))),
+                csid,
+            )
+        });
+    }
+
+    /// A lifecycle store attached to `reg`.
+    fn attach_store(
+        reg: &AiCoordRegistrar,
+    ) -> (
+        Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+                dir.path().join("terminal-sessions.json"),
+            )
+            .unwrap(),
+        );
+        reg.attach_lifecycle_store(store.clone());
+        (store, dir)
+    }
+
+    /// Open `id` on `terminal`, recording `adopted_from` through the store's
+    /// own writer (what the SessionStart hook does on `source: "clear"`).
+    fn open_on(
+        store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+        id: &str,
+        terminal: &str,
+        adopted_from: Option<&str>,
+    ) {
+        let mut rec = crate::session::session_lifecycle_store::test_open_record(id);
+        rec.terminal_id = terminal.to_string();
+        store.record_open(rec);
+        if let Some(pred) = adopted_from {
+            store.mark_adopted_from(id, pred);
+        }
+    }
+
+    /// Finished rows in the outbox as `(coord row, claude_session_id)`.
+    fn finished_rows(reg: &AiCoordRegistrar) -> Vec<(Uuid, String)> {
+        reg.inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .map(|r| {
+                (
+                    r.session_id,
+                    r.payload["claude_session_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `/clear` in the terminal's PINNED session P adopts Y from P: Y's
+    /// finish resolves as P does — the pane's coord row — through both the
+    /// forward path and the late bind (behaviour unchanged by recording the
+    /// predecessor instead of the terminal).
+    #[test]
+    fn an_adopted_harness_id_resolves_through_its_predecessor() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let pinned = "pinned-at-spawn";
+        let terminal = "term-shared";
+        let pane_coord = Uuid::new_v4();
+        attach_one_terminal(&reg, pinned, pane_coord);
+        open_on(&store, pinned, terminal, None);
+        open_on(&store, "cleared-y", terminal, Some(pinned));
+        let _ = store.set_finished("cleared-y", true, None).unwrap();
+        let y = store.get("cleared-y").unwrap();
+        assert_eq!(y.adopted_from.as_deref(), Some(pinned));
+
+        assert_eq!(
+            reg.forward_finish_change(&y),
+            FinishSync::Queued {
+                coord_session_id: pane_coord
+            },
+            "Y resolves as its predecessor (the pinned session) does"
+        );
+        assert_eq!(
+            reg.finish_session("cleared-y", Some(11)),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "precondition: by its own id alone the adopted session is unknown"
+        );
+        let mut unmarked = y.clone();
+        unmarked.finished_at = None;
+        assert_eq!(
+            reg.forward_finish_change(&unmarked),
+            FinishSync::Queued {
+                coord_session_id: pane_coord
+            },
+            "its unmark addresses the same row"
+        );
+
+        // Late bind: the terminal is (re-)wired to a row; Y's chain resolves
+        // to the bound pinned id, so Y's owed mark is delivered there.
+        let late_coord = Uuid::new_v4();
+        let before = finished_rows(&reg).len();
+        assert_eq!(
+            reg.deliver_owed_finish(pinned, terminal, late_coord),
+            vec![FinishSync::Queued {
+                coord_session_id: late_coord
+            }],
+            "the bind delivers the adopted record's owed mark to the terminal's row"
+        );
+        let rows = finished_rows(&reg);
+        assert_eq!(rows.len(), before + 1);
+        assert_eq!(
+            rows.into_iter()
+                .filter(|(c, _)| *c == late_coord)
+                .collect::<Vec<_>>(),
+            vec![(late_coord, "cleared-y".to_string())]
+        );
+    }
+
+    /// Review round 3, M-b. Every restored session is a typed
+    /// `claude --resume X` in a pane pinned to some OTHER id P. `/clear` in X
+    /// adopts Y from X — so Y's finish belongs on X's coord row, never the
+    /// pane's (P's): an ACK from P's row would stamp Y synced while X's row
+    /// never showed finished, and an unmark would flip P's row to working.
+    /// Also covers the registrar's late delivery: a mark made before X
+    /// registered is delivered to X's row when X does.
+    #[test]
+    fn a_clear_in_a_typed_resume_queues_to_the_resumed_sessions_row_not_the_panes() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let pinned = "pane-p";
+        let terminal = "term-pane";
+        let pane_coord = Uuid::new_v4();
+        attach_one_terminal(&reg, pinned, pane_coord);
+        // Non-uuid ids keep the attached store's handle hook network-silent.
+        let x = "typed-resume-x";
+        open_on(&store, pinned, terminal, None);
+        open_on(&store, x, terminal, None);
+        open_on(&store, "cleared-y", terminal, Some(x));
+        let _ = store.set_finished("cleared-y", true, None).unwrap();
+        let y = store.get("cleared-y").unwrap();
+
+        // Before X has a coord row: Y stays local-only, and the pane's bind
+        // owes nothing on Y's behalf.
+        assert_eq!(
+            reg.forward_finish_change(&y),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "Y must not borrow the pane's row while X is unregistered"
+        );
+        assert!(
+            reg.deliver_owed_finish(pinned, terminal, pane_coord)
+                .is_empty(),
+            "the pane's bind owes nothing on Y's behalf"
+        );
+        assert!(finished_rows(&reg).is_empty(), "nothing queued to the pane");
+
+        // X registers (the sniffed typed-resume plane): Y's owed mark is
+        // delivered to X's row.
+        let x_coord = reg
+            .register_sniffed_session(x, "typed resume", None)
+            .expect("registered");
+        assert_ne!(x_coord, pane_coord);
+        assert_eq!(
+            finished_rows(&reg),
+            vec![(x_coord, "cleared-y".to_string())],
+            "registration delivers the mark owed by the session cleared from X"
+        );
+
+        assert_eq!(
+            reg.forward_finish_change(&y),
+            FinishSync::Queued {
+                coord_session_id: x_coord
+            },
+            "Y's finish queues to X's row, NOT the pane's"
+        );
+        let mut unmarked = y.clone();
+        unmarked.finished_at = None;
+        assert_eq!(
+            reg.forward_finish_change(&unmarked),
+            FinishSync::Queued {
+                coord_session_id: x_coord
+            },
+            "and its unmark flips X's row, not the pane's"
+        );
+        assert!(
+            reg.inner
+                .outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .all(|r| r.session_id != pane_coord),
+            "no row of any kind was addressed to the pane"
+        );
+        assert!(
+            reg.deliver_owed_finish(pinned, terminal, pane_coord)
+                .is_empty(),
+            "a later pane bind still owes nothing for Y"
+        );
+    }
+
+    /// Two clears: P → Y → Z resolves to the pane row; X → Y2 → Z2 (X a typed
+    /// resume with its own row) resolves to X's. The pane's bind delivers Z
+    /// and not Z2.
+    #[test]
+    fn a_chain_of_clears_resolves_through_every_predecessor() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let pinned = "pane-p";
+        let pane_coord = Uuid::new_v4();
+        attach_one_terminal(&reg, pinned, pane_coord);
+        let x = "typed-resume-x";
+        let x_coord = reg
+            .register_sniffed_session(x, "typed resume", None)
+            .expect("registered");
+
+        open_on(&store, pinned, "term-pane", None);
+        open_on(&store, "y", "term-pane", Some(pinned));
+        open_on(&store, "z", "term-pane", Some("y"));
+        open_on(&store, x, "term-other", None);
+        open_on(&store, "y2", "term-other", Some(x));
+        open_on(&store, "z2", "term-other", Some("y2"));
+        let _ = store.set_finished("z", true, None).unwrap();
+        let _ = store.set_finished("z2", true, None).unwrap();
+
+        assert_eq!(
+            reg.forward_finish_change(&store.get("z").unwrap()),
+            FinishSync::Queued {
+                coord_session_id: pane_coord
+            },
+            "P → Y → Z resolves to the pane row"
+        );
+        assert_eq!(
+            reg.forward_finish_change(&store.get("z2").unwrap()),
+            FinishSync::Queued {
+                coord_session_id: x_coord
+            },
+            "X → Y2 → Z2 resolves to X's row"
+        );
+
+        let late = Uuid::new_v4();
+        let before = finished_rows(&reg).len();
+        assert_eq!(
+            reg.deliver_owed_finish(pinned, "term-pane", late),
+            vec![FinishSync::Queued {
+                coord_session_id: late
+            }],
+            "the pane's bind delivers Z only"
+        );
+        // `pending()` is not in insertion order, so select by row.
+        let rows = finished_rows(&reg);
+        assert_eq!(rows.len(), before + 1);
+        assert_eq!(
+            rows.into_iter()
+                .filter(|(c, _)| *c == late)
+                .collect::<Vec<_>>(),
+            vec![(late, "z".to_string())]
+        );
+    }
+
+    /// The pure chain rule: own row first, predecessors in order, bounded at
+    /// `MAX_ADOPTION_DEPTH` hops, and a cycle resolves nothing.
+    #[test]
+    fn resolve_adoption_chain_walks_predecessors_bounded_and_cycle_safe() {
+        let preds: HashMap<&str, &str> = (0..12)
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("s{i}").into_boxed_str());
+                let pred: &'static str = Box::leak(format!("s{}", i + 1).into_boxed_str());
+                (id, pred)
+            })
+            .collect();
+        let pred_of = |id: &str| preds.get(id).map(|p| p.to_string());
+        let resolve_at =
+            |target: &'static str| move |id: &str| (id == target).then(|| id.to_string());
+        // Own row wins over any predecessor.
+        assert_eq!(
+            resolve_adoption_chain("s0", Some("s1"), |id| Some(id.to_string()), pred_of),
+            Some("s0".to_string())
+        );
+        // One hop and the full bound resolve.
+        assert_eq!(
+            resolve_adoption_chain("s0", Some("s1"), resolve_at("s1"), pred_of),
+            Some("s1".to_string())
+        );
+        assert_eq!(
+            resolve_adoption_chain("s0", Some("s1"), resolve_at("s3"), pred_of),
+            Some("s3".to_string()),
+            "recurses through further predecessors"
+        );
+        let deepest = format!("s{MAX_ADOPTION_DEPTH}");
+        let deepest: &'static str = Box::leak(deepest.into_boxed_str());
+        assert_eq!(
+            resolve_adoption_chain("s0", Some("s1"), resolve_at(deepest), pred_of),
+            Some(deepest.to_string()),
+            "MAX_ADOPTION_DEPTH predecessors are followed"
+        );
+        let beyond: &'static str =
+            Box::leak(format!("s{}", MAX_ADOPTION_DEPTH + 1).into_boxed_str());
+        assert_eq!(
+            resolve_adoption_chain("s0", Some("s1"), resolve_at(beyond), pred_of),
+            None,
+            "the walk is bounded"
+        );
+        // No predecessor: only the session itself.
+        assert_eq!(
+            resolve_adoption_chain("s0", None, resolve_at("s1"), pred_of),
+            None
+        );
+        // A cycle terminates unresolved.
+        let cyc: HashMap<&str, &str> = [("a", "b"), ("b", "a")].into_iter().collect();
+        let mut calls = 0;
+        assert_eq!(
+            resolve_adoption_chain(
+                "a",
+                Some("b"),
+                |_: &str| {
+                    calls += 1;
+                    None::<String>
+                },
+                |id| cyc.get(id).map(|p| p.to_string()),
+            ),
+            None
+        );
+        assert_eq!(
+            calls, 2,
+            "each link is tried once before the cycle stops it"
+        );
+    }
+
+    /// Review round 2, M-a. A typed `claude --resume X` in a pane records X
+    /// against the pane's terminal, but X has its OWN coord identity
+    /// (`register_sniffed_session`) and no predecessor. Before X is registered
+    /// its finish must stay local-only — NOT be queued to the pane's row,
+    /// whose ACK would stamp X `finish_synced` and so stop `register_inner`
+    /// from ever re-offering it to X's real row.
+    #[test]
+    fn a_typed_resume_record_on_a_terminal_never_borrows_the_terminals_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let pinned = "pane-pinned-at-spawn";
+        let terminal = "term-pane";
+        let pane_coord_id = Uuid::new_v4();
+        attach_one_terminal(&reg, pinned, pane_coord_id);
+        let x = Uuid::new_v4().to_string();
+        open_on(&store, pinned, terminal, None);
+        open_on(&store, &x, terminal, None);
+        let _ = store.set_finished(&x, true, None).unwrap();
+        let sniffed = store.get(&x).unwrap();
+        assert!(
+            reg.session_id_for(&x).is_none(),
+            "precondition: no registrar entry"
+        );
+
+        assert_eq!(
+            reg.forward_finish_change(&sniffed),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "a record that merely NAMES the pane is not resolved through it"
+        );
+        let mut unmarked = sniffed.clone();
+        unmarked.finished_at = None;
+        assert_eq!(
+            reg.forward_finish_change(&unmarked),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "nor is its unmark"
+        );
+        assert!(
+            reg.deliver_owed_finish(pinned, terminal, pane_coord_id)
+                .is_empty(),
+            "the pane's bind owes nothing on X's behalf"
+        );
+        assert!(
+            reg.inner.outbox.pending().unwrap().is_empty(),
+            "nothing queued to the pane's row"
+        );
+        assert!(
+            !store.get(&x).unwrap().finish_synced,
+            "X's mark stays owed, for X's own registration to re-offer"
         );
     }
 
@@ -2326,9 +3165,14 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                adopted_from: None,
             },
         );
-        let finished_at = store.set_finished(csid, true, None).unwrap().finished_at;
+        let finished_at = store
+            .set_finished(csid, true, None)
+            .unwrap()
+            .record
+            .finished_at;
 
         assert!(
             reg.inner.outbox.pending().unwrap().is_empty(),
@@ -2422,6 +3266,7 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                adopted_from: None,
             },
         );
         let coord_id = reg

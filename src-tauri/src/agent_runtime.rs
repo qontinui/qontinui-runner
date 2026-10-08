@@ -226,6 +226,11 @@ pub struct GateContinuationPayload {
     /// The gate anchor that cleared (for logging / correlation).
     #[serde(default)]
     pub anchor_key: Option<String>,
+    /// Intent-derived display name coord stamps for this spawn (e.g.
+    /// `post-merge-runner#1863`). Becomes `claude --name`, the tab title and the
+    /// commit `Session-Name` trailer. Absent on a coord that predates it.
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// The gate row's id. Used to (1) dedupe a continuation delivered by BOTH
     /// the WS fast-path and the poll backstop against the process-wide
     /// [`dispatched_gate_ids`] set, (2) POST the `continuation-consumed` ack so
@@ -645,6 +650,11 @@ pub struct ConditionCheckPayload {
     /// this field wins with no further change here.
     #[serde(default)]
     pub report_token: Option<String>,
+    /// Human name of the condition being checked, when coord supplies one.
+    /// Drives the spawn name `check-<name>`; absent ⇒ the `Condition check <id8>`
+    /// label and no `--name`.
+    #[serde(default)]
+    pub condition_name: Option<String>,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -2348,15 +2358,11 @@ fn dispatched_gate_ids(
     DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Atomically claim a `gate_id` for dispatch. Returns `true` if THIS call was
-/// the first to claim it (caller should dispatch); `false` if it was already
-/// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
+/// Atomically claim a `gate_id` at re-delivery `attempt` (0 = first delivery)
+/// for dispatch. Returns `true` if THIS call won the claim (caller should
+/// dispatch); `false` if it must skip as a duplicate. Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
-fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
-    claim_gate_dispatch_attempt(gate_id, 0)
-}
-
-/// [`claim_gate_dispatch`] for re-delivery `attempt` (0 = first delivery).
+///
 /// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
 /// held attempt is THIS one and was released (a local skip that left the row
 /// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
@@ -2373,6 +2379,18 @@ fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
         held.insert(gate_id, (attempt, GateClaimState::Held));
     }
     wins
+}
+
+/// Test shim: [`claim_gate_dispatch_attempt`] at attempt 0 (a first delivery).
+#[cfg(test)]
+fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
+    claim_gate_dispatch_attempt(gate_id, 0)
+}
+
+/// Test shim: [`release_gate_dispatch_attempt`] at attempt 0.
+#[cfg(test)]
+fn release_gate_dispatch(gate_id: uuid::Uuid) {
+    release_gate_dispatch_attempt(gate_id, 0);
 }
 
 /// The in-process state of one gate's highest claimed attempt.
@@ -2399,7 +2417,10 @@ fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     }
 }
 
-/// Release an in-process gate-dispatch claim ([`claim_gate_dispatch`]).
+/// Release the in-process gate-dispatch claim `attempt` holds
+/// ([`claim_gate_dispatch_attempt`]) — a TOMBSTONE, and a no-op when a
+/// different (newer) attempt holds the gate or this attempt is already
+/// [`GateClaimState::Sealed`]. See [`dispatched_gate_ids`].
 ///
 /// **The load-bearing half of the delivery-stall fix.** The dedupe set's ONLY
 /// purpose is the WS+poll double-delivery race: an id must stay claimed only
@@ -2410,12 +2431,6 @@ fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
 /// the process lifetime: the backstop poll re-lists the row every tick and the
 /// dispatcher drops it at the dedupe check forever — the exact mechanism that
 /// stranded 51 continuations pending-with-null-outcomes over 2 days.
-fn release_gate_dispatch(gate_id: uuid::Uuid) {
-    release_gate_dispatch_attempt(gate_id, 0);
-}
-
-/// Release the claim attempt `attempt` holds — a TOMBSTONE, and a no-op when a
-/// different (newer) attempt holds the gate. See [`dispatched_gate_ids`].
 fn release_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
     if let Some(entry) = held.get_mut(&gate_id) {
@@ -2443,13 +2458,13 @@ fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::Hash
 /// Atomically claim a `dispatch_id` for dispatch. Returns `true` if THIS call was
 /// the first to claim it (caller should dispatch); `false` if it was already
 /// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
-/// lock, exactly like [`claim_gate_dispatch`].
+/// lock, exactly like [`claim_gate_dispatch_attempt`].
 fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
     lock_recover(dispatched_dispatch_ids(), "dispatched_dispatch_ids").insert(dispatch_id)
 }
 
 /// Release an in-process unit-dispatch claim ([`claim_dispatch_dispatch`]) —
-/// the sibling of [`release_gate_dispatch`] for the work-unit path. Load
+/// the sibling of [`release_gate_dispatch_attempt`] for the work-unit path. Load
 /// bearing for the unit contract's at-least-once promise: a failed spawn is
 /// deliberately left un-consumed so coord re-lists it, but WITHOUT this
 /// release the re-listed row would be dropped at the in-process dedupe check
@@ -2461,7 +2476,7 @@ fn release_dispatch_dispatch(dispatch_id: uuid::Uuid) {
 /// Release whichever in-process dedupe claim the dispatcher took for this
 /// continuation, per its [`ConsumeTarget`]. Called from every LOCAL-skip exit
 /// of [`run_gate_continuation_inner`] that leaves the row pending on coord
-/// (see [`release_gate_dispatch`] for the invariant). [`ConsumeTarget::None`]
+/// (see [`release_gate_dispatch_attempt`] for the invariant). [`ConsumeTarget::None`]
 /// (legacy, no id) never claimed, so there is nothing to release.
 fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
     match consume_target {
@@ -2485,7 +2500,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   superseded_by:<winner>` and left it pending and re-listed, so the loser
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
-///   for the process lifetime (see [`release_gate_dispatch`]).
+///   for the process lifetime (see [`release_gate_dispatch_attempt`]).
 /// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
 ///   IS still pending on coord, but targeted at another device — coord's
 ///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
@@ -2495,7 +2510,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   is kept for the uncommon one: a later reroute (or the offline re-target)
 ///   can pick THIS device again, and a kept claim would then drop that
 ///   re-delivery at the dedupe check for the process lifetime — the exact
-///   stranding [`release_gate_dispatch`] exists to prevent. The cost of
+///   stranding [`release_gate_dispatch_attempt`] exists to prevent. The cost of
 ///   releasing is at most one more consume claim on a stale duplicate
 ///   delivery, which coord refuses again with the same 409 — while coord is
 ///   reachable. If that later claim instead FAILS (timeout, 5xx), it lands in
@@ -2556,7 +2571,7 @@ enum ClaimOutcome {
 /// in the `SkipSuperseded` match arm, deleting **the call** — not the body of
 /// [`settle_skipped_claim`], which a test did cover — left every test green
 /// and stranded the superseded loser's gate id in
-/// [`release_gate_dispatch`]'s claim set for the process lifetime, so coord's
+/// [`release_gate_dispatch_attempt`]'s claim set for the process lifetime, so coord's
 /// re-listed row could never be re-claimed. The call site was the untested
 /// half. Here there is no such statement to delete: the log, the settle and
 /// the skip/spawn decision are one unit, and
@@ -4403,7 +4418,7 @@ enum ConsumeTarget {
 /// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
 /// 1. **Agent-registry authorization** (`agent-spawn-authorization`), then
-///    **fast-path dedupe**: [`claim_gate_dispatch`]
+///    **fast-path dedupe**: [`claim_gate_dispatch_attempt`]
 ///    against the in-process set — a duplicate delivery (same `gate_id`) is
 ///    dropped here so a continuation delivered by both transports never even
 ///    starts a second task. This is the in-process guard; the network claim
@@ -6074,6 +6089,9 @@ pub(crate) fn pick_continuation_page(
 pub(crate) fn build_continuation_claude_command(
     claude_bin: String,
     pinned_session_id: &str,
+    // The display name for `claude --name` (the same string the tab is titled
+    // with). `None` ⇒ no `--name`, today's argv. Sanitised by the launch seam.
+    session_name: Option<&str>,
     add_dir_args: Vec<String>,
     prompt: String,
     // The system-prompt carrier: the composed `--append-system-prompt-file`
@@ -6137,6 +6155,7 @@ pub(crate) fn build_continuation_claude_command(
     let spec = LaunchSpec {
         permission: PermissionMode::DangerouslySkip,
         session_id: Some(pinned_session_id.to_string()),
+        name: session_name.map(str::to_string),
         extra_required,
         ..Default::default()
     };
@@ -6242,10 +6261,16 @@ async fn run_continuation_terminal(
     // to the operator and would otherwise require a reassignment step.
 
     // Title: prefer the anchor_key, else a generic gate-continuation label.
-    let title = payload
-        .anchor_key
-        .clone()
-        .unwrap_or_else(|| "Gate continuation".to_string());
+    let spawn_name = payload
+        .session_name
+        .as_deref()
+        .and_then(crate::claude_session::launch_spec::sanitize_session_name);
+    let title = spawn_name.clone().unwrap_or_else(|| {
+        payload
+            .anchor_key
+            .clone()
+            .unwrap_or_else(|| "Gate continuation".to_string())
+    });
 
     // Resolve `claude` to an ABSOLUTE launchable path, same as the
     // condition-check terminal and for the same reason: this spawns via the
@@ -6376,6 +6401,7 @@ async fn run_continuation_terminal(
             config_dir: selected_config_dir.clone(),
             working_dir: workdir.to_string(),
             title: title.clone(),
+            spawn_name: spawn_name.clone(),
             page_id: Some(target_page.clone()),
             // Matches the `--session-id` in the spawn argv → synchronous record.
             claude_session_id: Some(pinned_session_id.clone()),
@@ -6423,6 +6449,9 @@ async fn run_continuation_terminal(
             .map(|s| crate::mcp::types::runner_api_port(s.inner()));
         let coord_mcp =
             crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+        // What `<workdir>/.claude/` serves, for the briefing's `[served-corpus: …]`
+        // header line. Bounded, off the runtime worker, fail-soft to UNKNOWN.
+        let served = crate::served_corpus::probe_async(workdir).await;
 
         // The argv, built HERE rather than beside `launch_cfg` above: the briefing
         // it carries gates its memory clause on `coord_mcp`, which the call
@@ -6441,7 +6470,11 @@ async fn run_continuation_terminal(
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
             compose_continuation_system_prompt(
-                crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+                crate::terminal::runner_context(
+                    crate::terminal::spawn_seam_api_port(),
+                    coord_mcp,
+                    &served,
+                ),
                 payload.brief.as_ref(),
             ),
         ));
@@ -6451,6 +6484,7 @@ async fn run_continuation_terminal(
         let argv = build_continuation_claude_command(
             claude_bin.clone(),
             &pinned_session_id,
+            spawn_name.as_deref(),
             add_dir_args.clone(),
             payload.initial_prompt.clone(),
             prompt_carrier,
@@ -7343,7 +7377,13 @@ async fn run_condition_check_terminal(
 
     // Title from a short run-id prefix: "Condition check <8 chars>".
     let run_id_short: String = payload.run_id.chars().take(8).collect();
-    let title = format!("Condition check {run_id_short}");
+    // `check-<condition name>` when coord supplies one, else the run-id label.
+    let spawn_name = payload.condition_name.as_deref().and_then(|n| {
+        crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
+    });
+    let title = spawn_name
+        .clone()
+        .unwrap_or_else(|| format!("Condition check {run_id_short}"));
 
     // A condition check does not edit code, so no worktree isolation — run from
     // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
@@ -7399,6 +7439,7 @@ async fn run_condition_check_terminal(
         crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &crate::served_corpus::probe_async(workdir.as_str()).await,
         ),
     ));
     // Carried to the child env by the capture hint below; from the SAME
@@ -7407,6 +7448,7 @@ async fn run_condition_check_terminal(
     let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
+        spawn_name.as_deref(),
         Vec::new(),
         payload.initial_prompt.clone(),
         prompt_carrier,
@@ -7454,6 +7496,7 @@ async fn run_condition_check_terminal(
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
         title: title.clone(),
+        spawn_name: spawn_name.clone(),
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the spawn argv → synchronous record.
         claude_session_id: Some(pinned_session_id.clone()),
@@ -7556,19 +7599,6 @@ async fn run_condition_check_terminal(
     }
 }
 
-/// Resolve the working directory for a gate continuation. Returns
-/// `(workdir, isolated_edit_ctx, agent_id)`.
-///
-/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
-///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
-///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
-///   a non-UUID id, used only for lifecycle correlation).
-/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
-///   [`continuation_fallback_workdir`] picks (the workspace root when the
-///   repo's verified checkout is under it, else that checkout), `None`
-///   context, and a fresh correlation UUID; `Err` with a
-///   `workdir_not_a_checkout` detail when the repo has no verified checkout on
-///   this device.
 /// Derive a stable per-session UUID discriminator for a gate continuation's
 /// worktree claims (Phase 1b, plan
 /// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
@@ -7606,6 +7636,18 @@ fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uu
     }
 }
 
+/// Resolve the working directory for a gate continuation. Returns
+/// `(workdir, isolated_edit_ctx, agent_id)`.
+///
+/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
+///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
+///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
+///   a non-UUID id, used only for lifecycle correlation).
+/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
+///   [`continuation_fallback_workdir`] picks (see its doc for the per-owner
+///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
+///   refusals), `None` context, and a fresh correlation UUID.
+/// - `Err` also when acquire succeeds but returns no worktrees.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
@@ -9399,6 +9441,9 @@ fn pick_autonomous_git_identity(
 pub(crate) fn finalize_headless_child_env(
     cmd: &mut tokio::process::Command,
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    // What the child's `<workdir>/.claude/` serves — measured by the caller,
+    // for the same reason `coord_mcp` is: it needs I/O `runner_context` forbids.
+    served: &crate::served_corpus::ServedCorpus,
 ) {
     // The coord-mcp outcome is the OPPOSITE case to the port below, and both
     // rules point the same way: ship the value only the right frame knows. The
@@ -9420,7 +9465,7 @@ pub(crate) fn finalize_headless_child_env(
     let runner_api_port = crate::terminal::spawn_seam_api_port();
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
-        crate::terminal::runner_context(runner_api_port, coord_mcp),
+        crate::terminal::runner_context(runner_api_port, coord_mcp, served),
     );
     cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
@@ -9605,7 +9650,8 @@ pub(crate) async fn spawn_claude_child(
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
-    finalize_headless_child_env(&mut cmd, coord_mcp);
+    let served = crate::served_corpus::probe_async(workdir).await;
+    finalize_headless_child_env(&mut cmd, coord_mcp, &served);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
@@ -10497,6 +10543,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: CONDITION_CHECK_SOURCE.to_string(),
             report_token: report_token.map(|s| s.to_string()),
+            condition_name: None,
         }
     }
 
@@ -10781,7 +10828,11 @@ mod tests {
             cmd.env(name, "hunter2");
         }
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
 
@@ -10814,6 +10865,15 @@ mod tests {
                 .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
             "the runner-context briefing must still be exported"
         );
+        // The served-corpus header line the caller measured must reach the
+        // exported briefing verbatim — the headless seam is one of the two
+        // env seams that make it readable by `/whereami`.
+        assert!(
+            envs.iter().any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT"
+                && v.as_deref()
+                    .is_some_and(|b| b.lines().any(|l| l == "[served-corpus: UNKNOWN (test)]"))),
+            "the exported briefing must carry the served-corpus header line"
+        );
     }
 
     /// The non-interactive git credential posture, asserted from the ONE shared
@@ -10827,7 +10887,11 @@ mod tests {
         // shape of coord finding 0056361d.
         cmd.env("GIT_ASKPASS", "/some/gui/askpass");
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::credential_helper::assert_non_interactive_git_posture_tokio(
             &cmd,
@@ -10874,7 +10938,11 @@ mod tests {
         set_bound_port(41_238);
 
         let mut cmd = tokio::process::Command::new("dummy");
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         let envs: std::collections::HashMap<String, String> = cmd
             .as_std()
@@ -11147,10 +11215,39 @@ mod tests {
     /// the `--` terminator and the trailing positional prompt, with
     /// attached-form `--add-dir=` siblings preserved in between.
     #[test]
+    fn continuation_command_name_precedes_terminator_and_is_one_token() {
+        let build = |name: Option<&str>| {
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                name,
+                vec![],
+                "-p do \"it\"".to_string(),
+                None,
+                Vec::new(),
+                &crate::claude_session::launch_spec::LaunchConfig::default(),
+            )
+        };
+        let without = build(None);
+        assert!(!without.iter().any(|a| a == "--name"));
+        let with = build(Some("check-login page"));
+        let n = with.iter().position(|a| a == "--name").unwrap();
+        assert_eq!(with[n + 1], "check-login page");
+        let dd = with.iter().position(|a| a == "--").unwrap();
+        assert!(n < dd);
+        assert_eq!(with.last().unwrap(), "-p do \"it\"");
+        // Dropping the name returns today's argv exactly.
+        let mut stripped = with.clone();
+        stripped.drain(n..n + 2);
+        assert_eq!(stripped, without);
+    }
+
+    #[test]
     fn continuation_command_pins_session_id_before_positional_prompt() {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
             None,
@@ -11174,6 +11271,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![
                 "--add-dir=D:/wt/coord".to_string(),
                 "--add-dir=D:/wt/web".to_string(),
@@ -11206,6 +11304,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "-prompt with dash".to_string(),
             None,
@@ -11228,6 +11327,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11278,10 +11378,12 @@ mod tests {
         let briefing = crate::terminal::runner_context(
             9876,
             crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
         );
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11318,6 +11420,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11354,6 +11457,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "do the thing".to_string(),
             None,
@@ -11376,6 +11480,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11408,6 +11513,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(carrier),
@@ -11442,6 +11548,7 @@ mod tests {
             build_continuation_claude_command(
                 "claude".to_string(),
                 "abc-123",
+                None,
                 vec![],
                 "do the thing".to_string(),
                 Some(carrier.clone()),
@@ -11486,6 +11593,7 @@ mod tests {
             let cmd = build_continuation_claude_command(
                 "claude".to_string(),
                 "abc-123",
+                None,
                 vec![],
                 "do the thing".to_string(),
                 carrier.clone(),
@@ -12704,6 +12812,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             Vec::new(),
             "run /babysit-prs".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -13387,6 +13496,7 @@ mod tests {
             presentation: Presentation::Headless,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: anchor.map(|s| s.to_string()),
+            session_name: None,
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
@@ -13433,6 +13543,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
+            session_name: None,
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
@@ -16386,6 +16497,7 @@ mod tests {
                 presentation: Presentation::Terminal,
                 source: GATE_CONTINUATION_SOURCE.to_string(),
                 anchor_key: Some("unit:00000000-0000-0000-0000-000000000000:phase-1".to_string()),
+                session_name: None,
                 gate_id,
                 dispatch_id,
                 target_instance_name: None,

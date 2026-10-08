@@ -1004,12 +1004,12 @@ export function toFindRequest(source: unknown): Record<string, unknown> {
     // forwarding the key would turn the SDK's `!== undefined` checks into
     // present-but-undefined, which reads differently in a `key in obj` test.
     //
-    // `null` is deliberately NOT skipped. `ui_bridge_discover_handler` builds
-    // `options` from six `Option<T>` fields, so an unspecified filter arrives
-    // as an explicit null; the previous allowlists forwarded those too (their
-    // guard was `!== undefined`), and the SDK reads each through a truthiness
-    // or `=== false` check, so they are inert. Skipping them here would be a
-    // behaviour change dressed as a tidy-up.
+    // `null` is deliberately NOT skipped: a caller that sends an explicit null
+    // gets it forwarded, as the previous allowlists did (their guard was
+    // `!== undefined`). `ui_bridge_discover_handler` no longer manufactures
+    // nulls for unset filters — it omits them — because a forwarded
+    // `includeHidden: null` would override the `includeHidden: true` seed in
+    // `toDiscoverRequest` with a value the SDK reads as false.
     if (value === undefined) continue;
     if ((FIND_ENVELOPE_KEYS as readonly string[]).includes(key)) continue;
     request[key] = value;

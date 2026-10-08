@@ -64,6 +64,9 @@ mod build_drift;
 // and the plan's Design decision 1 requires the SHIPPED app binary to emit it —
 // `bundle.externalBin` ships only two sidecars, so a helper bin would not be in
 // the installer and could not answer the question at all.
+/// The canonical-generation rung: the runner's bare mirror of
+/// `qontinui-claude-config`, refreshed off the spawn path.
+mod canonical_corpus;
 mod capability_manifest;
 mod check_executor;
 mod check_generation;
@@ -89,7 +92,7 @@ mod coord_doctor_cmd;
 mod coord_drain_state;
 mod coord_http;
 mod coord_mcp;
-mod coord_mcp_config;
+pub(crate) use qontinui_runner_lib::coord_mcp_config;
 // Plan 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant
 // Phase 2 — compare each coord answer's tenant with the session repo's tenant.
 mod coord_mcp_tenant;
@@ -103,6 +106,9 @@ mod coord_questions;
 mod cost_management;
 mod crash_dumps;
 mod crash_observability;
+// Ratchet: no module may be declared in both this root and `lib.rs`.
+#[cfg(test)]
+mod crate_roots_ratchet;
 mod credential_helper;
 mod database;
 mod debug_lifecycle;
@@ -142,8 +148,8 @@ mod fleet_commands;
 mod fleet_skills;
 mod flow_control;
 mod follow_up;
-mod fs_atomic;
-mod fs_perms;
+pub(crate) use qontinui_runner_lib::fs_atomic;
+pub(crate) use qontinui_runner_lib::fs_perms;
 mod git_status_subset;
 // D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
 // existing `trigger_system` (via the `SupervisionProposal` action variant)
@@ -184,7 +190,7 @@ mod logging;
 // covered by `cargo test --lib`.
 mod looping_agent_coord;
 mod looping_agent_supervisor;
-mod machine_identity;
+pub(crate) use qontinui_runner_lib::machine_identity;
 mod macros;
 mod mcp;
 mod mcp_api;
@@ -207,7 +213,7 @@ mod planning_bridge;
 mod playwright;
 mod pm_detect;
 mod process_capture;
-mod process_helpers;
+pub(crate) use qontinui_runner_lib::process_helpers;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
@@ -215,6 +221,8 @@ mod projects;
 mod prompt_library;
 mod prompt_snippets;
 mod prompts;
+/// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
+mod provenance;
 /// The shared tracked-destination guard both fleet provisioners consult.
 mod provision_guard;
 mod rag;
@@ -242,9 +250,12 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
-mod secure_storage;
+pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
+/// Which `.claude/` tree a spawned session is served, measured at the seam
+/// for the `[served-corpus: …]` header line of `QONTINUI_RUNNER_CONTEXT`.
+mod served_corpus;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
 mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
@@ -4245,14 +4256,53 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // ACK stamps `finish_synced` back so the boot reconcile can
                 // tell a synced mark from one coord has not seen. Weak handles
                 // for the same Arc-cycle reason as the close observer above.
+                //
+                // The registrar resolves the coord row across BOTH runner
+                // planes: its own index (AI/task-run + sniffed panes), then
+                // the terminal plane through the lookup injected here — a
+                // terminal-hosted `claude` registers through `SessionRegistry`
+                // and its coord id lives only on the terminal. That lookup
+                // keys on the PINNED harness id alone. A session the provider
+                // adopted after `/clear` resolves as its PREDECESSOR does
+                // (`TerminalSessionRecord::adopted_from`, walked by the
+                // registrar), so a `/clear` in the pinned session reaches the
+                // terminal's row while a `/clear` in a typed `claude --resume
+                // X` reaches X's own row, never the pane's. The observer's
+                // verdict is RETURNED to `set_finished`, so the finish route
+                // reports whether coord was told instead of dropping it. And
+                // every terminal binding re-delivers a mark made before the
+                // terminal had a coord row, for each record whose chain
+                // resolves to that terminal's pinned id — the in-process
+                // window between `record_open` and the bind only: a finished
+                // session is not restored on boot, so nothing re-binds for it
+                // after a restart (the terminal-plane twin of the registrar's
+                // own late-registration re-enqueue).
+                //
+                // Lock order: the finish observer runs inside `set_finished`
+                // AFTER the store's map guard is released (its `finish_forward`
+                // serializer is still held) and receives the record; walking
+                // its adoption chain reads the store (`get`, map lock only),
+                // which is safe there. The bind observer runs outside every
+                // store lock.
                 {
+                    let tm = std::sync::Arc::downgrade(&term_for_session);
+                    ai_coord_registrar.attach_terminal_coord_lookup(move |csid| {
+                        tm.upgrade()?.coord_session_id_for_pinned(csid)
+                    });
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    term_for_session.attach_coord_bind_observer(
+                        move |pinned, terminal_id, coord_id| {
+                            if let Some(r) = reg.upgrade() {
+                                r.deliver_owed_finish(pinned, terminal_id, coord_id);
+                            }
+                        },
+                    );
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     lifecycle_store.attach_finish_observer(move |rec| {
-                        if let Some(r) = reg.upgrade() {
-                            match rec.finished_at {
-                                Some(at) => r.finish_session(&rec.claude_session_id, Some(at)),
-                                None => r.unfinish_session(&rec.claude_session_id),
-                            };
+                        use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
+                        match reg.upgrade() {
+                            Some(r) => r.forward_finish_change(rec),
+                            None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
                         }
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);

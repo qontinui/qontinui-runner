@@ -755,6 +755,7 @@ fn pty_child_command(
         crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &crate::served_corpus::ServedCorpus::unknown("no session"),
         ),
     );
 
@@ -834,6 +835,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
     crate::agent_runtime::finalize_headless_child_env(
         &mut headless,
         crate::coord_mcp::CoordMcpDelivery::Unknown,
+        &crate::served_corpus::ServedCorpus::unknown("no session"),
     );
 
     // console-ok: built to fingerprint the seam env, never spawned (see above).

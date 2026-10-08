@@ -4632,6 +4632,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_claim_release",
     "coord_conflict_check",
     "coord_declare_intent",
+    // The direct supersession-declaration door (qontinui-coord, operator
+    // directive 2026-10-03, served policy `git-operations`
+    // `a-landed-adoption-closes-its-predecessor`). It records the declaration
+    // `coord_repoint_gate`'s supersession arm needs when a successor's title
+    // token was missing or not recorded — every precondition (tenant owns both
+    // repos, successor LANDED, successor not a fork) is verified by coord.
+    // Withheld here it would answer `-32601`, and the adoption's last two steps
+    // (move the gate, close the predecessor) would stay operator-only.
+    "coord_declare_supersession",
     "coord_diagnose",
     "coord_diff_impact",
     "coord_edit_predict",
@@ -4665,6 +4674,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Phase 2: the triage-stamp door. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
     // is the grant authority; this list only forwards.
     "coord_mark_findings_triaged",
+    // Plan 2026-09-21-a-memory-write-receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
+    // Phase 1: the by-id read-back of a memory write receipt. A pure read; added
+    // WITH the coord tool so the receipt's own door never answers -32601.
+    "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_record",
     "coord_memory_search",
@@ -11571,6 +11584,12 @@ pub fn create_router(
         });
     }
 
+    // Keep the canonical-generation rung's mirror of qontinui-claude-config
+    // fresh (plan 2026-09-03-served-corpus-provenance-at-spawn, Phase 6). A
+    // background timer, never a spawn path: registry resolution only READS the
+    // last loaded snapshot.
+    crate::canonical_corpus::start_refresh_loop();
+
     // Phase 3b — the stale-`.coord-mcp-status` sweep, beside the boot heal that
     // runs inside `reconcile_session_configs` above.
     //
@@ -14126,6 +14145,7 @@ mod self_id_chain_tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
@@ -16348,6 +16368,10 @@ mod coord_mcp_body_gate_tests {
             "coord_alert_queue",
             "coord_alert_claim",
             "coord_alert_release",
+            // The by-id memory read-back (plan 2026-09-21-a-memory-write-
+            // receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
+            // Phase 1), pinned with the coord tool rather than after a -32601.
+            "coord_memory_get",
         ] {
             assert!(
                 gate(serde_json::json!({
@@ -16789,6 +16813,9 @@ mod coord_mcp_body_gate_tests {
             // The registrant-only re-point (coord#2056): the only way to carry a
             // superseded gate's continuation onto the replacement PR.
             "coord_repoint_gate",
+            // ...and the declaration that authorizes a NON-registrant re-point
+            // of a superseded PR's system-registered gate.
+            "coord_declare_supersession",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
