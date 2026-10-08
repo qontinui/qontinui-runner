@@ -379,6 +379,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             console.warn(
               `[UIBridgeEventHandler] html2canvas failed for '${elementId}', trying SVG foreignObject fallback:`,
               describeThrown(html2canvasError, "html2canvas capture failed"),
+              html2canvasError,
             );
             try {
               const fallbackResult = await captureElementScreenshot(
@@ -433,6 +434,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
               console.warn(
                 `[UIBridgeEventHandler] SVG foreignObject fallback also failed for '${elementId}':`,
                 describeThrown(fallbackError, "SVG foreignObject capture failed"),
+                fallbackError,
               );
               await sendResponse({
                 requestId,

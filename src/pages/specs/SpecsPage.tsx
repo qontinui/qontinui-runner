@@ -595,6 +595,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
       console.error(
         "[Specs] State machine compilation failed — engine not updated:",
         describeThrown(err, "unknown error"),
+        err,
       );
       return;
     }
