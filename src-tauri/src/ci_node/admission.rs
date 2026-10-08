@@ -645,11 +645,20 @@ impl QueueStamp {
     /// A dispatch queued at `now` with no coord-supplied deadline: its lease
     /// was last (re)started by coord's dispatch, which is as close to `now` as
     /// the runner can know.
+    ///
+    /// `release_at` is built with `checked_add`: this runs inside
+    /// [`enqueue_locked`] under the `ci_state()` lock, and a panic there would
+    /// poison the mutex for every later caller until restart. Should the sum
+    /// ever be unrepresentable, the dispatch falls back to the unrenewed hold
+    /// — the deadline a dispatch from a coord with no ceiling gets.
     fn fresh(payload: &CiDispatchPayload, now: Instant) -> Self {
+        let renew_by = now + UNRENEWED_HOLD;
         Self {
             queued_since: now,
-            release_at: now + queue_release_after(payload),
-            renew_by: now + UNRENEWED_HOLD,
+            release_at: now
+                .checked_add(queue_release_after(payload))
+                .unwrap_or(renew_by),
+            renew_by,
         }
     }
 
@@ -673,6 +682,14 @@ impl QueueStamp {
     /// releases it. A dispatch the keeper does NOT renew gets no floor: no
     /// answer is coming, so an already-past deadline releases on the first
     /// tick.
+    ///
+    /// The floor is not free. For a GENUINELY late delivery (no skew) whose
+    /// first heartbeat fails because coord is unreachable, it can move the
+    /// release from just before coord's sweep to just after it; the release
+    /// is then answered `409 dispatch_terminal` and its reason is lost, the
+    /// row ending a reason-free `lost`. That is accepted: protecting a healthy
+    /// dispatch on a skewed clock from a release coord never asked for is
+    /// worth more than a reason on a row coord could not be reached about.
     fn on_arrival(
         payload: &CiDispatchPayload,
         now: Instant,
@@ -749,9 +766,10 @@ fn coord_age_at_arrival(
         (Some(lease_end), _, _) => {
             lease_end.checked_sub_signed(chrono::Duration::seconds(COORD_LEASE.as_secs() as i64))?
         }
-        (None, Some(ceiling), Some(max_age)) => {
-            ceiling.checked_sub_signed(chrono::Duration::seconds(max_age as i64))?
-        }
+        // `max_age` is payload-derived: an `as i64` cast would wrap a huge
+        // value negative, and `Duration::seconds` panics past its range.
+        (None, Some(ceiling), Some(max_age)) => ceiling
+            .checked_sub_signed(chrono::Duration::try_seconds(i64::try_from(max_age).ok()?)?)?,
         _ => return None,
     };
     Some(wall_now - started)
@@ -877,18 +895,28 @@ pub(crate) const UNRENEWED_HOLD: Duration = Duration::from_secs(10 * 60);
 /// runner then cannot know the limit it is inside.
 ///
 /// Never below [`UNRENEWED_HOLD`]: a ceiling shorter than that would release
-/// work the lease alone would have kept.
+/// work the lease alone would have kept. Never above
+/// [`MAX_ADVERTISED_QUEUE_CEILING`]: the ceiling is payload-derived, and an
+/// absurd one (a corrupt payload, a units bug in coord) must neither overflow
+/// `Instant` arithmetic nor pin a dispatch in the queue indefinitely.
 pub(crate) fn queue_release_after(payload: &CiDispatchPayload) -> Duration {
     match (
         payload.coord_accepts_queue_heartbeat(),
         payload.queued_renewal_max_age_secs,
     ) {
         (true, Some(ceiling)) => Duration::from_secs(ceiling)
+            .min(MAX_ADVERTISED_QUEUE_CEILING)
             .saturating_sub(QUEUE_RELEASE_MARGIN)
             .max(UNRENEWED_HOLD),
         _ => UNRENEWED_HOLD,
     }
 }
+
+/// The largest advertised `queued_renewal_max_age_secs` the runner believes:
+/// 24 hours, against coord's 30 minutes. Anything above it is clamped to it
+/// by [`queue_release_after`] — `renew_by` still releases a dispatch coord
+/// stops renewing, so the clamp only bounds how long a renewed one may wait.
+pub(crate) const MAX_ADVERTISED_QUEUE_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The `summary.reason` a released queued dispatch carries. A machine token,
 /// not prose, so the ledger can be counted by it.
@@ -2178,8 +2206,16 @@ mod tests {
     /// subtraction failed and was clamped to arrival — an already-expired
     /// dispatch was then held a full UNRENEWED_HOLD more. Deadlines are now
     /// expiry instants built by addition, so `now` here is a bare
-    /// `Instant::now()` with no headroom below it, and the verdict is the
-    /// same however recently the host booted.
+    /// `Instant::now()` with no headroom below it.
+    ///
+    /// What this test does and does not pin: the old bug fired only within
+    /// one hold of boot, so on a host up longer than that the LEGACY half
+    /// below passes against the old code too and catches nothing. The epoch
+    /// case is pinned by the RENEWABLE half (the grace floor, which the old
+    /// code had no notion of) and by
+    /// `a_coord_deadline_maps_to_an_instant_without_subtracting_from_now`,
+    /// which drives `margin_inside` directly with a deadline older than any
+    /// `Instant` epoch.
     #[tokio::test]
     async fn an_already_expired_dispatch_is_not_held_a_full_hold_past_arrival() {
         let arrived = Instant::now();
@@ -2318,6 +2354,51 @@ mod tests {
         );
         assert!(FIRST_RENEWAL_GRACE > QUEUE_HEARTBEAT_INTERVAL);
         assert!(FIRST_RENEWAL_GRACE < UNRENEWED_HOLD);
+    }
+
+    /// REGRESSION (review M1): an absurd advertised ceiling used to reach
+    /// `now + Duration::from_secs(u64::MAX)`, which panics on `Instant`
+    /// overflow — inside `enqueue_locked`, under the `ci_state()` lock, so the
+    /// panic poisoned the mutex for every later caller. It now enqueues and
+    /// gets a bounded queue deadline.
+    #[test]
+    fn an_absurd_advertised_ceiling_enqueues_with_a_bounded_deadline() {
+        let absurd = advertising(queued_payload("absurd"), u64::MAX);
+        let bound = MAX_ADVERTISED_QUEUE_CEILING - QUEUE_RELEASE_MARGIN;
+        assert_eq!(queue_release_after(&absurd), bound);
+
+        let mut state = CiState::new();
+        let before = Instant::now();
+        let (depth, armed) = enqueue_locked(&mut state, absurd, None);
+        assert_eq!((depth, armed), (1, true));
+        let stamp = state.queued[0].stamp;
+        assert!(stamp.release_at > stamp.queued_since);
+        assert!(
+            stamp.release_at <= Instant::now() + bound,
+            "the queue deadline is bounded by the clamp"
+        );
+        assert!(stamp.queued_since >= before);
+    }
+
+    /// REGRESSION (review L3): `coord_age_at_arrival` cast the advertised
+    /// ceiling `as i64` (u64::MAX wrapped to -1) and built a
+    /// `chrono::Duration::seconds` from it, which panics past chrono's range.
+    /// An unrepresentable ceiling now yields no age, and a representable one
+    /// still does.
+    #[test]
+    fn an_unrepresentable_ceiling_yields_no_coord_age() {
+        let wall = chrono::Utc::now();
+        for max_age in [u64::MAX, i64::MAX as u64, 1 << 62] {
+            let mut p = advertising(queued_payload("huge"), max_age);
+            p.queued_renewal_deadline = Some(wall);
+            assert_eq!(coord_age_at_arrival(&p, wall), None, "max_age {max_age}");
+        }
+        let mut p = advertising(queued_payload("sane"), 1800);
+        p.queued_renewal_deadline = Some(wall + chrono::Duration::minutes(20));
+        assert_eq!(
+            coord_age_at_arrival(&p, wall),
+            Some(chrono::Duration::minutes(10))
+        );
     }
 
     /// `lease_expires_at` is read as RFC 3339; absent or null is `None`; and a
