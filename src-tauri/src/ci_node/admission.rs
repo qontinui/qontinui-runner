@@ -606,16 +606,42 @@ pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
     available_bytes / (1024 * 1024 * 1024) < floor_gb
 }
 
-/// A deferred dispatch, when it FIRST entered this device's queue, and how
-/// long it may stay there ([`queue_release_after`], fixed at first enqueue).
+/// The two clocks a queued dispatch carries.
 ///
-/// `queued_since` survives re-submission: a dispatch popped for re-admission
-/// that defers again goes back in with its original stamp, so a dispatch
-/// bounced between the queue and a failed re-test cannot reset its own clock
-/// and outlive its release deadline.
+/// - `queued_since`: when it FIRST entered this device's queue. The
+///   [`queue_release_after`] deadline runs from here.
+/// - `last_renewed`: when coord last confirmed its lease — a `Renewed` queue
+///   heartbeat, or `queued_since` until there is one. Coord sweeps an unrenewed
+///   row one [`COORD_LEASE`] after its last renewal, so the runner may not hold
+///   a dispatch past [`UNRENEWED_HOLD`] from here (a queue heartbeat that keeps
+///   FAILING must not leave the runner holding a row coord has abandoned).
+///
+/// Both survive re-submission: a dispatch popped for re-admission that defers
+/// again goes back in with its original stamp, so a dispatch bounced between
+/// the queue and a failed re-test cannot reset either clock and outlive its
+/// deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueueStamp {
+    queued_since: Instant,
+    last_renewed: Instant,
+}
+
+impl QueueStamp {
+    /// A dispatch queued at `now`: its lease was last (re)started by coord's
+    /// dispatch, which is as close to `now` as the runner can know.
+    fn fresh(now: Instant) -> Self {
+        Self {
+            queued_since: now,
+            last_renewed: now,
+        }
+    }
+}
+
+/// A deferred dispatch, its [`QueueStamp`], and how long it may stay queued
+/// ([`queue_release_after`], fixed at first enqueue).
 struct QueuedDispatch {
     payload: CiDispatchPayload,
-    queued_since: Instant,
+    stamp: QueueStamp,
     release_after: Duration,
 }
 
@@ -661,7 +687,8 @@ pub(crate) const QUEUE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Coord's dispatch lease (`ci_dispatch::LEASE_SECS`). Without queue
 /// heartbeats a queued dispatch's lease runs out this long after coord created
-/// it, so this is also how long the runner may hold one it cannot renew.
+/// it (or last renewed it), and coord's sweeper marks it `lost` within the
+/// minute after; see [`UNRENEWED_HOLD`] for how far inside it the runner lets go.
 pub(crate) const COORD_LEASE: Duration = Duration::from_secs(15 * 60);
 
 /// How far inside coord's queued-renewal ceiling the runner releases.
@@ -673,8 +700,23 @@ pub(crate) const COORD_LEASE: Duration = Duration::from_secs(15 * 60);
 /// against a lag of seconds and a one-minute tick.
 pub(crate) const QUEUE_RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
 
+/// The longest the runner holds a queued dispatch past coord's last renewal of
+/// its lease (or past enqueue, before any): one [`COORD_LEASE`] less
+/// [`QUEUE_RELEASE_MARGIN`] — 10 minutes.
+///
+/// Why inside the lease and not AT it: coord's sweeper (every 60 s) marks an
+/// unrenewed row `lost` once its lease expires, and from then on a release is
+/// answered `409 dispatch_terminal` and the reason is discarded. A release at
+/// the one-lease mark therefore always arrives after the sweep — the runner's
+/// clock starts later than coord's `created_at`, never earlier — so it could
+/// not do the one thing it exists for, which is to put a reason in the ledger
+/// and hand the work back while coord can still re-dispatch it. The margin
+/// absorbs the delivery lag, one keeper tick, and the release POST itself.
+pub(crate) const UNRENEWED_HOLD: Duration = Duration::from_secs(10 * 60);
+
 /// How long this runner may hold `payload` in its admission queue before
 /// RELEASING it back to coord as `cancelled`/[`DEFERRED_PAST_LEASE_REASON`].
+/// (Independently, [`UNRENEWED_HOLD`] bounds the hold from the last renewal.)
 ///
 /// The goal is that queued work eventually BUILDS, not that its failure gets a
 /// better name. So a dispatch whose coord renews queued leases is held for the
@@ -685,12 +727,13 @@ pub(crate) const QUEUE_RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
 ///
 /// A dispatch from a coord that advertises no queued phase gets no heartbeat,
 /// so its lease lapses one [`COORD_LEASE`] after creation whatever the runner
-/// does; it is released at that mark, so the ledger carries a reason instead of
-/// a reason-free `lost`. The same applies to a coord that advertises the phase
-/// but no ceiling, since the runner then cannot know the limit it is inside.
+/// does; it is released at [`UNRENEWED_HOLD`], while the row is still live, so
+/// the ledger carries a reason instead of a reason-free `lost`. The same
+/// applies to a coord that advertises the phase but no ceiling, since the
+/// runner then cannot know the limit it is inside.
 ///
-/// Never below one lease: a ceiling shorter than that would release work the
-/// lease alone would have kept.
+/// Never below [`UNRENEWED_HOLD`]: a ceiling shorter than that would release
+/// work the lease alone would have kept.
 pub(crate) fn queue_release_after(payload: &CiDispatchPayload) -> Duration {
     match (
         payload.coord_accepts_queue_heartbeat(),
@@ -698,8 +741,8 @@ pub(crate) fn queue_release_after(payload: &CiDispatchPayload) -> Duration {
     ) {
         (true, Some(ceiling)) => Duration::from_secs(ceiling)
             .saturating_sub(QUEUE_RELEASE_MARGIN)
-            .max(COORD_LEASE),
-        _ => COORD_LEASE,
+            .max(UNRENEWED_HOLD),
+        _ => UNRENEWED_HOLD,
     }
 }
 
@@ -711,17 +754,37 @@ pub(crate) const DEFERRED_PAST_LEASE_REASON: &str = "deferred_past_lease";
 /// its lease renewal (past coord's queued-age ceiling).
 pub(crate) const QUEUED_RENEWAL_REFUSED_REASON: &str = "queued_renewal_refused";
 
-/// Remove and return every queued dispatch that has waited at least its own
-/// `release_after` as of `now`, preserving the FIFO order of the rest. Pure
-/// over the injected clock, so the release rule is unit-tested without a timer.
-fn take_expired(queue: &mut VecDeque<QueuedDispatch>, now: Instant) -> Vec<QueuedDispatch> {
+/// The `summary.reason` for a queued dispatch released because its lease went
+/// [`UNRENEWED_HOLD`] without a successful renewal (coord unreachable, no
+/// device credential …), so coord is about to sweep it.
+pub(crate) const QUEUED_RENEWAL_LAPSED_REASON: &str = "queued_renewal_lapsed";
+
+/// Why `q` must leave the queue as of `now`, if it must. The queue deadline is
+/// checked first, so a dispatch that was never renewable (where both clocks
+/// coincide) is named [`DEFERRED_PAST_LEASE_REASON`].
+fn expiry_reason(q: &QueuedDispatch, now: Instant) -> Option<&'static str> {
+    if now.saturating_duration_since(q.stamp.queued_since) >= q.release_after {
+        Some(DEFERRED_PAST_LEASE_REASON)
+    } else if now.saturating_duration_since(q.stamp.last_renewed) >= UNRENEWED_HOLD {
+        Some(QUEUED_RENEWAL_LAPSED_REASON)
+    } else {
+        None
+    }
+}
+
+/// Remove and return every queued dispatch whose [`expiry_reason`] fires as of
+/// `now`, with that reason, preserving the FIFO order of the rest. Pure over
+/// the injected clock, so the release rule is unit-tested without a timer.
+fn take_expired(
+    queue: &mut VecDeque<QueuedDispatch>,
+    now: Instant,
+) -> Vec<(QueuedDispatch, &'static str)> {
     let mut expired = Vec::new();
     let mut kept = VecDeque::with_capacity(queue.len());
     for q in queue.drain(..) {
-        if now.saturating_duration_since(q.queued_since) >= q.release_after {
-            expired.push(q);
-        } else {
-            kept.push_back(q);
+        match expiry_reason(&q, now) {
+            Some(reason) => expired.push((q, reason)),
+            None => kept.push_back(q),
         }
     }
     *queue = kept;
@@ -729,17 +792,18 @@ fn take_expired(queue: &mut VecDeque<QueuedDispatch>, now: Instant) -> Vec<Queue
 }
 
 /// Push a deferred dispatch and arm the queue-keeper if none is running.
-/// Returns `(queue depth, keeper newly armed)`; the caller spawns the keeper
-/// OUTSIDE the lock.
+/// `stamp` is `Some` for a RE-queue, which keeps both of its clocks; `None`
+/// stamps it fresh. Returns `(queue depth, keeper newly armed)`; the caller
+/// spawns the keeper OUTSIDE the lock.
 fn enqueue_locked(
     state: &mut CiState,
     payload: CiDispatchPayload,
-    queued_since: Option<Instant>,
+    stamp: Option<QueueStamp>,
 ) -> (usize, bool) {
     let release_after = queue_release_after(&payload);
     state.queued.push_back(QueuedDispatch {
         payload,
-        queued_since: queued_since.unwrap_or_else(Instant::now),
+        stamp: stamp.unwrap_or_else(|| QueueStamp::fresh(Instant::now())),
         release_after,
     });
     let arm = !state.keeper_armed;
@@ -788,8 +852,15 @@ impl QueueTransport for CoordQueueTransport {
 /// and building it would be work nobody will read. A REFUSED renewal releases
 /// the dispatch, but only if it is still queued: it may have been admitted
 /// while the POST was in flight, and a running build is not the queue's to
-/// release. A renewal that FAILS keeps the dispatch queued; the next tick
-/// retries, and the release deadline still bounds how long it can sit.
+/// release. A renewal that FAILS keeps the dispatch queued and does not move
+/// its `last_renewed`; the next tick retries, and [`UNRENEWED_HOLD`] releases
+/// it before coord's sweeper would abandon it. A `Renewed` reply moves
+/// `last_renewed` to `now` — the tick's START, which is no later than coord's
+/// own renewal stamp, so the runner's view of the lease errs short.
+///
+/// Renewals are sent concurrently, at most [`QUEUE_HEARTBEAT_CONCURRENCY`] in
+/// flight, so a queue of N against an unreachable coord costs one timeout per
+/// tick rather than N.
 ///
 /// The lock is held only to snapshot and to mutate; `report_base` (which may
 /// read the profile) and every network call run with it released.
@@ -798,6 +869,7 @@ async fn keeper_tick<T: QueueTransport>(
     transport: &T,
     now: Instant,
 ) -> bool {
+    use futures::StreamExt as _;
     let (expired, renew, emptied) = {
         let mut guard = state.lock().unwrap();
         let expired = take_expired(&mut guard.queued, now);
@@ -818,26 +890,45 @@ async fn keeper_tick<T: QueueTransport>(
         }
         (expired, renew, emptied)
     };
-    for q in expired {
+    for (q, reason) in expired {
         warn!(
             "ci_node: releasing dispatch {} for {} after {:?} queued on this device \
-             (deadline {:?}) — reporting cancelled/{DEFERRED_PAST_LEASE_REASON} \
-             so coord can re-dispatch it",
+             ({:?} since coord last renewed it; deadline {:?}) — reporting \
+             cancelled/{reason} so coord can re-dispatch it",
             q.payload.dispatch_id,
             q.payload.repo,
-            now.saturating_duration_since(q.queued_since),
+            now.saturating_duration_since(q.stamp.queued_since),
+            now.saturating_duration_since(q.stamp.last_renewed),
             q.release_after
         );
-        transport.release(&q.payload, DEFERRED_PAST_LEASE_REASON);
+        transport.release(&q.payload, reason);
     }
-    for payload in renew {
-        let dispatch_id = payload.dispatch_id.as_str();
-        let Some(base) = report_base(&payload) else {
-            warn!("ci_node: no coord base to renew queued dispatch {dispatch_id}");
-            continue;
-        };
-        match transport.heartbeat(&base, dispatch_id).await {
+    let targets: Vec<(String, String)> = renew
+        .iter()
+        .filter_map(|payload| match report_base(payload) {
+            Some(base) => Some((payload.dispatch_id.clone(), base)),
+            None => {
+                warn!(
+                    "ci_node: no coord base to renew queued dispatch {}",
+                    payload.dispatch_id
+                );
+                None
+            }
+        })
+        .collect();
+    let replies: Vec<(String, reporting::QueueHeartbeat)> = futures::stream::iter(targets)
+        .map(|(dispatch_id, base)| async move {
+            let reply = transport.heartbeat(&base, &dispatch_id).await;
+            (dispatch_id, reply)
+        })
+        .buffer_unordered(QUEUE_HEARTBEAT_CONCURRENCY)
+        .collect()
+        .await;
+    for (dispatch_id, reply) in replies {
+        let dispatch_id = dispatch_id.as_str();
+        match reply {
             reporting::QueueHeartbeat::Renewed => {
+                mark_renewed(state, dispatch_id, now);
                 debug!("ci_node: renewed coord lease on queued dispatch {dispatch_id}");
             }
             reporting::QueueHeartbeat::Terminal(ledger_state) => {
@@ -879,6 +970,23 @@ fn spawn_queue_keeper() {
             }
         }
     });
+}
+
+/// Most queue renewals in flight at once (see [`keeper_tick`]).
+pub(crate) const QUEUE_HEARTBEAT_CONCURRENCY: usize = 8;
+
+/// Record a successful lease renewal at `at` on a dispatch that is still
+/// queued. One admitted (or dropped) while the POST was in flight is left
+/// alone — it is no longer the queue's.
+fn mark_renewed(state: &Mutex<CiState>, dispatch_id: &str, at: Instant) {
+    let mut guard = state.lock().unwrap();
+    if let Some(q) = guard
+        .queued
+        .iter_mut()
+        .find(|q| q.payload.dispatch_id == dispatch_id)
+    {
+        q.stamp.last_renewed = q.stamp.last_renewed.max(at);
+    }
 }
 
 /// Remove one dispatch from the queue, returning it if it was there.
@@ -924,9 +1032,9 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     admit(payload, None);
 }
 
-/// Admission proper. `queued_since` is `Some` when this is a RE-admission of a
+/// Admission proper. `stamp` is `Some` when this is a RE-admission of a
 /// dispatch popped off the queue, so a second deferral keeps its first stamp.
-fn admit(payload: CiDispatchPayload, queued_since: Option<Instant>) {
+fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
     // Identifier safety FIRST: an unsafe dispatch_id can't even be reported
     // (it rides the result URL path), so it is dropped with a log only.
     if !super::dispatch_id_is_safe(&payload.dispatch_id) {
@@ -983,7 +1091,7 @@ fn admit(payload: CiDispatchPayload, queued_since: Option<Instant>) {
             let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
             let (depth, needs_waker, needs_keeper) = {
                 let mut state = ci_state().lock().unwrap();
-                let (_, needs_keeper) = enqueue_locked(&mut state, payload, queued_since);
+                let (_, needs_keeper) = enqueue_locked(&mut state, payload, stamp);
                 // An at-cap defer is drained by `on_build_finished` — something
                 // is running, so something will finish. A HEADROOM defer has no
                 // such guarantee: with nothing running, nothing will ever
@@ -1007,7 +1115,7 @@ fn admit(payload: CiDispatchPayload, queued_since: Option<Instant>) {
                 spawn_queue_keeper();
             }
         }
-        Admission::Proceed => start_build(payload, settings, host, max_concurrent, queued_since),
+        Admission::Proceed => start_build(payload, settings, host, max_concurrent, stamp),
     }
 }
 
@@ -1027,25 +1135,48 @@ const HEADROOM_RETRY_SECS: u64 = 60;
 fn spawn_headroom_waker() {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(HEADROOM_RETRY_SECS)).await;
-        let next = {
-            let mut state = ci_state().lock().unwrap();
-            state.waker_armed = false;
-            // If a build started in the meantime, `on_build_finished` owns the
-            // drain again and this waker has nothing to do.
-            if state.running.is_empty() {
-                state.queued.pop_front()
-            } else {
-                None
-            }
-        };
-        if let Some(q) = next {
-            info!(
-                "ci_node: re-testing headroom for deferred dispatch {}",
-                q.payload.dispatch_id
-            );
-            admit(q.payload, Some(q.queued_since));
-        }
+        headroom_retry_in(ci_state(), &LiveReadmission);
     });
+}
+
+/// The headroom waker's body over injected state: disarm, then re-admit the
+/// head of the queue WITH its stamp if nothing is running.
+fn headroom_retry_in<R: Readmit>(state: &Mutex<CiState>, readmit: &R) {
+    let next = {
+        let mut state = state.lock().unwrap();
+        state.waker_armed = false;
+        // If a build started in the meantime, `on_build_finished` owns the
+        // drain again and this waker has nothing to do.
+        if state.running.is_empty() {
+            state.queued.pop_front()
+        } else {
+            None
+        }
+    };
+    if let Some(q) = next {
+        info!(
+            "ci_node: re-testing headroom for deferred dispatch {}",
+            q.payload.dispatch_id
+        );
+        readmit.readmit(q.payload, q.stamp);
+    }
+}
+
+/// Re-admission of a dispatch popped off the queue. It takes the stamp as a
+/// required argument so that no drain path can re-admit a queued dispatch as
+/// if it were fresh (which would reset both of its clocks); a trait so the
+/// drain paths are tested against a recorder instead of the live admission.
+trait Readmit {
+    fn readmit(&self, payload: CiDispatchPayload, stamp: QueueStamp);
+}
+
+/// The production re-admission: [`admit`] with the carried stamp.
+struct LiveReadmission;
+
+impl Readmit for LiveReadmission {
+    fn readmit(&self, payload: CiDispatchPayload, stamp: QueueStamp) {
+        admit(payload, Some(stamp));
+    }
 }
 
 /// Start one admitted build: disk floor gate, then spawn the executor task
@@ -1053,14 +1184,14 @@ fn spawn_headroom_waker() {
 ///
 /// `host` and `max_concurrent` are the probe and resolved capacity `submit`
 /// admitted against; they are threaded through so the re-check and the
-/// executor's per-dispatch host share use the same N. `queued_since` is carried
-/// for the slot-race re-defer below, so it keeps the dispatch's original stamp.
+/// executor's per-dispatch host share use the same N. `stamp` is carried for
+/// the slot-race re-defer below, so it keeps the dispatch's original stamp.
 fn start_build(
     payload: CiDispatchPayload,
     settings: CiNodeSettings,
     host: super::host_sizing::HostCapacity,
     max_concurrent: u32,
-    queued_since: Option<Instant>,
+    stamp: Option<QueueStamp>,
 ) {
     let Some(root) = crate::agent_runtime::qontinui_root_dir() else {
         reject(
@@ -1121,24 +1252,19 @@ fn start_build(
     }
 
     let token = CancellationToken::new();
-    {
-        let mut state = ci_state().lock().unwrap();
-        // Re-check the cap under the lock (submit's read was unlocked
-        // in-between for the disk probe).
-        if state.running.len() >= max_concurrent.max(1) as usize {
-            let dispatch_id = payload.dispatch_id.clone();
-            let (_, needs_keeper) = enqueue_locked(&mut state, payload, queued_since);
-            drop(state);
+    let payload = match claim_slot_or_requeue(ci_state(), payload, stamp, max_concurrent, &token) {
+        SlotClaim::Claimed(payload) => *payload,
+        SlotClaim::Requeued {
+            dispatch_id,
+            needs_keeper,
+        } => {
             info!("ci_node: slot taken while gating — deferring dispatch {dispatch_id}");
             if needs_keeper {
                 spawn_queue_keeper();
             }
             return;
         }
-        state
-            .running
-            .insert(payload.dispatch_id.clone(), token.clone());
-    }
+    };
 
     let dispatch_id = payload.dispatch_id.clone();
     info!(
@@ -1151,12 +1277,56 @@ fn start_build(
     });
 }
 
+/// What [`claim_slot_or_requeue`] did with a dispatch.
+enum SlotClaim {
+    /// A slot was free: the dispatch is now in `running` under the token.
+    /// Boxed: the payload dwarfs the other variant.
+    Claimed(Box<CiDispatchPayload>),
+    /// The cap filled while it was being gated: it is back in the queue, with
+    /// the stamp it came in with.
+    Requeued {
+        dispatch_id: String,
+        needs_keeper: bool,
+    },
+}
+
+/// Re-check the cap under the lock (admission's read was unlocked in-between
+/// for the disk probe) and either register the build or re-queue it. A
+/// re-queued dispatch keeps `stamp`, so the slot race cannot reset its clocks.
+fn claim_slot_or_requeue(
+    state: &Mutex<CiState>,
+    payload: CiDispatchPayload,
+    stamp: Option<QueueStamp>,
+    max_concurrent: u32,
+    token: &CancellationToken,
+) -> SlotClaim {
+    let mut state = state.lock().unwrap();
+    if state.running.len() >= max_concurrent.max(1) as usize {
+        let dispatch_id = payload.dispatch_id.clone();
+        let (_, needs_keeper) = enqueue_locked(&mut state, payload, stamp);
+        return SlotClaim::Requeued {
+            dispatch_id,
+            needs_keeper,
+        };
+    }
+    state
+        .running
+        .insert(payload.dispatch_id.clone(), token.clone());
+    SlotClaim::Claimed(Box::new(payload))
+}
+
 /// Build-finished hook: free the slot, then re-admit the oldest deferred
 /// dispatch (fresh settings + fresh headroom + disk gate — conditions may have
 /// changed while it waited).
 fn on_build_finished(dispatch_id: &str) {
+    on_build_finished_in(ci_state(), dispatch_id, &LiveReadmission);
+}
+
+/// [`on_build_finished`] over injected state: the popped dispatch is
+/// re-admitted WITH its stamp.
+fn on_build_finished_in<R: Readmit>(state: &Mutex<CiState>, dispatch_id: &str, readmit: &R) {
     let next = {
-        let mut state = ci_state().lock().unwrap();
+        let mut state = state.lock().unwrap();
         state.running.remove(dispatch_id);
         state.queued.pop_front()
     };
@@ -1165,7 +1335,7 @@ fn on_build_finished(dispatch_id: &str) {
             "ci_node: slot freed by {} — re-admitting deferred dispatch {}",
             dispatch_id, q.payload.dispatch_id
         );
-        admit(q.payload, Some(q.queued_since));
+        readmit.readmit(q.payload, q.stamp);
     }
 }
 
@@ -1273,7 +1443,7 @@ mod tests {
         QueuedDispatch {
             release_after: queue_release_after(&p),
             payload: p,
-            queued_since,
+            stamp: QueueStamp::fresh(queued_since),
         }
     }
 
@@ -1288,25 +1458,38 @@ mod tests {
         let now = Instant::now() + Duration::from_secs(60 * 60);
         let mut q: VecDeque<QueuedDispatch> = VecDeque::new();
         for (p, age_secs) in [
-            // Legacy coord: one-lease deadline (15 min).
-            (queued_payload("legacy-over"), 16 * 60),
-            (queued_payload("legacy-edge"), 15 * 60),
+            // Legacy coord: released inside its one lease, at 10 min.
+            (queued_payload("legacy-over"), 11 * 60),
+            (queued_payload("legacy-edge"), 10 * 60),
+            (queued_payload("legacy-kept"), 10 * 60 - 1),
             // Heartbeating coord, 30-min ceiling: 25-min deadline.
             (advertising(queued_payload("renewed-kept"), 1800), 20 * 60),
             (advertising(queued_payload("renewed-over"), 1800), 25 * 60),
             (queued_payload("young"), 0),
         ] {
-            q.push_back(queued_at(p, now - Duration::from_secs(age_secs)));
+            let mut entry = queued_at(p, now - Duration::from_secs(age_secs));
+            if entry.payload.coord_accepts_queue_heartbeat() {
+                // Renewed a minute ago, so only the queue deadline is in play.
+                entry.stamp.last_renewed = now - Duration::from_secs(60);
+            }
+            q.push_back(entry);
         }
-        let released: Vec<String> = take_expired(&mut q, now)
+        let released: Vec<(String, &str)> = take_expired(&mut q, now)
             .into_iter()
-            .map(|r| r.payload.dispatch_id)
+            .map(|(r, reason)| (r.payload.dispatch_id, reason))
             .collect();
-        assert_eq!(released, ["legacy-over", "legacy-edge", "renewed-over"]);
+        assert_eq!(
+            released,
+            [
+                ("legacy-over".to_string(), DEFERRED_PAST_LEASE_REASON),
+                ("legacy-edge".to_string(), DEFERRED_PAST_LEASE_REASON),
+                ("renewed-over".to_string(), DEFERRED_PAST_LEASE_REASON),
+            ]
+        );
         let kept: Vec<&str> = q.iter().map(|r| r.payload.dispatch_id.as_str()).collect();
         assert_eq!(
             kept,
-            ["renewed-kept", "young"],
+            ["legacy-kept", "renewed-kept", "young"],
             "FIFO order of the survivors is kept"
         );
     }
@@ -1332,16 +1515,35 @@ mod tests {
             queue_release_after(&advertising(queued_payload("x"), 1800)),
             Duration::from_secs(25 * 60)
         );
-        // No heartbeat → the lease lapses at one lease whatever we do.
-        assert_eq!(queue_release_after(&queued_payload("legacy")), COORD_LEASE);
-        // Phase advertised but no ceiling: the limit is unknown, stay at one lease.
+        // No heartbeat → the lease lapses at one lease whatever we do, so the
+        // release lands inside it, while the row is still live.
+        assert_eq!(
+            queue_release_after(&queued_payload("legacy")),
+            UNRENEWED_HOLD
+        );
+        // Phase advertised but no ceiling: the limit is unknown, same hold.
         let mut phase_only = queued_payload("phase-only");
         phase_only.progress_phases = vec!["queued".into()];
-        assert_eq!(queue_release_after(&phase_only), COORD_LEASE);
-        // A ceiling at or under one lease never shortens the wait below it.
+        assert_eq!(queue_release_after(&phase_only), UNRENEWED_HOLD);
+        // A ceiling under the hold never shortens the wait below it.
         assert_eq!(
             queue_release_after(&advertising(queued_payload("tiny"), 60)),
-            COORD_LEASE
+            UNRENEWED_HOLD
+        );
+    }
+
+    /// REGRESSION (review LOW 1): a legacy-coord dispatch used to be released
+    /// at the one-lease mark from the runner's own (later) clock, which is
+    /// always after coord's sweeper has marked the row `lost` — so the release
+    /// was answered `409 dispatch_terminal` and the reason never landed. The
+    /// hold from the last renewal must end before coord's lease does, with a
+    /// keeper tick and the delivery lag to spare.
+    #[test]
+    fn an_unrenewed_dispatch_is_released_while_coord_still_holds_its_lease() {
+        assert_eq!(UNRENEWED_HOLD, COORD_LEASE - QUEUE_RELEASE_MARGIN);
+        assert!(
+            UNRENEWED_HOLD + QUEUE_HEARTBEAT_INTERVAL < COORD_LEASE,
+            "the release must be sent before the lease expires, even a tick late"
         );
     }
 
@@ -1349,7 +1551,7 @@ mod tests {
     /// optional "admit this dispatch while the POST is in flight" hook, and a
     /// record of every heartbeat and release.
     struct FakeTransport {
-        reply: reporting::QueueHeartbeat,
+        reply: Mutex<reporting::QueueHeartbeat>,
         admit_during_heartbeat: Option<std::sync::Arc<Mutex<CiState>>>,
         heartbeats: Mutex<Vec<String>>,
         releases: Mutex<Vec<(String, String)>>,
@@ -1358,7 +1560,7 @@ mod tests {
     impl FakeTransport {
         fn new(reply: reporting::QueueHeartbeat) -> Self {
             Self {
-                reply,
+                reply: Mutex::new(reply),
                 admit_during_heartbeat: None,
                 heartbeats: Mutex::new(Vec::new()),
                 releases: Mutex::new(Vec::new()),
@@ -1375,7 +1577,7 @@ mod tests {
             if let Some(state) = &self.admit_during_heartbeat {
                 remove_queued(state, dispatch_id);
             }
-            self.reply.clone()
+            self.reply.lock().unwrap().clone()
         }
 
         fn release(&self, payload: &CiDispatchPayload, reason: &str) {
@@ -1485,6 +1687,219 @@ mod tests {
         );
     }
 
+    /// Drive the keeper once a minute (a paused clock: `now` is injected) for
+    /// `minutes` ticks after `start`, with coord answering `reply_at(minute)`.
+    /// Returns the minute of the first release and its reason.
+    async fn run_keeper_minutes(
+        state: &Mutex<CiState>,
+        fake: &FakeTransport,
+        start: Instant,
+        minutes: u64,
+        reply_at: impl Fn(u64) -> reporting::QueueHeartbeat,
+    ) -> Option<(u64, String)> {
+        for minute in 1..=minutes {
+            *fake.reply.lock().unwrap() = reply_at(minute);
+            keeper_tick(state, fake, start + Duration::from_secs(minute * 60)).await;
+            if let Some((_, reason)) = fake.releases.lock().unwrap().first() {
+                return Some((minute, reason.clone()));
+            }
+        }
+        None
+    }
+
+    /// REGRESSION (review LOW 2): the queue deadline ignored whether renewals
+    /// were LANDING. With every heartbeat failing (coord unreachable, no device
+    /// JWT), coord sweeps the row one lease after its last renewal, yet the
+    /// runner held it to the 25-minute deadline and could admit and check out a
+    /// build coord had already abandoned. It is now released UNRENEWED_HOLD
+    /// after the last successful renewal.
+    #[tokio::test]
+    async fn a_dispatch_whose_renewals_keep_failing_is_released_before_coord_sweeps_it() {
+        let start = Instant::now();
+        let failed = || reporting::QueueHeartbeat::Failed("transport: unreachable".into());
+
+        // Never renewed: released at the hold, not at the 25-minute deadline.
+        let state = state_with(vec![queued_at(
+            advertising(queued_payload("dark"), 1800),
+            start,
+        )]);
+        let fake = FakeTransport::new(failed());
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, start, 30, |_| failed()).await,
+            Some((10, QUEUED_RENEWAL_LAPSED_REASON.to_string()))
+        );
+
+        // Renewed through minute 5, dark after: the hold runs from minute 5.
+        let state = state_with(vec![queued_at(
+            advertising(queued_payload("flaky"), 1800),
+            start,
+        )]);
+        let fake = FakeTransport::new(failed());
+        let renewed_until_5 = |m: u64| {
+            if m <= 5 {
+                reporting::QueueHeartbeat::Renewed
+            } else {
+                failed()
+            }
+        };
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, start, 30, renewed_until_5).await,
+            Some((15, QUEUED_RENEWAL_LAPSED_REASON.to_string()))
+        );
+
+        // Every renewal lands: held to the advertised deadline, past one lease.
+        let state = state_with(vec![queued_at(
+            advertising(queued_payload("live"), 1800),
+            start,
+        )]);
+        let fake = FakeTransport::new(reporting::QueueHeartbeat::Renewed);
+        assert_eq!(
+            run_keeper_minutes(&state, &fake, start, 30, |_| {
+                reporting::QueueHeartbeat::Renewed
+            })
+            .await,
+            Some((25, DEFERRED_PAST_LEASE_REASON.to_string()))
+        );
+    }
+
+    /// Renewals are sent concurrently: with three queued dispatches whose fake
+    /// heartbeats each wait for the other two, a sequential keeper never
+    /// finishes the tick.
+    #[tokio::test]
+    async fn queue_renewals_are_sent_concurrently() {
+        struct Rendezvous(tokio::sync::Barrier);
+        impl QueueTransport for Rendezvous {
+            async fn heartbeat(&self, _base: &str, _id: &str) -> reporting::QueueHeartbeat {
+                self.0.wait().await;
+                reporting::QueueHeartbeat::Renewed
+            }
+            fn release(&self, _payload: &CiDispatchPayload, _reason: &str) {}
+        }
+        let now = Instant::now();
+        let state = state_with(
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|id| queued_at(advertising(queued_payload(id), 1800), now))
+                .collect(),
+        );
+        let transport = Rendezvous(tokio::sync::Barrier::new(3));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            keeper_tick(&state, &transport, now),
+        )
+        .await
+        .expect("all three heartbeats in flight at once");
+    }
+
+    /// Records every re-admission instead of admitting.
+    #[derive(Default)]
+    struct RecordingReadmit(Mutex<Vec<(String, QueueStamp)>>);
+
+    impl Readmit for RecordingReadmit {
+        fn readmit(&self, payload: CiDispatchPayload, stamp: QueueStamp) {
+            self.0.lock().unwrap().push((payload.dispatch_id, stamp));
+        }
+    }
+
+    /// An old stamp with a distinct renewal time, so a reset of EITHER clock
+    /// is visible.
+    fn old_stamp() -> QueueStamp {
+        let queued_since = Instant::now();
+        QueueStamp {
+            queued_since,
+            last_renewed: queued_since + Duration::from_secs(120),
+        }
+    }
+
+    fn queued_with(id: &str, stamp: QueueStamp) -> QueuedDispatch {
+        let mut q = queued_at(advertising(queued_payload(id), 1800), stamp.queued_since);
+        q.stamp = stamp;
+        q
+    }
+
+    /// REGRESSION (review LOW 3): a finished build re-admits the queue head
+    /// with the stamp it was queued under, not as a fresh submission.
+    #[test]
+    fn a_finished_build_readmits_the_queue_head_with_its_stamp() {
+        let stamp = old_stamp();
+        let state = state_with(vec![queued_with("next", stamp)]);
+        state
+            .lock()
+            .unwrap()
+            .running
+            .insert("done".into(), CancellationToken::new());
+        let rec = RecordingReadmit::default();
+        on_build_finished_in(&state, "done", &rec);
+        assert_eq!(*rec.0.lock().unwrap(), [("next".to_string(), stamp)]);
+        let s = state.lock().unwrap();
+        assert!(s.running.is_empty() && s.queued.is_empty());
+    }
+
+    /// REGRESSION (review LOW 3): the headroom waker re-admits with the stamp,
+    /// and leaves the queue to `on_build_finished` while something runs.
+    #[test]
+    fn the_headroom_waker_readmits_with_the_stamp_only_when_idle() {
+        let stamp = old_stamp();
+        let state = state_with(vec![queued_with("waiting", stamp)]);
+        state.lock().unwrap().waker_armed = true;
+        let rec = RecordingReadmit::default();
+        headroom_retry_in(&state, &rec);
+        assert_eq!(*rec.0.lock().unwrap(), [("waiting".to_string(), stamp)]);
+        assert!(!state.lock().unwrap().waker_armed, "the waker disarms");
+
+        let busy = state_with(vec![queued_with("waiting", stamp)]);
+        busy.lock()
+            .unwrap()
+            .running
+            .insert("r".into(), CancellationToken::new());
+        let rec = RecordingReadmit::default();
+        headroom_retry_in(&busy, &rec);
+        assert!(rec.0.lock().unwrap().is_empty());
+        assert_eq!(busy.lock().unwrap().queued.len(), 1);
+    }
+
+    /// REGRESSION (review LOW 3): losing the slot race re-queues the dispatch
+    /// with the stamp it was admitted under, and arms the keeper; winning it
+    /// registers the build.
+    #[test]
+    fn the_slot_race_requeues_with_the_original_stamp_and_arms_the_keeper() {
+        let stamp = old_stamp();
+        let full = std::sync::Arc::new(Mutex::new(CiState::new()));
+        full.lock()
+            .unwrap()
+            .running
+            .insert("r".into(), CancellationToken::new());
+        let claim = claim_slot_or_requeue(
+            &full,
+            advertising(queued_payload("late"), 1800),
+            Some(stamp),
+            1,
+            &CancellationToken::new(),
+        );
+        assert!(matches!(
+            claim,
+            SlotClaim::Requeued {
+                ref dispatch_id,
+                needs_keeper: true
+            } if dispatch_id == "late"
+        ));
+        let s = full.lock().unwrap();
+        assert_eq!(s.queued[0].stamp, stamp);
+        assert!(s.keeper_armed);
+        drop(s);
+
+        let free = std::sync::Arc::new(Mutex::new(CiState::new()));
+        let claim = claim_slot_or_requeue(
+            &free,
+            queued_payload("go"),
+            Some(stamp),
+            1,
+            &CancellationToken::new(),
+        );
+        assert!(matches!(claim, SlotClaim::Claimed(ref p) if p.dispatch_id == "go"));
+        assert!(free.lock().unwrap().running.contains_key("go"));
+    }
+
     /// Rollout safety: an older coord reads `phase: "queued"` as a build
     /// heartbeat and stamps `started_at`, so the runner may queue-heartbeat only
     /// a dispatch whose coord advertised the phase.
@@ -1510,15 +1925,19 @@ mod tests {
         let mut state = CiState::new();
         // A stamp from the "future" proves the carried value is used verbatim
         // rather than replaced by `now()`.
-        let first = Instant::now() + Duration::from_secs(600);
+        let first = QueueStamp {
+            queued_since: Instant::now() + Duration::from_secs(600),
+            last_renewed: Instant::now() + Duration::from_secs(700),
+        };
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("a"), Some(first));
         assert_eq!((depth, armed), (1, true));
-        assert_eq!(state.queued[0].queued_since, first);
+        assert_eq!(state.queued[0].stamp, first);
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("b"), None);
         assert_eq!((depth, armed), (2, false), "one keeper, ever");
+        let fresh = state.queued[1].stamp;
         assert!(
-            state.queued[1].queued_since < first,
-            "a fresh defer is stamped now"
+            fresh.queued_since < first.queued_since && fresh.last_renewed == fresh.queued_since,
+            "a fresh defer is stamped now on both clocks"
         );
     }
 
