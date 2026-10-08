@@ -1777,3 +1777,69 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
         StatusCode::OK
     );
 }
+
+/// The build-admission broker's writes and its per-ticket poll refuse every
+/// browser origin under the default policy, while the cargo wrappers (no
+/// Origin) reach them; the read-only state is not a door. Plan
+/// 2026-10-06-builds-are-admitted-per-invocation-against-measured-host-memory,
+/// Phase 2 gate.
+#[tokio::test]
+async fn build_admission_doors_refuse_browser_origins_and_admit_the_wrappers() {
+    async fn ok() -> StatusCode {
+        StatusCode::OK
+    }
+    let h = harness("enforce-doors");
+    let router = apply(
+        Router::new()
+            .route("/build-admission/tickets", post(ok))
+            .route("/build-admission/tickets/{id}", get(ok))
+            .route("/build-admission/leases/{id}/release", post(ok))
+            .route("/build-admission/state", get(ok)),
+        h.guard.clone(),
+    );
+    let host = host(&h);
+    let status = |method: &'static str, uri: &'static str, origin: Option<&'static str>| {
+        let router = router.clone();
+        let host = host.clone();
+        async move {
+            let mut headers = vec![
+                ("host", host.as_str()),
+                ("content-type", "application/json"),
+            ];
+            if let Some(o) = origin {
+                headers.push(("origin", o));
+            }
+            router
+                .oneshot(req(method, uri, &headers, "{}"))
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    for (m, uri) in [
+        ("POST", "/build-admission/tickets"),
+        ("GET", "/build-admission/tickets/t1"),
+        ("POST", "/build-admission/leases/t1/release"),
+    ] {
+        assert_eq!(
+            status(m, uri, Some(EVIL)).await,
+            StatusCode::FORBIDDEN,
+            "{m} {uri}"
+        );
+        // The trusted web dev frontend is a browser origin too.
+        assert_eq!(
+            status(m, uri, Some(WEB)).await,
+            StatusCode::FORBIDDEN,
+            "{m} {uri} from {WEB}"
+        );
+        assert_eq!(
+            status(m, uri, None).await,
+            StatusCode::OK,
+            "{m} {uri} from a wrapper"
+        );
+    }
+    assert_eq!(
+        status("GET", "/build-admission/state", None).await,
+        StatusCode::OK
+    );
+}

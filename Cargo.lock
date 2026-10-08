@@ -6888,8 +6888,9 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "4.1.0"
+version = "4.3.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "hex",
  "html-escape",
