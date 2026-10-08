@@ -16575,7 +16575,7 @@ fn not_a_static() {}
             ),
             (
                 "fn hand_off_transport_rung(\n    emitter:",
-                "hand_off_transport_rung_in(&TRANSPORT_RUNG,emitter,lane,headers,body,door,caller_session_id,)",
+                "hand_off_transport_rung_in(&TRANSPORT_RUNG,emitter,lane,headers,operation,door,caller_session_id,)",
             ),
         ] {
             let (raw, body) = wrapper_body(prod, signature);

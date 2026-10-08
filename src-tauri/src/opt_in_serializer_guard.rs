@@ -175,75 +175,6 @@ struct AllowlistEntry {
 /// reword the entry.
 const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
-        file: "mcp/device_jwt_refresher.rs",
-        module: "tenant_slot_refresh_tests",
-        serializer: "health_lock",
-        outside_the_lock: &[
-            "a_bound_tenant_with_no_slot_is_a_gap",
-            "an_absent_sidecar_reports_unknown_never_no_gaps",
-            "a_stale_sidecar_reports_unknown_never_no_gaps",
-            "an_unreadable_covered_side_is_unknown_not_a_gap",
-            "the_sweep_hop_composes_the_gap_report",
-            "no_headless_pair_cli_seeds_a_bound_tenants_slot",
-            "a_sidecar_too_stale_to_act_on_reports_the_gap_but_asks_nobody",
-            "an_ask_made_with_no_listener_is_readable_by_pull_until_its_lapse_closes",
-            "an_open_ask_is_withdrawn_once_its_evidence_is_stale_or_contradicted",
-            "sign_out_forgets_the_asks_and_the_bound_set_they_came_from",
-            "asks_never_cross_an_account_switch",
-            "exactly_one_ask_per_tenant_per_lapse_across_passes_and_restarts",
-            "an_unknown_binding_gap_reading_asks_nobody_and_closes_nothing",
-            "a_corrupt_or_legacy_lapse_record_fails_soft",
-            "measured_gaps_is_the_one_gate_on_unknown",
-        ],
-        reason: "the lock serialises refresh_tenant_slots passes over the process-global posture cell, \
-         tenant_slot_health and the CLEARED_* counters; the 15 tests outside it are pure over \
-         explicit inputs, or file-backed state addressed by an explicit path, and never call \
-         refresh_tenant_slots or read the snapshot. The first five \
-         (a_bound_tenant_with_no_slot_is_a_gap, an_absent_sidecar_reports_unknown_never_no_gaps, \
-         a_stale_sidecar_reports_unknown_never_no_gaps, an_unreadable_covered_side_is_unknown_not_a_gap, \
-         the_sweep_hop_composes_the_gap_report) run resolve_binding_gaps / binding_gaps_from on \
-         literal reads and coord_bound_tenants_at on a uniquely named temp dir; enumerated after \
-         the 2026-09-21 rebase onto main, which added them. The ten binding-gap-ask tests added \
-         2026-10-02 are main's, and they are already in the shape this plan prescribes rather \
-         than in need of a lock: every state-touching call takes its path explicitly \
-         (ask_bound_tenant_gaps_at, forget_binding_gap_evidence_at, open_binding_gap_asks, \
-         load_gap_ask_state, save_gap_ask_state, coord_bound_tenants_at[_within]) and that path \
-         comes from the module's gap_state_path(), which keys every call on a fresh \
-         Uuid::now_v7() — so no two of them can meet. Of the remaining helpers \
-         resolve_binding_gaps, measured_gaps, binding_gap_ask_account and \
-         binding_gap_asks_permitted are pure, and \
-         no_headless_pair_cli_seeds_a_bound_tenants_slot reads this file's own source with \
-         include_str!. settle_binding_gap_actions is NOT pure, and this entry does not rest on \
-         pretending otherwise: on a GapAction::LapseClosed{slot_now_held:true} arm it calls \
-         reset_upstream_rejections_for, which mutates the process-global UPSTREAM_SIGNALS and, \
-         via clear_orphan_warning, ORPHAN_WARNED_KEYS — which is precisely why the sibling \
-         a_lapse_healed_by_a_new_slot_resets_that_tenants_rejection_streak takes this lock on \
-         its first line. The one allowlisted test that calls it, \
-         an_ask_made_with_no_listener_is_readable_by_pull_until_its_lapse_closes, is safe by its \
-         ARGUMENT DATA, and its own assertion is what pins that: it passes the opening pass's \
-         Notified actions and asserts the settle returns an EMPTY reset list, while \
-         reset.push(tenant) sits in the same `if let` body as the mutation — so an empty return \
-         is proof no mutation ran. Give that test a LapseClosed{slot_now_held:true} arm and this \
-         entry becomes wrong: take the lock there rather than reword this. Note too that \
-         health_lock() delegates to super::posture_test_lock(), THE crate-wide lock, so its \
-         blast radius is wider than the three cells named at the top of this reason. Verified \
-         2026-10-02 by enumerating every call in all ten bodies and in the five helpers they \
-         call; an independent review the same day caught the purity claim, because the author's \
-         grep set (refresh_tenant_slots / tenant_slot_health / CLEARED_* / the snapshot reader) \
-         covered only the cells named at the top of this reason. That file holds TWELVE statics: \
-         LOCK is the serialiser itself; COORD_CREDENTIAL_POSTURE, TENANT_SLOT_HEALTH, \
-         CLEARED_ON_EXPIRY_TOTAL and CLEARED_ON_REJECTION_TOTAL are the four this reason's \
-         opening sentence names; and SEVEN sit outside that scope entirely — \
-         DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL, WARNED_TENANT_MISMATCHES, UPSTREAM_SIGNALS, \
-         ORPHAN_WARNED_KEYS, BINDING_GAPS, POSTURE_TRANSITIONS and REFRESHER_STATE. The closure \
-         was re-run over all twelve and settle_binding_gap_actions is the only hit. Enumerate \
-         them rather than trusting this list: an incomplete set is how the first audit went \
-         wrong, and a correction that ships its own incomplete set repeats it (the independent \
-         review named eleven, omitting only the serialiser itself, and this sentence \
-         previously named five). Taking the lock in them is the trivial \
-         alternative and lives in that file, not this one",
-    },
-    AllowlistEntry {
         file: "mcp/session_message_poller.rs",
         module: "tests",
         serializer: "COUNTER_TEST_LOCK",
@@ -469,15 +400,34 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "credential_door_typed_404_in_code_field_never_falls_back",
             "decide_spawn_on_409_rerouted_skips_with_target",
             "decide_spawn_on_409_rerouted_without_target_still_skips",
+            "continuation_command_name_precedes_terminator_and_is_one_token",
+            "resolve_claude_bin_finds_the_binary_on_path",
+            "launchable_or_bare_falls_back_for_a_non_executable_file",
+            "a_later_redelivery_attempt_claims_afresh_and_is_monotone",
+            "retry_annotation_parses_leniently",
+            "a_redelivery_gets_its_own_claim_discriminator",
+            "session_lifetime_stops_at_the_recorded_exit",
+            "work_unreported_detail_classifies_how_the_session_ended",
+            "continuation_start_verdict_separates_never_started_from_started",
+            "continuation_start_bounds_are_coherent_with_the_shim_wait",
+            "never_started_detail_is_one_line_and_keeps_the_cause_under_coords_cut",
+            "condition_check_never_started_reason_reports_every_non_start",
         ],
         reason: "guards the continuation registry + admitted-launch cap (clear_continuation_registry); \
-         the 166 tests outside it never call evaluate_continuation_guard* or the registry \
-         accessors (grep-verified 2026-09-21, re-derived 2026-09-26 and 2026-10-02) — command \
-         builders, payload shapes, env scrubs. The two added 2026-10-02 are main's new rerouted \
-         arms (33844e8fb's sibling, plan 2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs \
+         the 178 tests outside it never call evaluate_continuation_guard* or the registry \
+         accessors (grep-verified 2026-09-21, re-derived 2026-09-26, 2026-10-02 and 2026-10-07) — \
+         command builders, payload shapes, env scrubs. The two added 2026-10-02 are main's new \
+         rerouted arms (33844e8fb's sibling, plan 2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs \
          Phase 3); like the six decide_spawn_on_409_* members already here (eight with these two) they call only \
          decide_spawn(status, body), a pure (u16, &str) -> SpawnDecision parse that reaches no \
-         global at all",
+         global at all. The twelve added 2026-10-07 are main's redelivery-claim and \
+         continuation-start-verdict additions: each was read line-by-line (not inferred from its \
+         name, which for four of them reads close enough to the registry to warrant it) and \
+         confirmed to call only pure parsers/classifiers over local arguments \
+         (continuation_command_name/ClaimDiscriminator construction, resolve_claude_bin, \
+         launchable_or_bare, retry annotation parsing, condition_check_never_started_reason, \
+         never_started_detail) — none reaches evaluate_continuation_guard*, \
+         clear_continuation_registry, or any other CONT_GUARD_LOCK-guarded accessor",
     },
     AllowlistEntry {
         file: "ai_provider/oauth_refresh.rs",
@@ -547,9 +497,18 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "expired_entry_is_not_servable",
             "differing_inputs_are_not_servable",
             "the_scan_path_uses_no_tokio_timer",
+            "external_processes_at_skip_return_the_cached_result_marked_stale",
+            "external_processes_shed_with_no_cache_is_unknown_not_empty",
+            "a_cached_answer_older_than_ten_minutes_is_unknown",
+            "a_degraded_scan_does_not_clobber_the_cache",
         ],
-        reason: "guards the scan cache, its counters and the process-wide scan dispatcher; the 4 tests \
-         outside it are pure (entry_is_servable over arguments) or read this file's source",
+        reason: "guards the scan cache, its counters and the process-wide scan dispatcher; the first 4 \
+         tests outside it are pure (entry_is_servable over arguments) or read this file's source. \
+         The 4 added 2026-10-07 read like cache tests by name but each constructs its OWN local \
+         `StdMutex::new(None)` cache and `ShedLog` and passes them explicitly into \
+         external_processes_response — never the module's process-wide cache/dispatcher — so two \
+         of them running in parallel cannot corrupt each other, exactly the per-test-handle shape \
+         this plan generalises",
     },
     AllowlistEntry {
         file: "embedded_pg.rs",
@@ -672,10 +631,13 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "an_interrupted_wait_reports_timed_out_instead_of_ready",
             "a_fast_child_completes_normally_with_its_stdout",
             "a_chatty_child_has_all_of_its_output_captured",
+            "a_failing_child_reporting_commit_exhaustion_is_suspected_not_status",
         ],
         reason: "guards assertions on the live_pipe_readers() gauge (two tests, one of which leaves \
          readers alive on purpose); the 12 tests outside it spawn children that bump the \
-         gauge but assert nothing about it, as the static's own doc says",
+         gauge but assert nothing about it, as the static's own doc says. The 13th, added \
+         2026-10-07, spawns a failing child and asserts only on the ProbeOutcome::Degraded \
+         classification it returns — never on live_pipe_readers()",
     },
     AllowlistEntry {
         file: "terminal/auto_response.rs",
@@ -703,44 +665,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         ],
         reason: "guards COMPILED_RULES (reload_rules / rules_active / process); the 18 tests outside \
          it score prompts, parse JSON and compute delays over their own values",
-    },
-    AllowlistEntry {
-        file: "terminal/mod.rs",
-        module: "tests",
-        serializer: "quiet_credential_posture",
-        outside_the_lock: &[
-            "credential_env_list_covers_the_three_known_plaintext_passwords",
-            "credential_env_list_excludes_identifier_variables",
-            "credential_env_list_entries_are_credential_values",
-            "scrub_removes_inherited_values_from_a_pty_command",
-            "scrub_records_removals_on_a_tokio_command",
-            "scrub_records_removals_on_a_std_command",
-            "source_marker_carries_build_identity",
-            "plan_capture_fallback_clause_names_both_doors_and_the_playbook",
-            "memory_clause_starts_with_a_blank_line_so_it_never_touches_line_one",
-            "memory_clause_names_both_tools_and_the_search_argument",
-            "memory_clause_has_no_collapsed_whitespace_runs",
-            "memory_clause_carries_no_tenant_identity",
-            "memory_clause_conditional_carries_no_tenant_identity",
-            "memory_clause_conditional_starts_with_a_blank_line_so_it_never_touches_line_one",
-            "memory_clause_conditional_names_both_tools_and_the_search_argument",
-            "memory_clause_conditional_has_no_collapsed_whitespace_runs",
-            "the_api_port_reaches_the_rendered_briefing",
-            "spawn_seam_api_port_prefers_the_bound_port_over_the_configured_one",
-            "spawn_seam_api_port_falls_back_when_no_bind_has_been_recorded",
-            "strip_ansi_removes_bracketed_paste_markers_and_keeps_the_body",
-            "strip_ansi_keeps_text_around_a_bracketed_paste_block",
-            "strip_ansi_removes_an_st_terminated_osc_and_keeps_the_rest",
-            "strip_ansi_removes_an_st_terminated_osc_52",
-            "strip_ansi_consumes_dcs_sos_pm_and_apc_payloads",
-            "strip_ansi_unterminated_csi_keeps_the_remainder",
-            "strip_ansi_unterminated_osc_keeps_the_remainder",
-            "strip_ansi_round_trips_unicode_outside_sequences",
-            "strip_ansi_removes_a_sequence_with_a_non_ascii_payload",
-        ],
-        reason: "delegates to the crate-wide posture_test_lock(); the tests outside it that render \
-         runner_context() assert on lines the posture does not write (source marker, api \
-         port, memory clause) or take posture_test_lock() directly and are credited",
     },
     AllowlistEntry {
         file: "health_monitor.rs",
@@ -923,6 +847,8 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "collapse_id_rule_edges",
             "an_empty_walk_is_not_a_census",
             "the_thread_name_census_sees_a_named_thread_of_this_process",
+            "collapse_folds_a_trailing_uuid",
+            "the_session_tally_is_uncapped_and_platform_independent",
         ],
         reason: "guards the process-global LANES slot counts; 31 of the 32 tests outside it drive a \
          private LaneTable (fresh_lane_table / spawn_blocking_tracked_in), scan this file's \
@@ -939,7 +865,11 @@ const ALLOWLIST: &[AllowlistEntry] = &[
          over literal name lists, and one live capture_thread_name_census over six threads it \
          names itself. LANES is reachable only through current_thread_lane \
          (BlockingSlot::enter), tracked_blocking_in_flight and tracked_blocking_by_thread; none \
-         of the seven calls any of them",
+         of the seven calls any of them. Two more thread-name-census tests arrived 2026-10-07 \
+         (collapse_folds_a_trailing_uuid, the_session_tally_is_uncapped_and_platform_independent): \
+         both drive collapse_thread_name / strip_uuid_suffix / finish_thread_name_census over \
+         literal name lists, same as the seven above, and neither calls current_thread_lane, \
+         tracked_blocking_in_flight or tracked_blocking_by_thread",
     },
     AllowlistEntry {
         file: "session/spawn_prompt.rs",
@@ -960,6 +890,135 @@ const ALLOWLIST: &[AllowlistEntry] = &[
          rebase onto main, which added it; taking the lock in it is the trivial alternative and \
          lives in that file, not this one",
     },
+    AllowlistEntry {
+        file: "coord_mcp.rs",
+        module: "tests",
+        serializer: "RESTORE_FORENSICS_LOCK",
+        outside_the_lock: &[
+            "workdir_declares_coord_mcp_detects_any_coord_entry",
+            "session_identity_gate_requires_handshake_and_marker_and_defaults_denied",
+            "the_master_env_flag_arm_is_deleted_not_deprecated",
+            "secret_eq_matches_only_the_whole_value",
+            "ephemeral_nonce_is_revoked_by_the_gate_while_persistent_is_untouched",
+            "expired_ephemeral_nonces_are_swept_on_mint",
+            "ephemeral_nonce_expires_and_evicts_while_persistent_never_expires",
+            "terminal_id_for_nonce_returns_the_minted_terminal",
+            "two_terminals_in_one_workdir_get_two_nonces_each_naming_its_own_terminal",
+            "terminalless_mint_has_no_terminal_and_still_evicts_its_own_class",
+            "ephemeral_nonces_are_never_persisted",
+            "proxy_config_json_is_one_shape_for_both_mint_paths",
+            "agent_marked_http_document_also_declares_the_native_rung",
+            "provision_session_proxy_config_fail_closed_without_bound_port",
+            "provision_coord_mcp_config_file_fail_closed_without_bound_port",
+            "mcp_config_file_name_is_stable_and_workdir_distinct",
+            "write_coord_mcp_proxy_config_emits_loopback_nonce_shape",
+            "proxy_request_gate_forwards_only_nonce_plus_device_bearer",
+            "proxy_request_gate_binds_agent_nonce_to_agent_bearer",
+            "missing_device_jwt_degrades_proxy_only_not_local_work",
+            "await_remint_is_bounded_when_no_jwt_appears",
+            "await_remint_returns_jwt_once_it_appears",
+            "agent_token_registry_round_trip",
+            "write_coord_mcp_agent_proxy_config_emits_agent_bound_loopback_shape",
+            "provision_session_route_stays_http_under_an_open_stdio_gate",
+            "credential_file_name_is_spelling_insensitive_for_one_directory",
+            "stdio_shim_gate_defaults_to_http_inside_cfg_test",
+            "write_coord_mcp_proxy_config_emits_the_stdio_shim_shape_when_the_gate_is_open",
+            "write_coord_mcp_agent_proxy_config_puts_the_marker_in_the_credential_file",
+            "stdio_shim_kill_switch_forces_the_http_arm",
+            "a_refused_selftest_falls_open_to_the_http_arm",
+            "an_unwritable_credential_file_falls_open_to_the_http_arm",
+            "rewrite_config_preserving_nonce_rewrites_the_stdio_credential_file",
+            "stdio_credential_file_name_is_stable_and_identity_distinct",
+            "stdio_config_readers_resolve_only_the_fleet_shim_shape",
+            "classify_mcp_json_doc_separates_ours_foreign_and_unparseable",
+            "mcp_json_read_error_is_unparseable_not_absent_unless_it_is_notfound",
+            "mcp_json_shape_for_a_directory_at_the_path_agrees_with_exists",
+            "mcp_json_report_shape_cannot_carry_the_bearer_or_the_nonce",
+            "the_report_verdict_core_agrees_with_the_warning_wrapper",
+            "coord_mcp_safe_to_write_guards_user_config",
+            "device_writes_are_refused_over_an_agent_marked_proxy_config",
+            "provision_with_jwt_orchestration",
+            "device_path_with_no_bound_port_writes_no_proxy_config",
+            "device_path_with_bound_port_writes_proxy_and_no_synchronous_breadcrumb",
+            "non_device_agent_bearer_writes_a_degraded_breadcrumb_naming_the_sub_type",
+            "foreign_mcp_json_workdir_writes_a_degraded_breadcrumb",
+            "existing_agent_coord_mcp_config_gets_no_false_degraded_breadcrumb",
+            "in_cwd_reprovision_reuses_the_live_nonce_and_evicts_no_sibling",
+            "probe_verdict_maps_every_transport_kind_and_status_distinctly",
+            "the_probe_failure_disjunction_is_unreconstructible_in_the_crate",
+            "breadcrumb_line_one_shape_is_pinned",
+            "breadcrumb_line_two_carries_all_six_keys_at_schema_one",
+            "refresh_only_never_creates_a_breadcrumb_where_none_exists",
+            "in_cwd_reprovision_mints_when_the_on_disk_nonce_is_not_reusable",
+            "in_cwd_reuse_upgrades_a_legacy_header_shape_without_rotating",
+            "live_clears_the_breadcrumb_and_a_repeat_failure_re_dates_it",
+            "rotation_mint_and_evict_lines_carry_the_slot_terminal",
+            "probe_timeout_budget_is_pinned_to_the_reason_string",
+            "nonce_store_load_is_typed_not_collapsed_into_an_empty_map",
+            "pre_restore_persist_merges_the_on_disk_set_under_the_live_snapshot",
+            "pre_restore_merge_is_bounded_by_the_persisted_cap_oldest_first",
+            "a_minted_binding_carries_a_caller_named_expectation_and_persists_it",
+            "agent_nonce_is_not_persisted_device_nonce_is",
+            "device_nonce_snapshot_drops_agent_and_ephemeral_nonces",
+            "device_nonce_snapshot_is_bounded_and_drops_the_oldest_first",
+            "unknown_age_bindings_are_cut_before_dated_ones",
+            "persistence_disabled_skips_default_store_write",
+            "reconcile_action_rewrites_only_on_port_mismatch",
+            "reconcile_action_adopts_an_unregistered_nonce_ahead_of_the_header_upgrade",
+            "reconcile_action_upgrades_a_legacy_only_config_on_the_bound_port",
+            "reconcile_session_configs_rewrites_stale_leaves_agent",
+            "an_agent_marked_config_is_never_adopted",
+            "session_configs_are_adopted_unrewritten_and_age_ordered_at_fleet_scale",
+            "on_disk_config_census_classifies_open_dead_and_orphaned",
+            "reconcile_root_config_self_heals_stale_root_mcp_json",
+            "secondary_instance_never_self_heals_the_shared_root_config",
+            "shared_root_write_guard_refuses_only_the_root_dir_and_only_for_secondaries",
+            "secondary_is_refused_a_canonical_repo_checkout_but_keeps_its_worktrees",
+            "safe_to_write_still_permits_an_ordinary_workdir",
+            "root_reconcile_action_resolves_adopt_vs_rewrite_vs_leave",
+            "a_healthy_but_legacy_only_config_is_upgraded_not_left",
+            "upgrade_in_place_adds_authorization_without_rotating_the_nonce",
+            "adopt_on_disk_nonce_reregisters_exact_string_as_device",
+            "remint_graces_evicted_device_nonce_but_never_agent",
+            "graced_nonce_expires_and_is_lazily_evicted",
+            "rotation_forensics_one_line_per_event_and_prefix_only",
+            "rotation_forensics_reject_line_joins_to_the_evicting_workdir",
+            "rotation_reject_line_carries_workdir_principal_and_terminal",
+            "rotation_revoke_line_is_emitted_for_device_and_agent",
+            "rotation_revoke_line_is_emitted_on_session_close",
+            "rotation_log_path_is_surfaced_for_health",
+            "reject_throttle_admits_once_per_window_and_counts_suppressed",
+            "revoked_nonce_no_longer_validates_including_grace",
+            "release_workdir_on_session_close_revokes_and_reaps",
+            "reaper_drops_dead_port_and_unregistered_nonce_configs",
+            "revoked_nonce_reap_matches_terminal_keyed_configs_not_just_the_workdir_name",
+        ],
+        reason: "restore_forensics_lock()'s own doc says it serialises every test that calls \
+         restore_proxy_nonces_from, because the aggregate restore forensics line has no \
+         workdir or key prefix to filter by and all tests share one log \
+         (rotation_log_test_dir). The ten tests that take it all call \
+         restore_proxy_nonces_from or restore_proxy_nonces_from_store directly and have \
+         restore in their names (restore_names_a_missing_store_and_an_unreadable_store_differently, \
+         persisted_nonce_survives_restore_round_trip, \
+         a_persisted_expectation_restores_and_an_old_record_reads_unknown, \
+         restored_nonces_keep_their_terminal_so_a_remint_evicts_only_one_slot, \
+         legacy_bare_string_nonce_store_restores_without_migration, \
+         restored_bindings_carry_their_persisted_age_not_the_restore_instant, \
+         disabled_restore_returns_zero_every_time_and_keeps_the_guard_unburnt, \
+         restore_reports_what_it_recovered_not_the_live_map_size, \
+         rotation_restore_event_reports_restored_and_skipped_counts, \
+         graced_set_survives_a_restore_round_trip_with_its_remaining_window). The 97 outside it \
+         never call restore_proxy_nonces_from or restore_proxy_nonces_from_store \
+         (grep-verified against this file) — they exercise nonce minting, config read/write, \
+         proxy gating, rotation forensics for revoke/evict events, and reconciliation, none of \
+         which touches the restore path. Two (pre_restore_persist_merges_the_on_disk_set_under_the_live_snapshot, \
+         pre_restore_merge_is_bounded_by_the_persisted_cap_oldest_first) name 'restore' but test \
+         only snapshot_for_store, which runs BEFORE a restore and never calls \
+         restore_proxy_nonces_from itself. Enumerated 2026-10-07; this is the lock's first \
+         allowlist entry — the module had none before, so this covers its whole population \
+         rather than extending a prior count",
+    },
+
 ];
 
 /// How a serialiser was recognised.
