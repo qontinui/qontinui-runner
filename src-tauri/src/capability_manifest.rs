@@ -1015,7 +1015,7 @@ impl SkipReason {
                 "tracked by the enclosing git repository — left alone deliberately".to_string()
             }
             SkipReason::ProbeUnknownInRepo => "kept: inside a git repository whose tracked-file \
-                 probe could not answer, so the existing file was not overwritten"
+                 probe could not answer, so what is already on disk was not overwritten"
                 .to_string(),
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),

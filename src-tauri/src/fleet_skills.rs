@@ -308,8 +308,9 @@ fn embedded_skill_file_count() -> usize {
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
 /// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
 /// narrowing: when that failure happens inside a repository (a `.git` at or
-/// above the dir), only ABSENT files are written and existing ones are kept
-/// (see that module's "UNKNOWN inside a repository" section). A skipped write
+/// above the dir), a skill whose `SKILL.md` already exists is kept WHOLE and only
+/// skills absent on disk are written (see that module's "UNKNOWN inside a
+/// repository" section). A skipped write
 /// must never become an aborted spawn, and a failed or slow probe must never
 /// become one either. The probe runs ONCE for the whole tree, not
 /// once per file, so this costs one process spawn rather than ~15.
@@ -396,14 +397,22 @@ fn provision_fleet_skills_into(
         // keeping would write only the files new in this build beside the old
         // ones and hand the session a skill that disagrees with itself (an old
         // SKILL.md naming helpers that changed). An absent skill is written.
-        if tracked.is_unknown_in_repo() && skills_dir.join(skill.dir_name()).exists() {
+        // Keyed on the skill's own SKILL.md, not the bare directory: an empty
+        // or half-written directory (a parent created, then the write failed)
+        // holds no skill a session could be using, so it is provisioned.
+        if tracked.is_unknown_in_repo()
+            && skills_dir
+                .join(skill.dir_name())
+                .join(SKILL_MANIFEST)
+                .exists()
+        {
             info!(
                 "fleet_skills: keeping skill {:?} as it is on disk — {}",
                 skill.name,
                 capability_manifest::SkipReason::ProbeUnknownInRepo.describe()
             );
             out.skip(
-                format!("{}/*", skill.dir_name()),
+                format!("{}/*", skill.name),
                 capability_manifest::SkipReason::ProbeUnknownInRepo,
             );
             continue;
