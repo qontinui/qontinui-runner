@@ -1025,6 +1025,25 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
     )
 }
 
+/// `/health` `degradedUnauthenticatedRequests`: the per-site ledger of BOTH
+/// compiled copies of `auth` (`lib.rs` `pub mod auth` — the plan adapter and
+/// session archive send through it — and this binary's `mod auth`), merged by
+/// site. Each copy holds its own statics, so either alone is a partial count
+/// that reads as the whole.
+fn degraded_unauthenticated_requests_health() -> serde_json::Value {
+    let lib = qontinui_runner_lib::auth::degraded_writes_snapshot()
+        .into_iter()
+        .map(|s| crate::auth::DegradedWriteSite {
+            site: s.site,
+            sent: s.sent,
+            last_at: s.last_at,
+            last_status: s.last_status,
+        });
+    let merged =
+        crate::auth::merge_degraded_write_snapshots(crate::auth::degraded_writes_snapshot(), lib);
+    crate::auth::degraded_writes_health_json(&merged)
+}
+
 /// The `/health` fields that state this runner's DEFAULT tenant — the tenant a
 /// session that names none is minted into (plan
 /// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
@@ -1683,6 +1702,12 @@ async fn health(
                 "reason": "no device-JWT refresher pass has completed in this process yet \
                            — UNKNOWN, never 'healthy'",
             })),
+        // Tenant-owned coord writes sent UNAUTHENTICATED because their owning
+        // tenant was unresolvable on a multi-bound device, per call site (plan
+        // 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device
+        // D6). Observability only — the credential choice is unchanged. Merges
+        // BOTH compiled copies of `auth`; `lastStatus: null` is UNKNOWN.
+        "degradedUnauthenticatedRequests": degraded_unauthenticated_requests_health(),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -21856,5 +21881,46 @@ mod ui_bridge_binding_health_tests {
             production.contains("relay_binding: crate::mcp::relay_binding::RelayBinding::new("),
             "the one instance must be the field on ApiState"
         );
+    }
+}
+
+/// `/health` `degradedUnauthenticatedRequests` must merge BOTH compiled copies of
+/// `auth` (plan 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device
+/// V8): the lib copy carries live sites (plan adapter, session archive), so a
+/// block that read only this binary's copy would under-count and read as whole.
+#[cfg(test)]
+mod degraded_writes_health_tests {
+    use super::*;
+    use std::panic::Location;
+
+    #[test]
+    fn the_health_block_merges_the_lib_and_bin_copies() {
+        let bin_only: &'static Location<'static> = Location::caller();
+        let lib_only: &'static Location<'static> = Location::caller();
+        let shared: &'static Location<'static> = Location::caller();
+        crate::auth::note_degraded_send(bin_only, 2);
+        qontinui_runner_lib::auth::note_degraded_send(lib_only, 2);
+        crate::auth::note_degraded_send(shared, 2);
+        qontinui_runner_lib::auth::note_degraded_send(shared, 2);
+        qontinui_runner_lib::auth::note_degraded_send(shared, 2);
+
+        let v = degraded_unauthenticated_requests_health();
+        let sent = |loc: &Location<'_>| {
+            let key = format!("{}:{}", loc.file(), loc.line());
+            v["sites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["site"] == key.as_str())
+                .map(|s| s["sent"].as_u64().unwrap())
+        };
+        assert_eq!(sent(bin_only), Some(1), "{v}");
+        assert_eq!(
+            sent(lib_only),
+            Some(1),
+            "the LIB copy's site must appear: {v}"
+        );
+        assert_eq!(sent(shared), Some(3), "a site in both copies sums: {v}");
+        assert!(v["total"].as_u64().unwrap() >= 5, "{v}");
     }
 }

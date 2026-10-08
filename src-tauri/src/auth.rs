@@ -2727,7 +2727,10 @@ pub(crate) fn select_scoped_bearer_lazy_result(
         TenantScope::Unresolved => {
             let count = binding_count();
             if count > 1 {
-                warn_once_unresolved_on_multi_bound(count);
+                // The warning and the per-site counter are the SEND path's
+                // (`count_and_resolve_bearer`), which knows the call site; a
+                // diagnostic read through here ([`presented_tenant`]) sends
+                // nothing and so must count nothing.
                 // NOT an absence — a refusal, taken BEFORE any slot was read.
                 // The count is the one this arm actually branched on, so the
                 // diagnostic cannot name a different one.
@@ -2741,7 +2744,16 @@ pub(crate) fn select_scoped_bearer_lazy_result(
 /// Scope-selecting sibling of [`device_bearer_for`] — the single resolver both
 /// transports of the credential seam share.
 pub fn device_bearer_scoped(scope: TenantScope) -> Option<String> {
-    select_scoped_bearer_lazy(
+    device_bearer_scoped_result(scope).ok()
+}
+
+/// [`device_bearer_scoped`], keeping the CAUSE of a miss. The ONE production
+/// resolution of a scope against this device's real store: the send path
+/// ([`count_and_resolve_bearer`]), the websocket bearer (via
+/// [`device_bearer_scoped`]) and the diagnostic [`presented_tenant`] all call
+/// it, so they cannot drift into resolving a scope differently.
+pub fn device_bearer_scoped_result(scope: TenantScope) -> Result<String, NoCredential> {
+    select_scoped_bearer_lazy_result(
         &AuthManager::new(),
         scope,
         default_binding_tenant(),
@@ -2899,13 +2911,7 @@ impl std::fmt::Display for PresentedTenant {
 /// Costs local encrypted-file reads, so call it when reporting a refusal,
 /// not on every pass of a loop.
 pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
-    let am = AuthManager::new();
-    match select_scoped_bearer_lazy_result(
-        &am,
-        scope,
-        default_binding_tenant(),
-        device_binding_count,
-    ) {
+    match device_bearer_scoped_result(scope) {
         Ok(token) => match jwt_tenant_claim(&token) {
             Some(t) => PresentedTenant::Tenant(t),
             None => PresentedTenant::Untenanted,
@@ -2914,21 +2920,314 @@ pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
     }
 }
 
-/// Warn once per process that an unresolved-tenant write degraded to
-/// unauthenticated on a multi-bound device.
+// ---------------------------------------------------------------------------
+// Degraded unauthenticated writes — observable, not different (plan
+// `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+// D6). WHICH credential is presented is unchanged: an `Unresolved` scope on a
+// multi-bound device still sends nothing (plan 2026-08-29 D2, security
+// surface). What changes is that each such send is attributed to its CALL SITE
+// and counted, so `GET /health` can say where the fallback fires and how often.
+// ---------------------------------------------------------------------------
+
+/// What coord's server side counts about these sends — the ONLY related metric,
+/// stated with its limit so no log line or `/health` reader assumes more.
 ///
-/// Once per process, not per call: the sites that degrade include periodic
-/// loops, and a per-call warning would bury the signal it exists to raise.
-fn warn_once_unresolved_on_multi_bound(binding_count: usize) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        warn!(
-            "coord data-plane: a tenant-owned write could not resolve its owning tenant on a \
-             device holding {binding_count} bindings — sending it UNAUTHENTICATED rather than \
-             presenting the default binding's credential, which would attribute the row to the \
-             wrong tenant. Coord's server-side resolution decides the outcome and counts it."
-        );
-    });
+/// `coord_data_plane_auth_requests_total{route,outcome}` in qontinui-coord
+/// `crates/coord/src/data_plane_observe.rs` (verified on coord `origin/main`
+/// `07b54b4b3`) counts `outcome="anonymous"` for exactly 8 routes —
+/// `sessions_create`, `sessions_update`, `sessions_close`, `sessions_steal`,
+/// `claims_acquire`, `claims_heartbeat`, `claims_release`, `agents_allocate`.
+/// A degraded request to any other route is counted by nothing on coord, and
+/// none of it is attributed to a runner call site.
+const COORD_ANONYMOUS_METRIC_NOTE: &str = "coord's only related counter is \
+     coord_data_plane_auth_requests_total{route,outcome=\"anonymous\"} \
+     (qontinui-coord crates/coord/src/data_plane_observe.rs), which covers 8 routes \
+     only (sessions create/update/close/steal, claims acquire/heartbeat/release, \
+     agents allocate) and does not attribute a request to a runner call site; a \
+     degraded request to any other route is counted by nothing on coord";
+
+/// One call site's record of tenant-owned coord requests it sent
+/// UNAUTHENTICATED because the owning tenant was unresolvable on a multi-bound
+/// device. REQUESTS, not only writes: the ledger counts every
+/// `TenantScope::Unresolved` send that degraded, and several sites are reads
+/// (`GET`s in `plan_workunit_adapter::push`, `coord_http::coord_get_for`) —
+/// a read creates no row, so a site here is not by itself a wrong-tenant or
+/// anonymous row on coord.
+///
+/// `last_status` is the HTTP status coord answered to this site's MOST RECENT
+/// degraded send, and only where a dispatch that sees the response records it
+/// ([`note_degraded_send_status`] — today `session::coord_sync`'s
+/// `push_record`, including its `agent_notification` and gate-bootstrap
+/// sends). `None` is UNKNOWN: no dispatch observed the answer (most
+/// sites), or the send failed below HTTP. It is NEVER success. A new send
+/// resets it, and a status is accepted only for the send it answers (a per-site
+/// sequence number, see [`DegradedWriteLedger::record_status`]), so
+/// `last_status` and `last_at` always describe the same send even when two
+/// tasks degrade at one site concurrently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedWriteSite {
+    /// `file:line` of the `attach_device_auth_for` / `attach_device_auth_blocking`
+    /// call — or of the nearest synchronous `#[track_caller]` forwarding helper's
+    /// caller. An `async fn` helper cannot propagate `#[track_caller]` on stable
+    /// Rust, so a site inside one names the HELPER's line — and when that helper
+    /// serves several routes (e.g. `install_effects_producer::coord_client`'s
+    /// shared `post_json`, used for declare, predict-and-check and verify) those
+    /// routes share ONE row and cannot be told apart here.
+    pub site: String,
+    /// Degraded sends from this site since this copy of the module started.
+    pub sent: u64,
+    /// RFC 3339 UTC time of the most recent degraded send.
+    pub last_at: String,
+    /// See the type doc: `None` is UNKNOWN, never success.
+    pub last_status: Option<u16>,
+}
+
+/// The per-site ledger behind [`degraded_writes_snapshot`]. A type rather than
+/// bare statics so the tests drive a fresh one; production uses
+/// [`DEGRADED_WRITES`].
+#[derive(Debug, Default)]
+pub(crate) struct DegradedWriteLedger {
+    /// Each site's row plus the sequence number of its LATEST send — the only
+    /// send a status may still be recorded for.
+    sites: std::sync::Mutex<std::collections::BTreeMap<String, (DegradedWriteSite, u64)>>,
+}
+
+/// One degraded send as the ledger numbered it: `first` is the warn cue,
+/// `seq` names this send for [`DegradedWriteLedger::record_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DegradedSend {
+    pub(crate) first: bool,
+    pub(crate) seq: u64,
+}
+
+impl DegradedWriteLedger {
+    /// Record one degraded send from `site`. Returns `true` exactly when this
+    /// is the site's FIRST — the caller's cue to warn. Per SITE, not per
+    /// process: a process-wide latch let the first degrading site hide every
+    /// other one, which is the defect this replaces.
+    pub(crate) fn record_sent(
+        &self,
+        site: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DegradedSend {
+        let mut sites = self.sites.lock().unwrap_or_else(|p| p.into_inner());
+        let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        match sites.get_mut(site) {
+            Some((entry, seq)) => {
+                entry.sent += 1;
+                entry.last_at = at;
+                entry.last_status = None;
+                *seq += 1;
+                DegradedSend {
+                    first: false,
+                    seq: *seq,
+                }
+            }
+            None => {
+                sites.insert(
+                    site.to_string(),
+                    (
+                        DegradedWriteSite {
+                            site: site.to_string(),
+                            sent: 1,
+                            last_at: at,
+                            last_status: None,
+                        },
+                        1,
+                    ),
+                );
+                DegradedSend {
+                    first: true,
+                    seq: 1,
+                }
+            }
+        }
+    }
+
+    /// Record the HTTP status coord answered to send `seq` from `site`.
+    /// Accepted — `true` — only when `seq` is the site's LATEST send: a late
+    /// answer to an earlier send would otherwise sit beside the later send's
+    /// `last_at` and describe a different request. A site never recorded as
+    /// sent is ignored too: a status with no send would be a row claiming a
+    /// degraded write that did not happen.
+    pub(crate) fn record_status(&self, site: &str, seq: u64, status: u16) -> bool {
+        let mut sites = self.sites.lock().unwrap_or_else(|p| p.into_inner());
+        match sites.get_mut(site) {
+            Some((entry, latest)) if *latest == seq => {
+                entry.last_status = Some(status);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<DegradedWriteSite> {
+        let sites = self.sites.lock().unwrap_or_else(|p| p.into_inner());
+        sites.values().map(|(entry, _)| entry.clone()).collect()
+    }
+}
+
+/// This copy's ledger. **`auth` is compiled TWICE** — `lib.rs` `pub mod auth`
+/// and `main.rs` `mod auth` — so the runner process holds two of these, and
+/// both carry live sites (the plan adapter and the session archive run the LIB
+/// copy; `session::coord_sync`, the worktree and claim paths run the BIN copy).
+/// `GET /health` therefore merges both with [`merge_degraded_write_snapshots`];
+/// either alone is a partial count that reads as the whole.
+static DEGRADED_WRITES: std::sync::LazyLock<DegradedWriteLedger> =
+    std::sync::LazyLock::new(DegradedWriteLedger::default);
+
+tokio::task_local! {
+    /// The site of the degraded send made inside the current
+    /// [`observe_degraded_send`] scope, if one was. How a dispatch that sees
+    /// the response attributes its status to the right site without every
+    /// dispatch arm naming its own line. Task-local, not thread-local: the
+    /// send's `.await` can resume the task on another worker thread.
+    /// Carries the send's ledger sequence number with its site, so the status
+    /// lands only on the send it answers.
+    static DEGRADED_SEND_SITE: std::cell::Cell<Option<(&'static std::panic::Location<'static>, u64)>>;
+}
+
+/// The `file:line` key of a call site.
+pub(crate) fn degraded_site_key(site: &std::panic::Location<'_>) -> String {
+    format!("{}:{}", site.file(), site.line())
+}
+
+/// Count one degraded send from `site` on this copy's ledger, warn if it is the
+/// site's first, and tell an enclosing [`observe_degraded_send`] scope which
+/// site it was.
+pub fn note_degraded_send(site: &'static std::panic::Location<'static>, binding_count: usize) {
+    let send = note_degraded_send_on(&DEGRADED_WRITES, site, binding_count);
+    // Outside a scope this is a no-op by design: most sites have no dispatch
+    // that sees the response, and their `lastStatus` stays UNKNOWN.
+    let _ = DEGRADED_SEND_SITE.try_with(|cell| cell.set(Some((site, send.seq))));
+}
+
+/// The ledger-parameterised body of [`note_degraded_send`]'s count-and-warn:
+/// returns the numbered send (`first` = it warned), so the per-site warn-once
+/// is testable on a fresh ledger.
+fn note_degraded_send_on(
+    ledger: &DegradedWriteLedger,
+    site: &std::panic::Location<'_>,
+    binding_count: usize,
+) -> DegradedSend {
+    let key = degraded_site_key(site);
+    let send = ledger.record_sent(&key, chrono::Utc::now());
+    if send.first {
+        warn_unresolved_on_multi_bound(&key, binding_count);
+    }
+    send
+}
+
+/// Run `fut` — one dispatch that inspects the response of each coord send it
+/// makes (recording each with [`note_degraded_send_status`] right after it, so
+/// a later send cannot inherit an earlier one's status) — so that [`note_degraded_send_status`] inside it can attribute the
+/// status to the site that degraded. Costs one task-local scope; a dispatch
+/// whose send was authenticated records nothing.
+pub async fn observe_degraded_send<F: std::future::Future>(fut: F) -> F::Output {
+    DEGRADED_SEND_SITE
+        .scope(std::cell::Cell::new(None), fut)
+        .await
+}
+
+/// Record `status` against the site that degraded inside the enclosing
+/// [`observe_degraded_send`] scope. A no-op when the send was authenticated or
+/// when called outside a scope. Takes the site, so a second send in the same
+/// scope cannot inherit the first one's status.
+pub fn note_degraded_send_status(status: u16) {
+    let site = DEGRADED_SEND_SITE
+        .try_with(|cell| cell.take())
+        .ok()
+        .flatten();
+    if let Some((site, seq)) = site {
+        // A `false` is a late answer to a send this site has since superseded:
+        // dropped, so `lastStatus` never describes a different send than `lastAt`.
+        let _ = DEGRADED_WRITES.record_status(&degraded_site_key(site), seq, status);
+    }
+}
+
+/// This copy's per-site ledger. See [`DEGRADED_WRITES`] for why `/health` must
+/// merge it with the other copy's.
+pub fn degraded_writes_snapshot() -> Vec<DegradedWriteSite> {
+    DEGRADED_WRITES.snapshot()
+}
+
+/// Merge two copies' snapshots by site: `sent` adds, and `last_at` /
+/// `last_status` come from whichever copy sent last, so they keep describing
+/// one send. On an exact `last_at` tie (two copies degrading at one site in the
+/// same millisecond) an observed status wins over a null one — the two rows
+/// then describe two simultaneous sends, and a known answer to one of them is
+/// more informative than UNKNOWN. Sorted by site for a stable `/health` body.
+pub fn merge_degraded_write_snapshots(
+    a: Vec<DegradedWriteSite>,
+    b: impl IntoIterator<Item = DegradedWriteSite>,
+) -> Vec<DegradedWriteSite> {
+    let mut by_site: std::collections::BTreeMap<String, DegradedWriteSite> =
+        std::collections::BTreeMap::new();
+    for entry in a.into_iter().chain(b) {
+        match by_site.get_mut(&entry.site) {
+            Some(have) => {
+                have.sent += entry.sent;
+                // RFC 3339 UTC with a fixed format orders lexically.
+                let newer = entry.last_at > have.last_at;
+                let tie_fills_unknown = entry.last_at == have.last_at
+                    && have.last_status.is_none()
+                    && entry.last_status.is_some();
+                if newer || tie_fills_unknown {
+                    have.last_at = entry.last_at;
+                    have.last_status = entry.last_status;
+                }
+            }
+            None => {
+                by_site.insert(entry.site.clone(), entry);
+            }
+        }
+    }
+    by_site.into_values().collect()
+}
+
+/// The `GET /health` `degradedUnauthenticatedRequests` block for `sites`.
+pub fn degraded_writes_health_json(sites: &[DegradedWriteSite]) -> serde_json::Value {
+    let total: u64 = sites.iter().map(|s| s.sent).sum();
+    serde_json::json!({
+        "total": total,
+        "sites": sites
+            .iter()
+            .map(|s| serde_json::json!({
+                "site": s.site,
+                "sent": s.sent,
+                "lastAt": s.last_at,
+                "lastStatus": s.last_status,
+            }))
+            .collect::<Vec<_>>(),
+        "outcomeNote": format!(
+            "Each site sent tenant-owned coord requests UNAUTHENTICATED because the owning \
+             tenant could not be resolved on a multi-bound device (presenting the default \
+             binding's credential would attribute the row to the wrong tenant). Requests, \
+             not only writes: some sites are reads (GETs), which create no row. A site \
+             inside a shared async helper names the helper's line, so routes through it \
+             share one row. Counts are \
+             since this runner process started. lastStatus is coord's HTTP answer to the \
+             site's most recent such send, recorded only where a dispatch sees the response \
+             (session::coord_sync push_record, all its arms); null means UNKNOWN, never success. \
+             {COORD_ANONYMOUS_METRIC_NOTE}."
+        ),
+    })
+}
+
+/// Warn — once per CALL SITE — that a tenant-owned request degraded to
+/// unauthenticated on a multi-bound device. Per site rather than per call
+/// because the sites include periodic loops, and per site rather than per
+/// process because one process-wide latch named whichever site happened to
+/// degrade first and hid the rest.
+fn warn_unresolved_on_multi_bound(site: &str, binding_count: usize) {
+    warn!(
+        "coord data-plane: a tenant-owned request at {site} could not resolve its owning \
+         tenant on a device holding {binding_count} bindings — sending it UNAUTHENTICATED \
+         rather than presenting the default binding's credential, which would attribute \
+         the row to the wrong tenant. Further sends from this site are counted, not \
+         logged: GET /health degradedUnauthenticatedRequests. The outcome is NOT observed \
+         here, and {COORD_ANONYMOUS_METRIC_NOTE}."
+    );
 }
 
 /// Attach the device-JWT bearer to a coord data-plane request when one is
@@ -2952,6 +3251,7 @@ fn warn_once_unresolved_on_multi_bound(binding_count: usize) {
 /// counts. A caller whose row does have an owner it could not name states
 /// [`TenantScope::Unresolved`] through [`attach_device_auth_for`] instead —
 /// that is the distinction the whole type exists for.
+#[track_caller]
 pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     attach_device_auth_for(rb, TenantScope::Device)
 }
@@ -2973,11 +3273,17 @@ pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilde
 ///
 /// Slot-miss posture is [`device_bearer_for`]'s and is unchanged: never another
 /// tenant's credential — degrade to unauthenticated.
+///
+/// `#[track_caller]`: a degraded send is attributed to the CALLER's `file:line`
+/// (see [`DegradedWriteSite`]). A synchronous helper that forwards a scope into
+/// this must carry `#[track_caller]` too, or every route through it collapses
+/// into the helper's one line.
+#[track_caller]
 pub fn attach_device_auth_for(
     rb: reqwest::RequestBuilder,
     scope: TenantScope,
 ) -> reqwest::RequestBuilder {
-    match count_and_resolve_bearer(scope) {
+    match count_and_resolve_bearer(scope, std::panic::Location::caller()) {
         Some(token) => rb.header("Authorization", format!("Bearer {token}")),
         None => rb,
     }
@@ -3008,11 +3314,12 @@ pub fn attach_device_auth_for(
 /// it would silently present the default binding's JWT against a request
 /// declaring another tenant. There is no unparameterized twin here precisely
 /// so that door cannot be opened by accident.
+#[track_caller]
 pub fn attach_device_auth_blocking(
     rb: reqwest::blocking::RequestBuilder,
     scope: TenantScope,
 ) -> reqwest::blocking::RequestBuilder {
-    match count_and_resolve_bearer(scope) {
+    match count_and_resolve_bearer(scope, std::panic::Location::caller()) {
         Some(token) => rb.header("Authorization", format!("Bearer {token}")),
         None => rb,
     }
@@ -3026,11 +3333,25 @@ pub fn attach_device_auth_blocking(
 /// fired (an `Unresolved` scope on a multi-bound device) — the caller then
 /// sends the request unauthenticated, which coord still accepts.
 ///
+/// `site` is the caller's location, passed explicitly from the
+/// `#[track_caller]` wrappers: a degraded send is counted and warned per site
+/// ([`note_degraded_send`]). The credential presented does not depend on it.
+///
 /// The returned token is only ever moved into a request header; it must never
 /// reach a log line or a process argument.
-fn count_and_resolve_bearer(scope: TenantScope) -> Option<String> {
+fn count_and_resolve_bearer(
+    scope: TenantScope,
+    site: &'static std::panic::Location<'static>,
+) -> Option<String> {
     let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let bearer = device_bearer_scoped(scope);
+    let bearer = match device_bearer_scoped_result(scope) {
+        Ok(token) => Some(token),
+        Err(NoCredential::UnresolvedOnMultiBound { bindings }) => {
+            note_degraded_send(site, bindings);
+            None
+        }
+        Err(_) => None,
+    };
     if bearer.is_some() {
         DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3799,7 +4120,7 @@ mod bearer_selection_tests {
     /// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`.
     /// Selection now VALIDATES what it finds, so an opaque string is a MISS by
     /// design — see [`slot_jwt_is_usable`] and the two dead-slot tests below.
-    fn live_jwt(tag: &str) -> String {
+    pub(super) fn live_jwt(tag: &str) -> String {
         jwt_for(tag, chrono::Utc::now().timestamp() + 3 * 60 * 60)
     }
 
@@ -5827,6 +6148,315 @@ mod device_jwt_tests {
         assert!(
             mgr.cognito_token_needs_refresh(),
             "an already-expired token must report stale"
+        );
+    }
+}
+
+/// Plan `2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device`
+/// D6: the degraded unauthenticated write is attributed per CALL SITE, counted,
+/// and merged across the two compiled copies — without changing which
+/// credential is presented.
+#[cfg(test)]
+mod degraded_write_tests {
+    use super::*;
+    use std::panic::Location;
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn site(name: &str, sent: u64, last_at: &str, last_status: Option<u16>) -> DegradedWriteSite {
+        DegradedWriteSite {
+            site: name.to_string(),
+            sent,
+            last_at: last_at.to_string(),
+            last_status,
+        }
+    }
+
+    /// Two different sites each warn on their first send; one site sending
+    /// twice warns once. Fails if the latch goes back to one per PROCESS.
+    #[test]
+    fn warn_once_is_per_call_site() {
+        let ledger = DegradedWriteLedger::default();
+        let a: &'static Location<'static> = Location::caller();
+        let b: &'static Location<'static> = Location::caller();
+        assert_ne!(degraded_site_key(a), degraded_site_key(b));
+        assert!(
+            note_degraded_send_on(&ledger, a, 2).first,
+            "site A's first send warns"
+        );
+        assert!(
+            note_degraded_send_on(&ledger, b, 2).first,
+            "site B's first send warns too — a process-wide latch would swallow it"
+        );
+        assert!(
+            !note_degraded_send_on(&ledger, a, 2).first,
+            "site A's second send does not"
+        );
+        assert!(!note_degraded_send_on(&ledger, b, 3).first, "nor B's");
+    }
+
+    /// The counter: `sent` per site, `last_at` the latest send, and a new send
+    /// resets `last_status` so it always describes the send `last_at` names.
+    #[test]
+    fn the_ledger_counts_per_site_and_keeps_status_with_its_send() {
+        let ledger = DegradedWriteLedger::default();
+        assert!(
+            ledger
+                .record_sent("x.rs:1", at("2026-10-05T10:00:00Z"))
+                .first
+        );
+        let x2 = ledger.record_sent("x.rs:1", at("2026-10-05T10:01:00Z"));
+        assert!(!x2.first);
+        assert!(
+            ledger
+                .record_sent("y.rs:2", at("2026-10-05T10:02:00Z"))
+                .first
+        );
+        assert!(ledger.record_status("x.rs:1", x2.seq, 401));
+        // A status for a site that never sent is not a degraded write.
+        assert!(!ledger.record_status("never.rs:9", 1, 500));
+        assert_eq!(
+            ledger.snapshot(),
+            vec![
+                site("x.rs:1", 2, "2026-10-05T10:01:00.000Z", Some(401)),
+                site("y.rs:2", 1, "2026-10-05T10:02:00.000Z", None),
+            ]
+        );
+        assert!(
+            !ledger
+                .record_sent("x.rs:1", at("2026-10-05T10:03:00Z"))
+                .first
+        );
+        assert_eq!(
+            ledger.snapshot()[0],
+            site("x.rs:1", 3, "2026-10-05T10:03:00.000Z", None),
+            "a new send's outcome is UNKNOWN until observed — never the last one's"
+        );
+    }
+
+    /// Two tasks degrade at ONE site: A sends, B sends, then A's answer
+    /// arrives. It is REJECTED — beside B's `last_at` it would describe a
+    /// different request — and B's answer is kept, in either arrival order.
+    #[test]
+    fn a_late_status_for_a_superseded_send_is_rejected() {
+        let ledger = DegradedWriteLedger::default();
+        let a = ledger.record_sent("s.rs:7", at("2026-10-05T10:00:00Z"));
+        let b = ledger.record_sent("s.rs:7", at("2026-10-05T10:00:01Z"));
+        assert_ne!(a.seq, b.seq);
+        assert!(
+            !ledger.record_status("s.rs:7", a.seq, 401),
+            "A's answer arrives after B sent: it is not the latest send's"
+        );
+        assert_eq!(ledger.snapshot()[0].last_status, None, "still UNKNOWN");
+        assert!(
+            ledger.record_status("s.rs:7", b.seq, 201),
+            "B's answer is kept"
+        );
+        assert!(
+            !ledger.record_status("s.rs:7", a.seq, 401),
+            "A arriving after B's answer does not overwrite it"
+        );
+        assert_eq!(
+            ledger.snapshot(),
+            vec![site("s.rs:7", 2, "2026-10-05T10:00:01.000Z", Some(201))]
+        );
+    }
+
+    /// Two copies' snapshots: disjoint sites both survive, a shared site sums
+    /// `sent` and takes `last_at`/`last_status` from the copy that sent last.
+    #[test]
+    fn merging_two_copies_sums_and_keeps_the_latest_send() {
+        let bin = vec![
+            site("a.rs:1", 2, "2026-10-05T10:00:00.000Z", Some(201)),
+            site("shared.rs:5", 1, "2026-10-05T10:05:00.000Z", None),
+        ];
+        let lib = vec![
+            site("shared.rs:5", 4, "2026-10-05T09:00:00.000Z", Some(401)),
+            site("z.rs:9", 1, "2026-10-05T08:00:00.000Z", None),
+        ];
+        assert_eq!(
+            merge_degraded_write_snapshots(bin, lib),
+            vec![
+                site("a.rs:1", 2, "2026-10-05T10:00:00.000Z", Some(201)),
+                site("shared.rs:5", 5, "2026-10-05T10:05:00.000Z", None),
+                site("z.rs:9", 1, "2026-10-05T08:00:00.000Z", None),
+            ]
+        );
+        let older_first = merge_degraded_write_snapshots(
+            vec![site("s:1", 1, "2026-10-05T09:00:00.000Z", Some(401))],
+            vec![site("s:1", 1, "2026-10-05T10:00:00.000Z", Some(500))],
+        );
+        assert_eq!(
+            older_first,
+            vec![site("s:1", 2, "2026-10-05T10:00:00.000Z", Some(500))]
+        );
+        // An exact tie: the observed status wins over UNKNOWN, in either order.
+        for (a, b) in [(None, Some(409)), (Some(409), None)] {
+            let tied = merge_degraded_write_snapshots(
+                vec![site("t:1", 1, "2026-10-05T10:00:00.000Z", a)],
+                vec![site("t:1", 1, "2026-10-05T10:00:00.000Z", b)],
+            );
+            assert_eq!(
+                tied,
+                vec![site("t:1", 2, "2026-10-05T10:00:00.000Z", Some(409))],
+                "tie {a:?} / {b:?}"
+            );
+        }
+    }
+
+    /// The `/health` block's key names, as LITERALS — a rename is a contract
+    /// change for every reader of `degradedUnauthenticatedRequests`.
+    #[test]
+    fn the_health_block_has_the_documented_shape() {
+        let v = degraded_writes_health_json(&[
+            site(
+                "src/session/coord_sync.rs:1603",
+                3,
+                "2026-10-05T10:00:00.000Z",
+                Some(401),
+            ),
+            site(
+                "src/plan_workunit_adapter/push.rs:1428",
+                2,
+                "2026-10-05T09:00:00.000Z",
+                None,
+            ),
+        ]);
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort_unstable();
+        assert_eq!(top, ["outcomeNote", "sites", "total"]);
+        assert_eq!(v["total"], 5);
+        let first = v["sites"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = first.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["lastAt", "lastStatus", "sent", "site"]);
+        assert_eq!(v["sites"][0]["site"], "src/session/coord_sync.rs:1603");
+        assert_eq!(v["sites"][0]["lastStatus"], 401);
+        assert!(
+            v["sites"][1]["lastStatus"].is_null(),
+            "an unobserved outcome is null, not absent and not a success code"
+        );
+        let note = v["outcomeNote"].as_str().unwrap();
+        assert!(note.contains("null means UNKNOWN"), "{note}");
+        assert!(
+            note.contains("not only writes") && note.contains("GETs"),
+            "the note does not claim every counted send was a write: {note}"
+        );
+        assert!(
+            note.contains("coord_data_plane_auth_requests_total") && note.contains("8 routes"),
+            "the note names coord's counter WITH its limit: {note}"
+        );
+        assert!(
+            !note.contains("decides the outcome and counts it"),
+            "the old claim is gone: {note}"
+        );
+    }
+
+    /// The status hook attributes coord's answer to the site that degraded
+    /// inside the scope, and does nothing outside one.
+    #[tokio::test]
+    async fn a_scoped_dispatch_records_the_status_of_its_degraded_send() {
+        let here: &'static Location<'static> = Location::caller();
+        let key = degraded_site_key(here);
+        observe_degraded_send(async {
+            note_degraded_send(here, 2);
+            note_degraded_send_status(403);
+        })
+        .await;
+        let row = degraded_writes_snapshot()
+            .into_iter()
+            .find(|s| s.site == key)
+            .unwrap();
+        assert_eq!((row.sent, row.last_status), (1, Some(403)));
+
+        // A second scope whose send was authenticated records nothing on it.
+        observe_degraded_send(async { note_degraded_send_status(500) }).await;
+        // Outside any scope: no-op.
+        note_degraded_send_status(500);
+        let row = degraded_writes_snapshot()
+            .into_iter()
+            .find(|s| s.site == key)
+            .unwrap();
+        assert_eq!(row.last_status, Some(403));
+    }
+
+    /// End to end through the real send path: an `Unresolved` scope on a
+    /// two-binding device presents NO bearer (unchanged, plan 2026-08-29 D2)
+    /// and is counted against the CALLER's line — `#[track_caller]` reaches
+    /// through `attach_device_auth_for` into the resolver. Fails if the
+    /// attribute is dropped (every row collapses onto `src/auth.rs`).
+    #[test]
+    fn a_degraded_send_is_counted_at_its_callers_line() {
+        let amb = crate::test_env::isolated_ambient();
+        // NEVER the real OS credential store (see the sibling test
+        // `device_bearer_scoped_degrades_on_a_devices_own_two_binding_file`).
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::from_bytes([0xD6; 16]);
+        let b = Uuid::from_bytes([0xD7; 16]);
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": a.to_string()}, {"tenant_id": b.to_string()}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A LIVE default credential is stored, so "no Authorization header"
+        // below is the degrade's doing and not an empty store's. Positive
+        // control: a Device-scoped call on the same box DOES present it.
+        AuthManager::new()
+            .store_tokens(
+                &super::bearer_selection_tests::live_jwt("default-binding"),
+                "",
+            )
+            .unwrap();
+        let client = reqwest::Client::new();
+        let control =
+            attach_device_auth_for(client.get("http://127.0.0.1:9/c"), TenantScope::Device)
+                .build()
+                .unwrap();
+        assert!(
+            control.headers().get("Authorization").is_some(),
+            "positive control: the stored default credential is presentable"
+        );
+
+        let start = Location::caller().line();
+        for _ in 0..2 {
+            let req =
+                attach_device_auth_for(client.get("http://127.0.0.1:9/x"), TenantScope::Unresolved)
+                    .build()
+                    .unwrap();
+            assert!(
+                req.headers().get("Authorization").is_none(),
+                "an Unresolved write on a multi-bound device presents NOTHING, though a \
+                 default credential is stored (plan 2026-08-29 D2)"
+            );
+        }
+        let _ = attach_device_auth_for(client.get("http://127.0.0.1:9/y"), TenantScope::Unresolved);
+        let end = Location::caller().line();
+
+        // Rows whose site is a line of THIS test body: exactly the two call
+        // sites, the looped one counted twice. Without `#[track_caller]` both
+        // would land on a line inside `attach_device_auth_for` — outside the
+        // range — and this finds none.
+        let file = Location::caller().file();
+        let mut mine: Vec<(u32, u64)> = degraded_writes_snapshot()
+            .into_iter()
+            .filter_map(|s| {
+                let line: u32 = s.site.strip_prefix(&format!("{file}:"))?.parse().ok()?;
+                (start < line && line < end).then_some((line, s.sent))
+            })
+            .collect();
+        mine.sort_unstable();
+        assert_eq!(
+            mine.iter().map(|(_, sent)| *sent).collect::<Vec<_>>(),
+            vec![2, 1],
+            "two call sites, the looped one counted twice: {mine:?}"
         );
     }
 }

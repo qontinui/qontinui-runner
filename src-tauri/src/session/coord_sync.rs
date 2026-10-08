@@ -462,7 +462,12 @@ impl CoordSync {
         rec: &OutboxRecord,
         timeout: Duration,
     ) -> Result<(), CoordRegistrationFailure> {
-        let failure = match tokio::time::timeout(timeout, push_record(&self.inner, rec)).await {
+        let failure = match tokio::time::timeout(
+            timeout,
+            crate::auth::observe_degraded_send(push_record(&self.inner, rec)),
+        )
+        .await
+        {
             Ok(PushOutcome::Acked) => {
                 if let Err(e) = self.inner.outbox.ack(&[(rec.session_id, rec.seq)]) {
                     // Coord HAS the row, so the confirmation stands; the drain
@@ -1117,7 +1122,7 @@ async fn push_chain(
             out.aborted = true;
             break;
         }
-        match push_record(&inner, &rec).await {
+        match crate::auth::observe_degraded_send(push_record(&inner, &rec)).await {
             PushOutcome::Acked => {
                 out.acked_by_coord = true;
                 out.succeeded.push((rec.session_id, rec.seq));
@@ -1894,6 +1899,13 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 
     match result {
         Ok(resp) => {
+            // Attributes coord's answer to the call site, when this send went
+            // out UNAUTHENTICATED (`/health` `degradedUnauthenticatedRequests`
+            // `lastStatus`); a no-op for an authenticated send. Before the
+            // per-kind branches so every arm that reaches here is covered;
+            // `agent_notification` returns earlier and records its own, and
+            // `bootstrap_then_register` records each of its two re-sends.
+            crate::auth::note_degraded_send_status(resp.status().as_u16());
             if kind == "helper_task_created" {
                 return helper_task_outcome(rec, resp).await;
             }
@@ -2268,6 +2280,9 @@ async fn agent_notification_push(
         Err(e) => return PushOutcome::Transport(transport_error(&e)),
     };
     let status = resp.status();
+    // This arm returns before `push_record`'s shared status hook, so it
+    // records coord's answer itself (a no-op for an authenticated send).
+    crate::auth::note_degraded_send_status(status.as_u16());
     if status.is_success() {
         return agent_notification_acked(rec, resp).await;
     }
@@ -2290,6 +2305,7 @@ async fn agent_notification_push(
             Err(e) => return PushOutcome::Transport(transport_error(&e)),
         };
         let status = resp.status();
+        crate::auth::note_degraded_send_status(status.as_u16());
         if status.is_success() {
             return agent_notification_acked(rec, resp).await;
         }
@@ -2560,6 +2576,7 @@ async fn bootstrap_then_register(
     {
         Ok(resp) => {
             let status = resp.status();
+            crate::auth::note_degraded_send_status(status.as_u16());
             if !status.is_success() {
                 let detail = resp.text().await.unwrap_or_default();
                 return write_failure_outcome(
@@ -2587,6 +2604,7 @@ async fn bootstrap_then_register(
     match with_gate_caller_session(rb, &rec.payload).send().await {
         Ok(resp) => {
             let status = resp.status();
+            crate::auth::note_degraded_send_status(status.as_u16());
             if status.is_success() {
                 log_registered_gate(rec, resp).await;
                 return PushOutcome::Acked;
