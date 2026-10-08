@@ -92,6 +92,7 @@ import {
   normalizePathInput,
   parseRepoCheckouts,
   planScanStatusLabel,
+  planScanStatusNote,
   repoCheckoutsDirty,
   scanSourceStatus,
   storedTenantOverrideCount,
@@ -481,7 +482,18 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
  * adapter looked and found nothing, which is not what a missing report means.
  */
 export function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
-  const accent = resolved.plan_tier_active ? getAccentColors("green") : getAccentColors("amber");
+  // Green means work units reach coord, not merely that the tier is on: a
+  // scanning tier whose pushes are withheld is amber, and one whose posture is
+  // not yet known is neutral (see `planScanStatusNote`).
+  const tone = !resolved.plan_tier_active
+    ? "amber"
+    : resolved.plan_work_unit_posture === null
+      ? "slate"
+      : resolved.plan_work_unit_posture.state === "write"
+        ? "green"
+        : "amber";
+  const accent = getAccentColors(tone);
+  const Icon = tone === "green" ? Check : tone === "slate" ? Info : TriangleAlert;
   return (
     <div
       data-ui-bridge-id="settings.paths-plan-scan-status"
@@ -489,20 +501,12 @@ export function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
       data-content-label="plan scanning status"
       className={`p-3 ${accent.bg} rounded-lg flex items-start gap-2`}
     >
-      {resolved.plan_tier_active ? (
-        <Check className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
-      ) : (
-        <TriangleAlert className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
-      )}
+      <Icon className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
       <div className="space-y-0.5">
         <p className={`text-xs font-medium ${accent.text}`}>
           {planScanStatusLabel(resolved.plan_tier_active, resolved.plan_scan_roots)}
         </p>
-        <p className={`text-[10px] ${accent.text}`}>
-          {resolved.plan_tier_active
-            ? "The adapter is scanning the device-wide plans directory and pushing work units to coord."
-            : "No device-wide plans directory is in effect, so nothing is scanned and no work units reach coord. Set one below to turn the tier on."}
-        </p>
+        <p className={`text-[10px] ${accent.text}`}>{planScanStatusNote(resolved)}</p>
       </div>
     </div>
   );

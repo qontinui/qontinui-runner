@@ -1502,24 +1502,6 @@ pub fn coord_http_base_from_url(coord_url: &str) -> String {
 // Pair: headless (--auth-token)
 // ============================================================================
 
-/// POST `Authorization: Bearer <user-jwt>` +
-/// `X-Qontinui-User-Id: <uuid>` to `POST /api/v1/devices/pair-cli` (the
-/// web backend's pair-cli proxy, which injects `tenant_id` server-side
-/// and forwards to coord). Coord verifies the bearer token, looks up the
-/// device, and returns a fresh device-token JWT.
-///
-/// Requirements (Defect 5):
-/// - `~/.qontinui/machine.json` must exist with a UUID `device_id`
-///   (run `qontinui_profile device init` first).
-/// - `{data_local_dir}/com.qontinui.runner/paired_user.json` must exist
-///   from a prior browser-pair (pair-cli is a refresh path, not a
-///   first-pair path).
-///
-/// Thin wrapper around [`pair_with_auth_token_with_ids`] — reads
-/// `device_id` and `user_id` from disk then delegates. Tests use the
-/// parameterized form directly so they can run hermetically against an
-/// in-process mock web backend without touching `~/.qontinui` or the
-/// `data_local_dir`.
 /// Decode the unverified payload of a JWT and pull the `tenant_id`
 /// claim, if any. Returns `None` if the token isn't a JWT, the payload
 /// isn't valid base64-decoded JSON, or no `tenant_id` claim is present.
@@ -1557,16 +1539,333 @@ fn tenant_id_from_jwt_claim(token: &str, claim: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Where a pair base URL came from and how to change it, built by the caller
-/// (this lib cannot see the bin-side `ApiBaseUrlArm`). Only rendered into the
-/// error when the request never got an answer, where the URL alone leaves the
-/// operator unable to tell which knob chose it.
+/// Where a pair base URL came from and how to change it. For the CLI web-base
+/// flows build it with [`CliWebBaseSource::pair_base_origin`]; other callers
+/// (the device-JWT refresher) build it from their own resolution ladder. Only
+/// rendered into the error when the request never got an answer, where the
+/// URL alone leaves the operator unable to tell which knob chose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairBaseOrigin {
     /// Short name of the rung/caller that chose the base.
     pub label: String,
     /// One-line instruction for pointing the pair at a different base.
     pub remedy: String,
+}
+
+/// Which rung of [`resolve_cli_web_base`] produced the web-backend base.
+///
+/// Serves all three CLI pairing flows — `--pair-code` redemption,
+/// `--auth-token` `pair-cli`, AND the `--browser` flow's `/connect-runner`
+/// page. The rungs have DIFFERENT remediations when a request fails against
+/// the resolved host, and the URL alone does not distinguish them —
+/// `https://api.qontinui.io` looks identical whether it came from an operator
+/// export, a profile's `api_url`, or the compiled-in default. Reporting the
+/// winning arm turns "wrong host" from a guess into a one-line fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliWebBaseSource {
+    /// `$QONTINUI_WEB_BASE` was set to a non-blank value. Fix: correct or
+    /// unset that var.
+    EnvOverride,
+    /// The active profile's `api_url` in `~/.qontinui/profiles.json`
+    /// (via [`crate::profiles::api_url_with_source`]). Fix: edit that field.
+    ProfileApiUrl(crate::profiles::ApiUrlSource),
+    /// Nothing configured; the compiled-in production default. Fix: export
+    /// `$QONTINUI_WEB_BASE` or set a profile `api_url` if you are not pairing
+    /// against production (a local dev backend is `http://127.0.0.1:8000`).
+    ProdDefault,
+}
+
+impl CliWebBaseSource {
+    /// Short operator-facing label naming the arm that chose the base.
+    pub fn label(&self) -> String {
+        match self {
+            CliWebBaseSource::EnvOverride => "$QONTINUI_WEB_BASE override".to_string(),
+            CliWebBaseSource::ProfileApiUrl(src) => {
+                format!(
+                    "profile `{}` api_url (~/.qontinui/profiles.json)",
+                    src.profile
+                )
+            }
+            CliWebBaseSource::ProdDefault => {
+                "compiled-in production default (no $QONTINUI_WEB_BASE, no profile api_url)"
+                    .to_string()
+            }
+        }
+    }
+
+    /// One-line instruction for pointing the pair at a different web backend.
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            CliWebBaseSource::EnvOverride => "Unset or correct QONTINUI_WEB_BASE.",
+            CliWebBaseSource::ProfileApiUrl(_) => "Edit api_url in ~/.qontinui/profiles.json.",
+            CliWebBaseSource::ProdDefault => {
+                "Export QONTINUI_WEB_BASE or set api_url in ~/.qontinui/profiles.json \
+                 to target a different web backend."
+            }
+        }
+    }
+
+    /// The [`PairBaseOrigin`] a pair request rendered from this rung carries.
+    pub fn pair_base_origin(&self) -> PairBaseOrigin {
+        PairBaseOrigin {
+            label: self.label(),
+            remedy: self.remedy().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for CliWebBaseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+/// Resolve the qontinui-web backend base the CLI pairing flows dial, WITH the
+/// arm that produced it. The one ladder for `--pair-code`, `--auth-token` and
+/// `--browser`; three rungs, in order:
+///
+/// 1. `env` (`$QONTINUI_WEB_BASE`) — an explicit operator override.
+/// 2. `profile` — the active profile's `api_url`, as returned by
+///    [`crate::profiles::api_url_with_source`]. Callers pass it in so tests
+///    never read the developer's real `~/.qontinui/profiles.json`.
+/// 3. [`crate::profiles::PROD_API_BASE_URL`] — the fleet's production default.
+///
+/// Blank/whitespace counts as unset on both configured rungs, matching how
+/// every other rung ladder in this workspace reads an exported-but-empty
+/// value. A trailing slash is trimmed so no rung can build `<base>//api/v1/…`.
+///
+/// # Why there is no derive-from-coord rung
+///
+/// There used to be a rung that derived this base from the active profile's
+/// `coord_url`, on the assumption that web and coord co-locate. It is
+/// **never** correct, in either environment:
+///
+/// * In PRODUCTION the two are different services — coord is
+///   `coord.qontinui.io`, the web backend is `api.qontinui.io`. The derived
+///   base sent a web-backend route to coord, which answers
+///   `401 missing operator Bearer token`. Measured on a headless box
+///   2026-09-02. Coord serves no `/api/v1/devices/*` route at all.
+/// * In DEV they share a host but NOT a port, and the derivation strips the
+///   port — `http://localhost:9870` derived to `http://localhost`, i.e. port
+///   80, while the dev backend listens on 8000.
+///
+/// A rung that is never correct is worse than no rung, because it outranks
+/// the working default and makes the failure look like a client bug.
+///
+/// The canonical runner resolver (`api_config::resolve_api_base_url`, which
+/// additionally weighs `$QONTINUI_WEB_BACKEND_URL`, `$QONTINUI_API_URL` and the
+/// persisted `web_integration.backend_url`) is deliberately NOT used: it lives
+/// in the runner binary's module tree and is unreachable from the
+/// `qontinui_profile` binary. Not named `resolve_web_base` — that name belongs
+/// to `memory::tenant_sync::resolve_web_base`, a different ladder.
+///
+/// The [`CliWebBaseSource`] half is returned rather than logged here so the
+/// function stays pure and the caller owns the output surface.
+pub fn resolve_cli_web_base(
+    env: Option<&str>,
+    profile: Option<(String, crate::profiles::ApiUrlSource)>,
+) -> (String, CliWebBaseSource) {
+    fn normalize(s: &str) -> String {
+        s.trim().trim_end_matches('/').to_string()
+    }
+    // Normalize BEFORE the blank test: a value of only slashes ("/", " // ")
+    // is not blank, but it normalizes to "" and would otherwise yield a
+    // host-less base. Such a value counts as unset, like a blank one.
+    if let Some(explicit) = env.map(normalize).filter(|s| !s.is_empty()) {
+        return (explicit, CliWebBaseSource::EnvOverride);
+    }
+    if let Some((url, src)) = profile
+        .map(|(u, s)| (normalize(&u), s))
+        .filter(|(u, _)| !u.is_empty())
+    {
+        return (url, CliWebBaseSource::ProfileApiUrl(src));
+    }
+    (
+        crate::profiles::PROD_API_BASE_URL.to_string(),
+        CliWebBaseSource::ProdDefault,
+    )
+}
+
+#[cfg(test)]
+mod cli_web_base_tests {
+    use super::*;
+    use crate::profiles::{ApiUrlSource, PROD_API_BASE_URL};
+
+    fn profile(url: &str) -> Option<(String, ApiUrlSource)> {
+        Some((
+            url.to_string(),
+            ApiUrlSource {
+                profile: "staging".to_string(),
+            },
+        ))
+    }
+
+    // A fresh machine with no profiles.json and no override must still be
+    // able to pair against production, not hard-error (fleet-join 2026-08-24).
+
+    #[test]
+    fn resolve_cli_web_base_prefers_env_override_over_everything() {
+        assert_eq!(
+            resolve_cli_web_base(
+                Some("https://custom.example/"),
+                profile("https://p.example")
+            ),
+            (
+                "https://custom.example".to_string(),
+                CliWebBaseSource::EnvOverride
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_ignores_an_empty_env_override() {
+        // An empty string is not a real override — e.g. `QONTINUI_WEB_BASE=`
+        // in an env file. Falls through exactly as if unset, and must report
+        // the arm that actually won rather than the one that was skipped.
+        assert_eq!(
+            resolve_cli_web_base(Some(""), None),
+            (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault)
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_prefers_profile_api_url_over_prod_default() {
+        let (base, arm) = resolve_cli_web_base(None, profile("http://127.0.0.1:8000/"));
+        assert_eq!(base, "http://127.0.0.1:8000");
+        assert_eq!(
+            arm,
+            CliWebBaseSource::ProfileApiUrl(ApiUrlSource {
+                profile: "staging".to_string()
+            })
+        );
+        assert_eq!(
+            arm.label(),
+            "profile `staging` api_url (~/.qontinui/profiles.json)"
+        );
+        // A blank profile value is unset, like a blank env override.
+        assert_eq!(
+            resolve_cli_web_base(Some("  "), profile("   ")).1,
+            CliWebBaseSource::ProdDefault
+        );
+    }
+
+    #[test]
+    fn slash_only_values_are_unset_on_both_rungs() {
+        // REGRESSION (review of e8ea66b81). A value that is only slashes is not
+        // blank before normalization but is empty after it; testing blankness
+        // first let it through as a host-less base ("" + "/api/v1/...").
+        for v in ["/", " // ", "///"] {
+            assert_eq!(
+                resolve_cli_web_base(Some(v), None),
+                (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault),
+                "env {v:?}"
+            );
+            assert_eq!(
+                resolve_cli_web_base(None, profile(v)),
+                (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault),
+                "profile {v:?}"
+            );
+        }
+        // A slash-only env override falls through to a real profile value.
+        assert_eq!(
+            resolve_cli_web_base(Some("/"), profile("https://p.example")).0,
+            "https://p.example"
+        );
+    }
+
+    #[test]
+    fn env_override_beats_profile_api_url() {
+        let (base, arm) =
+            resolve_cli_web_base(Some("https://env.example"), profile("https://p.example"));
+        assert_eq!(base, "https://env.example");
+        assert_eq!(arm, CliWebBaseSource::EnvOverride);
+    }
+
+    #[test]
+    fn resolve_cli_web_base_never_returns_the_coord_host() {
+        // REGRESSION. A rung used to derive this base from the active
+        // profile's coord_url. In production that sent a WEB-backend route to
+        // coord, which answers 401 (measured headless 2026-09-02); in dev it
+        // stripped the port and pointed at :80 instead of :8000. And
+        // `--auth-token` posted `pair-cli` straight to the coord base. Nothing
+        // may reintroduce a coord-derived answer: with nothing configured the
+        // ONLY permitted result is the production web base.
+        let (base, arm) = resolve_cli_web_base(None, None);
+        assert_eq!(base, PROD_API_BASE_URL);
+        assert_eq!(arm, CliWebBaseSource::ProdDefault);
+        assert!(
+            !base.contains("coord"),
+            "CLI web base must never resolve to a coord host, got {base}"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_treats_whitespace_env_as_unset() {
+        // An exported-but-blank var is how a shell says "absent"; it must not
+        // win the ladder and produce an empty base.
+        assert_eq!(
+            resolve_cli_web_base(Some("   "), None),
+            (PROD_API_BASE_URL.to_string(), CliWebBaseSource::ProdDefault)
+        );
+    }
+
+    #[test]
+    fn resolve_cli_web_base_trims_a_trailing_slash_from_the_override() {
+        // `QONTINUI_WEB_BASE=https://x/` would otherwise build `https://x//api/v1/...`.
+        assert_eq!(
+            resolve_cli_web_base(Some("https://custom.example/"), None),
+            (
+                "https://custom.example".to_string(),
+                CliWebBaseSource::EnvOverride
+            )
+        );
+    }
+
+    #[test]
+    fn cli_web_base_sources_have_distinct_operator_labels() {
+        // The whole point of the second return value: an operator reading the
+        // printed line must be able to tell the rungs apart, because each has
+        // a different fix. Identical labels would be worse than none.
+        let labels = [
+            CliWebBaseSource::EnvOverride.label(),
+            CliWebBaseSource::ProfileApiUrl(ApiUrlSource {
+                profile: "dev".to_string(),
+            })
+            .label(),
+            CliWebBaseSource::ProdDefault.label(),
+        ];
+        let unique: std::collections::HashSet<&String> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must be distinct: {labels:?}"
+        );
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        // Each label must name the knob the operator would turn.
+        assert!(labels[0].contains("QONTINUI_WEB_BASE"));
+        assert!(labels[1].contains("api_url"));
+        assert!(labels[2].contains("default"));
+    }
+
+    #[test]
+    fn each_rung_names_its_own_remedy() {
+        let env = CliWebBaseSource::EnvOverride.pair_base_origin();
+        assert!(env.remedy.contains("QONTINUI_WEB_BASE"));
+        let prof = CliWebBaseSource::ProfileApiUrl(ApiUrlSource {
+            profile: "dev".to_string(),
+        })
+        .pair_base_origin();
+        assert!(prof.label.contains("`dev`"));
+        assert!(prof.remedy.contains("api_url"));
+        let prod = CliWebBaseSource::ProdDefault.pair_base_origin();
+        assert!(prod.remedy.contains("QONTINUI_WEB_BASE") && prod.remedy.contains("api_url"));
+        for o in [&env, &prof, &prod] {
+            assert!(
+                !o.remedy.contains("coord_url"),
+                "a web-base remedy must not point at coord_url: {o:?}"
+            );
+        }
+    }
 }
 
 /// Replace URL userinfo (`scheme://user:pass@host`) with `scheme://***@host`
@@ -1617,6 +1916,24 @@ fn describe_send_error(url: &str, e: &reqwest::Error, origin: &PairBaseOrigin) -
     msg
 }
 
+/// POST `Authorization: Bearer <user-jwt>` +
+/// `X-Qontinui-User-Id: <uuid>` to `POST /api/v1/devices/pair-cli` (the
+/// web backend's pair-cli proxy, which injects `tenant_id` server-side
+/// and forwards to coord). Coord verifies the bearer token, looks up the
+/// device, and returns a fresh device-token JWT.
+///
+/// Requirements (Defect 5):
+/// - `~/.qontinui/machine.json` must exist with a UUID `device_id`
+///   (run `qontinui_profile device init` first).
+/// - `{data_local_dir}/com.qontinui.runner/paired_user.json` must exist
+///   from a prior browser-pair (pair-cli is a refresh path, not a
+///   first-pair path).
+///
+/// Thin wrapper around [`pair_with_auth_token_with_ids`] — reads
+/// `device_id` and `user_id` from disk then delegates. Tests use the
+/// parameterized form directly so they can run hermetically against an
+/// in-process mock web backend without touching `~/.qontinui` or the
+/// `data_local_dir`.
 pub fn pair_with_auth_token(
     base: &str,
     oauth_token: &str,
@@ -1876,19 +2193,15 @@ pub fn pair_via_browser(
     // coord's pair-complete.
     let device_id = read_device_id()?;
 
-    // Web backend URL: an explicit `$QONTINUI_WEB_BASE` override, else the
-    // fleet's production default. This deliberately does NOT derive from
-    // `coord_base`. That derivation assumed web and coord co-locate, which is
-    // false in BOTH environments — in prod they are different services
-    // (coord.qontinui.io vs api.qontinui.io), and in dev they share a host but
-    // not a port, while the derivation stripped the port. See
-    // `resolve_pair_code_base` in `bin/qontinui_profile.rs` for the full
-    // reasoning and the measured failure.
-    let web_base = std::env::var("QONTINUI_WEB_BASE")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| crate::profiles::PROD_API_BASE_URL.to_string());
+    // Web backend URL: the one CLI web-base ladder ($QONTINUI_WEB_BASE, then
+    // the active profile's api_url, then the production default). This
+    // deliberately does NOT derive from `coord_base` — see
+    // `resolve_cli_web_base` for the reasoning and the measured failure.
+    let (web_base, web_source) = resolve_cli_web_base(
+        std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+        crate::profiles::api_url_with_source(),
+    );
+    eprintln!("Opening connect-runner on {web_base} ({web_source})");
     let hostname_now = detect_hostname();
 
     // Bind a port for the callback. Use 0 to let the OS pick — then read it
@@ -4883,13 +5196,7 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         canonical,
         others,
         bare_default.as_deref(),
-        &|t: &uuid::Uuid, is_default: bool| {
-            crate::auth::holds_credential_for(
-                crate::auth::read_tenant_slot(&mgr, t).state(),
-                is_default,
-                crate::auth::read_legacy_slot(&mgr).state(),
-            )
-        },
+        &holds_credential_predicate(&mgr),
         &today,
     );
     if report.wrote_canonical
@@ -4920,6 +5227,47 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         );
     }
     report
+}
+
+/// The production credential predicate — "does this process hold a credential
+/// for `tenant`?" — shared by [`converge_binding_store`] (which merges under it)
+/// and [`binding_store_check`] (which judges the merge under it), so the two can
+/// never disagree about "credentialed".
+///
+/// Answers [`crate::auth::holds_credential_for`] over the tenant's own
+/// per-tenant slot and the LEGACY `access_token` slot. The legacy slot is read
+/// at most ONCE per predicate, and only when a DEFAULT tenant is asked about
+/// (`holds_credential_for` never consults it for a non-default tenant): the
+/// doctor builds one of these on every `/coord-mcp/doctor` probe, and the
+/// legacy read can reach the OS keychain.
+///
+/// **What "credentialed" establishes, stated so it is not over-claimed.**
+/// Per-tenant slots are file storage scoped by `$QONTINUI_SECURE_STORAGE_DIR`,
+/// so they are this installation's own. The legacy slot is not entirely:
+/// [`crate::auth::read_legacy_slot`] goes through `probe_access_token`, whose
+/// chain can fall back to the OS keychain under the fixed service name
+/// `com.qontinui.runner` — shared by every instance on the box. So for the
+/// DEFAULT tenant this predicate can be answered by another installation's
+/// keychain token. That is what converge merges under, and the doctor uses the
+/// very same predicate so that it judges the merge by the merge's own rule.
+pub(crate) fn holds_credential_predicate(
+    mgr: &crate::auth::AuthManager,
+) -> impl Fn(&uuid::Uuid, bool) -> Option<bool> + '_ {
+    let legacy: std::cell::OnceCell<crate::auth::SlotState> = std::cell::OnceCell::new();
+    move |tenant: &uuid::Uuid, is_default: bool| {
+        crate::auth::holds_credential_for(
+            crate::auth::read_tenant_slot(mgr, tenant).state(),
+            is_default,
+            // `holds_credential_for` consults the legacy slot only for the
+            // default tenant, so a non-default probe never pays the (possibly
+            // keychain-backed) read; `Absent` is never inspected on that arm.
+            if is_default {
+                *legacy.get_or_init(|| crate::auth::read_legacy_slot(mgr).state())
+            } else {
+                crate::auth::SlotState::Absent
+            },
+        )
+    }
 }
 
 /// Path-parameterized core of [`converge_binding_store`] — explicit canonical
@@ -5362,187 +5710,11 @@ fn supersede_copy(from: &std::path::Path, today: &str) -> Result<PathBuf, String
 }
 
 // ----------------------------------------------------------------------------
-// The doctor check
+// The doctor check — read-only, in `pair/binding_store_doctor.rs`
 // ----------------------------------------------------------------------------
 
-/// One computed copy, described. Serialized into `/coord-mcp/doctor`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BindingStoreCopyView {
-    pub path: String,
-    /// Is this the file [`paired_user_path`] resolves to?
-    pub canonical: bool,
-    /// `present` | `absent` | `unreadable`.
-    pub read: &'static str,
-    /// The migrated binding set, sorted. `None` is UNKNOWN (unreadable) —
-    /// never an empty list, which would read as "bound to nothing".
-    pub tenants: Option<Vec<String>>,
-    pub default_tenant_id: Option<String>,
-    /// `Some(true)` when this copy is in the pre-v2 single-tenant shape.
-    pub legacy_shape: Option<bool>,
-    /// `tenant_id -> paired_at`, for the REPORT-only difference arm.
-    pub paired_at: Option<std::collections::BTreeMap<String, String>>,
-}
-
-/// The split-brain verdict over the computed copies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BindingStoreCheck {
-    /// `ok` | `report` | `fail` | `unknown`.
-    ///
-    /// - `fail` — two live copies disagree on the BINDING SET or on
-    ///   `default_tenant_id`. That is a real split brain: which file a
-    ///   process reads decides which tenants it believes exist.
-    /// - `report` — they agree on both, and differ only on `paired_at`.
-    ///   That is cosmetic, and it is the ONLY way the copies differ on the
-    ///   operator box today, so failing on it would fail a healthy machine
-    ///   from day one and get the check disabled. Deciding priority:
-    ///   robustness.
-    /// - `unknown` — a copy exists and could not be read. UNKNOWN is never
-    ///   "no disagreement" (same discipline as `tenant_slots_unknown` and
-    ///   `auth::BindingTenantRead::Unknown`).
-    /// - `ok` — fewer than two live copies, or they agree outright.
-    pub verdict: &'static str,
-    pub detail: String,
-    pub copies: Vec<BindingStoreCopyView>,
-}
-
-impl BindingStoreCheck {
-    /// Does this verdict FAIL the doctor?
-    pub fn failed(&self) -> bool {
-        self.verdict == "fail"
-    }
-    /// Is the comparison UNKNOWN? A caller must not read this as agreement.
-    pub fn is_unknown(&self) -> bool {
-        self.verdict == "unknown"
-    }
-}
-
-/// Inspect the `paired_user.json` copies this process would itself compute.
-/// Read-only — the doctor never writes.
-pub fn binding_store_check() -> BindingStoreCheck {
-    inspect_binding_store_paths(&binding_store_candidate_paths())
-}
-
-/// Path-parameterized core of [`binding_store_check`]. `paths[0]` is the
-/// canonical one.
-pub(crate) fn inspect_binding_store_paths(paths: &[PathBuf]) -> BindingStoreCheck {
-    let copies: Vec<BindingStoreCopyView> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| describe_binding_store_copy(p, i == 0))
-        .collect();
-
-    let live: Vec<&BindingStoreCopyView> = copies.iter().filter(|c| c.read != "absent").collect();
-    let unreadable = live.iter().filter(|c| c.read == "unreadable").count();
-    let readable: Vec<&&BindingStoreCopyView> =
-        live.iter().filter(|c| c.read == "present").collect();
-
-    // Order matters: a disagreement we CAN see is a fail even when another
-    // copy is unreadable, but an unreadable copy must never let "the rest
-    // agree" stand in for "no disagreement".
-    let sets_differ = readable
-        .windows(2)
-        .any(|w| w[0].tenants != w[1].tenants || w[0].default_tenant_id != w[1].default_tenant_id);
-    let paired_at_differs = readable
-        .windows(2)
-        .any(|w| w[0].paired_at != w[1].paired_at);
-
-    let (verdict, detail) = if sets_differ {
-        (
-            "fail",
-            format!(
-                "{} live paired_user.json copies disagree on the binding set or on \
-                 default_tenant_id — which file a process reads decides which tenants it \
-                 believes exist. Run the runner once to converge them (the non-canonical \
-                 copy is left as .superseded-<date>), or reconcile by hand.",
-                readable.len()
-            ),
-        )
-    } else if unreadable > 0 {
-        (
-            "unknown",
-            format!(
-                "{unreadable} of {} live paired_user.json copies could not be read — \
-                 agreement is UNKNOWN, not established. An unreadable copy is never \
-                 evidence of no disagreement.",
-                live.len()
-            ),
-        )
-    } else if paired_at_differs {
-        (
-            "report",
-            format!(
-                "{} live paired_user.json copies agree on the binding set and on \
-                 default_tenant_id, and differ only on paired_at — cosmetic, reported \
-                 rather than failed.",
-                readable.len()
-            ),
-        )
-    } else if readable.len() < 2 {
-        (
-            "ok",
-            format!(
-                "{} live paired_user.json copy/copies under a path this process computes — \
-                 nothing to disagree with.",
-                readable.len()
-            ),
-        )
-    } else {
-        (
-            "ok",
-            format!("{} live paired_user.json copies agree.", readable.len()),
-        )
-    };
-
-    BindingStoreCheck {
-        verdict,
-        detail,
-        copies,
-    }
-}
-
-fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> BindingStoreCopyView {
-    let mut view = BindingStoreCopyView {
-        path: path.display().to_string(),
-        canonical,
-        read: "absent",
-        tenants: None,
-        default_tenant_id: None,
-        legacy_shape: None,
-        paired_at: None,
-    };
-    if !path.exists() {
-        return view;
-    }
-    let Some(pf) = read_paired_user_file_at(path) else {
-        // Present and unreadable. `tenants: None` stays UNKNOWN.
-        view.read = "unreadable";
-        return view;
-    };
-    view.read = "present";
-    let bindings = pf.effective_bindings();
-    let mut tenants: Vec<String> = bindings
-        .iter()
-        .map(|b| b.tenant_id.trim().to_string())
-        .collect();
-    tenants.sort();
-    tenants.dedup();
-    view.tenants = Some(tenants);
-    view.default_tenant_id = pf
-        .effective_default_tenant_id()
-        .map(|d| d.trim().to_string());
-    view.legacy_shape = Some(!pf.is_v2());
-    view.paired_at = Some(
-        bindings
-            .iter()
-            .filter_map(|b| {
-                b.paired_at
-                    .as_ref()
-                    .map(|p| (b.tenant_id.trim().to_string(), p.clone()))
-            })
-            .collect(),
-    );
-    view
-}
+mod binding_store_doctor;
+pub use binding_store_doctor::{binding_store_check, BindingStoreCheck, BindingStoreCopyView};
 
 // ============================================================================
 // D4 gate — "One binding store"
@@ -5559,26 +5731,36 @@ fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> Bindi
 //   2. both bindings survive the merge;
 //   3. the legacy single-tenant copy is migrated in place to v2;
 //   4. `bindings` gains NO tenant this runner has no credential for;
-//   5. the doctor check FAILS on a binding-set / `default_tenant_id`
-//      disagreement;
-//   6. the doctor check only REPORTS a `paired_at`-only difference;
-//   7. an unreadable copy reads as UNKNOWN, never as "no disagreement".
+//   5. the doctor check FAILS only on a MERGE GAP — a tenant another copy
+//      carries, that this process holds a credential for, and that the
+//      canonical lacks — or on a credential with no canonical store at all;
+//   6. the doctor check only REPORTS the expected one-way-merge residue
+//      (withheld / credential-unknown tenants, canonical-only tenants, a
+//      differing `default_tenant_id`, `paired_at` / `user_id` differences);
+//      two copies DIFFERING is the permanent, intended state under an
+//      override, so it is never by itself a fail;
+//   7. an unreadable copy reads as UNKNOWN, never as "nothing missing".
+//
+// Items 5-7 are asserted in `pair/binding_store_doctor.rs`'s tests, which
+// share this module's fixtures (hence the `pub(super)` items below); plan
+// 2026-10-02-binding-store-doctor-fails-forever-on-the-store-an-override-runner-must-retain
+// retired the pairwise "two copies must agree" rules these items used to state.
 #[cfg(test)]
 mod one_binding_store_tests {
     use super::*;
     use std::path::Path;
 
     /// `c231d9da…` on the operator box — the device default.
-    const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
+    pub(super) const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
     /// `7ac125b6…` on the operator box — Portofino, the second binding.
-    const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
+    pub(super) const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
     /// A tenant NO slot exists for. The merge must never admit it.
-    const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
-    const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    pub(super) const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
+    pub(super) const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// The production predicate, with the store answers pinned: the two real
     /// tenants have slots, everything else does not.
-    fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
+    pub(super) fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
         let slot = match tenant.to_string().as_str() {
             DEFAULT_TENANT | SECOND_TENANT => crate::auth::SlotState::Usable,
             _ => crate::auth::SlotState::Absent,
@@ -5586,13 +5768,13 @@ mod one_binding_store_tests {
         crate::auth::holds_credential_for(slot, is_default, crate::auth::SlotState::Usable)
     }
 
-    fn write(path: &Path, body: &str) {
+    pub(super) fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
 
     /// v2 shape: `bindings` + `default_tenant_id` + the legacy mirrors.
-    fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
+    pub(super) fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
         format!(
             r#"{{
   "user_id": "{USER}",
@@ -5608,7 +5790,7 @@ mod one_binding_store_tests {
 
     /// The 4-month-stale `%APPDATA%/com.qontinui.runner/paired_user.json`:
     /// pre-v2 single-tenant shape, no `bindings` array at all.
-    fn legacy() -> String {
+    pub(super) fn legacy() -> String {
         format!(r#"{{"user_id": "{USER}", "tenant_id": "{DEFAULT_TENANT}"}}"#)
     }
 
@@ -5944,128 +6126,6 @@ mod one_binding_store_tests {
         );
         assert!(other.exists(), "and it is left in place");
         assert!(!report.wrote_canonical);
-    }
-
-    // ------------------------------------------------------------------
-    // 5 + 6 — the doctor check
-    // ------------------------------------------------------------------
-
-    /// FAILS on a binding-set disagreement, and again on a
-    /// `default_tenant_id` disagreement — the two ways a split brain changes
-    /// which tenants a process believes exist.
-    #[test]
-    fn doctor_check_fails_on_a_binding_set_or_default_tenant_disagreement() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-
-        // Binding-set disagreement: the legacy copy cannot see the second
-        // binding at all. This is the operator box's %APPDATA% copy.
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, &legacy());
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(check.verdict, "fail", "{}", check.detail);
-        assert!(check.failed());
-        assert_eq!(
-            check.copies[1].legacy_shape,
-            Some(true),
-            "the legacy shape must be visible in the report"
-        );
-
-        // default_tenant_id disagreement, same binding set.
-        write(
-            &b,
-            &format!(
-                r#"{{"user_id":"{USER}","tenant_id":"{SECOND_TENANT}",
-  "bindings":[
-    {{"tenant_id":"{DEFAULT_TENANT}","user_id":"{USER}","paired_at":"2026-09-17T15:42:00Z"}},
-    {{"tenant_id":"{SECOND_TENANT}","user_id":"{USER}","paired_at":"2026-08-02T10:00:00Z"}}],
-  "default_tenant_id":"{SECOND_TENANT}"}}"#
-            ),
-        );
-        let check = inspect_binding_store_paths(&[a, b]);
-        assert_eq!(
-            check.verdict, "fail",
-            "same tenants, different default — still a split brain: {}",
-            check.detail
-        );
-    }
-
-    /// Only REPORTS a `paired_at`-only difference. This is the ONLY way the
-    /// copies differ on the operator box today, so a strict check would fail
-    /// a healthy machine from day one and get disabled.
-    #[test]
-    fn doctor_check_only_reports_a_paired_at_only_difference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
-
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(
-            check.verdict, "report",
-            "a paired_at-only difference is cosmetic: {}",
-            check.detail
-        );
-        assert!(!check.failed(), "and it must NOT fail the doctor");
-        assert!(check.detail.contains("paired_at"));
-
-        // Identical copies: plain ok.
-        write(&b, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        assert_eq!(inspect_binding_store_paths(&[a, b]).verdict, "ok");
-    }
-
-    /// One copy (the shape of a box with no `$QONTINUI_SECURE_STORAGE_DIR`)
-    /// is `ok`, not a fail.
-    #[test]
-    fn doctor_check_is_ok_with_a_single_live_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let missing = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-
-        let check = inspect_binding_store_paths(&[a, missing]);
-        assert_eq!(check.verdict, "ok", "{}", check.detail);
-        assert_eq!(check.copies[1].read, "absent");
-        assert_eq!(
-            check.copies[1].tenants, None,
-            "an ABSENT copy carries no binding list"
-        );
-    }
-
-    /// UNKNOWN discipline: an unreadable copy must never read as "no
-    /// disagreement", and a disagreement we CAN see still fails.
-    #[test]
-    fn doctor_check_reports_unknown_not_agreement_for_an_unreadable_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a/paired_user.json");
-        let b = tmp.path().join("b/paired_user.json");
-        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
-        write(&b, "\u{0}\u{1}not-json-at-all");
-
-        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
-        assert_eq!(
-            check.verdict, "unknown",
-            "an undecryptable/corrupt copy is UNKNOWN, never 'the rest agree': {}",
-            check.detail
-        );
-        assert!(check.is_unknown());
-        assert!(!check.failed(), "unknown is not a fail either");
-        assert_eq!(check.copies[1].read, "unreadable");
-        assert_eq!(
-            check.copies[1].tenants, None,
-            "an unreadable copy must NOT report an empty binding list — absence is not zero"
-        );
-
-        // A visible disagreement beats the unknown: still a fail.
-        let c = tmp.path().join("c/paired_user.json");
-        write(&c, &legacy());
-        assert_eq!(
-            inspect_binding_store_paths(&[a, c, b]).verdict,
-            "fail",
-            "a disagreement we can see is not masked by a copy we cannot read"
-        );
     }
 
     // ------------------------------------------------------------------

@@ -66,6 +66,7 @@ import {
   type SessionFileChange,
   type SessionFileChangesResponse,
 } from "./workerFileChanges";
+import { TabTitle } from "./displayTitle";
 
 // ── Pure presentation logic (exported for tests) ──────────────────────────────
 
@@ -933,7 +934,7 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
           Worker
         </span>
         <span className="truncate text-[11px] text-[#a9b1d6]" title={taskRunId}>
-          {tab.title}
+          <TabTitle tab={tab} />
         </span>
         <WorkerStateBadge
           state={session.sessionState}

@@ -806,6 +806,13 @@ pub mod test_support {
 
     /// The guard [`env_lock`] returns. Opaque on purpose — see that function
     /// for why it is not a bare `MutexGuard`.
+    ///
+    /// Drop guards on a thread in REVERSE acquisition order. The real mutex
+    /// lives in whichever guard was acquired FIRST on the thread (including
+    /// one embedded in a child test-lock guard), so dropping that outer guard
+    /// early releases `ENV_LOCK` while later guards still count as nested —
+    /// a silent loss of exclusion, not a deadlock.
+    #[must_use = "a test-lock guard locks nothing once dropped; bind it for the whole test body"]
     pub struct EnvLockGuard {
         /// `Some` only for the OUTERMOST acquisition on this thread; a nested
         /// one holds nothing and so releases nothing when it drops.
@@ -841,6 +848,58 @@ pub mod test_support {
         };
         ENV_LOCK_DEPTH.with(|d| d.set(depth + 1));
         EnvLockGuard { _inner: inner }
+    }
+
+    /// How many [`EnvLockGuard`]s THIS thread holds right now — `0` means it
+    /// does not hold the env lock at all.
+    ///
+    /// A probe for the test-lock hierarchy: every cross-module test lock (the
+    /// plan-capture pin, `posture_test_lock`, …) takes [`env_lock`] BEFORE its
+    /// own mutex and holds it for the guard's life, so "this thread holds child
+    /// lock X" must imply a depth of at least 1 here. Tests assert exactly
+    /// that. Plan
+    /// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`.
+    pub fn env_lock_depth() -> usize {
+        ENV_LOCK_DEPTH.with(|d| d.get())
+    }
+
+    /// The guard of a CHILD lock in the test-lock hierarchy: the child mutex's
+    /// guard plus the [`env_lock`] guard held beneath it.
+    ///
+    /// Field order is load-bearing — fields drop in declaration order, so the
+    /// child is released BEFORE the env lock, the reverse of acquisition, which
+    /// is also the LIFO order [`EnvLockGuard`]'s per-thread depth needs.
+    #[must_use = "a test-lock guard locks nothing once dropped; bind it for the whole test body"]
+    pub struct TestLockGuard {
+        _child: MutexGuard<'static, ()>,
+        _env: EnvLockGuard,
+    }
+
+    /// Acquire a cross-module test lock as a child of [`env_lock`]: the env
+    /// lock FIRST, then `child`, both held until the returned guard drops.
+    ///
+    /// **Why every shared test lock goes through this.** `env_lock` is the
+    /// root of the test-lock hierarchy. It is reentrant per thread, so a thread
+    /// that holds a child already holds `env_lock`, and a later `env_lock()` /
+    /// `isolated_ambient()` on that thread nests instead of waiting; and any
+    /// thread waiting on a child mutex also holds `env_lock`, so the child's
+    /// holder cannot be on another thread. A test may therefore take a child
+    /// and the env lock in EITHER order without an AB/BA deadlock. A child
+    /// mutex taken WITHOUT `env_lock` first is a sibling, and two siblings taken
+    /// in opposite orders on two threads hang `cargo test` — which the
+    /// plan-capture pin and `env_lock` did (plan
+    /// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`).
+    /// `env_test_lock_hierarchy_guard.rs` (runner bin) enforces it.
+    ///
+    /// Poison-recovering, like [`env_lock`]: the child protects a test
+    /// ordering, so one panicking holder must not cascade into its siblings.
+    pub fn hierarchy_lock(child: &'static Mutex<()>) -> TestLockGuard {
+        let env = env_lock();
+        let child = child.lock().unwrap_or_else(|p| p.into_inner());
+        TestLockGuard {
+            _child: child,
+            _env: env,
+        }
     }
 
     /// RAII guard that restores the captured env vars to their pre-capture
@@ -1149,10 +1208,127 @@ pub mod test_support {
             crate::profiles::set_runtime_tier_override(None);
         }
     }
+
+    /// Root under which every test PROCESS gets its own scratch directory.
+    pub const PROCESS_SCRATCH_ROOT: &str = "qontinui-test-scratch";
+
+    /// How old a sibling process's scratch directory must be before the first
+    /// call in a new process prunes it. Long enough that no live suite run is
+    /// touched, short enough that the temp dir does not grow without bound.
+    const STALE_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+    /// A directory under the system temp dir that belongs to THIS test process
+    /// alone: `<temp>/qontinui-test-scratch/<pid>/<label>`, created on demand.
+    ///
+    /// Test helpers used to build fixed paths such as
+    /// `env::temp_dir().join("qontinui_test_auth")` and `remove_file` + re-seed
+    /// a store in them. Two runner test processes on one box — what parallel
+    /// agent worktrees run all day — then shared and clobbered each other's
+    /// stores, and tests such as `auth::tests::test_device_id_persistence` went
+    /// red only while a sibling PROCESS was live. Neither `isolated_ambient()`
+    /// (no `TMPDIR` key) nor cargo-guard's per-process config sandbox redirects
+    /// `env::temp_dir()`, so the path itself has to be process-scoped. Plan
+    /// `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`
+    /// Phase 3.
+    ///
+    /// Within one process, callers keep their per-test file names, exactly as
+    /// before. The first call in a process removes sibling `<pid>` directories
+    /// older than a day (best-effort), so the root does not grow per run.
+    pub fn process_scratch_dir(label: &str) -> PathBuf {
+        static PRUNED: std::sync::Once = std::sync::Once::new();
+        let root = std::env::temp_dir().join(PROCESS_SCRATCH_ROOT);
+        let pid = std::process::id().to_string();
+        PRUNED.call_once(|| prune_stale_scratch(&root, &pid));
+        let dir = root.join(&pid).join(label);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn prune_stale_scratch(root: &Path, own_pid: &str) {
+        // The temp dir is world-writable on Unix: never follow a root that is
+        // not a real directory (a planted symlink would aim the prune at
+        // someone else's tree), and only ever touch `<pid>`-named entries.
+        let root_is_real_dir = std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir());
+        if !root_is_real_dir {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == own_pid || name.parse::<u32>().is_err() {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_SCRATCH_AGE);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The per-process scratch dir is per PROCESS (two pids never share it)
+    /// and per LABEL, and it exists once handed out.
+    #[test]
+    fn process_scratch_dir_is_scoped_to_this_process() {
+        let dir = test_support::process_scratch_dir("ambient_scratch_probe");
+        assert!(dir.is_dir(), "the scratch dir is created on demand");
+        let pid = std::process::id().to_string();
+        let parent = dir.parent().expect("label dir has a parent");
+        assert_eq!(parent.file_name().unwrap().to_string_lossy(), pid);
+        assert_eq!(
+            parent
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            test_support::PROCESS_SCRATCH_ROOT
+        );
+        assert_ne!(
+            dir,
+            test_support::process_scratch_dir("ambient_scratch_other")
+        );
+    }
+
+    /// Source pin: the test helpers that used to share FIXED temp paths
+    /// across processes must not grow a literal-named `temp_dir().join("…")`
+    /// again — that is the cross-process clobber the per-process scratch dir
+    /// retired. A literal name is the defect; a `format!` that carries a
+    /// pid or a uuid is unique already and stays allowed.
+    #[test]
+    fn no_fixed_name_temp_dir_join_in_the_store_test_helpers() {
+        let sources: &[(&str, &str)] = &[
+            ("auth.rs", include_str!("auth.rs")),
+            ("secure_storage.rs", include_str!("secure_storage.rs")),
+            (
+                "mcp/device_jwt_refresher.rs",
+                include_str!("mcp/device_jwt_refresher.rs"),
+            ),
+        ];
+        let mut offenders = Vec::new();
+        for (name, src) in sources {
+            let compact: String = src.split_whitespace().collect();
+            let hits = compact.matches("temp_dir().join(\"").count();
+            if hits > 0 {
+                offenders.push(format!("{name}: {hits}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "fixed-name `temp_dir().join(\"…\")` is shared by every test process on the box \
+             — use `test_env::process_scratch_dir(label)` instead: {offenders:?}"
+        );
+    }
+
     use super::test_support::*;
     use super::*;
     use proc_macro2::{Delimiter, TokenStream, TokenTree};

@@ -166,7 +166,14 @@ permissions:
 concurrency:
   # Keyed on the ref so a dispatch on a branch cannot collide with the nightly.
   # cancel-in-progress: false so a dispatch never kills a nightly mid-push.
-  group: schema-pg-sql-freshness-nightly-${{ github.ref }}
+  # Since 2026-10-05 a first-attempt pull_request run (the selftest lane) gets
+  # a per-PR group instead, so a newer push reaps an older head's PENDING
+  # selftest; schedule/dispatch/re-runs keep the per-ref serialisation above.
+  # One expression, so coord models it as "" (never reaper-at-risk).
+  # KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
+  # compares groups with `=`, so every "" group matches every other one and
+  # suppresses its auto re-run; the fix belongs in coord.
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('schema-pg-sql-freshness-nightly-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:

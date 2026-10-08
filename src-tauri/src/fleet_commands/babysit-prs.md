@@ -615,7 +615,68 @@ not apply to this code), no override arranged by the agent.
 | `reversal_gate` | the repo's `Migration Reversal Gate` check at the head is absent or not green | Fix that check | `fixed-and-waiting` |
 | `migration_disposition` | coord could not EVALUATE the migration (fetch failure, no GitHub App client, file missing at head) — not a check | Fix the cause `reason` names; if transient, re-evaluate (`coord_reevaluate`) | `fixed-and-waiting` |
 | `secret_scan` | the secret scan must pass, and THEN an operator override is still required | Get the scan green, then ask the operator — secrets is closed-list item 1 | `operator-escalated` |
-| `awaiting_operator_override` | every other category (`infra`, `dependencies`, `other`) and dispositions `block_hard` / `block_soft` | Ask the operator to review and override or reject — closed-list item 2 (the `strategy_admin` override is a resource no agent can obtain) | `operator-escalated` |
+| `awaiting_operator_override` | category `infra` / `dependencies` / `other`, any disposition — and also a `migrations` hit whose policy is `block_hard` / `block_soft`, or any hit on coord's secret floor. ⚠️ **For an `infra` / `dependencies` / `other` hit off the floor, the string predates coord's evidence door and does NOT mean operator-only** — coord's own `next_action` for those names the door; for the migration and floor cases it says operator-only, and means it | Read the per-hit `clearable_by` table (next note) and act per hit: `agent` → submit an evidence bundle; `operator` → ask the operator with a recommendation (closed-list item 2); `classifier` → see the `classifier` bullet (a `block_hard` / `block_soft` migration is operator-only) | `fixed-and-waiting` (bundle accepted, every hit cleared) or `operator-escalated` (an `operator` hit remains) |
+
+**Read `clearable_by` per HIT before deciding anyone but you acts — the
+verdict's `escalate` block does not carry it.** Coord appends a per-hit table
+(`path | glob | category | disposition | clearable_by`) to the merge-gate check
+run, and the same content flattened into `coord_pr_status` `blockers`
+(`escalate-path hits: agent: …; operator: …`). It is computed from the head's
+FILES (`qontinui-coord` `pr_merge::escalate_evidence::clearable_by` /
+`escalate_hit_rows`), so it is present even while an earlier tier masks the
+escalate one — the line then reads "pending behind `<code>`"; clear that tier
+first. One PR can carry hits with different values; each is handled on its own:
+
+- **`agent`** (`infra`, `dependencies`, `other`, off the secret floor) — you
+  clear it. Call `coord_submit_escalate_evidence` (on the device default tool
+  set; HTTP twin `POST /pr-merge/repos/:repo/pulls/:number/agent/escalate-evidence`;
+  both run the one core `pr_merge::escalate_evidence::submit_escalate_evidence`).
+  Arguments `{repo, pr, head_sha, hits, review, independence, category_proof?}`
+  — note `pr`, not the verdict tool's `pr_number`. Gather, for the CURRENT head:
+  1. `head_sha` — the PR's head now; a push after submission invalidates it.
+  2. An independent review of THIS head, recorded as a
+     `Coord-Reviewed-Head: <sha>` line in the PR body. Coord harvests that
+     trailer into a `coord:reviewed-head=` label and reads it itself
+     (`predicate::review_evidence`) rather than trusting `review`, which is
+     just your reference to it.
+  3. One `hits[]` entry per `agent` hit — evidence is all-or-nothing per head
+     (`hits_uncovered`). Each `disclosure` must QUOTE, verbatim, a line from
+     that file's diff at this head and say why the change is acceptable; coord
+     checks the quote mechanically. ⚠️ The tool description says a
+     `category_proof` replaces that grounding; the core deliberately does NOT
+     (`check_hit_evidence`) — quote the diff anyway.
+  4. A `dependencies` hit additionally needs a `category_proof` (version-only,
+     first-party provenance) or `package_audit` entries
+     `{package, publisher, verified}`; without one it is `dependency_not_audited`,
+     and the block carries your recommendation to the operator instead.
+  5. `independence` `{claim, verified, against}`, all non-empty. A subagent
+     handed the diff and not your reasoning qualifies, sharing your device
+     credential included — the recorded claim is the control.
+
+  The credential must be holder-issued (the anonymous `POST /agents/credential`
+  mint is refused) AND carry the `introspect` scope — the anonymous
+  `POST /agents/allocate` mint is holder-issued but lacks it, and is refused
+  too. Read the credential's claims before submitting, not after a refusal
+  (over MCP these two credential refusals come back as a message with no code;
+  every refusal from the shared core reads `<code>: <message>`). Coord recomputes the hits,
+  announces the clearance to the operator feed, and only then writes the marker
+  itself. Refusals name the failed check: `head_moved` (re-submit against
+  `current_head`), `review_not_for_head` (add the trailer), `disclosure_not_grounded`
+  (quote the diff), `disclosure_unverifiable` and `notification_failed`
+  (retryable; no marker was written). Verify by read — re-read
+  `coord_pr_merge_verdict` — never by the call's own success.
+- **`classifier`** (`migrations`) — never put it in a bundle: naming it is
+  refused (`not_agent_clearable`), and leaving it out leaves it in the
+  accepted bundle's `not_cleared`. The remedy depends on the disposition. Under
+  `auto_if_provably_safe` it is the `migration_classifier` / `reversal_gate`
+  rows above. Under `block_hard` / `block_soft` the classifier never runs, so
+  the hit is operator-only (coord `merge_verdict::escalate_next_action_on_floor`
+  says so). Ask the operator with a recommendation: override, or change the
+  supplying escalate policy (`sources`) to `auto_if_provably_safe`.
+- **`operator`** — a `secrets` hit is the `secret_scan` row (get the scan green,
+  then ask the operator). A non-secrets hit on coord's compiled-in secret floor
+  has no scan step and is an operator override only. The floor is empty
+  today; the rule is by class.
 
 **The override is a human decision by design, not a mechanical act.**
 `coord_attest_escalate_override` requires the `strategy_admin` scope precisely
@@ -623,7 +684,8 @@ so that no device or agent token can self-clear its own escalation
 (`crates/coord/src/mcp/tools.rs`, the override tool's authorization comment).
 Where the table says ask, the ask is the review decision itself — "review this
 change, then override or reject" — never a request to press a button, and
-never a reason to build an agent-clearable path around it.
+never a reason to build an agent-clearable path around it. Coord's evidence door above is not such a path: it is coord's own, it grants no
+scope, and coord writes the marker; the override tool stays operator-only.
 
 **When an ask is owed is served policy, not this file** — read it fresh
 (`/policy`) rather than from a copy here: [policy: `escalation-bar`
@@ -959,6 +1021,25 @@ Then:
    Stop-mode cancel is class C, and a 409 from the door is a successful guard,
    never something to retry.
    **Adopting a foreign branch (route-around) — the only shape it may take.**
+   **First, read what the implementer left you.** A diff shows what changed,
+   never what must NOT change. The implementing session's handoff record
+   (`handoff-arm/1` — plan
+   `2026-09-10-the-fixer-contract-authority-context-and-provenance-on-a-pr-you-did-not-author`
+   Phase 1) is five `Coord-Handoff-*` trailers in the PR body, keyed to the
+   head they describe; coord harvests them like `Coord-Reviewed-Head:` and
+   serves them on the `coord_pr_status` card as `handoff` (`state:
+   present|stale|absent` + `load_bearing[]`, `rejected[]`, `fragile[]`,
+   `deploy_order[]`). Read it through the card when a coord door is live, or
+   through the credential-free twin
+   `bash <workspace-root>/qontinui-claude-config/scripts/handoff-arm-check.sh <owner/repo#N>`
+   (exit 0 present, 1 stale — written for an earlier head, items still
+   shown — 3 **absent**, 2 PR unreadable, which is UNKNOWN and never
+   absent). **Absent is UNKNOWN, never "nothing load-bearing"**:
+   the implementer recorded nothing, so proceed with MORE caution, not less,
+   and say in your PR body which state you read. A `rejected[]` item is a
+   settled fork — do not re-litigate it (coord#1815's rescue re-opened one
+   `design-tradeoff-ranking#1` had already decided); a `deploy_order[]` item
+   is a landing constraint your new PR inherits (`Coord-Downstream-Of:`).
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —
@@ -984,6 +1065,8 @@ Then:
    ```
 
    Run `bash <workspace-root>/qontinui-claude-config/scripts/adoption-disclosure-check.sh --body-file <the body>`
+   (the body file lives in a private `mktemp -d` dir, never as a fixed name in
+   the scratchpad every subagent shares — `knowledge-base/qontinui-specific/common-pitfalls.md` §17)
    before `gh pr create`; it exits 1 naming the missing line. And **verify
    the `Untouched` sha against the ORIGINAL branch's provenance, not against
    your own** — coord#2034 certified a branch as untouched at a sha that was

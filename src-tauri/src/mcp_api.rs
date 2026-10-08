@@ -4632,6 +4632,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_claim_release",
     "coord_conflict_check",
     "coord_declare_intent",
+    // The direct supersession-declaration door (qontinui-coord, operator
+    // directive 2026-10-03, served policy `git-operations`
+    // `a-landed-adoption-closes-its-predecessor`). It records the declaration
+    // `coord_repoint_gate`'s supersession arm needs when a successor's title
+    // token was missing or not recorded — every precondition (tenant owns both
+    // repos, successor LANDED, successor not a fork) is verified by coord.
+    // Withheld here it would answer `-32601`, and the adoption's last two steps
+    // (move the gate, close the predecessor) would stay operator-only.
+    "coord_declare_supersession",
     "coord_diagnose",
     "coord_diff_impact",
     "coord_edit_predict",
@@ -4665,6 +4674,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Phase 2: the triage-stamp door. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
     // is the grant authority; this list only forwards.
     "coord_mark_findings_triaged",
+    // Plan 2026-09-21-a-memory-write-receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
+    // Phase 1: the by-id read-back of a memory write receipt. A pure read; added
+    // WITH the coord tool so the receipt's own door never answers -32601.
+    "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_record",
     "coord_memory_search",
@@ -4686,9 +4699,20 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_primary_tree_branch_status",
+    // Plan 2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously
+    // Phase 4: the post-land re-verification lane's three coord tools. This one
+    // is also covered by the `coord_query_` read-family prefix; it is named here
+    // anyway so the lane's full tool set is visible in one place and survives a
+    // future narrowing of that prefix. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
+    // is the grant authority; this list only forwards.
+    "coord_query_verification_metrics",
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
+    // Plan 2026-09-20-trust-calibration-… Phase 4: the verdict write door the
+    // `/reverify-shipped` lane POSTs through (coord refuses a verifier that is
+    // the unit's author; this list only forwards).
+    "coord_record_verification",
     "coord_reevaluate",
     "coord_reevaluate_dry",
     "coord_register_gate",
@@ -4712,6 +4736,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_twin_catalog",
     "coord_typecheck_file",
     "coord_unmute_gate",
+    // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
+    "coord_verification_queue",
     "coord_who_is_working_on",
     "coord_withdraw_agent_question",
     "coord_withdraw_gate",
@@ -11558,6 +11584,12 @@ pub fn create_router(
         });
     }
 
+    // Keep the canonical-generation rung's mirror of qontinui-claude-config
+    // fresh (plan 2026-09-03-served-corpus-provenance-at-spawn, Phase 6). A
+    // background timer, never a spawn path: registry resolution only READS the
+    // last loaded snapshot.
+    crate::canonical_corpus::start_refresh_loop();
+
     // Phase 3b — the stale-`.coord-mcp-status` sweep, beside the boot heal that
     // runs inside `reconcile_session_configs` above.
     //
@@ -12490,6 +12522,10 @@ pub fn create_router(
         // outside `/ui-bridge/...` because the surface is consumed
         // differently (IR + projection storage, not page-control RPC).
         .merge(crate::spec_api::routes())
+        // Journey twin ledger health — `/apps/{app_id}/journey/health`, beside
+        // the per-app spec routes (plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time).
+        .merge(crate::journey::routes())
         // Section 11 / Phase B2 — `/scenarios/...` scenario projection.
         // Static endpoint is pure Rust; runtime endpoint IPC's into the
         // webview to combine with the live registry. Both load the IR
@@ -13198,6 +13234,7 @@ mod transport_rung_counter_tests {
     /// assert that NO OTHER series moved, so they serialise on one lock —
     /// same defect class and same remedy as `series_lock` in the memory-search
     /// tests below.
+    // test-lock: standalone — module-private; its holders take no other test lock (no env_lock, pin or posture lock)
     fn series_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -14108,6 +14145,7 @@ mod self_id_chain_tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
@@ -15976,6 +16014,7 @@ mod memory_search_enrichment_tests {
     /// Same defect and same remedy as `device_jwt_refresher`'s `health_lock`
     /// (commit `4ea9a9e61`) — a second instance of the class in a second
     /// module, so the lock is copied rather than re-derived.
+    // test-lock: standalone — module-private; its holders take no other test lock (no env_lock, pin or posture lock)
     fn series_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -16222,6 +16261,39 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// Plan `2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously`
+    /// Phase 4: the re-verification lane's three tools forward, each sits in
+    /// sorted position (membership is a `binary_search`), and the source-text
+    /// parser `build_drift` runs over this file reads each exactly once — the
+    /// comments above them must not hide one or add a phantom.
+    #[test]
+    fn verification_lane_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_query_verification_metrics",
+            "coord_record_verification",
+            "coord_verification_queue",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position in COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not also be a deliberate exclusion"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
     /// The MCP handshake + the legitimate coordination surface forwards.
     #[test]
     fn allows_handshake_and_coordination_tools() {
@@ -16296,6 +16368,10 @@ mod coord_mcp_body_gate_tests {
             "coord_alert_queue",
             "coord_alert_claim",
             "coord_alert_release",
+            // The by-id memory read-back (plan 2026-09-21-a-memory-write-
+            // receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
+            // Phase 1), pinned with the coord tool rather than after a -32601.
+            "coord_memory_get",
         ] {
             assert!(
                 gate(serde_json::json!({
@@ -16737,6 +16813,9 @@ mod coord_mcp_body_gate_tests {
             // The registrant-only re-point (coord#2056): the only way to carry a
             // superseded gate's continuation onto the replacement PR.
             "coord_repoint_gate",
+            // ...and the declaration that authorizes a NON-registrant re-point
+            // of a superseded PR's system-registered gate.
+            "coord_declare_supersession",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
@@ -18347,6 +18426,11 @@ mod coord_read_proxy_tests {
     /// come back unreshaped — including a non-200 coord verdict.
     #[tokio::test]
     async fn forward_coord_get_injects_bearer_and_passes_through_verbatim() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
@@ -19669,6 +19753,11 @@ mod coord_write_proxy_tests {
     /// a non-200 coord verdict.
     #[tokio::test]
     async fn forward_coord_write_post_injects_bearer_and_passes_through_verbatim() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
@@ -19788,6 +19877,11 @@ mod coord_write_proxy_tests {
     /// Coord unreachable → 502 from the runner with the distinct upstream code.
     #[tokio::test]
     async fn forward_coord_write_post_unreachable_coord_is_502() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         // Bind then drop a listener so the port actively refuses connections.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -19934,6 +20028,11 @@ mod coord_write_proxy_tests {
     /// spooled, and the answer says so without claiming a gate exists.
     #[tokio::test]
     async fn transport_failure_spools_the_gate_and_answers_honestly() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let (spool, _dir) = test_spool();
         // Bind then drop a listener so the port actively refuses connections.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -19998,6 +20097,11 @@ mod coord_write_proxy_tests {
     /// is the opposite and IS spooled, with coord's own status preserved.
     #[tokio::test]
     async fn a_4xx_never_spools_but_a_5xx_does() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let (spool, _dir) = test_spool();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

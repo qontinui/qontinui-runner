@@ -182,6 +182,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .merge(registry_routes::routes())
 }
 
+/// The `SessionStart` source a provider reports after `/clear` — the only
+/// source that ADOPTS a new harness id onto a terminal already running one.
+const HOOK_SOURCE_CLEAR: &str = "clear";
+
 /// Body of `POST /control/session-open` — the session-restore registration
 /// payload the always-on identity shim / SessionStart hook POSTs. `config_dir`
 /// and `cwd` are optional (a provider that doesn't expose them omits them).
@@ -192,7 +196,9 @@ pub struct SessionOpenRequest {
     /// The provider session id (the runner-pinned `QONTINUI_PINNED_SESSION_ID`,
     /// echoed back by the hook for confirmation).
     pub session_id: String,
-    /// `"startup"` | `"resume"` — the hook's source signal (liveness only).
+    /// The hook's `SessionStart` source: `"startup"` | `"resume"` | `"clear"`
+    /// | `"compact"`. `"clear"` ([`HOOK_SOURCE_CLEAR`]) marks the id as ADOPTED
+    /// onto this terminal; every other value is liveness only.
     #[serde(default)]
     pub source: Option<String>,
     /// Which provider owns the session (`"claude"`, `"gemini"`). Defaults to
@@ -1272,11 +1278,17 @@ fn record_session_open_into(
     provider: &str,
 ) {
     let existing = store.get(&req.session_id);
-    // Only consulted when the provider's id has no record of its own; see the
-    // "inherited by TERMINAL" paragraph above.
+    // The most recent OTHER session open on this terminal, read before
+    // `record_open` below can supersede it. Deterministic, not a first match:
+    // a terminal can carry several open rows (see
+    // `SessionLifecycleStore::latest_open_on_terminal`), and the `/clear`
+    // predecessor below must be the one that was actually running here.
+    let terminal_latest = store.latest_open_on_terminal(&req.terminal_id, &req.session_id);
+    // Layout inheritance consults it only when the provider's id has no record
+    // of its own; see the "inherited by TERMINAL" paragraph above.
     let terminal_prior = existing
         .is_none()
-        .then(|| store.find_open_by_terminal(&req.terminal_id))
+        .then(|| terminal_latest.clone())
         .flatten();
     let (page_id, zone_index, working_dir, title) =
         match existing.as_ref().or(terminal_prior.as_ref()) {
@@ -1334,6 +1346,26 @@ fn record_session_open_into(
     // a provider therefore never gets a hook and stays provisional, so Phase 4's
     // restore classifier won't try to `--resume` a phantom shell "session".
     store.confirm_session(&req.session_id);
+    // This id's process is now the one running in the terminal — the order
+    // `latest_open_on_terminal` ranks by. Stamped AFTER `terminal_latest` was
+    // read (which excludes this id anyway).
+    store.note_session_start_hook(&req.session_id);
+
+    // ADOPTION marker. `source: "clear"` is the provider reporting that
+    // `/clear` minted a NEW harness id inside the process already running on
+    // this PTY — so the session it continues is the one that STARTED most
+    // recently on this terminal (`terminal_latest`, read before `record_open`
+    // could supersede it). Record THAT session as the predecessor, not the
+    // terminal: a restored session is a typed `claude --resume X` in a pane
+    // pinned to some other id P, both rows stay open, and a `/clear` in X
+    // continues X (X's own coord row), never P. Every other source (`resume`,
+    // `startup`, `compact`, absent) records no predecessor. See
+    // `TerminalSessionRecord::adopted_from`.
+    if req.source.as_deref() == Some(HOOK_SOURCE_CLEAR) {
+        if let Some(prior) = terminal_latest.as_ref() {
+            store.mark_adopted_from(&req.session_id, &prior.claude_session_id);
+        }
+    }
 
     // D1 name stamp at confirmation. The account is already durable (the
     // `record_pinned_session_open` above derives it from `config_dir`), but the
@@ -2437,6 +2469,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
@@ -2954,6 +2987,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -2986,6 +3020,214 @@ mod tests {
             "config dir not erased by a None from the hook"
         );
         assert!(rec.confirmed_at.is_some(), "hook still confirms");
+    }
+
+    /// The ADOPTION predecessor is set only by a `source: "clear"` hook — the
+    /// provider minting a new id inside the process already on this PTY —
+    /// and it names the session that was OPEN on that terminal (whose
+    /// session was cleared), not the terminal. A `resume` (a typed
+    /// `claude --resume X` reports that too), a `startup`, a `compact` and an
+    /// absent source record no predecessor, so those sessions never resolve
+    /// their finish through another session's coord row.
+    #[test]
+    fn only_a_clear_source_records_the_predecessor_it_continued() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let config = dir.path().join("cfg").to_string_lossy().into_owned();
+        let open = |id: &str, term: &str, source: Option<&str>| {
+            let req = SessionOpenRequest {
+                terminal_id: term.to_string(),
+                session_id: id.to_string(),
+                source: source.map(str::to_string),
+                provider: Some("claude".to_string()),
+                config_dir: Some(config.clone()),
+                cwd: None,
+            };
+            record_session_open_into(&store, &req, "claude");
+        };
+        // Each terminal first hosts an open session, then the hook reports a
+        // NEW id on it under each source.
+        let cases = [
+            ("cleared-id", "term-c", Some("clear")),
+            ("resumed-id", "term-r", Some("resume")),
+            ("started-id", "term-s", Some("startup")),
+            ("compacted-id", "term-k", Some("compact")),
+            ("no-source-id", "term-n", None),
+        ];
+        for (id, term, source) in cases {
+            open(&format!("prior-on-{term}"), term, Some("startup"));
+            open(id, term, source);
+        }
+        let cleared = store.get("cleared-id").expect("recorded");
+        assert_eq!(
+            cleared.adopted_from.as_deref(),
+            Some("prior-on-term-c"),
+            "a clear records WHOSE session it continued"
+        );
+        for (id, _, source) in &cases[1..] {
+            let rec = store.get(id).expect("recorded");
+            assert_eq!(
+                rec.adopted_from, None,
+                "source {source:?} is not an adoption"
+            );
+        }
+        // A clear on a terminal with no open session has no predecessor.
+        open("cleared-alone", "term-empty", Some("clear"));
+        assert_eq!(store.get("cleared-alone").unwrap().adopted_from, None);
+        // The first session on each terminal records none either.
+        assert_eq!(store.get("prior-on-term-c").unwrap().adopted_from, None);
+    }
+
+    /// A pane pinned to P whose operator exited and typed `claude --resume X`
+    /// carries TWO open, confirmed rows on one terminal: the hook bind of X
+    /// evicts only unconfirmed siblings, and confirming runs no supersede
+    /// scan. A `/clear` inside X continues X, so the clear's predecessor must
+    /// be X — never the pane's P, whose coord row would then take C's finished
+    /// mark and its ACK. A first match over the store's `HashMap` picks either
+    /// by iteration order, which is randomly seeded per map, so each round
+    /// uses a FRESH store and the rounds cover both orders many times over.
+    #[test]
+    fn a_clear_after_a_typed_resume_continues_the_resumed_session_not_the_pane() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        for round in 0..64 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let config = dir.path().join("cfg").to_string_lossy().into_owned();
+            let hook = |id: &str, source: &str| {
+                let req = SessionOpenRequest {
+                    terminal_id: "term-pane".to_string(),
+                    session_id: id.to_string(),
+                    source: Some(source.to_string()),
+                    provider: Some("claude".to_string()),
+                    config_dir: Some(config.clone()),
+                    cwd: None,
+                };
+                record_session_open_into(&store, &req, "claude");
+            };
+            // Vary which id sorts first too, so a tie-break on the id cannot
+            // pass the test by accident either.
+            let (pane, resumed) = if round % 2 == 0 {
+                ("aaaa-pane", "zzzz-resumed")
+            } else {
+                ("zzzz-pane", "aaaa-resumed")
+            };
+            hook(pane, "startup");
+            hook(resumed, "resume");
+            let open_on_pane: Vec<_> = store
+                .open_records()
+                .into_iter()
+                .filter(|r| r.terminal_id == "term-pane" && r.confirmed_at.is_some())
+                .collect();
+            assert_eq!(
+                open_on_pane.len(),
+                2,
+                "fixture precondition: both sessions stay open and confirmed on the pane"
+            );
+
+            hook("cleared", "clear");
+            assert_eq!(
+                store.get("cleared").unwrap().adopted_from.as_deref(),
+                Some(resumed),
+                "round {round}: a /clear in the typed-resume session continues IT, not the pane"
+            );
+
+            // A second /clear continues the session the first one minted.
+            hook("cleared-again", "clear");
+            assert_eq!(
+                store.get("cleared-again").unwrap().adopted_from.as_deref(),
+                Some("cleared"),
+                "round {round}: the latest start on the terminal is the cleared session"
+            );
+        }
+    }
+
+    /// `confirmed_at` is monotonic, so it cannot say which session started
+    /// LAST: a typed `claude --resume X` of a session confirmed before the
+    /// pane's own P keeps X's older stamp. The hook order decides, so a
+    /// `/clear` in X still continues X.
+    #[test]
+    fn a_clear_follows_the_latest_hook_not_the_latest_confirmation() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
+        };
+        for round in 0..64 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let config = dir.path().join("cfg").to_string_lossy().into_owned();
+            let seed = |id: &str, terminal: &str, confirmed_at: i64| {
+                store.record_open(TerminalSessionRecord {
+                    claude_session_id: id.to_string(),
+                    config_dir: Some(config.clone()),
+                    working_dir: None,
+                    page_id: "p".to_string(),
+                    zone_index: 0,
+                    title: None,
+                    terminal_id: terminal.to_string(),
+                    opened_at: 0,
+                    last_seen_at: 0,
+                    state: "open".to_string(),
+                    closed_at: None,
+                    close_reason: None,
+                    provider: "claude".to_string(),
+                    origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+                    restore_pending_at: None,
+                    confirmed_at: Some(confirmed_at),
+                    handle: None,
+                    account_label: None,
+                    account_wrapper: None,
+                    session_name: None,
+                    name_source: None,
+                    tenant_id: None,
+                    task_run_id: None,
+                    bypass_permissions: None,
+                    restored_from_boot_at: None,
+                    restore_tier: None,
+                    finished_at: None,
+                    wind_down_outcome: None,
+                    wind_down_at: None,
+                    finish_reason: None,
+                    finish_synced: false,
+                    spawn_device_default: None,
+                    adopted_from: None,
+                });
+            };
+            let hook = |id: &str, source: &str| {
+                let req = SessionOpenRequest {
+                    terminal_id: "term-pane".to_string(),
+                    session_id: id.to_string(),
+                    source: Some(source.to_string()),
+                    provider: Some("claude".to_string()),
+                    config_dir: Some(config.clone()),
+                    cwd: None,
+                };
+                record_session_open_into(&store, &req, "claude");
+            };
+            let (pane, resumed) = if round % 2 == 0 {
+                ("aaaa-pane", "zzzz-resumed")
+            } else {
+                ("zzzz-pane", "aaaa-resumed")
+            };
+            // X was confirmed long ago elsewhere; the pane's P confirmed later.
+            seed(resumed, "term-elsewhere", 1_000);
+            seed(pane, "term-pane", 2_000);
+            hook(pane, "startup");
+            hook(resumed, "resume");
+            let x = store.get(resumed).unwrap();
+            assert_eq!(x.terminal_id, "term-pane", "fixture: X moved onto the pane");
+            assert_eq!(
+                x.confirmed_at,
+                Some(1_000),
+                "fixture: X keeps its OLDER confirmation (monotonic)"
+            );
+
+            hook("cleared", "clear");
+            assert_eq!(
+                store.get("cleared").unwrap().adopted_from.as_deref(),
+                Some(resumed),
+                "round {round}: the latest hook wins over the latest confirmation"
+            );
+        }
     }
 
     /// The case PR #1201 exists for: the provider adopts an id the runner did
@@ -3042,6 +3284,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3127,6 +3370,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         });
 
         let req = SessionOpenRequest {

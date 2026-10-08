@@ -105,12 +105,43 @@ report_unresolved() {
 
 REAL="$(resolve_real_waiting || true)"
 
+# ---------------------------------------------------------------------------
+# Bounded retry on a FAILED exec of the resolved tool. Claude Code's
+# auto-updater rewrites `claude.exe` in place; an exec that lands while the
+# updater still holds the file open for writing fails ETXTBSY ("Text file
+# busy"), and a non-interactive bash exits on a failed exec -- so the terminal
+# dropped to a bare prompt with the session lost (2026-10-05, merytshost,
+# `/spawn-ai 2`). The file IS present, so resolve_real_waiting above never
+# fires. `execfail` makes a failed exec return instead of exiting; we retry for
+# at most QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 10; 0 disables -> the old
+# exit-on-failure behaviour), then exit with exec's own status. A SUCCESSFUL
+# exec replaces this process, so a healthy launch pays nothing.
+# ---------------------------------------------------------------------------
+exec_with_retry() {
+  shopt -s execfail 2>/dev/null || true
+  local wait_secs deadline rc announced=0
+  wait_secs="$(resolve_wait_secs)"
+  deadline=$((SECONDS + wait_secs))
+  while :; do
+    "$@"
+    rc=$?
+    [ "$SECONDS" -lt "$deadline" ] || break
+    if [ "$announced" -eq 0 ]; then
+      printf 'qontinui shim: exec of %s failed (status %s; likely a reinstall holding it open); retrying for up to %ss\n' \
+        "$REAL" "$rc" "$wait_secs" >&2
+      announced=1
+    fi
+    sleep 0.5 2>/dev/null || sleep 1
+  done
+  exit "$rc"
+}
+
 # Run the real provider, replacing this process (we don't need an exit code
 # beyond what exec propagates). Strips our dir from PATH as a last resort when
 # the real tool couldn't be resolved.
 exec_real() {
   if [ -n "${REAL:-}" ]; then
-    QONTINUI_INSTALL_INTERCEPT_GUARD=1 exec "$REAL" "$@"
+    QONTINUI_INSTALL_INTERCEPT_GUARD=1 exec_with_retry exec "$REAL" "$@"
   fi
   report_unresolved
   local newpath="" d

@@ -610,6 +610,21 @@ pub async fn ui_bridge_batch_actions_handler(
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // Journey ledger choke point (D3): a batch is ONE trigger — `batch:<n>`
+    // on its first target — opening one pending edge, not one per step.
+    // Recorded as `ChokePoint::BatchAction`, the same kind as the SDK batch
+    // routes (`sdk_client::record_sdk_batch`): the choke point names the
+    // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
+    if let Some(action) = crate::journey::cursor::ActionSpec::batch(&steps) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
+            action,
+            crate::journey::cursor::Provenance::default(),
+            failed > 0,
+        );
+    }
+
     Ok(Json(ApiResponse::success(serde_json::json!({
         "success": failed == 0,
         "results": results,
@@ -1123,6 +1138,67 @@ pub(crate) fn validate_type_action_params(
 }
 
 pub async fn ui_bridge_execute_action_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ActionQueryParams>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
+    // users-path-and-the-passage-of-time, D3): parse the body ONCE (the same
+    // lossy fallback the dispatch applies) and read only the action NAME and
+    // the `windowLabel` — never `params`, which carries typed text.
+    let peeked = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .or_else(|| serde_json::from_str(&String::from_utf8_lossy(&body_bytes)).ok());
+    let field = |key: &str| {
+        peeked
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let action_name = field("action");
+    let task_run_id = query.task_run_id;
+    // The cursor scope: the pop-out window this action targets (query wins,
+    // then the body field — the same precedence the dispatch applies).
+    let window_scope = query.window_label.clone().or_else(|| field("windowLabel"));
+    let result = execute_action_dispatch(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        Query(query),
+        headers,
+        body_bytes,
+    )
+    .await;
+    if let (Some(failed), Some(action)) = (
+        crate::journey::capture::control_action_verdict(&result),
+        action_name,
+    ) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::journey::cursor::CursorKey::new(
+                crate::spec_api::storage::RUNNER_APP_ID,
+                window_scope.as_deref(),
+            ),
+            crate::journey::cursor::ActionSpec::element(
+                &id,
+                &action,
+                qontinui_types::journey::ChokePoint::ElementAction,
+            ),
+            crate::journey::cursor::Provenance {
+                app_version: None,
+                run_id: crate::journey::capture::run_id_from_task_run(task_run_id),
+            },
+            failed,
+        );
+    }
+    result
+}
+
+/// The body of [`ui_bridge_execute_action_handler`], split out so the journey
+/// capture sees EVERY exit of this long handler in one place.
+async fn execute_action_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<ActionQueryParams>,
@@ -2481,6 +2557,43 @@ pub async fn ui_bridge_get_component_handler(
 pub async fn ui_bridge_execute_component_action_handler(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
+    request: UiBridgeJson<UIBridgeComponentActionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Which app the action lands on: a WS wrapper registered under the
+    // component id owns it (see `component_action_dispatch`); otherwise the
+    // runner's own webview does. Read before dispatch, from the same registry
+    // lookup the dispatch makes.
+    let app_id = match state.app_registry.get_live(&id).await {
+        Some(entry) if entry.transport == AppTransport::Websocket => id.clone(),
+        _ => crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+    };
+    let result = component_action_dispatch(
+        State(Arc::clone(&state)),
+        Path((id.clone(), action_id.clone())),
+        request,
+    )
+    .await;
+    // Journey ledger choke point (D3). Recorded as
+    // `ChokePoint::ComponentAction`, the same kind as the SDK component action
+    // (`sdk_client::record_sdk_component_action`): the choke point names the
+    // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
+    if let Some(failed) = crate::journey::capture::control_action_verdict(&result) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::journey::cursor::CursorKey::new(app_id, None),
+            crate::journey::cursor::ActionSpec::component(&id, &action_id),
+            crate::journey::cursor::Provenance::default(),
+            failed,
+        );
+    }
+    result
+}
+
+/// The body of [`ui_bridge_execute_component_action_handler`], split out so
+/// the journey capture sees every exit in one place.
+async fn component_action_dispatch(
+    State(state): State<Arc<ApiState>>,
+    Path((id, action_id)): Path<(String, String)>,
     UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
@@ -2574,7 +2687,7 @@ pub async fn ui_bridge_execute_component_action_handler(
 /// React registry occasionally pruning elements between calls.
 pub async fn ui_bridge_discover_handler(
     State(state): State<Arc<ApiState>>,
-    request: Option<Json<UIBridgeDiscoveryRequest>>,
+    request: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Discovering elements");
 
@@ -2583,31 +2696,29 @@ pub async fn ui_bridge_discover_handler(
     // axum default of 400'ing on `EOF while parsing a value` was needless
     // friction for manual testers and MCP clients sending bare POSTs.
     // Note: an explicit body (even `{"force": false}`) is preserved as-is.
-    let request = match request {
-        Some(Json(r)) => r,
-        None => UIBridgeDiscoveryRequest {
-            force: Some(true),
-            ..Default::default()
-        },
+    let body = match request {
+        Some(Json(v)) => v,
+        None => serde_json::json!({ "force": true }),
     };
 
-    // Collapse the top-level and nested-`options` spellings into one set of
-    // filters before building the IPC payload. Reading `request.root` etc.
-    // directly here is what silently dropped an `{"options": {...}}` body.
-    let opts = request.resolve();
+    // Forward the body WHOLE (as `find` does), with the typed filters
+    // resolved across both spellings — see
+    // `UIBridgeDiscoveryRequest::discover_ipc_request`. The previous six-key
+    // allowlist silently dropped `includeMedia`/`includeContent`/`text`/….
+    let (options, force) = UIBridgeDiscoveryRequest::discover_ipc_request(&body).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(api_error(format!(
+                "Failed to deserialize the JSON body into the target type: {e}"
+            ))),
+        )
+    })?;
 
     let payload = serde_json::json!({
-        "options": {
-            "root": opts.root,
-            "interactiveOnly": opts.interactive_only,
-            "includeHidden": opts.include_hidden,
-            "limit": opts.limit,
-            "types": opts.types,
-            "selector": opts.selector
-        },
+        "options": options,
         // Top-level (not inside options) — force is a meta-flag about
         // registry state rather than a discovery filter.
-        "force": opts.force.unwrap_or(false)
+        "force": force
     });
 
     match ui_bridge_request_sync(&state, "discover", payload).await {
@@ -2788,10 +2899,14 @@ pub async fn ui_bridge_get_last_discovered_handler(
 /// Filtering happens in this Rust handler (not via a special SDK code path),
 /// because `get_snapshot` participates in the dedup cache keyed by type, and
 /// filtering client-side here keeps the cached payload shared across callers.
+///
+/// The body is returned as an `Arc<Value>` so the response, the
+/// co-occurrence capture and the journey ledger share ONE copy of what can be
+/// a multi-megabyte snapshot.
 pub async fn ui_bridge_get_snapshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<Arc<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let truthy = |v: &String| {
         let s = v.trim();
         s == "1" || s.eq_ignore_ascii_case("true")
@@ -3019,11 +3134,29 @@ pub async fn ui_bridge_get_snapshot_handler(
             // The page label is resolved inside `enqueue_observation` from the
             // snapshot's own `page.pageContext` / `page.pathname` — the caller
             // has no scope knowledge the snapshot doesn't already carry.
+            let data = Arc::new(data);
             let pg_db_for_obs = state.app_state.pg_db.clone();
-            let snapshot_for_obs = data.clone();
-            let runner_instance = std::env::var("QONTINUI_RUNNER_ROLE")
-                .ok()
-                .unwrap_or_else(|| "primary".to_string());
+            let snapshot_for_obs = Arc::clone(&data);
+            let runner_instance = crate::journey::capture::runner_instance();
+            // Journey ledger (plan 2026-09-20-ui-bridge-represents-the-users-
+            // path-and-the-passage-of-time, D3): this snapshot closes the
+            // pending edge an earlier action opened. The control surface
+            // drives the runner's OWN webview, so the app is the runner's —
+            // a transport fact, the same key the action handlers use — and the
+            // cursor is the main window (this route takes no windowLabel).
+            // A FILTERED snapshot is not the page's configuration, so it is
+            // not recorded (the co-occurrence capture keeps its behaviour).
+            if !crate::journey::capture::snapshot_query_is_filtered(&query) {
+                crate::journey::capture::record_snapshot(
+                    state.app_state.pg_db.clone(),
+                    crate::journey::cursor::CursorKey::new(
+                        crate::spec_api::storage::RUNNER_APP_ID,
+                        None,
+                    ),
+                    None,
+                    Arc::clone(&data),
+                );
+            }
             tokio::spawn(async move {
                 crate::state_discovery::enqueue_observation(
                     pg_db_for_obs,
@@ -3055,7 +3188,7 @@ pub async fn ui_bridge_get_snapshot_handler(
                         "elements": [],
                         "note": "SDK was not connected. This is a native window capture fallback — no element tree is available."
                     });
-                    Ok(Json(ApiResponse::success(data)))
+                    Ok(Json(ApiResponse::success(Arc::new(data))))
                 }
                 None => {
                     error!("UI Bridge API: native capture fallback also failed");
@@ -3816,10 +3949,24 @@ pub async fn ui_bridge_find_by_text_handler(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/click-by-text` is an element action with no element id (null target).
+pub async fn ui_bridge_click_by_text_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_text");
+    let result =
+        ui_bridge_click_by_text_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// Click an element by its visible text content.
 /// POST /ui-bridge/control/page/click-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true, "index": 0 }
-pub async fn ui_bridge_click_by_text_handler(
+async fn ui_bridge_click_by_text_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -3884,10 +4031,24 @@ pub async fn ui_bridge_click_by_text_handler(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/click-by-selector` is an element action with no element id (null target).
+pub async fn ui_bridge_click_by_selector_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_selector");
+    let result =
+        ui_bridge_click_by_selector_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// Click an element by CSS selector.
 /// POST /ui-bridge/control/page/click-by-selector
 /// Body: { "selector": "button[type='submit']", "index": 0 }
-pub async fn ui_bridge_click_by_selector_handler(
+async fn ui_bridge_click_by_selector_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -4153,6 +4314,19 @@ fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_
     })
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/type-into` is an element action; the typed text is never read.
+pub async fn ui_bridge_type_into_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("type_into");
+    let result = ui_bridge_type_into_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// Type text into an element by CSS selector or label.
 /// POST /ui-bridge/control/page/type-into
 /// Body: { "selector": "textarea", "text": "hello", "clear": true, "index": 0 }
@@ -4188,7 +4362,7 @@ fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_
 /// `execute_action` reports no post-action value (`getElementState` carries no
 /// `value`), and inventing a third round-trip to read one back is worse than
 /// pointing callers at `POST /control/page/read-value`.
-pub async fn ui_bridge_type_into_handler(
+async fn ui_bridge_type_into_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {

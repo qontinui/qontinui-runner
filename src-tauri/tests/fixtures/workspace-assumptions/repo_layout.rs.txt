@@ -4,3 +4,8 @@ fn planted_repo_layout(root: &Path) -> PathBuf {
     let _ = std::env::var("QONTINUI_ROOT");
     root.join("qontinui-claude-config").join(".claude/commands")
 }
+
+// The runner-local bare-sibling-name refinement (no `../`, not fleet-only).
+fn planted_repo_layout_bare_sibling(workspace: &Path) -> PathBuf {
+    workspace.join("qontinui-web")
+}
