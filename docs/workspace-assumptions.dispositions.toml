@@ -23,7 +23,7 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
-unreviewed_ceiling = 238
+unreviewed_ceiling = 236
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
