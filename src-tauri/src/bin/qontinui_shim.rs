@@ -123,6 +123,9 @@ const POLICY_DELIVERED_FILE_ENV: &str = "QONTINUI_POLICY_DELIVERED_FILE";
 const PROVISION_SESSION_PATH: &str = "/coord-mcp/provision-session";
 
 fn main() -> std::process::ExitCode {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     // argv[0] → which tool we are impersonating. Fail-open to passthrough on
     // anything we don't recognize.
     let raw_args: Vec<String> = env::args().collect();

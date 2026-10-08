@@ -4856,7 +4856,7 @@ pub fn load_settings_full() -> LoadedSettings {
             provenance.as_str()
         );
     }
-    let is_secondary = crate::instance::is_secondary();
+    let is_secondary = crate::instance::shares_primary_settings();
     if needs_persist && is_secondary {
         // ONCE per process, at info!. This branch re-runs on every settings
         // load (the relay loop re-reads every iteration), so it used to emit

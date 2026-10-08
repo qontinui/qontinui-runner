@@ -120,6 +120,10 @@ impl RegistryCredentialStore {
     /// Store `value` under `name`. Overwrites any existing value.
     pub fn set(name: &str, value: &str) -> Result<(), RegistryCredentialError> {
         validate_name(name)?;
+        // The keychain gate (`instance_env::keychain_allowed`).
+        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            return Err(qontinui_runner_lib::instance_env::keychain_disabled_error().into());
+        }
         let entry = Entry::new(KEYRING_SERVICE, name)?;
         entry.set_password(value)?;
         Ok(())
@@ -129,6 +133,9 @@ impl RegistryCredentialStore {
     /// [`resolve_registry_env`] should call this.
     pub fn get(name: &str) -> Result<Option<String>, RegistryCredentialError> {
         validate_name(name)?;
+        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            return Ok(None);
+        }
         let entry = Entry::new(KEYRING_SERVICE, name)?;
         match entry.get_password() {
             Ok(s) => Ok(Some(s)),
@@ -154,6 +161,9 @@ impl RegistryCredentialStore {
     /// Remove the credential under `name`. No-op if absent.
     pub fn delete(name: &str) -> Result<(), RegistryCredentialError> {
         validate_name(name)?;
+        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            return Ok(());
+        }
         let entry = Entry::new(KEYRING_SERVICE, name)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),

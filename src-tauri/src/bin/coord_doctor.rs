@@ -42,6 +42,9 @@ use std::process::ExitCode;
 use qontinui_runner_lib::coord_doctor::{diagnose, render_onboarding_doc, DoctorInputs};
 
 fn main() -> ExitCode {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     // Doc-emit mode: print the onboarding checklist generated from CHECK_SPECS
     // and exit 0 WITHOUT running any live check. The CI freshness gate uses
     // this to regenerate `docs/runner-onboarding.md` and diff it.
