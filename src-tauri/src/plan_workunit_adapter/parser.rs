@@ -633,7 +633,9 @@ fn bold_span(s: &str) -> String {
 }
 
 /// `rest` (the text after a line's opening `**`) is a BARE bold phase
-/// mention — `Phase N` or `Phase Nx`, nothing else inside the span — that
+/// mention — `Phase N` or `Phase Nx` (ASCII digits, either letter case: the
+/// shapes [`phase_index_at`] and [`LETTERED_PHASE`] accept), nothing else
+/// inside the span — that
 /// the same line continues as sentence prose: right after the closing `**`
 /// comes `,` `.` `;`, or (after whitespace) a lowercase word.
 ///
@@ -655,7 +657,7 @@ fn bold_span(s: &str) -> String {
 )]
 fn bold_phase_opens_a_sentence(rest: &str) -> bool {
     static BARE_PHASE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^Phase\s+\d+[a-z]?$").expect("valid regex"));
+        Lazy::new(|| Regex::new(r"^Phase\s+[0-9]+[A-Za-z]?$").expect("valid regex"));
     let Some(close) = rest.find("**") else {
         return false;
     };
@@ -869,12 +871,19 @@ fn heading_rank(name: &str) -> NameRank {
 /// procedure's `…:` declares only explicit phase titles.
 ///
 /// Never declared: fenced code ([`fenced_lines`]); blockquotes (status
-/// narration such as `> **Phase 4 is HELD**`); mid-line prose; and an arm B-D
+/// narration such as `> **Phase 4 is HELD**`); mid-line prose; a line that
+/// opens with a bare bold phase mention continued as sentence prose
+/// (`**Phase 6**, near-verbatim.`, `**Phase 2**.` — coord finding f4812a7f),
+/// which is inert, leaving the phase-list state as a blank line would (see
+/// [`bold_phase_opens_a_sentence`]); and an arm B-D
 /// entry struck through or marked as not delivered by this plan
 /// ([`NOT_DELIVERED_MARKER`]). Such an entry also REFUSES its exact index: an
 /// index refused anywhere is dropped unless an arm-A heading declares it, so a
 /// later unrelated table mentioning the same number cannot re-declare it. These
-/// are heuristics over free-form Markdown, not a grammar the corpus agreed to;
+/// are heuristics over free-form Markdown, not a grammar the corpus agreed to.
+/// One consequence is an intended miss: a plan that writes its phases ONLY as
+/// column-0 bold-mention paragraphs (`**Phase 1** adds the column. **Phase 2**
+/// backfills.`) now declares nothing from them;
 /// the census in the plan above is the evidence for each one, and a miss is the
 /// intended failure mode.
 #[expect(
@@ -942,12 +951,17 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
         // is not about a phase, ends the phase list; a bold SENTENCE about a
         // phase (`**Phase 0 is a gate, not a step.**`) does not. A line that
         // only OPENS with a bare bold phase mention inside sentence prose
-        // ([`bold_phase_opens_a_sentence`]) is not handled here at all: it is
-        // a paragraph, and falls through to be treated as one.
-        let bold_rest = t
-            .strip_prefix("**")
-            .filter(|rest| !bold_phase_opens_a_sentence(rest));
-        if let Some(rest) = bold_rest {
+        // ([`bold_phase_opens_a_sentence`]) is INERT: it declares nothing and
+        // leaves the phase-list state exactly as a blank line would. Falling
+        // through to the paragraph handling instead would let it become a
+        // section's intro (arming the list after it) or disown the section on
+        // a word like `deferred`, dropping that section's phase tables.
+        if t.strip_prefix("**")
+            .is_some_and(bold_phase_opens_a_sentence)
+        {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("**") {
             match phase_index_at(rest) {
                 Some(index) => {
                     let name = bold_span(rest);
@@ -1590,6 +1604,70 @@ mod tests {
             let body = format!("# T\n\n## Phase 1 — a\n\n{line}\n\n## Phase 2 — b\n");
             assert_eq!(indices(&body), vec![1, 2], "line: {line}");
         }
+    }
+
+    /// Lettered bare spans, either case, are mentions too: `**Phase 6a**, …`
+    /// and `**Phase 6B**, …` declare nothing.
+    #[test]
+    fn phases_bold_lettered_bare_phase_followed_by_sentence_prose_does_not_declare() {
+        for line in [
+            "**Phase 6a**, near-verbatim.",
+            "**Phase 6B**, near-verbatim.",
+        ] {
+            let body = format!("# T\n\n## Phase 1 — a\n\n{line}\n\n## Phase 2 — b\n");
+            assert_eq!(indices(&body), vec![1, 2], "line: {line}");
+        }
+    }
+
+    /// `**Phase 2**.` alone on its line is read as a one-word sentence, not a
+    /// title — the bare span is followed by sentence punctuation.
+    #[test]
+    fn phases_bold_bare_phase_then_period_alone_is_a_sentence_and_does_not_declare() {
+        assert_eq!(indices("# T\n\n## Phase 1 — a\n\n**Phase 2**.\n"), vec![1]);
+    }
+
+    /// A bold-mention sentence in a `## Phases` intro must not disown the
+    /// section: `deferred` / `separate plan` in it would otherwise drop the
+    /// section's phase table (review of the f4812a7f fix).
+    #[test]
+    fn phases_bold_mention_in_a_phases_intro_does_not_disown_the_section() {
+        let body = "# T\n\n## Phases\n\n**Phase 4** is deferred to a separate plan.\n\n| Phase | Work |\n|---|---|\n| 1 | schema |\n| 2 | wiring |\n";
+        assert_eq!(indices(body), vec![1, 2]);
+    }
+
+    /// A bold-mention sentence is inert: in a section intro or between list
+    /// items it changes the phase-list state exactly as a blank line would —
+    /// it neither becomes the intro (which would un-procedure a `…:` list) nor
+    /// ends a list.
+    #[test]
+    fn phases_bold_mention_is_inert_like_a_blank_line() {
+        let mention = "**Phase 9** of the other plan, cited.";
+        for template in [
+            // In the intro: the procedure intro must still govern the list.
+            "# T\n\n## Phases\n\nFor each object:\n\nLINE\n\n1. probe\n2. build\n",
+            // Between list items: the list must neither end nor change.
+            "# T\n\n## Phases\n\n- **Phase 1 — a**\nLINE\n- **Phase 2 — b**\n3. c\n",
+        ] {
+            let with = template.replace("LINE", mention);
+            let blank = template.replace("LINE", "");
+            assert_eq!(indices(&with), indices(&blank), "template: {template}");
+        }
+        assert_eq!(
+            indices(
+                "# T\n\n## Phases\n\nFor each object:\n\nLINE\n\n1. probe\n2. build\n"
+                    .replace("LINE", mention)
+                    .as_str()
+            ),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            indices(
+                "# T\n\n## Phases\n\n- **Phase 1 — a**\nLINE\n- **Phase 2 — b**\n3. c\n"
+                    .replace("LINE", mention)
+                    .as_str()
+            ),
+            vec![1, 2, 3]
+        );
     }
 
     /// The f4812a7f rule leaves real bold titles alone: a bare bold phase
