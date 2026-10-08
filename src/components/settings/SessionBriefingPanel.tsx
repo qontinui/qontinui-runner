@@ -29,6 +29,7 @@ import {
   formatLastConfirmed,
   provenanceClasses,
 } from "./sessionBriefingHelpers";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Where a block's text came from, as `GET /session-briefing` reports it.
@@ -189,7 +190,7 @@ export function SessionBriefingPanel() {
     } catch (e) {
       // An unreachable local API is UNKNOWN, never "there is no briefing" —
       // say which it is rather than rendering an empty panel.
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Failed to load session briefing"));
       setData(null);
     } finally {
       setLoading(false);

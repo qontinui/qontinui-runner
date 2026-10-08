@@ -419,35 +419,39 @@ status; the order is write → commit → vet. (If the plans directory is not a 
 repo — see [Plan directories](#plan-directories) — the file on disk is the whole
 ritual.)
 
-**The push is not the publication — assert a PR carries the branch's push.**
-Where the plans repository is a coord-merge-authority repo, a branch pushed with
-no pull request never reaches `main`: the plan is published to `origin` and
-permanently invisible to every `origin/main` reader, which is the population a
-peer vetter, `/preflight` and the plan registry all read. Measured 2026-09-02, **9** plan
+**A push is not the publication — land the plan with the helper.** A branch
+pushed with no pull request, onto a repo that needs one, never reaches `main`:
+the plan is published to `origin` and permanently invisible to every
+`origin/main` reader, which is the population a peer vetter, `/preflight` and
+the plan registry all read. Measured 2026-09-02, **9** plan
 stems were pushed to `origin` and never proposed at all — no PR in any state, on
 any branch carrying the stem — one of them a plan authored the day before by this
-very step. So after the push:
+very step. So publish the new plan with:
 
 ```bash
-gh pr list --repo <owner/repo> --head "$(git rev-parse --abbrev-ref HEAD)" \
-  --state all --json number,state,headRefOid,url \
-  --jq '.[] | "\(.number) \(.state) \(.headRefOid) \(.url)"'
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
+  "docs: add <plan-stem> (DRAFT)"
 ```
 
-Use `--state all`, not `--state open`: an empty open-only answer cannot tell
-"never proposed" from "closed under you". A CLOSED or MERGED PR HAS been
-proposed, but it carries nothing pushed after its close. So apply
-`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-whose PR may already have landed". When it says no PR carries the push and
-commits remain unlanded, take its fresh-branch path and open the new PR:
-**`coord_create_pr` first, then `gh pr create`**, with a line-anchored
-`Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`** —
-coord is the sole merge authority. Open it in `/implement-plan` Step 4.5b's
-served door order (the runner's loopback door sits between the coord door and
-the `gh` fallback), then READ it back — the same `gh pr list --repo <owner/repo>
---head <branch> --state all` read as above — and take the PR number only from a
-row whose `headRefOid` is the head you pushed, never from the create call's exit
-status or output. Runbook:
+Whether the plans repo needs a PR is decided by the helper's ruleset probe of
+its default branch, not asserted here. With no PR-requiring rule it lands the
+blob directly and prints `LANDED <commit|unchanged> <blob>`; with one, or when
+the probe cannot tell, it cuts a fresh branch, opens a new PR with
+**`gh pr create`** — the only opener it runs — with a line-anchored
+`Plan: <stem>` marker in the body, and prints `PROPOSED <pr-url|branch> <branch>`.
+To open it with `coord_create_pr` instead, set `LAND_PLAN_STAMP_NO_PR=1`: the
+helper pushes and reads back the branch, prints it, and opens nothing; then open
+the PR in `/implement-plan` Step 4.5b's served door order (the runner's loopback
+door sits between the coord door and the `gh` fallback).
+It never pushes to an existing branch. A non-zero exit means the plan is NOT
+published; report it. On `PROPOSED`, READ the PR back with
+`gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid,url`
+and take the PR number only from a row whose `headRefOid` is the head the
+helper pushed (read it with `git -C <plans-repo-root> rev-parse origin/<branch>`, the ref the helper's own fetch leaves; its `PROPOSED` line names the branch, not the sha), never from the create call's exit status or output —
+`--state all`, not `--state open`: an empty open-only answer cannot tell
+"never proposed" from "closed under you". **Never `gh pr merge`, never
+`--admin`** — coord is the sole merge authority. Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
 Note what publishing the plan does **not** by itself buy you: it does not make the
@@ -466,13 +470,13 @@ and the plan misleads every later reader
 That has already happened. This command previously described a six-tier
 `non_author_allows_identities` ladder over `{device, agent, session}` for the
 work-unit check. **That was wrong about the code**: re-verified on qontinui-coord
-`origin/main` 2026-09-23 at `037fc1a8f`,
+`origin/main` 2026-10-03 at `f32fb04ad`,
 `work_unit_registry::authorize_target_transition` takes the two actor keys
 **plus an optional `independence` declaration** (`{verified, against, context}`),
-and does the flat `owner == attester` compare **only when no declaration is
-sent** — a well-formed one authorizes an Attested transition without that
-compare, while still refusing `attester_unresolved` when the caller's token
-derives no actor key; `non_author_allows_identities` is called only from
+and does the device-grain `owner == attester` compare **only when no
+declaration is sent** — a well-formed one authorizes an Attested transition
+without that compare, while still refusing `attester_unresolved` when the
+caller's token derives no actor key; `non_author_allows_identities` is called only from
 `gates.rs`. Fourteen plan status blocks now carry that invented ladder as fact.
 
 ⚠️ **Whether the coord instance serving YOU advertises that declaration is a
@@ -490,8 +494,8 @@ write landed. The declaration is STORED on the unit, so one you did not earn is
 a false witness statement with your actor key beside it.
 
 ⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`.
-The re-allocate prohibition is that refusal's alone: `attester_unresolved` wants a device-
-or agent-identified caller, which is a credential remedy rather than a route
+The re-allocate prohibition is that refusal's alone: `attester_unresolved` wants a caller
+coord admits as an SoD actor, which is a credential remedy rather than a route
 around a control.
 
 What you may safely rely on, because it is mechanism rather than policy: the

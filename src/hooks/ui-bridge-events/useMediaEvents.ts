@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import { compareVisualRegression, captureElementScreenshot } from "@qontinui/ui-bridge/ai";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Handles: find_media, media_audit, capture_media_snapshot, analyze_media,
@@ -377,7 +378,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             // Fall back to the SVG foreignObject capture path from ui-bridge SDK.
             console.warn(
               `[UIBridgeEventHandler] html2canvas failed for '${elementId}', trying SVG foreignObject fallback:`,
-              html2canvasError instanceof Error ? html2canvasError.message : html2canvasError,
+              describeThrown(html2canvasError, "html2canvas capture failed"),
             );
             try {
               const fallbackResult = await captureElementScreenshot(
@@ -431,7 +432,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAA0lEQVQI12P4z8BQDwAEgAF/QualzQAAAABJRU5ErkJggg==";
               console.warn(
                 `[UIBridgeEventHandler] SVG foreignObject fallback also failed for '${elementId}':`,
-                fallbackError instanceof Error ? fallbackError.message : fallbackError,
+                describeThrown(fallbackError, "SVG foreignObject capture failed"),
               );
               await sendResponse({
                 requestId,
@@ -519,7 +520,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
               requestId,
               type,
               success: false,
-              error: e instanceof Error ? e.message : String(e),
+              error: describeThrown(e, "Media request failed"),
               timestamp: Date.now(),
             });
           }

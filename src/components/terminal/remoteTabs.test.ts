@@ -8,6 +8,7 @@ import {
   type RemoteAttachWaiting,
   detachedRemoteTabs,
   fleetSessionAttachId,
+  openedTabStillOpen,
   remoteBadgeLabel,
   remoteSessionLabel,
   remoteTabTitle,
@@ -92,7 +93,8 @@ describe("attachErrorMessage (typed runner errors, shown inline)", () => {
     );
     expect(attachErrorMessage(new Error("remote_attach:timeout: no reply within 20s"))).toBe(
       "timeout — no reply within 20s",
-    );
+    ); // A padded Error message still parses: describeThrown trims every shape.
+    expect(attachErrorMessage(new Error("  remote_attach:timeout: x\n"))).toBe("timeout — x");
   });
 
   it("renders coord's target-runner refusal with its hint as the detail", () => {
@@ -359,5 +361,27 @@ describe("applyAttachWaiting", () => {
   it("a closing update for a session never seen waiting changes nothing", () => {
     const before = { b: w("b", true) };
     expect(applyAttachWaiting(before, w("a", false))).toBe(before);
+  });
+});
+
+describe("openedTabStillOpen", () => {
+  const tab = (id: string, isAlive = true) => ({ id, isAlive });
+
+  it("is true while the opened tab is on the page and alive", () => {
+    expect(openedTabStillOpen("t1", [tab("t0"), tab("t1")])).toBe(true);
+  });
+
+  it("is false once the operator closed the tab", () => {
+    expect(openedTabStillOpen("t1", [tab("t0")])).toBe(false);
+    expect(openedTabStillOpen("t1", [])).toBe(false);
+  });
+
+  it("is false for a tab whose pane ended", () => {
+    expect(openedTabStillOpen("t1", [tab("t1", false)])).toBe(false);
+  });
+
+  it("is false when nothing was opened", () => {
+    expect(openedTabStillOpen(null, [tab("t1")])).toBe(false);
+    expect(openedTabStillOpen(undefined, [tab("t1")])).toBe(false);
   });
 });

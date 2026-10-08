@@ -54,6 +54,7 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import { createLogger } from "@/lib/logger";
 
@@ -184,6 +185,24 @@ export function TenantProvider({ children }: TenantProviderProps) {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial tenant load on mount; refresh is the explicit synchronization point with the backend
     void refresh();
+  }, [refresh]);
+
+  // A sign-in or re-pair ADDS a binding to `paired_user.json` and emits
+  // `web-integration-changed`. Without a re-read, `candidates` (and so
+  // `showSwitcher`) stayed as they were at mount, and the credential banner's
+  // "Switch active tenant" action stayed hidden on a box that had just gained
+  // a second tenant (plan 2026-09-14-credential-posture-third-residuals).
+  useEffect(() => {
+    const unlisten = listen("web-integration-changed", () => {
+      void refresh();
+    });
+    return () => {
+      unlisten
+        .then((fn) => fn())
+        .catch(() => {
+          /* listener cleanup is best-effort */
+        });
+    };
   }, [refresh]);
 
   const setDefaultTenantForNewSessions = useCallback(

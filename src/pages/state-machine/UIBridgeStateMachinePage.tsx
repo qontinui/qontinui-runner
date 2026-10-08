@@ -55,6 +55,7 @@ import type { StateProvenance, StateProvenanceMeta } from "@/lib/compile-state-m
 import { ToastContainer } from "@/components/ToastContainer";
 import { StateExplorationResultsViewer } from "@/components/state-explorer/StateExplorationResultsViewer";
 import { createRunnerDataAdapter } from "@/lib/workflow-builder/runner-data-adapter";
+import { describeThrown } from "@/lib/utils";
 
 // Singleton adapter reused across introspection fetches.
 const dataAdapter = createRunnerDataAdapter();
@@ -340,10 +341,7 @@ export function UIBridgeStateMachinePage() {
         "success",
       );
     } catch (err) {
-      showToast(
-        `Invalidation failed: ${err instanceof Error ? err.message : String(err)}`,
-        "error",
-      );
+      showToast(`Invalidation failed: ${describeThrown(err, "unknown error")}`, "error");
     }
   }, [activeSpecId, selectedState, showToast]);
 
@@ -501,7 +499,7 @@ export function UIBridgeStateMachinePage() {
         );
         setActiveTab("graph");
       } catch (err) {
-        showToast(err instanceof Error ? err.message : "Import failed", "error");
+        showToast(describeThrown(err, "Import failed"), "error");
       }
     };
     window.addEventListener("sm-import-static", handleStaticImport);

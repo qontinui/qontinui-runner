@@ -92,6 +92,7 @@ import {
   normalizePathInput,
   parseRepoCheckouts,
   planScanStatusLabel,
+  planScanStatusNote,
   repoCheckoutsDirty,
   scanSourceStatus,
   storedTenantOverrideCount,
@@ -294,8 +295,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
       // any row a concurrent writer added in between — the same lost update the
       // patch door exists to remove, and `repo_checkouts` is gated the same way
       // for the same reason. Not-dirty ⇒ omitted ⇒ the stored maps survive.
-      const tenantMapsDirty =
-        showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts);
+      const tenantMapsDirty = showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts);
       const payload = buildPathSettingsPayload(
         view.configured,
         drafts,
@@ -481,8 +481,19 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
  * is not running), and that renders as UNKNOWN — a `0` here would claim the
  * adapter looked and found nothing, which is not what a missing report means.
  */
-function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
-  const accent = resolved.plan_tier_active ? getAccentColors("green") : getAccentColors("amber");
+export function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
+  // Green means work units reach coord, not merely that the tier is on: a
+  // scanning tier whose pushes are withheld is amber, and one whose posture is
+  // not yet known is neutral (see `planScanStatusNote`).
+  const tone = !resolved.plan_tier_active
+    ? "amber"
+    : resolved.plan_work_unit_posture === null
+      ? "slate"
+      : resolved.plan_work_unit_posture.state === "write"
+        ? "green"
+        : "amber";
+  const accent = getAccentColors(tone);
+  const Icon = tone === "green" ? Check : tone === "slate" ? Info : TriangleAlert;
   return (
     <div
       data-ui-bridge-id="settings.paths-plan-scan-status"
@@ -490,20 +501,12 @@ function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
       data-content-label="plan scanning status"
       className={`p-3 ${accent.bg} rounded-lg flex items-start gap-2`}
     >
-      {resolved.plan_tier_active ? (
-        <Check className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
-      ) : (
-        <TriangleAlert className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
-      )}
+      <Icon className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
       <div className="space-y-0.5">
         <p className={`text-xs font-medium ${accent.text}`}>
           {planScanStatusLabel(resolved.plan_tier_active, resolved.plan_scan_roots)}
         </p>
-        <p className={`text-[10px] ${accent.text}`}>
-          {resolved.plan_tier_active
-            ? "The adapter is scanning the plans directory in effect and pushing work units to coord."
-            : "No plans directory is in effect, so nothing is scanned and no work units reach coord. Set one below to turn the tier on."}
-        </p>
+        <p className={`text-[10px] ${accent.text}`}>{planScanStatusNote(resolved)}</p>
       </div>
     </div>
   );
@@ -719,7 +722,7 @@ interface PerTenantPathsProps {
  * UNKNOWN about the bindings, not evidence of one tenant — the note below says
  * so instead of the rows implying anything.
  */
-function PerTenantPaths({
+export function PerTenantPaths({
   showSwitcher,
   candidates,
   defaultTenantId,

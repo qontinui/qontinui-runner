@@ -14,6 +14,7 @@ import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
+import { TabTitle } from "../displayTitle";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from "./constants";
@@ -319,7 +320,9 @@ function CompactZoneCardInner({
             style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
           />
         )}
-        <span className="text-[11px] text-[#c0caf5] font-medium truncate flex-1">{tab.title}</span>
+        <span className="text-[11px] text-[#c0caf5] font-medium truncate flex-1">
+          <TabTitle tab={tab} />
+        </span>
         {isNonDurablePty(tab) && (
           <span
             className="flex items-center gap-0.5 text-[8px] font-medium px-1 py-0.5 rounded-full shrink-0 bg-[#565f89]/15 text-[#565f89]"
@@ -684,7 +687,9 @@ function QuickSwitchDropdown({
                 className="w-1.5 h-1.5 rounded-full shrink-0"
                 style={{ backgroundColor: STATE_BORDER_COLORS[tState] }}
               />
-              <span className="text-[10px] text-[#c0caf5] truncate">{t.title}</span>
+              <span className="text-[10px] text-[#c0caf5] truncate">
+                <TabTitle tab={t} />
+              </span>
             </button>
           );
         })

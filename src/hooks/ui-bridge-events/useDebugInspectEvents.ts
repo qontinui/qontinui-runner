@@ -5,6 +5,7 @@ import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
 import { loadDiscoveredSpecs } from "../../lib/ui-bridge/use-discovered-specs";
 import { actionOutcome, actionOutcomeError, actionSucceeded } from "../sdk-ui-bridge/actionOutcome";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Browser / Console capture type interfaces
@@ -67,7 +68,8 @@ function getBrowserCapture(): BrowserCaptureAPI | undefined {
  */
 function consoleEntryLevel(entry: unknown): string | undefined {
   if (typeof entry !== "object" || entry === null) return undefined;
-  const raw = (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
+  const raw =
+    (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
     (entry as { severity?: unknown }).severity ??
     (entry as { type?: unknown }).type;
   return typeof raw === "string" ? raw.toLowerCase() : undefined;
@@ -705,7 +707,7 @@ export function useDebugInspectEvents(
               perField[fieldId] = {
                 success: false,
                 action,
-                error: err instanceof Error ? err.message : String(err),
+                error: describeThrown(err, "field action failed"),
               };
               errorCount++;
             }

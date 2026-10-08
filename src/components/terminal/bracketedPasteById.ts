@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 /** Machine-readable failure code: the PTY's bracketed-paste state is unknown. */
 export const BRACKETED_PASTE_UNKNOWN = "BRACKETED_PASTE_UNKNOWN";
@@ -46,7 +47,7 @@ export async function readBracketedPasteMode(
   } catch (err) {
     throw invalid(
       `could not read bracketed-paste state for terminal ${terminalId}: ` +
-        `${err instanceof Error ? err.message : String(err)}. Nothing was written.`,
+        `${describeThrown(err, "unknown error")}. Nothing was written.`,
     );
   }
   const value = (resp as { data?: { bracketedPaste?: unknown } } | null)?.data?.bracketedPaste;

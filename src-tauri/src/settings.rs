@@ -2519,6 +2519,70 @@ mod session_guard_tests {
         assert_eq!(parsed.session_guard.warn_free_commit_bytes, 6 * GIB);
         assert_eq!(parsed.session_guard.critical_free_commit_bytes, 3 * GIB / 2);
         assert!(parsed.session_guard.enabled);
+        assert_eq!(parsed.session_guard.warn_thread_count, None);
+        assert_eq!(parsed.session_guard.critical_thread_count, None);
+    }
+
+    /// Plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
+    /// dialog-says-low-memory`, Phase 2: the load migration. Every panel save
+    /// wrote all four limits, so the fleet's files carry a literal 256 / 400
+    /// nobody chose — those read as UNSET (they behaved identically under the
+    /// old `min` fold). A value ABOVE the old default was inert until now and is
+    /// honoured as the operator's stated intent; one BELOW it was enforced and
+    /// is kept. A missing key and an explicit `null` are both unset.
+    #[test]
+    fn stored_thread_ceilings_migrate_the_old_default_to_unset() {
+        let load = |warn: &str, critical: &str| -> SessionGuardSettings {
+            serde_json::from_str::<Settings>(&format!(
+                r#"{{"session_guard": {{"warn_thread_count": {warn},
+                     "critical_thread_count": {critical}}}}}"#
+            ))
+            .expect("must deserialize")
+            .session_guard
+        };
+        let g = load("256", "400");
+        assert_eq!((g.warn_thread_count, g.critical_thread_count), (None, None));
+        let g = load("1000", "1200");
+        assert_eq!(
+            (g.warn_thread_count, g.critical_thread_count),
+            (Some(1000), Some(1200))
+        );
+        let g = load("220", "300");
+        assert_eq!(
+            (g.warn_thread_count, g.critical_thread_count),
+            (Some(220), Some(300))
+        );
+        // Each field migrates against ITS OWN old default: 400 is a real
+        // choice in the warn column, 256 a real choice in the critical one.
+        let g = load("400", "256");
+        assert_eq!(
+            (g.warn_thread_count, g.critical_thread_count),
+            (Some(400), Some(256))
+        );
+        let g = load("null", "null");
+        assert_eq!((g.warn_thread_count, g.critical_thread_count), (None, None));
+
+        // And unset round-trips as unset — never re-materialised as a number,
+        // and written as an ABSENT key, not `null`: an older runner build reads
+        // these as a plain `usize` and fails the whole document on a `null`.
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let guard = value["session_guard"]
+            .as_object()
+            .expect("session_guard object");
+        assert!(!guard.contains_key("warn_thread_count"), "{json}");
+        assert!(!guard.contains_key("critical_thread_count"), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_guard.warn_thread_count, None);
+        assert_eq!(back.session_guard.critical_thread_count, None);
+        assert_eq!(
+            migrate_thread_ceiling(Some(256), SHIPPED_WARN_THREAD_CEILING),
+            None
+        );
+        assert_eq!(
+            migrate_thread_ceiling(Some(257), SHIPPED_WARN_THREAD_CEILING),
+            Some(257)
+        );
     }
 }
 
@@ -2929,69 +2993,70 @@ pub struct SessionGuardSettings {
     /// warning. Default 1.5 GiB.
     #[serde(default = "default_session_guard_critical_free_commit_bytes")]
     pub critical_free_commit_bytes: u64,
-    /// OS threads in the runner process **above** which spawning a new session
-    /// is still allowed but the user is warned. Default 256.
+    /// The operator's own warn ceiling on the runner process's OS thread count,
+    /// or `None` — **not operator-set**, i.e. "use this machine's default".
     ///
     /// ## A CEILING, not a floor — the direction is inverted here
     ///
     /// The two `*_free_commit_bytes` fields above are floors: LOWER is worse.
     /// These two are ceilings: HIGHER is worse. Everything downstream mirrors
-    /// accordingly — the effective limit is a `min` over the three terms rather
-    /// than a `max` ([`crate::resource_guard::tighten_ceiling`]), the ladder
-    /// invariant is `critical >= warn` rather than `critical <= warn`
-    /// ([`crate::resource_guard::coerce_ceiling_ladder`]), and the clamp that
-    /// keeps a machine spawnable pushes the limit UP
+    /// accordingly — the ladder invariant is `critical >= warn` rather than
+    /// `critical <= warn` ([`crate::resource_guard::coerce_ceiling_ladder`]), and
+    /// the clamp that keeps a machine spawnable pushes the limit UP
     /// ([`crate::resource_guard::THREAD_CEILING_MIN`]) rather than down.
     ///
-    /// ## Why 256 — and why NOT the health monitor's 150
+    /// ## Why an `Option`, and what `Some` means
     ///
-    /// Both ceilings on this lane are fractions of the one resource they
-    /// protect: tokio's blocking pool, whose default `max_blocking_threads` is
-    /// **512**. 256 is half of it — half the pool consumed is the point where
-    /// back-pressure starts being worth its cost, and it is the number
-    /// `thread_pressure`'s WARN band hands to a gate continuation deciding
-    /// whether to wait.
+    /// Plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
+    /// dialog-says-low-memory`, Phase 2. The machine default is no longer a
+    /// constant: [`crate::resource_guard::merge_thread_ceilings`] derives it from
+    /// the box (cores, `MemTotal`, the measured at-rest floor), floored at
+    /// [`SHIPPED_WARN_THREAD_CEILING`]. An operator-set value REPLACES that
+    /// default — it may loosen as well as tighten, within
+    /// [`crate::resource_guard::THREAD_CEILING_MIN`] (plus the machine shift) and
+    /// [`crate::resource_guard::THREAD_CEILING_ABS_MAX`] — while the fleet term
+    /// still only tightens. That needs "operator-set" to be distinguishable from
+    /// "default", which a plain `usize` with a serde default cannot express: the
+    /// Settings panel's save writes every field, so most `settings.json` files on
+    /// the fleet carry a literal 256 that nobody chose.
     ///
-    /// The obvious alternative was to reuse
-    /// [`crate::health_monitor::THREAD_WARNING_THRESHOLD`] (150) so this lane
-    /// carried no second opinion about the same quantity. **Measurement killed
-    /// it.** Sampled every 3 s on 2026-08-30, a live idle runner (debug build,
-    /// embedded Postgres, full bridge set) sat at **150-151** threads — on and
-    /// over that constant. A warn ceiling there fires on every spawn of an idle
-    /// machine, which is not a warning, it is a permanent toast; and via Phase 1
-    /// of the load-aware-admission plan it would defer every gate continuation
-    /// on a box doing nothing. The relationship to that constant is kept, but as
-    /// an ORDERING rather than an equality: `resource_guard`'s tests pin both
-    /// ceilings strictly above it, so the spawn gate can never fire before the
-    /// health monitor's own "this is unusual" line.
-    #[serde(default = "default_session_guard_warn_thread_count")]
-    pub warn_thread_count: usize,
-    /// OS threads in the runner process above which a new spawn is refused by
-    /// default (always overridable at the point of refusal). Default 400.
+    /// ## The load migration
     ///
-    /// ## Why 400
+    /// [`deserialize_warn_thread_ceiling`] reads a stored value EQUAL to the old
+    /// default (256) as `None`. Under the old `min` fold such a value behaved
+    /// exactly like "unset", so nothing observable is lost. A stored value above
+    /// it (inert until now, silently dropped by the `min`) is honoured as the
+    /// operator's stated intent, and one below it (enforced until now) is kept.
+    /// The one residue, stated rather than discovered: an explicit 256 is no
+    /// longer expressible — it reads back as the machine default. An operator who
+    /// wants exactly today's number on a box whose default has risen writes 255
+    /// or 257.
     ///
-    /// tokio's blocking pool is the resource this protects, and its default
-    /// `max_blocking_threads` is **512** — confirmed unreconfigured in every
-    /// runtime this binary actually runs on: the only two
-    /// `.max_blocking_threads(…)` calls in `src-tauri` are inside
-    /// `health_monitor`'s own `#[test]` fixtures (which build 1- and 2-slot
-    /// runtimes on purpose, to saturate them), and every production runtime
-    /// built by hand (`logging.rs`, `off_runtime.rs`, `main.rs`) sets only
-    /// `worker_threads`. When the
-    /// primary runner wedged on 2026-08-29 the process carried **540** threads,
-    /// 119 of them inside `CreateProcess`: the pool was full and every further
-    /// blocking call was queued behind a spawn that could not finish.
+    /// ## `None` is written as an ABSENT key, never `null`
     ///
-    /// 400 leaves ~112 slots of the 512 for the runtime's own core workers, the
-    /// reactor, the dedicated health/watchdog threads, and — the reason it is
-    /// not 500 — the race this gate cannot close: the reading is taken before
-    /// the PTY opens, and a burst of concurrent admissions can each pass the
-    /// ceiling and only then create their threads. A margin narrower than the
-    /// burst that caused the incident (~130 concurrent spawns) would let the
-    /// gate say yes 130 times at 500 and land at 630.
-    #[serde(default = "default_session_guard_critical_thread_count")]
-    pub critical_thread_count: usize,
+    /// Older runner builds read this field as a plain `usize` with a serde
+    /// default. They accept a missing key, but a `null` fails the parse of the
+    /// WHOLE `Settings` document — which they then treat as unreadable, losing
+    /// every setting. `settings.json` is shared with secondary, temp and
+    /// rolled-back runners, so the new build must never write a shape an older
+    /// one cannot load: `skip_serializing_if` keeps "unset" as no key at all.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_warn_thread_ceiling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub warn_thread_count: Option<usize>,
+    /// The operator's own critical (refusal) ceiling, or `None` for this
+    /// machine's default. Always overridable at the point of refusal. Same
+    /// `Option` semantics and the same load migration as
+    /// [`Self::warn_thread_count`], against the old 400 default
+    /// ([`SHIPPED_CRITICAL_THREAD_CEILING`]).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_critical_thread_ceiling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub critical_thread_count: Option<usize>,
     /// Master switch for the whole guard — **both lanes**, the free-commit
     /// floors and the thread ceilings alike. Default **TRUE**, unlike
     /// [`CiNodeSettings::enabled`]: `ci_node` opts a machine INTO accepting
@@ -3018,17 +3083,100 @@ fn default_session_guard_critical_free_commit_bytes() -> u64 {
     3 * 1024 * 1024 * 1024 / 2
 }
 
-/// 256 threads — half tokio's 512-slot blocking pool. See
-/// [`SessionGuardSettings::warn_thread_count`] for why it is not the health
-/// monitor's 150, which a live runner was measured sitting on.
-fn default_session_guard_warn_thread_count() -> usize {
-    256
+/// The shipped warn ceiling on the runner's OS thread count: **256, on the
+/// calibration box** (a runner idling at 151 threads,
+/// [`crate::resource_guard::CALIBRATION_BASELINE`]).
+///
+/// It is no longer what every machine enforces. It is the FLOOR of the machine
+/// default — `max(256 + machine_thread_shift, scaled)` in
+/// [`crate::resource_guard::merge_thread_ceilings`] — so no box is ever stricter
+/// than it was before the ceilings scaled, and it is the number the
+/// [`SessionGuardSettings::warn_thread_count`] load migration reads as "unset".
+///
+/// ## Why 256 — and why NOT the health monitor's 150
+///
+/// Both shipped ceilings are fractions of the one resource they protect:
+/// tokio's blocking pool, whose default `max_blocking_threads` is **512**.
+/// 256 is half of it — half the pool consumed is the point where back-pressure
+/// starts being worth its cost, and it is the number `thread_pressure`'s WARN
+/// band hands to a gate continuation deciding whether to wait. The headroom it
+/// leaves above the calibration box's idle floor (256 − 151 = 105) is what
+/// `resource_guard` keeps CONSTANT on every machine as the blocking-pool arm of
+/// the scaled ceiling, because the pool is per-runtime and does not grow with
+/// cores or RAM.
+///
+/// The obvious alternative was to reuse
+/// [`crate::health_monitor::THREAD_WARNING_THRESHOLD`] (150) so this lane
+/// carried no second opinion about the same quantity. **Measurement killed
+/// it.** Sampled every 3 s on 2026-08-30, a live idle runner (debug build,
+/// embedded Postgres, full bridge set) sat at **150-151** threads — on and
+/// over that constant. A warn ceiling there fires on every spawn of an idle
+/// machine, which is not a warning, it is a permanent toast; and via Phase 1
+/// of the load-aware-admission plan it would defer every gate continuation
+/// on a box doing nothing. The relationship to that constant is kept, but as
+/// an ORDERING rather than an equality: `resource_guard`'s tests pin both
+/// ceilings strictly above it, so the spawn gate can never fire before the
+/// health monitor's own "this is unusual" line.
+pub(crate) const SHIPPED_WARN_THREAD_CEILING: usize = 256;
+
+/// The shipped critical ceiling: **400, on the calibration box** — the floor
+/// of the machine's critical default, exactly as
+/// [`SHIPPED_WARN_THREAD_CEILING`] is of its warn default.
+///
+/// ## Why 400
+///
+/// tokio's blocking pool is the resource this protects, and its default
+/// `max_blocking_threads` is **512** — confirmed unreconfigured in every
+/// runtime this binary actually runs on: the only two
+/// `.max_blocking_threads(…)` calls in `src-tauri` are inside
+/// `health_monitor`'s own `#[test]` fixtures (which build 1- and 2-slot
+/// runtimes on purpose, to saturate them), and every production runtime
+/// built by hand (`logging.rs`, `off_runtime.rs`, `main.rs`) sets only
+/// `worker_threads`. When the primary runner wedged on 2026-08-29 the process
+/// carried **540** threads, 119 of them inside `CreateProcess`: the pool was
+/// full and every further blocking call was queued behind a spawn that could
+/// not finish.
+///
+/// 400 leaves ~112 slots of the 512 for the runtime's own core workers, the
+/// reactor, the dedicated health/watchdog threads, and — the reason it is
+/// not 500 — the race this gate cannot close: the reading is taken before
+/// the PTY opens, and a burst of concurrent admissions can each pass the
+/// ceiling and only then create their threads. A margin narrower than the
+/// burst that caused the incident (~130 concurrent spawns) would let the
+/// gate say yes 130 times at 500 and land at 630. The headroom above the
+/// calibration floor (400 − 151 = 249) is the critical blocking-pool arm
+/// `resource_guard` keeps constant on every machine.
+pub(crate) const SHIPPED_CRITICAL_THREAD_CEILING: usize = 400;
+
+/// [`SessionGuardSettings::warn_thread_count`]'s load migration: a stored
+/// value equal to the old default ([`SHIPPED_WARN_THREAD_CEILING`]) was never
+/// distinguishable from "unset" and reads as `None`; anything else is kept.
+fn deserialize_warn_thread_ceiling<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<usize>::deserialize(deserializer)?;
+    Ok(migrate_thread_ceiling(stored, SHIPPED_WARN_THREAD_CEILING))
 }
 
-/// 400 threads — see [`SessionGuardSettings::critical_thread_count`] for the
-/// 512-slot blocking pool and the 540-thread wedge this is sized against.
-fn default_session_guard_critical_thread_count() -> usize {
-    400
+/// [`SessionGuardSettings::critical_thread_count`]'s load migration, against
+/// [`SHIPPED_CRITICAL_THREAD_CEILING`].
+fn deserialize_critical_thread_ceiling<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<usize>::deserialize(deserializer)?;
+    Ok(migrate_thread_ceiling(
+        stored,
+        SHIPPED_CRITICAL_THREAD_CEILING,
+    ))
+}
+
+/// PURE: the one rule both migrations apply. See
+/// [`SessionGuardSettings::warn_thread_count`] for why the old default is the
+/// value that means "unset".
+fn migrate_thread_ceiling(stored: Option<usize>, old_default: usize) -> Option<usize> {
+    stored.filter(|&n| n != old_default)
 }
 
 fn default_session_guard_enabled() -> bool {
@@ -3040,8 +3188,8 @@ impl Default for SessionGuardSettings {
         Self {
             warn_free_commit_bytes: default_session_guard_warn_free_commit_bytes(),
             critical_free_commit_bytes: default_session_guard_critical_free_commit_bytes(),
-            warn_thread_count: default_session_guard_warn_thread_count(),
-            critical_thread_count: default_session_guard_critical_thread_count(),
+            warn_thread_count: None,
+            critical_thread_count: None,
             enabled: default_session_guard_enabled(),
         }
     }
@@ -3148,6 +3296,15 @@ impl AcceptRemoteAttach {
 pub struct RemoteAttachSettings {
     #[serde(default)]
     pub accept_remote_attach: AcceptRemoteAttach,
+    /// When this runner's Fleet view last opened a device's session list,
+    /// keyed by the device id, RFC 3339 UTC. The runner's own interactivity
+    /// probe scheduler sweeps a device every `PROBE_EVERY` while its entry is
+    /// under seven days old (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A3) — an operator who has not looked at a device in a week is not
+    /// served by probing it. Pruned on every write.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fleet_view_opened_at: std::collections::BTreeMap<String, String>,
 }
 
 /// Who may ask this device to CREATE a terminal remotely (plan
@@ -5700,12 +5857,13 @@ static PERF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire the performance-cache test lock. Poison is ignored: a panicking
 /// test must not wedge every other test that touches the cache.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy (`hierarchy_lock` takes the
+/// env lock first): it is shared across three modules, so a future holder that
+/// also touches env cannot invert the order against an env-first one.
 #[cfg(test)]
-pub fn perf_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    match PERF_TEST_LOCK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+pub fn perf_test_lock() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&PERF_TEST_LOCK)
 }
 
 fn store_performance_cache(entry: CachedPerformance) {
@@ -6111,6 +6269,21 @@ pub fn save_remote_attach_preference(pref: AcceptRemoteAttach) -> Result<(), Str
         *cache = Some((std::time::Instant::now(), pref));
     }
     Ok(())
+}
+
+/// When the Fleet view last opened each device (see
+/// [`RemoteAttachSettings::fleet_view_opened_at`]).
+pub fn get_fleet_view_opened_at() -> std::collections::BTreeMap<String, String> {
+    load_settings().remote_attach.fleet_view_opened_at
+}
+
+/// Rewrite the Fleet-view opened-at map through `mutate` (the caller records
+/// and prunes; this persists).
+pub fn update_fleet_view_opened_at<F>(mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut std::collections::BTreeMap<String, String>),
+{
+    update_settings(|settings| mutate(&mut settings.remote_attach.fleet_view_opened_at))
 }
 
 /// The remote-CREATE preference. Default [`AcceptRemoteCreate::Off`].

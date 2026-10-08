@@ -45,7 +45,27 @@ ipc_handler_post!(
     "set_viewport_constraints"
 );
 ipc_handler_get!(ui_bridge_page_get_routes_handler, "get_routes");
-ipc_handler_post!(ui_bridge_page_navigate_to_handler, "navigate_by_adapter");
+ipc_handler_post!(
+    ui_bridge_page_navigate_to_handler_dispatch,
+    "navigate_by_adapter"
+);
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/navigate-to` is a `navigation` edge (`push`, or `replace` when the request says so); the target route is never recorded.
+pub async fn ui_bridge_page_navigate_to_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        "navigate_to",
+        crate::journey::cursor::push_or_replace(&body),
+    );
+    let result =
+        ui_bridge_page_navigate_to_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
 
 // ============================================================================
 // Request / response types
@@ -268,9 +288,83 @@ impl RequestHints for SetTabRequest {
 pub struct SetTabResponse {
     pub success: bool,
     pub tab: String,
-    /// Value of `[data-page-id]` on the active page after the tab change
-    /// (null if no element with that attribute is present).
+    /// Value of the FIRST `[data-page-id]` in document order after the tab
+    /// change — always the outermost page wrapper, never a sub-view (null if
+    /// no element with that attribute is present). The selector predates
+    /// `activePageId` and is unchanged; the value used to be always null
+    /// because the read-back Promise was never awaited. Read `active_page_id`
+    /// when you need the innermost visible view.
     pub page_id: Option<String>,
+    /// `data-page-id` of the deepest VISIBLE `[data-page-id]` inside the page
+    /// wrapper (the wrapper itself included) — the sub-view a nested page
+    /// publishes. Visible means a non-zero bounding client rect, so unmounted
+    /// and `display:none` views are skipped; greatest ancestor depth wins and
+    /// ties go to the last in document order. Equals `page_id` when the page
+    /// publishes no nested id and the wrapper is visible (Settings sub-tabs,
+    /// for one, carry none). Null when no candidate inside the wrapper has a
+    /// non-zero rect.
+    pub active_page_id: Option<String>,
+    /// `data-page-id` values along the winning element's ancestor path, outer
+    /// to inner, consecutive duplicates collapsed (the last entry equals
+    /// `active_page_id`). Empty when `active_page_id` is null.
+    pub page_id_chain: Vec<String>,
+}
+
+/// The read-back walk evaluated in the webview after a set-tab dispatch. It
+/// defines `readSetTabPageIds(doc)`; its vitest lives in
+/// `src/components/app/__tests__/set-tab-readback.test.ts`.
+const SET_TAB_READBACK_JS: &str = include_str!("set_tab_readback.js");
+
+/// The set-tab eval expression: dispatch `ui-bridge-set-tab`, wait 100 ms,
+/// then return the [`SET_TAB_READBACK_JS`] read-back as a JSON string. Must be
+/// evaluated with `await_promise = true` — it is an async IIFE.
+fn set_tab_expression(tab: &str) -> String {
+    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
+            await new Promise(r => setTimeout(r, 100));
+            {}
+            try {{ return JSON.stringify(readSetTabPageIds(document)); }} catch (e) {{ return "{{}}"; }}
+        }})()"#,
+        escaped_tab, SET_TAB_READBACK_JS
+    )
+}
+
+/// The page-id fields read back from the webview after a set-tab dispatch.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SetTabReadback {
+    pub page_id: Option<String>,
+    pub active_page_id: Option<String>,
+    pub page_id_chain: Vec<String>,
+}
+
+/// Parse the set-tab eval result (`{"pageId", "activePageId", "pageIdChain"}`
+/// as a JSON string). Every field is optional: an unparseable result, a
+/// missing key, or a non-string value reads as absent (and non-string chain
+/// entries are dropped). The eval result is text produced inside the webview,
+/// where page script runs alongside the read-back, so it is parsed as
+/// untrusted input: a malformed read-back costs the verification signal, never
+/// the tab switch that already happened.
+pub(crate) fn parse_set_tab_readback(result_str: &str) -> SetTabReadback {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result_str) else {
+        return SetTabReadback::default();
+    };
+    let str_field = |key: &str| v.get(key).and_then(|p| p.as_str()).map(|s| s.to_string());
+    let page_id_chain = v
+        .get("pageIdChain")
+        .and_then(|c| c.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    SetTabReadback {
+        page_id: str_field("pageId"),
+        active_page_id: str_field("activePageId"),
+        page_id_chain,
+    }
 }
 
 /// Request body for `POST /ui-bridge/control/tab/activate` (F4).
@@ -354,7 +448,26 @@ pub(crate) fn resolve_navigate_page(url: &str) -> Result<String, String> {
 // Navigate-and-wait
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/navigate-and-wait` acts on ONE element (`elementId` +
+/// `action`), so it is an `element_action` on that element.
 pub async fn ui_bridge_navigate_and_wait_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<NavigateAndWaitRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::element(
+        &request.0.element_id,
+        &request.0.action,
+        qontinui_types::journey::ChokePoint::ElementAction,
+    );
+    let result =
+        ui_bridge_navigate_and_wait_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+async fn ui_bridge_navigate_and_wait_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(req): UiBridgeJson<NavigateAndWaitRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -467,6 +580,24 @@ pub async fn ui_bridge_navigate_and_wait_handler(
 // Page lifecycle (refresh, hard-refresh, close-request, navigate, back, forward)
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/refresh` is a `navigation` edge: a reload is an `initial` load.
+pub async fn ui_bridge_page_refresh_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_refresh_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "refresh",
+            qontinui_types::journey::NavigationTriggerKind::Initial,
+        ),
+    );
+    result
+}
+
 /// Refresh the page — a DOCUMENTED NO-OP in the runner, now reported as one.
 ///
 /// This route used to answer a bare `200 {"success": true, "url": "…"}` for a
@@ -493,7 +624,7 @@ pub async fn ui_bridge_navigate_and_wait_handler(
 /// The honest reload door is the sibling `POST /control/page/hard-refresh`,
 /// which really does reload — it is named in the `message` so a caller that
 /// wanted a reload can get one instead of retrying this route forever.
-pub async fn ui_bridge_page_refresh_handler(
+async fn ui_bridge_page_refresh_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page refresh (no-op in the runner — reporting reloaded:false)");
@@ -535,8 +666,26 @@ pub(crate) fn augment_refresh_response(data: &mut serde_json::Value) {
     );
 }
 
-/// Hard refresh the page, bypassing browser cache.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/hard-refresh` is a `navigation` edge: a reload is an `initial` load.
 pub async fn ui_bridge_page_hard_refresh_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_hard_refresh_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "hard_refresh",
+            qontinui_types::journey::NavigationTriggerKind::Initial,
+        ),
+    );
+    result
+}
+
+/// Hard refresh the page, bypassing browser cache.
+async fn ui_bridge_page_hard_refresh_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use tauri::Manager;
@@ -1147,6 +1296,26 @@ pub(crate) fn navigate_rejection_response(
     api_error_detailed(message, detail)
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/navigate` is a `navigation` edge (`push`: both modes
+/// pushState — neither replaces); the URL is never recorded.
+pub async fn ui_bridge_page_navigate_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<PageNavigateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_navigate_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "navigate",
+            qontinui_types::journey::NavigationTriggerKind::Push,
+        ),
+    );
+    result
+}
+
 /// Navigate to a URL.
 ///
 /// Accepts an optional `mode` field. **Neither mode reloads the document** —
@@ -1209,7 +1378,7 @@ pub(crate) fn navigate_rejection_response(
 /// (`http://localhost:9881/terminal`) is rewritten to its path (`/terminal`)
 /// before anything else happens, because that is what actually gets navigated
 /// to. See [`same_origin_absolute_path`].
-pub async fn ui_bridge_page_navigate_handler(
+async fn ui_bridge_page_navigate_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<PageNavigateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -1340,8 +1509,26 @@ pub(crate) fn augment_navigate_response(data: &mut serde_json::Value, url: &str,
     obj.insert("reloaded".to_string(), serde_json::Value::Bool(false));
 }
 
-/// Go back in browser history.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/back` is a `navigation` edge triggered by history `pop`.
 pub async fn ui_bridge_page_go_back_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_go_back_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "back",
+            qontinui_types::journey::NavigationTriggerKind::Pop,
+        ),
+    );
+    result
+}
+
+/// Go back in browser history.
+async fn ui_bridge_page_go_back_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page go back");
@@ -1349,8 +1536,26 @@ pub async fn ui_bridge_page_go_back_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "page_go_back", serde_json::json!({})).await)
 }
 
-/// Go forward in browser history.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/forward` is a `navigation` edge triggered by history `pop`.
 pub async fn ui_bridge_page_go_forward_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_go_forward_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "forward",
+            qontinui_types::journey::NavigationTriggerKind::Pop,
+        ),
+    );
+    result
+}
+
+/// Go forward in browser history.
+async fn ui_bridge_page_go_forward_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page go forward");
@@ -2050,8 +2255,32 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 // Tab switching (set-tab, activate-tab)
 // ============================================================================
 
-/// POST /ui-bridge/control/page/set-tab
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/set-tab` is a `navigation` edge (`push`) to an
+/// app-declared tab id.
 pub async fn ui_bridge_page_set_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<SetTabRequest>,
+) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("tab:{}", request.0.tab),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result = ui_bridge_page_set_tab_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+/// POST /ui-bridge/control/page/set-tab
+///
+/// Dispatches `ui-bridge-set-tab`, waits 100 ms, then reads back three page-id
+/// signals via [`SET_TAB_READBACK_JS`]: `pageId` (the first `[data-page-id]`
+/// in document order — the outer wrapper), `activePageId` (the
+/// deepest visible `[data-page-id]` inside that wrapper, i.e. the sub-view) and
+/// `pageIdChain` (outer → inner along that element's ancestors). See
+/// [`SetTabResponse`].
+async fn ui_bridge_page_set_tab_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<SetTabRequest>,
 ) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -2081,31 +2310,24 @@ pub async fn ui_bridge_page_set_tab_handler(
 
     info!("UI Bridge API: page/set-tab → {}", tab);
 
-    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
-    let expression = format!(
-        r#"(async () => {{
-            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
-            await new Promise(r => setTimeout(r, 100));
-            var el = document.querySelector("[data-page-id]");
-            var pageId = el && el.getAttribute ? el.getAttribute("data-page-id") : null;
-            return JSON.stringify({{ pageId: pageId }});
-        }})()"#,
-        escaped_tab
-    );
+    let expression = set_tab_expression(&tab);
 
-    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), false).await {
+    // `await_promise` must be true: the expression is an async IIFE, and with
+    // false the helper stringifies the pending Promise (`"{}"`), so every
+    // read-back field would come back absent. The read-back is wrapped in
+    // try/catch so a throwing walk (a DOM method throwing mid-read) costs only
+    // the signal, not a 500 for a tab switch that already happened. A page that
+    // breaks `JSON.stringify` itself still times out: the helper's own POST
+    // back needs it.
+    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), true).await {
         Ok(result_str) => {
-            let page_id = serde_json::from_str::<serde_json::Value>(&result_str)
-                .ok()
-                .and_then(|v| {
-                    v.get("pageId")
-                        .and_then(|p| p.as_str())
-                        .map(|s| s.to_string())
-                });
+            let readback = parse_set_tab_readback(&result_str);
             Ok(Json(ApiResponse::success(SetTabResponse {
                 success: true,
                 tab,
-                page_id,
+                page_id: readback.page_id,
+                active_page_id: readback.active_page_id,
+                page_id_chain: readback.page_id_chain,
             })))
         }
         Err(e) => {
@@ -2121,8 +2343,26 @@ pub async fn ui_bridge_page_set_tab_handler(
     }
 }
 
-/// POST /ui-bridge/control/activate-tab/{tab_id}
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/activate-tab/{tab_id}` is a `navigation` edge (`push`) to an
+/// app-declared tab id (an unknown id is a 4xx and records nothing).
 pub async fn ui_bridge_activate_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(tab_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("tab:{tab_id}"),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result =
+        ui_bridge_activate_tab_handler_dispatch(State(Arc::clone(&state)), Path(tab_id)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+/// POST /ui-bridge/control/activate-tab/{tab_id}
+async fn ui_bridge_activate_tab_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(tab_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -2223,6 +2463,24 @@ pub async fn ui_bridge_tabs_list_handler(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/tab/activate` is a `navigation` edge (`push`) to an app-declared
+/// tab id.
+pub async fn ui_bridge_tab_activate_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<TabActivateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("tab:{}", request.0.tab_id),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result = ui_bridge_tab_activate_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// `POST /ui-bridge/control/tab/activate`
 ///
 /// Body: `{ "tabId": "<id>" }`. Fires the same code path a user click would
@@ -2235,7 +2493,7 @@ pub async fn ui_bridge_tabs_list_handler(
 /// static `VALID_TAB_IDS` registry so the caller gets the error without an
 /// IPC round-trip; the React handler repeats the check as a defence-in-depth
 /// guard in case the two lists ever diverge.
-pub async fn ui_bridge_tab_activate_handler(
+async fn ui_bridge_tab_activate_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<TabActivateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
@@ -3969,6 +4227,100 @@ mod refresh_response_honesty_tests {
         assert!(
             body.contains("Hard refresh triggered"),
             "hard-refresh's honest message must survive this change"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_tab_readback_tests {
+    use super::*;
+
+    #[test]
+    fn readback_js_defines_the_function_the_expression_calls() {
+        assert!(SET_TAB_READBACK_JS.contains("function readSetTabPageIds(doc)"));
+    }
+
+    #[test]
+    fn expression_embeds_the_walk_and_never_throws_on_readback() {
+        let expr = set_tab_expression("settings");
+        assert!(expr.starts_with("(async () => {"));
+        assert!(expr.contains(r#"detail: { tab: "settings" }"#));
+        assert!(expr.contains(SET_TAB_READBACK_JS));
+        assert!(expr.contains(
+            r#"try { return JSON.stringify(readSetTabPageIds(document)); } catch (e) { return "{}"; }"#
+        ));
+        assert!(expr.trim_end().ends_with("})()"));
+    }
+
+    #[test]
+    fn response_keeps_page_id_and_adds_active_fields() {
+        let resp = SetTabResponse {
+            success: true,
+            tab: "settings".to_string(),
+            page_id: Some("page-settings".to_string()),
+            active_page_id: Some("settings-general".to_string()),
+            page_id_chain: vec!["page-settings".to_string(), "settings-general".to_string()],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["pageId"], "page-settings");
+        assert_eq!(v["activePageId"], "settings-general");
+        assert_eq!(
+            v["pageIdChain"],
+            serde_json::json!(["page-settings", "settings-general"])
+        );
+        assert_eq!(v["success"], true);
+        assert_eq!(v["tab"], "settings");
+    }
+
+    #[test]
+    fn response_serializes_absent_active_fields_as_null_and_empty() {
+        let resp = SetTabResponse {
+            success: true,
+            tab: "tasks".to_string(),
+            page_id: None,
+            active_page_id: None,
+            page_id_chain: Vec::new(),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v["pageId"].is_null());
+        assert!(v["activePageId"].is_null());
+        assert_eq!(v["pageIdChain"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parses_full_readback() {
+        let r = parse_set_tab_readback(
+            r#"{"pageId":"page-settings","activePageId":"settings-ai","pageIdChain":["page-settings","settings-ai"]}"#,
+        );
+        assert_eq!(r.page_id.as_deref(), Some("page-settings"));
+        assert_eq!(r.active_page_id.as_deref(), Some("settings-ai"));
+        assert_eq!(r.page_id_chain, vec!["page-settings", "settings-ai"]);
+    }
+
+    #[test]
+    fn legacy_readback_with_only_page_id_degrades_cleanly() {
+        let r = parse_set_tab_readback(r#"{"pageId":"page-tasks"}"#);
+        assert_eq!(r.page_id.as_deref(), Some("page-tasks"));
+        assert_eq!(r.active_page_id, None);
+        assert!(r.page_id_chain.is_empty());
+    }
+
+    #[test]
+    fn nulls_non_strings_and_garbage_read_as_absent() {
+        let r = parse_set_tab_readback(
+            r#"{"pageId":null,"activePageId":7,"pageIdChain":["a",null,3,"b"]}"#,
+        );
+        assert_eq!(r.page_id, None);
+        assert_eq!(r.active_page_id, None);
+        assert_eq!(r.page_id_chain, vec!["a", "b"]);
+
+        assert_eq!(
+            parse_set_tab_readback("not json"),
+            SetTabReadback::default()
+        );
+        assert_eq!(
+            parse_set_tab_readback(r#"{"pageIdChain":"x"}"#),
+            SetTabReadback::default()
         );
     }
 }

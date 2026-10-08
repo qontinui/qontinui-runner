@@ -30,6 +30,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppDiscovery, type DiscoveredApp } from "@/hooks/useAppDiscovery";
 import { useSdkUIBridge } from "@/hooks/useSdkUIBridge";
 import type { useUIBridgeDiscovery } from "@/hooks/useUIBridgeDiscovery";
+import { describeThrown } from "@/lib/utils";
 
 interface UIBridgeDiscoveryPanelProps {
   discovery: ReturnType<typeof useUIBridgeDiscovery>;
@@ -219,7 +220,7 @@ export function UIBridgeDiscoveryPanel({
 
         setIsAnalyzing(false);
       } catch (err) {
-        setAnalyzeError(err instanceof Error ? err.message : "Failed to import");
+        setAnalyzeError(describeThrown(err, "Failed to import"));
         setIsAnalyzing(false);
       }
     };
@@ -289,7 +290,7 @@ export function UIBridgeDiscoveryPanel({
         }),
       );
     } catch (err) {
-      setAnalyzeError(err instanceof Error ? err.message : "Generation failed");
+      setAnalyzeError(describeThrown(err, "Generation failed"));
     } finally {
       setIsAnalyzing(false);
     }

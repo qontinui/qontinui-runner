@@ -2177,6 +2177,13 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
         });
     }
     let coord_base = crate::commands::remote_attach::coord_base_for(&api_state.app_handle);
+    // 4. Remote interactivity (plan
+    //    `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`):
+    //    observations go to the coord this runner mints grants against, and
+    //    the probe sweep's scheduler starts on the first connect — the sweep
+    //    rides this relay, so there is nothing for it to do before one.
+    crate::mcp::remote_interactivity::set_coord_base(&coord_base);
+    crate::commands::remote_interactivity_probe::ensure_probe_scheduler(&api_state.app_handle);
     tokio::spawn(
         crate::commands::remote_attach::mirror_attach_preference_logged(coord_base.clone()),
     );
@@ -4551,13 +4558,13 @@ async fn register_remote_created_session(
             let Some(session) = tm.get(terminal_id) else {
                 return Err(terminal_gone_after_confirm(&registry, coord_id));
             };
-            session.set_coord_session_id(coord_id);
+            tm.bind_coord_session(&session, coord_id);
             // Close the coord mirror the instant the PTY exits, instead of
             // leaving a ghost for coord's stale watcher to reap. Same
             // idempotent door the explicit close uses.
             let close_registry = registry.clone();
             let exit_pinned_session_id = session.pinned_session_id().to_string();
-            session.set_on_exit(Box::new(move |id, exit_code| {
+            session.set_on_exit(Box::new(move |id, exit| {
                 if let Err(e) = close_registry.close_by_id(id) {
                     warn!(
                         coord_session = %id,
@@ -4572,7 +4579,7 @@ async fn register_remote_created_session(
                     &close_registry,
                     id,
                     Some(&exit_pinned_session_id),
-                    exit_code,
+                    exit.agent_exit_code(),
                 );
             }));
             if !session.is_alive() {
@@ -4771,6 +4778,24 @@ where
     }
 }
 
+/// The refusal message a drain-deferred relay create carries back to its source.
+///
+/// The drain gate's `reason` is written for work that IS re-run once the drain
+/// lifts ("… is deferred and runs once the drain lifts"). A relay create is
+/// one-shot: nothing re-presents it, so that tail would tell the remote
+/// operator to wait for something that never happens. Keep the state half —
+/// coord's drain window and the operator's reason, or the unknown cause — and
+/// say what actually happened to this request.
+fn relay_create_drain_message(reason: &str) -> String {
+    // The gate's own tail is the LAST " — " clause; the operator's drain reason
+    // or the unknown cause before it may contain one of their own.
+    let state = reason
+        .rsplit_once(" — ")
+        .map_or(reason, |(head, _)| head)
+        .trim();
+    format!("{state} — this remote terminal create was refused, not queued; nothing was spawned")
+}
+
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D3): a relay create — web, mobile or a remote runner — is a remote
@@ -4794,7 +4819,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // `drain_unreadable` while the state is unknown, `device_drained`
             // only when coord said drained.
             "code": class.code(),
-            "message": reason,
+            "message": relay_create_drain_message(&reason),
             "request_id": data.get("request_id"),
         }));
     }
@@ -5173,13 +5198,23 @@ fn handle_terminal_input(api_state: &Arc<ApiState>, data: &Value) -> Option<Valu
         // The gate + decode + write live in `remote_terminal` so the "a
         // refused frame never reaches the PTY" property is unit-tested
         // against a recorder. No `remote` block → the pre-existing path.
-        return crate::mcp::remote_terminal::apply_terminal_input(
+        let reply = crate::mcp::remote_terminal::apply_terminal_input(
             tm.as_ref(),
             crate::mcp::remote_terminal::grants(),
             crate::settings::get_remote_attach_preference,
             data,
             crate::mcp::remote_terminal::now_epoch_secs(),
         );
+        // TARGET role of plan
+        // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`
+        // (A2): an ack is this runner MEASURING the write half, so it is
+        // reported to coord — coalesced and queued, never awaited here (this
+        // is the relay's serial read loop). A refusal frame or `None` is not
+        // an ack and reports nothing.
+        if let Some(ack) = reply.as_ref() {
+            crate::mcp::remote_interactivity::report_target_ack(ack);
+        }
+        return reply;
     }
     None
 }
@@ -8758,5 +8793,50 @@ mod remote_create_registration_tests {
             .as_str()
             .unwrap()
             .contains("no HTTP answer"));
+    }
+}
+
+#[cfg(test)]
+mod relay_create_drain_message_tests {
+    use super::relay_create_drain_message;
+    use crate::coord_drain_state::{gate_for_at, CoordDrainState, DrainGate, SpawnOrigin};
+
+    fn reason_for(state: &CoordDrainState) -> String {
+        match gate_for_at(state, SpawnOrigin::Unknown, chrono::Utc::now()) {
+            DrainGate::Defer { reason, .. } => reason,
+            DrainGate::Allow => panic!("{state:?} should defer a relay create"),
+        }
+    }
+
+    /// Built from the gate's REAL reasons, so a reworded gate cannot leave the
+    /// relay saying the create "runs once the drain lifts".
+    #[test]
+    fn keeps_the_drain_state_and_drops_the_will_run_later_promise() {
+        let drained = relay_create_drain_message(&reason_for(&CoordDrainState::Drained {
+            until: None,
+            reason: Some("rebuild".to_string()),
+        }));
+        assert!(
+            drained.starts_with("coord has drained this device (rebuild) — "),
+            "{drained}"
+        );
+        let unknown = relay_create_drain_message(&reason_for(&CoordDrainState::Unknown {
+            since: chrono::Utc::now(),
+            cause: "coord drain state not read yet".to_string(),
+        }));
+        assert!(
+            unknown.starts_with("coord drain state unknown (coord drain state not read yet) — "),
+            "{unknown}"
+        );
+        for message in [&drained, &unknown] {
+            assert!(message.contains("refused, not queued"), "{message}");
+            assert!(message.contains("nothing was spawned"), "{message}");
+            assert!(!message.contains("runs once"), "{message}");
+            assert!(
+                !message.contains("until the state is read again"),
+                "{message}"
+            );
+            assert_eq!(message.matches(" — ").count(), 1, "{message}");
+        }
     }
 }

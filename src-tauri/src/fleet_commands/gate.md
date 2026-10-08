@@ -203,7 +203,13 @@ Every gate needs exactly ONE anchor:
   - This is a **separate FIRST call**: the `register-gate` route does NOT upsert
     (it 404s `work_unit_not_found` if the slug is absent).
 - **Claim-anchored:** `(claim_kind, resource_key)` — only when the gate is bound
-  to a specific coord claim, not a plan phase.
+  to a specific coord claim, not a plan phase. **Never anchor a "watch / babysit
+  this OPEN PR" continuation on `claim:pr:<owner>/<repo>#<n>`**: coord's auto-PR
+  hook registers (on PR open, when enabled) its own open `pr_merged` gate on
+  that exact anchor, so your cleared continuation is held until the PR lands
+  while `will_dispatch` still reads `true`. Use a work-unit anchor or a
+  non-`pr` `claim_kind` (e.g. `babysit`).
+  Canonical: `_gate-registration` → "Anchor derivation (zero user input)".
 
 > **The work-unit WRITES are device-authed — no more upsert wall.** The work-unit
 > upsert + register routes live on coord's `require_jwt` sub-router, so a **device
@@ -439,6 +445,26 @@ AUTH=""   # Step 3's residual (c) stages the acting bearer here, and Step 4 the
           # nonce in $TMPDIR after exit.
 trap 'rm -f "$HDR" "$AUTH"' EXIT
 hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
+# This session's OWN id as one `curl -H @file` header line, or nothing at all,
+# so coord can stamp what this call writes with the session that made it (plan
+# 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state,
+# Phase 2). The rule is coord-revive.sh's `caller_session_id`, and
+# a test pins every copy of this function, byte-identical, to that rule:
+# validate-then-fall-through, so a MALFORMED QONTINUI_AGENT_SESSION_ID cannot
+# mask a good CLAUDE_CODE_SESSION_ID (a well-formed one still wins, stale or
+# not: it is the deliberate override), and a non-uuid is never sent (coord
+# would count it `malformed`). Not a credential; coord binds it to the device
+# fail-closed.
+caller_session_line() {
+  local _cs
+  for _cs in "${QONTINUI_AGENT_SESSION_ID:-}" "${CLAUDE_CODE_SESSION_ID:-}"; do
+    if [[ "$_cs" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+      printf 'X-Coord-Caller-Session: %s\n' "$_cs"
+      return 0
+    fi
+  done
+  return 0
+}
 
 # jq is NOT guaranteed to exist — it is ABSENT on the Windows operator box
 # (verified 2026-08-06). With `jq ... 2>/dev/null` inline, a missing binary is
@@ -489,6 +515,17 @@ else
   exit 1
 fi
 
+# ENV REFERENCES: the runner writes the nonce as
+# `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}` (plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages). Expand
+# it from THIS shell's environment exactly as Claude Code does, through the one
+# bash owner - never stage the literal reference as a bearer. The _for_url form
+# reads the environment only for a strictly-loopback $url (else the default), so
+# a sibling .mcp.json naming another host never receives an environment value.
+# Without the helper a key carrying a reference is skipped; a literal key still works.
+MCP_ENV_REF_LIB="$ROOT/qontinui-claude-config/scripts/lib/mcp-env-ref.sh"
+if [ -r "$MCP_ENV_REF_LIB" ]; then . "$MCP_ENV_REF_LIB"; else MCP_ENV_REF_LIB=""; fi
+
 LIVE_URL=""; LIVE_KEY=""; LIVE_HDR="X-Coord-Mcp-Proxy-Key"
 for f in "${CANDIDATES[@]}"; do
   [ -r "$f" ] || continue
@@ -508,11 +545,18 @@ for f in "${CANDIDATES[@]}"; do
   key=$(mcp_key)
   case "$url" in *"/coord-mcp"*) ;; *) continue ;; esac
   [ -n "$key" ] || continue
+  if [ -n "$MCP_ENV_REF_LIB" ]; then
+    mcp_expand_env_ref_for_url key "$url" "$key" || continue   # names UNEXPANDED_ENV_REF <NAME>
+  else
+    case "$key" in *'${'*'}'*) echo "skip: $f -> its nonce is a \${...} reference and mcp-env-ref.sh is not reachable" >&2; continue ;; esac
+  fi
   # Verify the staging: `curl -H @<empty file>` does NOT error, it sends the
   # probe with NO credential — every door then 401s and the sweep concludes
   # "no live proxy" while every door is fine.
   { printf '%s: %s\n' "$(mcp_keyhdr)" "$key" > "$HDR"; } 2>/dev/null
   [ -s "$HDR" ] || { echo "cannot stage the nonce header (LOCAL fault, not a coord verdict)" >&2; break; }
+  # AFTER the -s guard: the session line alone must never make it pass.
+  caller_session_line >> "$HDR"
   code=$(curl -s --connect-timeout 5 -m 20 -o /dev/null -w '%{http_code}' -X POST "$url" \
     -H "Content-Type: application/json" \
     -H @"$(hdrp)" -d "$COORD_RPC")
@@ -548,6 +592,7 @@ captured `work_unit_id`):
 # a fresh shell, re-stage it — never inline it on argv:
 #   HDR=$(mktemp); trap 'rm -f "$HDR"' EXIT
 #   printf '%s: %s\n' "$LIVE_HDR" "$LIVE_KEY" > "$HDR"   # $LIVE_HDR = the header name the sweep found the nonce under
+#   caller_session_line >> "$HDR"   # define caller_session_line as in the Step-2 sweep first
 #   hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
 curl -fsS -X POST "$LIVE_URL" -H "Content-Type: application/json" \
   -H @"$(hdrp)" \
@@ -684,6 +729,7 @@ LIVE_HDR="X-Coord-Mcp-Proxy-Key"
 # JSON-RPC block or Step 3's REST block UNCHANGED:
 #   HDR=$(mktemp); trap 'rm -f "$HDR"' EXIT
 #   printf '%s: %s\n' "$LIVE_HDR" "$LIVE_KEY" > "$HDR"
+#   caller_session_line >> "$HDR"   # define caller_session_line as in the Step-2 sweep first
 #   hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
 ```
 
@@ -829,8 +875,17 @@ $jwt = $jwt.Trim()
 # into a 401 the caller then has to decode. Reaching this with an EMPTY $jwt now
 # means the runner really did answer without a token, not that the read missed.
 if ($jwt.Split('.').Count -ne 3) { throw 'runner returned a non-JWT (signed out?)' }
+# This session's own id beside the bearer, so coord stamps the gate with the
+# session that registered it - the same validate-then-fall-through rule as the
+# bash `caller_session_line` (plan
+# 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state).
+$hdrs = @{ Authorization = "Bearer $jwt" }
+$cs = @($env:QONTINUI_AGENT_SESSION_ID, $env:CLAUDE_CODE_SESSION_ID) |
+  Where-Object { $_ -cmatch '\A[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\z' } |
+  Select-Object -First 1
+if ($cs) { $hdrs['X-Coord-Caller-Session'] = $cs }
 Invoke-RestMethod -Uri 'https://coord.qontinui.io/coord/work-units/upsert' -Method Post `
-  -Headers @{Authorization="Bearer $jwt"} -ContentType 'application/json' `
+  -Headers $hdrs -ContentType 'application/json' `
   -Body '{"slug":"<stem>","title":"<plan H1>"}'
 # then POST .../coord/work-units/<stem>/register-gate with the same header.
 ```
@@ -870,8 +925,29 @@ BEARER=$(bash "$ROOT/qontinui-claude-config/scripts/coord-acting-bearer.sh") || 
 # cmdlines are world-readable on this multi-session machine. If you carried
 # Step 2's shell forward, $AUTH is already covered by the trap set there; in a
 # fresh shell set `trap 'rm -f "$AUTH"' EXIT` here.
+# This session's OWN id as one `curl -H @file` header line, or nothing at all,
+# so coord can stamp what this call writes with the session that made it (plan
+# 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state,
+# Phase 2). The rule is coord-revive.sh's `caller_session_id`, and
+# a test pins every copy of this function, byte-identical, to that rule:
+# validate-then-fall-through, so a MALFORMED QONTINUI_AGENT_SESSION_ID cannot
+# mask a good CLAUDE_CODE_SESSION_ID (a well-formed one still wins, stale or
+# not: it is the deliberate override), and a non-uuid is never sent (coord
+# would count it `malformed`). Not a credential; coord binds it to the device
+# fail-closed.
+caller_session_line() {
+  local _cs
+  for _cs in "${QONTINUI_AGENT_SESSION_ID:-}" "${CLAUDE_CODE_SESSION_ID:-}"; do
+    if [[ "$_cs" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+      printf 'X-Coord-Caller-Session: %s\n' "$_cs"
+      return 0
+    fi
+  done
+  return 0
+}
 AUTH=$(mktemp) || { echo "mktemp failed — cannot stage the bearer off argv" >&2; exit 1; }
 printf 'Authorization: Bearer %s\n' "$BEARER" > "$AUTH"
+caller_session_line >> "$AUTH"
 AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
 # 1. upsert the work unit (capture work_unit_id):
 WU=$(curl -fsS -X POST "$COORD_HTTP_URL/coord/work-units/upsert" \
@@ -974,9 +1050,30 @@ COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 # carried Step 2's shell forward, $AUTH is already covered by that trap, and in
 # a fresh shell the guard below sets one that covers $HDR too.
 [ -n "$DEVICE_JWT" ] || { echo "no device JWT — LOCAL fault, not a coord verdict; see residual (b)" >&2; exit 1; }
+# This session's OWN id as one `curl -H @file` header line, or nothing at all,
+# so coord can stamp what this call writes with the session that made it (plan
+# 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state,
+# Phase 2). The rule is coord-revive.sh's `caller_session_id`, and
+# a test pins every copy of this function, byte-identical, to that rule:
+# validate-then-fall-through, so a MALFORMED QONTINUI_AGENT_SESSION_ID cannot
+# mask a good CLAUDE_CODE_SESSION_ID (a well-formed one still wins, stale or
+# not: it is the deliberate override), and a non-uuid is never sent (coord
+# would count it `malformed`). Not a credential; coord binds it to the device
+# fail-closed.
+caller_session_line() {
+  local _cs
+  for _cs in "${QONTINUI_AGENT_SESSION_ID:-}" "${CLAUDE_CODE_SESSION_ID:-}"; do
+    if [[ "$_cs" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+      printf 'X-Coord-Caller-Session: %s\n' "$_cs"
+      return 0
+    fi
+  done
+  return 0
+}
 [ -n "$AUTH" ] || { AUTH=$(mktemp) || exit 1; trap 'rm -f "$HDR" "$AUTH"' EXIT; }
 printf 'Authorization: Bearer %s\n' "$DEVICE_JWT" > "$AUTH"
 [ -s "$AUTH" ] || { echo "cannot stage the JWT header (LOCAL fault)" >&2; exit 1; }
+caller_session_line >> "$AUTH"   # after the guard, so it can never satisfy it
 AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
 # PROBE first — this rung's own validation. A 200 whose body carries no
 # JSON-RPC `result` is NOT a live door: treat it as dead and report Step 5.
@@ -1182,7 +1279,28 @@ else
 fi
 TOK=$(read_token)
 [ -z "$TOK" ] && echo "BOOTSTRAP_NO_TOKEN_IN_RESPONSE (HTTP $CODE, but no token field was readable)" >&2
+# This session's OWN id as one `curl -H @file` header line, or nothing at all,
+# so coord can stamp what this call writes with the session that made it (plan
+# 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state,
+# Phase 2). The rule is coord-revive.sh's `caller_session_id`, and
+# a test pins every copy of this function, byte-identical, to that rule:
+# validate-then-fall-through, so a MALFORMED QONTINUI_AGENT_SESSION_ID cannot
+# mask a good CLAUDE_CODE_SESSION_ID (a well-formed one still wins, stale or
+# not: it is the deliberate override), and a non-uuid is never sent (coord
+# would count it `malformed`). Not a credential; coord binds it to the device
+# fail-closed.
+caller_session_line() {
+  local _cs
+  for _cs in "${QONTINUI_AGENT_SESSION_ID:-}" "${CLAUDE_CODE_SESSION_ID:-}"; do
+    if [[ "$_cs" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+      printf 'X-Coord-Caller-Session: %s\n' "$_cs"
+      return 0
+    fi
+  done
+  return 0
+}
 printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
+caller_session_line >> "$HDR"
 # VERIFY BEFORE USE — a mint is not an authentication.
 curl -sS -o /dev/null -w '%{http_code}\n' -m 20 -H @"$(hdrp)" \
   "$COORD_HTTP_URL/coord/agent-findings?limit=1"   # must be 200
@@ -1192,19 +1310,34 @@ curl -sS -o /dev/null -w '%{http_code}\n' -m 20 -H @"$(hdrp)" \
 out** — `POST $COORD_HTTP_URL/coord/work-units/upsert` and
 `POST $COORD_HTTP_URL/coord/work-units/<stem>/register-gate` — with the header
 FILE, never the token on argv. **ATTEST and WITHDRAW are not on this rung.**
-coord refuses them to an anonymously minted credential (`403
-bootstrap_credential_scope`, plan
+Anyone can mint this bearer for any registered device, so it proves nothing
+about who is clearing or withdrawing a gate (plan
 `2026-09-23-anonymous-agent-credential-mint-can-act-as-any-registered-device`,
-decision finding `a777c0e6`): anyone can mint this bearer for any registered
-device, so it proves nothing about who is clearing or withdrawing a gate. A
-`403` with that code is the boundary, not an outage — do not retry it on
-another bootstrap mint; attest or withdraw over a door that carries a paired
+decision finding `a777c0e6`). **That fence is THIS rung's rule today, not
+coord's:** the server-side refusal (`403 bootstrap_credential_scope`, from
+`crates/coord/src/auth_bootstrap_scope.rs`) ships with qontinui-coord#2437,
+which was OPEN on 2026-10-03 — neither the file nor the code is on coord
+`origin/main` `07a192bae`, so coord applies NO mint-provenance refusal to an
+attest over this bearer today — only the gate's own clearance authority stands
+between it and a clear — and the fence holds because this rung never sends
+one. Once #2437
+lands, a `403` with that code is the boundary, not an outage — do not retry it
+on another bootstrap mint; attest or withdraw over a door that carries a paired
 device JWT or the runner's proxy nonce (Steps 1–4a), or report the gate spec
-as unattested. **Never carry it onto `POST $COORD_HTTP_URL/mcp`**:
-that door's device-JWT-only constraint is unchanged, and this bearer is
-`sub_type=agent` with a DEVICE subject (`sub=device:<uuid>`) and no `agent_id`
-claim. `coord-revive.sh`'s `PARTIAL_BOOTSTRAP` block states why in full; this
-rung and that one are the same door and must report in one spelling.
+as unattested. **`POST $COORD_HTTP_URL/mcp` does accept this bearer**, as
+`principal_kind: agent` (measured 2026-10-02 with `coord_query_identity`, HTTP
+200 `isError:false`). This paragraph used to say "never carry it onto `/mcp`:
+that door's device-JWT-only constraint is unchanged"; no such constraint answers
+today. The bearer is `sub_type=agent` with a DEVICE subject
+(`sub=device:<uuid>`) and no `agent_id` claim, so what it may call there is
+`tools/list`'s answer over the same bearer, never this page's — and that answer
+says what coord ACCEPTS, not what this rung may do. Attest and withdraw stay off
+this bearer on ANY door, `/mcp` included, for the reason given above: anyone can
+mint it for any registered device, so it proves nothing about who is clearing a
+gate. This rung spends it on the two registration routes above and nothing else. `coord-revive.sh`'s
+`PARTIAL_BOOTSTRAP` block states the same `/mcp` acceptance; this rung and that
+one are the same door and must report it in one spelling. The attest/withdraw
+fence is this rung's rule, not that block's.
 
 **What the bearer is, measured.** EdDSA, `iss=qontinui-coord`,
 `sub=device:<device_id>`, `sub_type=agent`, tenant resolved server-side from

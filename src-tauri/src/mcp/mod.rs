@@ -134,6 +134,7 @@ pub mod relay_binding; // UI Bridge relay registrant principal binding (plan 202
 pub mod relay_path_policy; // The closed allowlist of local API paths `backend_relay`'s `http_request` arm may reach (review round 2 finding 1; inverted to an allowlist in round 4)
 pub mod relay_routable;
 pub mod remote_create_reaper; // Attach-deadline reaper for remote-created terminals (plan 2026-09-23-remote-create-residuals-after-coord-registration-confirm, Phase 1)
+pub mod remote_interactivity; // Remote session interactivity: the coalescing, never-blocking reporter to coord's observation door (plan 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold, A2)
 pub mod remote_terminal; // Remote terminal attach: target-side grant table + source-side client (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod restart_readiness;
 pub mod restate_api;
@@ -171,6 +172,7 @@ pub mod task_run_workflow_state;
 pub mod task_runs;
 pub mod task_supervisor;
 pub mod tauri_proxy;
+pub mod tenant; // GET/PUT /tenant/active — headless door to the device tenant pin
 pub mod terminals;
 pub mod testing;
 // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:

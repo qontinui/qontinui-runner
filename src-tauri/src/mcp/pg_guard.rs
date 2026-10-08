@@ -112,7 +112,7 @@ const DB_BACKED_PREFIXES: &[&str] = &[
     "/state-discovery",
     "/co-occurrence",
     "/spec-check",
-    "/apps", // spec_api (exempt: /apps/*/spec/health, /apps/*/spec/subscribe)
+    "/apps", // spec_api + journey (exempt: /apps/*/spec/health, /apps/*/spec/subscribe, /apps/*/journey/health)
     "/hitl",
     "/restate/awakeables",
     "/trace", // trace_api (exempt: /trace/health)
@@ -196,6 +196,7 @@ const DB_EXEMPT: &[&str] = &[
     "/trace/health",               // under /trace
     "/apps/*/spec/health",         // under /apps
     "/apps/*/spec/subscribe",      // under /apps
+    "/apps/*/journey/health",      // under /apps; answers from in-process counters
 ];
 
 /// Segment-wise match. `pattern` and `path` are split on `/` (leading/trailing
@@ -362,6 +363,7 @@ mod tests {
             "/trace/health",
             "/apps/myapp/spec/health",
             "/apps/myapp/spec/subscribe",
+            "/apps/myapp/journey/health",
             // Segment-boundary lookalikes must NOT match.
             "/task-runs-archive",
             "/reviewsx",

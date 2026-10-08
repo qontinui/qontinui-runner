@@ -204,6 +204,50 @@ pub(crate) struct CiManifest {
     /// toolchains and none is checked.
     #[serde(default)]
     pub canonical: Option<CiCanonical>,
+    /// Mechanical repairs coord's CI-repair lane may run for this repo (plan
+    /// `2026-09-24-coord-deterministic-ci-repair-lane` §5.1, Phase 2). The
+    /// runner PARSES and VALIDATES these, so a repo can declare them without
+    /// failing every CI-node dispatch on `deny_unknown_fields`. It never
+    /// EXECUTES one: a repair runs in the repo's own `coord-repair.yml`
+    /// workflow, and coord alone writes the result.
+    #[serde(default)]
+    pub repair: Vec<CiRepair>,
+}
+
+/// One declared repair.
+///
+/// # Land order: runner first, declarations after
+///
+/// Same coupling as `[canonical]`, `[[tools]]` and `[[siblings]]`: a
+/// `[[repair]]` block on a repo is a hard parse error on any runner built
+/// before this field existed, so this lands and rolls out before any repo
+/// declares one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CiRepair {
+    /// The CI step name coord's trigger matches — the ONLY string the lane
+    /// compares against a failing run (no log grep). It names a step of the
+    /// repo's GitHub Actions job (what coord reads from the run's jobs), NOT
+    /// a `[[steps]]` entry of this manifest, so it is not cross-checked here.
+    pub step: String,
+    /// `format` or `regen` — see [`RepairKind`].
+    pub kind: RepairKind,
+    /// Argv that performs the repair. Never a shell string.
+    pub command: Vec<String>,
+    /// Repo-relative globs the repair may change. A patch touching anything
+    /// else is refused by coord.
+    pub allowed_paths: Vec<String>,
+    /// Argv whose exit 0 on the patched tree is the verifier.
+    pub check: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RepairKind {
+    /// Formatter / import-order only.
+    Format,
+    /// Regenerate a checked-in artifact.
+    Regen,
 }
 
 /// "This build requires the box to be at the canonical configuration for these
@@ -511,6 +555,7 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
     validate_tools(&manifest.tools)?;
     validate_services(&manifest.services)?;
     validate_canonical(manifest.canonical.as_ref())?;
+    validate_repairs(&manifest.repair)?;
     for (i, step) in manifest.steps.iter().enumerate() {
         let label = if step.name.trim().is_empty() {
             format!("steps[{i}]")
@@ -520,16 +565,7 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
         if step.name.trim().is_empty() {
             return Err(format!("{label}: name must be non-empty"));
         }
-        if step.command.is_empty() || step.command[0].trim().is_empty() {
-            return Err(format!("{label}: command must be a non-empty argv array"));
-        }
-        for token in &step.command {
-            if token.contains(ARGV_BANNED_CHARS) {
-                return Err(format!(
-                    "{label}: command token {token:?} contains a banned shell metacharacter"
-                ));
-            }
-        }
+        validate_argv(&label, "command", &step.command)?;
         for key in step.env.keys() {
             if let Some((_, owner)) = EXECUTOR_OWNED_ENV
                 .iter()
@@ -572,6 +608,130 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
         }
     }
     Ok(manifest)
+}
+
+fn validate_argv(label: &str, field: &str, argv: &[String]) -> Result<(), String> {
+    if argv.is_empty() || argv[0].trim().is_empty() {
+        return Err(format!("{label}: {field} must be a non-empty argv array"));
+    }
+    for token in argv {
+        if token.contains(ARGV_BANNED_CHARS) {
+            return Err(format!(
+                "{label}: {field} token {token:?} contains a banned shell metacharacter"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_repairs(repairs: &[CiRepair]) -> Result<(), String> {
+    if repairs.len() > MAX_PROVISIONED_ENTRIES {
+        return Err(format!(
+            "ci.toml declares {} [[repair]] (max {MAX_PROVISIONED_ENTRIES})",
+            repairs.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, r) in repairs.iter().enumerate() {
+        let label = format!("repair[{i}]");
+        if r.step.trim().is_empty() {
+            return Err(format!("{label}: step must name the CI step it repairs"));
+        }
+        validate_argv(&label, "command", &r.command)?;
+        validate_argv(&label, "check", &r.check)?;
+        if r.allowed_paths.is_empty() {
+            return Err(format!(
+                "{label}: allowed_paths must name what the repair may change"
+            ));
+        }
+        for glob in &r.allowed_paths {
+            validate_allowed_path(glob).map_err(|e| format!("{label}: {e}"))?;
+        }
+        if !seen.insert((r.step.trim(), r.kind)) {
+            return Err(format!(
+                "{label}: a second [[repair]] for step {:?} and the same kind",
+                r.step
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One `allowed_paths` glob: repo-relative, no parent escape, and narrow
+/// enough to mean something. These globs bound what coord ACCEPTS from a
+/// repair, so a glob that names the whole repo, or that a glob engine could
+/// expand outside it, defeats the declaration.
+///
+/// This is an author-facing lint, best-effort by nature: a glob language can
+/// always spell "nearly everything" (`**/?a*`) or match `.git` through a
+/// bare `*` component. The enforcing check is coord's, on the actual patch
+/// paths. What this refuses is every SPELLING an author could reasonably
+/// believe was narrow.
+fn validate_allowed_path(glob: &str) -> Result<(), String> {
+    let g = glob.trim();
+    if g.is_empty() {
+        return Err("allowed_paths entry must not be empty".to_string());
+    }
+    // Brace alternation (`{src,../x}`) expands past a component check, and a
+    // backslash is a separator only on Windows — on a Linux runner `..\x`
+    // would pass as one component. A character class (`.gi[t]`) defeats the
+    // literal `.git` check below. None is needed to name a path set.
+    if g.contains(['{', '}', '[', ']', '\\']) {
+        return Err(format!(
+            "allowed_paths {glob:?} must not use braces, character classes or backslashes"
+        ));
+    }
+    validate_repo_relative("allowed_paths", g)?;
+    // Judge the components, not the whole string: `./.git/x` and `sub/.git/x`
+    // (a submodule's git dir) reach into `.git` as surely as `.git/x`, and
+    // `./**`, `**/**` or `?*` are as unbounded as `**`.
+    let components: Vec<&str> = g
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if components
+        .iter()
+        .all(|c| c.chars().all(|ch| matches!(ch, '*' | '?')))
+    {
+        return Err(format!(
+            "allowed_paths {glob:?} is only wildcards, so it names the whole repository or \
+             nearly — name the files the repair may change"
+        ));
+    }
+    for c in &components {
+        // A bare `*` / `**` is the admitted limitation in the doc above; any
+        // other component is refused when it could resolve to `.git`.
+        if matches!(*c, "*" | "**") {
+            continue;
+        }
+        // Case-insensitive filesystems resolve `.GIT`, and Win32 strips a
+        // trailing dot or space, so `.git.` and `.git ` resolve there too —
+        // and a wildcard (`.g*`, `?git`, `*it`) can expand to `.git`.
+        let resolved = c.trim_end_matches(['.', ' ']);
+        if resolved.eq_ignore_ascii_case(".git") || wildcard_matches(c, ".git") {
+            return Err(format!(
+                "allowed_paths {glob:?} must not reach into .git (component {c:?})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `pattern` (only `*` and `?` special, ASCII case-insensitive, and
+/// a leading `.` NOT special — the most permissive reading a glob engine may
+/// take) matches the single path component `name`.
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], n: &[u8]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..])),
+            Some((b'?', rest)) => !n.is_empty() && go(rest, &n[1..]),
+            Some((c, rest)) => n
+                .first()
+                .is_some_and(|m| m.eq_ignore_ascii_case(c) && go(rest, &n[1..])),
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
 }
 
 fn validate_siblings(siblings: &[CiSibling]) -> Result<(), String> {
@@ -856,18 +1016,23 @@ fn validate_tool_version(version: &str) -> Result<(), String> {
 /// no parent/root/prefix components. Execution additionally canonicalizes
 /// and prefix-checks against the real worktree path.
 fn validate_working_dir(wd: &str) -> Result<(), String> {
+    validate_repo_relative("working_dir", wd)
+}
+
+/// `field`'s value is a repo-relative path with no parent or root component.
+fn validate_repo_relative(field: &str, wd: &str) -> Result<(), String> {
     let path = std::path::Path::new(wd);
     // The `:` check rejects Windows drive-qualified paths (`C:\x`, `C:x`)
     // even when this code runs on a non-Windows host (cross-platform tests).
     if path.is_absolute() || wd.starts_with('/') || wd.starts_with('\\') || wd.contains(':') {
-        return Err(format!("working_dir {wd:?} must be repo-relative"));
+        return Err(format!("{field} {wd:?} must be repo-relative"));
     }
     for component in path.components() {
         match component {
             std::path::Component::Normal(_) | std::path::Component::CurDir => {}
             _ => {
                 return Err(format!(
-                    "working_dir {wd:?} must not contain parent/root components"
+                    "{field} {wd:?} must not contain parent/root components"
                 ))
             }
         }
@@ -878,6 +1043,213 @@ fn validate_working_dir(wd: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WITH_REPAIR: &str = r#"
+version = 1
+
+[[steps]]
+name = "fmt"
+command = ["cargo", "fmt", "--check"]
+
+[[repair]]
+step = "fmt"
+kind = "format"
+command = ["bash", ".github/scripts/repair-fmt.sh"]
+allowed_paths = ["**/*.rs"]
+check = ["cargo", "fmt", "--all", "--", "--check"]
+
+[[repair]]
+step = "workspace assumptions"
+kind = "regen"
+command = ["cargo", "test", "workspace_assumptions"]
+allowed_paths = ["docs/workspace-assumptions.json", "docs/workspace-assumptions.md"]
+check = ["cargo", "test", "workspace_assumptions"]
+"#;
+
+    #[test]
+    fn repair_declarations_parse_and_are_never_steps() {
+        let m = parse_and_validate(WITH_REPAIR).expect("valid");
+        assert_eq!(m.repair.len(), 2);
+        assert_eq!(m.repair[0].kind, RepairKind::Format);
+        assert_eq!(m.repair[1].kind, RepairKind::Regen);
+        assert_eq!(m.steps.len(), 1, "a repair is not a step the executor runs");
+    }
+
+    #[test]
+    fn a_manifest_without_repair_still_parses() {
+        let m = parse_and_validate(VALID).expect("valid");
+        assert!(m.repair.is_empty());
+    }
+
+    /// `deny_unknown_fields` holds on `CiRepair` itself: an EXTRA key, with
+    /// every required one still present, is refused.
+    #[test]
+    fn repair_refuses_an_unknown_key() {
+        let text = WITH_REPAIR.replace("kind = \"format\"", "kind = \"format\"\nfoo = 1");
+        let err = parse_and_validate(&text).expect_err("unknown key");
+        assert!(
+            err.contains("unknown field") && err.contains("foo"),
+            "{err}"
+        );
+    }
+
+    /// The component checks must not over-refuse: a name that merely starts
+    /// with `.git`, or a wildcard narrowed by a literal, is a real path set.
+    #[test]
+    fn repair_accepts_narrow_globs_beside_the_refused_shapes() {
+        for g in [
+            ".github/workflows/*.yml",
+            ".gitignore",
+            "./src/**/*.rs",
+            "*/Cargo.toml",
+            ".env*",
+            ".cargo*/config.toml",
+        ] {
+            let text = WITH_REPAIR.replace("[\"**/*.rs\"]", &format!("[{g:?}]"));
+            parse_and_validate(&text).unwrap_or_else(|e| panic!("{g:?} refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn repair_rejects_bad_declarations() {
+        let cases = [
+            (
+                WITH_REPAIR.replace("kind = \"format\"", "kind = \"rewrite\""),
+                "parse error",
+            ),
+            (
+                WITH_REPAIR.replace("check = [\"cargo\", \"fmt\"", "chek = [\"cargo\", \"fmt\""),
+                "parse error",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"../x/*.rs\"]"),
+                "parent/root",
+            ),
+            (WITH_REPAIR.replace("[\"**/*.rs\"]", "[]"), "must name what"),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"\"]"),
+                "must not be empty",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"{src,../../etc}/**\"]"),
+                "braces, character classes or backslashes",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"..\\\\x\\\\*.rs\"]"),
+                "braces, character classes or backslashes",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"./**\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**/**\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"*/*\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"./.git/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"vendor/sub/.git/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"?*\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**/?*\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".gi?/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".*/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git*/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".GIT/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git./config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"?git/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"*git/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"?gi?/HEAD\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"*it/config\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".gi[t]/config\"]"),
+                "character classes",
+            ),
+            (
+                WITH_REPAIR.replace(
+                    "check = [\"cargo\", \"fmt\", \"--all\", \"--\", \"--check\"]",
+                    "check = []",
+                ),
+                "check must be a non-empty argv",
+            ),
+            (
+                WITH_REPAIR.replace("[\"bash\", \".github/scripts/repair-fmt.sh\"]", "[\"\"]"),
+                "command must be a non-empty argv",
+            ),
+            (
+                WITH_REPAIR.replace(
+                    "step = \"workspace assumptions\"\nkind = \"regen\"",
+                    "step = \"fmt\"\nkind = \"format\"",
+                ),
+                "a second [[repair]]",
+            ),
+            (
+                WITH_REPAIR.replace(".github/scripts/repair-fmt.sh", "a|b"),
+                "banned shell metacharacter",
+            ),
+            (
+                WITH_REPAIR.replace("step = \"fmt\"", "step = \" \""),
+                "step must name",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = parse_and_validate(&text).expect_err(want);
+            assert!(err.contains(want), "{want:?} not in {err:?}");
+        }
+    }
 
     /// A host large enough that no host cap binds, so limits tests read as
     /// statements about the MANIFEST value.

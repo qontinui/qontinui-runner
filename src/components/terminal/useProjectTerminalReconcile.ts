@@ -132,12 +132,17 @@ export function useProjectTerminalReconcile(
     setError(null);
     let failed = 0;
     try {
-      for (const tab of outside) {
+      for (const [index, tab] of outside.entries()) {
         // Explicit `root` as `workingDir`: the replacement must be pinned to
         // the project root at spawn time (the Rust `terminal_create` derives
         // `intent_repo` from it — see `resolveSpawnWorkingDir`), and the tab's
         // tenant is carried over so the replacement lands in the same tenant.
-        const replacementId = await createTerminal(tab.title, root, tab.tenantId);
+        // Serial, so a resource-guard refusal mid-move names the move and the
+        // terminals still ahead (this one included) in its dialog.
+        const replacementId = await createTerminal(tab.title, root, tab.tenantId, {
+          label: "move terminals to project",
+          queued: outside.length - index,
+        });
         if (!replacementId) {
           // The replacement never came up — keep the original alive. Losing a
           // running shell is worse than leaving the chip on screen.

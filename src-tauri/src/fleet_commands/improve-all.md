@@ -475,7 +475,7 @@ poetry run pytest
 
 1. **Skip any repo whose current branch has an open PR.** Pushing into an open PR branch as part of an autonomous improve-all run rewrites the snapshot reviewers are looking at. Use the `PR_PROTECTED_BRANCHES` list captured in Step 3.
 2. For each repo that has unpushed commits on its default branch (`<default>`):
-   - Capture the commits made this run: `git rev-list origin/<default>..HEAD`.
+   - Capture the commits made this run: `git rev-list "origin/<default>..HEAD"`.
    - Create a session branch holding exactly those commits and reset the default branch back to origin so nothing is left staged for a direct default-branch push:
      ```bash
      branch="loop/improve-all-$(date +%Y%m%d-%H%M%S)-${SESSION_SHORT:-$RANDOM}"
@@ -483,12 +483,20 @@ poetry run pytest
      git -C "$BASE/$repo" checkout "$branch"
      git -C "$BASE/$repo" branch -f "<default>" "origin/<default>"   # default ref returns to origin; commits live only on the branch
      ```
-   - Push the BRANCH (never the default branch): `git -C "$BASE/$repo" push -u origin "$branch"`.
-   - Open a PR naming the loop: `gh pr create --title "improve-all: <repo> autonomous improvements" --body "Autonomous /improve-all run. Commits: <subjects>."` (Session-Id + Session-Name trailers come from each repo's PER-CLONE `prepare-commit-msg` hook, not from the commit command — a clone the installer never ran against emits neither, so an untrailered commit is a missing hook, not a missing name. Install: `qontinui-claude-config/scripts/install-guard-hooks.sh` — add `--git-repo "$(git rev-parse --show-toplevel)"` to repair just the clone you are in.)
+   - Push the BRANCH (never the default branch), then open a PR naming the loop — CHAINED, so a refused push opens nothing and the repo is skipped:
+     ```bash
+     if git -C "$BASE/$repo" push -u origin "$branch"; then
+       (cd "$BASE/$repo" && gh pr create --head "$branch" --title "improve-all: $repo autonomous improvements" --body "Autonomous /improve-all run. Commits: $(git log --format=%s "origin/<default>..HEAD" | paste -sd ';' -)")
+     else
+       echo "refusing: push of $branch failed; no PR opened" >&2   # report $repo as Push failed
+     fi
+     ```
+     A refused push (auth, network, a hook) must not go on to a `gh pr create` whose failure would then be misreported as a PR problem. On that arm skip the read-back below, and report the repo as `Push failed`, naming `$branch`: the default ref was already reset to origin, so this run's commits live ONLY on that local branch.
+   - Session-Id + Session-Name trailers come from each repo's PER-CLONE `prepare-commit-msg` hook, not from the commit command — a clone the installer never ran against emits neither, so an untrailered commit is a missing hook, not a missing name. Install: `qontinui-claude-config/scripts/install-guard-hooks.sh` — add `--git-repo "$(git rev-parse --show-toplevel)"` to repair just the clone you are in.
    - **Read the PR back before reporting it** — in `/implement-plan` Step 4.5b's served door order the create may run through any door, and none of their exit statuses or outputs is evidence a PR exists: `gh pr list --repo <owner/repo> --head "$branch" --state all --json number,url,state,headRefOid` must return a row whose `headRefOid` is the head you pushed, and the PR URL in the summary report comes from that read.
    - **Do NOT merge.** Coord is the sole merge authority for `qontinui/*` repos; agents never run `gh pr merge` or `--admin` (CLAUDE.md; coord-served policy `git-operations` `merge-authority`). Opening the PR IS shipping — coord's merge train lands it once checks are green. If checks fail, leave the PR open and surface it in the report.
 3. **`qontinui-claude-config` / `qontinui-dev-notes`** (config/notes only): these have no CI gate; for them only, commit + push the default branch directly per the special-repos rule. (They are the carve-out — code repos always go through the branch-first PR flow above.)
-4. Generate summary report (see format below) — include each repo's branch name, PR URL, and merge status.
+4. Generate summary report (see format below) — include each repo's branch name, PR URL, and merge status; a repo whose push was refused reads `Push failed` with the local branch that holds its commits.
 
 ---
 
@@ -504,6 +512,7 @@ Date: {date}
 | Repository | Status | Changes |
 |------------|--------|---------|
 | qontinui | Processed | {description} |
+| {repo} | Push failed | commits only on local branch `{branch}` |
 | ... | ... | ... |
 
 ## Commits Made

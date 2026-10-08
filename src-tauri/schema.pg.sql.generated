@@ -1584,8 +1584,24 @@ CREATE TABLE coord.agent_sessions (
     label text,
     closed_at timestamp with time zone,
     derived_name text,
-    search_text text
+    search_text text,
+    context_tokens integer,
+    last_turn_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN agent_sessions.context_tokens; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_sessions.context_tokens IS 'Context size in tokens at the end of the last turn (input + cache_creation + cache_read of the last assistant usage). Written by the coord session-context route, fed by the qontinui-claude-config Stop hook session-context-report.sh. Read by the coord continuation-delivery decision choose_delivery (plan 2026-10-02-a-red-or-conflicting-pr-cannot-trigger-a-gate-continuation-and-delivery-ignores-context-cost). NULL = the hook never reported; read as UNKNOWN, never as small.';
+
+
+--
+-- Name: COLUMN agent_sessions.last_turn_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_sessions.last_turn_at IS 'When the last turn ended, as reported with context_tokens. Written by the coord session-context route, fed by the qontinui-claude-config Stop hook session-context-report.sh. Read by the coord continuation-delivery decision choose_delivery to judge whether the prompt cache is still warm (plan 2026-10-02-a-red-or-conflicting-pr-cannot-trigger-a-gate-continuation-and-delivery-ignores-context-cost). NULL = the hook never reported; read as UNKNOWN, never as warm.';
 
 
 --
@@ -4854,6 +4870,75 @@ CREATE TABLE coord.leader_lease (
 
 
 --
+-- Name: machine_dispatch_roles; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.machine_dispatch_roles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    machine_device_id uuid,
+    ci_host_name text,
+    dispatch_role text NOT NULL,
+    reason text,
+    current_version integer DEFAULT 1 NOT NULL,
+    updated_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    machine_key text GENERATED ALWAYS AS (((COALESCE((machine_device_id)::text, ''::text) || '/'::text) || COALESCE(lower(ci_host_name), ''::text))) STORED,
+    CONSTRAINT ck_machine_dispatch_roles_ci_host_name_canonical CHECK (((ci_host_name IS NULL) OR (ci_host_name ~ '^[\x21-\x7e]+$'::text))),
+    CONSTRAINT ck_machine_dispatch_roles_dispatch_role CHECK ((dispatch_role = ANY (ARRAY['workhorse'::text, 'bench'::text, 'ci_node'::text]))),
+    CONSTRAINT ck_machine_dispatch_roles_one_machine_key CHECK ((num_nonnulls(machine_device_id, ci_host_name) = 1))
+);
+
+
+--
+-- Name: TABLE machine_dispatch_roles; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.machine_dispatch_roles IS 'Operator-chosen dispatch role per machine: which lanes coord may dispatch on (workhorse = ci+agent, bench = none, ci_node = ci only). No row means unassigned, which behaves as workhorse. Keyed on the machine (workstation device or un-linked CI host), never on one coord.devices row. ci_host_name is unique case-insensitively via the derived machine_key: upsert with ON CONFLICT ON CONSTRAINT uq_machine_dispatch_roles_machine, and read with key-shaped predicates (machine_key = ''/'' || lower(host), or device::text || ''/''). ci_host_name is printable ASCII only. Not coord.devices.role, which is what a process IS and is self-declared. Every write must INSERT the matching coord.machine_dispatch_roles_versions row in the SAME transaction, including the first one.';
+
+
+--
+-- Name: COLUMN machine_dispatch_roles.updated_by; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.machine_dispatch_roles.updated_by IS 'Taken from the authenticated OperatorContext, NEVER the request body. An audit trail whose author field is client-asserted is not an audit trail.';
+
+
+--
+-- Name: COLUMN machine_dispatch_roles.machine_key; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.machine_dispatch_roles.machine_key IS 'DERIVED, never written: machine_device_id || ''/'' || lower(ci_host_name), each COALESCEd to empty. UNIQUE with tenant_id as uq_machine_dispatch_roles_machine. Not mirrored in machine_dispatch_roles_versions.';
+
+
+--
+-- Name: machine_dispatch_roles_versions; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.machine_dispatch_roles_versions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    role_id uuid NOT NULL,
+    version integer NOT NULL,
+    tenant_id uuid NOT NULL,
+    machine_device_id uuid,
+    ci_host_name text,
+    dispatch_role text NOT NULL,
+    reason text,
+    updated_by text,
+    updated_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE machine_dispatch_roles_versions; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.machine_dispatch_roles_versions IS 'Append-only immutable snapshots of coord.machine_dispatch_roles, mirroring every column. Never UPDATE or DELETE a row here: a rollback is a forward edit that INSERTs a new version, mirroring coord.prompt_document_versions. Every write that creates or mutates a machine_dispatch_roles row must INSERT the matching snapshot in the SAME transaction, including the first one, or current_version=1 describes history that does not exist. Any migration that adds a column to the parent must add it here too, in the same migration.';
+
+
+--
 -- Name: maintenance_runs; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -6948,6 +7033,47 @@ COMMENT ON COLUMN coord.schema_read_surfaces.surfaces IS 'JSON array of [table, 
 --
 
 COMMENT ON COLUMN coord.schema_read_surfaces.pushed_at IS 'When this row was last written by coord CI''s main-push workflow. Plain column default, evaluated per row at INSERT; the ingest''s UPSERT sets it explicitly on conflict.';
+
+
+--
+-- Name: session_census; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.session_census (
+    device_id uuid NOT NULL,
+    session_id text NOT NULL,
+    pid integer NOT NULL,
+    pid_alive boolean NOT NULL,
+    proc_start text,
+    started_at timestamp with time zone,
+    account text,
+    config_dir text,
+    cwd text,
+    entrypoint text,
+    kind text,
+    tmux_pane text,
+    window_name text,
+    window_name_source text,
+    registry_status text,
+    registry_status_updated_at timestamp with time zone,
+    last_acted_at timestamp with time zone,
+    runner_hosted boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: session_census_device; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.session_census_device (
+    device_id uuid NOT NULL,
+    tenant_id uuid,
+    observed_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    row_count integer NOT NULL,
+    account_homes integer NOT NULL,
+    runner_build text
+);
 
 
 --
@@ -11213,6 +11339,58 @@ CREATE TABLE project.iteration_logs (
     model_used text,
     duration_ms integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: journey_edge_observations; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_edge_observations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    app_id text NOT NULL,
+    app_version text,
+    runner_build_id text NOT NULL,
+    runner_instance text NOT NULL,
+    run_id text,
+    run_kind text NOT NULL,
+    from_node jsonb NOT NULL,
+    to_node jsonb,
+    trigger jsonb NOT NULL,
+    outcome text NOT NULL,
+    timeline jsonb,
+    invalidated_at timestamp with time zone,
+    invalidated_reason text,
+    invalidated_by text,
+    invalidation_token text,
+    CONSTRAINT ck_journey_edge_observations_from_node_object CHECK ((jsonb_typeof(from_node) = 'object'::text)),
+    CONSTRAINT ck_journey_edge_observations_outcome CHECK ((outcome = ANY (ARRAY['changed'::text, 'no_change'::text, 'error'::text, 'settle_timeout'::text, 'to_node_unobserved'::text]))),
+    CONSTRAINT ck_journey_edge_observations_run_kind CHECK ((run_kind = ANY (ARRAY['agent_action'::text, 'explorer'::text, 'passive_session'::text]))),
+    CONSTRAINT ck_journey_edge_observations_to_node_iff_observed CHECK (((to_node IS NULL) = (outcome = 'to_node_unobserved'::text))),
+    CONSTRAINT ck_journey_edge_observations_to_node_object CHECK (((to_node IS NULL) OR (jsonb_typeof(to_node) = 'object'::text))),
+    CONSTRAINT ck_journey_edge_observations_trigger_object CHECK ((jsonb_typeof(trigger) = 'object'::text))
+);
+
+
+--
+-- Name: journey_frontier; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_frontier (
+    app_id text NOT NULL,
+    node_key text NOT NULL,
+    node jsonb NOT NULL,
+    affordance_fingerprint text NOT NULL,
+    affordance_role text,
+    declared_effect text,
+    reason text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_run_id text,
+    CONSTRAINT ck_journey_frontier_declared_effect CHECK ((declared_effect = ANY (ARRAY['read'::text, 'write'::text, 'destructive'::text]))),
+    CONSTRAINT ck_journey_frontier_node_object CHECK ((jsonb_typeof(node) = 'object'::text)),
+    CONSTRAINT ck_journey_frontier_reason CHECK ((reason = ANY (ARRAY['not_yet_activated'::text, 'effect_undeclared'::text, 'effect_write'::text, 'effect_destructive'::text, 'budget_exhausted'::text, 'activation_failed'::text])))
 );
 
 
@@ -18850,6 +19028,22 @@ ALTER TABLE ONLY coord.leader_lease
 
 
 --
+-- Name: machine_dispatch_roles machine_dispatch_roles_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.machine_dispatch_roles
+    ADD CONSTRAINT machine_dispatch_roles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: machine_dispatch_roles_versions machine_dispatch_roles_versions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.machine_dispatch_roles_versions
+    ADD CONSTRAINT machine_dispatch_roles_versions_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: maintenance_runs maintenance_runs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -19522,6 +19716,22 @@ ALTER TABLE ONLY coord.schema_read_surfaces
 
 
 --
+-- Name: session_census_device session_census_device_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_census_device
+    ADD CONSTRAINT session_census_device_pkey PRIMARY KEY (device_id);
+
+
+--
+-- Name: session_census session_census_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_census
+    ADD CONSTRAINT session_census_pkey PRIMARY KEY (device_id, session_id, pid);
+
+
+--
 -- Name: session_compliance_config session_compliance_config_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -19823,6 +20033,22 @@ ALTER TABLE ONLY coord.claude_account_usage
 
 ALTER TABLE ONLY coord.fleet_runtime_policy_versions
     ADD CONSTRAINT uq_fleet_runtime_policy_versions_policy_version UNIQUE (policy_id, version);
+
+
+--
+-- Name: machine_dispatch_roles uq_machine_dispatch_roles_machine; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.machine_dispatch_roles
+    ADD CONSTRAINT uq_machine_dispatch_roles_machine UNIQUE (tenant_id, machine_key);
+
+
+--
+-- Name: machine_dispatch_roles_versions uq_machine_dispatch_roles_versions_role_version; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.machine_dispatch_roles_versions
+    ADD CONSTRAINT uq_machine_dispatch_roles_versions_role_version UNIQUE (role_id, version);
 
 
 --
@@ -20999,6 +21225,22 @@ ALTER TABLE ONLY project.issue_pattern_templates
 
 ALTER TABLE ONLY project.iteration_logs
     ADD CONSTRAINT iteration_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_edge_observations journey_edge_observations_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_edge_observations
+    ADD CONSTRAINT journey_edge_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_frontier journey_frontier_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_frontier
+    ADD CONSTRAINT journey_frontier_pkey PRIMARY KEY (app_id, node_key, affordance_fingerprint);
 
 
 --
@@ -24554,6 +24796,67 @@ CREATE INDEX idx_fde_session ON coord.footprint_drift_events USING btree (agent_
 
 
 --
+-- Name: idx_findings_dossier_readiness_last_seen; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_findings_dossier_readiness_last_seen ON coord.findings USING btree ((
+CASE
+    WHEN ((kind = 'dossier'::text) AND (jsonb_typeof((artifact_refs -> 'readiness'::text)) = 'string'::text) AND (length((artifact_refs ->> 'readiness'::text)) <= 64)) THEN (artifact_refs ->> 'readiness'::text)
+    ELSE NULL::text
+END), (
+CASE
+    WHEN ((kind = 'dossier'::text) AND ((artifact_refs ->> 'last_seen'::text) ~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([T ].*)?$'::text)) THEN
+    CASE
+        WHEN (((substr((artifact_refs ->> 'last_seen'::text), 1, 4))::integer >= 1) AND ((substr((artifact_refs ->> 'last_seen'::text), 9, 2))::integer <=
+        CASE (substr((artifact_refs ->> 'last_seen'::text), 6, 2))::integer
+            WHEN 2 THEN
+            CASE
+                WHEN (((((substr((artifact_refs ->> 'last_seen'::text), 1, 4))::integer % 4) = 0) AND (((substr((artifact_refs ->> 'last_seen'::text), 1, 4))::integer % 100) <> 0)) OR (((substr((artifact_refs ->> 'last_seen'::text), 1, 4))::integer % 400) = 0)) THEN 29
+                ELSE 28
+            END
+            WHEN 4 THEN 30
+            WHEN 6 THEN 30
+            WHEN 9 THEN 30
+            WHEN 11 THEN 30
+            ELSE 31
+        END)) THEN make_date((substr((artifact_refs ->> 'last_seen'::text), 1, 4))::integer, (substr((artifact_refs ->> 'last_seen'::text), 6, 2))::integer, (substr((artifact_refs ->> 'last_seen'::text), 9, 2))::integer)
+        ELSE NULL::date
+    END
+    ELSE NULL::date
+END) DESC, finding_id) WHERE (kind = 'dossier'::text);
+
+
+--
+-- Name: idx_findings_dossier_recurrence; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_findings_dossier_recurrence ON coord.findings USING btree ((
+CASE
+    WHEN ((kind = 'dossier'::text) AND ((artifact_refs ->> 'recurrence_count'::text) ~ '^[0-9]{1,9}$'::text)) THEN ((artifact_refs ->> 'recurrence_count'::text))::integer
+    ELSE NULL::integer
+END) DESC, finding_id) WHERE (kind = 'dossier'::text);
+
+
+--
+-- Name: idx_findings_dossier_slug; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_findings_dossier_slug ON coord.findings USING btree ((
+CASE
+    WHEN (kind = 'dossier'::text) THEN COALESCE(
+    CASE
+        WHEN ((jsonb_typeof((artifact_refs -> 'dossier_slug'::text)) <> ALL (ARRAY['array'::text, 'object'::text])) AND (length((artifact_refs ->> 'dossier_slug'::text)) <= 64)) THEN NULLIF((artifact_refs ->> 'dossier_slug'::text), ''::text)
+        ELSE NULL::text
+    END,
+    CASE
+        WHEN (("left"(topic, 8) = 'dossier:'::text) AND (length(substr(topic, 9)) <= 64)) THEN NULLIF(substr(topic, 9), ''::text)
+        ELSE NULL::text
+    END)
+    ELSE NULL::text
+END)) WHERE (kind = 'dossier'::text);
+
+
+--
 -- Name: idx_findings_resource_keys; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -26616,6 +26919,13 @@ CREATE INDEX ix_runner_sessions_runner_id ON coord.device_connections USING btre
 --
 
 CREATE INDEX ix_runner_sessions_user_id ON coord.device_connections USING btree (user_id);
+
+
+--
+-- Name: ix_session_census_session_id; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_session_census_session_id ON coord.session_census USING btree (session_id);
 
 
 --
@@ -31526,6 +31836,20 @@ CREATE INDEX ix_input_events_video_capture_session_id ON project.input_events US
 
 
 --
+-- Name: ix_journey_edge_observations_app_observed_at; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_edge_observations_app_observed_at ON project.journey_edge_observations USING btree (app_id, observed_at DESC) WHERE (invalidated_at IS NULL);
+
+
+--
+-- Name: ix_journey_edge_observations_app_run; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_edge_observations_app_run ON project.journey_edge_observations USING btree (app_id, run_id);
+
+
+--
 -- Name: ix_library_check_groups_created_by_user_id; Type: INDEX; Schema: project; Owner: -
 --
 
@@ -33796,6 +34120,14 @@ ALTER TABLE ONLY coord.helper_tasks
 
 
 --
+-- Name: machine_dispatch_roles_versions machine_dispatch_roles_versions_role_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.machine_dispatch_roles_versions
+    ADD CONSTRAINT machine_dispatch_roles_versions_role_id_fkey FOREIGN KEY (role_id) REFERENCES coord.machine_dispatch_roles(id) ON DELETE CASCADE;
+
+
+--
 -- Name: maintenance_runs maintenance_runs_task_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -34073,6 +34405,14 @@ ALTER TABLE ONLY coord.reviews
 
 ALTER TABLE ONLY coord.device_connections
     ADD CONSTRAINT runner_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: session_census session_census_device_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_census
+    ADD CONSTRAINT session_census_device_id_fkey FOREIGN KEY (device_id) REFERENCES coord.session_census_device(device_id) ON DELETE CASCADE;
 
 
 --

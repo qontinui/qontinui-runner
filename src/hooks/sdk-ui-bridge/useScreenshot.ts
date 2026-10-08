@@ -14,6 +14,7 @@ import { useState, useCallback } from "react";
 import type { PageScreenshot } from "./types";
 import { captureScreenshotBase64 } from "@/lib/vision-api";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 export interface UseScreenshotReturn {
   pageScreenshot: PageScreenshot | null;
@@ -41,7 +42,7 @@ export function useScreenshot(): UseScreenshotReturn {
         },
       });
     } catch (e) {
-      console.warn("[useScreenshot] Screenshot capture error:", e instanceof Error ? e.message : e);
+      console.warn("[useScreenshot] Screenshot capture error:", describeThrown(e, "unknown error"));
     } finally {
       setIsCapturingScreenshot(false);
     }

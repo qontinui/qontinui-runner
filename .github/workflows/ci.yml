@@ -109,13 +109,14 @@ permissions:
   contents: read
   pull-requests: read
 
-# Cancel ONLY superseded `pull_request` runs, one group per PR number. A PR
-# amended mid-run otherwise pays the full ~144 job-min matrix for a head sha
-# nobody will ever land. Plan: 2026-09-25-fleet-bundle-sync-residual-gaps
+# Cancel ONLY superseded FIRST-ATTEMPT `pull_request` runs, one group per PR
+# number. A PR amended mid-run otherwise pays the full ~144 job-min matrix for
+# a head sha nobody will ever land. Plan: 2026-09-25-fleet-bundle-sync-residual-gaps
 # (Phase 3 / Gap 3).
 #
-# `push` (main, develop, merge-candidate*/**) and `workflow_dispatch` runs are
-# NEVER grouped or cancelled: each keys on its own `github.run_id`, so it is
+# `push` (main, develop, merge-candidate*/**), `workflow_dispatch` and EVERY
+# re-run (run_attempt > 1) are NEVER grouped or cancelled: each keys on its own
+# `github.run_id` + `github.run_attempt`, so it is
 # the sole member of its group, and `cancel-in-progress` is false for them
 # anyway. coord lands on those push refs and redispatches this file on the
 # default branch, so a cancelled run there would be a missing verdict.
@@ -127,20 +128,29 @@ permissions:
 # view ranks `cancelled` last per (repo, head_sha, name), so a cancelled row
 # only counts when it is the sole row for that check on that sha.
 #
-# ⚠️ The group is keyed on the PR, NOT the sha: the NEWEST entrant cancels
-# whatever else is in the group, whichever sha it is for. A re-run of an OLDER
-# sha's run (the UI "Re-run" button, or ci-rerun-on-declaration.yml) therefore
-# cancels the CURRENT head's run and leaves a lone `cancelled` on it — red, with
-# nothing re-firing CI. ci-rerun-on-declaration.yml re-checks the PR head before
-# re-running for exactly this reason; do not re-run a superseded run by hand.
+# The group is keyed on the PR, NOT the sha: the NEWEST first-attempt entrant
+# cancels whatever else is in the group, whichever sha it is for. A RE-RUN used
+# to join the same group, so a re-run of an OLDER sha's run (the UI "Re-run"
+# button, or ci-rerun-on-declaration.yml) cancelled the CURRENT head's run and
+# left a lone `cancelled` on it. Since 2026-10-05 a re-run (run_attempt > 1)
+# gets a per-run group instead (pattern: qontinui-claude-config#1475), so it can
+# neither cancel nor be cancelled; the cost is that a re-run of a superseded
+# head runs to completion, so still do not re-run a superseded run by hand.
+# RESIDUAL: two pushes seconds apart can have their runs CREATED out of order,
+# so the older head's run cancels the newer head's; the next push heals it.
+#
+# The group is one expression, so coord models it as "" (never reaper-at-risk).
+# KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
+# compares groups with `=`, so every "" group matches every other one and
+# suppresses its auto re-run; the fix belongs in coord.
 #
 # `github.workflow` is in the key so the group cannot collide with another
 # workflow's group (concurrency groups are repo-wide). Do NOT add a `paths:`
 # filter as a cheaper alternative: the fleet bundle is compiled into the binary
 # via `include_dir!` (fleet_skills.rs), and coord counts `skipped` as passing.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -205,7 +215,16 @@ jobs:
     timeout-minutes: 150
 
     steps:
+      # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
+      # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
+      # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
+      # `filter: blob:none` keeps the fetch to commits and trees; the one roster
+      # blob it reads at the merge base is fetched lazily. Plan
+      # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, A6.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).

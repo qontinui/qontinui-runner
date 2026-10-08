@@ -250,6 +250,36 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   (`Authorization: Bearer <nonce>` and the legacy `X-Coord-Mcp-Proxy-Key`), and
   replay it verbatim. The nonce is staged into a private header file, never
   argv, never stdout.
+- **A STDIO `.mcp.json` rides too** — the shape the runner now provisions,
+  `{"command": <python>, "args": [<…>/coord-mcp-shim.py, "--credential", <file>]}`.
+  The verbs ask the shim itself (`coord-mcp-shim.py --credential <file>
+  --print-door <outfile>`): it reads that credential file exactly as its own
+  rung 1 does — url normalised to `127.0.0.1`, only the allowlisted headers, a
+  non-loopback or provision-session url refused — writes the headers to a 0600
+  file inside this script's private temp dir for `curl -H @file`, and prints only
+  the url. One credential grammar, not a second copy in bash. The file is read
+  afresh by every call, so a rotated nonce does not kill the door.
+  `X-Coord-Caller-Session` is appended exactly as on the proxy path. Typed
+  failures, nothing sent: `STDIO_CREDENTIAL_UNUSABLE` (the shim refused the file,
+  or the `--credential` path is not a readable file, with its reason),
+  `STDIO_SHIM_FAILED` (the shim did not run — says nothing about the
+  credential), `AUTH_HEADER_STAGING_FAILED` (it ran but could not write its
+  header file, exit 4 — a local write fault), `STDIO_SHIM_PARSER_ABSENT` (no reachable shim carries
+  `--print-door` — pull this repo), `STDIO_DOOR_NO_PYTHON` (no Python >= 3.6). When a
+  proxy-shaped `.mcp.json` sits ABOVE the stdio one, the verbs fall back to it,
+  as they did before, in exactly two cases: the stdio door cannot be opened (any
+  verdict above — nothing was sent), or the stdio request was provably **not
+  carried** — HTTP 401 (refused before dispatch, e.g. a stale credential) or a
+  curl connect failure (exit 6/7, no connection). That retry happens once, is
+  announced on stderr, and the proxy's outcome is the one reported. A carried
+  answer — any JSON-RPC result or error, another HTTP status, or a timeout — is
+  never retried, because the call may have reached a handler and a retry could
+  double a write. The shim run is the one this script resolves
+  for itself (the fleet config checkout's `scripts/`), **never** the
+  path the `.mcp.json` entry names — that file comes from whatever repo `$PWD`
+  is in. Stated limit: the skill's `_scripts/` render does not carry the shim
+  yet, so a device with no checkout reads `STDIO_SHIM_PARSER_ABSENT`. Plan
+  `2026-10-01-coord-revive-call-cannot-ride-a-stdio-shim-mcp-json`.
 - **They NEVER mint.** `POST /coord-mcp/provision-session` re-provisions this
   workdir+terminal's key and evicts the live peer's binding — the failure class
   Phase 1a of that plan exists to end. The cascade's own mint (L4 source 3) is
@@ -263,8 +293,9 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   the nonce came from. `0` the tool answered; `3` the tool answered with a
   JSON-RPC **error** (printed verbatim on stderr — that is *its* answer, the
   door carried the call); `1` the door did not carry the call, with a typed
-  reason: `NO_PROXY_CONFIG` (no provisioned nonce on the walk up — a statement
-  about this filesystem), `COORD_MCP_PROXY_UNAUTHORIZED` (below),
+  reason: `NO_PROXY_CONFIG` (neither a proxy-shaped nonce nor a stdio shim
+  entry naming `--credential` on the walk up — a statement about this
+  filesystem), the four `STDIO_*` verdicts above, `COORD_MCP_PROXY_UNAUTHORIZED` (below),
   `CONNECT_REFUSED` / `TIMEOUT` / the classifier's other verdicts; `4` usage
   (arguments must be ONE JSON **object**, parsed and refused locally before any
   request is sent).
@@ -1085,7 +1116,9 @@ always did: a door works. Then
 re-issue your lost call as a raw JSON-RPC `tools/call` against that door (for a
 loopback door, the proxy nonce from that file — carried as
 `X-Coord-Mcp-Proxy-Key: <nonce>` on older configs and as
-`Authorization: Bearer <nonce>` on ones written after the header move; the
+`Authorization: Bearer <nonce>` on ones written after the header move, and
+expanded from your own environment when written as
+`${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` — the script does that itself; the
 script reports which header name it used. The minted bearer for L3), then
 verify by read. On total failure it prints `VERDICT: DEAD` naming
 every exhausted door and its typed reason; run `coord doctor` next.
@@ -1211,16 +1244,24 @@ rather than reach — starting with the fact that its `url=` is the MINT, not a
 door to re-issue a write over.** This rung hands back a *bearer*; spend it on
 `$COORD_HTTP_URL/mcp` (coord tools by name) or on the device-authed hand-written
 `/coord/…` REST routes, which `/gate`'s **write-forwarder REST** rung spells
-out. It is **not** carried
-onto `$COORD_HTTP_URL/mcp`: that door's device-JWT-only constraint is unchanged. The bootstrap token is an **agent** principal minted against
+out. `$COORD_HTTP_URL/mcp` **does** accept it — as `principal_kind: agent`,
+not `device` (measured 2026-09-26 with `coord_work_unit_refresh_citations`, and
+2026-10-02 with `coord_query_identity` and `coord_work_unit_list_citations`, each
+HTTP 200 `isError:false`). This section used to say the opposite ("not carried
+onto `/mcp`: that door's device-JWT-only constraint is unchanged"); no such
+constraint answers today. Which tools that principal may call is `tools/list`'s
+answer over the same bearer, never this page's. The bootstrap token is an **agent** principal minted against
 a device UUID, not a device principal — so it is scoped by whatever coord grants
 an agent in this tenant, and this script asserts nothing beyond what its control
 read measured: that the bearer authenticates. It verified `GET
-/coord/agent-findings`; it did **not** probe `$COORD_HTTP_URL/mcp`, so a `401` or
-a `-32601` there is that door's own verdict, not a refutation of L5. And it is a
-**short-lived, over-broad** credential (~4h, carrying scopes far wider than any
-one recovery write) obtained from a route whose exposure is an open operator
-decision — use it for the write you came for and discard it.
+/coord/agent-findings`; the script does **not** probe `$COORD_HTTP_URL/mcp` with
+it, so a `401` or a `-32601` there is that door's own verdict about that tool for
+this principal, not a refutation of L5. And it is a
+**short-lived** credential (~4h). It is **not** over-broad, whatever this page
+used to say: measured 2026-09-04, every scope in the minted token was empty or
+false, narrower than the sibling `/agents/allocate` token — the same reading
+`PARTIAL_BOOTSTRAP` prints, and the two must report in one spelling. Use it for
+the write you came for and discard it.
 
 A bare `LIVE` that overstates its own reach is the same defect as a false
 `DEAD`, one level down: `DEAD` was made falsifiable by L4 and by the `SCOPE:`
@@ -1421,12 +1462,17 @@ this one — in its own words — *"usually cannot"*.
 # http://127.0.0.1:<port>/coord-mcp. Post-Phase-2 configs carry it under
 # `Authorization: Bearer <nonce>`; older ones under X-Coord-Mcp-Proxy-Key.
 LOG=~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl   # resolve yours -- see the warning above
+# A value written as `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` is an env
+# reference: expand it from this shell's environment (what Claude Code sent),
+# never take the prefix of the literal reference text.
 PREFIX=$(python3 -c "
-import json
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from mcp_env_ref import expand_env_ref
 h = json.load(open('.mcp.json'))['mcpServers']['coord-mcp'].get('headers', {})
-tok = h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', ''))
+tok = expand_env_ref(h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', '')))
 print(tok.split()[-1][:8] if tok else '')
-")
+" "<workspace-root>/qontinui-claude-config/scripts/lib")
 [ -n "$PREFIX" ] || echo "no nonce in .mcp.json headers -- resolve it by hand"
 grep -F "\"key_prefix\":\"$PREFIX\"" "$LOG" | jq -c '{ts,event,workdir,cause,pid}'
 ```
@@ -1619,7 +1665,8 @@ evict a live peer and will not unlatch your client. Use
   **fallback**: the in-process invoke door is tried on every runner first,
   headless or not, and only a build that lacks the entry reaches the arm.
 - **The `call` / `tools` verbs never mint, and never print the nonce.** They
-  ride the caller's own `.mcp.json` key only; a missing one is
+  ride the caller's own `.mcp.json` key only (or, for a stdio shim entry, the
+  credential file it names, read by the shim's `--print-door`); a missing one is
   `NO_PROXY_CONFIG`, a rejected one is a 401 with its recovery named — never a
   `/coord-mcp/provision-session` mint, which would evict the live peer holding
   that workdir slot.

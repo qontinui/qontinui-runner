@@ -1,4 +1,5 @@
 import type { FleetSession } from "./useFleetSessions";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Remote session tabs — the frontend half of plan
@@ -109,9 +110,11 @@ export function attachButtonState(
  * needs first, the detail is kept because it names the machine or grant.
  */
 export function attachErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
-  const m = /^remote_attach:([a-z_]+)(?::([a-z_]+))?:\s*(.*)$/s.exec(raw.trim());
-  if (!m) return raw.trim() || "attach failed (no reason given)";
+  // describeThrown trims every shape and falls back on a blank cause, so `raw`
+  // is never empty and never carries leading whitespace.
+  const raw = describeThrown(err, "attach failed (no reason given)");
+  const m = /^remote_attach:([a-z_]+)(?::([a-z_]+))?:\s*(.*)$/s.exec(raw);
+  if (!m) return raw;
   const code = m[2] ? `${m[1]} (${m[2]})` : m[1];
   const detail = m[3]?.trim();
   return detail ? `${code} — ${detail}` : code;
@@ -192,6 +195,24 @@ export function detachedRemoteTabs<T extends { isAlive: boolean; remote?: Remote
   tabs: readonly T[],
 ): T[] {
   return tabs.filter((t) => !!t.remote && !t.isAlive);
+}
+
+/**
+ * Whether the tab a fleet-picker attach (or create) opened is STILL open on
+ * this page — the predicate behind "Attached — tab open on this page."
+ *
+ * The picker records the opened tab's id once, when the attach succeeds; that
+ * is a fact about the past. Rendering the notice off the id alone kept it on
+ * screen after the operator closed the tab. The claim is about the present, so
+ * it is read against the page's live tab list: gone, or ended (`!isAlive`, the
+ * tab that offers "Reattach"), and the notice goes.
+ */
+export function openedTabStillOpen<T extends { id: string; isAlive: boolean }>(
+  openedId: string | null | undefined,
+  tabs: readonly T[],
+): boolean {
+  if (!openedId) return false;
+  return tabs.some((t) => t.id === openedId && t.isAlive);
 }
 
 /**

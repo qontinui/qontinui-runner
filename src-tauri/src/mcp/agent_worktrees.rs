@@ -95,7 +95,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///     "coord_reachable": true,
 ///     "coord_error": null,
 ///     "remove_armed": false,      // informational; this path does not need it
-///     "rejunction_armed": false,
 ///     "canonical_excluded": 12,   // canonical checkouts filtered out (never reapable)
 ///     "items": [
 ///       { "id": "d:/qontinui-root/qontinui-runner-wt-a",

@@ -44,6 +44,32 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
     cmd
 }
 
+/// A git command that can only ever address the repository its caller names
+/// and whose messages are the untranslated C-locale text.
+///
+/// The caller's repository environment (`GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+/// `GIT_COMMON_DIR`) is removed, so an inherited value can never redirect a
+/// read or a fetch at some other repository — or borrow its object store —
+/// and `LC_ALL` / `LANGUAGE` are `C`, so a stderr match is never defeated by a
+/// translation. [`no_window`] also applies the prompt-proof git posture, so a
+/// credential prompt fails instead of blocking.
+pub fn scrubbed_git(program: &std::ffi::OsStr) -> std::process::Command {
+    let mut cmd = no_window(program);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
+    cmd
+}
+
 /// Is this program `git`?
 ///
 /// Matched on the file stem so a bare `git`, an absolute
@@ -1046,8 +1072,71 @@ pub fn run_with_timeout(
 /// INCOMPLETE. That is reported in [`TimedRun::truncation`] rather than
 /// silently folded into a successful `Output` — see [`Truncation`].
 pub fn run_with_timeout_detailed(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, None)
+}
+
+/// [`run_with_timeout_detailed`] for a child that reads a FIXED input on stdin
+/// — `git cat-file --batch`, which takes its object list there and nowhere
+/// else.
+///
+/// Every guarantee of [`run_with_timeout_detailed`] holds, with one change:
+/// stdin is a pipe that a detached writer thread fills with `input` and then
+/// CLOSES, so the child sees EOF exactly where a `/dev/null` stdin would have
+/// given it one, and can no more block waiting for input than before.
+///
+/// That writer adds one row to the resource table of
+/// [`run_with_timeout_detailed`]:
+///
+/// | Resource | Worst case |
+/// |---|---|
+/// | Stdin writer OS thread | 1, until the write completes or the pipe's READ end closes |
+///
+/// It is never joined. It ends when the write completes or fails, and the
+/// write fails with `EPIPE` (Rust ignores `SIGPIPE`) once every holder of the
+/// pipe's read end is gone — so its life is bounded by the read end's, not by
+/// this call. The holders are the child and any descendant that inherited its
+/// stdin. On the timeout path the tree reaper kills those; on the success path
+/// the tree is disarmed, so a descendant of a child that exited 0 WITHOUT
+/// consuming its input — and that neither reads nor closes the inherited
+/// stdin — keeps the writer blocked for as long as it lives. A child that
+/// reads its whole input (`git cat-file --batch` does) leaves no such case.
+///
+/// When the writer thread cannot be started at all (the process is at its
+/// thread ceiling), the child is killed and reaped and the spawn error is
+/// returned — it is never left waiting on input that will not come.
+pub fn run_with_timeout_input(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+    input: Vec<u8>,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, Some((input, spawn_stdin_writer)))
+}
+
+/// Starts the detached thread that fills a child's stdin and then closes it.
+/// A seam so a test can stand in for the thread ceiling.
+type StdinWriter = fn(std::process::ChildStdin, Vec<u8>) -> std::io::Result<()>;
+
+/// The production [`StdinWriter`]: a named, never-joined thread that writes
+/// `input` and drops `stdin` — the drop is the EOF the child waits for. Built
+/// with [`std::thread::Builder`] so a process at its thread ceiling gets an
+/// `Err` back instead of a panic on the caller's thread.
+fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, input: Vec<u8>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("stdin-feed".to_string())
+        .spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        })
+        .map(drop)
+}
+
+fn run_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
+    input: Option<(Vec<u8>, StdinWriter)>,
 ) -> std::io::Result<TimedRun> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1056,9 +1145,13 @@ pub fn run_with_timeout_detailed(
     // sweep that keeps [`start_detached`] thread-free.
     reap_detached_children();
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     // Pre-spawn half of the tree reaper (Unix process group; no-op on Windows).
     ChildTreeGuard::arm(&mut cmd);
@@ -1079,6 +1172,26 @@ pub fn run_with_timeout_detailed(
     qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
+
+    if let (Some((input, writer)), Some(stdin)) = (input, child.stdin.take()) {
+        // Detached, never joined — see `run_with_timeout_input`. A writer that
+        // cannot start leaves a child that would wait on stdin until the
+        // deadline for input that never comes: kill and reap it (and fire the
+        // tree reaper) now, and hand the spawn error to the caller. No reader
+        // thread exists yet, so nothing else is left behind.
+        if let Err(e) = writer(stdin, input) {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(tree);
+            tracing::warn!(
+                child_pid = pid,
+                program = %program_label(&cmd),
+                error = %e,
+                "could not start the stdin writer thread; the child was killed"
+            );
+            return Err(e);
+        }
+    }
 
     let stdout_reader = PipeDrain::spawn(child.stdout.take());
     let stderr_reader = PipeDrain::spawn(child.stderr.take());
@@ -1484,6 +1597,77 @@ fn run_probe_inner(
 mod timeout_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// The input reaches the child's stdin in full and is followed by EOF.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_feeds_stdin_then_closes_it() {
+        let input: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let run = run_with_timeout_input(
+            std::process::Command::new("cat"),
+            Duration::from_secs(10),
+            input.clone(),
+        )
+        .expect("spawn cat");
+        assert!(run.truncation.is_none());
+        match run.outcome {
+            TimedOutput::Completed(out) => {
+                assert!(out.status.success());
+                assert_eq!(out.stdout, input, "every byte, then EOF");
+            }
+            TimedOutput::TimedOut { .. } => panic!("cat must see EOF and exit"),
+        }
+    }
+
+    /// A child that never reads its stdin neither blocks the call nor is
+    /// blocked by it: the writer's pipe fills, the child exits, the write
+    /// fails, and the call returns promptly.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_survives_a_child_that_ignores_stdin() {
+        let started = Instant::now();
+        let run = run_with_timeout_input(
+            std::process::Command::new("true"),
+            Duration::from_secs(10),
+            vec![b'x'; 1024 * 1024],
+        )
+        .expect("spawn true");
+        assert!(matches!(run.outcome, TimedOutput::Completed(ref o) if o.status.success()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A stdin writer that cannot start — the thread ceiling — is an `Err`,
+    /// not a panic, and the child it would have fed is killed at once rather
+    /// than left waiting on stdin until the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdin_writer_that_cannot_start_kills_the_child_and_is_an_error() {
+        fn at_the_ceiling(_: std::process::ChildStdin, _: Vec<u8>) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "no thread to spare",
+            ))
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("survived");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 0.5; touch '{}'", marker.display()));
+        let started = Instant::now();
+        let err = run_bounded(
+            cmd,
+            Duration::from_secs(30),
+            Some((vec![b'x'], at_the_ceiling)),
+        )
+        .expect_err("a writer that cannot start is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned at once, not at the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "the child was killed, not left running");
+    }
 
     /// A command that blocks for far longer than any budget we hand it.
     fn sleeper() -> std::process::Command {
@@ -2173,13 +2357,26 @@ mod timeout_tests {
     #[cfg(unix)]
     const MIN_TICKS_IN_WINDOW: usize = 5;
 
+    /// The pid the start command recorded in `pidfile`.
+    ///
+    /// The shell's `> pidfile` redirect CREATES the file before `echo` writes
+    /// the pid into it, so "the file exists" (what the callers wait on) does
+    /// not mean "the pid is in it". Re-read until it parses rather than
+    /// panicking on the empty window (seen on CI: runner#1922, ubuntu).
     #[cfg(unix)]
     fn read_pid(pidfile: &std::path::Path) -> i32 {
-        std::fs::read_to_string(pidfile)
-            .expect("the start command must have recorded its server pid")
-            .trim()
-            .parse()
-            .expect("pidfile must hold a pid")
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let contents = std::fs::read_to_string(pidfile)
+                .expect("the start command must have recorded its server pid");
+            match contents.trim().parse() {
+                Ok(pid) => return pid,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("pidfile must hold a pid, got {contents:?}: {e}"),
+            }
+        }
     }
 
     /// A command whose whole purpose is to leave a server running, in the shape

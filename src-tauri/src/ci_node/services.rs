@@ -113,11 +113,14 @@
 //!
 //! # Blast radius on disk and on the network
 //!
-//! Containers are created with **no bind mounts and no volumes** (see
-//! [`run_argv`]), so a service cannot write anywhere on the host, and the
-//! cleanup guarantee stated in [`super::checkout`] — exactly one directory
-//! removed, nothing outside it — is unchanged by this phase: services add
-//! nothing to disk at all. Ports are published on `127.0.0.1` only, never
+//! Containers are created with **no bind mounts** (see [`run_argv`]), so no
+//! HOST path is ever handed to a service, and the cleanup guarantee stated in
+//! [`super::checkout`] — exactly one directory removed, nothing outside it — is
+//! unchanged by this phase. Services do still put bytes on disk: every registry
+//! image declares a `VOLUME`, so the runtime gives each container an ANONYMOUS
+//! volume. [`removal_argv`] removes with `-v`, which reaps that volume with the
+//! container; a container the runner never gets to remove (a killed process —
+//! see the Drop reaper's docs) still orphans its volume. Ports are published on `127.0.0.1` only, never
 //! `0.0.0.0`, so a dispatch never exposes a database to the network the user's
 //! machine is on. The published host port is EPHEMERAL (kernel-assigned), not
 //! the service's well-known port, because this lane exists to serve a machine
@@ -522,14 +525,34 @@ pub(crate) fn run_argv(
         // BARE. The value is passed out of band; see this function's docs.
         argv.push((*name).to_string());
     }
-    // No `-v`, no `--mount`: a dispatch service writes nowhere on the host.
+    // No `-v <host>:<ctr>` bind and no `--mount`: no HOST path is ever handed to
+    // a dispatch service. That does NOT mean it writes nowhere on the host —
+    // every image in the registry declares a `VOLUME` (Postgres' data dir,
+    // Redis' `/data`), so the runtime creates an ANONYMOUS volume per container
+    // regardless. `removal_argv` therefore removes with `-v`, which reaps those
+    // anonymous volumes with the container.
     argv.push(image.to_string());
     argv
 }
 
-/// The removal argv. Force, because a running server will not stop on its own.
+/// The removal argv. Force, because a running server will not stop on its own;
+/// `-v`, because every registry image declares a `VOLUME`, so each container
+/// owns an anonymous volume that a bare `rm -f` orphans on the host forever
+/// (plan 2026-10-02-orphaned-anonymous-docker-volumes-stop-producers-and-reap-nightly).
+/// `-v` removes only ANONYMOUS volumes, never a named one, and `podman rm -v`
+/// means the same. EVERY removal in this module goes through here.
 fn removal_argv(name: &str) -> Vec<String> {
-    vec!["rm".to_string(), "-f".to_string(), name.to_string()]
+    vec![
+        "rm".to_string(),
+        "-f".to_string(),
+        "-v".to_string(),
+        name.to_string(),
+    ]
+}
+
+/// `removal_argv` as the `&[&str]` shape `run_capture` takes.
+fn removal_args(argv: &[String]) -> Vec<&str> {
+    argv.iter().map(String::as_str).collect()
 }
 
 /// Outcome of one readiness probe.
@@ -645,7 +668,8 @@ impl ServiceStack {
             // A stale container from a crashed prior attempt at this dispatch
             // id would make `run --name` fail — the same reason
             // `prepare_worktree` clears a stale dispatch dir before re-adding.
-            let _ = run_capture(&runtime, &["rm", "-f", &name], CONTAINER_CMD_TIMEOUT, None).await;
+            let stale = removal_argv(&name);
+            let _ = run_capture(&runtime, &removal_args(&stale), CONTAINER_CMD_TIMEOUT, None).await;
 
             // REGISTERED BEFORE CREATED. From here every exit path — a failed
             // run, a readiness timeout, a later service's failure, a failed
@@ -711,8 +735,14 @@ impl ServiceStack {
                     last_err = e;
                     // Whatever the runtime left behind under this name must go
                     // before the next attempt can reuse it.
-                    let _ = run_capture(runtime, &["rm", "-f", name], CONTAINER_CMD_TIMEOUT, None)
-                        .await;
+                    let leftover = removal_argv(name);
+                    let _ = run_capture(
+                        runtime,
+                        &removal_args(&leftover),
+                        CONTAINER_CMD_TIMEOUT,
+                        None,
+                    )
+                    .await;
                     if !retryable {
                         break;
                     }
@@ -1797,16 +1827,8 @@ mod tests {
         assert_eq!(
             issued,
             vec![
-                vec![
-                    "rm".to_string(),
-                    "-f".to_string(),
-                    "qontinui-ci-d-teardown-redis".to_string()
-                ],
-                vec![
-                    "rm".to_string(),
-                    "-f".to_string(),
-                    "qontinui-ci-d-teardown-postgres".to_string()
-                ],
+                removal_argv("qontinui-ci-d-teardown-redis"),
+                removal_argv("qontinui-ci-d-teardown-postgres"),
             ],
             "teardown must issue a forced removal per registered container"
         );
@@ -1828,13 +1850,44 @@ mod tests {
     #[test]
     fn removal_targets_one_container_by_exact_name() {
         let argv = removal_argv("qontinui-ci-d-123-redis");
-        assert_eq!(argv, vec!["rm", "-f", "qontinui-ci-d-123-redis"]);
+        assert_eq!(argv, vec!["rm", "-f", "-v", "qontinui-ci-d-123-redis"]);
         for dangerous in ["prune", "--all", "-a", "--filter", "system"] {
             assert!(
                 !argv.iter().any(|a| a == dangerous),
                 "{dangerous} in {argv:?}"
             );
         }
+    }
+
+    /// Every registry image declares a `VOLUME`, so the removal MUST carry `-v`
+    /// or each dispatch orphans an anonymous volume on the host. Pinned on its
+    /// own so a revert to a bare `rm -f` fails a test named for the defect.
+    #[test]
+    fn removal_reaps_the_containers_anonymous_volumes() {
+        let argv = removal_argv("qontinui-ci-d-vol-postgres");
+        assert!(
+            argv.iter().any(|a| a == "-v" || a == "--volumes"),
+            "removal must reap anonymous volumes: {argv:?}"
+        );
+        assert_eq!(
+            removal_args(&argv),
+            vec!["rm", "-f", "-v", "qontinui-ci-d-vol-postgres"]
+        );
+    }
+
+    /// The stale pre-run removal and the leftover removal after a failed start
+    /// run through `run_capture` directly and no runtime-free test reaches
+    /// them, so pin the CONVENTION instead: nothing in this module spells a
+    /// removal argv by hand — every one goes through `removal_argv`, which the
+    /// tests above pin to carry `-v`.
+    #[test]
+    fn no_removal_argv_is_spelled_by_hand() {
+        let src = include_str!("services.rs");
+        let hand_spelled = concat!("&[", "\"rm\"");
+        assert!(
+            !src.contains(hand_spelled),
+            "a container removal bypasses removal_argv (and so its `-v`)"
+        );
     }
 
     /// A stack that still holds containers is not silently forgotten when it is
@@ -1852,11 +1905,7 @@ mod tests {
         drop(stack);
         assert_eq!(
             log.lock().unwrap().clone(),
-            vec![vec![
-                "rm".to_string(),
-                "-f".to_string(),
-                "qontinui-ci-d-drop-redis".to_string()
-            ]],
+            vec![removal_argv("qontinui-ci-d-drop-redis")],
             "the last-resort reaper must actually issue the removal"
         );
         // And it is BOUNDED: a wedged daemon must not own this thread forever.
@@ -2146,6 +2195,32 @@ mod tests {
             .to_string();
         assert_eq!(password.len(), 32);
 
+        // The runtime the stack actually chose, which may be podman.
+        let runtime = stack
+            .runtime
+            .clone()
+            .expect("a provisioned stack has a runtime");
+
+        // Both registry images declare a `VOLUME`, so each container owns an
+        // anonymous volume. Read them BEFORE teardown so the removal's `-v` can
+        // be proven on a real daemon, not only as a pinned argv string.
+        let mut inspect = vec![
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}",
+        ];
+        inspect.extend(stack.container_names().iter().map(String::as_str));
+        let volumes: Vec<String> = run_capture(&runtime, &inspect, CONTAINER_CMD_TIMEOUT, None)
+            .await
+            .expect("inspect must answer")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            volumes.len() >= 2,
+            "every registry image declares a VOLUME, so each container owns one: {volumes:?}"
+        );
+
         let log = stack.removal_log();
         stack.teardown().await;
         assert!(stack.container_names().is_empty());
@@ -2157,7 +2232,7 @@ mod tests {
 
         // Nothing labelled with this dispatch survives.
         let leftovers = run_capture(
-            "docker",
+            &runtime,
             &[
                 "ps",
                 "-aq",
@@ -2172,6 +2247,26 @@ mod tests {
         assert!(
             leftovers.trim().is_empty(),
             "containers leaked: {leftovers:?}"
+        );
+
+        // ...and nor does any of their anonymous volumes: `rm -f` without `-v`
+        // leaves exactly these behind (plan
+        // 2026-10-02-orphaned-anonymous-docker-volumes-stop-producers-and-reap-nightly).
+        let remaining = run_capture(
+            &runtime,
+            &["volume", "ls", "-q"],
+            CONTAINER_CMD_TIMEOUT,
+            None,
+        )
+        .await
+        .expect("volume ls must answer");
+        let orphaned: Vec<&String> = volumes
+            .iter()
+            .filter(|v| remaining.lines().any(|l| l.trim() == v.as_str()))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "teardown orphaned anonymous volumes: {orphaned:?}"
         );
     }
 

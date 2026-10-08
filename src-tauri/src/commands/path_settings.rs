@@ -81,8 +81,42 @@ use crate::config_facade;
 use crate::settings::PathSettings;
 use qontinui_runner_lib::plan_workunit_adapter::trigger::{
     adapter_metrics, resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir,
-    MetricsSnapshot, ScanDivergence,
+    MetricsSnapshot, ScanDivergence, WorkUnitWritePosture,
 };
+
+/// The adapter's last work-unit write posture, projected across the Tauri
+/// boundary — see `trigger::work_unit_write_posture`.
+///
+/// "The tier is on" and "work units reach coord" are different claims: on a
+/// device bound to more than one tenant, or one whose binding set coord has
+/// not echoed, the adapter scans every cycle and makes NO coord work-unit call.
+/// A surface that says units are pushed has to read this, not the tier flag.
+///
+/// `state` is `write` | `withheld_multi_bound` | `withheld_bindings_unknown`;
+/// `tenants` is present only on `withheld_multi_bound`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkUnitPostureView {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenants: Option<u32>,
+}
+
+impl From<WorkUnitWritePosture> for WorkUnitPostureView {
+    fn from(p: WorkUnitWritePosture) -> Self {
+        let (state, tenants) = match p {
+            WorkUnitWritePosture::Write => ("write", None),
+            WorkUnitWritePosture::WithheldMultiBound(n) => (
+                "withheld_multi_bound",
+                Some(u32::try_from(n).unwrap_or(u32::MAX)),
+            ),
+            WorkUnitWritePosture::WithheldBindingsUnknown => ("withheld_bindings_unknown", None),
+        };
+        Self {
+            state: state.to_string(),
+            tenants,
+        }
+    }
+}
 
 /// The adapter's last scan-source divergence reading, projected across the
 /// Tauri boundary.
@@ -110,8 +144,9 @@ pub struct ScanDivergenceView {
     pub ref_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Commits on `default_ref` the scanned tree lacks: how stale the scan
-    /// source is. Measured as of that clone's last fetch — the adapter never
-    /// fetches.
+    /// source is. Counted against the commit the cycle pinned — the ref as the
+    /// cycle's own fetch left it on a writing cycle, and as the clone last
+    /// fetched it on a withheld cycle or one whose fetch failed.
     pub behind: Option<u64>,
     /// Commits the scanned tree has that `default_ref` does not.
     pub ahead: Option<u64>,
@@ -206,6 +241,11 @@ pub struct ResolvedPaths {
     /// and reports `not_scanning`, so an off machine is a reading here, never
     /// an absence.
     pub plan_scan_divergence: Option<ScanDivergenceView>,
+    /// Whether the adapter's last armed cycle DECIDED to push work units to
+    /// coord or to withhold them — a decision, not proof a push succeeded — see [`WorkUnitPostureView`]. `None` is UNKNOWN: the loop
+    /// has not run an armed cycle yet, or the tier is off and nothing is
+    /// decided. Never read as `write`.
+    pub plan_work_unit_posture: Option<WorkUnitPostureView>,
     /// The same three keyed directories resolved **for one named tenant**.
     ///
     /// Present only when the caller named a `tenant_id`; with no tenant named
@@ -433,6 +473,9 @@ pub fn view_from(
             .scan_divergence
             .as_ref()
             .map(ScanDivergenceView::from),
+        plan_work_unit_posture: adapter
+            .work_unit_write_posture
+            .map(WorkUnitPostureView::from),
         resolved_for_tenant: tenant.map(|tenant_id| ResolvedForTenant {
             tenant_id: tenant_id.to_string(),
             plans_dir: resolve_plans_dir(
@@ -547,6 +590,7 @@ mod tests {
             seed_errors_total: 0,
             work_unit_writes_withheld_total: 0,
             work_unit_writes_withheld_unknown_total: 0,
+            work_unit_write_posture: None,
             scan_roots,
             path_resolutions_total,
             active_plans_dir: None,
@@ -740,8 +784,47 @@ mod tests {
         assert_eq!(on.resolved.plans_dir.as_deref(), Some("/root/plans"));
         assert_eq!(on.resolved.prompts_dir.as_deref(), Some("/root/prompts"));
         assert_eq!(on.resolved.plan_scan_roots, Some(2));
+        assert_eq!(
+            on.resolved.plan_work_unit_posture, None,
+            "no armed cycle yet: the posture is UNKNOWN, never 'write'"
+        );
         // The configured half is echoed as given, not normalised on read.
         assert_eq!(on.configured.plans_dir.as_deref(), Some("/root/plans"));
+    }
+
+    /// The work-unit posture crosses the boundary as its stable tag, with the
+    /// tenant count only where it means something — so the panel can say
+    /// "withheld" instead of claiming units reach coord on a multi-bound device.
+    #[test]
+    fn resolved_view_projects_the_work_unit_write_posture() {
+        let settings = || PathSettings {
+            plans_dir: Some("/notes/plans".to_string()),
+            ..PathSettings::default()
+        };
+        let cases = [
+            (
+                WorkUnitWritePosture::Write,
+                serde_json::json!({"state": "write"}),
+            ),
+            (
+                WorkUnitWritePosture::WithheldMultiBound(3),
+                serde_json::json!({"state": "withheld_multi_bound", "tenants": 3}),
+            ),
+            (
+                WorkUnitWritePosture::WithheldBindingsUnknown,
+                serde_json::json!({"state": "withheld_bindings_unknown"}),
+            ),
+        ];
+        for (posture, wire) in cases {
+            let mut snap = snapshot(1, 1);
+            snap.work_unit_write_posture = Some(posture);
+            let view = view_from(settings(), &snap, "/logs".to_string(), None);
+            assert_eq!(
+                serde_json::to_value(view.resolved.plan_work_unit_posture).unwrap(),
+                wire,
+                "{posture:?}"
+            );
+        }
     }
 
     /// The divergence reading crosses the boundary WHOLE — every field, and
