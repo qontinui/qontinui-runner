@@ -379,9 +379,9 @@ impl KeychainHelper {
 
     /// Store a secret in the keychain.
     pub fn store(&self, key: &str, value: &str) -> Result<()> {
-        // The keychain gate (`instance_env::keychain_allowed`): a refused write
+        // The keychain gate (`instance_env::os_keychain_allowed`): a refused write
         // is an error, never a silent success that loses the secret.
-        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
             return Err(qontinui_runner_lib::instance_env::keychain_disabled_error().into());
         }
         let entry = Entry::new(&self.service, key)?;
@@ -396,7 +396,7 @@ impl KeychainHelper {
     /// `Ok(None)` if it doesn't exist,
     /// or an error if something went wrong.
     pub fn get(&self, key: &str) -> Result<Option<String>> {
-        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
             return Ok(None);
         }
         let entry = Entry::new(&self.service, key)?;
@@ -411,7 +411,7 @@ impl KeychainHelper {
     ///
     /// This is idempotent - it won't error if the secret doesn't exist.
     pub fn delete(&self, key: &str) -> Result<()> {
-        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
             return Ok(());
         }
         let entry = Entry::new(&self.service, key)?;
@@ -1182,9 +1182,14 @@ mod tests {
     #[test]
     fn under_an_instance_root_the_keychain_helper_never_touches_the_os_keychain() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::remove_var("QONTINUI_DISABLE_KEYCHAIN");
         std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.dir().join("subject"));
-        let keychain = ai_keychain();
+        // A unique test service, never `com.qontinui.runner.ai`: if the gate
+        // ever regressed, the store below would land in a throwaway entry
+        // rather than overwrite a real secret.
+        let keychain = KeychainHelper::new(&format!(
+            "com.qontinui.runner.test.keychain-gate.{}",
+            uuid::Uuid::new_v4()
+        ));
         assert_eq!(keychain.get("api_key").unwrap(), None);
         assert!(keychain.delete("api_key").is_ok());
         let err = keychain.store("api_key", "sk-never-stored").unwrap_err();

@@ -79,8 +79,8 @@ impl CredentialStore {
     /// existing value.
     pub fn set(wrapper_id: &str, name: &str, value: &str) -> Result<(), CredentialError> {
         validate_name(name)?;
-        // The keychain gate (`instance_env::keychain_allowed`).
-        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+        // The keychain gate (`instance_env::os_keychain_allowed`).
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
             return Err(qontinui_runner_lib::instance_env::keychain_disabled_error().into());
         }
         let entry = Entry::new(&keyring_service(wrapper_id), name)?;
@@ -93,7 +93,7 @@ impl CredentialStore {
     /// this.
     pub fn get(wrapper_id: &str, name: &str) -> Result<Option<String>, CredentialError> {
         validate_name(name)?;
-        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
             return Ok(None);
         }
         let entry = Entry::new(&keyring_service(wrapper_id), name)?;
@@ -122,7 +122,7 @@ impl CredentialStore {
     /// Remove a credential. No-op if it doesn't exist.
     pub fn delete(wrapper_id: &str, name: &str) -> Result<(), CredentialError> {
         validate_name(name)?;
-        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
             return Ok(());
         }
         let entry = Entry::new(&keyring_service(wrapper_id), name)?;
