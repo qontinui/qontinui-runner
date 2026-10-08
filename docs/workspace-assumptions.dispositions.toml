@@ -535,7 +535,7 @@ class = "os_bound_tooling"
 file = "src/fleet/computer/services.rs"
 symbol = "sc"
 disposition = "fallback_correct"
-note = "The Windows service watcher's `sc query`/`sc qc` probe, inside `mod windows` and called only from cfg(windows) code; off Windows the systemd collector in the same file watches the units instead."
+note = "The Windows service watcher's `sc query`/`sc qc` probe, inside `mod windows` and called only from cfg(windows) code. On Linux the systemd collector in the same file watches the units; other non-Windows targets report no service scan (units unknown, nothing deleted)."
 reviewed = [
     "cfg(windows)-only fn `sc` has no cfg(not(windows)) sibling in this file",
 ]
