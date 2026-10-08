@@ -179,6 +179,9 @@ fn send_assistant_and_result(text: &str, session_id: &str) {
 // ============================================================================
 
 fn main() {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     // Check for special modes via command-line args
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("normal");

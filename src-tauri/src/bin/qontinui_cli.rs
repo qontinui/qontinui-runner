@@ -65,6 +65,9 @@ use qontinui_runner_lib::coord_mcp_config::{
 const RUNNER_PORT_ENV: &str = "QONTINUI_RUNNER_API_PORT";
 
 fn main() -> ExitCode {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("create") => pr_create(&args[1..]),

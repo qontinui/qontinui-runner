@@ -379,6 +379,11 @@ impl KeychainHelper {
 
     /// Store a secret in the keychain.
     pub fn store(&self, key: &str, value: &str) -> Result<()> {
+        // The keychain gate (`instance_env::keychain_allowed`): a refused write
+        // is an error, never a silent success that loses the secret.
+        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            return Err(qontinui_runner_lib::instance_env::keychain_disabled_error().into());
+        }
         let entry = Entry::new(&self.service, key)?;
         entry.set_password(value)?;
         info!("Stored {} in keychain (service: {})", key, self.service);
@@ -391,6 +396,9 @@ impl KeychainHelper {
     /// `Ok(None)` if it doesn't exist,
     /// or an error if something went wrong.
     pub fn get(&self, key: &str) -> Result<Option<String>> {
+        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            return Ok(None);
+        }
         let entry = Entry::new(&self.service, key)?;
         match entry.get_password() {
             Ok(v) => Ok(Some(v)),
@@ -403,6 +411,9 @@ impl KeychainHelper {
     ///
     /// This is idempotent - it won't error if the secret doesn't exist.
     pub fn delete(&self, key: &str) -> Result<()> {
+        if !qontinui_runner_lib::instance_env::keychain_allowed() {
+            return Ok(());
+        }
         let entry = Entry::new(&self.service, key)?;
         // Ignore NoEntry error - it's fine if it doesn't exist
         match entry.delete_credential() {
@@ -1161,5 +1172,22 @@ mod tests {
         );
         assert_eq!(GlobalLogSourceSettings::field_name(), "log_sources");
         assert_eq!(CloudRelaySettings::field_name(), "cloud_relay");
+    }
+
+    /// Plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D2, through the real entry point: under an instance root the keychain
+    /// helper never reaches the machine-shared OS keychain — a read answers
+    /// "absent", a delete is a no-op, and a write is refused with the gate's
+    /// error instead of overwriting the harness's secret.
+    #[test]
+    fn under_an_instance_root_the_keychain_helper_never_touches_the_os_keychain() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::remove_var("QONTINUI_DISABLE_KEYCHAIN");
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.dir().join("subject"));
+        let keychain = ai_keychain();
+        assert_eq!(keychain.get("api_key").unwrap(), None);
+        assert!(keychain.delete("api_key").is_ok());
+        let err = keychain.store("api_key", "sk-never-stored").unwrap_err();
+        assert!(err.to_string().contains("keychain is disabled"), "{err}");
     }
 }

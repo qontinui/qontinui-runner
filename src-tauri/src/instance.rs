@@ -11,8 +11,7 @@
 
 #![allow(dead_code)]
 
-use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
 /// The env-identity primitives live in the LIB crate
@@ -24,7 +23,9 @@ use tracing::{debug, error, info};
 ///
 /// The rest of this module stays bin-side: it reaches into `crate::mcp::types`
 /// and `crate::session`, neither of which is in the lib.
-pub use qontinui_runner_lib::instance_env::{instance_name, instance_root, is_secondary};
+pub use qontinui_runner_lib::instance_env::{
+    instance_name, instance_root, is_secondary, shares_primary_settings,
+};
 
 /// True iff this runner is the canonical instance — the one allowed to own
 /// SHARED, machine-wide state that is not path-isolated per instance.
@@ -37,8 +38,9 @@ pub use qontinui_runner_lib::instance_env::{instance_name, instance_root, is_sec
 /// the primary next boots — which, for a protected primary, can be days.
 ///
 /// **Deliberately `resolve_data_subdir`-based, not [`is_secondary`].**
-/// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` alone, so a secondary the
-/// supervisor spawned without that env var reads as PRIMARY and would be handed
+/// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` and `QONTINUI_INSTANCE_ROOT`
+/// only, so a secondary the supervisor spawned with neither reads as PRIMARY and
+/// would be handed
 /// the shared root config — the exact fail-open this guard exists to prevent.
 /// `resolve_data_subdir` additionally detects a secondary by `primary_port` or
 /// a non-default API port, so a nameless secondary fails CLOSED (quarantined,
@@ -66,11 +68,26 @@ pub fn owns_shared_root_state() -> bool {
 /// supervisor uses `RunnerKind::from_id` (with the runner id, not env) to
 /// produce the precise variant. Callers in the runner that need the
 /// secondary/primary split should still prefer `is_secondary()` for clarity.
+///
+/// A nameless runner under an instance root is `Named` with its stable
+/// `rooted_instance_id` — never `Primary`, which would hand it the primary's
+/// WebView2 profile fallback in [`webview2_data_dir`].
 pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
+    runner_kind_from(instance_name(), instance_root().as_deref())
+}
+
+/// Env-free core of [`runner_kind`].
+fn runner_kind_from(
+    name: Option<String>,
+    instance_root: Option<&Path>,
+) -> qontinui_types::wire::runner_kind::RunnerKind {
     use qontinui_types::wire::runner_kind::RunnerKind;
-    match instance_name() {
-        Some(name) => RunnerKind::Named { name },
-        None => RunnerKind::Primary,
+    match (name, instance_root) {
+        (Some(name), _) => RunnerKind::Named { name },
+        (None, Some(root)) => RunnerKind::Named {
+            name: qontinui_runner_lib::instance_env::rooted_instance_id(root),
+        },
+        (None, None) => RunnerKind::Primary,
     }
 }
 
@@ -110,18 +127,16 @@ fn resolve_data_subdir(
     None
 }
 
-/// The data subdir of a NAMELESS subject: `instance-root-<16 hex>`, the hex being
-/// a 64-bit FNV-1a of the root path as written. Deterministic across processes
-/// and Rust releases (unlike `DefaultHasher`), so a subject restarted under the
-/// same root finds its own scoped state again, and two subjects under different
-/// roots never share a subdir of a still machine-global base.
+/// The data subdir of a NAMELESS subject: `instance-<rooted_instance_id>`, i.e.
+/// `instance-root-<16 hex>`. Stable across processes, releases and spellings
+/// of the same root, so a subject restarted under it finds its own scoped
+/// state again, and two subjects under different roots never share a subdir of
+/// a still machine-global base.
 fn rooted_subdir(root: &Path) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in root.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("instance-root-{hash:016x}")
+    format!(
+        "instance-{}",
+        qontinui_runner_lib::instance_env::rooted_instance_id(root)
+    )
 }
 
 /// Returns the per-instance path segment, or `None` for the primary runner.
@@ -188,221 +203,35 @@ pub fn primary_port() -> Option<u16> {
 }
 
 // ============================================================================
-// Subject-runner instance root — the startup contract
-// (plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`,
-// Phase 2: D1 defaults, D2 no keychain, D3 port refusal)
+// Subject-runner instance root (plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`)
 // ============================================================================
+//
+// The contract itself — validation, root-derived defaults, the refusal — lives
+// in the LIB (`qontinui_runner_lib::instance_env`) so every binary of this
+// crate runs the same one first thing in its `main`. Only the runner bin binds
+// `QONTINUI_PORT`, so only it requires one.
 
-/// Exit status of a runner that refuses to start under an invalid instance
-/// root: 78, `EX_CONFIG` in `sysexits.h` — a launch-configuration error, kept
-/// distinct from the `1` / `2` that `main` uses for an application error / a
-/// panic, so a launcher can tell "you launched me wrong" from "I crashed".
-pub const INSTANCE_ROOT_REFUSAL_EXIT: i32 = 78;
-
-/// The runner-read location overrides (all in `ambient::AMBIENT_ENV_KEYS`) that,
-/// under an instance root, may only point INSIDE it. Refused rather than
-/// clamped (plan D1): a silent clamp would hide the launcher bug that set them.
-pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[
-    "QONTINUI_CAPABILITY_STATE_DIR",
-    "QONTINUI_CONFIG_DIR",
-    "QONTINUI_EMBEDDED_PG_DIR",
-    "QONTINUI_HOME",
-    "QONTINUI_PANIC_LOG_DIR",
-    "QONTINUI_PROMPTS_DIR",
-    "QONTINUI_RUNNER_LOG_DIR",
-    "QONTINUI_SECURE_STORAGE_DIR",
-    "QONTINUI_SESSION_NAMES_DIR",
-];
-
-/// Is an env value absent for the purposes of a path override? Unset, empty and
-/// whitespace-only all read as "no override" — the same rule
-/// `ambient::qontinui_dir_from` applies.
-fn is_blank(value: Option<&OsString>) -> bool {
-    value.is_none_or(|v| v.to_string_lossy().trim().is_empty())
-}
-
-/// `path` with `.` dropped and `..` applied, without touching the filesystem —
-/// so a path that does not exist yet can still be judged, and a symlink is not
-/// followed (a symlink inside the root pointing out of it is the launcher's
-/// explicit choice, not an implicit fallback).
-fn lexically_normalized(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// Env-free check of a subject runner's launch environment, run BEFORE the
-/// root-derived defaults are applied, so only what the launcher actually
-/// supplied is judged.
-///
-/// - `root`: the `QONTINUI_INSTANCE_ROOT` value — must be absolute.
-/// - `port`: the raw `QONTINUI_PORT` — must be set, parse, and not be the
-///   primary's [`crate::mcp::types::MCP_API_PORT`] (D3).
-/// - `overrides`: each [`ROOT_CONFINED_ENV_KEYS`] key with its raw value; a
-///   non-blank value must be absolute and lexically inside `root`.
-///
-/// Every problem is reported, not only the first, so one refused launch names
-/// everything the launcher has to fix.
-pub fn validate_instance_root(
-    root: &Path,
-    port: Option<&str>,
-    overrides: &[(&str, Option<OsString>)],
-) -> Result<(), String> {
-    if !root.is_absolute() {
-        return Err(format!(
-            "QONTINUI_INSTANCE_ROOT must be an absolute path, got {:?}",
-            root
-        ));
-    }
-    let mut problems: Vec<String> = Vec::new();
-
-    let primary = crate::mcp::types::MCP_API_PORT;
-    match port.map(str::trim).filter(|p| !p.is_empty()) {
-        None => problems.push(format!(
-            "QONTINUI_PORT is unset; a runner under an instance root needs its own explicit \
-             port (never the primary's {primary})"
-        )),
-        Some(raw) => match raw.parse::<u16>() {
-            Err(_) => problems.push(format!("QONTINUI_PORT={raw:?} is not a valid port")),
-            Ok(p) if p == primary => problems.push(format!(
-                "QONTINUI_PORT={p} is the primary runner's port; a runner under an instance \
-                 root must use another"
-            )),
-            Ok(_) => {}
-        },
-    }
-
-    let normalized_root = lexically_normalized(root);
-    for (key, value) in overrides {
-        if is_blank(value.as_ref()) {
-            continue;
-        }
-        let Some(value) = value else { continue };
-        let path = Path::new(value);
-        if !path.is_absolute() || !lexically_normalized(path).starts_with(&normalized_root) {
-            problems.push(format!(
-                "{key}={:?} is outside the instance root {:?}",
-                path, root
-            ));
-        }
-    }
-
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(problems.join("; "))
-    }
-}
-
-/// One environment default an instance root implies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstanceRootDefault {
-    pub key: &'static str,
-    pub value: OsString,
-    /// The value is a directory the runner creates before exporting it.
-    pub is_dir: bool,
-}
-
-/// Env-free core of the defaults a subject runner derives from its root (D1,
-/// minimal; D2): for each key the launcher left unset, the value to export.
-///
-/// - `QONTINUI_SECURE_STORAGE_DIR` → `<root>/secure` (binding store, token store)
-/// - `QONTINUI_CONFIG_DIR` → `<root>/config` (`settings.json`)
-/// - `QONTINUI_HOME` → `<root>/home` (the `~/.qontinui` seam)
-/// - `QONTINUI_DISABLE_KEYCHAIN` → `1`: the OS keychain is keyed on the fixed
-///   service name `com.qontinui.runner`, shared by every instance on the box,
-///   so a subject never reads or writes it — file storage is already the source
-///   of truth (`auth.rs` `keychain_enabled_env`). Exported rather than special-
-///   cased inside `auth`, so children the subject spawns inherit it too (D5).
-///
-/// `current(key)` is the key's present value. A path key counts as unset when
-/// blank (its readers ignore a blank value); the keychain switch only when
-/// absent, because `auth` treats ANY value of it — even empty — as "disabled".
-pub fn instance_root_defaults(
-    root: &Path,
-    current: &dyn Fn(&str) -> Option<OsString>,
-) -> Vec<InstanceRootDefault> {
-    use qontinui_runner_lib::instance_env::{
-        INSTANCE_ROOT_CONFIG_SUBDIR, INSTANCE_ROOT_HOME_SUBDIR, INSTANCE_ROOT_SECURE_SUBDIR,
-    };
-    let dirs: [(&'static str, &str); 3] = [
-        ("QONTINUI_SECURE_STORAGE_DIR", INSTANCE_ROOT_SECURE_SUBDIR),
-        ("QONTINUI_CONFIG_DIR", INSTANCE_ROOT_CONFIG_SUBDIR),
-        ("QONTINUI_HOME", INSTANCE_ROOT_HOME_SUBDIR),
-    ];
-    let mut out: Vec<InstanceRootDefault> = dirs
-        .into_iter()
-        .filter(|(key, _)| is_blank(current(key).as_ref()))
-        .map(|(key, sub)| InstanceRootDefault {
-            key,
-            value: root.join(sub).into_os_string(),
-            is_dir: true,
-        })
-        .collect();
-    if current("QONTINUI_DISABLE_KEYCHAIN").is_none() {
-        out.push(InstanceRootDefault {
-            key: "QONTINUI_DISABLE_KEYCHAIN",
-            value: OsString::from("1"),
-            is_dir: false,
-        });
-    }
-    out
-}
-
-/// Print why this runner will not start under its instance root, and exit.
-fn refuse_instance_root(root: &Path, why: &str) -> ! {
-    eprintln!(
-        "qontinui-runner: refusing to start under QONTINUI_INSTANCE_ROOT={}: {why}",
-        root.display()
-    );
-    std::process::exit(INSTANCE_ROOT_REFUSAL_EXIT);
-}
-
-/// The subject-runner startup contract. A no-op without an instance root — the
-/// primary's startup is byte-for-byte what it was.
-///
-/// Under a root: validate what the launcher supplied ([`validate_instance_root`]),
-/// refusing with [`INSTANCE_ROOT_REFUSAL_EXIT`] on any problem; then create and
-/// export the root-derived defaults ([`instance_root_defaults`]) for every key
-/// the launcher left unset, so every resolver that runs afterwards — settings,
-/// pairing, secure storage, `~/.qontinui` — and every child the runner spawns
-/// resolves inside the root.
-///
-/// Must be the FIRST thing `main` does: before anything reads a path, and
-/// while the process is still single-threaded, so the `set_var` calls below
-/// cannot race a reader on another thread.
+/// The runner bin's startup contract: [`qontinui_runner_lib::instance_env::enforce_instance_root_or_exit`]
+/// with the port required (D3). A no-op without an instance root.
 pub fn enforce_instance_root_at_startup() {
-    let Some(root) = instance_root() else {
-        return;
-    };
-    let overrides: Vec<(&str, Option<OsString>)> = ROOT_CONFINED_ENV_KEYS
-        .iter()
-        .map(|key| (*key, std::env::var_os(key)))
-        .collect();
-    let port = std::env::var("QONTINUI_PORT").ok();
-    if let Err(why) = validate_instance_root(&root, port.as_deref(), &overrides) {
-        refuse_instance_root(&root, &why);
-    }
-    for default in instance_root_defaults(&root, &|key| std::env::var_os(key)) {
-        if default.is_dir {
-            if let Err(e) = std::fs::create_dir_all(&default.value) {
-                refuse_instance_root(
-                    &root,
-                    &format!("cannot create {} at {:?}: {e}", default.key, default.value),
-                );
-            }
-        }
-        // Single-threaded here (see the doc above): no reader can observe a
-        // half-applied environment.
-        std::env::set_var(default.key, &default.value);
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(true);
+}
+
+/// The ports the MCP API bind loop tries, in order. Normally `port` and two
+/// fallbacks (a crashed predecessor's zombie sockets on Windows). Under an
+/// instance root ONLY `port`: the launcher chose it and is about to address
+/// the subject on it, and a silent `+1` could land on another runner's port.
+pub fn api_ports_to_try(port: u16) -> Vec<u16> {
+    api_ports_to_try_for(port, instance_root().is_some())
+}
+
+/// Env-free core of [`api_ports_to_try`].
+fn api_ports_to_try_for(port: u16, under_instance_root: bool) -> Vec<u16> {
+    if under_instance_root {
+        vec![port]
+    } else {
+        vec![port, port + 1, port + 2]
     }
 }
 
@@ -438,7 +267,12 @@ pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(p));
     }
     let kind = runner_kind();
-    let id = instance_name().unwrap_or_else(|| "primary".into());
+    // The kind's own name: the instance name, or a root-only subject's
+    // `rooted_instance_id` — never "primary" for anything but the primary.
+    let id = match &kind {
+        qontinui_types::wire::runner_kind::RunnerKind::Named { name } => name.clone(),
+        _ => instance_name().unwrap_or_else(|| "primary".into()),
+    };
     qontinui_types::wire::webview2_data_dir(&kind, &id)
 }
 
@@ -776,16 +610,12 @@ mod tests {
     }
     // ------------------------------------------------------------------
     // Subject-runner instance root (plan
-    // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`)
+    // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`).
+    // The contract's own tests live with it in `instance_env`.
     // ------------------------------------------------------------------
 
-    /// An absolute path on whichever OS the test runs on.
     fn abs(rel: &str) -> PathBuf {
         std::env::temp_dir().join(rel)
-    }
-
-    fn os(p: &Path) -> Option<OsString> {
-        Some(p.as_os_str().to_owned())
     }
 
     /// D3: a root alone makes the runner a secondary with its own subdir, so
@@ -798,6 +628,13 @@ mod tests {
         let sub = resolve_data_subdir(None, Some(&root), None, PRIMARY)
             .expect("a rooted runner must never resolve to the primary's unscoped path");
         assert!(sub.starts_with("instance-root-"), "{sub}");
+        assert_eq!(
+            sub,
+            format!(
+                "instance-{}",
+                qontinui_runner_lib::instance_env::rooted_instance_id(&root)
+            )
+        );
         // Stable for one root, distinct across roots.
         assert_eq!(
             resolve_data_subdir(None, Some(&root), None, 9877),
@@ -817,232 +654,55 @@ mod tests {
     }
 
     #[test]
-    fn rooted_subdir_is_a_pinned_fnv1a_of_the_path() {
-        // Pinned value: an on-disk name must not move between releases.
+    fn a_root_only_subject_is_not_the_primary_kind() {
+        use qontinui_types::wire::runner_kind::RunnerKind;
+        let root = abs("subject-kind");
+        let id = qontinui_runner_lib::instance_env::rooted_instance_id(&root);
         assert_eq!(
-            rooted_subdir(Path::new("")),
-            "instance-root-cbf29ce484222325"
+            runner_kind_from(None, Some(&root)),
+            RunnerKind::Named { name: id }
         );
         assert_eq!(
-            rooted_subdir(Path::new("a")),
-            "instance-root-af63dc4c8601ec8c"
+            runner_kind_from(Some("n".to_string()), Some(&root)),
+            RunnerKind::Named { name: "n".into() }
         );
-    }
-
-    fn no_overrides() -> Vec<(&'static str, Option<OsString>)> {
-        ROOT_CONFINED_ENV_KEYS.iter().map(|k| (*k, None)).collect()
-    }
-
-    fn with_override(
-        key: &'static str,
-        value: Option<OsString>,
-    ) -> Vec<(&'static str, Option<OsString>)> {
-        ROOT_CONFINED_ENV_KEYS
-            .iter()
-            .map(|k| (*k, if *k == key { value.clone() } else { None }))
-            .collect()
+        assert_eq!(runner_kind_from(None, None), RunnerKind::Primary);
     }
 
     #[test]
-    fn validate_accepts_an_absolute_root_with_its_own_port_and_inside_overrides() {
-        let root = abs("subject-ok");
-        assert_eq!(
-            validate_instance_root(&root, Some("9881"), &no_overrides()),
-            Ok(())
-        );
-        let inside: Vec<(&'static str, Option<OsString>)> = ROOT_CONFINED_ENV_KEYS
-            .iter()
-            .map(|k| (*k, os(&root.join("deep").join(k.to_ascii_lowercase()))))
-            .collect();
-        assert_eq!(validate_instance_root(&root, Some("9881"), &inside), Ok(()));
-        // The root itself, and a path that only leaves and re-enters, are inside.
-        let reenter = root.join("x").join("..").join(".").join("config");
-        assert_eq!(
-            validate_instance_root(
-                &root,
-                Some("9881"),
-                &with_override("QONTINUI_CONFIG_DIR", os(&reenter))
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            validate_instance_root(
-                &root,
-                Some("9881"),
-                &with_override("QONTINUI_HOME", os(&root))
-            ),
-            Ok(())
-        );
-        // Blank overrides are no overrides.
-        assert_eq!(
-            validate_instance_root(
-                &root,
-                Some("9881"),
-                &with_override("QONTINUI_HOME", Some(OsString::from("  ")))
-            ),
-            Ok(())
-        );
+    fn under_a_root_the_api_binds_only_the_requested_port() {
+        assert_eq!(api_ports_to_try_for(9881, true), vec![9881]);
+        assert_eq!(api_ports_to_try_for(9876, false), vec![9876, 9877, 9878]);
     }
 
+    /// Through the real entry points: with `QONTINUI_INSTANCE_ROOT` in the
+    /// process env, `is_secondary()`, `data_subdir()` and
+    /// `owns_shared_root_state()` all read the runner as an isolated subject.
     #[test]
-    fn validate_refuses_a_relative_root() {
-        let err = validate_instance_root(Path::new("subject"), Some("9881"), &no_overrides())
-            .unwrap_err();
-        assert!(err.contains("absolute"), "{err}");
-    }
+    fn a_root_in_the_env_makes_the_live_predicates_read_secondary() {
+        let amb = crate::test_env::isolated_ambient();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        std::env::remove_var("QONTINUI_PRIMARY_PORT");
+        std::env::remove_var("QONTINUI_PORT");
+        assert!(owns_shared_root_state(), "fixture baseline: the primary");
+        assert!(!is_secondary());
 
-    #[test]
-    fn validate_refuses_a_missing_invalid_or_primary_port() {
-        let root = abs("subject-port");
-        for port in [None, Some(""), Some("  ")] {
-            let err = validate_instance_root(&root, port, &no_overrides()).unwrap_err();
-            assert!(err.contains("QONTINUI_PORT is unset"), "{port:?}: {err}");
-        }
-        let err = validate_instance_root(&root, Some("nope"), &no_overrides()).unwrap_err();
-        assert!(err.contains("not a valid port"), "{err}");
-        let primary = crate::mcp::types::MCP_API_PORT.to_string();
-        let err = validate_instance_root(&root, Some(&primary), &no_overrides()).unwrap_err();
-        assert!(err.contains("primary runner's port"), "{err}");
-    }
-
-    #[test]
-    fn validate_refuses_every_confined_override_outside_the_root() {
-        let root = abs("subject-confined");
-        let outside = abs("harness-state");
-        for key in ROOT_CONFINED_ENV_KEYS {
-            let err =
-                validate_instance_root(&root, Some("9881"), &with_override(key, os(&outside)))
-                    .unwrap_err();
-            assert!(
-                err.contains(key) && err.contains("outside the instance root"),
-                "{err}"
-            );
-        }
-        // Escaping with `..`, a sibling that merely shares a prefix, and a
-        // relative override are all outside.
-        let escapes = [
-            root.join("..").join("harness"),
-            PathBuf::from(format!("{}-sibling", root.display())),
-            PathBuf::from("relative/secure"),
-        ];
-        for path in escapes {
-            let got = validate_instance_root(
-                &root,
-                Some("9881"),
-                &with_override("QONTINUI_SECURE_STORAGE_DIR", os(&path)),
-            );
-            assert!(got.is_err(), "{path:?} must be refused");
-        }
-    }
-
-    #[test]
-    fn validate_reports_every_problem_at_once() {
-        let root = abs("subject-many");
-        let mut overrides = with_override("QONTINUI_CONFIG_DIR", os(&abs("elsewhere")));
-        overrides.push(("QONTINUI_HOME", os(&abs("elsewhere-home"))));
-        let err = validate_instance_root(&root, None, &overrides).unwrap_err();
-        assert!(err.contains("QONTINUI_PORT"), "{err}");
-        assert!(err.contains("QONTINUI_CONFIG_DIR"), "{err}");
-        assert!(err.contains("QONTINUI_HOME"), "{err}");
-    }
-
-    #[test]
-    fn defaults_fill_every_unset_key_under_the_root() {
-        let root = abs("subject-defaults");
-        let got = instance_root_defaults(&root, &|_| None);
+        let root = amb.dir().join("subject");
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", &root);
+        assert!(is_secondary());
+        assert!(!owns_shared_root_state());
         assert_eq!(
-            got,
-            vec![
-                InstanceRootDefault {
-                    key: "QONTINUI_SECURE_STORAGE_DIR",
-                    value: root.join("secure").into_os_string(),
-                    is_dir: true,
-                },
-                InstanceRootDefault {
-                    key: "QONTINUI_CONFIG_DIR",
-                    value: root.join("config").into_os_string(),
-                    is_dir: true,
-                },
-                InstanceRootDefault {
-                    key: "QONTINUI_HOME",
-                    value: root.join("home").into_os_string(),
-                    is_dir: true,
-                },
-                InstanceRootDefault {
-                    key: "QONTINUI_DISABLE_KEYCHAIN",
-                    value: OsString::from("1"),
-                    is_dir: false,
-                },
-            ]
+            data_subdir(),
+            Some(format!(
+                "instance-{}",
+                qontinui_runner_lib::instance_env::rooted_instance_id(&root)
+            ))
         );
-        // Every default is itself inside the root, so validation after
-        // applying them could never refuse what the runner chose.
-        let applied: Vec<(&str, Option<OsString>)> = got
-            .iter()
-            .filter(|d| d.is_dir)
-            .map(|d| (d.key, Some(d.value.clone())))
-            .collect();
-        assert_eq!(
-            validate_instance_root(&root, Some("9881"), &applied),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn defaults_never_override_what_the_launcher_set() {
-        let root = abs("subject-launcher-set");
-        let set = root.join("my-secure").into_os_string();
-        let got = instance_root_defaults(&root, &|key| match key {
-            "QONTINUI_SECURE_STORAGE_DIR" => Some(set.clone()),
-            "QONTINUI_HOME" => Some(OsString::from("")), // blank = unset
-            _ => None,
-        });
-        let keys: Vec<&str> = got.iter().map(|d| d.key).collect();
-        assert_eq!(
-            keys,
-            vec![
-                "QONTINUI_CONFIG_DIR",
-                "QONTINUI_HOME",
-                "QONTINUI_DISABLE_KEYCHAIN"
-            ]
-        );
-    }
-
-    /// D2: under a root the OS keychain is always off. `auth` disables it on
-    /// ANY value of `QONTINUI_DISABLE_KEYCHAIN` (`var_os(..).is_none()` is the
-    /// enabled test), so a launcher-set value — even empty — is kept, and an
-    /// absent one is defaulted to `1`. Either way the subject's keychain
-    /// predicate reads "disabled".
-    #[test]
-    fn under_a_root_the_keychain_is_always_disabled() {
-        let root = abs("subject-keychain");
-        for launcher_value in [None, Some(OsString::new()), Some(OsString::from("0"))] {
-            let defaults = instance_root_defaults(&root, &|key| {
-                (key == "QONTINUI_DISABLE_KEYCHAIN")
-                    .then(|| launcher_value.clone())
-                    .flatten()
-            });
-            let effective = defaults
-                .iter()
-                .find(|d| d.key == "QONTINUI_DISABLE_KEYCHAIN")
-                .map(|d| d.value.clone())
-                .or(launcher_value.clone());
-            assert!(
-                effective.is_some(),
-                "keychain must read disabled under a root (launcher value {launcher_value:?})"
-            );
-        }
-    }
-
-    #[test]
-    fn lexical_normalization_applies_dot_and_dotdot_without_the_filesystem() {
-        assert_eq!(
-            lexically_normalized(Path::new("/a/./b/../c")),
-            PathBuf::from("/a/c")
-        );
-        assert_eq!(
-            lexically_normalized(Path::new("/a/b/../../..")),
-            PathBuf::from("/")
-        );
+        assert!(!matches!(
+            runner_kind(),
+            qontinui_types::wire::runner_kind::RunnerKind::Primary
+        ));
+        assert_eq!(api_ports_to_try(9881), vec![9881]);
     }
 }

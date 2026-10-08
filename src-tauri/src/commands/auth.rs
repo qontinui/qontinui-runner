@@ -929,7 +929,7 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
     let Some(parsed) = settings::RunnerTier::from_wire(&tier) else {
         return Err(format!("invalid tier: {}", tier));
     };
-    let is_secondary = crate::instance::is_secondary();
+    let is_secondary = crate::instance::shares_primary_settings();
     // Blocking file I/O (`fs::read_to_string`, `create_dir_all`, and the
     // atomic write's `File::create`/`write_all`/`sync_all`/`rename`) off the
     // UI thread. The in-memory branch is cheap but goes through the same hop
@@ -1348,7 +1348,7 @@ async fn finalize_signed_in(
 
     // 6. Promote to Tier 2 + stage backend, then kick the relay/refresher.
     {
-        if crate::instance::is_secondary() {
+        if crate::instance::shares_primary_settings() {
             warn!("finalize_signed_in: secondary runner — applying in-memory only, skipping save_settings");
         } else {
             let base_for_write = base.clone();
@@ -1532,7 +1532,7 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
     // account's click must mint its own rather than reuse it.
     crate::commands::setup_wizard::clear_pending_connect();
 
-    if crate::instance::is_secondary() {
+    if crate::instance::shares_primary_settings() {
         warn!(
             "qontinui_sign_out: secondary runner — applying in-memory only, skipping save_settings"
         );

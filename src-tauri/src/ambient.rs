@@ -773,6 +773,9 @@ pub mod test_support {
     /// configured developer box exports and a clean CI runner does not.
     pub const KEYS_REMOVED: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
+        // A subject runner's root: a test that inherited one would run as a
+        // secondary with the keychain gated off.
+        "QONTINUI_INSTANCE_ROOT",
         "COORD_HTTP_URL",
         "QONTINUI_WORKSPACE_ROOT",
         "QONTINUI_SERVER_MODE",
@@ -2054,6 +2057,73 @@ mod tests {
             violations.is_empty(),
             "env keys read but not declared in ambient::AMBIENT_ENV_KEYS (add them, sorted):\n  {}",
             violations.into_iter().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+    /// Files whose keychain access is gated by something OTHER than
+    /// `instance_env::keychain_allowed`, each with the reason.
+    const KEYCHAIN_GATE_ALLOWLIST: &[(&str, &str)] = &[(
+        "auth.rs",
+        "every keyring call goes through `AuthManager::keychain_enabled`, which reads \
+         `QONTINUI_DISABLE_KEYCHAIN` — exported as `1` by every binary's startup under an \
+         instance root (`instance_env::instance_root_defaults`)",
+    )];
+
+    /// Drift guard (c), plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D2: every `keyring::Entry::new` in PRODUCTION code sits behind
+    /// `instance_env::keychain_allowed()` — the gate must be named in the same
+    /// fn, BEFORE the entry is built. Keychain service names are machine-wide,
+    /// so an ungated entry lets a subject runner read or overwrite the
+    /// harness's secrets. `KEYCHAIN_GATE_ALLOWLIST` names the exceptions; a
+    /// stale entry fails too.
+    #[test]
+    fn every_keyring_entry_is_behind_the_keychain_gate() {
+        let mut violations = Vec::new();
+        let mut entries_seen = 0usize;
+        let mut allowlist_used: BTreeSet<&str> = BTreeSet::new();
+        for (rel, leaves) in production_sources() {
+            for i in 0..leaves.len() {
+                let is_entry_new = leaves[i].is_ident("Entry")
+                    && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+                    && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+                    && leaves.get(i + 3).is_some_and(|l| l.is_ident("new"));
+                if !is_entry_new {
+                    continue;
+                }
+                entries_seen += 1;
+                if let Some((f, _)) = KEYCHAIN_GATE_ALLOWLIST.iter().find(|(f, _)| *f == rel) {
+                    allowlist_used.insert(f);
+                    continue;
+                }
+                // The enclosing fn: the nearest preceding `fn` keyword.
+                let fn_start = (0..i).rev().find(|&j| leaves[j].is_ident("fn"));
+                let gated = fn_start.is_some_and(|start| {
+                    leaves[start..i]
+                        .iter()
+                        .any(|l| l.is_ident("keychain_allowed"))
+                });
+                if !gated {
+                    violations.push(format!("{rel}:{}", leaves[i].line));
+                }
+            }
+        }
+        // Measured when written: 10 gated sites outside auth.rs plus auth.rs's
+        // own. A scan that sees none has stopped recognising the call.
+        assert!(entries_seen >= 10, "only {entries_seen} `Entry::new` found");
+        assert!(
+            violations.is_empty(),
+            "keyring::Entry::new not behind instance_env::keychain_allowed() (gate it, or \
+             allowlist the file with a reason):\n  {}",
+            violations.join("\n  ")
+        );
+        let stale: Vec<&str> = KEYCHAIN_GATE_ALLOWLIST
+            .iter()
+            .map(|(f, _)| *f)
+            .filter(|f| !allowlist_used.contains(f))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stale KEYCHAIN_GATE_ALLOWLIST entries: {stale:?}"
         );
     }
 }
