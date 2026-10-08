@@ -116,6 +116,14 @@ pub(crate) struct CiDispatchPayload {
     /// admission queue derives how long it may hold the dispatch from this.
     #[serde(default)]
     pub queued_renewal_max_age_secs: Option<u64>,
+    /// When coord's lease on this dispatch runs out, as coord stamped it
+    /// (RFC 3339). The admission queue anchors its "last renewed" clock to it
+    /// (`lease_expires_at - COORD_LEASE`) instead of to the moment the message
+    /// ARRIVED, so a late or redelivered `build_requested` is released before
+    /// coord's sweeper instead of after it. Absent on a payload from a coord
+    /// that does not send it; the anchor is then arrival, as before.
+    #[serde(default)]
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl CiDispatchPayload {
