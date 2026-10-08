@@ -5048,7 +5048,7 @@ mod pair_code_hang_regression_tests {
                 // Force the real (bounded, post-Phase-2) keychain path
                 // regardless of the ambient QONTINUI_DISABLE_KEYCHAIN — CI
                 // runs the whole test binary with that var set to `1`
-                // (`ci_node/manifest.rs`), which would otherwise skip the
+                // (`qontinui-schemas ci-exec/src/manifest.rs`), which would otherwise skip the
                 // keychain write entirely and make this test pass
                 // vacuously on BOTH the fixed and the unfixed tree.
                 let mgr = crate::auth::AuthManager::with_storage_force_keychain(storage);

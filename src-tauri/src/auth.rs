@@ -286,7 +286,7 @@ impl SlotDescriptor {
 /// test-only per-instance override (see
 /// [`AuthManager::with_storage_force_keychain`]) so a regression test can
 /// exercise the real keychain path even when the whole test binary runs
-/// under `QONTINUI_DISABLE_KEYCHAIN=1` (CI's default — `ci_node/manifest.rs`).
+/// under `QONTINUI_DISABLE_KEYCHAIN=1` (CI's default — `qontinui-schemas ci-exec/src/manifest.rs`).
 fn keychain_enabled_env() -> bool {
     std::env::var_os("QONTINUI_DISABLE_KEYCHAIN").is_none()
 }
@@ -486,7 +486,7 @@ impl AuthManager {
     /// (`pair::pair_code_hang_regression_tests`, plan
     /// `2026-08-29-qontinui-profile-device-pair-never-exits` Phase 4). CI
     /// runs the whole test binary with `QONTINUI_DISABLE_KEYCHAIN=1`
-    /// (`ci_node/manifest.rs`) so existing tests never touch the real OS
+    /// (`qontinui-schemas ci-exec/src/manifest.rs`) so existing tests never touch the real OS
     /// keychain — but that same env var would silently skip the keychain
     /// write path the regression test exists to exercise, making it pass
     /// vacuously on both the fixed and unfixed tree. An instance-level

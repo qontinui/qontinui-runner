@@ -111,9 +111,11 @@ pub(crate) fn is_terminal_403(status: u16, remaining: Option<i64>) -> bool {
     status == 403 && remaining != Some(0)
 }
 
-/// What a completed exchange means for the ETag entry the caller holds. Pure,
-/// unit-tested, and shared with [`crate::ci_node::sibling`] so the two doors
-/// cannot drift into disagreeing about when a cached body is still replayable.
+/// What a completed exchange means for the ETag entry the caller holds. Pure
+/// and unit-tested. The CI executor's sibling resolver
+/// (`qontinui_ci_exec::sibling`, in qontinui-schemas) applies the same rule at
+/// its own door — store only a validated success, drop the entry on anything
+/// else — through the cache this runner lends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheAction {
     /// A `200` carrying a validator — cache the body against it.

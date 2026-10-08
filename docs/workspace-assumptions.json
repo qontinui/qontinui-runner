@@ -364,30 +364,6 @@
     },
     {
       "class": "os_bound_tooling",
-      "file": "src/ci_node/executor.rs",
-      "symbol": "spawn_step_child",
-      "excerpt": "let mut shim = build_step_command(\"cmd.exe\", &argv);",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "os_bound_tooling",
-      "file": "src/ci_node/services.rs",
-      "symbol": "reap_blocking",
-      "excerpt": "spawn(\"cmd.exe\", &shim_argv)",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "os_bound_tooling",
-      "file": "src/ci_node/tools.rs",
-      "symbol": "run_capture_env",
-      "excerpt": "let mut shim = build(\"cmd.exe\", &argv_ref, path_dir, envs);",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "os_bound_tooling",
       "file": "src/commands/saved_projects.rs",
       "symbol": "is_drive_rooted",
       "excerpt": "cfg(windows)-only fn `is_drive_rooted` has no cfg(not(windows)) sibling in this file",
@@ -1606,6 +1582,15 @@
       "excerpt": "\"QONTINUI_ROOT not resolvable on this device\".to_string(),",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/ci_node/host.rs",
+      "symbol": "RunnerIdentity::ci_root",
+      "excerpt": ".ok_or_else(|| \"QONTINUI_ROOT not resolvable on this device\".to_string())",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "New with the shared ci-exec host adapter (qontinui-schemas#213 follow-up): the CI node resolves its workspace root through qontinui_root_dir(); not yet triaged."
     },
     {
       "class": "repo_layout",

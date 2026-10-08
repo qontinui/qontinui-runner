@@ -36,8 +36,8 @@
 #        examples/demo-workflows/*.py (3)  src/demo_workflows.rs:14-17   NOT a test
 #        specs/pages                       src/spec_api/storage.rs:49    NOT a test
 #        docs/runner-config-layers.md      src/config_report.rs:1907     #[test]
-#        .qontinui/ci.toml                 src/ci_node/sibling.rs:1893   #[test]
-#        .github/sibling-pins.conf         src/ci_node/sibling.rs:1894   #[test]
+#        .qontinui/ci.toml                 src/ci_node/mod.rs:147        #[test]
+#        .github/sibling-pins.conf         src/ci_node/mod.rs:148        #[test]
 #        src/hooks/.../useControlEvents.ts src/mcp/ui_bridge/...:145     cfg(test) mod
 #
 #      `include_str!` of a missing path is a COMPILE error. The first two break

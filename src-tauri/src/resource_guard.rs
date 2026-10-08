@@ -1413,7 +1413,7 @@ pub(crate) struct ThreadCapacityInputs {
 /// the pre-scaling ceilings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScaledUnknown {
-    /// The core count could not be read. `ci_node::host_sizing::probe` reports
+    /// The core count could not be read. `qontinui_ci_exec::host_sizing::probe` reports
     /// an unreadable `available_parallelism` as `1`, indistinguishable from a
     /// genuine single core, so the live seam reads `1` as UNKNOWN — the result
     /// is identical either way (a 1-core capacity falls under the floor).
@@ -1978,17 +1978,17 @@ pub(crate) fn effective_session_floors(
 
 /// This host's cores and `MemTotal`, probed ONCE per process.
 ///
-/// `ci_node::host_sizing::probe` is the shipped capability probe (plan
+/// `qontinui_ci_exec::host_sizing::probe` is the shipped capability probe (plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-
 /// spawns-are-ungated`'s `fleet::machine_capability` is the preferred input
 /// once it lands; reusing a shipped probe rather than writing a third is the
 /// point). It does a blocking sysinfo refresh, and [`effective_thread_ceilings`]
 /// runs on every spawn, so it is cached in a `OnceLock` — neither quantity
 /// changes under a live process in any way this guard should chase.
-fn host_capacity() -> crate::ci_node::host_sizing::HostCapacity {
-    static HOST: std::sync::OnceLock<crate::ci_node::host_sizing::HostCapacity> =
+fn host_capacity() -> qontinui_ci_exec::host_sizing::HostCapacity {
+    static HOST: std::sync::OnceLock<qontinui_ci_exec::host_sizing::HostCapacity> =
         std::sync::OnceLock::new();
-    *HOST.get_or_init(crate::ci_node::host_sizing::probe)
+    *HOST.get_or_init(qontinui_ci_exec::host_sizing::probe)
 }
 
 /// The machine inputs for [`merge_thread_ceilings`], read live. IMPURE — the

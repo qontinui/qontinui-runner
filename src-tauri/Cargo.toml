@@ -150,14 +150,13 @@ qontinui-runner-win32 = { path = "../crates/runner-win32" }
 qontinui-types = { path = "../../qontinui-schemas/rust" }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph" }
 qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core" }
+qontinui-ci-exec = { path = "../../qontinui-schemas/ci-exec" }
 socket2 = "0.6"
 cron = "0.15"
 chrono-tz = "0.10"
 once_cell = "1.19"
-flate2 = "1.0"
-# CI-node toolchain provisioning (`ci_node::tools`): prebuilt tool archives are
-# `.tar.gz` on linux/macOS and `.zip` on Windows, so `tar` pairs with the
-# existing `flate2` and `zip` rather than adding a third archive stack.
+# The agent-worktree sibling store reads `git archive` tarballs
+# (`agent_worktree::sibling_store`).
 tar = "0.4"
 # Section 4 (UI Bridge redesign) — embed `<runner>/specs/pages/` into the
 # release binary at compile time. Production runners served outside the repo

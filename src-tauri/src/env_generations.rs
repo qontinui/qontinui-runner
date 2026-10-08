@@ -201,7 +201,7 @@ pub enum UrlUserinfo {
 /// `postgresql://qontinui:hunter2@localhost:5432/qontinui` short-circuits to
 /// `false` there — while `QONTINUI_DATABASE_URL` matches
 /// [`HIGHLIGHT_PREFIXES`] and would be printed verbatim into the side-by-side
-/// table. `ci_node::services` already documents that `DATABASE_URL` "embeds
+/// table. `qontinui_ci_exec::services` already documents that `DATABASE_URL` "embeds
 /// the password".
 ///
 /// # Why EVERY `://` is scanned, and why the scheme is walked BACKWARDS
@@ -304,8 +304,8 @@ pub enum UrlUserinfo {
 /// | `https://u:pw@münchen.example.com/x` | a non-ASCII (IDN) host |
 ///
 /// This module CONSTRUCTS `redis://` URLs and exports `REDIS_URL` itself
-/// (`bin/qontinui_profile.rs`, `ci_node::services`, `ci_node::executor`, and
-/// `ci_node::manifest` names `REDIS_URL` alongside `DATABASE_URL` as a
+/// (`bin/qontinui_profile.rs`, `qontinui_ci_exec::services`, `qontinui_ci_exec::executor`, and
+/// `qontinui_ci_exec::manifest` names `REDIS_URL` alongside `DATABASE_URL` as a
 /// credential-bearing family), so the empty-username row is not a curiosity —
 /// it is the shape the report is most likely to meet.
 ///
@@ -2280,7 +2280,7 @@ mod tests {
             // The `user.is_empty()` reject printed all four of these. The first
             // is the canonical pre-ACL Redis form, and this crate CONSTRUCTS
             // `redis://` URLs and exports `REDIS_URL` itself
-            // (`ci_node::services`, `ci_node::executor`, `bin/qontinui_profile`).
+            // (`qontinui_ci_exec::services`, `qontinui_ci_exec::executor`, `bin/qontinui_profile`).
             (
                 "leak/empty-user-redis",
                 "redis://:s3cretpw@127.0.0.1:6379/0",
