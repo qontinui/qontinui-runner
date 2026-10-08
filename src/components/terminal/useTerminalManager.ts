@@ -1395,6 +1395,13 @@ export function useTerminalManager(
       workingDir?: string,
       tenantId?: string,
       spawnSource?: ResourceGuardSource,
+      // Pin the PTY to this Claude account instead of the spawn-time picker's
+      // (`terminal_create` `claudeConfigDir`). The boot restore passes the
+      // account its session's transcript lives under (auto-resume panes
+      // only); every other caller omits it and the picker decides, as before.
+      // The pin lasts the pane's life: a fresh `claude` typed there after the
+      // resumed session ends also runs on that account.
+      claudeConfigDir?: string,
     ): Promise<string | null> => {
       try {
         const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
@@ -1431,6 +1438,7 @@ export function useTerminalManager(
               // pane in another window. "main" → omitted (legacy/back-compat key).
               windowLabel: windowLabel !== "main" ? windowLabel : null,
               resourceOverride,
+              claudeConfigDir: claudeConfigDir ?? null,
             }),
           spawnSource ?? { label: "new terminal" },
         );
