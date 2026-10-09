@@ -92,9 +92,9 @@ async function boundaryMessages(code: string, filePath: string): Promise<string[
 
 describe("output-text boundary (eslint.config.js)", () => {
   for (const filePath of BOUNDARY_FILES) {
-    for (const [specifier, code] of Object.entries(FORBIDDEN_IMPORTS)) {
+    for (const [specifier, importSource] of Object.entries(FORBIDDEN_IMPORTS)) {
       it(`refuses ${specifier} in ${filePath}`, async () => {
-        const msgs = await boundaryMessages(code, filePath);
+        const msgs = await boundaryMessages(importSource, filePath);
         expect(msgs).toHaveLength(1);
       }, 60_000);
     }
