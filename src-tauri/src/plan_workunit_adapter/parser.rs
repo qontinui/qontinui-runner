@@ -651,20 +651,15 @@ fn bold_span(s: &str) -> String {
 /// deliberately this narrow: a non-bare span is left to [`heading_rank`],
 /// whose sentence/title split already exists, and every other arm is
 /// untouched.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
 fn bold_phase_opens_a_sentence(rest: &str) -> bool {
     static BARE_PHASE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^Phase\s+[0-9]+[A-Za-z]?$").expect("valid regex"));
-    let Some(close) = rest.find("**") else {
+    let Some((span, after)) = rest.split_once("**") else {
         return false;
     };
-    if !BARE_PHASE.is_match(rest[..close].trim()) {
+    if !BARE_PHASE.is_match(span.trim()) {
         return false;
     }
-    let after = &rest[close + 2..];
     if after.starts_with([',', '.', ';']) {
         return true;
     }
