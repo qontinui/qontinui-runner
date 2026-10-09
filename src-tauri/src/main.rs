@@ -4321,10 +4321,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             )
                         {
                             if let Some(t) = tailer_for_finish.clone() {
+                                // Un-throttled and retrying, on its own detached
+                                // task: the finish is owed NOW, and the schedule
+                                // must outlive any tail that ends meanwhile.
+                                // `spawn_owed_finish_bind` needs a tokio context.
                                 let rec = rec.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    session::transcript_autobind::bind_lifecycle_record(&t, &rec)
-                                        .await;
+                                    session::transcript_autobind::spawn_owed_finish_bind(&t, &rec);
                                 });
                             }
                         }
