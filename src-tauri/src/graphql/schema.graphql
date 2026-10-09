@@ -77,6 +77,78 @@ type GenericRunnerEvent {
 }
 
 """
+The wire discriminant of a bounded read's bound — GraphQL mirror of
+`qontinui_types::page::BoundKind`.
+"""
+enum GqlBoundKind {
+	"""
+	A count ran; `total` is a number.
+	"""
+	EXACT
+	"""
+	A probe fired; more rows exist, `total` is null.
+	"""
+	AT_LEAST
+	"""
+	The page holds everything from its start position.
+	"""
+	COMPLETE
+	"""
+	Did not resolve; `truncated` and `total` are null.
+	"""
+	UNKNOWN
+}
+
+"""
+The shared bounded-read envelope (plan
+`2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus` §3
+Layer 2) — GraphQL mirror of `qontinui_types::page::BoundedReadMeta`, key
+for key. GraphQL cannot flatten, so a bounded query nests it as `page`.
+"""
+type GqlBoundedReadMeta {
+	"""
+	Items in this page (the legacy spelling of `shown`).
+	"""
+	count: Int!
+	"""
+	The cap actually applied to this page.
+	"""
+	limit: Int!
+	"""
+	Items in this page.
+	"""
+	shown: Int!
+	"""
+	The exact count from this page's start position, when one ran.
+	"""
+	total: Int
+	"""
+	Whether more exists beyond this page; null when unknown.
+	"""
+	truncated: Boolean
+	"""
+	Which kind of bound produced `total` / `truncated`.
+	"""
+	boundKind: GqlBoundKind!
+	"""
+	The opaque token for the next page — pass it back verbatim as `cursor`.
+	"""
+	nextCursor: String
+	"""
+	False only when the store is unprovisioned.
+	"""
+	available: Boolean!
+	"""
+	A filter narrowed before the read ran, or null.
+	"""
+	filterNarrowed: GqlFilterNarrowing
+	"""
+	For a ranked read that cannot page: the door that walks the corpus.
+	"""
+	enumerateVia: String
+}
+
+"""
 Budget warning when consumption exceeds a threshold.
 """
 type GqlBudgetWarningEvent {
@@ -171,6 +243,25 @@ type GqlErrorSummary {
 	criticalCount: Int!
 	errorCount: Int!
 	warningCount: Int!
+}
+
+"""
+A filter the surface narrowed before the read ran — GraphQL mirror of
+`qontinui_types::page::FilterNarrowing`.
+"""
+type GqlFilterNarrowing {
+	"""
+	The query parameter that was narrowed.
+	"""
+	parameter: String!
+	"""
+	How many of its values the read applied.
+	"""
+	applied: Int!
+	"""
+	The cap that dropped the rest.
+	"""
+	cap: Int!
 }
 
 """
@@ -369,7 +460,8 @@ type GqlTaskRun {
 }
 
 """
-Paginated task run output.
+One byte-cursor page of a task run's output (see
+`graphql::output_page`).
 """
 type GqlTaskRunOutput {
 	"""
@@ -377,21 +469,19 @@ type GqlTaskRunOutput {
 	"""
 	taskRunId: String!
 	"""
-	Output text (may be truncated by offset/limit).
+	This page's text: at most `page.limit` bytes, never splitting a
+	character.
 	"""
 	content: String!
 	"""
-	Total length of the full output in characters.
+	Length of the WHOLE output in bytes, whatever page this is.
 	"""
 	totalLength: Int!
 	"""
-	Character offset of this content within the full output.
+	The bounded-read envelope: pass `page.nextCursor` back as `cursor` for
+	the following page; `null` means this page reaches the end.
 	"""
-	offset: Int!
-	"""
-	Whether there is more content after this chunk.
-	"""
-	hasMore: Boolean!
+	page: GqlBoundedReadMeta!
 }
 
 """
@@ -650,10 +740,14 @@ type QueryRoot {
 	"""
 	taskRun(id: String!): GqlTaskRun
 	"""
-	Get task run output with optional offset/limit for pagination.
-	Defaults to last 10000 characters (tail) if no offset specified.
+	One page of a task run's output, walked from the start by an opaque
+	byte cursor: omit `cursor` for the first page and pass the previous
+	response's `page.nextCursor` for the next. `limit` is in bytes,
+	clamped to `1..=1048576`; a page never splits a character. A cursor
+	that this read did not mint for this run is refused with extension
+	`code: "cursor_malformed"`, `parameter: "cursor"`.
 	"""
-	taskRunOutput(id: String!, offset: Int! = 0, limit: Int! = 10000): GqlTaskRunOutput!
+	taskRunOutput(id: String!, cursor: String, limit: Int! = 10000): GqlTaskRunOutput!
 	"""
 	List only currently running task runs.
 	"""

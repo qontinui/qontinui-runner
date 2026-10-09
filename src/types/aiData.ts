@@ -19,6 +19,54 @@ export interface AiDataResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
+  /**
+   * Stable machine code for a refusal the caller can act on — e.g.
+   * `cursor_malformed`: restart the walk without `cursor`.
+   */
+  error_code?: string;
+}
+
+// =============================================================================
+// Bounded-read envelope
+// =============================================================================
+
+/** Matches `qontinui_types::page::BoundKind`. */
+export type BoundKind = "exact" | "at_least" | "complete" | "unknown";
+
+/** Matches `qontinui_types::page::FilterNarrowing`. */
+export interface FilterNarrowing {
+  parameter: string;
+  applied: number;
+  cap: number;
+}
+
+/**
+ * The shared bounded-read envelope keys, flattened beside a paged result's
+ * collection key. Matches `qontinui_types::page::BoundedReadMeta` — the
+ * generated binding lives in qontinui-schemas `ts/src/generated/BoundedReadMeta.d.ts`,
+ * which the `@qontinui/shared-types` release this app pins predates. Every key
+ * is always present; `null` is a value (`total: null` = no count ran,
+ * `truncated: null` = unknown, `next_cursor: null` = no next page).
+ */
+export interface BoundedReadMeta {
+  /** Rows in this page (the legacy spelling of `shown`). */
+  count: number;
+  /** The cap actually applied to this page. */
+  limit: number;
+  /** Rows in this page. */
+  shown: number;
+  /** Exact match count from this page's start position, when `bound_kind` is `exact`. */
+  total: number | null;
+  /** Whether matching rows exist beyond this page; `null` when unknown. */
+  truncated: boolean | null;
+  bound_kind: BoundKind;
+  /** Opaque token for the next page — pass it back verbatim as `cursor`. */
+  next_cursor: string | null;
+  /** `false` ONLY when the store is unprovisioned. */
+  available: boolean;
+  filter_narrowed: FilterNarrowing | null;
+  /** For a ranked read that cannot page: the door that walks the corpus. */
+  enumerate_via: string | null;
 }
 
 // =============================================================================
@@ -636,15 +684,16 @@ export interface TaskRunPlaywrightResultDb {
 }
 
 /**
- * Result of querying Playwright results from SQLite.
+ * One keyset page of a run's Playwright results.
+ * Matches TaskRunPlaywrightResultsResult from ai_data.rs.
  */
-export interface TaskRunPlaywrightResultsDbResult {
+export interface TaskRunPlaywrightResultsDbResult extends BoundedReadMeta {
   task_run_id: string;
   results: TaskRunPlaywrightResultDb[];
-  count: number;
+  /** Passed from this page's start position onward — the whole run on the first page. */
   passed: number;
+  /** Failed from this page's start position onward. */
   failed: number;
-  has_more?: boolean;
 }
 
 /**
@@ -696,16 +745,16 @@ export interface TaskRunApiRequestDb {
 }
 
 /**
- * Result of querying API requests from SQLite.
+ * One keyset page of a run's API requests.
+ * Matches TaskRunApiRequestsResult from ai_data.rs.
  */
-export interface TaskRunApiRequestsDbResult {
+export interface TaskRunApiRequestsDbResult extends BoundedReadMeta {
   task_run_id: string;
   requests: TaskRunApiRequestDb[];
-  count: number;
-  total_count?: number;
+  /** Succeeded from this page's start position onward — the whole run on the first page. */
   success_count: number;
+  /** Failed from this page's start position onward. */
   failed_count: number;
-  has_more?: boolean;
 }
 
 // =============================================================================
@@ -740,16 +789,16 @@ export interface TaskRunAwasStepDb {
 }
 
 /**
- * Result of querying AWAS steps from SQLite.
+ * One keyset page of a run's AWAS steps.
+ * Matches TaskRunAwasStepsResult from ai_data.rs.
  */
-export interface TaskRunAwasStepsDbResult {
+export interface TaskRunAwasStepsDbResult extends BoundedReadMeta {
   task_run_id: string;
   steps: TaskRunAwasStepDb[];
-  count: number;
-  total_count?: number;
+  /** Succeeded from this page's start position onward — the whole run on the first page. */
   success_count: number;
+  /** Failed from this page's start position onward. */
   failed_count: number;
-  has_more?: boolean;
 }
 
 // =============================================================================

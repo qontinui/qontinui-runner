@@ -762,19 +762,107 @@ pub struct GqlQueueStatus {
 // Input Types
 // ==========================================================================
 
-/// Paginated task run output.
+/// One byte-cursor page of a task run's output (see
+/// `graphql::output_page`).
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlTaskRunOutput {
     /// The task run ID.
     pub task_run_id: String,
-    /// Output text (may be truncated by offset/limit).
+    /// This page's text: at most `page.limit` bytes, never splitting a
+    /// character.
     pub content: String,
-    /// Total length of the full output in characters.
-    pub total_length: i32,
-    /// Character offset of this content within the full output.
-    pub offset: i32,
-    /// Whether there is more content after this chunk.
-    pub has_more: bool,
+    /// Length of the WHOLE output in bytes, whatever page this is.
+    pub total_length: i64,
+    /// The bounded-read envelope: pass `page.nextCursor` back as `cursor` for
+    /// the following page; `null` means this page reaches the end.
+    pub page: GqlBoundedReadMeta,
+}
+
+/// The wire discriminant of a bounded read's bound — GraphQL mirror of
+/// `qontinui_types::page::BoundKind`.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlBoundKind {
+    /// A count ran; `total` is a number.
+    Exact,
+    /// A probe fired; more rows exist, `total` is null.
+    AtLeast,
+    /// The page holds everything from its start position.
+    Complete,
+    /// Did not resolve; `truncated` and `total` are null.
+    Unknown,
+}
+
+impl From<qontinui_types::page::BoundKind> for GqlBoundKind {
+    fn from(kind: qontinui_types::page::BoundKind) -> Self {
+        use qontinui_types::page::BoundKind;
+        match kind {
+            BoundKind::Exact => GqlBoundKind::Exact,
+            BoundKind::AtLeast => GqlBoundKind::AtLeast,
+            BoundKind::Complete => GqlBoundKind::Complete,
+            BoundKind::Unknown => GqlBoundKind::Unknown,
+        }
+    }
+}
+
+/// A filter the surface narrowed before the read ran — GraphQL mirror of
+/// `qontinui_types::page::FilterNarrowing`.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlFilterNarrowing {
+    /// The query parameter that was narrowed.
+    pub parameter: String,
+    /// How many of its values the read applied.
+    pub applied: i64,
+    /// The cap that dropped the rest.
+    pub cap: i64,
+}
+
+/// The shared bounded-read envelope (plan
+/// `2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus` §3
+/// Layer 2) — GraphQL mirror of `qontinui_types::page::BoundedReadMeta`, key
+/// for key. GraphQL cannot flatten, so a bounded query nests it as `page`.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlBoundedReadMeta {
+    /// Items in this page (the legacy spelling of `shown`).
+    pub count: i64,
+    /// The cap actually applied to this page.
+    pub limit: i64,
+    /// Items in this page.
+    pub shown: i64,
+    /// The exact count from this page's start position, when one ran.
+    pub total: Option<i64>,
+    /// Whether more exists beyond this page; null when unknown.
+    pub truncated: Option<bool>,
+    /// Which kind of bound produced `total` / `truncated`.
+    pub bound_kind: GqlBoundKind,
+    /// The opaque token for the next page — pass it back verbatim as `cursor`.
+    pub next_cursor: Option<String>,
+    /// False only when the store is unprovisioned.
+    pub available: bool,
+    /// A filter narrowed before the read ran, or null.
+    pub filter_narrowed: Option<GqlFilterNarrowing>,
+    /// For a ranked read that cannot page: the door that walks the corpus.
+    pub enumerate_via: Option<String>,
+}
+
+impl From<qontinui_types::page::BoundedReadMeta> for GqlBoundedReadMeta {
+    fn from(meta: qontinui_types::page::BoundedReadMeta) -> Self {
+        GqlBoundedReadMeta {
+            count: meta.count,
+            limit: meta.limit,
+            shown: meta.shown,
+            total: meta.total,
+            truncated: meta.truncated,
+            bound_kind: meta.bound_kind.into(),
+            next_cursor: meta.next_cursor,
+            available: meta.available,
+            filter_narrowed: meta.filter_narrowed.map(|n| GqlFilterNarrowing {
+                parameter: n.parameter,
+                applied: n.applied,
+                cap: n.cap,
+            }),
+            enumerate_via: meta.enumerate_via,
+        }
+    }
 }
 
 /// Input for creating a new task run.
