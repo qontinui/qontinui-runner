@@ -1148,7 +1148,8 @@ function ZoneGridInner({
                 }
               }}
               onRestart={
-                onRestartInZone
+                // No restart for a remote tab (`remoteParity.ts`, row `restart`).
+                cmTab?.remote == null
                   ? () => onRestartInZone(gridState.contextMenu!.zoneIndex)
                   : undefined
               }
@@ -1657,7 +1658,9 @@ function ZoneCellInner({
               onSetZoneLabel={
                 onSetZoneLabel ? (label) => onSetZoneLabel(zoneIdx, label) : undefined
               }
-              onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
+              onRestart={
+                onRestartInZone && tab.remote == null ? () => onRestartInZone(zoneIdx) : undefined
+              }
               groupColor={zoneLabels?.[zoneIdx] ? labelColorMap?.[zoneLabels[zoneIdx]] : undefined}
               uptime={formatUptime(tab.createdAt)}
               lastCommand={commandHistories?.[tab.id]?.slice(-1)[0]?.command}
@@ -1822,7 +1825,9 @@ function ZoneCellInner({
               }}
               lastLines={lastLines}
               state={state}
-              onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
+              onRestart={
+                onRestartInZone && tab.remote == null ? () => onRestartInZone(zoneIdx) : undefined
+              }
               onExportZone={onExportZone ? (fmt) => onExportZone(zoneIdx, fmt) : undefined}
             />
           )}

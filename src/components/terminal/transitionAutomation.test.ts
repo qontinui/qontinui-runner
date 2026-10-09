@@ -89,6 +89,14 @@ describe("isRestartable", () => {
   it("refuses a missing tab", () => {
     expect(isRestartable(undefined)).toBe(false);
   });
+
+  it("refuses a remote tab, even after a clean (exit 0) remote exit", () => {
+    // RemotePaneIo::wait returns the target's exit code, and the ended tab
+    // stays in its zone. A restart would put a LOCAL shell where it was.
+    const remote = { deviceId: "d", deviceLabel: "box", sessionId: "s", remoteTerminalId: "t" };
+    expect(isRestartable(TAB("a", { exitCode: 0, remote }))).toBe(false);
+    expect(isRestartable(TAB("a", { exitCode: null, remote }))).toBe(false);
+  });
 });
 
 describe("evaluateTransitions — purity", () => {
@@ -298,6 +306,15 @@ describe("evaluateTransitions — auto-restart", () => {
       input({ ...completed, tabs: [TAB("a", { exitCode: 0 })], autoRestart: true }),
     );
     expect(out.restarts).toEqual([{ zoneIdx: 2, tabId: "a", title: "title-a" }]);
+  });
+
+  it("never auto-restarts a remote tab", () => {
+    const remote = { deviceId: "d", deviceLabel: "box", sessionId: "s", remoteTerminalId: "t" };
+    const out = evaluateTransitions(
+      input({ ...completed, tabs: [TAB("a", { exitCode: 0, remote })], autoRestart: true }),
+    );
+    expect(out.restarts).toEqual([]);
+    expect(out.newCompleted).toEqual(["a"]);
   });
 
   it("does nothing when auto-restart is disarmed", () => {
