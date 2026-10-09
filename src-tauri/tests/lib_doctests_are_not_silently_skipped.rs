@@ -291,7 +291,8 @@ fn mod_keywords(code_line: &str) -> Vec<usize> {
     let mut start = 0;
     while let Some(pos) = code_line[start..].find("mod") {
         let at = start + pos;
-        let before_ok = at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        let before_ok =
+            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
         let after = at + 3;
         let after_ok = after < bytes.len() && (bytes[after] as char).is_whitespace();
         if before_ok && after_ok {
@@ -310,7 +311,9 @@ fn walk(sweep: &mut Sweep, file: &Path, is_crate_root: bool) {
     let src = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
-            sweep.problems.push(format!("{}: unreadable: {e}", file.display()));
+            sweep
+                .problems
+                .push(format!("{}: unreadable: {e}", file.display()));
             return;
         }
     };
@@ -344,7 +347,10 @@ fn walk(sweep: &mut Sweep, file: &Path, is_crate_root: bool) {
         let trimmed_code = code_line.trim_start();
 
         if trimmed_code.starts_with("#[") || trimmed_code.starts_with("#![") {
-            let compact: String = trimmed_code.chars().filter(|c| !c.is_whitespace()).collect();
+            let compact: String = trimmed_code
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             if compact.starts_with("#[path=") {
                 // The string contents were blanked in `code`; read them raw.
                 if let (Some(a), Some(b)) = (raw.find('"'), raw.rfind('"')) {
@@ -375,9 +381,7 @@ fn walk(sweep: &mut Sweep, file: &Path, is_crate_root: bool) {
                 continue;
             };
             let tail = code_line[after..].trim_start();
-            let base = inline
-                .iter()
-                .fold(own_dir.clone(), |d, (n, _)| d.join(n));
+            let base = inline.iter().fold(own_dir.clone(), |d, (n, _)| d.join(n));
             if tail.starts_with(';') {
                 let target = match pending_path.take() {
                     Some(p) if inline.is_empty() => dir.join(p),
@@ -429,7 +433,10 @@ fn walk(sweep: &mut Sweep, file: &Path, is_crate_root: bool) {
                 _ => {}
             }
         }
-        if !trimmed_code.is_empty() && !trimmed_code.starts_with("#[") && !trimmed_code.starts_with("#![") {
+        if !trimmed_code.is_empty()
+            && !trimmed_code.starts_with("#[")
+            && !trimmed_code.starts_with("#![")
+        {
             pending_path = None;
         }
     }
@@ -477,7 +484,9 @@ fn classify(info: &str) -> (bool, bool) {
     let seen_rust = words.iter().any(|w| is_rustdoc_word(w));
     let seen_other = words.iter().any(|w| !is_rustdoc_word(w));
     let is_rust = !seen_other || seen_rust;
-    let ignored = words.iter().any(|w| *w == "ignore" || w.starts_with("ignore-"));
+    let ignored = words
+        .iter()
+        .any(|w| *w == "ignore" || w.starts_with("ignore-"));
     (is_rust, ignored)
 }
 
@@ -678,7 +687,11 @@ fn record(sweep: &mut Sweep, file: &Path, line: usize, info: &str) {
 fn sweep_lib() -> Sweep {
     let mut sweep = Sweep::default();
     let root = src_dir().join("lib.rs");
-    assert!(root.exists(), "lib crate root not found at {}", root.display());
+    assert!(
+        root.exists(),
+        "lib crate root not found at {}",
+        root.display()
+    );
     walk(&mut sweep, &root, true);
     sweep
 }
@@ -733,9 +746,10 @@ fn the_lib_has_no_doctest_that_ci_would_silently_skip() {
 #[test]
 fn the_sweep_finds_the_one_ignored_doctest_ci_last_reported() {
     let sweep = sweep_lib();
-    let found = sweep.ignored_doctests.iter().any(|(f, _, _)| {
-        f.ends_with(Path::new("accessibility").join("query").join("mod.rs"))
-    });
+    let found = sweep
+        .ignored_doctests
+        .iter()
+        .any(|(f, _, _)| f.ends_with(Path::new("accessibility").join("query").join("mod.rs")));
     assert!(
         found,
         "expected the ignored `QueryBuilder` doctest in src/accessibility/query/mod.rs; the sweep found ignored doctests at: {:?}",
@@ -772,7 +786,10 @@ fn a_backtick_run_with_a_backtick_in_its_info_is_not_a_fence() {
     assert!(fence("```rust").is_some());
     assert!(fence("~~~").is_some());
     assert!(fence("``` ```x` ```` is inline code").is_none());
-    assert!(fence("    ```").is_none(), "four spaces is an indented code block, not a fence");
+    assert!(
+        fence("    ```").is_none(),
+        "four spaces is an indented code block, not a fence"
+    );
     assert!(fence("``").is_none());
 }
 
@@ -781,11 +798,28 @@ fn the_lexer_does_not_read_structure_out_of_literals_or_comments() {
     let src = "const Q: char = '\\'';
 const A: &str = \"mod fake;\";\nconst B: &str = r#\"{ mod x; \"#;\n/* mod y; { */\nlet c = '{';\nfn f<'a>(x: &'a str) {}\n/// ```\n/// let x = 1;\n/// ```\n";
     let lexed = lex(src);
-    assert!(!lexed.code.contains("fake"), "string contents must be blanked");
-    assert!(!lexed.code.contains("mod x"), "raw string contents must be blanked");
-    assert!(!lexed.code.contains("mod y"), "block comment contents must be blanked");
-    assert_eq!(brace_delta(&lexed.code), 0, "only the fn body's balanced braces are code");
-    assert_eq!(lexed.code.lines().count(), src.lines().count(), "line numbers must survive");
+    assert!(
+        !lexed.code.contains("fake"),
+        "string contents must be blanked"
+    );
+    assert!(
+        !lexed.code.contains("mod x"),
+        "raw string contents must be blanked"
+    );
+    assert!(
+        !lexed.code.contains("mod y"),
+        "block comment contents must be blanked"
+    );
+    assert_eq!(
+        brace_delta(&lexed.code),
+        0,
+        "only the fn body's balanced braces are code"
+    );
+    assert_eq!(
+        lexed.code.lines().count(),
+        src.lines().count(),
+        "line numbers must survive"
+    );
     assert_eq!(lexed.line_comments.len(), 3);
     assert_eq!(lexed.line_comments[0].line, 7);
 }
@@ -841,7 +875,11 @@ fn doc_code_forms_the_sweep_cannot_classify_are_refused_not_skipped() {
         let lexed = lex(src);
         let mut sweep = Sweep::default();
         scan_doc_fences(&mut sweep, Path::new("x.rs"), &lexed.line_comments);
-        assert!(sweep.problems.is_empty(), "refused prose {src:?}: {:?}", sweep.problems);
+        assert!(
+            sweep.problems.is_empty(),
+            "refused prose {src:?}: {:?}",
+            sweep.problems
+        );
     }
 }
 
@@ -854,5 +892,8 @@ fn a_mod_form_the_walk_cannot_read_is_refused_not_skipped() {
     let mut sweep = Sweep::default();
     walk(&mut sweep, &root, true);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(!sweep.problems.is_empty(), "a `mod x` with its brace on the next line must be refused");
+    assert!(
+        !sweep.problems.is_empty(),
+        "a `mod x` with its brace on the next line must be refused"
+    );
 }

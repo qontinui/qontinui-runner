@@ -641,7 +641,10 @@ fn no_step_after_the_build_half_invokes_cargo_again() {
         }
         let body = command_lines(step, &label);
         for caps in CARGO_INVOCATION.captures_iter(&body) {
-            offenders.push(format!("`{label}`: `{}`", caps.get(0).unwrap().as_str().trim()));
+            offenders.push(format!(
+                "`{label}`: `{}`",
+                caps.get(0).unwrap().as_str().trim()
+            ));
         }
     }
     assert!(
