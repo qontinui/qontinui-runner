@@ -109,17 +109,21 @@ FROM task_run_playwright_results
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
---! get_task_run_playwright_results_limited
+--! get_task_run_playwright_results_page
 SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status,
        COALESCE(duration_ms, 0) as duration_ms,
        COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr,
        COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot,
        COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path,
-       assertions_passed, assertions_failed, created_at
+       assertions_passed, assertions_failed, created_at,
+       COUNT(*) OVER () as total_from_start,
+       COUNT(*) FILTER (WHERE status = 'passed') OVER () as passed_from_start,
+       COUNT(*) FILTER (WHERE status = 'failed') OVER () as failed_from_start
 FROM task_run_playwright_results
 WHERE task_run_id = :task_run_id
-ORDER BY created_at ASC
-LIMIT :max_results OFFSET :skip_results;
+  AND (created_at, id) > (:after_created_at, :after_id)
+ORDER BY created_at ASC, id ASC
+LIMIT :max_results;
 
 --! create_task_run_api_request (step_name?, request_headers?, request_body?, status_text?, response_headers?, response_body?, response_size_bytes?, extractions?, assertions?, error_message?)
 INSERT INTO task_run_api_requests
@@ -148,7 +152,7 @@ FROM task_run_api_requests
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
---! get_task_run_api_requests_limited
+--! get_task_run_api_requests_page
 SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name,
        method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers,
        COALESCE(request_body, '') as request_body,
@@ -157,11 +161,15 @@ SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name,
        response_body_type, COALESCE(response_body, '') as response_body,
        COALESCE(response_size_bytes, 0) as response_size_bytes,
        COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions,
-       success, COALESCE(error_message, '') as error_message, created_at
+       success, COALESCE(error_message, '') as error_message, created_at,
+       COUNT(*) OVER () as total_from_start,
+       COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start
 FROM task_run_api_requests
 WHERE task_run_id = :task_run_id
-ORDER BY created_at ASC
-LIMIT :max_results OFFSET :skip_results;
+  AND (NOT :filter_by_success OR success = :success)
+  AND (created_at, id) > (:after_created_at, :after_id)
+ORDER BY created_at ASC, id ASC
+LIMIT :max_results;
 
 --! create_task_run_awas_step (step_id?, step_name?, url?, action_id?, parameters?, response_data?, error_message?, duration_ms?)
 INSERT INTO task_run_awas_steps
@@ -181,12 +189,16 @@ FROM task_run_awas_steps
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
---! get_task_run_awas_steps_limited
+--! get_task_run_awas_steps_page
 SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type,
        COALESCE(url, '') as url, COALESCE(action_id, '') as action_id,
        COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data,
-       success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at
+       success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at,
+       COUNT(*) OVER () as total_from_start,
+       COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start
 FROM task_run_awas_steps
 WHERE task_run_id = :task_run_id
-ORDER BY created_at ASC
-LIMIT :max_results OFFSET :skip_results;
+  AND (NOT :filter_by_step_type OR step_type = :step_type)
+  AND (created_at, id) > (:after_created_at, :after_id)
+ORDER BY created_at ASC, id ASC
+LIMIT :max_results;

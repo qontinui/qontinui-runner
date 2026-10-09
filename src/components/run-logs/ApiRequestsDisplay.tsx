@@ -71,13 +71,18 @@ function getStatusCodeStyle(statusCode: number) {
 }
 
 export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
-  const [pageSize, setPageSize] = useState(PAGE_SIZE);
-  const { data: apiData, isLoading, error } = useTaskRunApiRequests(taskRunId, undefined, pageSize);
+  const {
+    data: apiData,
+    isLoading,
+    error,
+    fetchNextPage,
+    isFetchingNextPage,
+  } = useTaskRunApiRequests(taskRunId, undefined, PAGE_SIZE);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const loadMore = useCallback(() => {
-    setPageSize((prev) => prev + PAGE_SIZE);
-  }, []);
+    void fetchNextPage();
+  }, [fetchNextPage]);
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -109,7 +114,7 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
     );
   }
 
-  if (!apiData || apiData.requests.length === 0) {
+  if (!apiData || apiData.rows.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
         <Globe className="w-8 h-8 mb-3 opacity-50" />
@@ -130,7 +135,7 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}
         >
           <CheckCircle className="w-4 h-4" />
-          {apiData.success_count} successful
+          {apiData.first.success_count} successful
         </span>
         <span
           data-content-role="metric"
@@ -138,19 +143,19 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}
         >
           <XCircle className="w-4 h-4" />
-          {apiData.failed_count} failed
+          {apiData.first.failed_count} failed
         </span>
         <span
           data-content-role="metric"
           data-content-label="total API requests"
           className="text-xs text-muted-foreground ml-auto"
         >
-          {apiData.count} total requests
+          {apiData.first.total ?? apiData.rows.length} total requests
         </span>
       </div>
 
       <div className="space-y-2">
-        {apiData.requests.map((request: TaskRunApiRequestDb) => {
+        {apiData.rows.map((request: TaskRunApiRequestDb) => {
           const methodStyle = getMethodStyle(request.method);
           const statusStyle = getStatusCodeStyle(request.status_code);
           const isExpanded = expandedIds.has(request.id);
@@ -335,13 +340,14 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
             </div>
           );
         })}
-        {apiData.has_more && (
+        {apiData.hasMore && (
           <button
             onClick={loadMore}
+            disabled={isFetchingNextPage}
             className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
           >
             <ChevronDown className="w-3 h-3" />
-            Show more ({apiData.count - apiData.requests.length} remaining)
+            Show more ({apiData.remaining ?? "more"} remaining)
           </button>
         )}
       </div>

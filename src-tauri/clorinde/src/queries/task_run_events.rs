@@ -101,10 +101,11 @@ pub struct CreateTaskRunPlaywrightResultParams<
     pub assertions_failed: i32,
 }
 #[derive(Debug)]
-pub struct GetTaskRunPlaywrightResultsLimitedParams<T1: crate::StringSql> {
+pub struct GetTaskRunPlaywrightResultsPageParams<T1: crate::StringSql, T2: crate::StringSql> {
     pub task_run_id: T1,
+    pub after_created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub after_id: T2,
     pub max_results: i64,
-    pub skip_results: i64,
 }
 #[derive(Debug)]
 pub struct CreateTaskRunApiRequestParams<
@@ -147,10 +148,13 @@ pub struct CreateTaskRunApiRequestParams<
     pub error_message: Option<T16>,
 }
 #[derive(Debug)]
-pub struct GetTaskRunApiRequestsLimitedParams<T1: crate::StringSql> {
+pub struct GetTaskRunApiRequestsPageParams<T1: crate::StringSql, T2: crate::StringSql> {
     pub task_run_id: T1,
+    pub filter_by_success: bool,
+    pub success: bool,
+    pub after_created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub after_id: T2,
     pub max_results: i64,
-    pub skip_results: i64,
 }
 #[derive(Debug)]
 pub struct CreateTaskRunAwasStepParams<
@@ -179,10 +183,13 @@ pub struct CreateTaskRunAwasStepParams<
     pub duration_ms: Option<i64>,
 }
 #[derive(Debug)]
-pub struct GetTaskRunAwasStepsLimitedParams<T1: crate::StringSql> {
+pub struct GetTaskRunAwasStepsPageParams<T1: crate::StringSql, T2: crate::StringSql, T3: crate::StringSql> {
     pub task_run_id: T1,
+    pub filter_by_step_type: bool,
+    pub step_type: T2,
+    pub after_created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub after_id: T3,
     pub max_results: i64,
-    pub skip_results: i64,
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetTaskRunEventsAll {
@@ -617,7 +624,7 @@ for GetTaskRunPlaywrightResultsAll {
     }
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct GetTaskRunPlaywrightResultsLimited {
+pub struct GetTaskRunPlaywrightResultsPage {
     pub id: String,
     pub task_run_id: String,
     pub test_name: String,
@@ -633,8 +640,11 @@ pub struct GetTaskRunPlaywrightResultsLimited {
     pub assertions_passed: i32,
     pub assertions_failed: i32,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub total_from_start: i64,
+    pub passed_from_start: i64,
+    pub failed_from_start: i64,
 }
-pub struct GetTaskRunPlaywrightResultsLimitedBorrowed<'a> {
+pub struct GetTaskRunPlaywrightResultsPageBorrowed<'a> {
     pub id: &'a str,
     pub task_run_id: &'a str,
     pub test_name: &'a str,
@@ -650,11 +660,14 @@ pub struct GetTaskRunPlaywrightResultsLimitedBorrowed<'a> {
     pub assertions_passed: i32,
     pub assertions_failed: i32,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub total_from_start: i64,
+    pub passed_from_start: i64,
+    pub failed_from_start: i64,
 }
-impl<'a> From<GetTaskRunPlaywrightResultsLimitedBorrowed<'a>>
-for GetTaskRunPlaywrightResultsLimited {
+impl<'a> From<GetTaskRunPlaywrightResultsPageBorrowed<'a>>
+for GetTaskRunPlaywrightResultsPage {
     fn from(
-        GetTaskRunPlaywrightResultsLimitedBorrowed {
+        GetTaskRunPlaywrightResultsPageBorrowed {
             id,
             task_run_id,
             test_name,
@@ -670,7 +683,10 @@ for GetTaskRunPlaywrightResultsLimited {
             assertions_passed,
             assertions_failed,
             created_at,
-        }: GetTaskRunPlaywrightResultsLimitedBorrowed<'a>,
+            total_from_start,
+            passed_from_start,
+            failed_from_start,
+        }: GetTaskRunPlaywrightResultsPageBorrowed<'a>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -688,6 +704,9 @@ for GetTaskRunPlaywrightResultsLimited {
             assertions_passed,
             assertions_failed,
             created_at,
+            total_from_start,
+            passed_from_start,
+            failed_from_start,
         }
     }
 }
@@ -790,7 +809,7 @@ impl<'a> From<GetTaskRunApiRequestsAllBorrowed<'a>> for GetTaskRunApiRequestsAll
     }
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct GetTaskRunApiRequestsLimited {
+pub struct GetTaskRunApiRequestsPage {
     pub id: String,
     pub task_run_id: String,
     pub step_id: String,
@@ -812,8 +831,10 @@ pub struct GetTaskRunApiRequestsLimited {
     pub success: bool,
     pub error_message: String,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub total_from_start: i64,
+    pub succeeded_from_start: i64,
 }
-pub struct GetTaskRunApiRequestsLimitedBorrowed<'a> {
+pub struct GetTaskRunApiRequestsPageBorrowed<'a> {
     pub id: &'a str,
     pub task_run_id: &'a str,
     pub step_id: &'a str,
@@ -835,11 +856,13 @@ pub struct GetTaskRunApiRequestsLimitedBorrowed<'a> {
     pub success: bool,
     pub error_message: &'a str,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub total_from_start: i64,
+    pub succeeded_from_start: i64,
 }
-impl<'a> From<GetTaskRunApiRequestsLimitedBorrowed<'a>>
-for GetTaskRunApiRequestsLimited {
+impl<'a> From<GetTaskRunApiRequestsPageBorrowed<'a>>
+for GetTaskRunApiRequestsPage {
     fn from(
-        GetTaskRunApiRequestsLimitedBorrowed {
+        GetTaskRunApiRequestsPageBorrowed {
             id,
             task_run_id,
             step_id,
@@ -861,7 +884,9 @@ for GetTaskRunApiRequestsLimited {
             success,
             error_message,
             created_at,
-        }: GetTaskRunApiRequestsLimitedBorrowed<'a>,
+            total_from_start,
+            succeeded_from_start,
+        }: GetTaskRunApiRequestsPageBorrowed<'a>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -885,6 +910,8 @@ for GetTaskRunApiRequestsLimited {
             success,
             error_message: error_message.into(),
             created_at,
+            total_from_start,
+            succeeded_from_start,
         }
     }
 }
@@ -955,7 +982,7 @@ impl<'a> From<GetTaskRunAwasStepsBorrowed<'a>> for GetTaskRunAwasSteps {
     }
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct GetTaskRunAwasStepsLimited {
+pub struct GetTaskRunAwasStepsPage {
     pub id: String,
     pub task_run_id: String,
     pub step_id: String,
@@ -969,8 +996,10 @@ pub struct GetTaskRunAwasStepsLimited {
     pub error_message: String,
     pub duration_ms: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub total_from_start: i64,
+    pub succeeded_from_start: i64,
 }
-pub struct GetTaskRunAwasStepsLimitedBorrowed<'a> {
+pub struct GetTaskRunAwasStepsPageBorrowed<'a> {
     pub id: &'a str,
     pub task_run_id: &'a str,
     pub step_id: &'a str,
@@ -984,10 +1013,12 @@ pub struct GetTaskRunAwasStepsLimitedBorrowed<'a> {
     pub error_message: &'a str,
     pub duration_ms: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub total_from_start: i64,
+    pub succeeded_from_start: i64,
 }
-impl<'a> From<GetTaskRunAwasStepsLimitedBorrowed<'a>> for GetTaskRunAwasStepsLimited {
+impl<'a> From<GetTaskRunAwasStepsPageBorrowed<'a>> for GetTaskRunAwasStepsPage {
     fn from(
-        GetTaskRunAwasStepsLimitedBorrowed {
+        GetTaskRunAwasStepsPageBorrowed {
             id,
             task_run_id,
             step_id,
@@ -1001,7 +1032,9 @@ impl<'a> From<GetTaskRunAwasStepsLimitedBorrowed<'a>> for GetTaskRunAwasStepsLim
             error_message,
             duration_ms,
             created_at,
-        }: GetTaskRunAwasStepsLimitedBorrowed<'a>,
+            total_from_start,
+            succeeded_from_start,
+        }: GetTaskRunAwasStepsPageBorrowed<'a>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -1017,6 +1050,8 @@ impl<'a> From<GetTaskRunAwasStepsLimitedBorrowed<'a>> for GetTaskRunAwasStepsLim
             error_message: error_message.into(),
             duration_ms,
             created_at,
+            total_from_start,
+            succeeded_from_start,
         }
     }
 }
@@ -1750,7 +1785,7 @@ where
         Ok(mapped)
     }
 }
-pub struct GetTaskRunPlaywrightResultsLimitedQuery<
+pub struct GetTaskRunPlaywrightResultsPageQuery<
     'c,
     'a,
     's,
@@ -1764,8 +1799,8 @@ pub struct GetTaskRunPlaywrightResultsLimitedQuery<
     cached: Option<&'s tokio_postgres::Statement>,
     extractor: fn(
         &tokio_postgres::Row,
-    ) -> Result<GetTaskRunPlaywrightResultsLimitedBorrowed, tokio_postgres::Error>,
-    mapper: fn(GetTaskRunPlaywrightResultsLimitedBorrowed) -> T,
+    ) -> Result<GetTaskRunPlaywrightResultsPageBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunPlaywrightResultsPageBorrowed) -> T,
 }
 impl<
     'c,
@@ -1774,15 +1809,15 @@ impl<
     C,
     T: 'c,
     const N: usize,
-> GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C, T, N>
+> GetTaskRunPlaywrightResultsPageQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
     pub fn map<R>(
         self,
-        mapper: fn(GetTaskRunPlaywrightResultsLimitedBorrowed) -> R,
-    ) -> GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C, R, N> {
-        GetTaskRunPlaywrightResultsLimitedQuery {
+        mapper: fn(GetTaskRunPlaywrightResultsPageBorrowed) -> R,
+    ) -> GetTaskRunPlaywrightResultsPageQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunPlaywrightResultsPageQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -1942,7 +1977,7 @@ where
         Ok(mapped)
     }
 }
-pub struct GetTaskRunApiRequestsLimitedQuery<
+pub struct GetTaskRunApiRequestsPageQuery<
     'c,
     'a,
     's,
@@ -1956,8 +1991,8 @@ pub struct GetTaskRunApiRequestsLimitedQuery<
     cached: Option<&'s tokio_postgres::Statement>,
     extractor: fn(
         &tokio_postgres::Row,
-    ) -> Result<GetTaskRunApiRequestsLimitedBorrowed, tokio_postgres::Error>,
-    mapper: fn(GetTaskRunApiRequestsLimitedBorrowed) -> T,
+    ) -> Result<GetTaskRunApiRequestsPageBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunApiRequestsPageBorrowed) -> T,
 }
 impl<
     'c,
@@ -1966,15 +2001,15 @@ impl<
     C,
     T: 'c,
     const N: usize,
-> GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, T, N>
+> GetTaskRunApiRequestsPageQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
     pub fn map<R>(
         self,
-        mapper: fn(GetTaskRunApiRequestsLimitedBorrowed) -> R,
-    ) -> GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, R, N> {
-        GetTaskRunApiRequestsLimitedQuery {
+        mapper: fn(GetTaskRunApiRequestsPageBorrowed) -> R,
+    ) -> GetTaskRunApiRequestsPageQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunApiRequestsPageQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -2120,7 +2155,7 @@ where
         Ok(mapped)
     }
 }
-pub struct GetTaskRunAwasStepsLimitedQuery<
+pub struct GetTaskRunAwasStepsPageQuery<
     'c,
     'a,
     's,
@@ -2134,8 +2169,8 @@ pub struct GetTaskRunAwasStepsLimitedQuery<
     cached: Option<&'s tokio_postgres::Statement>,
     extractor: fn(
         &tokio_postgres::Row,
-    ) -> Result<GetTaskRunAwasStepsLimitedBorrowed, tokio_postgres::Error>,
-    mapper: fn(GetTaskRunAwasStepsLimitedBorrowed) -> T,
+    ) -> Result<GetTaskRunAwasStepsPageBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunAwasStepsPageBorrowed) -> T,
 }
 impl<
     'c,
@@ -2144,15 +2179,15 @@ impl<
     C,
     T: 'c,
     const N: usize,
-> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, T, N>
+> GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
     pub fn map<R>(
         self,
-        mapper: fn(GetTaskRunAwasStepsLimitedBorrowed) -> R,
-    ) -> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, R, N> {
-        GetTaskRunAwasStepsLimitedQuery {
+        mapper: fn(GetTaskRunAwasStepsPageBorrowed) -> R,
+    ) -> GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunAwasStepsPageQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -3107,17 +3142,17 @@ impl GetTaskRunPlaywrightResultsAllStmt {
         }
     }
 }
-pub struct GetTaskRunPlaywrightResultsLimitedStmt(
+pub struct GetTaskRunPlaywrightResultsPageStmt(
     &'static str,
     Option<tokio_postgres::Statement>,
 );
-pub fn get_task_run_playwright_results_limited() -> GetTaskRunPlaywrightResultsLimitedStmt {
-    GetTaskRunPlaywrightResultsLimitedStmt(
-        "SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status, COALESCE(duration_ms, 0) as duration_ms, COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr, COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot, COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path, assertions_passed, assertions_failed, created_at FROM task_run_playwright_results WHERE task_run_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+pub fn get_task_run_playwright_results_page() -> GetTaskRunPlaywrightResultsPageStmt {
+    GetTaskRunPlaywrightResultsPageStmt(
+        "SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status, COALESCE(duration_ms, 0) as duration_ms, COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr, COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot, COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path, assertions_passed, assertions_failed, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE status = 'passed') OVER () as passed_from_start, COUNT(*) FILTER (WHERE status = 'failed') OVER () as failed_from_start FROM task_run_playwright_results WHERE task_run_id = $1 AND (created_at, id) > ($2, $3) ORDER BY created_at ASC, id ASC LIMIT $4",
         None,
     )
 }
-impl GetTaskRunPlaywrightResultsLimitedStmt {
+impl GetTaskRunPlaywrightResultsPageStmt {
     pub async fn prepare<'a, C: GenericClient>(
         mut self,
         client: &'a C,
@@ -3125,32 +3160,40 @@ impl GetTaskRunPlaywrightResultsLimitedStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+    >(
         &'s self,
         client: &'c C,
         task_run_id: &'a T1,
+        after_created_at: &'a chrono::DateTime<chrono::FixedOffset>,
+        after_id: &'a T2,
         max_results: &'a i64,
-        skip_results: &'a i64,
-    ) -> GetTaskRunPlaywrightResultsLimitedQuery<
+    ) -> GetTaskRunPlaywrightResultsPageQuery<
         'c,
         'a,
         's,
         C,
-        GetTaskRunPlaywrightResultsLimited,
-        3,
+        GetTaskRunPlaywrightResultsPage,
+        4,
     > {
-        GetTaskRunPlaywrightResultsLimitedQuery {
+        GetTaskRunPlaywrightResultsPageQuery {
             client,
-            params: [task_run_id, max_results, skip_results],
+            params: [task_run_id, after_created_at, after_id, max_results],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |
                 row: &tokio_postgres::Row,
             | -> Result<
-                GetTaskRunPlaywrightResultsLimitedBorrowed,
+                GetTaskRunPlaywrightResultsPageBorrowed,
                 tokio_postgres::Error,
             > {
-                Ok(GetTaskRunPlaywrightResultsLimitedBorrowed {
+                Ok(GetTaskRunPlaywrightResultsPageBorrowed {
                     id: row.try_get(0)?,
                     task_run_id: row.try_get(1)?,
                     test_name: row.try_get(2)?,
@@ -3166,9 +3209,12 @@ impl GetTaskRunPlaywrightResultsLimitedStmt {
                     assertions_passed: row.try_get(12)?,
                     assertions_failed: row.try_get(13)?,
                     created_at: row.try_get(14)?,
+                    total_from_start: row.try_get(15)?,
+                    passed_from_start: row.try_get(16)?,
+                    failed_from_start: row.try_get(17)?,
                 })
             },
-            mapper: |it| GetTaskRunPlaywrightResultsLimited::from(it),
+            mapper: |it| GetTaskRunPlaywrightResultsPage::from(it),
         }
     }
 }
@@ -3178,34 +3224,35 @@ impl<
     's,
     C: GenericClient,
     T1: crate::StringSql,
+    T2: crate::StringSql,
 > crate::client::async_::Params<
     'c,
     'a,
     's,
-    GetTaskRunPlaywrightResultsLimitedParams<T1>,
-    GetTaskRunPlaywrightResultsLimitedQuery<
+    GetTaskRunPlaywrightResultsPageParams<T1, T2>,
+    GetTaskRunPlaywrightResultsPageQuery<
         'c,
         'a,
         's,
         C,
-        GetTaskRunPlaywrightResultsLimited,
-        3,
+        GetTaskRunPlaywrightResultsPage,
+        4,
     >,
     C,
-> for GetTaskRunPlaywrightResultsLimitedStmt {
+> for GetTaskRunPlaywrightResultsPageStmt {
     fn params(
         &'s self,
         client: &'c C,
-        params: &'a GetTaskRunPlaywrightResultsLimitedParams<T1>,
-    ) -> GetTaskRunPlaywrightResultsLimitedQuery<
+        params: &'a GetTaskRunPlaywrightResultsPageParams<T1, T2>,
+    ) -> GetTaskRunPlaywrightResultsPageQuery<
         'c,
         'a,
         's,
         C,
-        GetTaskRunPlaywrightResultsLimited,
-        3,
+        GetTaskRunPlaywrightResultsPage,
+        4,
     > {
-        self.bind(client, &params.task_run_id, &params.max_results, &params.skip_results)
+        self.bind(client, &params.task_run_id, &params.after_created_at, &params.after_id, &params.max_results)
     }
 }
 pub struct CreateTaskRunApiRequestStmt(&'static str, Option<tokio_postgres::Statement>);
@@ -3451,17 +3498,17 @@ impl GetTaskRunApiRequestsAllStmt {
         }
     }
 }
-pub struct GetTaskRunApiRequestsLimitedStmt(
+pub struct GetTaskRunApiRequestsPageStmt(
     &'static str,
     Option<tokio_postgres::Statement>,
 );
-pub fn get_task_run_api_requests_limited() -> GetTaskRunApiRequestsLimitedStmt {
-    GetTaskRunApiRequestsLimitedStmt(
-        "SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name, method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers, COALESCE(request_body, '') as request_body, status_code, COALESCE(status_text, '') as status_text, COALESCE(response_headers, '{}') as response_headers, response_time_ms, response_body_type, COALESCE(response_body, '') as response_body, COALESCE(response_size_bytes, 0) as response_size_bytes, COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions, success, COALESCE(error_message, '') as error_message, created_at FROM task_run_api_requests WHERE task_run_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+pub fn get_task_run_api_requests_page() -> GetTaskRunApiRequestsPageStmt {
+    GetTaskRunApiRequestsPageStmt(
+        "SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name, method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers, COALESCE(request_body, '') as request_body, status_code, COALESCE(status_text, '') as status_text, COALESCE(response_headers, '{}') as response_headers, response_time_ms, response_body_type, COALESCE(response_body, '') as response_body, COALESCE(response_size_bytes, 0) as response_size_bytes, COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions, success, COALESCE(error_message, '') as error_message, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start FROM task_run_api_requests WHERE task_run_id = $1 AND (NOT $2 OR success = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
         None,
     )
 }
-impl GetTaskRunApiRequestsLimitedStmt {
+impl GetTaskRunApiRequestsPageStmt {
     pub async fn prepare<'a, C: GenericClient>(
         mut self,
         client: &'a C,
@@ -3469,29 +3516,39 @@ impl GetTaskRunApiRequestsLimitedStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+    >(
         &'s self,
         client: &'c C,
         task_run_id: &'a T1,
+        filter_by_success: &'a bool,
+        success: &'a bool,
+        after_created_at: &'a chrono::DateTime<chrono::FixedOffset>,
+        after_id: &'a T2,
         max_results: &'a i64,
-        skip_results: &'a i64,
-    ) -> GetTaskRunApiRequestsLimitedQuery<
+    ) -> GetTaskRunApiRequestsPageQuery<
         'c,
         'a,
         's,
         C,
-        GetTaskRunApiRequestsLimited,
-        3,
+        GetTaskRunApiRequestsPage,
+        6,
     > {
-        GetTaskRunApiRequestsLimitedQuery {
+        GetTaskRunApiRequestsPageQuery {
             client,
-            params: [task_run_id, max_results, skip_results],
+            params: [task_run_id, filter_by_success, success, after_created_at, after_id, max_results],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |
                 row: &tokio_postgres::Row,
-            | -> Result<GetTaskRunApiRequestsLimitedBorrowed, tokio_postgres::Error> {
-                Ok(GetTaskRunApiRequestsLimitedBorrowed {
+            | -> Result<GetTaskRunApiRequestsPageBorrowed, tokio_postgres::Error> {
+                Ok(GetTaskRunApiRequestsPageBorrowed {
                     id: row.try_get(0)?,
                     task_run_id: row.try_get(1)?,
                     step_id: row.try_get(2)?,
@@ -3513,9 +3570,11 @@ impl GetTaskRunApiRequestsLimitedStmt {
                     success: row.try_get(18)?,
                     error_message: row.try_get(19)?,
                     created_at: row.try_get(20)?,
+                    total_from_start: row.try_get(21)?,
+                    succeeded_from_start: row.try_get(22)?,
                 })
             },
-            mapper: |it| GetTaskRunApiRequestsLimited::from(it),
+            mapper: |it| GetTaskRunApiRequestsPage::from(it),
         }
     }
 }
@@ -3525,27 +3584,28 @@ impl<
     's,
     C: GenericClient,
     T1: crate::StringSql,
+    T2: crate::StringSql,
 > crate::client::async_::Params<
     'c,
     'a,
     's,
-    GetTaskRunApiRequestsLimitedParams<T1>,
-    GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, GetTaskRunApiRequestsLimited, 3>,
+    GetTaskRunApiRequestsPageParams<T1, T2>,
+    GetTaskRunApiRequestsPageQuery<'c, 'a, 's, C, GetTaskRunApiRequestsPage, 6>,
     C,
-> for GetTaskRunApiRequestsLimitedStmt {
+> for GetTaskRunApiRequestsPageStmt {
     fn params(
         &'s self,
         client: &'c C,
-        params: &'a GetTaskRunApiRequestsLimitedParams<T1>,
-    ) -> GetTaskRunApiRequestsLimitedQuery<
+        params: &'a GetTaskRunApiRequestsPageParams<T1, T2>,
+    ) -> GetTaskRunApiRequestsPageQuery<
         'c,
         'a,
         's,
         C,
-        GetTaskRunApiRequestsLimited,
-        3,
+        GetTaskRunApiRequestsPage,
+        6,
     > {
-        self.bind(client, &params.task_run_id, &params.max_results, &params.skip_results)
+        self.bind(client, &params.task_run_id, &params.filter_by_success, &params.success, &params.after_created_at, &params.after_id, &params.max_results)
     }
 }
 pub struct CreateTaskRunAwasStepStmt(&'static str, Option<tokio_postgres::Statement>);
@@ -3713,17 +3773,17 @@ impl GetTaskRunAwasStepsStmt {
         }
     }
 }
-pub struct GetTaskRunAwasStepsLimitedStmt(
+pub struct GetTaskRunAwasStepsPageStmt(
     &'static str,
     Option<tokio_postgres::Statement>,
 );
-pub fn get_task_run_awas_steps_limited() -> GetTaskRunAwasStepsLimitedStmt {
-    GetTaskRunAwasStepsLimitedStmt(
-        "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at FROM task_run_awas_steps WHERE task_run_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+pub fn get_task_run_awas_steps_page() -> GetTaskRunAwasStepsPageStmt {
+    GetTaskRunAwasStepsPageStmt(
+        "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start FROM task_run_awas_steps WHERE task_run_id = $1 AND (NOT $2 OR step_type = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
         None,
     )
 }
-impl GetTaskRunAwasStepsLimitedStmt {
+impl GetTaskRunAwasStepsPageStmt {
     pub async fn prepare<'a, C: GenericClient>(
         mut self,
         client: &'a C,
@@ -3731,22 +3791,33 @@ impl GetTaskRunAwasStepsLimitedStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+        T3: crate::StringSql,
+    >(
         &'s self,
         client: &'c C,
         task_run_id: &'a T1,
+        filter_by_step_type: &'a bool,
+        step_type: &'a T2,
+        after_created_at: &'a chrono::DateTime<chrono::FixedOffset>,
+        after_id: &'a T3,
         max_results: &'a i64,
-        skip_results: &'a i64,
-    ) -> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, GetTaskRunAwasStepsLimited, 3> {
-        GetTaskRunAwasStepsLimitedQuery {
+    ) -> GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, GetTaskRunAwasStepsPage, 6> {
+        GetTaskRunAwasStepsPageQuery {
             client,
-            params: [task_run_id, max_results, skip_results],
+            params: [task_run_id, filter_by_step_type, step_type, after_created_at, after_id, max_results],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |
                 row: &tokio_postgres::Row,
-            | -> Result<GetTaskRunAwasStepsLimitedBorrowed, tokio_postgres::Error> {
-                Ok(GetTaskRunAwasStepsLimitedBorrowed {
+            | -> Result<GetTaskRunAwasStepsPageBorrowed, tokio_postgres::Error> {
+                Ok(GetTaskRunAwasStepsPageBorrowed {
                     id: row.try_get(0)?,
                     task_run_id: row.try_get(1)?,
                     step_id: row.try_get(2)?,
@@ -3760,9 +3831,11 @@ impl GetTaskRunAwasStepsLimitedStmt {
                     error_message: row.try_get(10)?,
                     duration_ms: row.try_get(11)?,
                     created_at: row.try_get(12)?,
+                    total_from_start: row.try_get(13)?,
+                    succeeded_from_start: row.try_get(14)?,
                 })
             },
-            mapper: |it| GetTaskRunAwasStepsLimited::from(it),
+            mapper: |it| GetTaskRunAwasStepsPage::from(it),
         }
     }
 }
@@ -3772,19 +3845,21 @@ impl<
     's,
     C: GenericClient,
     T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
 > crate::client::async_::Params<
     'c,
     'a,
     's,
-    GetTaskRunAwasStepsLimitedParams<T1>,
-    GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, GetTaskRunAwasStepsLimited, 3>,
+    GetTaskRunAwasStepsPageParams<T1, T2, T3>,
+    GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, GetTaskRunAwasStepsPage, 6>,
     C,
-> for GetTaskRunAwasStepsLimitedStmt {
+> for GetTaskRunAwasStepsPageStmt {
     fn params(
         &'s self,
         client: &'c C,
-        params: &'a GetTaskRunAwasStepsLimitedParams<T1>,
-    ) -> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, GetTaskRunAwasStepsLimited, 3> {
-        self.bind(client, &params.task_run_id, &params.max_results, &params.skip_results)
+        params: &'a GetTaskRunAwasStepsPageParams<T1, T2, T3>,
+    ) -> GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, GetTaskRunAwasStepsPage, 6> {
+        self.bind(client, &params.task_run_id, &params.filter_by_step_type, &params.step_type, &params.after_created_at, &params.after_id, &params.max_results)
     }
 }

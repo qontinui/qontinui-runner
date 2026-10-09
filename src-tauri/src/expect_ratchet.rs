@@ -82,7 +82,10 @@ mod tests {
             expect_needle: "#[expect(clippy::disallowed_methods",
             // 537 -> 536: qontinui_specs.rs `table_exists` migrated to
             // try_get (plan 2026-05-14-atlas-wave-6-triage).
-            baseline: 536,
+            // 536 -> 535: task_run_events.rs `count_task_run_table` deleted —
+            // the per-run log pages carry a window count (plan
+            // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
+            baseline: 535,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
@@ -109,7 +112,10 @@ mod tests {
         Ratchet {
             lint: "clippy::string_slice",
             expect_needle: "#[expect(clippy::string_slice",
-            baseline: 435,
+            // 435 -> 434: graphql `task_run_output` moved to char-boundary
+            // `str::get` slicing in `graphql::output_page` (plan
+            // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
+            baseline: 434,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
