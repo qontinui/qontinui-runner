@@ -672,7 +672,7 @@ client's mask):
 | `LIVE_APP_ERROR` | **A LIVE verdict, not a failure.** The end-to-end `tools/call` was carried and the TOOL answered `isError:true` | Re-issue over this door. See "`isError` is the TOOL's verdict" below — never read it as a dead door |
 | `PROXY_LIVE_E2E_UNVERIFIED` | **Also LIVE**, and honest about how far it was measured: `tools/list` answered and the end-to-end probe did not run (`$COORD_REVIVE_E2E=0`) | Usable, but read the ANSWER to your re-issued call rather than treating this as end-to-end proof. Unset `$COORD_REVIVE_E2E` to measure it |
 | `SKIPPED_SHARED_UPSTREAM_REFRESHING` | **A skip, not a verdict about that door** — nothing probed it. A sibling on the same `host:port` already settled on `CREDENTIAL_REFRESHING` after its own retry, and they share one upstream process | Nothing to do: the fact is already established by the sibling. `$COORD_REVIVE_NO_UPSTREAM_SKIP=1` probes every sibling anyway |
-| `SKIPPED_BUDGET_EXCEEDED` | **Also a skip** — the `$COORD_REVIVE_TOTAL_BUDGET` sweep budget ran out before this door was reached. UNKNOWN, never dead | Raise the budget to finish the sweep, or probe the named door by hand |
+| `SKIPPED_BUDGET_EXCEEDED` | **Also a skip** — the `$COORD_REVIVE_TOTAL_BUDGET` sweep budget ran out before this door was reached. UNKNOWN, never dead. L5 never reads this once the same sweep measured the runner's credential dead (`CREDENTIAL_REFRESHING` settled, or `RUNNER_CREDENTIAL_*`): it is probed past the budget instead | Raise the budget to finish the sweep, or probe the named door by hand |
 | `NO_RUNNER` | L4 mint: nothing answered at that origin (connection refused, or no status at all) | Runner down, moved, or never started; set `$QONTINUI_RUNNER_URL` |
 | `RUNNER_TIMEOUT` | L4 mint: the port **accepted** the connection but produced no response within `COORD_REVIVE_MINT_TIMEOUT` (60s) | Often **saturation**, not a dead runner — do NOT restart it on this alone (served policy `production-and-cost` `runner-lifecycle`). Re-run, or use another door |
 | `RUNNER_EVAL_FAILED` | L4 mint (the door name says which of the two — `source=runner-invoke` or `source=runner-eval`): the runner **answered**, but not with a well-formed mint result — a non-2xx, a route-absent 404, or a `success:false` body. The verdict quotes the response's own error string **when the body carried one** | **Not** a sign-in problem. Read the quoted error. A 4xx means the route moved or something else answers on that port; a 5xx means the route is present and failed server-side |
@@ -1565,7 +1565,25 @@ evict a live peer and will not unlatch your client. Use
   skipped doors appear in the same list as `SKIPPED_BUDGET_EXCEEDED`. Stated
   honestly: the bound is the budget **plus at most one door's worst case**, since
   a door already in flight when the budget runs out is allowed to finish rather
-  than be cut off mid-request.
+  than be cut off mid-request — plus L5's one attempt in the single state the
+  next paragraph exempts.
+
+  **One door is exempt from the fourth, and only in one state: L5.** When this
+  sweep has already measured the runner's own credential dead — a loopback door
+  settled on `CREDENTIAL_REFRESHING` or answered `RUNNER_CREDENTIAL_<POSTURE>` —
+  a spent budget no longer skips L5. Every rung the budget was spent on (L1, L2,
+  the L4 runner mints) carried that same dead credential, so L5, the
+  runner-independent bootstrap credential, is the one door left, and skipping it
+  there reported `BUDGET_EXCEEDED` in exactly the state L5 exists for (device
+  c79a07d5, 2026-10-07: a default-budget run never reached L5; a 600 s run
+  reached it LIVE). The exemption prints a `sweep budget … spent, probing
+  anyway: <why>` line. It costs one bounded attempt: the session-tenant read
+  (a runner GET, only when `$QONTINUI_TERMINAL_ID` is set and L4 did not
+  already resolve it), the POST and the control read, each under
+  `COORD_REVIVE_PROBE_TIMEOUT`. So in this state alone the bound above grows by
+  up to three `PROBE_TIMEOUT`s. A sweep that ran out on `TIMEOUT`s gets no
+  exemption, because a hang says nothing about the credential.
+  `$COORD_REVIVE_NO_BOOTSTRAP` still wins.
 - **The correlated case is short-circuited, and that is the real fix — the budget
   is only the backstop.** Every canonical door on this fleet now resolves to the
   **same runner port**, so a device-JWT refresh makes all ~12 answer
