@@ -690,10 +690,10 @@ export interface TaskRunPlaywrightResultDb {
 export interface TaskRunPlaywrightResultsDbResult extends BoundedReadMeta {
   task_run_id: string;
   results: TaskRunPlaywrightResultDb[];
-  /** Passed from this page's start position onward — the whole run on the first page. */
-  passed: number;
-  /** Failed from this page's start position onward. */
-  failed: number;
+  /** Passed across the whole run. FIRST page only (it alone ran the counts statement); absent on later pages. */
+  passed?: number;
+  /** Failed across the whole run. First page only. */
+  failed?: number;
 }
 
 /**
@@ -751,10 +751,10 @@ export interface TaskRunApiRequestDb {
 export interface TaskRunApiRequestsDbResult extends BoundedReadMeta {
   task_run_id: string;
   requests: TaskRunApiRequestDb[];
-  /** Succeeded from this page's start position onward — the whole run on the first page. */
-  success_count: number;
-  /** Failed from this page's start position onward. */
-  failed_count: number;
+  /** Succeeded across the whole (filtered) run. FIRST page only; absent on later pages. */
+  success_count?: number;
+  /** Failed across the whole (filtered) run. First page only. */
+  failed_count?: number;
 }
 
 // =============================================================================
@@ -795,10 +795,10 @@ export interface TaskRunAwasStepDb {
 export interface TaskRunAwasStepsDbResult extends BoundedReadMeta {
   task_run_id: string;
   steps: TaskRunAwasStepDb[];
-  /** Succeeded from this page's start position onward — the whole run on the first page. */
-  success_count: number;
-  /** Failed from this page's start position onward. */
-  failed_count: number;
+  /** Succeeded across the whole (filtered) run. FIRST page only; absent on later pages. */
+  success_count?: number;
+  /** Failed across the whole (filtered) run. First page only. */
+  failed_count?: number;
 }
 
 // =============================================================================

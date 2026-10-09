@@ -758,32 +758,34 @@ impl PgDb {
 /// than the codec's usual descending, so rows a still-running task appends
 /// land AHEAD of the cursor and are reached, never skipped.
 ///
-/// The three counts are window counts (`COUNT(*) OVER ()`) carried by every
-/// row of the statement, so they cover the rows matching from this page's
-/// START POSITION onward — the whole match set on the first page, exactly as
-/// `qontinui_types::page::Bound::Exact` defines `total`.
+/// **A page statement carries no window count.** `COUNT(*) OVER ()` would make
+/// the executor read every remaining row — the big text columns included — on
+/// every page, turning a walk into O(n^2). The page is `LIMIT limit + 1` (the
+/// extra row is the has-more probe), and the exact population counts are a
+/// separate statement over the small columns, run ONLY on the first page
+/// (plan Section 6: the exact total is opt-in at a cost the caller can see,
+/// `at_least` is the default). Later pages report `at_least`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskRunLogPage<T> {
-    /// The rows, in walk order, each with its exact `created_at` (the keyset
-    /// value the next cursor is minted from).
+    /// The rows in walk order, each with its exact `created_at` (the keyset
+    /// value the next cursor is minted from): up to `limit + 1` of them. The
+    /// last one, when present, is the probe — NOT part of the page.
     pub rows: Vec<(T, chrono::DateTime<chrono::Utc>)>,
-    /// Rows matching from this page's start position onward.
-    pub total_from_start: i64,
-    /// Of those, rows that passed (Playwright) or succeeded.
-    pub succeeded_from_start: i64,
-    /// Of those, rows that failed.
-    pub failed_from_start: i64,
+    /// The population counts, from the first page's separate statement; `None`
+    /// on every later page (never computed, not zero).
+    pub counts: Option<TaskRunLogCounts>,
 }
 
-impl<T> TaskRunLogPage<T> {
-    fn empty() -> Self {
-        TaskRunLogPage {
-            rows: Vec::new(),
-            total_from_start: 0,
-            succeeded_from_start: 0,
-            failed_from_start: 0,
-        }
-    }
+/// Rows matching the walk's filters over the WHOLE run — what the first page's
+/// counts statement measured (a first page starts before every row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRunLogCounts {
+    /// Every matching row.
+    pub total: i64,
+    /// Of those, rows that passed (Playwright) or succeeded.
+    pub succeeded: i64,
+    /// Of those, rows that failed.
+    pub failed: i64,
 }
 
 /// `0001-01-01T00:00:00Z` — an instant both chrono and PostgreSQL's
@@ -825,8 +827,8 @@ fn non_zero(v: i64) -> Option<i64> {
 }
 
 impl PgDb {
-    /// One keyset page of a run's Playwright results. `limit` is the cap the
-    /// statement applies; see [`TaskRunLogPage`] for the walk and the counts.
+    /// One keyset page of a run's Playwright results. `limit` is the page size (the statement
+    /// fetches `limit + 1`); see [`TaskRunLogPage`] for the walk and the counts.
     pub async fn get_task_run_playwright_results_page(
         &self,
         task_run_id: &str,
@@ -838,7 +840,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let first_page = after.is_none();
         let (after_created_at, after_id) = keyset_after(after);
+        // `limit + 1`: the extra row is the has-more probe.
+        let probe_limit = limit.saturating_add(1);
 
         let rows = qontinui_db::queries::task_run_events::get_task_run_playwright_results_page()
             .bind(
@@ -846,19 +851,29 @@ impl PgDb {
                 &task_run_id,
                 &after_created_at,
                 &after_id.as_str(),
-                &limit,
+                &probe_limit,
             )
             .all()
             .await
             .map_err(|e| crate::database::pg::pg_err("PG query task_run_playwright_results", &e))?;
 
-        let mut page = TaskRunLogPage::empty();
-        if let Some(first) = rows.first() {
-            page.total_from_start = first.total_from_start;
-            page.succeeded_from_start = first.passed_from_start;
-            page.failed_from_start = first.failed_from_start;
-        }
-        page.rows = rows
+        let counts = if first_page {
+            let c = qontinui_db::queries::task_run_events::get_task_run_playwright_results_counts()
+                .bind(&conn, &task_run_id)
+                .one()
+                .await
+                .map_err(|e| {
+                    crate::database::pg::pg_err("PG count task_run_playwright_results", &e)
+                })?;
+            Some(TaskRunLogCounts {
+                total: c.total,
+                succeeded: c.passed,
+                failed: c.failed,
+            })
+        } else {
+            None
+        };
+        let rows = rows
             .into_iter()
             .map(|r| {
                 let created_at = r.created_at.with_timezone(&chrono::Utc);
@@ -881,13 +896,13 @@ impl PgDb {
                 };
                 (row, created_at)
             })
-            .collect();
-        Ok(page)
+            .collect::<Vec<_>>();
+        Ok(TaskRunLogPage { rows, counts })
     }
 
     /// One keyset page of a run's API requests, optionally only the
     /// succeeded (`Some(true)`) or failed (`Some(false)`) ones — filtered in
-    /// the statement, so the window counts and the page agree.
+    /// the statement, so the counts and the page agree.
     pub async fn get_task_run_api_requests_page(
         &self,
         task_run_id: &str,
@@ -900,7 +915,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let first_page = after.is_none();
         let (after_created_at, after_id) = keyset_after(after);
+        // `limit + 1`: the extra row is the has-more probe.
+        let probe_limit = limit.saturating_add(1);
         let filter_by_success = success_filter.is_some();
         let success = success_filter.unwrap_or(false);
 
@@ -912,19 +930,27 @@ impl PgDb {
                 &success,
                 &after_created_at,
                 &after_id.as_str(),
-                &limit,
+                &probe_limit,
             )
             .all()
             .await
             .map_err(|e| crate::database::pg::pg_err("PG query task_run_api_requests", &e))?;
 
-        let mut page = TaskRunLogPage::empty();
-        if let Some(first) = rows.first() {
-            page.total_from_start = first.total_from_start;
-            page.succeeded_from_start = first.succeeded_from_start;
-            page.failed_from_start = first.total_from_start - first.succeeded_from_start;
-        }
-        page.rows = rows
+        let counts = if first_page {
+            let c = qontinui_db::queries::task_run_events::get_task_run_api_requests_counts()
+                .bind(&conn, &task_run_id, &filter_by_success, &success)
+                .one()
+                .await
+                .map_err(|e| crate::database::pg::pg_err("PG count task_run_api_requests", &e))?;
+            Some(TaskRunLogCounts {
+                total: c.total,
+                succeeded: c.succeeded,
+                failed: c.total - c.succeeded,
+            })
+        } else {
+            None
+        };
+        let rows = rows
             .into_iter()
             .map(|r| {
                 let created_at = r.created_at.with_timezone(&chrono::Utc);
@@ -953,12 +979,12 @@ impl PgDb {
                 };
                 (row, created_at)
             })
-            .collect();
-        Ok(page)
+            .collect::<Vec<_>>();
+        Ok(TaskRunLogPage { rows, counts })
     }
 
     /// One keyset page of a run's AWAS steps, optionally only one
-    /// `step_type` — filtered in the statement, so the window counts and the
+    /// `step_type` — filtered in the statement, so the counts and the
     /// page agree.
     pub async fn get_task_run_awas_steps_page(
         &self,
@@ -972,7 +998,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let first_page = after.is_none();
         let (after_created_at, after_id) = keyset_after(after);
+        // `limit + 1`: the extra row is the has-more probe.
+        let probe_limit = limit.saturating_add(1);
         let filter_by_step_type = step_type.is_some();
         let step_type = step_type.unwrap_or("");
 
@@ -984,19 +1013,27 @@ impl PgDb {
                 &step_type,
                 &after_created_at,
                 &after_id.as_str(),
-                &limit,
+                &probe_limit,
             )
             .all()
             .await
             .map_err(|e| crate::database::pg::pg_err("PG query task_run_awas_steps", &e))?;
 
-        let mut page = TaskRunLogPage::empty();
-        if let Some(first) = rows.first() {
-            page.total_from_start = first.total_from_start;
-            page.succeeded_from_start = first.succeeded_from_start;
-            page.failed_from_start = first.total_from_start - first.succeeded_from_start;
-        }
-        page.rows = rows
+        let counts = if first_page {
+            let c = qontinui_db::queries::task_run_events::get_task_run_awas_steps_counts()
+                .bind(&conn, &task_run_id, &filter_by_step_type, &step_type)
+                .one()
+                .await
+                .map_err(|e| crate::database::pg::pg_err("PG count task_run_awas_steps", &e))?;
+            Some(TaskRunLogCounts {
+                total: c.total,
+                succeeded: c.succeeded,
+                failed: c.total - c.succeeded,
+            })
+        } else {
+            None
+        };
+        let rows = rows
             .into_iter()
             .map(|r| {
                 let created_at = r.created_at.with_timezone(&chrono::Utc);
@@ -1017,7 +1054,7 @@ impl PgDb {
                 };
                 (row, created_at)
             })
-            .collect();
-        Ok(page)
+            .collect::<Vec<_>>();
+        Ok(TaskRunLogPage { rows, counts })
     }
 }

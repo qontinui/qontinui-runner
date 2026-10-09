@@ -128,7 +128,7 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}
         >
           <CheckCircle className="w-4 h-4" />
-          {playwrightData.first.passed} passed
+          {playwrightData.first.passed ?? "—"} passed
         </span>
         <span
           data-content-role="metric"
@@ -136,7 +136,7 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}
         >
           <XCircle className="w-4 h-4" />
-          {playwrightData.first.failed} failed
+          {playwrightData.first.failed ?? "—"} failed
         </span>
         <span
           data-content-role="metric"

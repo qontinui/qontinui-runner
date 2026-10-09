@@ -135,7 +135,7 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}
         >
           <CheckCircle className="w-4 h-4" />
-          {apiData.first.success_count} successful
+          {apiData.first.success_count ?? "—"} successful
         </span>
         <span
           data-content-role="metric"
@@ -143,7 +143,7 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
           className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}
         >
           <XCircle className="w-4 h-4" />
-          {apiData.first.failed_count} failed
+          {apiData.first.failed_count ?? "—"} failed
         </span>
         <span
           data-content-role="metric"

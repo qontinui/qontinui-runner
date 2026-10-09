@@ -127,11 +127,11 @@ export function AwasStepsSection() {
         <span className="text-sm font-medium">AWAS Steps:</span>
         <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
           <CheckCircle className="w-4 h-4" />
-          {awasData.first.success_count} successful
+          {awasData.first.success_count ?? "—"} successful
         </span>
         <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
           <XCircle className="w-4 h-4" />
-          {awasData.first.failed_count} failed
+          {awasData.first.failed_count ?? "—"} failed
         </span>
         <span className="text-xs text-muted-foreground ml-auto">
           {awasData.first.total ?? awasData.rows.length} total steps

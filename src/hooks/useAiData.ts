@@ -420,9 +420,11 @@ export function useTaskRunEvents(taskRunId: string | null, eventType?: string, l
  * A keyset walk over a bounded read, merged across every page loaded so far.
  *
  * Counts (`first.total`, `first.passed`, …) come from the FIRST page, whose
- * window counts cover the whole match set; the rows are every page's rows in
- * walk order; `remaining` is what the last page's count says lies beyond the
- * loaded rows (`null` when no exact count ran).
+ * separate counts statement covers the whole match set (later pages run none,
+ * so their `bound_kind` is `at_least` and their per-status counts are absent);
+ * the rows are every page's rows in walk order; `remaining` is what the last
+ * page's exact total says lies beyond the loaded rows (`null` when that page
+ * ran no exact count, i.e. on every page after the first).
  */
 export interface BoundedWalk<P extends BoundedReadMeta, R> {
   first: P;

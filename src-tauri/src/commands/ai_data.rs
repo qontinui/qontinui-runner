@@ -1214,7 +1214,7 @@ pub async fn get_contexts_for_viewer() -> Result<AiDataResponse<ContextsResult>,
 // SQLite Event Queries (migrated from JSONL)
 // =============================================================================
 
-use crate::database::pg::task_run_events::TaskRunLogPage;
+use crate::database::pg::task_run_events::{TaskRunLogCounts, TaskRunLogPage};
 use crate::database::{
     TaskRunApiRequest, TaskRunAwasStep, TaskRunEvent, TaskRunPlaywrightResult, TaskRunScreenshot,
 };
@@ -1307,6 +1307,13 @@ pub async fn get_task_run_screenshots_from_db(
 // (`qontinui_types::page`), filter in the statement, and disclose the page
 // through the shared `BoundedReadMeta` envelope keys, flattened beside each
 // result's collection key.
+//
+// **Cost.** A page statement carries no window count (`COUNT(*) OVER ()` reads
+// every remaining row, big text columns included, on every page: O(n^2) over a
+// walk). It is `LIMIT limit + 1`, and the exact population counts are a separate
+// statement over the small columns, run on the FIRST page only. A first page is
+// `bound_kind: exact`; every later page is `at_least` (or `complete` on the last)
+// and omits the per-status counts.
 
 /// The page size when the caller passes no `limit`.
 const TASK_RUN_LOG_PAGE_DEFAULT: i64 = 200;
@@ -1377,28 +1384,52 @@ fn log_row_position(id: &str, created_at: DateTime<Utc>) -> Result<KeysetPositio
     }
 }
 
-/// Build the shared [`Page`] from a keyset fetch: an exact window count from
-/// the page's start position, and a next cursor minted from the LAST served
-/// row whenever rows remain beyond the page.
+/// Build the page's rows and shared [`BoundedReadMeta`] from a keyset fetch of
+/// up to `limit + 1` rows (the extra row is the has-more probe).
+///
+/// The has-more fact comes from the probe, read in the SAME statement as the
+/// rows. On the FIRST page the separate counts statement also ran, so the bound
+/// is `exact` (`total` = the whole filtered run) — provided it agrees with the
+/// probe; a run still appending rows can make the two statements disagree, and
+/// then the honest answer is the probe's `at_least`. Every later page has no
+/// counts and is `at_least` while rows remain, `complete` on the last page. The
+/// next cursor is minted from the LAST KEPT row, never the probe.
 fn log_page<T, K: SortKey>(
     fetched: TaskRunLogPage<T>,
     limit: i64,
     scope: &ScopeFingerprint<K>,
     id_of: fn(&T) -> &str,
-) -> Result<Page<T>, String> {
-    let total = fetched.total_from_start;
-    let next_cursor = if total > fetched.rows.len() as i64 {
-        match fetched.rows.last() {
-            Some((row, at)) => Some(scope.encode(log_row_position(id_of(row), *at)?)),
-            None => None,
+) -> Result<(Vec<T>, BoundedReadMeta), String> {
+    let TaskRunLogPage { mut rows, counts } = fetched;
+    let keep = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+    let has_more = rows.len() > keep;
+    // Refuse to mint a cursor that would skip rows (non-canonical id) before
+    // the page is built; a last page needs no cursor and so no such id.
+    if has_more {
+        if let Some((row, at)) = rows.get(keep - 1) {
+            log_row_position(id_of(row), *at)?;
         }
-    } else {
-        None
+    }
+    let cursor_of = |(row, at): &(T, DateTime<Utc>)| {
+        log_row_position(id_of(row), *at)
+            .map(|pos| scope.encode(pos))
+            .unwrap_or_default()
     };
-    let rows: Vec<T> = fetched.rows.into_iter().map(|(row, _)| row).collect();
-    Ok(Page::from_window_count(rows, limit, total, move |_| {
-        next_cursor.unwrap_or_default()
-    }))
+    let exact_total = counts
+        .map(|c| c.total)
+        .filter(|total| (*total > keep as i64) == has_more);
+    let page = match exact_total {
+        Some(total) => {
+            rows.truncate(keep);
+            Page::from_window_count(rows, limit, total, cursor_of)
+        }
+        None => Page::from_probe(rows, limit, cursor_of),
+    };
+    let meta = page.meta();
+    Ok((
+        page.into_rows().into_iter().map(|(row, _)| row).collect(),
+        meta,
+    ))
 }
 
 /// One keyset page of a run's Playwright results.
@@ -1406,11 +1437,14 @@ fn log_page<T, K: SortKey>(
 pub struct TaskRunPlaywrightResultsResult {
     pub task_run_id: String,
     pub results: Vec<TaskRunPlaywrightResult>,
-    /// Tests from this page's start position onward that passed — the whole
-    /// run on the first page (the same scope as `total`).
-    pub passed: i64,
-    /// Tests from this page's start position onward that failed.
-    pub failed: i64,
+    /// Tests that passed across the whole run. Present on the FIRST page only
+    /// (the page that ran the counts statement), absent — not zero — on every
+    /// later page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passed: Option<i64>,
+    /// Tests that failed across the whole run; first page only, like `passed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<i64>,
     /// `count`, `limit`, `shown`, `total`, `truncated`, `bound_kind`,
     /// `next_cursor`, … — pass `next_cursor` back as `cursor` for the next page.
     #[serde(flatten)]
@@ -1447,14 +1481,17 @@ pub async fn get_task_run_playwright_results_from_db(
         Ok(fetched) => fetched,
         Err(e) => return Ok(AiDataResponse::err(e)),
     };
-    let (passed, failed) = (fetched.succeeded_from_start, fetched.failed_from_start);
+    let (passed, failed) = (
+        fetched.counts.map(|c| c.succeeded),
+        fetched.counts.map(|c| c.failed),
+    );
     match log_page(fetched, limit, &scope, |r: &TaskRunPlaywrightResult| {
         r.id.as_str()
     }) {
-        Ok(page) => Ok(AiDataResponse::ok(TaskRunPlaywrightResultsResult {
+        Ok((results, page)) => Ok(AiDataResponse::ok(TaskRunPlaywrightResultsResult {
             task_run_id,
-            page: page.meta(),
-            results: page.into_rows(),
+            page,
+            results,
             passed,
             failed,
         })),
@@ -1519,11 +1556,13 @@ pub async fn get_task_run_migrated_logs_summary(
 pub struct TaskRunApiRequestsResult {
     pub task_run_id: String,
     pub requests: Vec<TaskRunApiRequest>,
-    /// Requests from this page's start position onward that succeeded — the
-    /// whole (filtered) run on the first page (the same scope as `total`).
-    pub success_count: i64,
-    /// Requests from this page's start position onward that failed.
-    pub failed_count: i64,
+    /// Requests that succeeded across the whole (filtered) run. Present on the
+    /// FIRST page only, absent — not zero — on every later page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_count: Option<i64>,
+    /// Requests that failed across the whole (filtered) run; first page only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_count: Option<i64>,
     /// `count`, `limit`, `shown`, `total`, `truncated`, `bound_kind`,
     /// `next_cursor`, … — pass `next_cursor` back as `cursor` for the next page.
     #[serde(flatten)]
@@ -1566,14 +1605,17 @@ pub async fn get_task_run_api_requests_from_db(
         Ok(fetched) => fetched,
         Err(e) => return Ok(AiDataResponse::err(e)),
     };
-    let (success_count, failed_count) = (fetched.succeeded_from_start, fetched.failed_from_start);
+    let (success_count, failed_count) = (
+        fetched.counts.map(|c| c.succeeded),
+        fetched.counts.map(|c| c.failed),
+    );
     match log_page(fetched, limit, &scope, |r: &TaskRunApiRequest| {
         r.id.as_str()
     }) {
-        Ok(page) => Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
+        Ok((requests, page)) => Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
             task_run_id,
-            page: page.meta(),
-            requests: page.into_rows(),
+            page,
+            requests,
             success_count,
             failed_count,
         })),
@@ -1586,11 +1628,13 @@ pub async fn get_task_run_api_requests_from_db(
 pub struct TaskRunAwasStepsResult {
     pub task_run_id: String,
     pub steps: Vec<TaskRunAwasStep>,
-    /// Steps from this page's start position onward that succeeded — the
-    /// whole (filtered) run on the first page (the same scope as `total`).
-    pub success_count: i64,
-    /// Steps from this page's start position onward that failed.
-    pub failed_count: i64,
+    /// Steps that succeeded across the whole (filtered) run. Present on the
+    /// FIRST page only, absent — not zero — on every later page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_count: Option<i64>,
+    /// Steps that failed across the whole (filtered) run; first page only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_count: Option<i64>,
     /// `count`, `limit`, `shown`, `total`, `truncated`, `bound_kind`,
     /// `next_cursor`, … — pass `next_cursor` back as `cursor` for the next page.
     #[serde(flatten)]
@@ -1626,12 +1670,15 @@ pub async fn get_task_run_awas_steps_from_db(
         Ok(fetched) => fetched,
         Err(e) => return Ok(AiDataResponse::err(e)),
     };
-    let (success_count, failed_count) = (fetched.succeeded_from_start, fetched.failed_from_start);
+    let (success_count, failed_count) = (
+        fetched.counts.map(|c| c.succeeded),
+        fetched.counts.map(|c| c.failed),
+    );
     match log_page(fetched, limit, &scope, |r: &TaskRunAwasStep| r.id.as_str()) {
-        Ok(page) => Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
+        Ok((steps, page)) => Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
             task_run_id,
-            page: page.meta(),
-            steps: page.into_rows(),
+            page,
+            steps,
             success_count,
             failed_count,
         })),
@@ -1827,22 +1874,26 @@ mod tests {
             .finish()
     }
 
-    /// A fake row: just its id.
-    fn fetched(ids: &[&str], total: i64) -> TaskRunLogPage<String> {
+    /// A fake fetch: just row ids. `exact_total` is the first page's counts
+    /// statement (`None` = a later page, which never ran one).
+    fn fetched(ids: &[&str], exact_total: Option<i64>) -> TaskRunLogPage<String> {
         TaskRunLogPage {
             rows: ids
                 .iter()
                 .enumerate()
                 .map(|(i, id)| (id.to_string(), at(1_790_000_000_000_000 + i as i64)))
                 .collect(),
-            total_from_start: total,
-            succeeded_from_start: 0,
-            failed_from_start: 0,
+            counts: exact_total.map(|total| TaskRunLogCounts {
+                total,
+                succeeded: 0,
+                failed: 0,
+            }),
         }
     }
 
     const ID_A: &str = "0b7c8e2a-1f3d-4c5e-9a6b-7c8d9e0f1a2b";
     const ID_B: &str = "1c8d9f3b-2a4e-4d6f-8b7c-8d9e0f1a2b3c";
+    const ID_C: &str = "2d9e0a4c-3b5f-4e7a-9c8d-9e0f1a2b3c4d";
 
     #[test]
     fn limit_is_defaulted_and_clamped() {
@@ -1854,13 +1905,17 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_page_mints_a_cursor_from_its_last_row_that_resumes_after_it() {
+    fn the_first_page_is_exact_and_mints_its_cursor_from_the_last_kept_row_not_the_probe() {
         let scope = scope("run-1");
-        let page = log_page(fetched(&[ID_A, ID_B], 5), 2, &scope, |r: &String| {
-            r.as_str()
-        })
+        // limit 2: A and B are the page, C is the has-more probe.
+        let (rows, meta) = log_page(
+            fetched(&[ID_A, ID_B, ID_C], Some(5)),
+            2,
+            &scope,
+            |r: &String| r.as_str(),
+        )
         .expect("canonical ids mint a cursor");
-        let meta = page.meta();
+        assert_eq!(rows, vec![ID_A.to_string(), ID_B.to_string()]);
         assert_eq!(meta.bound_kind, BoundKind::Exact);
         assert_eq!(meta.total, Some(5));
         assert_eq!(meta.truncated, Some(true));
@@ -1868,33 +1923,83 @@ mod tests {
         assert_eq!(meta.limit, 2);
         let token = meta.next_cursor.expect("truncated page carries a cursor");
         let pos = scope.decode(&token).expect("the same scope decodes it");
-        assert_eq!(pos.id.to_string(), ID_B);
+        assert_eq!(pos.id.to_string(), ID_B, "the last KEPT row, not the probe");
         assert_eq!(pos.at, at(1_790_000_000_000_001));
     }
 
     #[test]
-    fn the_last_page_is_complete_with_no_cursor() {
-        let page = log_page(
-            fetched(&[ID_A, ID_B], 2),
+    fn a_later_page_runs_no_count_and_reports_at_least_while_rows_remain() {
+        let scope = scope("run-1");
+        let (rows, meta) = log_page(
+            fetched(&[ID_A, ID_B, ID_C], None),
+            2,
+            &scope,
+            |r: &String| r.as_str(),
+        )
+        .expect("mint");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(meta.bound_kind, BoundKind::AtLeast);
+        assert_eq!(meta.truncated, Some(true));
+        assert_eq!(meta.total, None, "no exact total without the count");
+        let pos = scope
+            .decode(&meta.next_cursor.expect("cursor"))
+            .expect("decodes");
+        assert_eq!(pos.id.to_string(), ID_B);
+    }
+
+    #[test]
+    fn the_last_page_is_complete_with_no_cursor_with_or_without_counts() {
+        // Later last page: no counts, no probe row.
+        let (_, meta) = log_page(
+            fetched(&[ID_A, ID_B], None),
+            2,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect("no cursor needed");
+        assert_eq!(meta.bound_kind, BoundKind::Complete);
+        assert_eq!(meta.truncated, Some(false));
+        assert_eq!(meta.next_cursor, None);
+        assert_eq!(meta.enumerate_via, None);
+        // First and only page: exact.
+        let (_, meta) = log_page(
+            fetched(&[ID_A, ID_B], Some(2)),
             200,
             &scope("run-1"),
             |r: &String| r.as_str(),
         )
         .expect("no cursor needed");
-        let meta = page.meta();
+        assert_eq!(meta.bound_kind, BoundKind::Exact);
         assert_eq!(meta.truncated, Some(false));
         assert_eq!(meta.total, Some(2));
         assert_eq!(meta.next_cursor, None);
-        assert_eq!(meta.enumerate_via, None);
+    }
+
+    #[test]
+    fn counts_that_disagree_with_the_probe_fall_back_to_at_least() {
+        // A running task appended a row between the page and the counts
+        // statements: the counts say the page is complete, the probe row says
+        // more exists. The probe (same snapshot as the rows) wins, honestly.
+        let (rows, meta) = log_page(
+            fetched(&[ID_A, ID_B, ID_C], Some(2)),
+            2,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect("mint");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(meta.bound_kind, BoundKind::AtLeast);
+        assert_eq!(meta.truncated, Some(true));
+        assert!(meta.next_cursor.is_some());
     }
 
     #[test]
     fn an_empty_walk_is_an_exact_zero_not_unknown() {
-        let page = log_page(fetched(&[], 0), 200, &scope("run-1"), |r: &String| {
+        let (rows, meta) = log_page(fetched(&[], Some(0)), 200, &scope("run-1"), |r: &String| {
             r.as_str()
         })
         .expect("empty");
-        let meta = page.meta();
+        assert!(rows.is_empty());
         assert_eq!(meta.total, Some(0));
         assert_eq!(meta.truncated, Some(false));
         assert!(meta.available);
@@ -1904,7 +2009,7 @@ mod tests {
     fn a_non_canonical_id_refuses_to_mint_rather_than_skip_rows() {
         let upper = ID_B.to_uppercase();
         let err = log_page(
-            fetched(&[ID_A, upper.as_str()], 9),
+            fetched(&[ID_A, upper.as_str(), ID_C], None),
             2,
             &scope("run-1"),
             |r: &String| r.as_str(),
@@ -1913,7 +2018,7 @@ mod tests {
         assert!(err.contains("canonical"), "{err}");
         // ...but a non-canonical id on a page that needs no cursor is fine.
         assert!(log_page(
-            fetched(&["not-a-uuid"], 1),
+            fetched(&["not-a-uuid"], Some(1)),
             2,
             &scope("run-1"),
             |r: &String| r.as_str()
@@ -1954,16 +2059,19 @@ mod tests {
 
     #[test]
     fn the_envelope_flattens_beside_the_collection_with_every_key_present() {
-        let page = log_page(fetched(&[ID_A], 3), 1, &scope("run-1"), |r: &String| {
-            r.as_str()
-        })
+        let (_, page) = log_page(
+            fetched(&[ID_A, ID_B], Some(3)),
+            1,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
         .expect("mint");
         let result = TaskRunPlaywrightResultsResult {
             task_run_id: "run-1".into(),
-            page: page.meta(),
+            page,
             results: Vec::new(),
-            passed: 1,
-            failed: 0,
+            passed: Some(1),
+            failed: Some(0),
         };
         let v = serde_json::to_value(&result).expect("serializes");
         for key in [
