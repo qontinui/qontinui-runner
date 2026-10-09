@@ -24,7 +24,7 @@
 //!
 //! Shape mirrors `commands/lock_yield_policy_settings.rs`: a `get_`/`save_`
 //! pair per group, each `#[tauri::command]` delegating to an `_impl` that
-//! returns [`AppError`], plus a `plugin()` for parity. See `settings.rs` for
+//! returns [`AppError`], registered through the module's `ipc_group!`. See `settings.rs` for
 //! the on-disk schema and for why both writers go through `update_settings`.
 //!
 //! **These commands are writers, not gates.** The one invariant that would be
@@ -36,8 +36,6 @@
 use crate::error::AppError;
 use crate::settings::{self, CiNodeSettings, SessionGuardSettings};
 use anyhow::Result;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -416,22 +414,6 @@ pub fn save_ci_node_settings(
     .map_err(String::from)
 }
 
-/// Tauri plugin exposing the resource-guard settings commands.
-///
-/// Left in place for parity with the rest of `commands/*_settings.rs`;
-/// the runtime registration goes through main.rs's central
-/// `generate_handler!`.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_resource_guard_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_session_guard_settings,
-            save_session_guard_settings,
-            get_ci_node_settings,
-            save_ci_node_settings,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,3 +578,13 @@ mod tests {
         assert!(unknown["limiting_term"].is_null());
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_ci_node_settings,
+    get_session_guard_settings,
+    save_ci_node_settings,
+    save_session_guard_settings,
+);

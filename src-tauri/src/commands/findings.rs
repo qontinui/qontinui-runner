@@ -3,8 +3,6 @@
 //! Provides commands for querying and managing AI-detected findings
 //! stored in the checkpoint database.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -130,20 +128,16 @@ pub async fn list_task_knowledge_cmd(
         .await
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_findings")
-        .invoke_handler(tauri::generate_handler![
-            get_task_findings,
-            get_findings_by_status_cmd,
-            get_finding_by_id,
-            update_finding,
-            resolve_finding,
-            provide_finding_response,
-            get_findings_summary,
-            list_task_knowledge_cmd,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_finding_by_id,
+    get_findings_by_status_cmd,
+    get_findings_summary,
+    get_task_findings,
+    list_task_knowledge_cmd,
+    provide_finding_response,
+    resolve_finding,
+    update_finding,
+);

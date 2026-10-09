@@ -29,8 +29,6 @@ use crate::container::isolated_executor::IsolatedExecutor;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -189,15 +187,11 @@ pub async fn check_docker_status(
     check_docker_status_impl(&state).await.map_err(String::from)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_container_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_container_settings,
-            update_container_settings,
-            check_docker_status,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    check_docker_status,
+    get_container_settings,
+    update_container_settings,
+);

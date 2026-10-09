@@ -6,8 +6,6 @@
 
 use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 // ============================================================================
@@ -289,21 +287,20 @@ pub async fn get_learning_trends(
     pg.get_learning_trends(days).await
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_adaptive_learning")
-        .invoke_handler(tauri::generate_handler![
-            get_adaptive_learning_stats,
-            get_playbook_entries,
-            get_curated_examples,
-            get_template_performance,
-            get_gepa_runs,
-            get_template_lifecycle_history,
-            update_playbook_entry_status,
-            delete_playbook_entry,
-            delete_curated_example,
-            get_gepa_run_detail,
-            get_playbook_entry_detail,
-            get_learning_trends,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    delete_curated_example,
+    delete_playbook_entry,
+    get_adaptive_learning_stats,
+    get_curated_examples,
+    get_gepa_run_detail,
+    get_gepa_runs,
+    get_learning_trends,
+    get_playbook_entries,
+    get_playbook_entry_detail,
+    get_template_lifecycle_history,
+    get_template_performance,
+    update_playbook_entry_status,
+);

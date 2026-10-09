@@ -5,8 +5,6 @@
 //! Tauri's managed state and that type is owned there.
 
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 
 /// Health status info for a single monitored process (for frontend display).
 #[derive(Debug, Clone, Serialize)]
@@ -51,9 +49,7 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_doctor_commands")
-        .invoke_handler(tauri::generate_handler![stop_process_by_pid])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(stop_process_by_pid,);

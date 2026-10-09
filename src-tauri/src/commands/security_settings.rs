@@ -6,8 +6,6 @@
 //! errors via [`AppError`] internally, converting with
 //! `.map_err(String::from)`. See `commands/mod.rs` for the migration guide.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -78,13 +76,11 @@ pub async fn get_security_profiles() -> Result<Vec<ProfileSummary>, String> {
     Ok(profiles::list_profiles())
 }
 
-/// Tauri plugin exposing all security-settings commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_security_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_security_settings,
-            update_security_settings,
-            get_security_profiles,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_security_profiles,
+    get_security_settings,
+    update_security_settings,
+);

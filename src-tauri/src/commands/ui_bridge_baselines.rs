@@ -3,8 +3,6 @@
 //! Provides persistent baseline storage backed by PostgreSQL, replacing the
 //! in-memory `InMemoryBaselineStore` that loses data on reload.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -124,14 +122,12 @@ pub async fn sm_delete_baseline(
     Ok(deleted)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_ui_bridge_baselines")
-        .invoke_handler(tauri::generate_handler![
-            sm_save_baseline,
-            sm_get_baseline,
-            sm_list_baselines,
-            sm_delete_baseline,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    sm_delete_baseline,
+    sm_get_baseline,
+    sm_list_baselines,
+    sm_save_baseline,
+);

@@ -80,8 +80,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tokio::sync::RwLock;
 
 /// A single unhandled frontend error.
@@ -1555,17 +1553,6 @@ pub async fn get_ui_error(
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Option<UiError>, String> {
     Ok(app_state.ui_error.get().await)
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_ui_error")
-        .invoke_handler(tauri::generate_handler![
-            report_ui_error,
-            clear_ui_error,
-            get_ui_error,
-        ])
-        .build()
 }
 
 // ---------------------------------------------------------------------------
@@ -3541,3 +3528,8 @@ mod tests {
         assert_eq!(main_document_nonce().as_deref(), Some(mine));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(clear_ui_error, get_ui_error, report_ui_error,);

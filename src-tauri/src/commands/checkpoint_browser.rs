@@ -18,8 +18,6 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 /// Global checkpoint manager instance for in-memory operations (replay, comparison).
@@ -813,32 +811,31 @@ pub async fn get_checkpoints_count(
         .await
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_checkpoint_browser")
-        .invoke_handler(tauri::generate_handler![
-            list_orchestrator_checkpoints,
-            get_orchestrator_checkpoint,
-            create_orchestrator_checkpoint,
-            delete_orchestrator_checkpoint,
-            find_checkpoints_by_tag,
-            compare_orchestrator_checkpoints,
-            get_latest_checkpoint,
-            start_replay_session,
-            get_checkpoint_count,
-            get_checkpoint_task_ids,
-            clear_all_checkpoints,
-            add_sample_checkpoints,
-            get_checkpoint_stats,
-            replay_from_checkpoint,
-            get_replay_lineage,
-            register_task_for_lineage,
-            get_task_lineage_info,
-            list_active_replay_sessions,
-            complete_replay_session,
-            fail_replay_session,
-            get_checkpoints_filtered,
-            get_checkpoints_paginated,
-            get_checkpoints_count,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    add_sample_checkpoints,
+    clear_all_checkpoints,
+    compare_orchestrator_checkpoints,
+    complete_replay_session,
+    create_orchestrator_checkpoint,
+    delete_orchestrator_checkpoint,
+    fail_replay_session,
+    find_checkpoints_by_tag,
+    get_checkpoint_count,
+    get_checkpoint_stats,
+    get_checkpoint_task_ids,
+    get_checkpoints_count,
+    get_checkpoints_filtered,
+    get_checkpoints_paginated,
+    get_latest_checkpoint,
+    get_orchestrator_checkpoint,
+    get_replay_lineage,
+    get_task_lineage_info,
+    list_active_replay_sessions,
+    list_orchestrator_checkpoints,
+    register_task_for_lineage,
+    replay_from_checkpoint,
+    start_replay_session,
+);

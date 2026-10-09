@@ -18,14 +18,16 @@
 //!   swallowed the resulting error, and the UI reported a successful sign-out
 //!   while the credentials were never cleared.
 //!
-//! The shared root cause: each `commands/*.rs` module exposes a
+//! The shared root cause: each `commands/*.rs` module used to expose a
 //! `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` carrying its own
-//! `generate_handler!` list. Those `plugin()` fns are **dead scaffolding** —
-//! plugin-based registration was rolled back to the central handler in commit
-//! `1f1d807f` ("fix(runner): restore central invoke_handler"), because Tauri 2's
-//! plugin path requires `plugin:<name>|<cmd>` invoke prefixes and the frontend
-//! invokes commands bare. Adding a command to the `plugin()` list — which *looks*
-//! exactly like the registration site — registers it nowhere.
+//! `generate_handler!` list, and those `plugin()` fns were **dead scaffolding** —
+//! plugin-based registration was rolled back in commit `1f1d807f`
+//! ("fix(runner): restore central invoke_handler"), because Tauri 2's plugin
+//! path requires `plugin:<name>|<cmd>` invoke prefixes and the frontend invokes
+//! commands bare. Adding a command to the `plugin()` list — which *looked*
+//! exactly like the registration site — registered it nowhere. Those fns are
+//! deleted (plan `2026-10-02-split-run-app-invoke-handler`); each module now
+//! registers its commands in one `crate::ipc_group!(...)` list.
 //!
 //! ## The invariant
 //!
@@ -34,18 +36,11 @@
 //!
 //! 1. in its owning module's `crate::ipc_group!(...)` list (the normal path —
 //!    `ipc_registry` routes the bare name, e.g. `invoke("save_settings")`, to
-//!    that module's handler), OR in `main.rs`'s central
-//!    `tauri::generate_handler![...]` block while it still exists (plan
-//!    `2026-10-02-split-run-app-invoke-handler` moves every module onto
-//!    `ipc_group!` and then deletes it), OR
+//!    that module's handler), OR
 //! 2. in a plugin that is **actually mounted** on the Tauri builder via
 //!    `.plugin(<module>::init())` in `main.rs` (today: `ui_bridge_plugin`). Those
 //!    commands are reachable under the `plugin:<name>|<cmd>` prefix, so their
-//!    absence from the central handler is correct, not a bug.
-//!
-//! That second clause is what distinguishes a *mounted* plugin from the dead
-//! `plugin()` scaffolding. A command reachable ONLY from an unmounted `plugin()`
-//! fn is unreachable, and this test fails.
+//!    absence from every `ipc_group!` is correct, not a bug.
 //!
 //! ## There is deliberately NO allowlist
 //!
@@ -63,8 +58,10 @@
 //!
 //! ## Also guarded here
 //!
-//! - **No name is registered twice** — in two groups, or in a group AND the
-//!   central list. The router would silently pick one.
+//! - **No name is registered in two groups.** The router would silently pick
+//!   one.
+//! - **Every module that invokes `ipc_group!` has its `ipc_registry::GROUPS`
+//!   entry**, or the router never reaches its commands.
 //! - **No `#[tauri::command(rename = ...)]`.** `ipc_group!` builds each group's
 //!   routing names with `stringify!` on the fn ident, which equals the name
 //!   Tauri registers only when there is no `rename`.
@@ -453,8 +450,6 @@ fn every_tauri_command_is_registered() {
     let main_src =
         fs::read_to_string(root.join("src/main.rs")).expect("failed to read src/main.rs");
 
-    let central = handler_list(&main_src);
-
     // name -> every file whose `ipc_group!` lists it
     let mut grouped: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     // module path of every file that invokes `ipc_group!`
@@ -491,24 +486,16 @@ fn every_tauri_command_is_registered() {
          in src-tauri/src/ipc_registry.rs.\n"
     );
     assert!(
-        central.len() + grouped.len() > 500,
-        "sanity check failed: only parsed {} central + {} ipc_group! commands — \
-         the parser is broken, not the codebase",
-        central.len(),
+        grouped.len() > 500,
+        "sanity check failed: only parsed {} ipc_group! commands — the parser is \
+         broken, not the codebase",
         grouped.len()
     );
 
     let double_registered: Vec<String> = grouped
         .iter()
-        .filter(|(name, files)| files.len() > 1 || central.contains(*name))
-        .map(|(name, files)| {
-            let central_note = if central.contains(name) {
-                " + main.rs central list"
-            } else {
-                ""
-            };
-            format!("  - {name}  ({}{central_note})", files.join(", "))
-        })
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(name, files)| format!("  - {name}  ({})", files.join(", ")))
         .collect();
     assert!(
         double_registered.is_empty(),
@@ -534,10 +521,7 @@ fn every_tauri_command_is_registered() {
             .replace('\\', "/");
 
         for name in defined_commands(&src) {
-            if !central.contains(&name)
-                && !grouped.contains_key(&name)
-                && !via_mounted_plugin.contains(&name)
-            {
+            if !grouped.contains_key(&name) && !via_mounted_plugin.contains(&name) {
                 unregistered.push((name, rel.clone()));
             }
         }
@@ -552,8 +536,8 @@ fn every_tauri_command_is_registered() {
          `src-tauri/src/ipc_registry.rs`). If the command is dead, DELETE it — \
          do not add an allowlist here.\n\nNOTE: a Tauri *plugin* does NOT \
          register a bare command — plugin commands are reachable only as \
-         `plugin:<name>|<cmd>` (see commit 1f1d807f); only `ipc_group!` lists, \
-         the central handler and plugins mounted via `.plugin(...)` count.\n",
+         `plugin:<name>|<cmd>` (see commit 1f1d807f); only `ipc_group!` lists \
+         and plugins mounted via `.plugin(...)` count.\n",
         unregistered.len(),
         unregistered
             .iter()

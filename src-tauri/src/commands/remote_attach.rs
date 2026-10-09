@@ -1872,3 +1872,16 @@ mod interactivity_command_tests {
         }
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    remote_attach_preference_get,
+    remote_attach_preference_set,
+    terminal_attach_remote,
+    terminal_remote_identities,
+    terminal_remote_history_load,
+    terminal_remote_interactivity,
+    remote_interactivity_probe,
+);

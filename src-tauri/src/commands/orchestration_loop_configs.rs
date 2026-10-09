@@ -1,7 +1,5 @@
 //! Tauri commands for orchestration loop config CRUD operations.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -77,16 +75,14 @@ pub async fn ol_toggle_favorite(
     storage.pg_db().update_ol_config(&id, &req).await
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_orchestration_loop_configs")
-        .invoke_handler(tauri::generate_handler![
-            ol_list_configs,
-            ol_get_config,
-            ol_save_config,
-            ol_update_config,
-            ol_delete_config,
-            ol_toggle_favorite,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    ol_delete_config,
+    ol_get_config,
+    ol_list_configs,
+    ol_save_config,
+    ol_toggle_favorite,
+    ol_update_config,
+);

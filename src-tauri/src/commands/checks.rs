@@ -20,8 +20,6 @@ use crate::database::{
     Check, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput, UpdateCheckInput,
 };
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -813,32 +811,28 @@ pub async fn repair_check_group_associations(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_checks")
-        .invoke_handler(tauri::generate_handler![
-            execute_code_check,
-            execute_code_check_suite,
-            execute_check_by_id,
-            list_checks,
-            get_check,
-            create_check,
-            update_check,
-            delete_check,
-            detect_project_check_suggestions,
-            get_check_tool_info,
-            get_check_results,
-            list_check_groups,
-            get_check_group,
-            create_check_group,
-            update_check_group,
-            delete_check_group,
-            get_checks_in_group,
-            set_checks_in_group,
-            execute_check_group,
-            repair_check_group_associations,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    create_check,
+    create_check_group,
+    delete_check,
+    delete_check_group,
+    detect_project_check_suggestions,
+    execute_check_by_id,
+    execute_check_group,
+    execute_code_check,
+    execute_code_check_suite,
+    get_check,
+    get_check_group,
+    get_check_results,
+    get_check_tool_info,
+    get_checks_in_group,
+    list_check_groups,
+    list_checks,
+    repair_check_group_associations,
+    set_checks_in_group,
+    update_check,
+    update_check_group,
+);

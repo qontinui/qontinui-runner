@@ -1,8 +1,6 @@
 //! Tauri commands for DAG workflow operations.
 
 use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 use super::compartments::StorageCompartment;
@@ -117,17 +115,13 @@ pub async fn respond_dag_approval(
     crate::step_executor::handlers::dag_nodes::resolve_approval(&approval_id, approved)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_dag_workflows")
-        .invoke_handler(tauri::generate_handler![
-            validate_dag_workflow,
-            import_dag_workflow,
-            import_dag_workflows_from_project,
-            export_dag_workflow,
-            respond_dag_approval,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    export_dag_workflow,
+    import_dag_workflow,
+    import_dag_workflows_from_project,
+    respond_dag_approval,
+    validate_dag_workflow,
+);

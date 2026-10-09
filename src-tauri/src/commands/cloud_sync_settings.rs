@@ -15,8 +15,6 @@
 //!   off, the restore-record emitter writes nothing. Default ON — this half
 //!   carries no conversation content.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -75,16 +73,12 @@ pub fn save_session_metadata_sync_settings(
     })
 }
 
-/// Plugin registration (kept for future reuse alongside the central
-/// `generate_handler!` list in main.rs — see the rationale comment there).
-#[allow(dead_code)]
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_cloud_sync_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_cloud_sync_settings,
-            save_cloud_sync_settings,
-            get_session_metadata_sync_settings,
-            save_session_metadata_sync_settings
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_cloud_sync_settings,
+    save_cloud_sync_settings,
+    get_session_metadata_sync_settings,
+    save_session_metadata_sync_settings,
+);

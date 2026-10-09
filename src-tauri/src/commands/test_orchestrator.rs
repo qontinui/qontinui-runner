@@ -9,8 +9,6 @@ use crate::test_orchestrator::{
     OrchestrationExecutionResult, TestOrchestrationPlan, TestOrchestrationRequest,
     TestOrchestrator,
 };
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -288,17 +286,15 @@ pub async fn delete_orchestration_plan(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_test_orchestrator")
-        .invoke_handler(tauri::generate_handler![
-            plan_test_orchestration,
-            execute_test_orchestration,
-            generate_test_from_orchestration,
-            get_saved_requests_for_orchestration,
-            save_orchestration_plan,
-            list_orchestration_plans,
-            delete_orchestration_plan,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    delete_orchestration_plan,
+    execute_test_orchestration,
+    generate_test_from_orchestration,
+    get_saved_requests_for_orchestration,
+    list_orchestration_plans,
+    plan_test_orchestration,
+    save_orchestration_plan,
+);

@@ -3,8 +3,6 @@
 //! This module provides Tauri commands for the state explorer that
 //! enables AI-driven exploration of application states.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -391,17 +389,15 @@ pub async fn clear_exploration_history(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_state_explorer")
-        .invoke_handler(tauri::generate_handler![
-            start_exploration,
-            get_exploration_strategies,
-            preview_exploration_plan,
-            get_exploration_history,
-            get_exploration_report,
-            get_exploration_analysis_prompt,
-            clear_exploration_history,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    clear_exploration_history,
+    get_exploration_analysis_prompt,
+    get_exploration_history,
+    get_exploration_report,
+    get_exploration_strategies,
+    preview_exploration_plan,
+    start_exploration,
+);

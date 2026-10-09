@@ -19,7 +19,6 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// Environment variable that gates all dev-only endpoints in this module.
@@ -135,18 +134,6 @@ pub async fn dev_seed_finding<R: Runtime>(
     }))
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_dev_findings")
-        .invoke_handler(tauri::generate_handler![
-            is_dev_endpoints_enabled,
-            dev_seed_finding,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,3 +171,8 @@ mod tests {
         );
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(dev_seed_finding, is_dev_endpoints_enabled,);

@@ -9,8 +9,6 @@
 use crate::auth::AuthManager;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -959,15 +957,13 @@ async fn complete_execution_run_impl(
     Ok(result)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_execution_reporting")
-        .invoke_handler(tauri::generate_handler![
-            create_execution_run,
-            report_action_executions,
-            upload_execution_screenshot,
-            report_execution_issues,
-            complete_execution_run,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    complete_execution_run,
+    create_execution_run,
+    report_action_executions,
+    report_execution_issues,
+    upload_execution_screenshot,
+);

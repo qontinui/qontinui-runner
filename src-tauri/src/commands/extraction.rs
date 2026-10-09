@@ -13,8 +13,6 @@ use crate::auth::AuthManager;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -888,23 +886,21 @@ async fn get_project_extractions_impl(
     Ok(sessions)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_extraction")
-        .invoke_handler(tauri::generate_handler![
-            start_web_extraction,
-            start_vision_extraction,
-            stop_web_extraction,
-            get_extraction_status,
-            request_extraction_screenshot,
-            export_training_data,
-            export_state_structure,
-            list_extractions,
-            create_extraction_session,
-            update_extraction_session,
-            upload_extraction_annotations,
-            upload_state_structure,
-            get_project_extractions,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    create_extraction_session,
+    export_state_structure,
+    export_training_data,
+    get_extraction_status,
+    get_project_extractions,
+    list_extractions,
+    request_extraction_screenshot,
+    start_vision_extraction,
+    start_web_extraction,
+    stop_web_extraction,
+    update_extraction_session,
+    upload_extraction_annotations,
+    upload_state_structure,
+);

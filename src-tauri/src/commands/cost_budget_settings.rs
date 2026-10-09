@@ -130,3 +130,8 @@ mod tests {
         assert_eq!(served.clone().sanitized().sanitized(), served);
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(get_cost_budget_settings, save_cost_budget_settings,);

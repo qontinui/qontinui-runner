@@ -7,8 +7,6 @@
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{error, info, warn};
 
 /// Maximum file size for read_file_content (10 MB)
@@ -433,15 +431,7 @@ pub async fn read_file_content(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_file_browser")
-        .invoke_handler(tauri::generate_handler![
-            get_safe_browse_roots,
-            browse_directory,
-            read_file_content,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(browse_directory, get_safe_browse_roots, read_file_content,);

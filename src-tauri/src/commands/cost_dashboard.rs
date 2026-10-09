@@ -5,8 +5,6 @@
 
 use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 
 /// Unified cost dashboard summary.
 #[derive(Debug, Clone, Serialize)]
@@ -159,11 +157,7 @@ pub async fn get_active_budget_status(
     }
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_cost_dashboard")
-        .invoke_handler(tauri::generate_handler![
-            get_cost_dashboard,
-            get_active_budget_status,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(get_active_budget_status, get_cost_dashboard,);

@@ -5,8 +5,6 @@
 //! of a chunk's sorted state ids (see `chunkStateMachine` in
 //! `@qontinui/workflow-utils`), so labels survive input re-orderings.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::compartments::StorageCompartment;
@@ -48,15 +46,7 @@ pub async fn delete_chunk_label(
         .await
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_chunk_labels")
-        .invoke_handler(tauri::generate_handler![
-            list_chunk_labels,
-            upsert_chunk_label,
-            delete_chunk_label,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(delete_chunk_label, list_chunk_labels, upsert_chunk_label,);

@@ -315,3 +315,16 @@ mod tests {
         }
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    operator_run_prompt,
+    operator_run_unified_workflow,
+    operator_execute_inline_workflow,
+    operator_run_composed_workflow,
+    operator_generate_unified_workflow_async,
+    operator_resume_task_run,
+    scheduler_run_task_now,
+);

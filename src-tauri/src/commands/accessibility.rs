@@ -18,7 +18,6 @@ use qontinui_runner_lib::accessibility::model::UnifiedRole;
 use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
 use qontinui_runner_lib::accessibility::AccessibilityManager;
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
@@ -562,22 +561,20 @@ fn parse_connection_target(target: &str, _backend: &str) -> Result<ConnectionTar
     Ok(ConnectionTarget::WindowTitle(target.to_string()))
 }
 
-/// Tauri plugin exposing all accessibility commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_accessibility")
-        .invoke_handler(tauri::generate_handler![
-            get_accessibility_settings,
-            save_accessibility_settings,
-            launch_chrome_debug,
-            check_chrome_available,
-            a11y_connect,
-            a11y_capture,
-            a11y_query,
-            a11y_click,
-            a11y_type_text,
-            a11y_focus,
-            a11y_ai_context,
-            a11y_disconnect,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    a11y_ai_context,
+    a11y_capture,
+    a11y_click,
+    a11y_connect,
+    a11y_disconnect,
+    a11y_focus,
+    a11y_query,
+    a11y_type_text,
+    check_chrome_available,
+    get_accessibility_settings,
+    launch_chrome_debug,
+    save_accessibility_settings,
+);

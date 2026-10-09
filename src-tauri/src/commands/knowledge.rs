@@ -29,3 +29,8 @@ pub async fn search_knowledge(
         .search_knowledge_fts(&query, area_filter.as_deref(), top_k)
         .await
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(search_knowledge,);

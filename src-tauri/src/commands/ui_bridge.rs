@@ -28,8 +28,6 @@
 //! - `ui_bridge_get_snapshot` - Get a full snapshot of the UI bridge state
 //! - `ui_bridge_discover_states_from_fingerprints` - Discover states from fingerprint co-occurrence data
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -739,27 +737,23 @@ pub async fn ui_bridge_discover_states_native(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// Non-generic because handlers accept concrete `tauri::AppHandle`.
-pub fn plugin() -> TauriPlugin<tauri::Wry> {
-    PluginBuilder::<tauri::Wry>::new("qontinui_ui_bridge")
-        .invoke_handler(tauri::generate_handler![
-            ui_bridge_get_elements,
-            ui_bridge_get_element,
-            ui_bridge_execute_action,
-            ui_bridge_get_components,
-            ui_bridge_get_component,
-            ui_bridge_execute_component_action,
-            ui_bridge_discover,
-            ui_bridge_get_snapshot,
-            ui_bridge_discover_states_from_fingerprints,
-            ui_bridge_run_exploration,
-            ui_bridge_stop_exploration,
-            ui_bridge_reload_webview,
-            ui_bridge_run_exploration_native,
-            ui_bridge_stop_exploration_native,
-            ui_bridge_discover_states_native,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    ui_bridge_discover,
+    ui_bridge_discover_states_from_fingerprints,
+    ui_bridge_discover_states_native,
+    ui_bridge_execute_action,
+    ui_bridge_execute_component_action,
+    ui_bridge_get_component,
+    ui_bridge_get_components,
+    ui_bridge_get_element,
+    ui_bridge_get_elements,
+    ui_bridge_get_snapshot,
+    ui_bridge_reload_webview,
+    ui_bridge_run_exploration,
+    ui_bridge_run_exploration_native,
+    ui_bridge_stop_exploration,
+    ui_bridge_stop_exploration_native,
+);

@@ -265,3 +265,12 @@ pub fn update_capture_settings(
         data: None,
     })
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    start_python_executor,
+    stop_python_executor,
+    update_capture_settings,
+);

@@ -39,8 +39,6 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -282,13 +280,6 @@ pub async fn dismiss_recent_crash(
     Ok(())
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_crash_dumps")
-        .invoke_handler(tauri::generate_handler![dismiss_recent_crash])
-        .build()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -433,3 +424,8 @@ mod tests {
         assert!(state.get().await.is_none());
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(dismiss_recent_crash,);

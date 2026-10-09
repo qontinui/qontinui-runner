@@ -2,8 +2,6 @@
 
 use crate::commands::compartments::StorageCompartment;
 use crate::database::token_analytics::*;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 /// Get daily cost breakdown for the last N days (default: 7).
@@ -78,16 +76,15 @@ pub async fn get_token_usage_summary(
     state.pg_db().get_token_usage_summary(d).await
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_token_analytics")
-        .invoke_handler(tauri::generate_handler![
-            get_token_usage_summary,
-            get_daily_cost,
-            get_cost_by_model,
-            get_cost_by_phase,
-            get_provider_latency,
-            get_task_run_costs,
-            get_cost_by_target_app,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_cost_by_model,
+    get_cost_by_phase,
+    get_cost_by_target_app,
+    get_daily_cost,
+    get_provider_latency,
+    get_task_run_costs,
+    get_token_usage_summary,
+);

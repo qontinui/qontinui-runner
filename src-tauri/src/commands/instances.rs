@@ -1,7 +1,6 @@
 //! Tauri commands for managing runner instances (dev feature).
 
 use std::sync::Arc;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Manager;
 use tauri::State;
 use tracing::info;
@@ -412,26 +411,19 @@ pub async fn get_runner_identity(
     }))
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// The plugin is non-generic (defaulting to `tauri::Wry`) because
-/// some commands here take `tauri::AppHandle` (Wry-default) directly.
-/// This matches the pattern used by `commands::ui_bridge` and
-/// `commands::ai_session`.
-pub fn plugin() -> TauriPlugin<tauri::Wry> {
-    PluginBuilder::new("qontinui_instances")
-        .invoke_handler(tauri::generate_handler![
-            get_runner_instances,
-            save_runner_instance,
-            delete_runner_instance,
-            launch_runner_instance,
-            stop_runner_instance,
-            get_runner_identity,
-            list_repo_worktrees,
-            preview_spawn_placement,
-            list_monitors_for_placement,
-            get_temp_spawn_placements,
-            set_temp_spawn_placements,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    delete_runner_instance,
+    get_runner_identity,
+    get_runner_instances,
+    get_temp_spawn_placements,
+    launch_runner_instance,
+    list_monitors_for_placement,
+    list_repo_worktrees,
+    preview_spawn_placement,
+    save_runner_instance,
+    set_temp_spawn_placements,
+    stop_runner_instance,
+);

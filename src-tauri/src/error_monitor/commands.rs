@@ -11,8 +11,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -522,63 +520,25 @@ pub async fn get_error_recurrence_history(
     Ok(rows)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_error_monitor_commands")
-        .invoke_handler(tauri::generate_handler![
-            query_error_events,
-            get_error_event,
-            get_unresolved_errors,
-            update_error_status,
-            acknowledge_error,
-            resolve_error,
-            ignore_error,
-            link_error_to_finding,
-            get_error_summary,
-            search_errors,
-            has_actionable_errors,
-            get_recent_errors,
-            acknowledge_all_errors,
-            get_debug_context,
-            get_debug_context_for_ai,
-            open_error_in_editor,
-            get_error_recurrence_history,
-            super::workflow::check_fixable_errors,
-        ])
-        .build()
-}
-
-/// Get all commands that should be registered with Tauri.
-///
-/// Use this in your main.rs to register all error monitoring commands:
-/// ```ignore
-/// .invoke_handler(tauri::generate_handler![
-///     ...error_monitor::commands::all_commands(),
-///     ...other_commands,
-/// ])
-/// ```
-#[macro_export]
-macro_rules! error_monitor_commands {
-    () => {
-        [
-            $crate::error_monitor::commands::query_error_events,
-            $crate::error_monitor::commands::get_error_event,
-            $crate::error_monitor::commands::get_unresolved_errors,
-            $crate::error_monitor::commands::update_error_status,
-            $crate::error_monitor::commands::acknowledge_error,
-            $crate::error_monitor::commands::resolve_error,
-            $crate::error_monitor::commands::ignore_error,
-            $crate::error_monitor::commands::link_error_to_finding,
-            $crate::error_monitor::commands::get_error_summary,
-            $crate::error_monitor::commands::search_errors,
-            $crate::error_monitor::commands::has_actionable_errors,
-            $crate::error_monitor::commands::get_recent_errors,
-            $crate::error_monitor::commands::acknowledge_all_errors,
-            $crate::error_monitor::commands::get_debug_context,
-            $crate::error_monitor::commands::get_debug_context_for_ai,
-            $crate::error_monitor::commands::open_error_in_editor,
-            $crate::error_monitor::commands::get_error_recurrence_history,
-            $crate::error_monitor::workflow::check_fixable_errors,
-        ]
-    };
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    acknowledge_all_errors,
+    acknowledge_error,
+    get_debug_context,
+    get_debug_context_for_ai,
+    get_error_event,
+    get_error_recurrence_history,
+    get_error_summary,
+    get_recent_errors,
+    get_unresolved_errors,
+    has_actionable_errors,
+    ignore_error,
+    link_error_to_finding,
+    open_error_in_editor,
+    query_error_events,
+    resolve_error,
+    search_errors,
+    update_error_status,
+);

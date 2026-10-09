@@ -15,8 +15,6 @@ use chrono::Utc;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -1388,25 +1386,23 @@ pub async fn find_log_sources_with_ai(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_global_log_sources")
-        .invoke_handler(tauri::generate_handler![
-            find_log_sources_with_ai,
-            get_global_log_sources,
-            save_global_log_sources,
-            add_global_log_source,
-            update_global_log_source,
-            delete_global_log_source,
-            create_global_log_source_profile,
-            update_global_log_source_profile,
-            delete_global_log_source_profile,
-            set_default_log_source_profile,
-            set_log_source_ai_selection_mode,
-            read_global_log_sources,
-            read_log_sources_by_profile,
-            migrate_project_sources_to_global,
-            select_log_sources_for_context,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    add_global_log_source,
+    create_global_log_source_profile,
+    delete_global_log_source,
+    delete_global_log_source_profile,
+    find_log_sources_with_ai,
+    get_global_log_sources,
+    migrate_project_sources_to_global,
+    read_global_log_sources,
+    read_log_sources_by_profile,
+    save_global_log_sources,
+    select_log_sources_for_context,
+    set_default_log_source_profile,
+    set_log_source_ai_selection_mode,
+    update_global_log_source,
+    update_global_log_source_profile,
+);

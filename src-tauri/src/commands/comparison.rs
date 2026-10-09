@@ -8,8 +8,6 @@
 //!
 //! Migrated to StorageCompartment + HealthCompartment (Workstream C).
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::compartments::{HealthCompartment, StorageCompartment};
@@ -303,15 +301,7 @@ fn calculate_duration(created_at: &str, completed_at: Option<&str>) -> u64 {
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_comparison")
-        .invoke_handler(tauri::generate_handler![
-            start_comparison,
-            get_comparison_status,
-            list_comparisons,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(get_comparison_status, list_comparisons, start_comparison,);

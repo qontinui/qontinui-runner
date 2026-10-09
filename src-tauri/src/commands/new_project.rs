@@ -1594,3 +1594,8 @@ mod tests {
         assert_eq!(find_string_key(&v, &["missing"]), None);
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(check_project_name, create_new_project, github_oauth_status,);

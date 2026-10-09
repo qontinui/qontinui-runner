@@ -1108,3 +1108,13 @@ mod tests {
         assert!(last_mirror_outcome().unwrap().is_consistent());
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    remote_create_preference_get,
+    remote_create_preference_set,
+    remote_create_preference_reconcile,
+    terminal_create_remote,
+);

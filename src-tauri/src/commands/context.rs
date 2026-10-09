@@ -11,8 +11,6 @@
 use crate::context::{self, Context, ContextAutoInclude, ContextScope, ContextWithMetadata};
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -552,20 +550,19 @@ fn evaluate_auto_include_impl(
     })
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_context")
-        .invoke_handler(tauri::generate_handler![
-            get_all_contexts,
-            get_context,
-            create_context,
-            update_context,
-            delete_context,
-            search_contexts,
-            get_context_categories,
-            set_context_enabled,
-            record_context_usage,
-            get_builtin_contexts_cmd,
-            evaluate_auto_include,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    create_context,
+    delete_context,
+    evaluate_auto_include,
+    get_all_contexts,
+    get_builtin_contexts_cmd,
+    get_context,
+    get_context_categories,
+    record_context_usage,
+    search_contexts,
+    set_context_enabled,
+    update_context,
+);

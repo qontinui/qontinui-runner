@@ -7,8 +7,6 @@ use crate::discoveries::{
     self, sync_discoveries_batch, DiscoveryPayload, DiscoveryToSync, PendingDiscovery, SyncStatus,
 };
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -250,18 +248,14 @@ pub async fn get_discovery_sync_status(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_discoveries")
-        .invoke_handler(tauri::generate_handler![
-            get_pending_discoveries_cmd,
-            get_discovery_summary,
-            sync_discoveries,
-            clear_discovery,
-            clear_failed_discoveries,
-            get_discovery_sync_status,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    clear_discovery,
+    clear_failed_discoveries,
+    get_discovery_summary,
+    get_discovery_sync_status,
+    get_pending_discoveries_cmd,
+    sync_discoveries,
+);

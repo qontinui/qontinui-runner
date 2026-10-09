@@ -10,8 +10,6 @@ use crate::tiered_info::{
     self, ConfigStatistics, DebuggingContext, FlakyItem, RunDetails, RunStatus,
 };
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info, warn};
 
@@ -598,24 +596,22 @@ pub async fn delete_ai_session(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_tiered_info")
-        .invoke_handler(tauri::generate_handler![
-            get_config_statistics,
-            get_flaky_transitions,
-            get_flaky_templates,
-            get_debugging_context,
-            get_debugging_context_prompt,
-            get_run_details,
-            get_recent_runs,
-            get_failed_runs,
-            record_run,
-            cleanup_old_runs,
-            get_execution_options,
-            get_flakiness_summary,
-            get_ai_session_history,
-            delete_ai_session,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    cleanup_old_runs,
+    delete_ai_session,
+    get_ai_session_history,
+    get_config_statistics,
+    get_debugging_context,
+    get_debugging_context_prompt,
+    get_execution_options,
+    get_failed_runs,
+    get_flakiness_summary,
+    get_flaky_templates,
+    get_flaky_transitions,
+    get_recent_runs,
+    get_run_details,
+    record_run,
+);

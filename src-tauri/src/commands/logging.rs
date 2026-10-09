@@ -11,8 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use super::CommandResponse;
@@ -1120,24 +1118,6 @@ pub fn get_render_log_path_cmd() -> CommandResponse {
     }
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_logging")
-        .invoke_handler(tauri::generate_handler![
-            append_ai_output_log,
-            clear_ai_output_log,
-            get_ai_output_log_path_cmd,
-            load_ai_output_log,
-            list_session_checkpoints,
-            delete_session_checkpoints,
-            clear_all_run_history,
-            append_render_log,
-            clear_render_log,
-            load_render_log,
-            get_render_log_path_cmd,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod ai_output_sink_tests {
     use super::*;
@@ -1356,3 +1336,20 @@ mod ai_output_sink_tests {
         worker.join().expect("worker exits when the sender drops");
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    append_ai_output_log,
+    append_render_log,
+    clear_ai_output_log,
+    clear_all_run_history,
+    clear_render_log,
+    delete_session_checkpoints,
+    get_ai_output_log_path_cmd,
+    get_render_log_path_cmd,
+    list_session_checkpoints,
+    load_ai_output_log,
+    load_render_log,
+);
