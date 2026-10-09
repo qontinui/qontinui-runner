@@ -155,8 +155,11 @@ BASE="$PWD"
 # Restart all web services
 "$BASE/qontinui-claude-config/scripts/restart-services.sh" all
 
-# Restart runner (if Python code changed)
-powershell.exe -Command "Stop-Process -Name qontinui-runner -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; cd '$PWD\qontinui-runner'; Start-Process -FilePath 'npm.cmd' -ArgumentList 'run','tauri','dev' -WindowStyle Normal"
+# Runner (if Python code changed) - do not restart it yourself:
+# Never restart, kill or rebuild a running runner (served policy production-and-cost
+# runner-lifecycle): READ whether a restart is safe, report it, the operator restarts.
+curl -sS --max-time 15 http://127.0.0.1:9876/restart-readiness
+# Report safe_to_restart, terminal_sessions.count, ai_sessions.count, reason; a failed read is UNKNOWN.
 ```
 
 ### Step 8: Re-run Test

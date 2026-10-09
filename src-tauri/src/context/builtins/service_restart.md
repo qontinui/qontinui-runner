@@ -12,29 +12,30 @@ cd {{WORKSPACE}}; .\dev-start.ps1 -Backend
 
 # Restart frontend (Next.js)
 cd {{WORKSPACE}}; .\dev-start.ps1 -Frontend
-
-# Restart API service
-cd {{WORKSPACE}}; .\dev-start.ps1 -Api
-
-# Restart all services
-cd {{WORKSPACE}}; .\dev-start.ps1 -All
 ```
 
-**Alternative (if dev-start.ps1 is not available):**
+`dev-start.ps1` is Windows-only. On Linux there is no equivalent restart command
+here: report that the backend/frontend were not restarted rather than killing
+processes by hand. Never kill processes by name (`Stop-Process -Name python`,
+`Stop-Process -Name node`, `taskkill /IM node.exe`, ...): that takes down unrelated
+tools and, for `node` / `powershell`, live Claude Code sessions.
 
-```powershell
-# Backend - kill and restart
-Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match 'backend' } | Stop-Process -Force
-cd {{WORKSPACE}}\backend && poetry run python run.py
+### The runner: never restart it — read and report
 
-# Frontend - kill and restart
-Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'next' } | Stop-Process -Force
-cd {{WORKSPACE}}\frontend && npm run dev
+An agent never stops, kills, restarts or rebuilds a running runner (served policy
+`production-and-cost` `runner-lifecycle`), and so never runs any `dev-start.ps1`
+switch that stops the runner (`-All`, `-Runner`, `-Fresh`, `-Supervisor`, `-Stop`,
+`-StopRunner`, `-StopSupervisor`). Instead:
 
-# Tauri runner - restart
-Stop-Process -Name qontinui-runner -Force -ErrorAction SilentlyContinue
-cd {{WORKSPACE}}\qontinui-runner && npm run tauri dev
+```bash
+curl -sS --max-time 15 http://127.0.0.1:9876/restart-readiness
 ```
+
+Report `safe_to_restart`, `terminal_sessions.count`, `ai_sessions.count` and
+`reason` from the response. A failed read (unreachable, non-2xx, unparseable, or a
+404 from a build that predates the endpoint) is UNKNOWN, never "safe". Then stop:
+the operator restarts the runner. Verify runner code changes on an ephemeral build
+(`cargo-guard.sh check` / `cargo-guard.sh test`) instead.
 
 ### Customization
 
