@@ -4888,6 +4888,20 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
 ///   default, precedence-aware re-derive, reversible by re-running).
 ///
+/// `coord_fleet_dispatch_roles` (qontinui-coord#3015, plan
+/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` Phase 3) is the
+/// read-only twin of `GET /coord/fleet/dispatch-roles`: every machine of the
+/// caller's tenant with its dispatch role, the lane verdicts composing role and
+/// drain, and the role suggestion. That PR (head `9da84247`, OPEN as of
+/// 2026-10-08) grants it on coord's `READ_ONLY_TOOLS`, `MERGER_TOOLS` and
+/// `DEVICE_DEFAULT_TOOLS` beside `coord_fleet_drain_status`, for the same
+/// reason: a session that cannot see a machine's role reads a bench or CI node
+/// as an idle workhorse. Its WRITE (`PUT /coord/fleet/dispatch-role`) is
+/// operator-only there and has no MCP tool, so there is nothing to exclude.
+/// Forwarding the name before coord serves it grants nothing: coord answers
+/// its own unknown-tool error. Re-verify against coord `origin/main` when
+/// editing this paragraph.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4952,6 +4966,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_explain_worktree",
     "coord_find_references",
     "coord_fixer_arm_readiness",
+    "coord_fleet_dispatch_roles",
     "coord_fleet_drain_status",
     "coord_force_clear_gate",
     "coord_gate_doctor",
@@ -17208,6 +17223,39 @@ mod coord_mcp_body_gate_tests {
         assert!(coord_mcp_withholding_is_deliberate(
             "coord_attest_escalate_override"
         ));
+    }
+
+    /// The dispatch-role read (qontinui-coord#3015) is forwarded like its
+    /// sibling drain read. Pinned by name so dropping it reds this test.
+    #[test]
+    fn fleet_dispatch_roles_read_is_forwarded() {
+        let tool = "coord_fleet_dispatch_roles";
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+            1,
+            "the parser must read {tool} exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+        assert!(
+            coord_mcp_tool_is_allowed(tool),
+            "{tool} is on coord's device floor beside coord_fleet_drain_status and must \
+             not be withheld here"
+        );
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not be both allowed and listed as a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
