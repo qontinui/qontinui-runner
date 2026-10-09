@@ -937,3 +937,186 @@ function ConvertFrom-VerbatimPath {
     if ($Path -like '\\?\*')      { return $Path.Substring(4) }
     return $Path
 }
+
+# ===========================================================================
+# PLATFORM (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 6B -- the Linux published leg).
+#
+# The harness was Windows-shaped in three places that are not about the
+# artifact at all: the dev binary's FILE NAME (`.exe`), the separator its
+# build-dir guard matched on (`\target\debug\`), and the process table its
+# teardown walked (Win32_Process). Each is decided here, as a pure function, so
+# scripts/tests/test-parity-diff.ps1 pins it on whichever interpreter runs the
+# suite -- the 5.1 gate on the Windows job, pwsh 7 on the Linux one.
+# ===========================================================================
+
+# 'windows' | 'linux' | 'macos'. $IsLinux / $IsMacOS do not exist on Windows
+# PowerShell 5.1, and $null is false, so 5.1 lands on 'windows' -- which is the
+# only platform 5.1 runs on.
+function Get-ParityHostPlatform {
+    if ($IsLinux) { return 'linux' }
+    if ($IsMacOS) { return 'macos' }
+    return 'windows'
+}
+
+# The cargo binary's file name on a platform. Tauri 2 does not rename it to
+# productName on any of them, so the only difference is the extension.
+function Get-ParityDevExeName {
+    param([ValidateSet('windows', 'linux', 'macos')] [string]$Platform)
+    if ($Platform -eq 'windows') { return 'qontinui-runner.exe' }
+    return 'qontinui-runner'
+}
+
+# True when $Path lies under a cargo build directory (target/debug or
+# target/release), with EITHER separator. The dev leg is required to be such a
+# path, so this is one half of the disjointness the harness header promises. It
+# used to match only `\target\`, which on Linux would refuse every dev binary.
+function Test-ParityDevBuildPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $norm = ($Path -replace '\\', '/')
+    return [bool]($norm -match '(?i)/target/(debug|release)/')
+}
+
+# One line of /proc/<pid>/stat -> { ProcessId, ParentProcessId, Name,
+# CreationDate }, or $null when the line does not parse. CreationDate is the
+# kernel's `starttime` (field 22, clock ticks since boot): not a date, but
+# ordered the same way within one boot, which is the only use the teardown makes
+# of it (a child created BEFORE the root is a recycled pid, never a descendant).
+#
+# Field 2 (comm) is parenthesised and may itself contain spaces and ')', so the
+# remaining fields are counted from the LAST ')'. After it: field 3 (state) is
+# index 0, field 4 (ppid) index 1, field 22 (starttime) index 19.
+function ConvertFrom-ParityProcStat {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    $open = $Line.IndexOf('(')
+    $close = $Line.LastIndexOf(')')
+    if ($open -lt 1 -or $close -lt $open) { return $null }
+    $rest = @($Line.Substring($close + 1).Trim() -split '\s+')
+    if ($rest.Count -lt 20) { return $null }
+    $procId = 0
+    $parentId = 0
+    [long]$start = 0
+    if (-not [int]::TryParse($Line.Substring(0, $open).Trim(), [ref]$procId)) { return $null }
+    if (-not [int]::TryParse($rest[1], [ref]$parentId)) { return $null }
+    if (-not [long]::TryParse($rest[19], [ref]$start)) { return $null }
+    return [PSCustomObject]@{
+        ProcessId       = $procId
+        ParentProcessId = $parentId
+        Name            = $Line.Substring($open + 1, $close - $open - 1)
+        CreationDate    = $start
+    }
+}
+
+# ===========================================================================
+# CROSS-PLATFORM, PUBLISHED SIDE ONLY (Phase 6B's third number).
+#
+# Given the Windows leg's report and the Linux leg's report -- each the JSON
+# ConvertTo-ParityReportObject wrote, read back -- list the capability rows
+# whose PUBLISHED rung differs between the two platforms.
+#
+# This is deliberately NOT a parity number and is never added to
+# parity_defects: the metric's unit is development-vs-published on ONE
+# platform. A row that resolves `bundle_resource` on Windows and `unresolved` on
+# Linux is a fact about the Linux artifact that neither per-platform count can
+# show, which is why it is reported -- as its own list.
+#
+# The same rule as the main comparator: a row either leg did not observe is
+# UNOBSERVED, never agreement. And the comparison REFUSES (Available = $false,
+# DifferCount = $null) rather than producing a number when it would be
+# meaningless: a missing report, a schema-refused report, or two published
+# builds of different versions -- a difference between v1.0.11 on one side and
+# v1.0.12 on the other is version skew, not platform.
+# ===========================================================================
+function New-ParityCrossPlatformRefusal {
+    param([string]$Reason, $WindowsVersion = $null, $LinuxVersion = $null)
+    return [PSCustomObject]@{
+        Available       = $false
+        Reason          = $Reason
+        Rows            = @()
+        DifferCount     = $null
+        SameCount       = $null
+        UnobservedCount = $null
+        WindowsVersion  = $WindowsVersion
+        LinuxVersion    = $LinuxVersion
+    }
+}
+
+function Compare-ParityPublishedAcrossPlatforms {
+    param($WindowsReport, $LinuxReport)
+
+    if ($null -eq $WindowsReport) { return (New-ParityCrossPlatformRefusal 'windows_report_missing') }
+    if ($null -eq $LinuxReport) { return (New-ParityCrossPlatformRefusal 'linux_report_missing') }
+    if ($WindowsReport.schema_refused) { return (New-ParityCrossPlatformRefusal 'windows_report_schema_refused') }
+    if ($LinuxReport.schema_refused) { return (New-ParityCrossPlatformRefusal 'linux_report_schema_refused') }
+
+    $winVer = $null
+    $linVer = $null
+    if ($WindowsReport.build_identity -and $WindowsReport.build_identity.published) { $winVer = $WindowsReport.build_identity.published.app_version }
+    if ($LinuxReport.build_identity -and $LinuxReport.build_identity.published) { $linVer = $LinuxReport.build_identity.published.app_version }
+    if ([string]::IsNullOrWhiteSpace([string]$winVer) -or [string]::IsNullOrWhiteSpace([string]$linVer)) {
+        return (New-ParityCrossPlatformRefusal 'published_version_unknown' $winVer $linVer)
+    }
+    if ([string]$winVer -ne [string]$linVer) {
+        return (New-ParityCrossPlatformRefusal 'published_versions_differ' $winVer $linVer)
+    }
+
+    $win = @{}
+    $lin = @{}
+    $order = New-Object System.Collections.Generic.List[string]
+    foreach ($row in @($WindowsReport.rows)) {
+        if ($null -eq $row) { continue }
+        $win[[string]$row.id] = $row
+        if (-not $order.Contains([string]$row.id)) { $order.Add([string]$row.id) }
+    }
+    foreach ($row in @($LinuxReport.rows)) {
+        if ($null -eq $row) { continue }
+        $lin[[string]$row.id] = $row
+        if (-not $order.Contains([string]$row.id)) { $order.Add([string]$row.id) }
+    }
+
+    $rows = @()
+    $differ = 0
+    $same = 0
+    $unobserved = 0
+    foreach ($id in $order) {
+        $w = $win[$id]
+        $l = $lin[$id]
+        $wr = $null
+        $lr = $null
+        if ($null -ne $w) { $wr = $w.published_rung }
+        if ($null -ne $l) { $lr = $l.published_rung }
+        if ($null -eq $w) {
+            $disp = 'only_on_linux'
+        } elseif ($null -eq $l) {
+            $disp = 'only_on_windows'
+        } elseif (-not $w.published_observed -or -not $l.published_observed) {
+            $disp = 'unobserved'
+            $unobserved++
+        } elseif ([string]$wr -ne [string]$lr) {
+            $disp = 'differs'
+            $differ++
+        } else {
+            $disp = 'same'
+            $same++
+        }
+        $rows += [PSCustomObject]@{
+            id                     = $id
+            windows_published_rung = $wr
+            linux_published_rung   = $lr
+            disposition            = $disp
+        }
+    }
+
+    return [PSCustomObject]@{
+        Available       = $true
+        Reason          = $null
+        Rows            = $rows
+        DifferCount     = $differ
+        SameCount       = $same
+        UnobservedCount = $unobserved
+        WindowsVersion  = $winVer
+        LinuxVersion    = $linVer
+    }
+}

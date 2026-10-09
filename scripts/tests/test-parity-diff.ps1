@@ -603,6 +603,107 @@ if ($IsWindows -or $env:OS -eq 'Windows_NT') {
     Write-Host "  skip Join-Path arms (not Windows; drive qualifiers do not resolve here)" -ForegroundColor DarkGray
 }
 
+
+# ---------------------------------------------------------------------------
+# [14] Platform helpers (Phase 6B). The dev leg's name and build-dir guard were
+# Windows literals; on Linux they would have refused every dev binary.
+# ---------------------------------------------------------------------------
+Write-Host "[14] platform helpers: dev exe name, build-dir guard, /proc/<pid>/stat"
+Assert-Equal "windows dev exe"                 'qontinui-runner.exe' (Get-ParityDevExeName -Platform 'windows')
+Assert-Equal "linux dev exe"                   'qontinui-runner'     (Get-ParityDevExeName -Platform 'linux')
+Assert-True  "host platform is one of three"   (@('windows', 'linux', 'macos') -contains (Get-ParityHostPlatform))
+Assert-True  "backslash build dir accepted"    (Test-ParityDevBuildPath 'D:\a\qontinui-runner\target\debug\qontinui-runner.exe')
+Assert-True  "slash build dir accepted"        (Test-ParityDevBuildPath '/home/runner/work/qontinui-runner/target/debug/qontinui-runner')
+Assert-True  "release profile accepted"        (Test-ParityDevBuildPath '/w/target/release/qontinui-runner')
+Assert-True  "an unpacked prefix is NOT one"   (-not (Test-ParityDevBuildPath '/tmp/prefix/usr/bin/qontinui-runner'))
+Assert-True  "an install dir is NOT one"       (-not (Test-ParityDevBuildPath 'C:\Users\u\AppData\Local\Qontinui Runner\qontinui-runner.exe'))
+Assert-True  "a target-agent dir is NOT one"   (-not (Test-ParityDevBuildPath '/w/target-agent/debug/qontinui-runner'))
+Assert-True  "empty is NOT one"                (-not (Test-ParityDevBuildPath ''))
+
+# A real /proc/<pid>/stat line shape, including a comm with a space and a ')'
+# inside it -- the case a naive split on whitespace gets wrong by one field.
+$stat = '4242 (WebKit Net)work) S 4100 4242 4100 0 -1 4194560 1234 0 0 0 10 5 0 0 20 0 7 0 987654 123456789 3000 18446744073709551615 1 1 0 0 0 0 0 4096 0 0 0 0 17 3 0 0 0 0 0'
+$ps = ConvertFrom-ParityProcStat -Line $stat
+Assert-Equal "stat: pid"                       4242     $ps.ProcessId
+Assert-Equal "stat: ppid (counted from the LAST paren)" 4100 $ps.ParentProcessId
+Assert-Equal "stat: starttime (field 22)"      987654   $ps.CreationDate
+Assert-Equal "stat: comm keeps its paren"      'WebKit Net)work' $ps.Name
+Assert-Equal "stat: empty line"                $null    (ConvertFrom-ParityProcStat -Line '')
+Assert-Equal "stat: truncated line"            $null    (ConvertFrom-ParityProcStat -Line '12 (x) S 1 2')
+Assert-Equal "stat: non-numeric pid"           $null    (ConvertFrom-ParityProcStat -Line ('x (y) ' + (@(1..25) -join ' ')))
+
+# ---------------------------------------------------------------------------
+# [15] Cross-platform, published side only. The reports are built by the REAL
+# pipeline (Compare-CapabilityManifests -> ConvertTo-ParityReportObject) and
+# round-tripped through JSON, because the workflow compares the two JSON
+# artifacts the legs uploaded, not in-memory objects.
+# ---------------------------------------------------------------------------
+Write-Host "[15] cross-platform comparison over two real-shaped reports"
+function New-PlatformReport {
+    param($Published, [string]$Platform)
+    $res = Compare-CapabilityManifests -Dev (New-Manifest) -Published $Published
+    $obj = ConvertTo-ParityReportObject -Result $res -GeneratedAt '2026-10-09T00:00:00Z' -Observability $null
+    $obj | Add-Member -NotePropertyName platform -NotePropertyValue $Platform
+    return (($obj | ConvertTo-Json -Depth 10) | ConvertFrom-Json)
+}
+$pubObserved = { Set-Rung (Set-Rung (New-Manifest) 'bundled_resources' 'bundle_resource') 'spec_pages' 'embedded' }
+
+$winR = New-PlatformReport (& $pubObserved) 'windows'
+$linR = New-PlatformReport (& $pubObserved) 'linux'
+$c1 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $linR
+Assert-True  "identical: available"            $c1.Available
+Assert-Equal "identical: differs"              0 $c1.DifferCount
+Assert-Equal "identical: same (3 observed rows)" 3 $c1.SameCount
+Assert-Equal "identical: unobserved rows are NOT same" 6 $c1.UnobservedCount
+Assert-Equal "identical: version carried"      '1.0.10' $c1.WindowsVersion
+
+$linDiff = New-PlatformReport (Set-Rung (& $pubObserved) 'bundled_resources' 'unresolved') 'linux'
+$c2 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $linDiff
+Assert-Equal "one differing row: differs"      1 $c2.DifferCount
+$row = @($c2.Rows | Where-Object { $_.id -eq 'bundled_resources' })[0]
+Assert-Equal "  the row is bundled_resources"  'differs' $row.disposition
+Assert-Equal "  windows rung"                  'bundle_resource' $row.windows_published_rung
+Assert-Equal "  linux rung"                    'unresolved' $row.linux_published_rung
+
+# unknown on ONE platform is unobserved, never a difference and never agreement.
+$linUnknown = New-PlatformReport (Set-Rung (& $pubObserved) 'spec_pages' 'unknown') 'linux'
+$c3 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $linUnknown
+Assert-Equal "unknown on linux: not a difference" 0 $c3.DifferCount
+Assert-Equal "unknown on linux: unobserved"    'unobserved' (@($c3.Rows | Where-Object { $_.id -eq 'spec_pages' })[0]).disposition
+
+# A row only one roster carries.
+$linExtra = New-PlatformReport (Add-Row (& $pubObserved) 'session_cli' 'bundle_resource') 'linux'
+$c4 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $linExtra
+Assert-Equal "roster difference is labelled"   'only_on_linux' (@($c4.Rows | Where-Object { $_.id -eq 'session_cli' })[0]).disposition
+Assert-Equal "  and is not counted as differs" 0 $c4.DifferCount
+
+# ---------------------------------------------------------------------------
+# [16] The refusals. Each one would otherwise produce a number that means
+# something else: a 0 from a missing leg, or "platform difference" from two
+# different releases.
+# ---------------------------------------------------------------------------
+Write-Host "[16] cross-platform refusals are UNKNOWN, never 0"
+$r1 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $null
+Assert-True  "missing linux: unavailable"      (-not $r1.Available)
+Assert-Equal "missing linux: reason"           'linux_report_missing' $r1.Reason
+Assert-Equal "missing linux: count is null, not 0" $null $r1.DifferCount
+Assert-Equal "missing windows: reason"         'windows_report_missing' (Compare-ParityPublishedAcrossPlatforms -WindowsReport $null -LinuxReport $linR).Reason
+
+$newer = & $pubObserved
+$newer.app_version = '1.0.12'
+$r2 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport (New-PlatformReport $newer 'linux')
+Assert-Equal "versions differ: reason"         'published_versions_differ' $r2.Reason
+Assert-Equal "versions differ: count is null"  $null $r2.DifferCount
+Assert-Equal "versions differ: linux version named" '1.0.12' $r2.LinuxVersion
+
+$refused = New-PlatformReport (& $pubObserved) 'linux'
+$refused.schema_refused = $true
+Assert-Equal "schema-refused: reason"          'linux_report_schema_refused' (Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $refused).Reason
+
+$noVer = & $pubObserved
+$noVer.app_version = $null
+Assert-Equal "version unknown: reason"         'published_version_unknown' (Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport (New-PlatformReport $noVer 'linux')).Reason
+
 Write-Host ""
 if ($failures -gt 0) {
     Write-Host "PARITY-DIFF-TESTS FAILED: $failures of $checks checks" -ForegroundColor Red
