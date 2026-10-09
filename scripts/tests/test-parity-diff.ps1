@@ -706,6 +706,7 @@ $r5 = Compare-ParityPublishedAcrossPlatforms -WindowsReport (New-PlatformReport 
 Assert-True  "no row on both: unavailable"     (-not $r5.Available)
 Assert-Equal "no row on both: reason"          'no_row_observed_on_both' $r5.Reason
 Assert-Equal "no row on both: count is null, not 0" $null $r5.DifferCount
+Assert-Equal "no row on both: the rows are kept for diagnosis" 9 @($r5.Rows).Count
 Assert-Equal "roster-only row is counted"      1 $c4.OnlyOnOneCount
 
 $noVer = & $pubObserved

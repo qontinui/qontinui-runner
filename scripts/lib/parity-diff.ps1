@@ -1116,8 +1116,14 @@ function Compare-ParityPublishedAcrossPlatforms {
     # Nothing compared is not "0 differ". With every row unobserved on at least
     # one platform (an artifact that predates the probe route, a refused
     # provisioning drive) the honest answer is UNKNOWN.
+    # The rows are kept on the refusal: which ones went unobserved is exactly
+    # what diagnoses an artifact that predates the probe route.
     if (($differ + $same) -eq 0) {
-        return (New-ParityCrossPlatformRefusal 'no_row_observed_on_both' $winVer $linVer)
+        $r = New-ParityCrossPlatformRefusal 'no_row_observed_on_both' $winVer $linVer
+        $r.Rows = $rows
+        $r.UnobservedCount = $unobserved
+        $r.OnlyOnOneCount = $onlyOnOne
+        return $r
     }
 
     return [PSCustomObject]@{
