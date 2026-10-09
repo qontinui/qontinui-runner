@@ -101,7 +101,10 @@ pub struct CreateTaskRunPlaywrightResultParams<
     pub assertions_failed: i32,
 }
 #[derive(Debug)]
-pub struct GetTaskRunPlaywrightResultsPageParams<T1: crate::StringSql, T2: crate::StringSql> {
+pub struct GetTaskRunPlaywrightResultsPageParams<
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+> {
     pub task_run_id: T1,
     pub after_created_at: chrono::DateTime<chrono::FixedOffset>,
     pub after_id: T2,
@@ -183,7 +186,11 @@ pub struct CreateTaskRunAwasStepParams<
     pub duration_ms: Option<i64>,
 }
 #[derive(Debug)]
-pub struct GetTaskRunAwasStepsPageParams<T1: crate::StringSql, T2: crate::StringSql, T3: crate::StringSql> {
+pub struct GetTaskRunAwasStepsPageParams<
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+> {
     pub task_run_id: T1,
     pub filter_by_step_type: bool,
     pub step_type: T2,
@@ -859,8 +866,7 @@ pub struct GetTaskRunApiRequestsPageBorrowed<'a> {
     pub total_from_start: i64,
     pub succeeded_from_start: i64,
 }
-impl<'a> From<GetTaskRunApiRequestsPageBorrowed<'a>>
-for GetTaskRunApiRequestsPage {
+impl<'a> From<GetTaskRunApiRequestsPageBorrowed<'a>> for GetTaskRunApiRequestsPage {
     fn from(
         GetTaskRunApiRequestsPageBorrowed {
             id,
@@ -3189,10 +3195,7 @@ impl GetTaskRunPlaywrightResultsPageStmt {
             cached: self.1.as_ref(),
             extractor: |
                 row: &tokio_postgres::Row,
-            | -> Result<
-                GetTaskRunPlaywrightResultsPageBorrowed,
-                tokio_postgres::Error,
-            > {
+            | -> Result<GetTaskRunPlaywrightResultsPageBorrowed, tokio_postgres::Error> {
                 Ok(GetTaskRunPlaywrightResultsPageBorrowed {
                     id: row.try_get(0)?,
                     task_run_id: row.try_get(1)?,
@@ -3252,7 +3255,13 @@ impl<
         GetTaskRunPlaywrightResultsPage,
         4,
     > {
-        self.bind(client, &params.task_run_id, &params.after_created_at, &params.after_id, &params.max_results)
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.after_created_at,
+            &params.after_id,
+            &params.max_results,
+        )
     }
 }
 pub struct CreateTaskRunApiRequestStmt(&'static str, Option<tokio_postgres::Statement>);
@@ -3532,17 +3541,17 @@ impl GetTaskRunApiRequestsPageStmt {
         after_created_at: &'a chrono::DateTime<chrono::FixedOffset>,
         after_id: &'a T2,
         max_results: &'a i64,
-    ) -> GetTaskRunApiRequestsPageQuery<
-        'c,
-        'a,
-        's,
-        C,
-        GetTaskRunApiRequestsPage,
-        6,
-    > {
+    ) -> GetTaskRunApiRequestsPageQuery<'c, 'a, 's, C, GetTaskRunApiRequestsPage, 6> {
         GetTaskRunApiRequestsPageQuery {
             client,
-            params: [task_run_id, filter_by_success, success, after_created_at, after_id, max_results],
+            params: [
+                task_run_id,
+                filter_by_success,
+                success,
+                after_created_at,
+                after_id,
+                max_results,
+            ],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |
@@ -3597,15 +3606,16 @@ impl<
         &'s self,
         client: &'c C,
         params: &'a GetTaskRunApiRequestsPageParams<T1, T2>,
-    ) -> GetTaskRunApiRequestsPageQuery<
-        'c,
-        'a,
-        's,
-        C,
-        GetTaskRunApiRequestsPage,
-        6,
-    > {
-        self.bind(client, &params.task_run_id, &params.filter_by_success, &params.success, &params.after_created_at, &params.after_id, &params.max_results)
+    ) -> GetTaskRunApiRequestsPageQuery<'c, 'a, 's, C, GetTaskRunApiRequestsPage, 6> {
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.filter_by_success,
+            &params.success,
+            &params.after_created_at,
+            &params.after_id,
+            &params.max_results,
+        )
     }
 }
 pub struct CreateTaskRunAwasStepStmt(&'static str, Option<tokio_postgres::Statement>);
@@ -3773,10 +3783,7 @@ impl GetTaskRunAwasStepsStmt {
         }
     }
 }
-pub struct GetTaskRunAwasStepsPageStmt(
-    &'static str,
-    Option<tokio_postgres::Statement>,
-);
+pub struct GetTaskRunAwasStepsPageStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_awas_steps_page() -> GetTaskRunAwasStepsPageStmt {
     GetTaskRunAwasStepsPageStmt(
         "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start FROM task_run_awas_steps WHERE task_run_id = $1 AND (NOT $2 OR step_type = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
@@ -3811,7 +3818,14 @@ impl GetTaskRunAwasStepsPageStmt {
     ) -> GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, GetTaskRunAwasStepsPage, 6> {
         GetTaskRunAwasStepsPageQuery {
             client,
-            params: [task_run_id, filter_by_step_type, step_type, after_created_at, after_id, max_results],
+            params: [
+                task_run_id,
+                filter_by_step_type,
+                step_type,
+                after_created_at,
+                after_id,
+                max_results,
+            ],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |
@@ -3860,6 +3874,14 @@ impl<
         client: &'c C,
         params: &'a GetTaskRunAwasStepsPageParams<T1, T2, T3>,
     ) -> GetTaskRunAwasStepsPageQuery<'c, 'a, 's, C, GetTaskRunAwasStepsPage, 6> {
-        self.bind(client, &params.task_run_id, &params.filter_by_step_type, &params.step_type, &params.after_created_at, &params.after_id, &params.max_results)
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.filter_by_step_type,
+            &params.step_type,
+            &params.after_created_at,
+            &params.after_id,
+            &params.max_results,
+        )
     }
 }
