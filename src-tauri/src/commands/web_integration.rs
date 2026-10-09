@@ -862,6 +862,29 @@ pub async fn redeem_pair_code(
     complete_pairing_after_redeem(&resp, tenant_id, &web_base, "redeem_pair_code", || Ok(()))
         .await?;
 
+    // Plan 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3:
+    // the redeem response carries no device machine key, so enrol one now with
+    // the just-minted device JWT. Without it this device has no unattended way
+    // back if its JWT expires during an outage. Best-effort — the pairing
+    // already succeeded, and the refresher retries enrolment on its cadence.
+    {
+        let enrol_base = web_base.clone();
+        let enrol_resp = resp.clone();
+        match spawn_blocking_tracked(move || {
+            qontinui_runner_lib::pair::enrol_machine_key_after_pairing(&enrol_base, &enrol_resp)
+        })
+        .await
+        {
+            Ok(Ok(true)) => info!("redeem_pair_code: device machine key enrolled"),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => warn!(
+                "redeem_pair_code: device machine key enrolment did not complete ({e}); \
+                 the refresher retries it"
+            ),
+            Err(e) => warn!("redeem_pair_code: machine-key enrolment task failed: {e}"),
+        }
+    }
+
     // Redeeming a pair code IS an explicit interactive credential acquisition —
     // the operator typed a code that a signed-in web session minted — so it ends
     // any interactive logout, exactly like a Cognito sign-in does.
