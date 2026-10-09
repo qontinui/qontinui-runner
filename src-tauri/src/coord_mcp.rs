@@ -2514,19 +2514,21 @@ impl NonceState {
                 GracedNonce {
                     expires_at: now + remaining,
                     grace_until,
-                    workdir: g.workdir.clone(),
+                    workdir: normalize_binding_workdir(&g.workdir),
                     terminal_id: g.terminal_id.clone(),
                     session_tenant: g.session_tenant,
                     pin_origin: PinOrigin::restored(g.session_tenant, g.session_tenant_origin),
                     // Restored VERBATIM when settled (never re-resolved, F2),
-                    // pending otherwise — no settle hook: a graced key is never
-                    // re-persisted by its own resolution.
+                    // pending otherwise. The settle hook persists an answer that
+                    // lands after the restart (the persist writes the grace
+                    // snapshot too), so a second restart does not re-resolve it.
                     expected: match g.expected_tenant.clone() {
                         Some(cwd) => {
                             crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named)
                         }
                         None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
-                    },
+                    }
+                    .with_settle_hook(persist_on_settle()),
                 },
             );
             self.tombstone(
@@ -7230,7 +7232,7 @@ pub(crate) struct SessionDecisionInputs {
 
 /// [`session_tenant_or_refuse`] without its logging — for read-only reporters.
 pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecision {
-    let inputs = session_decision_inputs(nonce);
+    let mut inputs = session_decision_inputs(nonce);
     let decision = decide_session_tenant(
         inputs.binding_pin,
         inputs.binding_origin,
@@ -7240,6 +7242,11 @@ pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecis
         device_jwt_claim_tenant,
         validate_spawn_tenant,
     );
+    // A read-only reporter never awaits the first resolution the proxy awaits,
+    // so a key whose expectation has not been ASKED yet (restored, adopted,
+    // graced, before its first call) is not "refused by every request": the
+    // proxy settles it on that call. Same guard as the doctor's.
+    inputs.repo_steers = inputs.repo_steers && inputs.repo.is_some();
     repo_unsettled_refusal(&inputs, &decision, device_is_multi_bound).unwrap_or(decision)
 }
 
