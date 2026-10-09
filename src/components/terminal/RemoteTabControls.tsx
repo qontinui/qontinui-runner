@@ -19,6 +19,23 @@ import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
 import { useRemoteInteractivity } from "./useRemoteInteractivity";
 
 /**
+ * The action roster of a remote tab's header controls — one id per button,
+ * rendered as `data-remote-action`. These are the remote-only affordances; the
+ * local-vs-remote parity matrix (`remoteParity.ts`) is pinned against this
+ * roster as well as `ZONE_HOVER_ACTIONS`, so a button added here without a
+ * matrix row fails `remoteParity.test.ts` (plan
+ * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+ * Phase C).
+ */
+export const REMOTE_TAB_CONTROL_ACTIONS = {
+  earlierOutput: "remote.earlier-output",
+  reattach: "remote.reattach",
+} as const;
+
+export type RemoteTabControlActionId =
+  (typeof REMOTE_TAB_CONTROL_ACTIONS)[keyof typeof REMOTE_TAB_CONTROL_ACTIONS];
+
+/**
  * Zone-header controls for a REMOTE tab (plan
  * `2026-08-31-remote-session-tabs-in-runner-terminal`, Phases 4/5):
  *
@@ -151,6 +168,7 @@ export function RemoteTabControls({
         <button
           type="button"
           data-ui-bridge-id={`terminal.remote-history.${tab.id}`}
+          data-remote-action={REMOTE_TAB_CONTROL_ACTIONS.earlierOutput}
           onClick={(e) => {
             e.stopPropagation();
             void loadHistory();
@@ -167,6 +185,7 @@ export function RemoteTabControls({
         <button
           type="button"
           data-ui-bridge-id={`terminal.remote-reattach.${tab.id}`}
+          data-remote-action={REMOTE_TAB_CONTROL_ACTIONS.reattach}
           onClick={(e) => {
             e.stopPropagation();
             void reattach();

@@ -64,6 +64,7 @@ import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import type { ApprovalReport } from "../approveAll";
+import { REMOTE_RESTART_REFUSAL } from "../remoteParity";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -1045,10 +1046,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   // ── 9. /restart ───────────────────────────────────────────────────────
   // State-gated handler — surfaces `not-restartable` per the audit's
   // §"Per-action success criterion checks" so the CommandBar can show
-  // a friendly error instead of a silent no-op. Today
-  // `transitionEffects.handleRestartInZone` itself returns silently
-  // (`TransitionEffectsContext.tsx:44`) so we replicate the same gate
-  // here to give the user feedback.
+  // a friendly error instead of a silent no-op. `handleRestartInZone`
+  // returns a typed `RestartOutcome` but no message, so the state gate and
+  // the remote-tab refusal are checked here first to give the user one.
   useCommandAction({
     id: "terminal.restart",
     slash: "/restart",
@@ -1067,6 +1067,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (zone.kind === "out-of-range") return fail("out-of-range");
       const tabId = zoneLayout.assignments[zone.index];
       const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
+      if (tabId && tabs.some((t) => t.id === tabId && t.remote != null)) {
+        return fail("not-restartable", REMOTE_RESTART_REFUSAL);
+      }
       if (state !== "completed" && state !== "error") {
         return fail("not-restartable", `session state is ${state}`);
       }
