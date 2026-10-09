@@ -1,3 +1,5 @@
+import type { FinishedVerdict } from "../useFinishedSessions";
+
 export function formatUptime(createdAt?: number): string | undefined {
   if (!createdAt) return undefined;
   const ms = Date.now() - createdAt;
@@ -71,4 +73,30 @@ export function showSoloSessionInfo(opts: {
 }): boolean {
   if (opts.showLabels || opts.showCompactCard) return false;
   return !!opts.claudeSessionId;
+}
+
+/**
+ * Whether a zone draws the chequered FINISHED band, and the verdict it exposes
+ * on `data-session-finished`.
+ *
+ * The band draws on a positive `finished`, and — dimmed — on a `held` one (the
+ * current read could not answer; the last one that could said `finished`). A
+ * session with no answer at all is `unknown` and keeps the ordinary border,
+ * because a missing mark is not evidence of either arm. A tab with no Claude
+ * session has nothing to be finished, so its verdict is `undefined`.
+ *
+ * Nothing else switches the band off, because switching it changes the border
+ * width and so resizes the zone's live PTY. Drop target, swap source,
+ * selection and the needs-input / error states recolour it instead
+ * (`finishedBandColor`); a search match keeps its glow.
+ */
+export function zoneFinishedBand(opts: {
+  claudeSessionId?: string;
+  verdict?: FinishedVerdict;
+  held?: boolean;
+}): { verdict: FinishedVerdict | undefined; showBand: boolean; held: boolean } {
+  if (!opts.claudeSessionId) return { verdict: undefined, showBand: false, held: false };
+  const verdict = opts.verdict ?? "unknown";
+  const held = opts.held === true && verdict !== "finished";
+  return { verdict, showBand: verdict === "finished" || held, held };
 }
