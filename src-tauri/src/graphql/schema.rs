@@ -250,10 +250,15 @@ mod tests {
             .expect("SDL must publish enum UiBridgeErrorCode");
         // The enum's closing brace sits alone on its line; a bare `find('}')`
         // would stop inside a variant description that quotes a JSON payload.
-        let block_len = sdl[block_start..]
+        let from_enum = sdl
+            .get(block_start..)
+            .expect("find returns a char boundary");
+        let block_len = from_enum
             .find("\n}\n")
             .expect("enum UiBridgeErrorCode block must close");
-        let block = &sdl[block_start..block_start + block_len];
+        let block = from_enum
+            .get(..block_len)
+            .expect("find returns a char boundary");
         for item in items {
             let wire = serde_json::to_value(item.value).expect("serialize code");
             assert_eq!(

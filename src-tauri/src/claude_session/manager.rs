@@ -91,39 +91,63 @@ impl SessionManager {
     /// The coord-mcp loopback proxy knows only the session WORKDIR its
     /// per-session nonce was provisioned into; this bridges that back to the
     /// `task_run_id` the `AiCoordRegistrar` keys the coord `agent_session_id`
-    /// on. Matches on the promoted worktree path — the terminal chokepoint
-    /// (`acquire_for_terminal`) provisions the nonce into exactly that dir.
+    /// on. Matches on the session's worktree path — the provisioning
+    /// chokepoint (`provision_session_cwd`, reached from `acquire_for_terminal`
+    /// and `acquire_for_worker`) writes the nonce into exactly that dir.
     ///
-    /// Sessions NOT promoted into a worktree carry no stored cwd to match, so
-    /// they resolve `None`: a documented Phase-0 residual (the proxy then omits
-    /// the caller-session header and coord keeps its fuzzy fallback). O(N) over
-    /// active sessions (bounded by the operator's live terminal count).
+    /// Two sources of that path, because sessions reach a worktree two ways:
+    /// - PROMOTED ([`ClaudeSession::worktree`]) — moved into one after spawn.
+    /// - SPAWNED in one, with the `IsolatedEditContext` parked on the session
+    ///   ([`ClaudeSession::isolated_worktree_paths`]) — every orchestration
+    ///   worker that declares a repo (which, since plan
+    ///   `2026-09-23-conductor-e2e-phase1-defects` Phase 1, never runs without
+    ///   one) and every resumed chat session that re-acquired its worktree.
+    ///   Before this source was read, those sessions never self-identified.
+    ///   A parked path counts only when it is an agent allocation ROOT: a
+    ///   `shared_branch` row names the canonical checkout, whose in-cwd
+    ///   `.mcp.json` every session launched there reads, so matching it would
+    ///   attribute a stranger's call to this session.
+    ///
+    /// Sessions with neither carry no stored cwd to match, so they resolve
+    /// `None` (the proxy then omits the caller-session header and coord keeps
+    /// its fuzzy fallback), and so do two DIFFERENT sessions claiming the same
+    /// workdir — see [`identifying_candidate`]. O(N) over active sessions
+    /// (bounded by the operator's live terminal count).
     pub fn task_run_id_for_workdir(&self, workdir: &str) -> Option<String> {
-        let target_canon = std::fs::canonicalize(workdir).ok();
         // Snapshot (task_run_id, worktree path) pairs under the lock, then do
-        // the filesystem `canonicalize` comparisons AFTER releasing it. This
-        // runs on every proxied coord_* call (session-fabric Phase 0 caller
-        // self-identification), and holding `sessions` across O(live sessions)
-        // `canonicalize` syscalls would serialize all session management behind
-        // proxy traffic. The snapshot is cheap (clone of a String + PathBuf per
-        // worktree-carrying session); the syscalls happen lock-free.
-        let candidates: Vec<(String, std::path::PathBuf)> = {
+        // the filesystem checks AFTER releasing it. This runs on every proxied
+        // coord_* call (session-fabric Phase 0 caller self-identification), and
+        // holding `sessions` across O(live sessions) `canonicalize` syscalls
+        // would serialize all session management behind proxy traffic. The
+        // snapshot clones one String + PathBuf per worktree path (a multi-repo
+        // context contributes one per repo); the syscalls happen lock-free.
+        let candidates: Vec<WorkdirCandidate> = {
             let guard = self.sessions.lock().ok()?;
-            guard
-                .iter()
-                .filter_map(|(task_run_id, session)| {
-                    session
-                        .worktree()
-                        .map(|wt| (task_run_id.clone(), wt.path.clone()))
-                })
-                .collect()
-        };
-        for (task_run_id, path) in candidates {
-            if worktree_path_matches(&path, workdir, target_canon.as_deref()) {
-                return Some(task_run_id);
+            let mut out = Vec::with_capacity(guard.len());
+            for (task_run_id, session) in guard.iter() {
+                if let Some(wt) = session.worktree() {
+                    out.push(WorkdirCandidate {
+                        task_run_id: task_run_id.clone(),
+                        path: wt.path.clone(),
+                        parked: false,
+                    });
+                }
+                for path in session.isolated_worktree_paths() {
+                    out.push(WorkdirCandidate {
+                        task_run_id: task_run_id.clone(),
+                        path,
+                        parked: true,
+                    });
+                }
             }
-        }
-        None
+            out
+        };
+        identifying_candidate(
+            &candidates,
+            workdir,
+            || std::fs::canonicalize(workdir).ok(),
+            is_agent_allocation_root,
+        )
     }
 
     /// Register an inline (non-interactive) session's PID for stale task sweep visibility.
@@ -329,6 +353,72 @@ impl SessionManager {
     }
 }
 
+/// One session's claim on a workdir, snapshotted under the `sessions` lock so
+/// the filesystem checks run after it is released.
+struct WorkdirCandidate {
+    task_run_id: String,
+    path: std::path::PathBuf,
+    /// `true` when `path` came from a parked `IsolatedEditContext` rather than
+    /// a promoted worktree — see [`SessionManager::task_run_id_for_workdir`].
+    parked: bool,
+}
+
+/// The one session whose candidate path identifies `workdir`.
+///
+/// Two passes, so the common case stays off the filesystem: a literal string
+/// compare first (the proxy provisions the nonce into the exact stored path),
+/// and only when nothing matches literally, the canonical-path compare —
+/// `canonicalize(workdir)` is computed lazily, once. A parked path must also be
+/// an agent allocation root (`is_allocation_root`), so a `shared_branch`
+/// context naming the canonical checkout never matches; that probe runs only
+/// on a path match.
+///
+/// AMBIGUITY RESOLVES TO `None`: when the accepted matches name more than one
+/// session (two contexts on one root, a promoted path and another session's
+/// parked one), HashMap order would otherwise pick the caller at random. No
+/// header beats a wrong one — the same rule the terminal leg applies. Pure over
+/// its injected probes so every arm is unit-testable.
+fn identifying_candidate(
+    candidates: &[WorkdirCandidate],
+    workdir: &str,
+    canon_of_workdir: impl FnOnce() -> Option<std::path::PathBuf>,
+    is_allocation_root: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    let accepted = |c: &&WorkdirCandidate| !c.parked || is_allocation_root(&c.path);
+    let literal: Vec<&WorkdirCandidate> = candidates
+        .iter()
+        .filter(|c| c.path.to_string_lossy() == workdir)
+        .filter(accepted)
+        .collect();
+    let hits = if literal.is_empty() {
+        match canon_of_workdir() {
+            Some(tc) => candidates
+                .iter()
+                .filter(|c| worktree_path_matches(&c.path, workdir, Some(&tc)))
+                .filter(accepted)
+                .collect(),
+            None => Vec::new(),
+        }
+    } else {
+        literal
+    };
+    let mut ids = hits.iter().map(|c| c.task_run_id.as_str());
+    let first = ids.next()?;
+    if ids.all(|id| id == first) {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
+/// Is `path` itself an agent worktree allocation root (not a descendant, and
+/// not a canonical checkout)? The same predicate `provision_session_cwd` uses
+/// to decide a cwd was freshly allocated.
+fn is_agent_allocation_root(path: &std::path::Path) -> bool {
+    crate::agent_worktree::canonical_paths::allocated_worktree_for_path(path)
+        .is_some_and(|root| crate::agent_worktree::canonical_paths::paths_equal(&root, path))
+}
+
 /// Does a session's worktree `path` identify `workdir`? A fast literal-string
 /// compare first (the common case — the proxy provisions the nonce into the
 /// exact stored path), then a canonical-path fallback for symlink/8.3/case
@@ -368,6 +458,112 @@ impl std::fmt::Debug for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(task_run_id: &str, path: &str, parked: bool) -> WorkdirCandidate {
+        WorkdirCandidate {
+            task_run_id: task_run_id.to_string(),
+            path: std::path::PathBuf::from(path),
+            parked,
+        }
+    }
+
+    /// An orchestration worker is spawned IN its allocated worktree, so its
+    /// path lives only on the parked context. It must resolve — before the
+    /// parked source was read, every worker's proxied coord call went out with
+    /// no caller-session header.
+    #[test]
+    fn a_parked_allocation_root_identifies_its_worker() {
+        let wt = "D:/qontinui-root/agent-worktrees/abc/qontinui-runner";
+        let hit = identifying_candidate(
+            &[
+                candidate(
+                    "other",
+                    "D:/qontinui-root/agent-worktrees/xyz/qontinui-web",
+                    true,
+                ),
+                candidate("worker", wt, true),
+            ],
+            wt,
+            || panic!("a literal hit must not canonicalize"),
+            |_| true,
+        );
+        assert_eq!(hit.as_deref(), Some("worker"));
+    }
+
+    /// A `shared_branch` context names the canonical checkout, which is not an
+    /// allocation root and whose `.mcp.json` every session there shares. It
+    /// must not claim the workdir — and the probe must be what decides it.
+    #[test]
+    fn a_parked_path_that_is_not_an_allocation_root_does_not_identify() {
+        let canonical = "D:/qontinui-root/qontinui-runner";
+        let hit = identifying_candidate(
+            &[candidate("resumed-chat", canonical, true)],
+            canonical,
+            || None,
+            |_| false,
+        );
+        assert_eq!(hit, None);
+    }
+
+    /// A promoted worktree keeps matching without the allocation-root probe,
+    /// exactly as before the parked source existed.
+    #[test]
+    fn a_promoted_worktree_matches_without_the_allocation_root_probe() {
+        let wt = "D:/qontinui-root/agent-worktrees/abc/qontinui-runner";
+        let hit = identifying_candidate(
+            &[candidate("promoted", wt, false)],
+            wt,
+            || None,
+            |_| panic!("a promoted path must not consult the allocation-root probe"),
+        );
+        assert_eq!(hit.as_deref(), Some("promoted"));
+    }
+
+    /// Two different sessions accepted on one workdir: no header beats a
+    /// guessed one. The same session contributing twice (a promoted path and
+    /// its own parked context) is still that session.
+    #[test]
+    fn two_sessions_on_one_workdir_resolve_to_none() {
+        let wt = "D:/qontinui-root/agent-worktrees/abc/qontinui-runner";
+        let ambiguous = identifying_candidate(
+            &[candidate("a", wt, true), candidate("b", wt, false)],
+            wt,
+            || None,
+            |_| true,
+        );
+        assert_eq!(ambiguous, None);
+        let same = identifying_candidate(
+            &[candidate("a", wt, false), candidate("a", wt, true)],
+            wt,
+            || None,
+            |_| true,
+        );
+        assert_eq!(same.as_deref(), Some("a"));
+    }
+
+    /// No literal match falls through to the canonical compare, and a parked
+    /// candidate found there still has to pass the allocation-root probe.
+    #[test]
+    fn the_canonical_pass_runs_only_without_a_literal_hit() {
+        let base = std::env::temp_dir();
+        let dotted = base.join(".");
+        let dotted = dotted.to_string_lossy();
+        let base_str = base.to_string_lossy();
+        let hit = identifying_candidate(
+            &[candidate("worker", &dotted, true)],
+            &base_str,
+            || std::fs::canonicalize(&base).ok(),
+            |_| true,
+        );
+        assert_eq!(hit.as_deref(), Some("worker"));
+        let refused = identifying_candidate(
+            &[candidate("worker", &dotted, true)],
+            &base_str,
+            || std::fs::canonicalize(&base).ok(),
+            |_| false,
+        );
+        assert_eq!(refused, None);
+    }
 
     #[test]
     fn worktree_path_matches_on_exact_string_without_touching_fs() {
