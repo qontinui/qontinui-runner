@@ -647,9 +647,6 @@ pub struct GetTaskRunPlaywrightResultsPage {
     pub assertions_passed: i32,
     pub assertions_failed: i32,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
-    pub total_from_start: i64,
-    pub passed_from_start: i64,
-    pub failed_from_start: i64,
 }
 pub struct GetTaskRunPlaywrightResultsPageBorrowed<'a> {
     pub id: &'a str,
@@ -667,9 +664,6 @@ pub struct GetTaskRunPlaywrightResultsPageBorrowed<'a> {
     pub assertions_passed: i32,
     pub assertions_failed: i32,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
-    pub total_from_start: i64,
-    pub passed_from_start: i64,
-    pub failed_from_start: i64,
 }
 impl<'a> From<GetTaskRunPlaywrightResultsPageBorrowed<'a>>
 for GetTaskRunPlaywrightResultsPage {
@@ -690,9 +684,6 @@ for GetTaskRunPlaywrightResultsPage {
             assertions_passed,
             assertions_failed,
             created_at,
-            total_from_start,
-            passed_from_start,
-            failed_from_start,
         }: GetTaskRunPlaywrightResultsPageBorrowed<'a>,
     ) -> Self {
         Self {
@@ -711,9 +702,6 @@ for GetTaskRunPlaywrightResultsPage {
             assertions_passed,
             assertions_failed,
             created_at,
-            total_from_start,
-            passed_from_start,
-            failed_from_start,
         }
     }
 }
@@ -838,8 +826,6 @@ pub struct GetTaskRunApiRequestsPage {
     pub success: bool,
     pub error_message: String,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
-    pub total_from_start: i64,
-    pub succeeded_from_start: i64,
 }
 pub struct GetTaskRunApiRequestsPageBorrowed<'a> {
     pub id: &'a str,
@@ -863,8 +849,6 @@ pub struct GetTaskRunApiRequestsPageBorrowed<'a> {
     pub success: bool,
     pub error_message: &'a str,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
-    pub total_from_start: i64,
-    pub succeeded_from_start: i64,
 }
 impl<'a> From<GetTaskRunApiRequestsPageBorrowed<'a>> for GetTaskRunApiRequestsPage {
     fn from(
@@ -890,8 +874,6 @@ impl<'a> From<GetTaskRunApiRequestsPageBorrowed<'a>> for GetTaskRunApiRequestsPa
             success,
             error_message,
             created_at,
-            total_from_start,
-            succeeded_from_start,
         }: GetTaskRunApiRequestsPageBorrowed<'a>,
     ) -> Self {
         Self {
@@ -916,8 +898,6 @@ impl<'a> From<GetTaskRunApiRequestsPageBorrowed<'a>> for GetTaskRunApiRequestsPa
             success,
             error_message: error_message.into(),
             created_at,
-            total_from_start,
-            succeeded_from_start,
         }
     }
 }
@@ -1002,8 +982,6 @@ pub struct GetTaskRunAwasStepsPage {
     pub error_message: String,
     pub duration_ms: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
-    pub total_from_start: i64,
-    pub succeeded_from_start: i64,
 }
 pub struct GetTaskRunAwasStepsPageBorrowed<'a> {
     pub id: &'a str,
@@ -1019,8 +997,6 @@ pub struct GetTaskRunAwasStepsPageBorrowed<'a> {
     pub error_message: &'a str,
     pub duration_ms: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
-    pub total_from_start: i64,
-    pub succeeded_from_start: i64,
 }
 impl<'a> From<GetTaskRunAwasStepsPageBorrowed<'a>> for GetTaskRunAwasStepsPage {
     fn from(
@@ -1038,8 +1014,6 @@ impl<'a> From<GetTaskRunAwasStepsPageBorrowed<'a>> for GetTaskRunAwasStepsPage {
             error_message,
             duration_ms,
             created_at,
-            total_from_start,
-            succeeded_from_start,
         }: GetTaskRunAwasStepsPageBorrowed<'a>,
     ) -> Self {
         Self {
@@ -1056,8 +1030,6 @@ impl<'a> From<GetTaskRunAwasStepsPageBorrowed<'a>> for GetTaskRunAwasStepsPage {
             error_message: error_message.into(),
             duration_ms,
             created_at,
-            total_from_start,
-            succeeded_from_start,
         }
     }
 }
@@ -1077,6 +1049,262 @@ where
 {
     pub fn map<R>(self, mapper: fn(i64) -> R) -> I64Query<'c, 'a, 's, C, R, N> {
         I64Query {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
+        let mapped = stream
+            .map(move |res| {
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunPlaywrightResultsCounts {
+    pub total: i64,
+    pub passed: i64,
+    pub failed: i64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunApiRequestsCounts {
+    pub total: i64,
+    pub succeeded: i64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunAwasStepsCounts {
+    pub total: i64,
+    pub succeeded: i64,
+}
+pub struct GetTaskRunPlaywrightResultsCountsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(&tokio_postgres::Row) -> Result<GetTaskRunPlaywrightResultsCounts, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunPlaywrightResultsCounts) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskRunPlaywrightResultsCountsQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunPlaywrightResultsCounts) -> R,
+    ) -> GetTaskRunPlaywrightResultsCountsQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunPlaywrightResultsCountsQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
+        let mapped = stream
+            .map(move |res| {
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetTaskRunApiRequestsCountsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(&tokio_postgres::Row) -> Result<GetTaskRunApiRequestsCounts, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunApiRequestsCounts) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskRunApiRequestsCountsQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunApiRequestsCounts) -> R,
+    ) -> GetTaskRunApiRequestsCountsQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunApiRequestsCountsQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
+        let mapped = stream
+            .map(move |res| {
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetTaskRunAwasStepsCountsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(&tokio_postgres::Row) -> Result<GetTaskRunAwasStepsCounts, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunAwasStepsCounts) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskRunAwasStepsCountsQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunAwasStepsCounts) -> R,
+    ) -> GetTaskRunAwasStepsCountsQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunAwasStepsCountsQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -3154,7 +3382,7 @@ pub struct GetTaskRunPlaywrightResultsPageStmt(
 );
 pub fn get_task_run_playwright_results_page() -> GetTaskRunPlaywrightResultsPageStmt {
     GetTaskRunPlaywrightResultsPageStmt(
-        "SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status, COALESCE(duration_ms, 0) as duration_ms, COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr, COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot, COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path, assertions_passed, assertions_failed, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE status = 'passed') OVER () as passed_from_start, COUNT(*) FILTER (WHERE status = 'failed') OVER () as failed_from_start FROM task_run_playwright_results WHERE task_run_id = $1 AND (created_at, id) > ($2, $3) ORDER BY created_at ASC, id ASC LIMIT $4",
+        "SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status, COALESCE(duration_ms, 0) as duration_ms, COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr, COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot, COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path, assertions_passed, assertions_failed, created_at FROM task_run_playwright_results WHERE task_run_id = $1 AND (created_at, id) > ($2, $3) ORDER BY created_at ASC, id ASC LIMIT $4",
         None,
     )
 }
@@ -3212,9 +3440,6 @@ impl GetTaskRunPlaywrightResultsPageStmt {
                     assertions_passed: row.try_get(12)?,
                     assertions_failed: row.try_get(13)?,
                     created_at: row.try_get(14)?,
-                    total_from_start: row.try_get(15)?,
-                    passed_from_start: row.try_get(16)?,
-                    failed_from_start: row.try_get(17)?,
                 })
             },
             mapper: |it| GetTaskRunPlaywrightResultsPage::from(it),
@@ -3513,7 +3738,7 @@ pub struct GetTaskRunApiRequestsPageStmt(
 );
 pub fn get_task_run_api_requests_page() -> GetTaskRunApiRequestsPageStmt {
     GetTaskRunApiRequestsPageStmt(
-        "SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name, method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers, COALESCE(request_body, '') as request_body, status_code, COALESCE(status_text, '') as status_text, COALESCE(response_headers, '{}') as response_headers, response_time_ms, response_body_type, COALESCE(response_body, '') as response_body, COALESCE(response_size_bytes, 0) as response_size_bytes, COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions, success, COALESCE(error_message, '') as error_message, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start FROM task_run_api_requests WHERE task_run_id = $1 AND (NOT $2 OR success = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
+        "SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name, method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers, COALESCE(request_body, '') as request_body, status_code, COALESCE(status_text, '') as status_text, COALESCE(response_headers, '{}') as response_headers, response_time_ms, response_body_type, COALESCE(response_body, '') as response_body, COALESCE(response_size_bytes, 0) as response_size_bytes, COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions, success, COALESCE(error_message, '') as error_message, created_at FROM task_run_api_requests WHERE task_run_id = $1 AND (NOT $2 OR success = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
         None,
     )
 }
@@ -3579,8 +3804,6 @@ impl GetTaskRunApiRequestsPageStmt {
                     success: row.try_get(18)?,
                     error_message: row.try_get(19)?,
                     created_at: row.try_get(20)?,
-                    total_from_start: row.try_get(21)?,
-                    succeeded_from_start: row.try_get(22)?,
                 })
             },
             mapper: |it| GetTaskRunApiRequestsPage::from(it),
@@ -3786,7 +4009,7 @@ impl GetTaskRunAwasStepsStmt {
 pub struct GetTaskRunAwasStepsPageStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_awas_steps_page() -> GetTaskRunAwasStepsPageStmt {
     GetTaskRunAwasStepsPageStmt(
-        "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at, COUNT(*) OVER () as total_from_start, COUNT(*) FILTER (WHERE success) OVER () as succeeded_from_start FROM task_run_awas_steps WHERE task_run_id = $1 AND (NOT $2 OR step_type = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
+        "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at FROM task_run_awas_steps WHERE task_run_id = $1 AND (NOT $2 OR step_type = $3) AND (created_at, id) > ($4, $5) ORDER BY created_at ASC, id ASC LIMIT $6",
         None,
     )
 }
@@ -3845,8 +4068,6 @@ impl GetTaskRunAwasStepsPageStmt {
                     error_message: row.try_get(10)?,
                     duration_ms: row.try_get(11)?,
                     created_at: row.try_get(12)?,
-                    total_from_start: row.try_get(13)?,
-                    succeeded_from_start: row.try_get(14)?,
                 })
             },
             mapper: |it| GetTaskRunAwasStepsPage::from(it),
@@ -3883,5 +4104,134 @@ impl<
             &params.after_id,
             &params.max_results,
         )
+    }
+}
+pub struct GetTaskRunPlaywrightResultsCountsStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_playwright_results_counts() -> GetTaskRunPlaywrightResultsCountsStmt {
+    GetTaskRunPlaywrightResultsCountsStmt(
+        "SELECT COUNT(*)::bigint as total, (COUNT(*) FILTER (WHERE status = 'passed'))::bigint as passed, (COUNT(*) FILTER (WHERE status = 'failed'))::bigint as failed FROM task_run_playwright_results WHERE task_run_id = $1",
+        None,
+    )
+}
+impl GetTaskRunPlaywrightResultsCountsStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+    >(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+    ) -> GetTaskRunPlaywrightResultsCountsQuery<'c, 'a, 's, C, GetTaskRunPlaywrightResultsCounts, 1> {
+        GetTaskRunPlaywrightResultsCountsQuery {
+            client,
+            params: [task_run_id],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row: &tokio_postgres::Row| -> Result<GetTaskRunPlaywrightResultsCounts, tokio_postgres::Error> {
+                Ok(GetTaskRunPlaywrightResultsCounts {
+                    total: row.try_get(0)?,
+                    passed: row.try_get(1)?,
+                    failed: row.try_get(2)?,
+                })
+            },
+            mapper: |it| it,
+        }
+    }
+}
+pub struct GetTaskRunApiRequestsCountsStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_api_requests_counts() -> GetTaskRunApiRequestsCountsStmt {
+    GetTaskRunApiRequestsCountsStmt(
+        "SELECT COUNT(*)::bigint as total, (COUNT(*) FILTER (WHERE success))::bigint as succeeded FROM task_run_api_requests WHERE task_run_id = $1 AND (NOT $2 OR success = $3)",
+        None,
+    )
+}
+impl GetTaskRunApiRequestsCountsStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+    >(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+        filter_by_success: &'a bool,
+        success: &'a bool,
+    ) -> GetTaskRunApiRequestsCountsQuery<'c, 'a, 's, C, GetTaskRunApiRequestsCounts, 3> {
+        GetTaskRunApiRequestsCountsQuery {
+            client,
+            params: [task_run_id, filter_by_success, success],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row: &tokio_postgres::Row| -> Result<GetTaskRunApiRequestsCounts, tokio_postgres::Error> {
+                Ok(GetTaskRunApiRequestsCounts {
+                    total: row.try_get(0)?,
+                    succeeded: row.try_get(1)?,
+                })
+            },
+            mapper: |it| it,
+        }
+    }
+}
+pub struct GetTaskRunAwasStepsCountsStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_awas_steps_counts() -> GetTaskRunAwasStepsCountsStmt {
+    GetTaskRunAwasStepsCountsStmt(
+        "SELECT COUNT(*)::bigint as total, (COUNT(*) FILTER (WHERE success))::bigint as succeeded FROM task_run_awas_steps WHERE task_run_id = $1 AND (NOT $2 OR step_type = $3)",
+        None,
+    )
+}
+impl GetTaskRunAwasStepsCountsStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+    >(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+        filter_by_step_type: &'a bool,
+        step_type: &'a T2,
+    ) -> GetTaskRunAwasStepsCountsQuery<'c, 'a, 's, C, GetTaskRunAwasStepsCounts, 3> {
+        GetTaskRunAwasStepsCountsQuery {
+            client,
+            params: [task_run_id, filter_by_step_type, step_type],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row: &tokio_postgres::Row| -> Result<GetTaskRunAwasStepsCounts, tokio_postgres::Error> {
+                Ok(GetTaskRunAwasStepsCounts {
+                    total: row.try_get(0)?,
+                    succeeded: row.try_get(1)?,
+                })
+            },
+            mapper: |it| it,
+        }
     }
 }
