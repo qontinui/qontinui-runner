@@ -3,8 +3,11 @@ name: published-build parity
 # Phase 7 of plan 2026-08-31-published-build-parity-check.
 #
 # Runs the DEVELOPMENT build and the INSTALLED PUBLISHED build side by side on a
-# clean GitHub-hosted windows-latest box and reports where they differ, on two
-# axes:
+# clean GitHub-hosted windows-latest box -- and, since Phase 6B of plan
+# 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# on ubuntu-22.04 against the published .deb/AppImage (job
+# `published-parity-linux`, manifest axis only so far) -- and reports where
+# they differ, on two axes:
 #
 #   1. CAPABILITY MANIFEST (Phase 5) — scripts/published-parity.ps1 diffs which
 #      rung answered for each capability in each build.
@@ -190,6 +193,11 @@ jobs:
     # still cannot sit past 150m; what changes is that a cold night reports
     # instead of dying.
     timeout-minutes: 150
+    # The tag this leg compared against, so the cross-platform job can name the
+    # artifact it reads (Phase 6B). Empty when the job died before resolving it,
+    # which the cross-platform job reads as a missing report, never as 0.
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
 
     steps:
       # NO `ref:` -- deliberately. The ref is the event's: on a `release` event
@@ -994,7 +1002,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: published-parity-${{ steps.release.outputs.tag }}
+          # Per-platform since Phase 6B: the Linux leg uploads
+          # published-parity-<tag>-linux beside this one.
+          name: published-parity-${{ steps.release.outputs.tag }}-windows
           if-no-files-found: warn
           retention-days: 30
           path: |
@@ -1033,6 +1043,382 @@ jobs:
             echo "::warning::No parity count was produced. The comparison refused (schema mismatch) or could not run. This is UNKNOWN, not zero."
           fi
         shell: bash
+
+  # ===========================================================================
+  # THE LINUX PUBLISHED LEG -- Phase 6B of plan
+  # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports.
+  # ===========================================================================
+  #
+  # Same question as the job above, asked of the Linux artifact: build the
+  # DEVELOPMENT runner from this commit on ubuntu-22.04 (the release leg's own
+  # image), unpack the PUBLISHED .deb (else AppImage) without root, boot both
+  # under Xvfb, drive provisioning through each one's own doors and diff the two
+  # capability manifests. Same posture: it gates nothing, every reporting step
+  # is continue-on-error, and an empty count is UNKNOWN, never 0.
+  #
+  # PROVENANCE BEFORE UNPACKING. The release's checksums-linux-x64.txt names
+  # PRE-UPLOAD paths ("deb/Qontinui Runner_1.0.11_amd64.deb", with a space)
+  # while the asset is "Qontinui.Runner_1.0.11_amd64.deb", so the asset is
+  # matched by sha256, never by name (Confirm-PublishedLinuxAssetHash in
+  # scripts/lib/installed-runner.ps1). A hash that matches no line REFUSES the
+  # run, as the Windows leg refuses an unverified installer: nothing unpacked
+  # from an unproven file may stand for the published build.
+  #
+  # A RELEASE WITH NO LINUX ASSET IS UNKNOWN, NOT RED. The Linux release leg is
+  # continue-on-error and v1.0.6 / v1.0.7 shipped none. That is decided from the
+  # release's asset LIST, as one of the enumerated reasons in
+  # $LinuxUnknownReasons, and reported -- never a 0 and never a failed run.
+  #
+  # NOT YET HERE: the behavioural axis. contract-smoke.ps1 tears its runner
+  # down by walking Win32_Process, which does not exist on Linux, so this leg
+  # does not run it. The summary says so as UNKNOWN rather than implying the
+  # two builds behave alike.
+  published-parity-linux:
+    name: Published-build parity (linux)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    # Ladder: apt 10 + build 60 + parity 30 + unpack 10 = 110 of step budget,
+    # plus checkout, the sibling, setup, `pnpm install` and the unit tests (~10).
+    # A JOB timeout cancels rather than reports (the #1511 shape the Windows
+    # job's comment records), so the job bound sits above the ladder.
+    timeout-minutes: 130
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same coupling, same reason as the Windows job: the rust-cache step below
+      # reads ci.yml's `test` job cache (its ubuntu-22.04 leg, by OS key).
+      - name: Assert ci.yml still has a job named "test" (the rust-cache shared-key)
+        shell: bash
+        run: |
+          if ! grep -qE '^  test:' .github/workflows/ci.yml; then
+            echo "::error::ci.yml no longer declares a job named 'test'. This job's Swatinem/rust-cache step reads shared-key: \"test\" -- ci.yml's job id -- to get main's warm cache. If that job was renamed, rename the shared-key here to match, or this workflow silently runs cold every night."
+            exit 1
+          fi
+          echo "ci.yml still declares job 'test' -- shared-key coupling holds."
+
+      # FIRST, before any compile, and the one step here that is not
+      # continue-on-error: the classifier and the Linux locator, under the
+      # interpreter that will run them on this leg (pwsh 7; there is no 5.1 on
+      # Linux). test-installed-runner.ps1 carries the Linux fixtures -- the
+      # never-the-dev-binary guard on usr/bin layouts -- which until this job
+      # existed only ever ran on Windows, where they are skipped.
+      - name: Parity comparator and Linux locator unit tests (pwsh)
+        shell: bash
+        run: |
+          pwsh -NoProfile -File scripts/tests/test-parity-diff.ps1
+          pwsh -NoProfile -File scripts/tests/test-installed-runner.ps1
+
+      # qontinui-schemas is a hard compile dependency. ui-bridge is not checked
+      # out: it feeds only contract-smoke, which this leg does not run.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      # ci.yml's package list (it builds the same workspace on this image), plus
+      # xvfb for xvfb-run: both artifacts are GUI processes and WebKitGTK needs a
+      # display even when nothing is drawn. Bounded for the same apt-hang reason
+      # ci.yml records on its identical step.
+      - name: Install dependencies (Ubuntu)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core \
+            xvfb
+
+      # Same reclaim and the same exclusions as ci.yml's step of this name --
+      # `large-packages: true` would cascade-remove the GTK/GDK libs just
+      # installed. Read ci.yml's comment before changing either side.
+      - name: Free disk space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      # The link-time OOM guard ci.yml's ubuntu leg carries, for the same
+      # workspace on the same 16 GB image.
+      - name: Add swapfile (guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        # Pin matches rust-toolchain.toml (channel = "1.95.0").
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # Read-only, shared with ci.yml's `test` job -- see the Windows job's
+      # step for the full reasoning; it applies here unchanged.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: "test"
+          save-if: "false"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The DEVELOPMENT leg's artifact: target/debug/qontinui-runner. Not
+      # continue-on-error, for the reason the Windows job gives: a build that
+      # genuinely fails is a real signal.
+      - name: Build Tauri app (development)
+        timeout-minutes: 60
+        run: pnpm run tauri build --debug --no-bundle
+
+      # Identical to the Windows job's resolution. Each leg resolves "latest"
+      # on its own, so a release published between the two could put different
+      # versions on the two platforms; the cross-platform job refuses that pair
+      # (published_versions_differ) rather than reporting skew as a difference.
+      - name: Resolve the release to compare against
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag="$EVENT_TAG"
+          if [ -z "$tag" ]; then tag="$INPUT_TAG"; fi
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName) || tag=""
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::Could not resolve a release tag to compare against. This is NOT a parity result — the comparison did not run."
+            exit 1
+          fi
+          echo "Comparing against release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # Select from the asset LIST, download, prove by sha256, THEN unpack into
+      # a prefix under RUNNER_TEMP -- outside this checkout, which the locator's
+      # guard refuses. Outputs exactly one of:
+      #   prefix=<dir>          the unpacked published build, located and guarded
+      #   linux-unknown=<why>   a typed UNKNOWN from $LinuxUnknownReasons
+      # Anything else (the asset list could not be read, a download failed, the
+      # hash matched no line, the guard fired) throws and fails the step: that
+      # is a refusal to measure, not a parity verdict.
+      - name: Download, verify and unpack the published Linux build
+        id: linux_asset
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . ./scripts/lib/installed-runner.ps1
+          $unknown = {
+            param([string]$Reason, [string]$Detail)
+            Write-Host "::warning::Published Linux build UNKNOWN($Reason) -- no Linux parity number for $env:TAG. Not a 0. $Detail"
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "linux-unknown=$Reason"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("### Published-build capability parity (linux)`n`n**UNKNOWN** -- ``$Reason``. No Linux parity count for $env:TAG; this is not a 0.`n")
+            exit 0
+          }
+
+          $names = @(& gh release view $env:TAG --repo $env:REPO --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0) { throw "could not list the assets of release $env:TAG (gh exit $LASTEXITCODE) -- a harness fault, not a release fact." }
+          try {
+            $asset = Select-PublishedLinuxAsset -AssetNames $names -Version $env:TAG
+            $sums = Select-PublishedLinuxChecksums -AssetNames $names
+          } catch {
+            $r = Get-LinuxUnknownReason -Message $_.Exception.Message
+            if ($r) { & $unknown $r $_.Exception.Message }
+            throw
+          }
+          Write-Host "Selected $($asset.Kind) asset: $($asset.Name); checksums: $sums"
+
+          $dl = Join-Path $env:RUNNER_TEMP 'published-linux-download'
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          & gh release download $env:TAG --repo $env:REPO --dir $dl --pattern $asset.Name --pattern $sums
+          if ($LASTEXITCODE -ne 0) { throw "gh release download exited $LASTEXITCODE -- a harness fault, not a release fact." }
+          $assetPath = Join-Path $dl $asset.Name
+          $line = Confirm-PublishedLinuxAssetHash -AssetPath $assetPath -ChecksumsPath (Join-Path $dl $sums)
+          Write-Host "Provenance proven by sha256: $line"
+
+          $prefix = Join-Path $env:RUNNER_TEMP 'published-linux-prefix'
+          New-Item -ItemType Directory -Force -Path $prefix | Out-Null
+          if ($asset.Kind -eq 'deb') {
+            & dpkg -x $assetPath $prefix
+            if ($LASTEXITCODE -ne 0) { throw "dpkg -x exited $LASTEXITCODE" }
+          } else {
+            & chmod +x $assetPath
+            Push-Location $prefix
+            try { & $assetPath --appimage-extract | Out-Null } finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "--appimage-extract exited $LASTEXITCODE" }
+          }
+
+          try {
+            $exe = Find-InstalledRunnerExe -InstallRoot $prefix -Platform linux
+          } catch {
+            $r = Get-LinuxUnknownReason -Message $_.Exception.Message
+            if ($r) { & $unknown $r $_.Exception.Message }
+            throw
+          }
+          Write-Host "Published Linux runner: $exe"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "prefix=$prefix"
+
+      # AXIS 1 on Linux. pwsh directly (there is no 5.1 here, and the 5.1
+      # detached-host wrapper exists for a Windows pipe-inheritance hang), under
+      # xvfb-run so both booted artifacts get a display, under `timeout` so the
+      # inner bound fires before the step's. The harness picks the Linux branch
+      # of every platform choice from the host and records `platform: linux` in
+      # its JSON report; -InstallRoot is required here because a Linux install
+      # has no default location to probe.
+      - name: Capability-manifest parity (development vs published)
+        id: parity
+        if: steps.linux_asset.outputs.prefix != ''
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+          PREFIX: ${{ steps.linux_asset.outputs.prefix }}
+        shell: bash
+        run: |
+          mkdir -p parity-report
+          set -o pipefail
+          timeout 1500 xvfb-run -a pwsh -NoProfile -File scripts/published-parity.ps1 \
+            -InstallRoot "$PREFIX" \
+            -JsonOut parity-report/published-parity.json \
+            -SummaryOut "$GITHUB_STEP_SUMMARY" \
+            -Annotate 2>&1 | tee parity-report/published-parity.log
+
+      - name: Behavioural axis (linux) -- not run
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo ""
+            echo "### Behavioural axis (linux)"
+            echo ""
+            echo "**UNKNOWN -- not run on this leg.** contract-smoke.ps1 tears its runner down by walking Win32_Process, which Linux does not have, so the route walk has not been ported. This is not a statement that the two Linux builds behave the same."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the row-level parity diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-${{ steps.release.outputs.tag }}-linux
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            parity-report/published-parity.json
+            parity-report/published-parity.log
+
+      - name: Report the count
+        if: always()
+        env:
+          PARITY_COUNT: ${{ steps.parity.outputs.parity-count }}
+          COMPARABLE_COUNT: ${{ steps.parity.outputs.comparable-count }}
+          UNOBSERVED_COUNT: ${{ steps.parity.outputs.unobserved-count }}
+          SCHEMA_REFUSED: ${{ steps.parity.outputs.schema-refused }}
+          PLATFORM: ${{ steps.parity.outputs.platform }}
+          LINUX_UNKNOWN: ${{ steps.linux_asset.outputs.linux-unknown }}
+          LOCATOR_UNKNOWN: ${{ steps.parity.outputs.linux-unknown-reason }}
+        run: |
+          echo "platform                  = '${PLATFORM:-}'"
+          echo "parity-count              = '${PARITY_COUNT:-}'"
+          echo "comparable-count          = '${COMPARABLE_COUNT:-}'"
+          echo "unobserved-count          = '${UNOBSERVED_COUNT:-}'"
+          echo "schema-refused            = '${SCHEMA_REFUSED:-}'"
+          echo "linux-unknown             = '${LINUX_UNKNOWN:-${LOCATOR_UNKNOWN:-}}'"
+          if [ -z "${PARITY_COUNT:-}" ]; then
+            echo "::warning::No Linux parity count was produced (unknown reason: '${LINUX_UNKNOWN:-${LOCATOR_UNKNOWN:-none recorded}}'). This is UNKNOWN, not zero."
+          fi
+        shell: bash
+
+  # ===========================================================================
+  # THE CROSS-PLATFORM LIST -- Phase 6B's third number.
+  # ===========================================================================
+  #
+  # Reads the two JSON reports the legs above uploaded and lists the capability
+  # rows whose PUBLISHED rung differs between windows and linux. Its own list,
+  # never added to parity_defects (that unit is dev-vs-published on one
+  # platform). Boots nothing, so it is cheap; `if: always()` so a failed leg
+  # still produces an explicit UNKNOWN rather than no line at all.
+  cross-platform:
+    name: Published build, windows vs linux
+    needs: [published-parity, published-parity-linux]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the windows report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: published-parity-${{ needs.published-parity.outputs.tag }}-windows
+          path: cross-platform/windows
+
+      - name: Download the linux report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: published-parity-${{ needs.published-parity-linux.outputs.tag }}-linux
+          path: cross-platform/linux
+
+      # The artifact's internal layout depends on upload-artifact's common-root
+      # rule, so find the report by name rather than assuming a path. A missing
+      # file reaches the harness as an empty argument, which it reports as
+      # <platform>_report_missing -- UNKNOWN, exit 2, never a 0.
+      - name: Compare the published side across platforms
+        continue-on-error: true
+        shell: bash
+        run: |
+          win=$(find cross-platform/windows -name published-parity.json -type f 2>/dev/null | head -1)
+          lin=$(find cross-platform/linux -name published-parity.json -type f 2>/dev/null | head -1)
+          echo "windows report: '${win}'"
+          echo "linux report  : '${lin}'"
+          pwsh -NoProfile -File scripts/published-parity.ps1 -CrossPlatform \
+            -WindowsReport "$win" -LinuxReport "$lin" \
+            -JsonOut cross-platform/published-cross-platform.json \
+            -SummaryOut "$GITHUB_STEP_SUMMARY" -Annotate
+
+      - name: Upload the cross-platform list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-cross-platform-${{ needs.published-parity.outputs.tag || needs.published-parity-linux.outputs.tag || 'unresolved' }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: cross-platform/published-cross-platform.json
 
   # ===========================================================================
   # THE NEGATIVE CONTROL -- the one check that can falsify the instrument.
