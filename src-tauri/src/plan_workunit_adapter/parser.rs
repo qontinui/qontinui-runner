@@ -1719,13 +1719,23 @@ mod tests {
     }
 
     /// Every status-blockquote `Area:` line but one on `qontinui-dev-notes`
-    /// `origin/main` as of 2026-09-22 (`86208321`, plus the
-    /// `2026-08-31-published-build-parity-check` line added by `171b0398`),
-    /// verbatim, each under the status line it sits beneath in its plan. The
-    /// twelfth, the parity plan's own head, is tested verbatim by
-    /// `inline_code_area_mention_is_not_a_key` below instead, because its point
-    /// is the inline-code mention that precedes the real key. Re-measure with
-    /// `git grep -n 'Area:' origin/main -- plans/` filtered to the status block.
+    /// `origin/main` as of 2026-09-23 (`e392a0bef`), verbatim, each under the
+    /// status line it sits beneath in its plan. The thirteenth, the parity
+    /// plan's own head, is tested verbatim by `inline_code_area_mention_is_not_a_key`
+    /// below instead, because its point is the inline-code mention that
+    /// precedes the real key. Re-measure with `git grep -n 'Area:' origin/main
+    /// -- plans/` filtered to the status block.
+    ///
+    /// Re-measured 2026-09-23 (was 2026-09-22, `86208321`): three of the
+    /// fixtures below (`orphan-target-reaper`, `runner-reclaim-cannot-unlink`,
+    /// `rejunction-on-linux`) were free-text `agent_worktree` rejections at the
+    /// prior measurement; commit `9d40b75a` on dev-notes reworded all three to
+    /// the valid kebab value `agent-worktree` the same day, so the live corpus
+    /// now has **no naturally-occurring rejected example** — rejection is still
+    /// covered, synthetically, by `extract_area_applies_the_kebab_fixtures`
+    /// above (which includes the literal `agent_worktree` bad case). A new
+    /// plan, `2026-09-22-orchestration-loop-restart-modes-…`, added a fourth
+    /// `published-parity` declaration.
     const STATUS_BLOCK_AREA_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         (
             "2026-08-31-published-build-parity-check",
@@ -1748,6 +1758,16 @@ mod tests {
             Some("coord-tests"),
         ),
         (
+            "2026-09-19-orphan-target-reaper-cannot-remove-a-nested-windows-junction",
+            "> **Repo:** `qontinui-runner`. **Area:** `agent-worktree` (the `agent_worktree` module: orphan target reaper).",
+            Some("agent-worktree"),
+        ),
+        (
+            "2026-09-19-runner-reclaim-cannot-unlink-a-symlink-on-linux",
+            "> **Repo:** `qontinui-runner`. **Area:** `agent-worktree` (the `agent_worktree` module: reclaim). Line references are to",
+            Some("agent-worktree"),
+        ),
+        (
             "2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists",
             "> **Area:** `published-parity`.",
             Some("published-parity"),
@@ -1756,6 +1776,11 @@ mod tests {
             "2026-09-20-the-second-ratchet-domain-is-operations-and-its-cost-is-compared-to-the-first",
             "> Area: domain-cost-ledger",
             Some("domain-cost-ledger"),
+        ),
+        (
+            "2026-09-21-rejunction-on-linux-reports-success-without-creating-a-link",
+            "> **Repo:** `qontinui-runner`. **Area:** `agent-worktree` (the `agent_worktree` module: reclaim, the `Rejunction` action).",
+            Some("agent-worktree"),
         ),
         (
             "2026-09-22-a-fan-out-skill-rediscovers-the-worktree-cap-once-per-subagent",
@@ -1767,21 +1792,10 @@ mod tests {
             "> **Area:** `new-project-initiation` (work-unit `metadata.area`, exactly that key).",
             Some("new-project-initiation"),
         ),
-        // The measured free-text forms: rejected, with the value named.
         (
-            "2026-09-19-orphan-target-reaper-cannot-remove-a-nested-windows-junction",
-            "> **Repo:** `qontinui-runner`. **Area:** `agent_worktree` orphan target reaper.",
-            None,
-        ),
-        (
-            "2026-09-19-runner-reclaim-cannot-unlink-a-symlink-on-linux",
-            "> **Repo:** `qontinui-runner`. **Area:** `agent_worktree` reclaim. Line references are to",
-            None,
-        ),
-        (
-            "2026-09-21-rejunction-on-linux-reports-success-without-creating-a-link",
-            "> **Repo:** `qontinui-runner`. **Area:** `agent_worktree` reclaim, the `Rejunction` action.",
-            None,
+            "2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor",
+            "> **Area:** `published-parity`",
+            Some("published-parity"),
         ),
     ];
 
