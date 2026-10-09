@@ -1450,6 +1450,7 @@ function New-ParityCrossPlatformRefusal {
         DifferCount     = $null
         SameCount       = $null
         UnobservedCount = $null
+        OnlyOnOneCount  = $null
         WindowsVersion  = $WindowsVersion
         LinuxVersion    = $LinuxVersion
     }
@@ -1492,6 +1493,7 @@ function Compare-ParityPublishedAcrossPlatforms {
     $differ = 0
     $same = 0
     $unobserved = 0
+    $onlyOnOne = 0
     foreach ($id in $order) {
         $w = $win[$id]
         $l = $lin[$id]
@@ -1501,8 +1503,10 @@ function Compare-ParityPublishedAcrossPlatforms {
         if ($null -ne $l) { $lr = $l.published_rung }
         if ($null -eq $w) {
             $disp = 'only_on_linux'
+            $onlyOnOne++
         } elseif ($null -eq $l) {
             $disp = 'only_on_windows'
+            $onlyOnOne++
         } elseif (-not $w.published_observed -or -not $l.published_observed) {
             $disp = 'unobserved'
             $unobserved++
@@ -1521,6 +1525,13 @@ function Compare-ParityPublishedAcrossPlatforms {
         }
     }
 
+    # Nothing compared is not "0 differ". With every row unobserved on at least
+    # one platform (an artifact that predates the probe route, a refused
+    # provisioning drive) the honest answer is UNKNOWN.
+    if (($differ + $same) -eq 0) {
+        return (New-ParityCrossPlatformRefusal 'no_row_observed_on_both' $winVer $linVer)
+    }
+
     return [PSCustomObject]@{
         Available       = $true
         Reason          = $null
@@ -1528,6 +1539,7 @@ function Compare-ParityPublishedAcrossPlatforms {
         DifferCount     = $differ
         SameCount       = $same
         UnobservedCount = $unobserved
+        OnlyOnOneCount  = $onlyOnOne
         WindowsVersion  = $winVer
         LinuxVersion    = $linVer
     }

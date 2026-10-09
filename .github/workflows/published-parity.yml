@@ -1084,6 +1084,10 @@ jobs:
     timeout-minutes: 130
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      # A typed UNKNOWN from the asset step (no Linux asset / checksums on the
+      # release, or the locator's own reasons), so the cross-platform job can
+      # name the release fact instead of a generic missing report.
+      linux_unknown: ${{ steps.linux_asset.outputs.linux-unknown }}
 
     steps:
       - uses: actions/checkout@v5
@@ -1278,6 +1282,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "dpkg -x exited $LASTEXITCODE" }
           } else {
             & chmod +x $assetPath
+            if ($LASTEXITCODE -ne 0) { throw "chmod +x exited $LASTEXITCODE" }
             Push-Location $prefix
             try { & $assetPath --appimage-extract | Out-Null } finally { Pop-Location }
             if ($LASTEXITCODE -ne 0) { throw "--appimage-extract exited $LASTEXITCODE" }
@@ -1399,17 +1404,42 @@ jobs:
       # file reaches the harness as an empty argument, which it reports as
       # <platform>_report_missing -- UNKNOWN, exit 2, never a 0.
       - name: Compare the published side across platforms
+        id: compare
         continue-on-error: true
         shell: bash
+        env:
+          LINUX_UNKNOWN: ${{ needs.published-parity-linux.outputs.linux_unknown }}
         run: |
           win=$(find cross-platform/windows -name published-parity.json -type f 2>/dev/null | head -1)
           lin=$(find cross-platform/linux -name published-parity.json -type f 2>/dev/null | head -1)
           echo "windows report: '${win}'"
           echo "linux report  : '${lin}'"
-          pwsh -NoProfile -File scripts/published-parity.ps1 -CrossPlatform \
-            -WindowsReport "$win" -LinuxReport "$lin" \
+          echo "linux unknown : '${LINUX_UNKNOWN:-}'"
+          # Each flag only when it has a value: an empty argv element must never
+          # be able to shift -LinuxReport into -WindowsReport's value. An absent
+          # path binds the script's $null default -> <platform>_report_missing.
+          args=()
+          [ -n "$win" ] && args+=(-WindowsReport "$win")
+          [ -n "$lin" ] && args+=(-LinuxReport "$lin")
+          [ -n "${LINUX_UNKNOWN:-}" ] && args+=(-LinuxUnknown "$LINUX_UNKNOWN")
+          pwsh -NoProfile -File scripts/published-parity.ps1 -CrossPlatform "${args[@]}" \
             -JsonOut cross-platform/published-cross-platform.json \
             -SummaryOut "$GITHUB_STEP_SUMMARY" -Annotate
+
+      # Restated on the run, as the per-platform legs do. EMPTY means no list
+      # was produced (the reason says why) -- never read it as 0.
+      - name: Report the cross-platform count
+        if: always()
+        shell: bash
+        env:
+          DIFFER: ${{ steps.compare.outputs.cross-platform-differ-count }}
+          REASON: ${{ steps.compare.outputs.cross-platform-reason }}
+        run: |
+          echo "cross-platform-differ-count = '${DIFFER:-}'"
+          echo "cross-platform-reason       = '${REASON:-}'"
+          if [ -z "${DIFFER:-}" ]; then
+            echo "::warning::No cross-platform list was produced (reason: '${REASON:-none recorded}'). This is UNKNOWN, not zero."
+          fi
 
       - name: Upload the cross-platform list
         if: always()
