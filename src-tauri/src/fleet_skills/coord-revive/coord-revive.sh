@@ -1292,7 +1292,7 @@ note_runner_credential() {
 # L2, L4 sources 3 and 4) is carrying the same dead credential, and they spend
 # the sweep budget before L5 is reached - so the one runner-independent door was
 # reported SKIPPED_BUDGET_EXCEEDED in exactly the state it exists for. Measured
-# 2026-10-07 on device c79a07d5 (32 h stranded; coord findings e70fd8cf and
+# 2026-10-07 on one fleet device (32 h stranded; coord findings e70fd8cf and
 # 4d5a024f, dossier runner-coord-credential-stranded): a default-budget run
 # never reached L5, a 600 s run reached it LIVE.
 #
