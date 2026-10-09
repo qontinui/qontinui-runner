@@ -387,6 +387,115 @@ async fn bind_one(
     }
 }
 
+/// Transcript targets for a set of lifecycle-store records: one
+/// `(claude_session_id, transcript path)` per Claude-provider record whose
+/// transcript is on disk. `resolve` is injected so the selection is testable
+/// without a real config dir.
+pub fn lifecycle_transcript_targets(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    resolve: impl Fn(Option<&str>, Option<&str>, &str) -> Option<std::path::PathBuf>,
+) -> Vec<(String, std::path::PathBuf)> {
+    records
+        .iter()
+        .filter(|r| r.provider == crate::session::session_lifecycle_store::DEFAULT_PROVIDER)
+        .filter_map(|r| {
+            resolve(
+                r.config_dir.as_deref(),
+                r.working_dir.as_deref(),
+                &r.claude_session_id,
+            )
+            .map(|p| (r.claude_session_id.clone(), p))
+        })
+        .collect()
+}
+
+/// Delays before each attempt of an owed-finish bind ([`spawn_owed_finish_bind`]).
+/// The first is immediate; the rest back off so a dark coord is probed ~5 times
+/// over ~12 minutes rather than hammered, and the whole schedule is owned by a
+/// detached task, so it outlives the transcript tail that may have ended.
+pub const OWED_BIND_BACKOFF: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+];
+
+/// Bind ONE lifecycle-store record whose finished mark coord is OWED, so
+/// `register_inner` can deliver it. Unlike [`spawn_ensure_bound`] this does NOT
+/// go through the 60 s attempt throttle (that throttle exists to space tail
+/// retries; here a finish is waiting and a throttled-away attempt would leave
+/// the mark local-only until some unrelated append) and it retries on
+/// [`OWED_BIND_BACKOFF`] until the session is bound. A record whose transcript
+/// is not on disk has nothing to tail and is left alone; consent withheld
+/// (`cloud_sync_enabled` off) binds nothing. Detached; never blocks the caller.
+pub fn spawn_owed_finish_bind(
+    tailer: &Arc<SessionTranscriptTailer>,
+    rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+) {
+    let targets = lifecycle_transcript_targets(std::slice::from_ref(rec), |c, w, id| {
+        crate::session::past_sessions::resolve_transcript_path(c, w, id)
+    });
+    for (_, path) in targets {
+        let Some(identity) = identity_from_path(&path) else {
+            continue;
+        };
+        if !crate::settings::get_cloud_sync_enabled() {
+            return;
+        }
+        let tailer = tailer.clone();
+        tokio::spawn(async move {
+            for delay in OWED_BIND_BACKOFF {
+                tokio::time::sleep(delay).await;
+                if tailer.is_bound(&identity.claude_session_id) {
+                    return;
+                }
+                bind_one(&tailer, identity.clone(), &path, true).await;
+                if tailer.is_bound(&identity.claude_session_id) {
+                    return;
+                }
+            }
+            warn!(
+                "transcript_autobind: {} still unbound after {} attempts; its finished mark \
+                 stays local-only until the session next registers",
+                identity.claude_session_id,
+                OWED_BIND_BACKOFF.len()
+            );
+        });
+    }
+}
+
+/// Boot pass: bind every lifecycle-store session. The transcript watcher covers
+/// transcripts it sees under the config dirs; this covers the registry's own
+/// view, so a session the registry knows is never left without a coord row to
+/// carry its finished mark. A record owed a finish takes the un-throttled,
+/// retrying path ([`spawn_owed_finish_bind`]); the rest go through the ordinary
+/// throttled binder. Both detach, so this returns without waiting on coord.
+pub async fn bind_lifecycle_sessions(
+    tailer: &Arc<SessionTranscriptTailer>,
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+) {
+    let records = store.all_records();
+    let mut with_transcript = 0usize;
+    for rec in &records {
+        let targets = lifecycle_transcript_targets(std::slice::from_ref(rec), |c, w, id| {
+            crate::session::past_sessions::resolve_transcript_path(c, w, id)
+        });
+        with_transcript += targets.len();
+        if rec.finished_at.is_some() && !rec.finish_synced {
+            spawn_owed_finish_bind(tailer, rec);
+        } else {
+            for (_, path) in targets {
+                spawn_ensure_bound(tailer, &path);
+            }
+        }
+    }
+    info!(
+        "transcript_autobind: boot bind of {} lifecycle session(s) ({with_transcript} with a transcript on disk)",
+        records.len()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,5 +772,116 @@ mod tests {
             (c.autobind_adopted, c.autobind_minted, c.autobind_deferred),
             (1, 2, 1)
         );
+    }
+
+    fn lifecycle_rec(
+        csid: &str,
+        provider: &str,
+    ) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
+        let mut rec = crate::session::session_lifecycle_store::TerminalSessionRecord {
+            claude_session_id: csid.to_string(),
+            config_dir: None,
+            working_dir: None,
+            page_id: "default".to_string(),
+            zone_index: 0,
+            title: None,
+            terminal_id: "t".to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "closed".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: provider.to_string(),
+            origin: None,
+            restore_pending_at: None,
+            confirmed_at: None,
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+            finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
+            finish_reason: None,
+            finish_synced: false,
+            spawn_device_default: None,
+            adopted_from: None,
+        };
+        rec.working_dir = Some("/w".into());
+        rec
+    }
+
+    #[test]
+    fn the_owed_finish_bind_starts_immediately_and_backs_off() {
+        assert_eq!(
+            OWED_BIND_BACKOFF[0],
+            Duration::ZERO,
+            "no throttle on attempt 1"
+        );
+        assert!(
+            OWED_BIND_BACKOFF.windows(2).all(|w| w[0] < w[1]),
+            "strictly increasing backoff"
+        );
+    }
+
+    #[test]
+    fn lifecycle_targets_cover_every_claude_record_with_a_transcript() {
+        let other = "11111111-1111-4111-8111-111111111111";
+        let missing = "22222222-2222-4222-8222-222222222222";
+        let recs = vec![
+            lifecycle_rec(CSID, "claude"),
+            lifecycle_rec(other, "gemini"),
+            lifecycle_rec(missing, "claude"),
+        ];
+        let t = lifecycle_transcript_targets(&recs, |_, _, id| {
+            (id != missing).then(|| std::path::PathBuf::from(format!("/x/{id}.jsonl")))
+        });
+        assert_eq!(t.len(), 1, "gemini and transcript-less records are skipped");
+        assert_eq!(t[0].0, CSID);
+    }
+
+    #[test]
+    fn a_bound_lifecycle_session_delivers_its_owed_finish_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let store = Arc::new(
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+                dir.path().join("terminal-sessions.json"),
+            )
+            .unwrap(),
+        );
+        registrar.attach_lifecycle_store(store.clone());
+        store.record_open(lifecycle_rec(CSID, "claude"));
+        // Finish BEFORE any coord row exists: stays local-only.
+        let fin = store
+            .set_finished(CSID, true, Some("dismissed".into()))
+            .unwrap();
+        assert_eq!(
+            registrar.finish_session(CSID, fin.record.finished_at),
+            crate::session::session_lifecycle_store::FinishSync::LocalOnly(
+                crate::session::session_lifecycle_store::LocalOnlyReason::NoCoordSession
+            )
+        );
+
+        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        assert_eq!(
+            apply_retrying(&t, &id, &path, &Decision::Mint(Uuid::new_v4())),
+            Some(AutoBindKind::Minted)
+        );
+        let finished: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(finished.len(), 1, "binding delivers the owed mark");
+        assert_eq!(finished[0].payload["finish_reason"], "dismissed");
     }
 }

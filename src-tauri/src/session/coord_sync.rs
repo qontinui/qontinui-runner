@@ -1694,9 +1694,16 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // `session_status = "finished"` is terminal on coord's work axis and
             // gates prompting; no coord production writer moves a row off it.
             let url = format!("{base}/sessions/{}", rec.session_id);
-            let body = json!({
-                "progress": { "session_status": "finished" },
-            });
+            // `finish_reason` rides the same progress object (coord ignores
+            // unknown progress keys until its reader lands, so this cannot
+            // 4xx-drop the marker); a payload without one (an older outbox
+            // row) sends none rather than inventing one.
+            let mut progress = serde_json::Map::new();
+            progress.insert("session_status".into(), json!("finished"));
+            if let Some(reason) = rec.payload.get("finish_reason").and_then(|v| v.as_str()) {
+                progress.insert("finish_reason".into(), json!(reason));
+            }
+            let body = json!({ "progress": progress });
             crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
@@ -3547,7 +3554,8 @@ mod tests {
             "the finished write must be a PATCH, matching the progress arm: {body}"
         );
         assert!(
-            body.contains("\"session_status\": \"finished\""),
+            body.contains("\"session_status\".into(), json!(\"finished\")")
+                && body.contains("finish_reason"),
             "the body must set coord's WORK axis to finished: {body}"
         );
     }
