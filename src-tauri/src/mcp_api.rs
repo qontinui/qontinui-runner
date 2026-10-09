@@ -9975,7 +9975,18 @@ async fn coord_work_unit_deps_get_handler(
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /coord-mcp/provision-session`.
+///
+/// **`deny_unknown_fields` is load-bearing, not tidiness.** This is a
+/// cross-repo wire contract whose callers live in other checkouts
+/// (qontinui-claude-config's `coord-provision-nonce.sh`, the bundled
+/// `coord-revive`), and serde's default is to DROP a key it does not know. A
+/// misspelled tenant key therefore used to deserialize as "no tenant" and mint
+/// on the machine's default slot with a 200 — measured live (coord finding
+/// `659b574a`), when every shipped caller sent `tenant_id` while this struct
+/// only knew `tenant`. An unknown key is now a typed 400
+/// `COORD_MCP_PROVISION_INVALID_BODY`, so the NEXT drift reports itself.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProvisionSessionBody {
     /// The requesting session's working directory. The minted nonce is BOUND to
     /// this path (`NonceBinding::workdir`), which is what gives a bare session
@@ -10003,7 +10014,14 @@ struct ProvisionSessionBody {
     /// exactly the tenant-less document. That is the point of the switch: one
     /// lever reverses "a chosen tenant reaches the credential" on every door,
     /// rather than on the spawn paths while this one quietly keeps pinning.
-    #[serde(default)]
+    ///
+    /// **Accepted as `tenant_id` too.** Plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P2
+    /// specified the field as `tenant_id`, and that is the spelling every
+    /// shipped caller sends (`coord-provision-nonce.sh`, which `/coord-revive`
+    /// L4 source 3 drives, and the runner's own bundled copy of it). Sending
+    /// both keys is a duplicate-field 400, never a silent pick.
+    #[serde(default, alias = "tenant_id")]
     tenant: Option<uuid::Uuid>,
 }
 
@@ -10111,7 +10129,7 @@ struct ProvisionSessionBody {
 ///
 /// | Status | `code` | Meaning |
 /// |---|---|---|
-/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` (a non-UUID `tenant` lands here) |
+/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` — `tenant_id` is accepted as an alias for `tenant`; a non-UUID tenant, both spellings at once, and any other key all land here |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
@@ -10193,7 +10211,8 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
                 "COORD_MCP_PROVISION_INVALID_BODY",
                 format!(
                     "expected a JSON body of the shape {{\"cwd\": \"<path>\", \
-                     \"tenant\"?: \"<uuid>\"}}: {e}"
+                     \"tenant\"?: \"<uuid>\"}} (\"tenant_id\" is accepted for \
+                     \"tenant\"; any other key is refused): {e}"
                 ),
             );
         }
@@ -19128,6 +19147,80 @@ mod coord_provision_session_gate_tests {
             serde_json::from_str::<ProvisionSessionBody>(r#"{"cwd":"/tmp","tenant":"not-a-uuid"}"#)
                 .is_err(),
             "a non-UUID tenant must not parse (it lands as COORD_MCP_PROVISION_INVALID_BODY)"
+        );
+    }
+
+    /// Coord finding `659b574a`: every shipped caller spells the selector
+    /// `tenant_id` (plan 2026-09-10 P2's name), and before the alias serde
+    /// dropped it — so a named tenant minted on the machine's default slot with
+    /// a 200. Both spellings select; both at once, and any unknown key, refuse.
+    #[test]
+    fn provision_body_takes_tenant_id_and_refuses_unknown_keys() {
+        use super::ProvisionSessionBody;
+        let t = uuid::Uuid::from_u128(0xC5C5_0000_0000_4000_8000_0000_0000_00C5);
+        let aliased: ProvisionSessionBody =
+            serde_json::from_str(&format!(r#"{{"cwd":"/tmp","tenant_id":"{t}"}}"#)).unwrap();
+        assert_eq!(
+            aliased.tenant,
+            Some(t),
+            "tenant_id is the fleet callers' spelling and must select, not vanish"
+        );
+
+        assert!(
+            serde_json::from_str::<ProvisionSessionBody>(&format!(
+                r#"{{"cwd":"/tmp","tenant":"{t}","tenant_id":"{t}"}}"#
+            ))
+            .is_err(),
+            "both spellings at once is a duplicate field, never a silent pick"
+        );
+
+        for body in [
+            r#"{"cwd":"/tmp","tennant":"x"}"#,
+            r#"{"cwd":"/tmp","tenantId":"00000000-0000-4000-8000-0000deadbeef"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProvisionSessionBody>(body).is_err(),
+                "an unknown key must refuse rather than read as 'no tenant': {body}"
+            );
+        }
+    }
+
+    /// The route-level half of `659b574a`: the measured defect was
+    /// `{"cwd", "tenant_id": <unpaired>}` answering **200** with a document
+    /// minted on the default slot. Through the post-gate half it must now be the
+    /// same typed 403 the `tenant` spelling gets, and a misspelled key a 400 —
+    /// neither of which mints anything for the caller's cwd.
+    #[tokio::test]
+    async fn a_tenant_id_body_is_admitted_like_tenant_and_a_misspelling_is_refused() {
+        let amb = crate::test_env::isolated_ambient();
+        let tenant = uuid::Uuid::from_u128(0xD6D6_0000_0000_4000_8000_0000_0000_00D6);
+        let cwd = amb.dir().join("provision-tenant-id-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_str = cwd.to_string_lossy().to_string();
+
+        let body = serde_json::json!({ "cwd": cwd_str, "tenant_id": tenant.to_string() });
+        let resp = super::provision_session_after_gate(body.to_string().as_bytes());
+        assert_eq!(resp.status(), 403, "tenant_id must reach tenant admission");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_TENANT_NOT_PAIRED");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&tenant.to_string()),
+            "the refusal names the tenant the caller sent under tenant_id: {v}"
+        );
+
+        let body = serde_json::json!({ "cwd": cwd_str, "tenantId": tenant.to_string() });
+        let resp = super::provision_session_after_gate(body.to_string().as_bytes());
+        assert_eq!(resp.status(), 400, "an unknown key is refused, not dropped");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_INVALID_BODY");
+
+        let registry = crate::coord_mcp::NonceRegistry::global().test_live();
+        assert!(
+            registry.values().all(|b| b.workdir() != cwd_str),
+            "neither refusal may mint anything for the caller's cwd"
         );
     }
 
