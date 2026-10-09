@@ -705,7 +705,9 @@ function ZoneCellInner({
               activity={hot.activity}
               zoneLabel={zoneLabel}
               onSetZoneLabel={setLabel}
-              onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
+              onRestart={
+                onRestartInZone && tab.remote == null ? () => onRestartInZone(zoneIdx) : undefined
+              }
               groupColor={zoneLabel ? labelColorMap?.[zoneLabel] : undefined}
               uptime={formatUptime(tab.createdAt)}
               lastCommand={commandHistories?.[tab.id]?.slice(-1)[0]?.command}
@@ -902,7 +904,9 @@ function ZoneCellInner({
               }}
               lastLines={lastLines}
               state={state}
-              onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
+              onRestart={
+                onRestartInZone && tab.remote == null ? () => onRestartInZone(zoneIdx) : undefined
+              }
               onExportZone={onExportZone ? (fmt) => onExportZone(zoneIdx, fmt) : undefined}
             />
           )}

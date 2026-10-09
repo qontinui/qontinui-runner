@@ -20,7 +20,15 @@ import type { ResourceGuardSource } from "@/lib/resourceGuard";
  */
 export type RestartOutcome =
   | { restarted: true; tabId: string; retiredTabId: string | null }
-  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+  | {
+      restarted: false;
+      /** `remote-session`: the zone holds a REMOTE tab. A restart spawns a LOCAL
+       *  terminal and retires the old tab, which for a remote pane only detaches
+       *  it. Refused; the tab's own reattach control is the remote path
+       *  (`remoteParity.ts`, row `restart`). */
+      reason: "not-restartable" | "spawn-failed" | "remote-session";
+      state?: string;
+    };
 
 /** The page state and actions a restart reads and drives. */
 export interface RestartInZoneDeps {
@@ -32,7 +40,7 @@ export interface RestartInZoneDeps {
     /** `useZoneLayout().cosmeticZoneFor`: whose label a zone shows. */
     cosmeticZoneFor: (zoneIdx: number) => number | null;
   };
-  tabs: readonly { id: string; title?: string; workingDir?: string | null }[];
+  tabs: readonly { id: string; title?: string; workingDir?: string | null; remote?: unknown }[];
   sessionStates: Readonly<Record<string, string>>;
   zoneLabels: Readonly<Record<number, string>>;
   setZoneLabel: (zone: number, label: string) => void;
@@ -79,6 +87,9 @@ export async function restartInZone(
   const oldTabId = zoneLayout.assignments[zoneIdx];
   const oldTab = deps.tabs.find((t) => t.id === oldTabId);
   const state = oldTabId ? (deps.sessionStates[oldTabId] ?? "idle") : "idle";
+  if (oldTab?.remote != null) {
+    return { restarted: false, reason: "remote-session", state };
+  }
   if (!oldTabId || (state !== "completed" && state !== "error")) {
     return { restarted: false, reason: "not-restartable", state };
   }

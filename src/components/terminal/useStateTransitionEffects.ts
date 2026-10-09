@@ -8,7 +8,8 @@ import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./noti
 export interface UseStateTransitionEffectsParams {
   sessionStates: Record<string, SessionState>;
   prevSessionStatesRef: React.MutableRefObject<Record<string, SessionState>>;
-  tabs: Array<{ id: string; title: string; exitCode?: number | null }>;
+  /** `remote` must be carried through: `isRestartable` refuses a remote tab on it. */
+  tabs: Array<{ id: string; title: string; exitCode?: number | null; remote?: unknown }>;
   assignments: Record<number, string>;
   /**
    * Lazy reader for a tab's last rendered lines. A stable function (backed by

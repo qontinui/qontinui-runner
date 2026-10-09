@@ -68,6 +68,7 @@ import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import { describeThrown } from "@/lib/utils";
 import type { ApprovalReport } from "../approveAll";
+import { REMOTE_RESTART_REFUSAL } from "../remoteParity";
 import {
   WORK_MODE_NAMES,
   applyWorkModeRequest,
@@ -1239,6 +1240,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (zone.kind === "out-of-range") return fail("out-of-range");
       const tabId = zoneLayout.assignments[zone.index];
       const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
+      if (tabId && tabs.some((t) => t.id === tabId && t.remote != null)) {
+        return fail("not-restartable", REMOTE_RESTART_REFUSAL);
+      }
       if (state !== "completed" && state !== "error") {
         return fail("not-restartable", `session state is ${state}`);
       }
