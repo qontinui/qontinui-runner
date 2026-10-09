@@ -10098,8 +10098,11 @@ pub(crate) enum CredentialTenantRead {
     /// The proxy would select this tenant's slot; `None` is the default
     /// (`access_token`) slot.
     Resolved(Option<Uuid>),
-    /// The proxy would refuse every request. The string is its typed refusal body.
-    Refused(String),
+    /// The proxy would refuse every request, with this typed refusal — kept
+    /// whole so the report can name the refusal's OWN code rather than calling
+    /// every refusal "unresolvable" (plan
+    /// `2026-09-14-credential-posture-second-residuals` Phase 3 follow-up).
+    Refused(ProxyRefusal),
 }
 
 /// Resolve `nonce` the way the coord-mcp proxy does, without its logging.
@@ -10112,7 +10115,7 @@ fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
     }
     match session_tenant_decision(Some(nonce)).into_result() {
         Ok(tenant) => CredentialTenantRead::Resolved(tenant),
-        Err(refusal) => CredentialTenantRead::Refused(refusal.message),
+        Err(refusal) => CredentialTenantRead::Refused(refusal),
     }
 }
 
@@ -22103,7 +22106,7 @@ mod spawn_tenant_credential_tests {
             .credential
             .reason
             .as_deref()
-            .is_some_and(|r| r.starts_with("tenant_unresolvable:")));
+            .is_some_and(|r| r.starts_with("COORD_MCP_PROXY_TENANT_UNRESOLVABLE:")));
     }
 
     /// B1 (review). A second spawn for ANOTHER tenant into an existing
