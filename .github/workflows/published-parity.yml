@@ -1087,7 +1087,7 @@ jobs:
       # A typed UNKNOWN from the asset step (no Linux asset / checksums on the
       # release, or the locator's own reasons), so the cross-platform job can
       # name the release fact instead of a generic missing report.
-      linux_unknown: ${{ steps.linux_asset.outputs.linux-unknown }}
+      linux_unknown: ${{ steps.linux_asset.outputs.linux-unknown || steps.parity.outputs.linux-unknown-reason }}
 
     steps:
       - uses: actions/checkout@v5
@@ -1410,8 +1410,13 @@ jobs:
         env:
           LINUX_UNKNOWN: ${{ needs.published-parity-linux.outputs.linux_unknown }}
         run: |
-          win=$(find cross-platform/windows -name published-parity.json -type f 2>/dev/null | head -1)
-          lin=$(find cross-platform/linux -name published-parity.json -type f 2>/dev/null | head -1)
+          # GitHub runs bash with -eo pipefail, and `find` on a directory a
+          # failed download never created exits 1 -- which would stop this step
+          # before the harness could name the reason. Make both directories
+          # exist so a missing report reaches the harness as *_report_missing.
+          mkdir -p cross-platform/windows cross-platform/linux
+          win=$(find cross-platform/windows -name published-parity.json -type f | head -1 || true)
+          lin=$(find cross-platform/linux -name published-parity.json -type f | head -1 || true)
           echo "windows report: '${win}'"
           echo "linux report  : '${lin}'"
           echo "linux unknown : '${LINUX_UNKNOWN:-}'"

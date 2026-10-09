@@ -255,8 +255,9 @@ $DevExeName = Get-ParityDevExeName -Platform $ParityPlatform
 # There is no macOS leg: the published locator knows a Windows install dir and a
 # Linux unpacked prefix, nothing else. Refuse up front (harness, exit 2) rather
 # than let a macOS run fail later with a Windows-locator message. -CrossPlatform
-# boots nothing and needs no locator, so it is exempt.
-if ($ParityPlatform -eq 'macos' -and -not $CrossPlatform) {
+# boots nothing and -NegativeControl never calls the published locator, so both
+# are exempt.
+if ($ParityPlatform -eq 'macos' -and -not $CrossPlatform -and -not $NegativeControl) {
     Write-Host "PARITY-UNAVAILABLE platform: no macOS published leg exists (windows and linux only)." -ForegroundColor Red
     exit 2
 }
@@ -907,7 +908,9 @@ if ($CrossPlatform) {
     $l = & $readReport $LinuxReport 'linux'
     # A leg that reported a typed UNKNOWN uploads no report; carry its reason
     # so the refusal names the release fact instead of a generic "missing".
-    if ($null -eq $l.Report -and -not $l.Problem -and $LinuxUnknown) {
+    # Only when the Windows report IS present: otherwise the missing Windows
+    # report is the first thing to say, and Compare- says it.
+    if ($null -ne $w.Report -and $null -eq $l.Report -and -not $l.Problem -and $LinuxUnknown) {
         $l.Problem = "linux_report_missing($LinuxUnknown)"
     }
     if ($w.Problem) {
