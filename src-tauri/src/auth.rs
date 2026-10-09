@@ -1694,7 +1694,7 @@ pub(crate) fn select_device_bearer_result(
 /// injected — THE implementation every other shape and arity above delegates
 /// to, so the typed cause and the injected count can never be decided by two
 /// bodies.
-pub(crate) fn select_device_bearer_result_with(
+pub fn select_device_bearer_result_with(
     am: &AuthManager,
     tenant: Option<&Uuid>,
     default_tenant: Option<Uuid>,
