@@ -5814,7 +5814,16 @@ mod tests {
 
         // Chain level: the 429 stops the chain at the lifecycle row.
         let abort = Arc::new(AtomicBool::new(false));
-        let outcome = push_chain(coord.inner.clone(), rows, HashMap::new(), abort, true).await;
+        let outcome = push_chain(
+            coord.inner.clone(),
+            rows,
+            HashMap::new(),
+            abort,
+            true,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .await;
         assert!(outcome.blocked_on.is_some(), "the 429 must block the chain");
         assert!(
             outcome.succeeded.is_empty(),
