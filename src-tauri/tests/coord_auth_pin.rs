@@ -212,7 +212,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ),
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
     ("pair.rs", "bootstrap", 1),
-    ("pair.rs", "not-coord", 2),
+    // 2 -> 3 with machine-key enrolment (plan
+    // `2026-09-24-runner-coord-credential-stranded-after-outage`): the POST to
+    // qontinui-web's `/api/v1/devices/{id}/machine-credential/{self-mint|mint}`
+    // is a web call, not a coord write.
+    ("pair.rs", "not-coord", 3),
     ("session_bus.rs", "device-jwt-required", 1),
     ("session_bus.rs", "not-coord", 1),
     ("terminal/context_watcher.rs", "not-coord", 1),

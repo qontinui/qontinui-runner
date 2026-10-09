@@ -18,3 +18,6 @@ pub mod egress_context;
 // (`crate_roots_ratchet` fails on that).
 pub use qontinui_runner_lib::util::error_chain;
 pub mod path_extraction;
+/// Once-per-window transport-error WARNs with a suppressed count (plan
+/// 2026-09-24-runner-coord-credential-stranded-after-outage Phase 1). Bin-only.
+pub mod transport_log_dedupe;
