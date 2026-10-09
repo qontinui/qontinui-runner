@@ -4121,6 +4121,30 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
             .any(|p| name.starts_with(p))
 }
 
+/// Tools this door answers ITSELF, in-process, and never forwards to coord.
+/// They are appended to every `tools/list` answer
+/// ([`coord_mcp_with_runner_local_tools`]) and a `tools/call` naming one is
+/// dispatched by [`coord_mcp_answer_runner_local_call`] after the nonce has
+/// authenticated the session and before any coord bearer is selected.
+///
+/// Served here because this proxy is the MCP server every worker session's
+/// `.mcp.json` already names (`acquire_for_worker` / `provision_session_cwd`),
+/// so a worker reaches the tool with no second server to configure. Kept
+/// apart from [`COORD_MCP_ALLOWED_TOOLS`] on purpose: that list is the set of
+/// COORD tools this door forwards, and the drift bookkeeping compares it to
+/// coord's grant — a runner tool in it would read as a coord capability.
+const COORD_MCP_RUNNER_LOCAL_TOOLS: &[&str] =
+    &[crate::orchestration_loop::ai_session_executor::REPORT_TOOL_NAME];
+
+fn coord_mcp_tool_is_runner_local(name: &str) -> bool {
+    COORD_MCP_RUNNER_LOCAL_TOOLS.contains(&name)
+}
+
+/// The `tools/list` entries of [`COORD_MCP_RUNNER_LOCAL_TOOLS`].
+fn coord_mcp_runner_local_tool_descriptors() -> Vec<serde_json::Value> {
+    vec![crate::mcp::orchestration_report::report_tool_descriptor()]
+}
+
 /// The tools this door withholds ON PURPOSE — the "DELIBERATELY EXCLUDED"
 /// families from [`COORD_MCP_ALLOWED_TOOLS`]'s note, restated as data.
 ///
@@ -4240,6 +4264,8 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         "deliberateExclusions": COORD_MCP_DELIBERATE_EXCLUSIONS,
         "deliberateExclusionPrefixes": COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES,
         "deliberateExclusionCount": COORD_MCP_DELIBERATE_EXCLUSIONS.len(),
+        // Answered in-process by this runner, never forwarded to coord.
+        "runnerLocalTools": COORD_MCP_RUNNER_LOCAL_TOOLS,
         // The provenance half. Identical fields to `/health`'s, from the same
         // producer, so the two can never disagree about this binary.
         "gitSha": env!("QONTINUI_GIT_SHA"),
@@ -4898,11 +4924,161 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
             }
             for elem in elems {
                 coord_mcp_request_gate_one(elem)?;
+                // A runner-local tool is answered in-process and the rest of a
+                // batch is forwarded to coord; one POST cannot be both.
+                if let Some(tool) = coord_mcp_runner_local_tool_of(elem) {
+                    return Err(CoordMcpBodyRejection {
+                        id: elem.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        message: format!(
+                            "tool {tool:?} is served by this runner and cannot be sent in a \
+                             JSON-RPC batch; send it as a single request"
+                        ),
+                        tool: None,
+                    });
+                }
             }
             Ok(())
         }
         _ => coord_mcp_request_gate_one(&parsed),
     }
+}
+
+/// The runner-local tool a single JSON-RPC request object calls, if any.
+fn coord_mcp_runner_local_tool_of(req: &serde_json::Value) -> Option<&str> {
+    if req.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    req.pointer("/params/name")
+        .and_then(|n| n.as_str())
+        .filter(|n| coord_mcp_tool_is_runner_local(n))
+}
+
+/// A `tools/call` this door answers itself: the JSON-RPC `id` to echo, the
+/// tool name, and its `arguments`.
+#[derive(Debug, PartialEq)]
+struct RunnerLocalCall {
+    id: serde_json::Value,
+    tool: String,
+    arguments: serde_json::Value,
+}
+
+/// `Some` when the (already gated) body is a single `tools/call` of a
+/// [`COORD_MCP_RUNNER_LOCAL_TOOLS`] entry. A batch never is — the gate refuses
+/// a batch naming one.
+fn coord_mcp_runner_local_call(body: &[u8]) -> Option<RunnerLocalCall> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let tool = coord_mcp_runner_local_tool_of(&parsed)?.to_string();
+    Some(RunnerLocalCall {
+        id: parsed.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        tool,
+        arguments: parsed
+            .pointer("/params/arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// A JSON-RPC `tools/call` result carrying one text block. `is_error` is the
+/// MCP tool-error flag: the call reached the tool and the tool refused, which
+/// is what a client shows the model — unlike a JSON-RPC `error`, which reads
+/// as a transport fault.
+fn coord_mcp_tool_result(id: serde_json::Value, text: String, is_error: bool) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        },
+    })
+}
+
+/// Render [`orchestration_report::report_subtask_inner`]'s outcome as the
+/// `tools/call` answer. A rejection keeps its HTTP body verbatim — for a
+/// schema violation that is serde's detail plus the expected schema — and
+/// names the status, so the worker reads the same answer on either door.
+fn coord_mcp_report_tool_result(
+    id: serde_json::Value,
+    outcome: Result<
+        crate::mcp::orchestration_report::ReportSubtaskResponse,
+        (axum::http::StatusCode, String),
+    >,
+) -> serde_json::Value {
+    match outcome {
+        Ok(resp) => coord_mcp_tool_result(
+            id,
+            serde_json::to_string(&resp).unwrap_or_else(|e| format!("accepted ({e})")),
+            false,
+        ),
+        Err((status, body)) => coord_mcp_tool_result(
+            id,
+            format!("HTTP {} — {body}", status.as_u16()),
+            true,
+        ),
+    }
+}
+
+/// Answer a [`RunnerLocalCall`] in-process. Nothing here dials coord.
+async fn coord_mcp_answer_runner_local_call(
+    state: &Arc<ApiState>,
+    call: RunnerLocalCall,
+) -> serde_json::Value {
+    use crate::orchestration_loop::ai_session_executor::REPORT_TOOL_NAME;
+    if call.tool != REPORT_TOOL_NAME {
+        // Unreachable while the set has one entry; named so a second entry
+        // cannot be half-wired silently.
+        return coord_mcp_tool_result(
+            call.id,
+            format!("runner-local tool {:?} has no in-process handler", call.tool),
+            true,
+        );
+    }
+    let body: crate::mcp::orchestration_report::ReportSubtaskBody =
+        match serde_json::from_value(call.arguments) {
+            Ok(b) => b,
+            Err(e) => {
+                return coord_mcp_tool_result(
+                    call.id,
+                    serde_json::json!({
+                        "error": "invalid_arguments",
+                        "detail": e.to_string(),
+                        "retryable": true,
+                        "expectedSchema":
+                            crate::mcp::orchestration_report::report_tool_input_schema(),
+                    })
+                    .to_string(),
+                    true,
+                );
+            }
+        };
+    let outcome = crate::mcp::orchestration_report::report_subtask_inner(state, body).await;
+    coord_mcp_report_tool_result(call.id, outcome)
+}
+
+/// Append [`COORD_MCP_RUNNER_LOCAL_TOOLS`] to every `result.tools` array of a
+/// `tools/list` answer the filter already inspected (so it names only tools
+/// this door will run), skipping any name already present. `None` when the
+/// body is not JSON, which the filter has already reported.
+fn coord_mcp_with_runner_local_tools(response: &[u8]) -> Option<Vec<u8>> {
+    let mut parsed: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let append = |resp: &mut serde_json::Value| {
+        if let Some(tools) = resp
+            .pointer_mut("/result/tools")
+            .and_then(|t| t.as_array_mut())
+        {
+            for descriptor in coord_mcp_runner_local_tool_descriptors() {
+                let name = descriptor.get("name").cloned();
+                if !tools.iter().any(|t| t.get("name") == name.as_ref()) {
+                    tools.push(descriptor);
+                }
+            }
+        }
+    };
+    match &mut parsed {
+        serde_json::Value::Array(elems) => elems.iter_mut().for_each(append),
+        other => append(other),
+    }
+    serde_json::to_vec(&parsed).ok()
 }
 
 /// Gate ONE JSON-RPC request object. See [`coord_mcp_body_gate`].
@@ -4934,7 +5110,7 @@ fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBod
             Some(t) => t,
             None => return reject("tools/call has no string `params.name`".to_string(), None),
         };
-        if !coord_mcp_tool_is_allowed(tool) {
+        if !coord_mcp_tool_is_allowed(tool) && !coord_mcp_tool_is_runner_local(tool) {
             return reject(
                 format!(
                     "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
@@ -5711,6 +5887,14 @@ async fn coord_mcp_proxy_handler(
             })),
         )
             .into_response();
+    }
+
+    // A runner-local tool (`orchestration_report_subtask`) is answered HERE,
+    // in-process: the nonce above authenticated the session, and nothing about
+    // the call concerns coord, so no bearer is selected and nothing is
+    // forwarded.
+    if let Some(call) = coord_mcp_runner_local_call(&body) {
+        return Json(coord_mcp_answer_runner_local_call(&state, call).await).into_response();
     }
 
     // C3/M2: the tenant whose DEVICE slot supplied the bearer, hoisted out of
@@ -6589,7 +6773,11 @@ async fn coord_mcp_proxy_handler(
             // answer, and recording it is what lets `/health`'s
             // `coordMcpDrift` distinguish "clean" from "never looked".
             record_observed_coord_mcp_drift(&[]);
-            axum::body::Body::from(bytes)
+            // ...plus this door's own tools, which coord never lists.
+            match coord_mcp_with_runner_local_tools(&bytes) {
+                Some(with_local) => axum::body::Body::from(with_local),
+                None => axum::body::Body::from(bytes),
+            }
         }
         CoordMcpToolsListFilter::Filtered {
             body: filtered,
@@ -6653,7 +6841,9 @@ async fn coord_mcp_proxy_handler(
                     set,
                 ));
             }
-            axum::body::Body::from(filtered)
+            axum::body::Body::from(
+                coord_mcp_with_runner_local_tools(&filtered).unwrap_or(filtered),
+            )
         }
         CoordMcpToolsListFilter::Uninspectable { reason, leaked } => {
             // The upstream bytes still go out — this filter never turns a
@@ -19452,5 +19642,187 @@ mod supervised_workers_health_tests {
             src.contains(".route(\"/health\", get(health))"),
             "`/health` must still be served by `health`"
         );
+    }
+}
+
+/// `orchestration_report_subtask` on the `/coord-mcp` proxy (plan
+/// `2026-09-23-conductor-e2e-phase1-defects` Phase 3, P1-5): listed in every
+/// inspected `tools/list`, admitted by the gate, and answered in-process.
+#[cfg(test)]
+mod coord_mcp_runner_local_tool_tests {
+    use super::{
+        coord_mcp_body_gate, coord_mcp_filter_tools_list_response, coord_mcp_report_tool_result,
+        coord_mcp_runner_local_call, coord_mcp_tool_is_allowed, coord_mcp_with_runner_local_tools,
+        CoordMcpToolsListFilter, RunnerLocalCall,
+    };
+    use crate::orchestration_loop::ai_session_executor::REPORT_TOOL_NAME;
+
+    const TOOLS_LIST_REQ: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    fn call_req(tool: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": {"run_id": "11111111-2222-3333-4444-555555555555", "task_id": "T1"},
+            },
+        })
+    }
+
+    fn names(body: &[u8]) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(body).expect("json");
+        v["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn it_is_not_a_coord_tool() {
+        assert!(
+            !coord_mcp_tool_is_allowed(REPORT_TOOL_NAME),
+            "the coord allowlist is what the drift check compares to coord's grant"
+        );
+    }
+
+    #[test]
+    fn a_clean_tools_list_gains_the_tool_once() {
+        let clean = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "coord_memory_search"}]},
+        })
+        .to_string();
+        assert!(matches!(
+            coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), clean.as_bytes()),
+            CoordMcpToolsListFilter::Unchanged
+        ));
+        let out = coord_mcp_with_runner_local_tools(clean.as_bytes()).expect("json");
+        assert_eq!(names(&out), vec!["coord_memory_search", REPORT_TOOL_NAME]);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let schema = &v["result"]["tools"][1]["inputSchema"];
+        assert!(
+            schema["properties"]["completion_report"]["properties"]["followUps"].is_object(),
+            "the input schema is generated from CompletionReport: {schema}"
+        );
+        // Idempotent: a second pass (or a coord that one day lists the same
+        // name) does not duplicate it.
+        let twice = coord_mcp_with_runner_local_tools(&out).expect("json");
+        assert_eq!(names(&twice), vec!["coord_memory_search", REPORT_TOOL_NAME]);
+    }
+
+    #[test]
+    fn a_filtered_tools_list_gains_the_tool_too() {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "coord_memory_search"}, {"name": "not_a_granted_tool"}]},
+        })
+        .to_string();
+        let CoordMcpToolsListFilter::Filtered { body, .. } =
+            coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), resp.as_bytes())
+        else {
+            panic!("expected a filtered answer");
+        };
+        let out = coord_mcp_with_runner_local_tools(&body).expect("json");
+        assert_eq!(names(&out), vec!["coord_memory_search", REPORT_TOOL_NAME]);
+    }
+
+    #[test]
+    fn an_answer_with_no_tools_array_is_left_alone() {
+        let err = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#;
+        let out = coord_mcp_with_runner_local_tools(err.as_bytes()).expect("json");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.pointer("/result/tools").is_none(), "{v}");
+        assert!(coord_mcp_with_runner_local_tools(b"not json").is_none());
+    }
+
+    #[test]
+    fn the_gate_admits_a_single_call_and_refuses_a_batch_naming_it() {
+        assert!(coord_mcp_body_gate(call_req(REPORT_TOOL_NAME).to_string().as_bytes()).is_ok());
+        let batch = serde_json::json!([call_req("coord_memory_search"), call_req(REPORT_TOOL_NAME)]);
+        let err = coord_mcp_body_gate(batch.to_string().as_bytes())
+            .err()
+            .expect("a batch cannot be half local, half forwarded");
+        assert!(err.message.contains("single request"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_call_of_the_tool_is_routed_in_process_and_nothing_else_is() {
+        let body = call_req(REPORT_TOOL_NAME).to_string();
+        assert_eq!(
+            coord_mcp_runner_local_call(body.as_bytes()),
+            Some(RunnerLocalCall {
+                id: serde_json::json!(7),
+                tool: REPORT_TOOL_NAME.to_string(),
+                arguments: serde_json::json!({
+                    "run_id": "11111111-2222-3333-4444-555555555555",
+                    "task_id": "T1",
+                }),
+            })
+        );
+        for other in [
+            call_req("coord_memory_search").to_string(),
+            TOOLS_LIST_REQ.to_string(),
+        ] {
+            assert_eq!(coord_mcp_runner_local_call(other.as_bytes()), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_report_is_a_tool_error_carrying_the_schema() {
+        let body = crate::mcp::orchestration_report::schema_violation_body("missing field");
+        let out = coord_mcp_report_tool_result(
+            serde_json::json!(3),
+            Err((axum::http::StatusCode::BAD_REQUEST, body.to_string())),
+        );
+        assert_eq!(out["id"], 3);
+        assert_eq!(out["result"]["isError"], true);
+        let text = out["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("HTTP 400"), "{text}");
+        assert!(text.contains("expectedSchema"), "{text}");
+
+        let ok = coord_mcp_report_tool_result(
+            serde_json::json!(4),
+            Ok(crate::mcp::orchestration_report::ReportSubtaskResponse {
+                run_id: uuid::Uuid::nil(),
+                task_id: "T1".to_string(),
+                accepted: true,
+                warnings: vec![],
+            }),
+        );
+        assert_eq!(ok["result"]["isError"], false);
+        assert!(ok["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"accepted\":true"));
+    }
+
+    /// The handler answers the call BEFORE it selects a coord bearer, so a
+    /// report never waits on, or is refused by, coord's credential. Pinned at
+    /// the source (the handler needs a live nonce registry and `ApiState`),
+    /// the same technique the posture tests above use.
+    #[test]
+    fn the_proxy_answers_the_local_call_before_any_coord_io() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let handler = text
+            .find("async fn coord_mcp_proxy_handler(")
+            .expect("handler exists");
+        let after = |needle: &str| {
+            text.match_indices(needle)
+                .map(|(i, _)| i)
+                .find(|i| *i > handler)
+                .unwrap_or_else(|| panic!("{needle} in the handler"))
+        };
+        let gate = after("coord_mcp_body_gate(&body)");
+        let local = after("coord_mcp_runner_local_call(&body)");
+        let bearer = after("let mut bearer = match &principal");
+        assert!(gate < local, "the allowlist gate runs first");
+        assert!(local < bearer, "and the local call is answered before any bearer I/O");
     }
 }

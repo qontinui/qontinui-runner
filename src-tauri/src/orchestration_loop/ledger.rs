@@ -167,6 +167,14 @@ pub struct Subtask {
     /// is plain nullable `text` with no CHECK, so this doc and the matching
     /// comment in `atlas/schema.hcl` are the only enumeration there is.
     pub gate_status: Option<String>,
+    /// Why the row reached a terminal failure: `dependency <id> failed`, a
+    /// spawn-authorization refusal, `no_isolated_worktree: …`, or
+    /// [`LostWorkerDisposition::FAIL_REASON`]. `None` on every row that is not
+    /// failed — each state write sets it, so a row put back to `submitted` /
+    /// `working` never carries a stale one. The run's own `status_reason`
+    /// names its failed rows with these.
+    #[serde(default)]
+    pub state_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -206,7 +214,8 @@ pub enum LostWorkerDisposition {
 }
 
 impl LostWorkerDisposition {
-    /// The reason written to the log for a [`Self::Fail`], stated once.
+    /// The reason a [`Self::Fail`] writes to `subtasks.state_reason` (and
+    /// the log), stated once.
     pub const FAIL_REASON: &'static str = "worker lost across 2 restarts";
 
     /// Decide one lost row. A landed report always wins, whatever the count:

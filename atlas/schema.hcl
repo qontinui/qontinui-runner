@@ -636,6 +636,14 @@ table "subtasks" {
     type    = integer
     default = 0
   }
+  // Why the row reached a terminal failure, token-first where one exists:
+  // `dependency <id> failed`, an authorization refusal, `no_isolated_worktree:
+  // …`, or "worker lost across 2 restarts". NULL for every non-failed row —
+  // a transition back to `submitted`/`working` clears it.
+  column "state_reason" {
+    null = true
+    type = text
+  }
   column "created_at" {
     null    = false
     type    = timestamptz

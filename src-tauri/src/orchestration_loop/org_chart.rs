@@ -168,6 +168,7 @@ pub fn seeds_to_subtasks(
                 // on its first dispatch tick (if observable).
                 gate_id: None,
                 gate_status: None,
+                state_reason: None,
                 created_at: now,
                 updated_at: now,
             }

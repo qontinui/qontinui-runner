@@ -127,39 +127,62 @@ pub fn can_complete(subtask: &Subtask, signal: WorkerSignal) -> bool {
     matches!(signal, WorkerSignal::ReadyIdle) && subtask.artifact.is_some()
 }
 
+/// The runner-local MCP tool a worker reports through. Served in-process on
+/// the `/coord-mcp` proxy every worker's `.mcp.json` points at
+/// (`mcp_api::coord_mcp_runner_local_tool_call`), and over HTTP at
+/// [`REPORT_ROUTE`] as the fallback.
+pub const REPORT_TOOL_NAME: &str = "orchestration_report_subtask";
+
+/// The HTTP route [`REPORT_TOOL_NAME`] is also mounted at.
+pub const REPORT_ROUTE: &str = "/orchestration/report-subtask";
+
 /// Build the report-contract instruction block appended to a worker's brief.
 ///
 /// Tells the worker, in no uncertain terms, that finishing means calling the
-/// runner MCP tool `orchestration_report_subtask` with the run/task identity
-/// and a `CompletionReport`-shaped payload, and only THEN (optionally) printing
-/// the `[TASK_COMPLETE]` sentinel. The identity (`run_id` + `task_id`) is
-/// inlined so the worker reports against the right ledger row.
+/// runner MCP tool [`REPORT_TOOL_NAME`] with the run/task identity and a
+/// `CompletionReport`-shaped payload, and only THEN (optionally) printing the
+/// `[TASK_COMPLETE]` sentinel. The identity (`run_id` + `task_id`) is inlined
+/// so the worker reports against the right ledger row.
+///
+/// The payload shape is spelled out in FULL — one element of every array,
+/// with the exact serde field names of `database/pg/completion_reports.rs`
+/// (`camelCase`) and `FollowUp::priority`'s three values — because a worker
+/// shown `"followUps": []` has to guess an element's shape, and one wrong
+/// guess is a rejected report.
 ///
 /// `report_url` is the absolute runner endpoint the tool is mounted at, so the
-/// worker (which shares this runner's MCP surface) can resolve it without
-/// guessing the port.
+/// worker can resolve the fallback without guessing the port.
 pub fn build_report_instruction(run_id: Uuid, task_id: &str, report_url: &str) -> String {
     format!(
         "\n\n---\n\
          [ORCHESTRATION REPORT CONTRACT — REQUIRED]\n\
          You are a worker subtask in an orchestrated run. When you have FINISHED \
          this subtask you MUST report a structured result before stopping:\n\n\
-         1. Call the runner MCP tool `orchestration_report_subtask` with EXACTLY:\n\
+         1. Call the MCP tool `{REPORT_TOOL_NAME}` (served by the runner on your \
+            `coord-mcp` MCP server, so it may be listed as \
+            `mcp__coord-mcp__{REPORT_TOOL_NAME}`) with EXACTLY this shape:\n\
             {{\n\
               \"run_id\": \"{run_id}\",\n\
               \"task_id\": \"{task_id}\",\n\
               \"completion_report\": {{\n\
                 \"summaryMd\": \"<markdown summary of what you did>\",\n\
-                \"deliverables\": [{{\"kind\": \"pr|commit|file|endpoint|schema-change|spec|other\", \"reference\": \"<ref>\", \"description\": \"<one line>\"}}],\n\
-                \"breakingChanges\": [],\n\
-                \"followUps\": []\n\
+                \"deliverables\": [{{\"kind\": \"pr|commit|file|endpoint|schema-change|spec|other\", \"reference\": \"<SHA, URL, path, route or table>\", \"description\": \"<one line>\"}}],\n\
+                \"breakingChanges\": [{{\"area\": \"<subsystem>\", \"description\": \"<what broke and what dependents must now do>\", \"migrationStepsMd\": \"<markdown steps, or empty>\"}}],\n\
+                \"followUps\": [{{\"description\": \"<the loose end>\", \"priority\": \"critical|important|nice-to-have\", \"blockingForDependents\": false}}],\n\
+                \"artifacts\": {{}}\n\
               }}\n\
             }}\n\
-            (If you have no runner MCP client, POST the same JSON to `{report_url}`.)\n\
+            Every array may be empty (`[]`); the elements above show each one's \
+            shape. `priority` is exactly one of `critical`, `important`, \
+            `nice-to-have`. `artifacts` is optional.\n\
+            (If the tool is not available to you, POST the same JSON to `{report_url}`.)\n\
          2. Only AFTER the tool returns success, you MAY print `[TASK_COMPLETE]` \
             on its own line. The sentinel alone is NOT sufficient — the report \
             is what marks you done.\n\
-         3. If you cannot complete the work, still call the tool with a summary \
+         3. If the report is rejected as malformed, the answer carries the expected \
+            schema: fix the payload and call the tool again. A rejected report does \
+            not fail your subtask.\n\
+         4. If you cannot complete the work, still call the tool with a summary \
             describing the blocker so the orchestrator can recover.\n\
          ---\n"
     )
@@ -168,13 +191,21 @@ pub fn build_report_instruction(run_id: Uuid, task_id: &str, report_url: &str) -
 /// Absolute URL of the `orchestration_report_subtask` HTTP endpoint on THIS
 /// runner, used in the brief's fallback instruction. Reads the actually-bound
 /// API port from `AppState` when available, else the bootstrap default.
+///
+/// Spelled `127.0.0.1`, never `localhost`: the runner binds the IPv4 loopback
+/// only, and Windows resolves `localhost` to `::1` first.
 fn report_endpoint_url(app_handle: &tauri::AppHandle) -> String {
     let port = app_handle
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| s.api_port.load(std::sync::atomic::Ordering::Relaxed))
         .filter(|p| *p != 0)
         .unwrap_or(crate::mcp::types::MCP_API_PORT);
-    format!("http://localhost:{port}/orchestration/report-subtask")
+    report_endpoint_url_for_port(port)
+}
+
+/// [`report_endpoint_url`] for a known port (pure, so the spelling is tested).
+fn report_endpoint_url_for_port(port: u16) -> String {
+    format!("http://127.0.0.1:{port}{REPORT_ROUTE}")
 }
 
 /// How long [`dispatch_subtask`] reuses a subtask's last isolation refusal
@@ -461,7 +492,12 @@ pub async fn dispatch_subtask(
             }
             warn!("dispatch_subtask: {} refused: {refusal}", subtask.task_id);
             if let Err(e) = pg
-                .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
+                .set_subtask_state(
+                    run_id,
+                    &subtask.task_id,
+                    SubtaskState::Failed,
+                    Some(&refusal),
+                )
                 .await
             {
                 warn!(
@@ -545,8 +581,14 @@ pub async fn dispatch_subtask(
                         // A standing decision, like the authorization refusal
                         // above: mark the row Failed FIRST so the conductor stops
                         // re-deciding it every tick.
+                        let reason = refusal.error.to_string();
                         if let Err(pe) = pg
-                            .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
+                            .set_subtask_state(
+                                run_id,
+                                &subtask.task_id,
+                                SubtaskState::Failed,
+                                Some(&reason),
+                            )
                             .await
                         {
                             warn!(
@@ -764,6 +806,7 @@ pub async fn dispatch_subtask(
     let mut updated = subtask.clone();
     updated.task_run_id = Some(task_run_id);
     updated.state = SubtaskState::Working;
+    updated.state_reason = None;
     if let Err(e) = pg.upsert_subtask(&updated).await {
         // The one step that makes a live worker RECONCILABLE, and the one that
         // can fail with the worker already live. Leaving it up is not a
@@ -872,6 +915,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            state_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1088,11 +1132,7 @@ mod tests {
     #[test]
     fn report_instruction_inlines_run_and_task_identity() {
         let run = Uuid::new_v4();
-        let block = build_report_instruction(
-            run,
-            "T42",
-            "http://localhost:9876/orchestration/report-subtask",
-        );
+        let block = build_report_instruction(run, "T42", &report_endpoint_url_for_port(9876));
         assert!(block.contains(&run.to_string()), "run_id must be inlined");
         assert!(
             block.contains("\"task_id\": \"T42\""),
@@ -1110,5 +1150,54 @@ mod tests {
             block.contains("NOT sufficient"),
             "must state the sentinel alone is insufficient"
         );
+    }
+
+    #[test]
+    fn report_instruction_spells_every_element_shape_and_the_ipv4_loopback() {
+        let url = report_endpoint_url_for_port(9876);
+        assert_eq!(url, "http://127.0.0.1:9876/orchestration/report-subtask");
+        let block = build_report_instruction(Uuid::new_v4(), "T1", &url);
+        for field in [
+            // CompletionReport
+            "\"summaryMd\"",
+            "\"deliverables\"",
+            "\"breakingChanges\"",
+            "\"followUps\"",
+            // Deliverable
+            "\"kind\"",
+            "\"reference\"",
+            // BreakingChange
+            "\"area\"",
+            "\"migrationStepsMd\"",
+            // FollowUp
+            "\"description\"",
+            "\"priority\": \"critical|important|nice-to-have\"",
+            "\"blockingForDependents\": false",
+        ] {
+            assert!(block.contains(field), "instruction must spell {field}:\n{block}");
+        }
+        assert!(block.contains("http://127.0.0.1:9876/"), "{block}");
+        assert!(!block.contains("localhost"), "{block}");
+    }
+
+    /// The example the instruction shows must itself be a report the route
+    /// accepts — otherwise the contract teaches a malformed payload.
+    #[test]
+    fn report_instruction_example_is_a_valid_completion_report() {
+        use crate::database::pg::completion_reports::CompletionReport;
+        let block = build_report_instruction(Uuid::new_v4(), "T1", "http://127.0.0.1:1/x");
+        let open = block.find('{').expect("example opens");
+        // Rust's `\` line continuation strips the source indentation, so the
+        // example ends at the first `}` line directly followed by another.
+        let close = block.find("\n}\n}\n").expect("example closes") + 4;
+        let example: serde_json::Value =
+            serde_json::from_str(block.get(open..close).expect("in bounds"))
+                .expect("the example is JSON");
+        let report: CompletionReport =
+            serde_json::from_value(example["completion_report"].clone())
+                .expect("the example deserializes as a CompletionReport");
+        assert_eq!(report.follow_ups.len(), 1);
+        assert_eq!(report.breaking_changes.len(), 1);
+        assert!(!report.follow_ups[0].blocking_for_dependents);
     }
 }

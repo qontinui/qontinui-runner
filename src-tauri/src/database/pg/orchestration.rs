@@ -224,8 +224,9 @@ impl PgDb {
     /// - [`LostWorkerDisposition::Reported`] → no write (`Ok(false)`): the
     ///   relaunched reconciler completes it through its normal path.
     /// - [`LostWorkerDisposition::Resubmit`] → `submitted`, `task_run_id`
-    ///   cleared, `restart_resets + 1`.
-    /// - [`LostWorkerDisposition::Fail`] → `failed`.
+    ///   cleared, `restart_resets + 1`, `state_reason` cleared.
+    /// - [`LostWorkerDisposition::Fail`] → `failed`, with
+    ///   [`LostWorkerDisposition::FAIL_REASON`] in `state_reason`.
     pub async fn apply_lost_worker(
         &self,
         run_id: Uuid,
@@ -240,6 +241,7 @@ impl PgDb {
                 SET state = 'submitted',
                     task_run_id = NULL,
                     restart_resets = restart_resets + 1,
+                    state_reason = NULL,
                     updated_at = now()
                 WHERE run_id = $1 AND task_id = $2 AND state = 'working'
                 "#
@@ -247,7 +249,7 @@ impl PgDb {
             LostWorkerDisposition::Fail => {
                 r#"
                 UPDATE orchestration.subtasks
-                SET state = 'failed', updated_at = now()
+                SET state = 'failed', state_reason = $3, updated_at = now()
                 WHERE run_id = $1 AND task_id = $2 AND state = 'working'
                 "#
             }
@@ -257,10 +259,17 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let n = conn
-            .execute(sql, &[&run_id, &task_id])
-            .await
-            .map_err(|e| crate::database::pg::pg_err("apply_lost_worker", &e))?;
+        let n = match disposition {
+            LostWorkerDisposition::Fail => {
+                conn.execute(
+                    sql,
+                    &[&run_id, &task_id, &LostWorkerDisposition::FAIL_REASON],
+                )
+                .await
+            }
+            _ => conn.execute(sql, &[&run_id, &task_id]).await,
+        }
+        .map_err(|e| crate::database::pg::pg_err("apply_lost_worker", &e))?;
         Ok(n > 0)
     }
 
@@ -426,9 +435,9 @@ impl PgDb {
             INSERT INTO orchestration.subtasks
                 (task_id, run_id, idx, title, brief, phase, repo, depends_on,
                  expected_output, emits_subtasks, state, task_run_id, artifact,
-                 produced_by, gate_id, gate_status)
+                 produced_by, gate_id, gate_status, state_reason)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16)
+                    $15, $16, $17)
             ON CONFLICT (run_id, task_id) DO UPDATE SET
                 idx             = EXCLUDED.idx,
                 title           = EXCLUDED.title,
@@ -444,6 +453,7 @@ impl PgDb {
                 produced_by     = EXCLUDED.produced_by,
                 gate_id         = EXCLUDED.gate_id,
                 gate_status     = EXCLUDED.gate_status,
+                state_reason    = EXCLUDED.state_reason,
                 updated_at      = now()
             "#,
             &[
@@ -463,6 +473,7 @@ impl PgDb {
                 &subtask.produced_by,
                 &subtask.gate_id,
                 &subtask.gate_status,
+                &subtask.state_reason,
             ],
         )
         .await
@@ -486,7 +497,7 @@ impl PgDb {
                 SELECT task_id, run_id, idx, title, brief, phase, repo,
                        depends_on, expected_output, emits_subtasks, state,
                        task_run_id, artifact, produced_by, gate_id, gate_status,
-                       created_at, updated_at
+                       created_at, updated_at, state_reason
                 FROM orchestration.subtasks
                 WHERE run_id = $1
                 ORDER BY idx ASC, task_id ASC
@@ -499,13 +510,17 @@ impl PgDb {
         rows.iter().map(Self::subtask_from_row).collect()
     }
 
-    /// Transition a single subtask's lifecycle state. Returns `Err` if no row
-    /// matched `(run_id, task_id)`.
+    /// Transition a single subtask's lifecycle state, writing `state_reason`
+    /// in the same statement. Pass the reason for a `Failed` / `Canceled`
+    /// transition; `None` clears it, so a row that leaves a failure never
+    /// carries a stale reason. Returns `Err` if no row matched
+    /// `(run_id, task_id)`.
     pub async fn set_subtask_state(
         &self,
         run_id: Uuid,
         task_id: &str,
         state: SubtaskState,
+        reason: Option<&str>,
     ) -> Result<(), String> {
         let conn = self
             .pool
@@ -518,10 +533,11 @@ impl PgDb {
                 r#"
                 UPDATE orchestration.subtasks
                 SET state = $3,
+                    state_reason = $4,
                     updated_at = now()
                 WHERE run_id = $1 AND task_id = $2
                 "#,
-                &[&run_id, &task_id, &state.as_str()],
+                &[&run_id, &task_id, &state.as_str(), &reason],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("set_subtask_state", &e))?;
@@ -652,9 +668,10 @@ impl PgDb {
                     INSERT INTO orchestration.subtasks
                         (task_id, run_id, idx, title, brief, phase, repo,
                          depends_on, expected_output, emits_subtasks, state,
-                         task_run_id, artifact, produced_by, gate_id, gate_status)
+                         task_run_id, artifact, produced_by, gate_id, gate_status,
+                         state_reason)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                            $13, $14, $15, $16)
+                            $13, $14, $15, $16, $17)
                     ON CONFLICT (run_id, task_id) DO NOTHING
                     "#,
                     &[
@@ -674,6 +691,7 @@ impl PgDb {
                         &subtask.produced_by,
                         &subtask.gate_id,
                         &subtask.gate_status,
+                        &subtask.state_reason,
                     ],
                 )
                 .await
@@ -740,6 +758,9 @@ impl PgDb {
             produced_by: row.get(13),
             gate_id: row.get(14),
             gate_status: row.get(15),
+            state_reason: row
+                .try_get(18)
+                .map_err(|e| crate::database::pg::pg_err("subtask_from_row state_reason", &e))?,
             created_at: row.get::<_, DateTime<Utc>>(16),
             updated_at: row.get::<_, DateTime<Utc>>(17),
         })
@@ -782,6 +803,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            state_reason: None,
             // Placeholders — the DB stamps real `now()` values on insert; the
             // in-memory struct never sends these (they're not in any INSERT
             // column list).
@@ -941,7 +963,7 @@ mod tests {
         assert!(matches!(b_row.state, SubtaskState::Working));
 
         // set_subtask_state.
-        pg.set_subtask_state(run_id, "A", SubtaskState::Completed)
+        pg.set_subtask_state(run_id, "A", SubtaskState::Completed, None)
             .await
             .expect("set_subtask_state A");
         let a_row = pg
@@ -1216,12 +1238,61 @@ mod tests {
             let now = pg.list_subtasks(run_id).await.expect("list");
             let r = now.iter().find(|s| s.task_id == "lost").expect("lost");
             assert_eq!(r.state, expected);
+            let want_reason = (expected == SubtaskState::Failed)
+                .then_some(crate::orchestration_loop::ledger::LostWorkerDisposition::FAIL_REASON);
+            assert_eq!(
+                r.state_reason.as_deref(),
+                want_reason,
+                "a reset clears the reason; the fail persists it"
+            );
         }
         assert_eq!(
             restart_resets(&pg, run_id, "lost").await,
             2,
             "a fail does not count as a reset"
         );
+
+        delete_run(&pg, run_id).await;
+    }
+
+    /// `state_reason` is written by every state transition: a `Failed` write
+    /// carries its reason, and a transition back to `submitted` / `working`
+    /// (a set, or the dispatch upsert) clears it.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn state_reason_is_written_with_the_failure_and_cleared_on_the_way_back() {
+        let pg = PgDb::new_for_test().await;
+        let run_id = Uuid::new_v4();
+        pg.create_run(run_id, "reasons", None, &[], "running")
+            .await
+            .expect("create_run");
+        let st = mk_subtask(run_id, "A", 0, vec![], false);
+        pg.upsert_subtask(&st).await.expect("upsert");
+        let read = |rows: Vec<Subtask>| rows.into_iter().find(|s| s.task_id == "A").unwrap();
+
+        pg.set_subtask_state(run_id, "A", SubtaskState::Failed, Some("dependency Z failed"))
+            .await
+            .expect("fail");
+        let a = read(pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(a.state, SubtaskState::Failed);
+        assert_eq!(a.state_reason.as_deref(), Some("dependency Z failed"));
+
+        pg.set_subtask_state(run_id, "A", SubtaskState::Submitted, None)
+            .await
+            .expect("back to submitted");
+        let a = read(pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(a.state_reason, None, "a set with no reason clears it");
+
+        pg.set_subtask_state(run_id, "A", SubtaskState::Failed, Some("x"))
+            .await
+            .expect("fail again");
+        let mut working = read(pg.list_subtasks(run_id).await.unwrap());
+        working.state = SubtaskState::Working;
+        working.state_reason = None;
+        pg.upsert_subtask(&working).await.expect("dispatch upsert");
+        let a = read(pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(a.state, SubtaskState::Working);
+        assert_eq!(a.state_reason, None, "the dispatch upsert clears it");
 
         delete_run(&pg, run_id).await;
     }
