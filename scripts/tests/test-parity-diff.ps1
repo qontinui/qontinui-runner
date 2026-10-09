@@ -700,6 +700,14 @@ $refused = New-PlatformReport (& $pubObserved) 'linux'
 $refused.schema_refused = $true
 Assert-Equal "schema-refused: reason"          'linux_report_schema_refused' (Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $refused).Reason
 
+# Nothing observed on both platforms: UNKNOWN, never "differs 0".
+$allUnknown = { Set-Rung (New-Manifest) 'workspace_root' 'unknown' }
+$r5 = Compare-ParityPublishedAcrossPlatforms -WindowsReport (New-PlatformReport (& $allUnknown) 'windows') -LinuxReport (New-PlatformReport (& $allUnknown) 'linux')
+Assert-True  "no row on both: unavailable"     (-not $r5.Available)
+Assert-Equal "no row on both: reason"          'no_row_observed_on_both' $r5.Reason
+Assert-Equal "no row on both: count is null, not 0" $null $r5.DifferCount
+Assert-Equal "roster-only row is counted"      1 $c4.OnlyOnOneCount
+
 $noVer = & $pubObserved
 $noVer.app_version = $null
 Assert-Equal "version unknown: reason"         'published_version_unknown' (Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport (New-PlatformReport $noVer 'linux')).Reason

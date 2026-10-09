@@ -202,7 +202,9 @@ param(
     # two published builds are different versions), which is UNKNOWN.
     [switch]$CrossPlatform,
     [string]$WindowsReport = $null,
-    [string]$LinuxReport = $null
+    [string]$LinuxReport = $null,
+    # The Linux leg's typed UNKNOWN reason, when it produced no report.
+    [string]$LinuxUnknown = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -237,6 +239,14 @@ $RepoRoot = (Get-Item $PSScriptRoot).Parent.FullName
 # artifact and a Linux artifact can never be mistaken for one another.
 $ParityPlatform = Get-ParityHostPlatform
 $DevExeName = Get-ParityDevExeName -Platform $ParityPlatform
+# There is no macOS leg: the published locator knows a Windows install dir and a
+# Linux unpacked prefix, nothing else. Refuse up front (harness, exit 2) rather
+# than let a macOS run fail later with a Windows-locator message. -CrossPlatform
+# boots nothing and needs no locator, so it is exempt.
+if ($ParityPlatform -eq 'macos' -and -not $CrossPlatform) {
+    Write-Host "PARITY-UNAVAILABLE platform: no macOS published leg exists (windows and linux only)." -ForegroundColor Red
+    exit 2
+}
 
 function Assert-DevRunnerExe {
     param([string]$Path)
@@ -870,16 +880,23 @@ if ($CrossPlatform) {
         } catch {
             return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_unparseable" }
         }
-        # A report written before Phase 6B carries no platform; one that names
-        # the WRONG platform was passed in the wrong slot, and comparing it would
-        # report a platform difference that is really no difference at all.
-        if ($obj.platform -and [string]$obj.platform -ne $Expected) {
-            return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_is_$($obj.platform)" }
+        # A report that names the WRONG platform was passed in the wrong slot,
+        # and comparing it would report a platform difference that is really no
+        # difference at all. One with NO platform predates Phase 6B, so it can
+        # only be a Windows report -- accepted in neither slot, not guessed at.
+        if ([string]$obj.platform -ne $Expected) {
+            $label = $(if ($obj.platform) { [string]$obj.platform } else { 'unlabelled' })
+            return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_is_$label" }
         }
         return [PSCustomObject]@{ Report = $obj; Problem = $null }
     }
     $w = & $readReport $WindowsReport 'windows'
     $l = & $readReport $LinuxReport 'linux'
+    # A leg that reported a typed UNKNOWN uploads no report; carry its reason
+    # so the refusal names the release fact instead of a generic "missing".
+    if ($null -eq $l.Report -and -not $l.Problem -and $LinuxUnknown) {
+        $l.Problem = "linux_report_missing($LinuxUnknown)"
+    }
     if ($w.Problem) {
         $cp = New-ParityCrossPlatformRefusal $w.Problem
     } elseif ($l.Problem) {
@@ -898,9 +915,9 @@ if ($CrossPlatform) {
         }
         $md.Add("**UNKNOWN** -- ``$($cp.Reason)``. No cross-platform list was produced; this is not a statement that the two published builds agree.")
     } else {
-        Write-Host ("cross-platform (published {0}): differs {1}, same {2}, unobserved {3}" -f `
-            $cp.WindowsVersion, $cp.DifferCount, $cp.SameCount, $cp.UnobservedCount)
-        $md.Add("Published ``$($cp.WindowsVersion)`` on both platforms. Rows whose published rung differs: **$($cp.DifferCount)** (same: $($cp.SameCount), unobserved on at least one platform: $($cp.UnobservedCount)).")
+        Write-Host ("cross-platform (published {0}): differs {1}, same {2}, unobserved {3}, roster-only {4}" -f `
+            $cp.WindowsVersion, $cp.DifferCount, $cp.SameCount, $cp.UnobservedCount, $cp.OnlyOnOneCount)
+        $md.Add("Published ``$($cp.WindowsVersion)`` on both platforms. Rows whose published rung differs: **$($cp.DifferCount)** (same: $($cp.SameCount), unobserved on at least one platform: $($cp.UnobservedCount), in one platform's roster only: $($cp.OnlyOnOneCount)).")
         $md.Add("")
         $md.Add("This list is NOT part of ``parity_defects``: that number is development-vs-published on one platform. ``unobserved`` is the absence of a reading on a platform, never agreement.")
         $md.Add("")
@@ -934,7 +951,7 @@ if ($CrossPlatform) {
             reason           = $cp.Reason
             windows_version  = $cp.WindowsVersion
             linux_version    = $cp.LinuxVersion
-            counts           = [PSCustomObject]@{ differs = $cp.DifferCount; same = $cp.SameCount; unobserved = $cp.UnobservedCount }
+            counts           = [PSCustomObject]@{ differs = $cp.DifferCount; same = $cp.SameCount; unobserved = $cp.UnobservedCount; only_on_one = $cp.OnlyOnOneCount }
             rows             = @($cp.Rows)
         }
         [System.IO.File]::WriteAllText($JsonOut, ($cpObj | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
@@ -1117,7 +1134,7 @@ if ($NegativeControl) {
 }
 
 try {
-    $pubPath = Find-InstalledRunnerExe -InstallRoot $InstallRoot -Platform $(if ($ParityPlatform -eq 'linux') { 'linux' } else { 'windows' })
+    $pubPath = Find-InstalledRunnerExe -InstallRoot $InstallRoot -Platform $ParityPlatform
 } catch {
     Write-Host "PARITY-UNAVAILABLE published_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
