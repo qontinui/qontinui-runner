@@ -3186,11 +3186,10 @@ mod tests {
     /// `offset`.
     #[test]
     fn offset_is_not_forwarded_and_cursor_is() {
-        let raw: HashMap<String, String> =
-            [("offset", "10"), ("cursor", "abc"), ("limit", "5")]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+        let raw: HashMap<String, String> = [("offset", "10"), ("cursor", "abc"), ("limit", "5")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         for allow in [&SEARCH_PARAMS[..], &CANDIDATE_PARAMS[..]] {
             let forwarded = forward_only(raw.clone(), allow);
             assert_eq!(forwarded.get("cursor").map(String::as_str), Some("abc"));
