@@ -54,6 +54,9 @@ pub(crate) type GroupEntry = (&'static [&'static str], GroupHandler);
 /// crate::ipc_group!(a11y_capture, a11y_click);
 /// ```
 ///
+/// Invoke it at FILE level (not inside an inline `mod {}`): the registration
+/// guard maps each `ipc_group!` to its module by file path.
+///
 /// Command names are `stringify!`d from the fn idents, which is exactly the
 /// name `#[tauri::command]` registers unless the attribute carries `rename`.
 /// No command uses `rename`, and the registration guard test refuses one.
@@ -142,13 +145,17 @@ mod tests {
         assert!(lookup("__no_such_command__").is_none());
     }
 
-    /// Phase 0 measurement (plan `2026-10-02-split-run-app-invoke-handler` §0):
-    /// a generated handler's frame is roughly (arm count) × this size at
-    /// debug opt-level 0. Printed so `cargo test -- --nocapture` records it.
+    /// A generated handler's frame is roughly (arm count) × this size at debug
+    /// opt-level 0 (944 bytes on tauri 2.11.1 — plan
+    /// `2026-10-02-split-run-app-invoke-handler` §5). If it grows past 4 KiB,
+    /// group sizes need re-checking against the 128 KB frame budget.
     #[test]
-    fn invoke_size_is_recorded() {
+    fn invoke_size_stays_within_the_frame_budget_model() {
         let size = std::mem::size_of::<Invoke<Wry>>();
         println!("size_of::<tauri::ipc::Invoke<tauri::Wry>>() = {size} bytes");
-        assert!(size > 0);
+        assert!(
+            size <= 4096,
+            "Invoke<Wry> is {size} bytes; re-check ipc_group! sizes against the 128 KB frame budget"
+        );
     }
 }

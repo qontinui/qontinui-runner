@@ -2638,8 +2638,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             None,
         ))
         .plugin(ui_bridge_plugin::init())
-        // All other in-app Tauri commands are registered via the central
-        // `generate_handler!` below rather than per-module plugins.
+        // All other in-app Tauri commands are app-level, never per-module
+        // plugins: modules moved onto `crate::ipc_group!` are routed by
+        // `ipc_registry`, the rest by the central `generate_handler!` below
+        // (plan 2026-10-02-split-run-app-invoke-handler moves them all).
         //
         // Rationale: the 90-module plugin split (Workstream B of
         // REFACTOR_WAVE_3_PLAN) compiled clean but broke runtime IPC. Tauri 2
@@ -2658,8 +2660,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // `ui_bridge_plugin` remains the one exception — its handler fns are
         // non-`pub` and the frontend talks to them only via HTTP, not IPC.
         //
-        // The per-module `plugin()` fns are left in place for future reuse
-        // even though nothing invokes them now.
+        // The remaining per-module `plugin()` fns are dead code; each is
+        // deleted as its module moves onto `ipc_group!`.
         //
         // 2026-05-21 audit-trail shim — every IPC dispatch is observed once
         // before being forwarded to the macro-generated handler. We record
