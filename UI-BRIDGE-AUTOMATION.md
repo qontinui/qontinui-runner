@@ -136,9 +136,10 @@ entry to `UI_BRIDGE_COMMANDS`. The name must match the `#[tauri::command]`
 function name exactly. Populate both schemas — `GET /ui-bridge/commands`
 consumers (tests, SDK generators, tutorial docs) rely on them.
 
-The Tauri command itself must already be registered in
-`invoke_handler!` in `src-tauri/src/main.rs`. The HTTP proxy doesn't
-register commands — it only dispatches invocations through the frontend.
+The Tauri command itself must already be registered in its module's
+`crate::ipc_group!(...)` list (see `src-tauri/src/ipc_registry.rs`). The
+HTTP proxy doesn't register commands — it only dispatches invocations
+through the frontend.
 
 ---
 

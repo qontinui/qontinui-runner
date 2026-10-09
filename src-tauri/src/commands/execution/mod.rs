@@ -16,7 +16,8 @@
 //! - `system_ops` - System-level operations (updates, folder opening, error handling)
 //! - `bridge_execution` - Bridge-specific workflow execution and GUI lock transfer
 
-// Make submodules public so tauri::generate_handler! can access macro-generated items
+// Submodules are public so `ipc_registry::GROUPS` can name each one's
+// `IPC_GROUP` (`crate::commands::execution::<sub>::IPC_GROUP`).
 pub mod bridge_execution;
 pub mod executor_status;
 pub mod python_executor;
