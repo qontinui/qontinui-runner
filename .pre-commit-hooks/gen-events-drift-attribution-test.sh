@@ -19,6 +19,10 @@
 #   * a push that touches a codegen input is never cleared   (no lost signal)
 #   * a push that touches none of them is never blamed       (no false blame)
 #   * a push whose attribution cannot be computed is never cleared (fail closed)
+#
+# Plus one section that reads the REAL tree rather than a fixture: the premise
+# guard for the library's markdown exclusion, which must fail the day markdown
+# can reach schemas.json.
 
 set -uo pipefail
 
@@ -32,13 +36,44 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # hypothetical: it happened the first time this script ran from a pre-push hook.
 gen_events_clear_inherited_git_env
 
+# The same for the HOOK-STAGE environment. pre-commit runs this suite at
+# pre-push as well as pre-commit (it has no `stages:`), exporting
+# PRE_COMMIT_TO_REF / FROM_REF / REMOTE_NAME / …; the direct shim hands it
+# git's pre-push stdin; a parent drift hook may have left
+# GEN_EVENTS_STAGE_HINT. Every stage-sensitive case below would then read
+# `push` whatever it set up — measured: 8 failures under
+# `PRE_COMMIT_REMOTE_NAME=origin PRE_COMMIT_TO_REF=bbbb`. So the suite starts
+# from none of it, and never reads git's stdin: it neither needs it nor may
+# consume it. Cases that want a push stage set it themselves.
+#
+# Command-line git config too. Under `git -c k=v <cmd>` or `git --config-env
+# k=ENV <cmd>` git exports GIT_CONFIG_PARAMETERS to every hook, and it
+# overrides the fixtures' local config: `-c core.hooksPath=…` meant no fixture
+# hook ran (11 failures), `-c commit.gpgsign=true` failed ~92 fixture
+# commits. The suite also drops any user-set GIT_CONFIG_COUNT / KEY_n /
+# VALUE_n, which inject config the same way. The LIBRARY deliberately keeps
+# GIT_CONFIG_PARAMETERS for the hook's own git calls — the user's `-c`
+# settings are their intent for this repo, and the attribution's calls pin
+# what matters (`-z`, `--no-renames`) explicitly. What the library DOES clear
+# (GIT_CONFIG, GIT_CONFIG_COUNT, GIT_CONFIG_GLOBAL/SYSTEM) are env-set
+# redirections of which config git reads, cleared with the rest of the
+# inherited git environment rather than as `-c` settings. Only this suite,
+# whose fixtures are not the user's repo, drops all of it.
+sanitize_hook_stage_env() {
+    local v
+    for v in $(compgen -v PRE_COMMIT_) $(compgen -v GIT_CONFIG); do unset "$v"; done
+    unset GEN_EVENTS_STAGE_HINT QONTINUI_GEN_EVENTS_DRIFT_STRICT
+}
+sanitize_hook_stage_env
+exec </dev/null
+
 PASS=0
 FAIL=0
 SKIP=0
 WORK=""
 UPSTREAM=""
 
-# Every fixture root, removed on exit. `fixture` is called ~20 times and each
+# Every fixture root, removed on exit. `fixture` is called dozens of times and each
 # call builds an upstream repo plus a clone, so without this a run leaves that
 # many trees behind in $TMPDIR — on a dev box that is a slow leak, and on a
 # CI runner it is disk the next job wanted. Same shape as the scratch cleanup
@@ -108,13 +143,20 @@ fixture() {
     # CONTENT — so pin the line-ending translation off rather than let a
     # Windows checkout print a CRLF warning per file per case.
     git -C "$UPSTREAM" config core.autocrlf false
+    # A user's global `commit.gpgsign = true` would otherwise make every
+    # fixture commit ask for a key; fixtures are throwaway, never signed.
+    git -C "$UPSTREAM" config commit.gpgsign false
     # Fixture commits must not run the developer machine's git hooks. A global
     # `core.hooksPath` would otherwise aim these throwaway repos at this repo's
     # pre-commit install, and a hook failing on a two-line fixture would read
     # as an attribution bug.
     git -C "$UPSTREAM" config core.hooksPath "$UPSTREAM/.git/no-hooks"
-    mkdir -p "$UPSTREAM/src-tauri/src" "$UPSTREAM/src-tauri/scripts" "$UPSTREAM/src"
+    mkdir -p "$UPSTREAM/src-tauri/src/bin" "$UPSTREAM/src-tauri/scripts" "$UPSTREAM/src"
     printf '// base\n' > "$UPSTREAM/src-tauri/src/lib.rs"
+    # The exporter, mentioning JsonSchema, beside the generator script: the
+    # shape the premise guard's decision-time vacuity check expects. Without
+    # it every fixture would read as an unverifiable premise.
+    printf '// exports every schemars::JsonSchema type\n' > "$UPSTREAM/src-tauri/src/bin/export_schemas.rs"
     printf '# gen\n'   > "$UPSTREAM/src-tauri/scripts/generate_types.sh"
     printf '// ui\n'   > "$UPSTREAM/src/app.ts"
     printf '[package]\n' > "$UPSTREAM/Cargo.toml"
@@ -128,6 +170,7 @@ fixture() {
     git clone --quiet --config core.autocrlf=false "$UPSTREAM" "$WORK"
     git -C "$WORK" config user.email t@example.com
     git -C "$WORK" config user.name t
+    git -C "$WORK" config commit.gpgsign false
     git -C "$WORK" config core.hooksPath "$WORK/.git/no-hooks"
 
     # The fixture is only a fixture if git agrees. `GIT_DIR` and friends
@@ -169,6 +212,24 @@ decide() {
     gen_events_attribution "$WORK"
 }
 
+# Put a path into the fixture's BASE (the upstream `main` the work clone is
+# measured against), so a case can then edit it without the edit being the
+# push's own commit.
+seed_base() {
+    local path="$1" text="$2"
+    mkdir -p "$UPSTREAM/$(dirname "$path")"
+    printf '%s\n' "$text" >> "$UPSTREAM/$path"
+    git -C "$UPSTREAM" add -A >/dev/null
+    git -C "$UPSTREAM" commit --quiet -m "base: $path"
+    git -C "$WORK" fetch --quiet origin
+    git -C "$WORK" reset --hard --quiet origin/main
+}
+
+# The ATTRIBUTION_TOUCHED_DETAIL line for one path — `<path><TAB><source>`.
+detail_line() {
+    printf '%s\t%s' "$1" "$2"
+}
+
 echo "gen-events-drift attribution"
 echo "  -- pre-existing: this push cannot have moved the bindings --"
 
@@ -191,6 +252,29 @@ printf '// scratch\n' > "$WORK/src/scratch.ts"
 decide
 check "an untracked frontend file is PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
 
+echo "  -- markdown under a codegen input directory feeds nothing (#1667) --"
+
+# The push that motivated the exclusion: markdown only, under src-tauri/src —
+# a directory-prefix input — so the pre-exclusion library blamed it.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a command body"
+decide
+check "a committed src-tauri/src/fleet_commands/x.md is PRE-EXISTING" \
+    "pre-existing" "$ATTRIBUTION_STATE"
+
+fixture
+mkdir -p "$WORK/src-tauri/src/fleet_skills/new"
+printf '# draft\n' > "$WORK/src-tauri/src/fleet_skills/new/SKILL.md"
+decide
+check "an UNTRACKED .md under src-tauri/src is PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
+
+fixture
+seed_base "src-tauri/src/context/builtins/guide.md" "# guide"
+printf '# edited\n' >> "$WORK/src-tauri/src/context/builtins/guide.md"
+decide
+check "an unstaged edit to a tracked .md under src-tauri/src is PRE-EXISTING" \
+    "pre-existing" "$ATTRIBUTION_STATE"
+
 echo "  -- mine: this push touches something that feeds schemas.json --"
 
 fixture
@@ -202,12 +286,16 @@ fixture
 printf '// dirty\n' >> "$WORK/src-tauri/src/lib.rs"
 decide
 check "an UNSTAGED src-tauri/src change is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and it is labelled unstaged" \
+    "$(detail_line src-tauri/src/lib.rs unstaged)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 fixture
 printf '// staged\n' >> "$WORK/src-tauri/src/lib.rs"
 git -C "$WORK" add -A >/dev/null
 decide
 check "a STAGED src-tauri/src change is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and it is labelled staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 # A new module is invisible to `git diff`, which is why the library also
 # consults `ls-files --others`. Without that arm this case reads as innocent.
@@ -215,6 +303,8 @@ fixture
 printf '// new module\n' > "$WORK/src-tauri/src/brand_new.rs"
 decide
 check "a brand-new UNTRACKED .rs file is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and it is labelled untracked" \
+    "$(detail_line src-tauri/src/brand_new.rs untracked)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 fixture
 commit_change "Cargo.lock" "# bumped"
@@ -266,7 +356,10 @@ check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STAT
 # in-repo path dependency or the toolchain pin can move it without any
 # `src-tauri/src` file changing. Pinned here because the asymmetry only works
 # while the list stays complete — a narrowed list clears a guilty pusher.
-for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml; do
+for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml \
+    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs vendor/tao-0.35.0/src/lib.rs \
+    src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config \
+    rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain; do
     fixture
     commit_change "$input" "# touched"
     decide
@@ -353,6 +446,7 @@ DECOY="$(dirname "$WORK")/decoy"
 git init --quiet --initial-branch=main "$DECOY"
 git -C "$DECOY" config user.email t@example.com
 git -C "$DECOY" config user.name t
+git -C "$DECOY" config commit.gpgsign false
 git -C "$DECOY" config core.hooksPath "$DECOY/.git/no-hooks"
 git -C "$DECOY" commit --quiet --allow-empty -m "decoy tip"
 DECOY_TIP_BEFORE="$(git -C "$DECOY" rev-parse HEAD)"
@@ -387,6 +481,837 @@ fixture
 commit_change "src/app.ts" "// ui"
 decide
 check "the PRE-EXISTING arm blames nothing" "" "$ATTRIBUTION_TOUCHED"
+check "  and its detail is empty too" "" "$ATTRIBUTION_TOUCHED_DETAIL"
+
+# Markdown in the same commit as real Rust neither clears the Rust nor gets
+# blamed beside it: the verdict is the Rust's, and so is the file list.
+fixture
+mkdir -p "$WORK/src-tauri/src/fleet_commands"
+printf '// changed\n' >> "$WORK/src-tauri/src/lib.rs"
+printf '# body\n' > "$WORK/src-tauri/src/fleet_commands/x.md"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "rust + markdown"
+decide
+check "a commit touching lib.rs AND an .md is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and blames lib.rs alone" "src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
+
+# The #1667 shape in its other half: the committed input is in the push, the
+# dirty lockfile is not — and the message must be able to say which is which.
+# The verdict does not move (the regen reads the working tree); only the label.
+fixture
+commit_change "src-tauri/src/lib.rs" "// committed"
+printf '# dirty\n' >> "$WORK/Cargo.lock"
+decide
+check "committed lib.rs + dirty Cargo.lock is still MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and the detail tells the two sources apart" \
+    "$(detail_line Cargo.lock unstaged)"$'\n'"$(detail_line src-tauri/src/lib.rs committed)" \
+    "$ATTRIBUTION_TOUCHED_DETAIL"
+check "  while the flat list is unchanged" \
+    "Cargo.lock"$'\n'"src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
+
+# A path in two sources is listed once per source, not collapsed by precedence.
+fixture
+commit_change "src-tauri/src/lib.rs" "// committed"
+printf '// and dirty\n' >> "$WORK/src-tauri/src/lib.rs"
+decide
+check "a committed AND dirty path is listed under both sources" \
+    "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs unstaged)" \
+    "$ATTRIBUTION_TOUCHED_DETAIL"
+check "  but once in the flat list" "src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
+
+echo "  -- premise guard: markdown still cannot reach schemas.json --"
+
+# The markdown exclusion is a NARROWING of the input list, which the library
+# header forbids except on evidence. The library re-checks that evidence on
+# every decision (`gen_events_markdown_premise_violations`); this runs the SAME
+# function against the REAL tree, so a violation is loud here too rather than
+# only quietly widening the next pusher's list.
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+REPO_TOP="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$REPO_TOP" ] && REPO_TOP="$(cd "$REPO_TOP" && pwd -P)"
+if [ "$REPO_TOP" != "$REPO_ROOT" ]; then
+    skip_note "premise guard: $REPO_ROOT is not a git checkout, so the real tree cannot be read"
+else
+    VIOLATIONS="$(gen_events_markdown_premise_violations "$REPO_ROOT")" && PREMISE_RC=0 || PREMISE_RC=$?
+    if [ "$PREMISE_RC" -eq 0 ] && [ -z "$VIOLATIONS" ]; then
+        pass_note "no markdown in the real tree can reach schemas.json"
+    else
+        fail_note "markdown may now reach schemas.json (premise exit $PREMISE_RC):"
+        printf '%s\n' "$VIOLATIONS" | sed 's/^/         /'
+        printf '       Every attribution decision now drops the *.md exclusion and blames\n'
+        printf '       markdown again. Restructure so no markdown can reach a JsonSchema\n'
+        printf '       type, or delete the exclusion if that is no longer true by design.\n'
+    fi
+    # Non-vacuity on the real tree: the guard must actually be SEEING the
+    # embedded markdown it reasons about. Zero would mean the query broke, not
+    # that the premise holds. Counted as `.rs` paths only, so a multi-line
+    # error message cannot inflate it.
+    INCLUDED_MD="$(gen_events_premise_grep "$REPO_ROOT" -l -E 'include_(str|bytes)!\([^)]*\.md"' | grep -c '\.rs$' || true)"
+    if [ "${INCLUDED_MD:-0}" -gt 0 ]; then
+        pass_note "  and it saw the $INCLUDED_MD files that include_str! markdown"
+    else
+        fail_note "  premise guard saw no include_str!'d markdown at all — the query is broken"
+    fi
+    # Arms 1-2 intersect with the JsonSchema file list; an empty list would
+    # make them unfalsifiable while still printing "no violation".
+    SCHEMA_FILES="$(gen_events_premise_grep "$REPO_ROOT" -l -F 'JsonSchema' | grep -c '\.rs$' || true)"
+    if [ "${SCHEMA_FILES:-0}" -gt 0 ]; then
+        pass_note "  and it saw the $SCHEMA_FILES files that mention JsonSchema"
+    else
+        fail_note "  premise guard saw no JsonSchema file at all — arms 1-2 are neutered"
+    fi
+fi
+
+# Non-vacuity on fixtures: each arm must fire on a tree that violates it, and
+# the `let doc = include_str!` shape the real tree carries must not.
+premise_fixture() {
+    local root rel="${2:-src-tauri/src/m.rs}"
+    if ! root="$(mktemp -d -t gen-events-premise-XXXXXX)" || [ ! -d "$root" ]; then
+        printf '  FATAL could not create a fixture directory\n' >&2
+        exit 1
+    fi
+    FIXTURE_ROOTS+=("$root")
+    git init --quiet --initial-branch=main "$root"
+    mkdir -p "$root/$(dirname "$rel")"
+    printf '%s\n' "$1" > "$root/$rel"
+    PREMISE_FIXTURE="$root"
+}
+premise_case() {
+    local label="$1" want="$2" body="$3" rel="${4:-}" got rc
+    premise_fixture "$body" "$rel"
+    gen_events_markdown_premise_violations "$PREMISE_FIXTURE" >/dev/null && rc=0 || rc=$?
+    case "$rc" in 0) got="clean" ;; 1) got="violation" ;; *) got="probe-failed($rc)" ;; esac
+    check "$label" "$want" "$got"
+}
+premise_case "guard fires: include_str! .md beside JsonSchema" violation \
+    '#[derive(JsonSchema)] struct S; const B: &str = include_str!("b.md");'
+premise_case "guard fires: include_str!(concat!(.., \"/x.\", \"md\")) beside JsonSchema" violation \
+    "$(printf '#[derive(JsonSchema)] struct S;\nconst B: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/x.", "md"));')"
+premise_case "guard fires: include_bytes! .md beside JsonSchema" violation \
+    '#[derive(JsonSchema)] struct S; const B: &[u8] = include_bytes!("b.md");'
+premise_case "guard fires: include_dir! beside JsonSchema, no .md literal needed" violation \
+    '#[derive(JsonSchema)] struct S; static D: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");'
+premise_case "guard fires: #[doc = include_str!(..)]" violation \
+    '#[doc = include_str!("b.md")] struct S;'
+premise_case "guard fires: #[doc = concat!(.., include_str!(..))]" violation \
+    '#[doc = concat!("Intro. ", include_str!("b.md"))] struct S;'
+premise_case "guard fires: schemars(description = CONST)" violation \
+    '#[schemars(description = BODY)] struct S;'
+premise_case "guard fires: include_dir! beside a schemars attribute, no JsonSchema token" violation \
+    '#[schemars(title = "x")] struct S; static D: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");'
+premise_case "guard fires: a rustfmt-wrapped schemars attribute with an embed" violation \
+    "$(printf '#[schemars(\n    description = include_str!(\n        "b.md"\n    )\n)]\nstruct S;')"
+premise_case "guard is quiet on let doc = include_str!(..) with no JsonSchema" clean \
+    'fn t() { let doc = include_str!("b.md"); }'
+premise_case "guard fires: schemars(example = CONST)" violation \
+    '#[schemars(example = BODY)] struct S;'
+premise_case "guard fires: schemars(extend(\"description\" = CONST))" violation \
+    '#[schemars(extend("description" = BODY))] struct S;'
+premise_case "guard is quiet on literal schemars values (string and number)" clean \
+    '#[schemars(title = "S", range(min = 1))] struct S;'
+premise_case "guard fires: include!(\"x.md\")" violation \
+    'include!("body.md");'
+premise_case "guard fires: #[path = \"x.md\"] mod" violation \
+    '#[path = "body.md"] mod body;'
+premise_case "guard fires: include!(concat!(..)) naming a .md" violation \
+    "$(printf 'include!(concat!(\n    env!("CARGO_MANIFEST_DIR"),\n    "/body.md"\n));')"
+premise_case "guard fires: include![\"x.md\"]" violation \
+    'include!["body.md"];'
+premise_case "guard fires: include!{\"x.md\"}" violation \
+    'include!{"body.md"}'
+premise_case "guard fires: include! (\"x.md\") with a space" violation \
+    'include! ("body.md");'
+premise_case "guard fires: #[cfg_attr(unix, path = \"x.md\")] mod" violation \
+    '#[cfg_attr(unix, path = "body.md")] mod body;'
+premise_case "guard fires: a rustfmt-wrapped cfg_attr path" violation \
+    "$(printf '#[cfg_attr(\n    unix,\n    path = "body.md"\n)]\nmod body;')"
+premise_case "guard is quiet on tracing's path = %p beside a .md literal" clean \
+    'fn f() { debug!(path = %rel, "see notes.md"); }'
+# Non-Rust files beside the sources DESCRIBE these patterns without the
+# compiler ever reading them: a command body quoting attributes and TOML, a
+# shell helper assigning `path=`. Probing them would drop the exclusion on
+# every push (#1667 again).
+premise_case "guard is quiet on a .md command body that quotes the patterns" clean \
+    "$(printf 'Use #[schemars(description = BODY)] with include_str!("x.md") on a JsonSchema type.\n#[path = "body.md"] mod body;\npath = "../qontinui-schemas"\n')" \
+    src-tauri/src/fleet_commands/describe.md
+premise_case "guard is quiet on a .sh helper with path= and a .md literal" clean \
+    "$(printf '#!/usr/bin/env bash\npath="$1"\ncat "notes.md"\ninclude!("x.md")\n')" \
+    src-tauri/src/fleet_skills/helper/run.sh
+premise_case "guard is quiet on the real tree's include!(concat!(OUT_DIR, .rs)) and #[path = x.rs]" clean \
+    "$(printf 'include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));\n#[path = "../build.rs"]\nmod b;')"
+premise_case "an exporter with no JsonSchema anywhere is UNVERIFIABLE, not clean" "probe-failed(2)" \
+    'fn main() {}' src-tauri/src/bin/export_schemas.rs
+# The generator-without-exporter check ALONE: a JsonSchema file is present,
+# so the empty-JsonSchema check cannot be what fires.
+premise_fixture '#[derive(JsonSchema)] struct S;'
+mkdir -p "$PREMISE_FIXTURE/src-tauri/scripts"
+printf '# gen\n' > "$PREMISE_FIXTURE/src-tauri/scripts/generate_types.sh"
+GEN_OUT="$(gen_events_markdown_premise_violations "$PREMISE_FIXTURE")" && GEN_RC=0 || GEN_RC=$?
+check "a generator script with no exporter beside it is UNVERIFIABLE" "2|yes|no" \
+    "$GEN_RC|$(printf '%s\n' "$GEN_OUT" | grep -qF 'exists but src-tauri/src/bin/export_schemas.rs does not' && echo yes || echo no)|$(printf '%s\n' "$GEN_OUT" | grep -qF 'no file mentions JsonSchema' && echo yes || echo no)"
+premise_case "guard fires: a build script reading markdown" violation \
+    'fn main() { let b = std::fs::read_to_string("src/guide.md").unwrap(); }' src-tauri/build.rs
+premise_case "guard fires: a build script filtering on the md extension" violation \
+    'fn main() { if p.extension() == Some("md".as_ref()) {} }' src-tauri/build.rs
+premise_case "guard is quiet on a build script that only mentions a .md in prose" clean \
+    'fn main() { println!("See src-tauri/docs/tokio-console.md.\\n"); }' src-tauri/build.rs
+
+echo "  -- the probe's reach is derived from the input list --"
+
+# Every DIRECTORY input is probed: a violation seeded under any of them drops
+# the exclusion, so a markdown push there is MINE. Iterating the library's own
+# list, so a new directory input is covered the day it is added.
+for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+    case "$PDIR" in */) PDIR="${PDIR%/}" ;; *) continue ;; esac
+    fixture
+    seed_base "$PDIR/src/v.rs" '#[derive(JsonSchema)] struct V; const B: &str = include_str!("../x.md");'
+    commit_change "$PDIR/x.md" "# a body"
+    decide
+    check "a violation under $PDIR is probed, so its .md is MINE" "mine|yes" \
+        "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
+    # And its build scripts: one that reads markdown, with no JsonSchema in
+    # sight, is reachable only through the derived `<dir>/**/build.rs`.
+    fixture
+    seed_base "$PDIR/build.rs" 'fn main() { std::fs::read_to_string("x.md").unwrap(); }'
+    commit_change "$PDIR/x.md" "# a body"
+    decide
+    check "a build script under $PDIR reading markdown is probed, so its .md is MINE" "mine|yes" \
+        "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
+done
+
+# The marking — a trailing `/` means a directory — checked against the real
+# tree for every entry that exists there.
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    MISCLASSIFIED=""
+    for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        case "$PDIR" in */) want=dir; PDIR="${PDIR%/}" ;; *) want=file ;; esac
+        [ -e "$REPO_ROOT/$PDIR" ] || continue
+        if [ -d "$REPO_ROOT/$PDIR" ]; then got=dir; else got=file; fi
+        [ "$want" = "$got" ] || MISCLASSIFIED+=" $PDIR($got)"
+    done
+    check "every input's dir/file classification matches the real tree" "" "$MISCLASSIFIED"
+fi
+
+echo "  -- every in-repo path dependency is an input --"
+
+# The walk lives in the library (`gen_events_uncovered_path_deps`), shared
+# with the `gen-events-path-deps` hook that runs it on every Cargo.toml edit;
+# here it is run on the real tree and proved able to fail on a fixture.
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    REAL_DEPS="$(gen_events_uncovered_path_deps "$REPO_ROOT")" && REAL_RC=0 || REAL_RC=$?
+    check "every in-repo path dependency of the export build is under an input" \
+        "0|" "$REAL_RC|$REAL_DEPS"
+    SEEN_DEPS="$(_gen_events_cargo_path_deps "$REPO_ROOT/src-tauri/Cargo.toml" | grep -c . || true)"
+    if [ "${SEEN_DEPS:-0}" -gt 0 ]; then
+        pass_note "  and it read $SEEN_DEPS path dependencies from src-tauri/Cargo.toml"
+    else
+        fail_note "  it read no path dependency from src-tauri/Cargo.toml — the parser is broken"
+    fi
+    ROOT_DEPS="$(_gen_events_cargo_path_deps "$REPO_ROOT/Cargo.toml" | grep -c . || true)"
+    if [ "${ROOT_DEPS:-0}" -gt 0 ]; then
+        pass_note "  and $ROOT_DEPS from the root Cargo.toml's [patch.*]/workspace sections"
+    else
+        fail_note "  it read no path dependency from the root Cargo.toml — the [patch.*] arm is broken"
+    fi
+fi
+
+# Non-vacuity: a tree that adds the pty-holder crate as a dependency (and a
+# transitive one behind it) is caught; target `path`s and an out-of-repo
+# sibling are not. The target paths point OUTSIDE every input on purpose —
+# under an input they would be "covered" and prove nothing about the section
+# filter that is supposed to skip them.
+premise_fixture 'fn f() {}'
+mkdir -p "$PREMISE_FIXTURE/crates/pty-holder"
+cat > "$PREMISE_FIXTURE/src-tauri/Cargo.toml" <<'TOML'
+[package]
+name = "x"
+
+[dependencies]
+qontinui-spec-check = { path = "../crates/spec-check" }
+qontinui-pty-holder = { path = "../crates/pty-holder" }
+qontinui-types = { path = "../../qontinui-schemas/rust" }
+
+[lib]
+path = "../tools/lib.rs"
+
+[[bin]]
+name = "export_schemas"
+path = "bin/export_schemas.rs"
+TOML
+cat > "$PREMISE_FIXTURE/crates/pty-holder/Cargo.toml" <<'TOML'
+[target.'cfg(unix)'.dependencies]
+frame = { path = "../frame-proto" }
+TOML
+# The root manifest's [patch.*] arm: how vendor/tao reaches the graph today.
+cat > "$PREMISE_FIXTURE/Cargo.toml" <<'TOML'
+[workspace]
+members = ["src-tauri"]
+
+[patch.crates-io]
+foo = { path = "patched/foo" }
+TOML
+PTY_OUT="$(gen_events_uncovered_path_deps "$PREMISE_FIXTURE")"
+check "a new pty-holder path dependency, its own, and a [patch] path are reported uncovered" \
+    "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"patched/foo (from Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
+    "$PTY_OUT"
+
+# The hook script itself, against fixtures: it must FAIL on an uncovered
+# dependency (double- or single-quoted), and must not pass a walk that read
+# nothing — a missing manifest is a failure, not an empty answer.
+PATH_DEPS_HOOK="$SCRIPT_DIR/gen-events-path-deps-check.sh"
+path_deps_hook_rc() { bash "$PATH_DEPS_HOOK" "$1" >/dev/null 2>&1; echo "$?"; }
+check "the path-deps hook fails on the uncovered pty-holder fixture" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+premise_fixture 'fn f() {}'
+printf "[dependencies]\nqontinui-pty-holder = { path = '../crates/pty-holder' }\n" > "$PREMISE_FIXTURE/src-tauri/Cargo.toml"
+check "  and on a single-quoted (TOML literal string) uncovered path" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+EMPTY_ROOT="$(mktemp -d -t gen-events-nomanifest-XXXXXX)"; FIXTURE_ROOTS+=("$EMPTY_ROOT")
+check "  and does not pass when src-tauri/Cargo.toml is missing" "2" "$(path_deps_hook_rc "$EMPTY_ROOT")"
+premise_fixture 'fn f() {}'
+printf '[package]\nname = "x"\n' > "$PREMISE_FIXTURE/src-tauri/Cargo.toml"
+check "  or when it yields no path dependency at all" "2" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    check "  and passes on the real tree" "0" "$(path_deps_hook_rc "$REPO_ROOT")"
+fi
+
+echo "  -- the premise gates the exclusion at decision time --"
+
+# The guard is not advisory: a tree that violates it gets NO markdown
+# exclusion, so a markdown-only push is blamed again — the safe direction.
+fixture
+seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &str = include_str!("fleet_commands/x.md");'
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body a JsonSchema type embeds"
+decide
+check "with the premise violated, a committed .md is MINE" "mine" "$ATTRIBUTION_STATE"
+case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in
+    "markdown may reach schemas.json ("*)
+        pass_note "  and the decision says why: $ATTRIBUTION_EXCLUDES_DROPPED_REASON" ;;
+    *)
+        fail_note "  want a violation reason, got: '${ATTRIBUTION_EXCLUDES_DROPPED_REASON}'" ;;
+esac
+
+# Markdown compiled AS RUST, in both spellings: the exclusion must drop.
+for AS_RUST in 'include!("fleet_commands/x.md");' '#[path = "fleet_commands/x.md"] mod body;'; do
+    fixture
+    seed_base "src-tauri/src/schema.rs" "$AS_RUST"
+    commit_change "src-tauri/src/fleet_commands/x.md" "#[derive(JsonSchema)] struct S;"
+    decide
+    check "with markdown compiled as Rust ($AS_RUST), a committed .md is MINE" \
+        "mine|yes" "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
+done
+
+# A gitignored source still compiles, so the premise probe must read it.
+fixture
+seed_base ".gitignore" "src-tauri/src/gen.rs"
+printf '#[derive(JsonSchema)] struct S;\nconst B: &str = include_str!("fleet_commands/x.md");\n' > "$WORK/src-tauri/src/gen.rs"
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+decide
+check "a gitignored violating source is seen: the committed .md is MINE" \
+    "mine|yes" "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in *"src-tauri/src/gen.rs"*) echo yes ;; *) echo no ;; esac)"
+
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+decide
+check "with the premise intact, the exclusion applies and no reason is set" \
+    "pre-existing|" "$ATTRIBUTION_STATE|$ATTRIBUTION_EXCLUDES_DROPPED_REASON"
+
+echo "  -- a git failure is UNAVAILABLE, never a cleared pusher --"
+
+# A `git` on PATH that fails any invocation whose argument string matches a
+# glob, and passes the rest to the real one. Before the fix,
+# `$(git ... || true)` turned such a failure into an empty list, i.e.
+# "touched nothing", i.e. PRE-EXISTING. One case per call, because each is its
+# own way to lose the signal.
+REAL_GIT="$(command -v git)"
+git_shim_failing() {
+    local name="$1" glob="$2" dir
+    dir="$(dirname "$WORK")/shim-$name"
+    mkdir -p "$dir"
+    printf '#!/usr/bin/env bash\ncase "$*" in %s) echo "shim: %s fails" >&2; exit 128 ;; esac\nexec "%s" "$@"\n' \
+        "$glob" "$name" "$REAL_GIT" > "$dir/git"
+    chmod +x "$dir/git"
+    printf '%s' "$dir"
+}
+shim_case() {
+    local name="$1" glob="$2" want_reason="$3"
+    fixture
+    commit_change "src/app.ts" "// ui"
+    SHIM="$(git_shim_failing "$name" "$glob")"
+    ( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_UNAVAILABLE_REASON" > "$WORK/.state" )
+    check "a failing $name is UNAVAILABLE, not PRE-EXISTING" \
+        "unavailable" "$(cut -d'|' -f1 < "$WORK/.state")"
+    check "  and the reason names the call" "yes" \
+        "$(grep -qF -- "$want_reason" "$WORK/.state" && echo yes || echo no)"
+}
+shim_case "git diff base..HEAD" '*" diff --name-only --no-renames -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so the commits since the merge-base"
+shim_case "git diff --cached"   '*" diff --name-only --no-renames -z --cached HEAD -- "*' "git diff --cached HEAD failed"
+shim_case "git diff (worktree)" '*" diff --name-only --no-renames -z -- "*'             "git diff (working tree) failed"
+shim_case "git ls-files"        '*" ls-files "*'                              "ls-files --others failed"
+
+# The premise probe failing is treated as a violation: exclusion dropped.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+SHIM="$(git_shim_failing grep '*" grep "*')"
+( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "a failing premise probe drops the exclusion, so the .md is MINE" \
+    "mine" "$(cut -d'|' -f1 < "$WORK/.state")"
+check "  and says the probe failed" "yes" \
+    "$(grep -q 'probe failed' "$WORK/.state" && echo yes || echo no)"
+check "  quoting the first ERROR line, with no fallback text appended" "yes|no" \
+    "$(grep -qF '(ERROR git grep' "$WORK/.state" && echo yes || echo no)|$(grep -qF 'no ERROR line' "$WORK/.state" && echo yes || echo no)"
+
+# The same without pipefail: a failed grep's status is then lost at the `|
+# sort` in each list's pipeline, and only the scan for ERROR lines catches it.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+( set +o pipefail; PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "without pipefail, a failing probe still drops the exclusion" "mine|yes" \
+    "$(cut -d'|' -f1 < "$WORK/.state")|$(grep -qF '(ERROR git grep' "$WORK/.state" && echo yes || echo no)"
+
+# And the case where that scan is the ONLY catch: only the `-l` list greps
+# fail (arms 5-7 run without a pipe and would catch their own), in a tree with
+# no schema toolchain (so the vacuity check cannot fire either).
+premise_fixture 'fn f() {}'
+LSHIM="$(git_shim_failing grep-l '*" grep "*" -l "*')"
+( set +o pipefail; PATH="$LSHIM:$PATH"
+  gen_events_markdown_premise_violations "$PREMISE_FIXTURE" >/dev/null; echo "$?" > "$PREMISE_FIXTURE/.rc" )
+check "without pipefail, failed list greps alone still fail the probe" "2" "$(cat "$PREMISE_FIXTURE/.rc")"
+
+# A failing `comm` — the intersection behind arms 1-4 — must fail the probe,
+# not leave those arms silently empty.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+COMM_SHIM="$(dirname "$WORK")/shim-comm"
+mkdir -p "$COMM_SHIM"
+printf '#!/usr/bin/env bash\nexit 2\n' > "$COMM_SHIM/comm"
+chmod +x "$COMM_SHIM/comm"
+( PATH="$COMM_SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "a failing comm drops the exclusion, so the .md is MINE" \
+    "mine" "$(cut -d'|' -f1 < "$WORK/.state")"
+check "  and the reason names the failed intersection" yes \
+    "$(grep -qF 'intersecting the premise lists failed' "$WORK/.state" && echo yes || echo no)"
+
+echo "  -- the hook runs under set -e: the MINE path must survive it --"
+
+# The hook is `set -euo pipefail`. A non-zero status leaking out of the
+# decision or the renderer would abort it mid-message.
+fixture
+seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &str = include_str!("fleet_commands/x.md");'
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+# `( .. ); rc=$?`, never `( .. ) && rc=0 || rc=$?`: on the left of `&&`/`||`
+# errexit is suspended INSIDE the subshell too, so that form passes whatever
+# fails in it. This harness itself runs without -e, so the plain form is safe.
+( set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
+check "set -e: a violated-premise MINE decision and render exit 0" "0" "$SETE_RC"
+fixture
+commit_change "src-tauri/src/lib.rs" "// mine"
+( set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
+check "set -e: a normal MINE decision and render exit 0" "0" "$SETE_RC"
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+SHIM="$(git_shim_failing grep '*" grep "*')"
+( PATH="$SHIM:$PATH"; set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
+check "set -e: a failed-probe MINE decision and render exit 0" "0" "$SETE_RC"
+
+echo "  -- the MINE message the hook prints --"
+
+# `gen_events_render_mine` renders from the ATTRIBUTION_* variables alone, so
+# these set them directly rather than building a repo per case. The stage is
+# set explicitly every time through RENDER_STAGE, independent of the top-level
+# sanitizing: `push` sets PRE_COMMIT_TO_REF as pre-commit does for a push;
+# `commit` unsets every variable `gen_events_stage` reads.
+RENDER_STAGE="push"
+render_now() {
+    if [ "$RENDER_STAGE" = "push" ]; then
+        RENDERED="$(PRE_COMMIT_TO_REF=0123456789abcdef gen_events_render_mine)"
+    else
+        RENDERED="$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_render_mine)"
+    fi
+}
+render_with() {
+    ATTRIBUTION_BASE_REF="origin/main"
+    ATTRIBUTION_BASE_SHA="0123456789abcdef"
+    ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
+    ATTRIBUTION_TOUCHED_DETAIL="$1"
+    render_now
+}
+has() { printf '%s\n' "$RENDERED" | grep -qF -- "$1" && echo yes || echo no; }
+
+LOCAL_NOTE="Inputs marked 'not part of this push' are local working-tree state"
+LOCAL_REMEDY="set them aside so the working tree"
+NO_COMMANDS_RE='git (stash|checkout|worktree|reset)'
+
+echo "     (at pre-push)"
+RENDER_STAGE="push"
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+check "all committed: the lead line says this push" yes "$(has 'This push changes sources')"
+check "  the file is labelled committed" yes "$(has 'src-tauri/src/lib.rs  (committed in this push)')"
+check "  no working-tree note" no "$(has "$LOCAL_NOTE")"
+check "  the pre-existing caveat is kept" yes "$(has 'Part of the diff may still be pre-existing')"
+
+render_with "$(detail_line Cargo.lock unstaged)"
+check "unstaged only: the lead line blames the working tree, not the push" \
+    "yes|no" "$(has 'Your working tree (not this push' )|$(has 'This push changes')"
+check "  the file is labelled as not in the push" \
+    yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
+check "  the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
+# The primary guard: the message runs nothing. The wording check below it
+# only pins that the old "commit or discard" advice did not come back.
+check "  and the message prints no commands" no \
+    "$(printf '%s\n' "$RENDERED" | grep -qE "$NO_COMMANDS_RE" && echo yes || echo no)"
+check "  and it says to set them aside, not to commit them" "yes|no" \
+    "$(has "$LOCAL_REMEDY")|$(has 'commit or discard')"
+
+render_with "$(detail_line src-tauri/src/lib.rs staged)"
+check "staged at pre-push: labelled as not in the push" \
+    yes "$(has 'src-tauri/src/lib.rs  (staged, not committed — not part of this push)')"
+check "  the lead line blames the working tree, not the push" "yes|no" \
+    "$(has 'Your working tree (not this push')|$(has 'This push changes')"
+check "  and the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
+
+render_with "$(detail_line src-tauri/src/new.rs untracked)"
+check "untracked: labelled as not in the push" \
+    yes "$(has 'src-tauri/src/new.rs  (untracked — not part of this push)')"
+check "  and gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
+
+render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs unstaged)"
+check "committed AND dirty: the push is still named in the lead line" yes "$(has 'This push changes sources')"
+check "  both labels are printed" "yes|yes" \
+    "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
+check "  and the dirty half gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
+
+echo "     (at pre-commit, or a manual run)"
+# There the staged input IS the change being made; "this push" and "push
+# again" would both be false.
+RENDER_STAGE="commit"
+render_with "$(detail_line src-tauri/src/lib.rs staged)"
+check "staged at pre-commit: the lead line says this commit" "yes|no" \
+    "$(has 'This commit changes sources')|$(has 'push')"
+check "  and labels it staged for this commit" yes "$(has 'src-tauri/src/lib.rs  (staged for this commit)')"
+check "  with no working-tree note" "no|no" "$(has "$LOCAL_NOTE")|$(has "not in this commit' are")"
+
+render_with "$(detail_line src-tauri/src/lib.rs unstaged)"$'\n'"$(detail_line src-tauri/src/new.rs untracked)"
+check "unstaged and untracked at pre-commit: not this commit's changes" "yes|no" \
+    "$(has "Your working tree (not this commit's changes)")|$(has 'push again')"
+check "  labelled not in this commit" "yes|yes" \
+    "$(has 'src-tauri/src/lib.rs  (unstaged — not in this commit)')|$(has 'src-tauri/src/new.rs  (untracked — not in this commit)')"
+check "  with the commit-stage note, and no commands" "yes|no" \
+    "$(has "Inputs marked 'not in this commit' are working-tree state")|$(printf '%s\n' "$RENDERED" | grep -qE "$NO_COMMANDS_RE" && echo yes || echo no)"
+
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+check "earlier commits at pre-commit: named as the branch's, not this commit's" "yes|yes|no" \
+    "$(has 'Commits already on this branch (not this commit)')|$(has '(already committed on this branch)')|$(has 'This commit changes')"
+RENDER_STAGE="push"
+
+# The dropped-exclusion line is for a pusher who is being blamed FOR markdown;
+# with no `.md` among the blamed paths it would explain nothing.
+render_with "$(detail_line src-tauri/src/fleet_commands/x.md committed)"
+ATTRIBUTION_TOUCHED="src-tauri/src/fleet_commands/x.md"
+ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
+render_now
+check "a dropped exclusion is stated when an .md is blamed" yes "$(has 'Markdown was counted as a codegen input this time')"
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+ATTRIBUTION_TOUCHED="src-tauri/src/lib.rs"
+ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
+render_now
+check "  and not when no .md is blamed" no "$(has 'Markdown was counted as a codegen input this time')"
+# A %q-escaped markdown name ends in `.md'`, not `.md`.
+render_with "$(detail_line "\$'src-tauri/src/a\\tb.md'" committed)"
+ATTRIBUTION_TOUCHED="\$'src-tauri/src/a\\tb.md'"
+ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
+render_now
+check "  and when the blamed .md is a %q-escaped name" yes "$(has 'Markdown was counted as a codegen input this time')"
+
+# The hook's own verdict lines (outside the renderer) name the stage too.
+check "gen-events-drift.sh words its verdicts and bypass by stage" "yes|no" \
+    "$(grep -qF 'Bypass for this $STAGE only: SKIP=gen-events-drift $BYPASS_CMD' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)|$(grep -qE '^[^#]*(log|fail) "[^"]*(not caused by|Nothing to do for|whether) this push' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
+
+# The stage helper's three answers: pre-commit sets PRE_COMMIT_TO_REF and
+# PRE_COMMIT_REMOTE_NAME for a push; either alone means push.
+check "gen_events_stage: TO_REF alone, REMOTE_NAME alone, neither" "push|push|commit" \
+    "$(unset PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; PRE_COMMIT_TO_REF=abc gen_events_stage)|$(unset PRE_COMMIT_TO_REF GEN_EVENTS_STAGE_HINT; PRE_COMMIT_REMOTE_NAME=origin gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_stage)"
+
+# Under the fleet's direct pre-push shim no PRE_COMMIT_* is exported; git's
+# own protocol on stdin is the only sign of a push. A real ref line reads as
+# push; an empty stdin (pre-commit, a manual run) as commit.
+STAGE_REF_LINE="refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222"
+check "gen_events_stage under the direct shim: ref line on stdin, empty stdin" "push|commit" \
+    "$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_detect_stage_from_stdin <<< "$STAGE_REF_LINE"; gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_detect_stage_from_stdin < /dev/null; gen_events_stage)"
+check "gen-events-drift.sh reads the stage from stdin before deciding it" yes \
+    "$(awk '/^gen_events_detect_stage_from_stdin$/ {d=NR} /^STAGE="\$\(gen_events_stage\)"$/ {s=NR} END {print (d && s && d < s) ? "yes" : "no"}' "$SCRIPT_DIR/gen-events-drift.sh")"
+
+# The staged-later source is working tree outside the change being made, at
+# either stage: never "this commit"/"this push" in the lead line.
+RENDER_STAGE="commit"
+render_with "$(detail_line src-tauri/src/new.rs staged-later)"
+check "staged-later at pre-commit: lead line and label" "yes|no|yes" \
+    "$(has "Your working tree (not this commit's changes)")|$(has 'This commit changes')|$(has 'src-tauri/src/new.rs  (staged for a later commit — not in this commit)')"
+RENDER_STAGE="push"
+render_with "$(detail_line src-tauri/src/new.rs staged-later)"
+check "staged-later at pre-push: lead line and label" "yes|no|yes" \
+    "$(has 'Your working tree (not this push')|$(has 'This push changes')|$(has 'src-tauri/src/new.rs  (staged for a later commit — not part of this push)')"
+
+# Regression for the suite's own isolation: with the environment a pre-push
+# run of this suite inherits re-exported, the commit-stage cases must still
+# read `commit`. Before the fix these read `push` and 8 cases failed.
+POLLUTED="$(
+    export PRE_COMMIT_REMOTE_NAME=origin PRE_COMMIT_TO_REF=bbbb PRE_COMMIT_FROM_REF=aaaa GEN_EVENTS_STAGE_HINT=push
+    RENDER_STAGE="commit"
+    render_with "$(detail_line src-tauri/src/lib.rs staged)"
+    printf '%s|' "$(has 'This commit changes sources')" "$(has '(staged for this commit)')"
+    RENDER_STAGE="push"
+    render_with "$(detail_line src-tauri/src/lib.rs committed)"
+    printf '%s|' "$(has 'This push changes sources')"
+    sanitize_hook_stage_env
+    printf '%s' "$(gen_events_stage)"
+)"
+check "under an inherited pre-push environment the stage cases still hold" \
+    "yes|yes|yes|commit" "$POLLUTED"
+check "  and the suite itself started with no PRE_COMMIT_*, command-line git config or stage hint" "" \
+    "$(compgen -v PRE_COMMIT_; compgen -v GIT_CONFIG; printf '%s' "${GEN_EVENTS_STAGE_HINT:-}")"
+
+# Everything above pins the renderer; this pins that the hook still USES it,
+# so the tests describe the message a pusher actually sees.
+check "gen-events-drift.sh renders its MINE arm through gen_events_render_mine" yes \
+    "$(grep -qE '^[[:space:]]*gen_events_render_mine[[:space:]]*\|' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
+
+echo "  -- at pre-commit, 'staged' means the index the commit is built from --"
+
+# `git commit -a` and `git commit <path>` build the commit from a TEMPORARY
+# index and hand its path to the hook in GIT_INDEX_FILE; the plain
+# .git/index is then not what is being committed. A real pre-commit hook in
+# a fixture runs the drift hook's own sequence — clear the git env, detect
+# the stage, attribute from the hook's cwd — records the detail, and fails
+# so the commit never lands.
+# With `subdir`, the hook moves into src-tauri/ after recording the index and
+# attributes the top level from there — the recorded path must not depend on
+# the cwd it is used from.
+index_hook_fixture() {
+    local mode="${1:-}" attribute_line='gen_events_attribution "$PWD"'
+    fixture
+    local hooks="$(dirname "$WORK")/index-hooks"
+    mkdir -p "$hooks"
+    if [ "$mode" = "subdir" ]; then
+        attribute_line='cd src-tauri && gen_events_attribution "$(git rev-parse --show-toplevel)"'
+    fi
+    # git puts its own exec-path first on a hook's PATH, so a shim on the
+    # committer's PATH never reaches the hook; HOOK_PATH_PREFIX re-adds one.
+    cat > "$hooks/pre-commit" <<HOOK
+#!/usr/bin/env bash
+[ -z "\${HOOK_PATH_PREFIX:-}" ] || PATH="\$HOOK_PATH_PREFIX:\$PATH"
+. "$SCRIPT_DIR/lib/gen-events-attribution.sh"
+gen_events_clear_inherited_git_env
+printf '%s\n' "\$GEN_EVENTS_HOOK_INDEX_FILE" > "$WORK/.hook-index"
+gen_events_detect_stage_from_stdin
+$attribute_line
+printf '%s\n' "\$ATTRIBUTION_STATE" > "$WORK/.hook-state"
+printf '%s\n' "\$ATTRIBUTION_UNAVAILABLE_REASON" > "$WORK/.hook-reason"
+printf '%s\n' "\$ATTRIBUTION_TOUCHED_DETAIL" > "$WORK/.hook-detail"
+exit 1
+HOOK
+    chmod +x "$hooks/pre-commit"
+    git -C "$WORK" config core.hooksPath "$hooks"
+}
+hook_detail() { cat "$WORK/.hook-detail" 2>/dev/null; }
+hook_state() { cat "$WORK/.hook-state" 2>/dev/null; }
+
+index_hook_fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+( cd "$WORK" && git commit -qam "commit -a" ) >/dev/null 2>&1
+check "commit -a: the edited input is staged for this commit" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+index_hook_fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+printf '# bumped\n' >> "$WORK/Cargo.lock"
+git -C "$WORK" add Cargo.lock
+( cd "$WORK" && git commit -qm "partial" -- src-tauri/src/lib.rs ) >/dev/null 2>&1
+check "commit <path>: the named path is staged; a pre-staged other path is not in this commit" \
+    "$(detail_line Cargo.lock staged-later)"$'\n'"$(detail_line Cargo.lock unstaged)"$'\n'"$(detail_line src-tauri/src/lib.rs staged)" \
+    "$(hook_detail)"
+
+index_hook_fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
+check "a plain commit (relative GIT_INDEX_FILE) still labels the staged path staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+# Honouring the hook's index must never NARROW the sources. Under `commit
+# <path>` the temporary index lacks what the real index holds for a later
+# commit; without the `staged-later` source these two read PRE-EXISTING with
+# an empty detail — a committer cleared over an input the regeneration reads.
+index_hook_fixture
+printf '// new module\n' > "$WORK/src-tauri/src/new.rs"
+git -C "$WORK" add src-tauri/src/new.rs
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "commit <path> with a NEW input staged for later: MINE, labelled staged-later" \
+    "mine|$(detail_line src-tauri/src/new.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+index_hook_fixture
+printf '// staged edit\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+git -C "$WORK" show HEAD:src-tauri/src/lib.rs > "$WORK/src-tauri/src/lib.rs"
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "commit <path> with an edit staged for later, working copy restored: MINE, staged-later" \
+    "mine|$(detail_line src-tauri/src/lib.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+# An INTENT-TO-ADD input (`git add -N`): `--cached` hides it, the temporary
+# index lacks it, and the untracked listing sees it as tracked — so only the
+# staged-later source's `--ita-visible-in-index` keeps it. Without that flag
+# this read PRE-EXISTING.
+index_hook_fixture
+printf '// new module\n' > "$WORK/src-tauri/src/new.rs"
+git -C "$WORK" add -N src-tauri/src/new.rs
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "commit <path> with an intent-to-add input: MINE, labelled staged-later" \
+    "mine|$(detail_line src-tauri/src/new.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+# At a plain commit the working-tree diff reports it — accurately, as not in
+# this commit, since git does not commit an intent-to-add entry.
+index_hook_fixture
+printf '// new module\n' > "$WORK/src-tauri/src/new.rs"
+git -C "$WORK" add -N src-tauri/src/new.rs
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
+check "a plain commit with an intent-to-add input: MINE, not in this commit" \
+    "mine|$(detail_line src-tauri/src/new.rs unstaged)" "$(hook_state)|$(hook_detail)"
+
+# When the hook's index IS the real index (a plain commit), the staged-later
+# read must not run at all: it would only repeat the staged source. A logging
+# `git`, placed first on the HOOK's PATH, records every call the hook makes.
+# Committed through a SYMLINK to the fixture: the hook's $PWD — and so the
+# recorded index — then names the link while git reports the real path, and
+# only canonicalising both makes them the same file. Where `ln -s` makes a
+# copy instead (Git for Windows by default) the case would prove nothing, so
+# it is skipped rather than passed; and it asserts its own premise, that the
+# recorded index really names the link.
+index_hook_fixture
+WORK_LINK="$(dirname "$WORK")/work-link"
+ln -s "$WORK" "$WORK_LINK" 2>/dev/null
+GIT_LOG_SHIM="$(dirname "$WORK")/shim-gitlog"
+mkdir -p "$GIT_LOG_SHIM"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$WORK/.git-calls" "$(command -v git)" > "$GIT_LOG_SHIM/git"
+chmod +x "$GIT_LOG_SHIM/git"
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+if [ -L "$WORK_LINK" ]; then
+    ( cd "$WORK_LINK" && HOOK_PATH_PREFIX="$GIT_LOG_SHIM" git commit -qm "plain" ) >/dev/null 2>&1
+    check "a plain commit, via a symlinked path, never runs the staged-later read" "yes|0" \
+        "$(grep -qF -- '--cached HEAD' "$WORK/.git-calls" 2>/dev/null && echo yes || echo no)|$(grep -cF -- '--ita-visible-in-index' "$WORK/.git-calls" 2>/dev/null || true)"
+    check "  and the recorded index really named the link" yes \
+        "$(case "$(cat "$WORK/.hook-index" 2>/dev/null)" in "$WORK_LINK"/*) echo yes ;; *) echo no ;; esac)"
+else
+    skip_note "symlinked-path canonicalisation: \`ln -s\` made no symlink here (a copy, or refused)"
+fi
+
+# The staged-later read fails closed like every other source: a failure is
+# UNAVAILABLE, never an empty list that could clear the committer.
+index_hook_fixture
+ITA_SHIM="$(git_shim_failing ita '*--ita-visible-in-index*')"
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && HOOK_PATH_PREFIX="$ITA_SHIM" git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "a failing staged-later read is UNAVAILABLE, naming the call" "unavailable|yes" \
+    "$(hook_state)|$(grep -qF 'against the real index failed' "$WORK/.hook-reason" 2>/dev/null && echo yes || echo no)"
+
+# `commit -a` with a path ALREADY staged: it is in both indexes, and is listed
+# once, as staged — not a second time as staged-later.
+index_hook_fixture
+printf '// staged\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+printf '// and more\n' >> "$WORK/src-tauri/src/lib.rs"
+( cd "$WORK" && git commit -qam "commit -a" ) >/dev/null 2>&1
+check "commit -a over an already-staged path lists it once, as staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+# The recorded index path is absolute, so it means the same file from any
+# cwd; git hands a plain commit the RELATIVE `.git/index`. Pinned directly —
+# through `git -C` a relative path would still resolve against the repo top,
+# so no label could show the difference — and by labels from a subdirectory.
+index_hook_fixture subdir
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
+HOOK_INDEX="$(cat "$WORK/.hook-index" 2>/dev/null)"
+check "a relative GIT_INDEX_FILE is recorded absolute, naming the real file" "yes|yes" \
+    "$(case "$HOOK_INDEX" in /*|[A-Za-z]:[/\\]*) echo yes ;; *) echo no ;; esac)|$([ -f "$HOOK_INDEX" ] && echo yes || echo no)"
+check "  and attribution from a subdirectory labels the staged path staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+# The hook's index is used only for the hook's repo: attribution of some
+# OTHER repo from inside a hook (a fixture here, the schemas checkout in the
+# drift hook) must read that repo's own index.
+fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+( GEN_EVENTS_HOOK_INDEX_FILE="$WORK/.git/does-not-exist" GEN_EVENTS_HOOK_GIT_DIR="/not/this/repo/.git"
+  decide; printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" > "$WORK/.state" )
+check "a recorded hook index is ignored for a repo with a different git dir" \
+    "$(detail_line src-tauri/src/lib.rs unstaged)" "$(cat "$WORK/.state")"
+
+echo "  -- odd file names are shown as themselves --"
+
+# git C-quotes non-ASCII, `"` and `\` without `-z`, and the label would then
+# name a file that does not exist.
+fixture
+ODD_E='src-tauri/src/é b.rs'
+ODD_Q='src-tauri/src/q"t.rs'
+printf '// e\n' > "$WORK/$ODD_E"
+printf '// q\n' > "$WORK/$ODD_Q"
+ODD_T=""
+if printf '// t\n' > "$WORK/src-tauri/src/a"$'\t'"b.rs" 2>/dev/null; then
+    ODD_T="src-tauri/src/a"$'\t'"b.rs"
+fi
+decide
+check "odd names are MINE" "mine" "$ATTRIBUTION_STATE"
+check "  é b.rs is labelled by its real name" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_E"$'\t'"untracked" && echo yes || echo no)"
+check "  q\"t.rs is labelled by its real name" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_Q"$'\t'"untracked" && echo yes || echo no)"
+if [ -n "$ODD_T" ]; then
+    ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
+    check "  a tab-named file is kept, in its %q form" yes \
+        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"untracked" && echo yes || echo no)"
+    check "  and counted in the flat list" yes \
+        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qxF "$ODD_T_SHOWN" && echo yes || echo no)"
+else
+    skip_note "tab-named file: this filesystem refuses a tab in a file name"
+fi
+RENDERED="$(gen_events_render_mine)"
+check "  the message shows é b.rs raw" yes \
+    "$(printf '%s\n' "$RENDERED" | grep -qF "    $ODD_E  (untracked" && echo yes || echo no)"
+
+echo "  -- renames and deletions: both halves are inputs --"
+
+# The old path's disappearance moves the bindings as surely as the new path's
+# arrival; with rename detection on, git would name only the new one.
+fixture
+seed_base "src-tauri/src/a.rs" "// a module"
+git -C "$WORK" mv src-tauri/src/a.rs src-tauri/src/b.rs
+git -C "$WORK" commit --quiet -m "rename a -> b"
+decide
+check "a committed rename lists both halves" \
+    "src-tauri/src/a.rs"$'\n'"src-tauri/src/b.rs" "$ATTRIBUTION_TOUCHED"
+
+fixture
+seed_base "src-tauri/src/a.rs" "// a module"
+git -C "$WORK" mv src-tauri/src/a.rs src-tauri/src/b.rs
+decide
+check "a staged rename lists both halves as staged" \
+    "$(detail_line src-tauri/src/a.rs staged)"$'\n'"$(detail_line src-tauri/src/b.rs staged)" \
+    "$ATTRIBUTION_TOUCHED_DETAIL"
+
+fixture
+git -C "$WORK" rm --quiet src-tauri/src/lib.rs
+decide
+check "a staged git rm is listed as staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 echo
 if [ "$SKIP" -gt 0 ]; then

@@ -286,9 +286,17 @@ mod handler_tests {
         // Exercise the broadcaster directly: subscribe, emit, await event.
         // Per-app channels (Stream C) — subscriber + emitter must agree on
         // the app_id or the event lands on a different channel.
-        let mut rx = events::subscribe(RUNNER_APP_ID);
+        //
+        // The channel is this test's OWN app_id, never `RUNNER_APP_ID`: the
+        // registry is process-global and keyed by app_id, and sibling tests
+        // (e.g. the C.8 fill test's `c8-fill` author) emit on the runner's
+        // channel, so a runner-channel subscriber here received their event
+        // first and went red in the suite while green alone (plan
+        // `2026-09-21-interleave-census-residue-five-more-suite-only-sites-a-tmpdir-substring-assertion-and-a-cross-process-class`).
+        const APP: &str = "test-sse-receives-emitted-event";
+        let mut rx = events::subscribe(APP);
         events::emit(events::SpecApiEvent::SpecChanged(events::SpecChanged {
-            app_id: RUNNER_APP_ID.to_string(),
+            app_id: APP.to_string(),
             page_id: "active".to_string(),
             kind: "ir-and-projection".to_string(),
             at_ms: events::now_ms(),
@@ -773,13 +781,18 @@ mod handler_tests {
     #[tokio::test]
     async fn get_subscribe_only_receives_own_app_events() {
         use super::super::events;
-        // Two subscribers on two distinct app channels.
-        let mut rx_runner = events::subscribe("qontinui-runner");
-        let mut rx_web = events::subscribe("qontinui-web");
+        // Two subscribers on two distinct app channels. Both ids are this
+        // test's own: the real `qontinui-runner` channel also carries sibling
+        // tests' events (the registry is process-global), which would arrive
+        // ahead of ours on `rx_runner`.
+        const RUNNER: &str = "test-c8-iso-runner";
+        const WEB: &str = "test-c8-iso-web";
+        let mut rx_runner = events::subscribe(RUNNER);
+        let mut rx_web = events::subscribe(WEB);
 
         // Emit a SpecChanged tagged for the runner app.
         events::emit(events::SpecApiEvent::SpecChanged(events::SpecChanged {
-            app_id: "qontinui-runner".to_string(),
+            app_id: RUNNER.to_string(),
             page_id: "c8-iso".to_string(),
             kind: "ir-and-projection".to_string(),
             at_ms: events::now_ms(),
@@ -793,7 +806,7 @@ mod handler_tests {
                 .expect("event must arrive on runner channel");
         match recv_runner {
             events::SpecApiEvent::SpecChanged(payload) => {
-                assert_eq!(payload.app_id, "qontinui-runner");
+                assert_eq!(payload.app_id, RUNNER);
                 assert_eq!(payload.page_id, "c8-iso");
             }
             other => panic!("expected SpecChanged on runner channel, got {other:?}"),
@@ -804,7 +817,7 @@ mod handler_tests {
             tokio::time::timeout(std::time::Duration::from_millis(200), rx_web.recv()).await;
         assert!(
             recv_web.is_err(),
-            "qontinui-web subscriber must not receive qontinui-runner events; got {:?}",
+            "the web-app subscriber must not receive the runner app's events; got {:?}",
             recv_web
         );
     }

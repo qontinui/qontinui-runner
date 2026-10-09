@@ -1025,6 +1025,298 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
     )
 }
 
+/// Request body for `POST /capability-manifest/provision-probe`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProvisionProbeBody {
+    /// Absolute path to a scratch directory the probe may write
+    /// `.claude/agents/` into. Caller-supplied and caller-owned: the probe
+    /// creates nothing outside it and removes nothing.
+    ///
+    /// `Option` + `default` on purpose: without them an absent field — and,
+    /// with a bare `#[serde(default)]`, an explicit `null` — is rejected by the
+    /// `Json` extractor as a 422 before the handler runs, which contradicts this
+    /// route's contract that every refusal is typed and names the next action.
+    /// Both shapes now land on the same 400 as an empty string.
+    #[serde(default)]
+    workdir: Option<String>,
+}
+
+/// What `POST /capability-manifest/provision-probe` answers with.
+#[derive(Debug, serde::Serialize)]
+struct ProvisionProbeResponse {
+    /// Echoed back so a caller driving several probes can match answers to
+    /// requests without relying on ordering. This is the CANONICAL form of what
+    /// the caller asked for, which on Windows is a verbatim `\\?\C:\...` path.
+    workdir: String,
+    /// Where the provisioning actually landed: a fresh directory the probe
+    /// created inside `workdir`, never `workdir` itself. A caller that wants to
+    /// witness the files on disk — as the parity harness does — must list THIS
+    /// path, because `<workdir>/.claude` is deliberately never written.
+    provisioned_into: String,
+    /// The `agent_definitions` report this pass recorded — ONE entry, not both
+    /// rows. The embedded `fleet_agents` floor is recorded by the same call from
+    /// inside `provision_agent_definitions_from_root`, which does not hand it
+    /// back, so it is visible on the next manifest read rather than here. A
+    /// caller that needs both reads the manifest, which is what the parity
+    /// harness does anyway.
+    recorded: Vec<crate::capability_manifest::ProvisionReport>,
+}
+
+/// `POST /capability-manifest/provision-probe` — fill the two
+/// session-provisioning rows that NO other door on this binary can reach.
+///
+/// Plan `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-
+/// reports` Phase 5, Fork B. The parity harness fills the other five rows
+/// through real user-path doors — `POST /terminals` (four rows, via
+/// `acquire_for_terminal`) and `POST /slash-commands/sync` (one) — because a
+/// door users actually hit is better evidence than a probe. `fleet_agents` and
+/// `agent_definitions` have no such door: they are written only by
+/// `agent_runtime`'s spawn path, which needs a launchable `claude`, a coord
+/// credential and a DB the parity box has none of. Without this route those two
+/// rows report `unknown` on BOTH legs forever, and `unknown == unknown` is the
+/// absence of two readings, never parity.
+///
+/// It calls [`crate::agent_runtime::provision_agent_definitions_recorded`] —
+/// the SAME function the spawn path calls, not a copy. That is the condition
+/// Fork B was decided on: a probe that can drift from the real path would
+/// certify a provisioning arm nobody runs.
+///
+/// **Refusals are typed and name the next action**, because this door exists to
+/// make an UNKNOWN legible and a vague 500 would defeat it:
+/// * a relative or empty `workdir` → 400;
+/// * a `workdir` that is not an existing directory → 400 naming the path;
+/// * a `workdir` inside a git work tree → 400. The agent-path provisioners
+///   overwrite `.claude/agents/*.md` unconditionally (the terminal chokepoint's
+///   `claude_tree_is_repo_authored` guard is on that path, not this one), so
+///   pointing this at a checkout would clobber hand-authored definitions and
+///   leave the repo dirty-from-birth. A scratch dir is the only correct target.
+///
+/// **Every successful call is RECORDED in the process-wide provisioning store**
+/// (`capability_manifest::record_provision`), through both of its indexes:
+/// * `latest` — the probe's `agent_definitions` and `fleet_agents` readings
+///   become the latest observation for those two capabilities, so
+///   `GET /capability-manifest` reports them until the next real spawn records
+///   over them. That is the point of the route, and it cannot mislead about the
+///   RUNG: the probe runs the spawn path's own function against the same
+///   qontinui-root, so the rung is the one a real spawn would read. Only the
+///   destination differs (the probe's directory, not a session worktree).
+/// * the per-session ledger index — each call adds one ledger keyed by its own
+///   fresh `probe-<uuid>` directory, and that index is capped at
+///   `LEDGER_CAPACITY` (64), oldest dropped first. So N calls can push the N
+///   oldest session ledgers out. Accepted rather than routed around: no
+///   production reader consumes that index (`GET /capability-manifest` reads
+///   only `latest`), the parity harness calls this once per leg against a fresh
+///   process, and the plan's Phase 5 relies on the ledger carrying the probe's
+///   workdir. If a reader of the per-session index ever ships, this route should
+///   record under a non-evicting key first.
+async fn capability_manifest_provision_probe(
+    Json(body): Json<ProvisionProbeBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let refuse = |msg: String| -> axum::response::Response {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+
+    let requested = body.workdir.unwrap_or_default().trim().to_string();
+    if requested.is_empty() {
+        return refuse("workdir is required and must be an absolute path".to_string());
+    }
+    let requested_path = std::path::Path::new(&requested);
+    if !requested_path.is_absolute() {
+        return refuse(format!(
+            "workdir must be an absolute path; got {requested:?}. \
+             The probe resolves nothing against a cwd it does not own."
+        ));
+    }
+    // CANONICALIZE BEFORE EVERY OTHER CHECK, and act on the canonical path.
+    //
+    // `is_dir()` and the writes below FOLLOW symlinks while a lexical parent
+    // walk does not, so a link whose target sits inside a checkout would pass a
+    // guard applied to the link's own path and then clobber `.claude/agents` in
+    // the repository. Resolving first collapses that gap: every check below, and
+    // the provisioning itself, see the same real directory.
+    let path = match std::fs::canonicalize(requested_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return refuse(format!(
+                "workdir {requested:?} could not be resolved: {e}. \
+                 Create the scratch directory first; the probe resolves it, it does not \
+                 create it — it creates only its own subdirectory inside it."
+            ))
+        }
+    };
+    let workdir = path.display().to_string();
+    if !path.is_dir() {
+        return refuse(format!(
+            "workdir {requested:?} resolves to {workdir:?}, which is not a directory. \
+             Point it at an existing scratch directory."
+        ));
+    }
+    if let Some(repo_root) = enclosing_git_work_tree(&path) {
+        return refuse(format!(
+            "workdir {requested:?} resolves to {workdir:?}, inside the git work tree at \
+             {repo_root:?}. This probe overwrites .claude/agents/*.md unconditionally, which \
+             in a checkout would clobber hand-authored definitions and leave the tree dirty. \
+             Point it at a scratch directory outside any repository."
+        ));
+    }
+    // A HOME DIRECTORY IS NOT A CHECKOUT, AND IS JUST AS VALUABLE. `~/.claude`
+    // is the user-scoped location `claude` resolves subagent definitions from,
+    // so writing there would overwrite the operator's own hand-authored defs
+    // with this binary's embedded snapshot. No git guard catches it: a home dir
+    // is not a work tree.
+    match dirs::home_dir().and_then(|h| std::fs::canonicalize(h).ok()) {
+        Some(home) => {
+            // `path == home` or `path` is an ANCESTOR of home. The descendant
+            // direction is deliberately absent: on Windows the harness's own
+            // scratch dir lives under %USERPROFILE%\AppData\Local\Temp.
+            if path == home || home.starts_with(&path) {
+                // NOTE on the reason, which changed under this guard's feet: it was
+                // written when the probe wrote `<workdir>/.claude/agents` directly, so
+                // pointing it at `$HOME` would have overwritten the operator's own
+                // definitions. The probe now writes only inside a directory it creates,
+                // so that can no longer happen and this guard is belt-and-braces. It
+                // stays for the reason below — a probe has no business littering a home
+                // directory — and must NOT be deleted on discovering the old rationale
+                // is stale.
+                return refuse(format!(
+                    "workdir {requested:?} resolves to {workdir:?}, which is the home directory \
+                     {home:?} or an ancestor of it. The probe creates directories where it is \
+                     pointed and has no business doing that in a home directory. Point it at a \
+                     scratch directory."
+                ));
+            }
+        }
+        // FAIL LOUD, not open. A container or service account with no resolvable
+        // home skips this guard; on a route whose purpose is making UNKNOWN
+        // legible, that must not be silent.
+        None => tracing::warn!(
+            workdir = %workdir,
+            "provision probe: the home directory could not be resolved, so the \
+             home-directory guard did NOT run for this call"
+        ),
+    }
+
+    // THE GUARDS ABOVE VET `path`. THE PROVISIONERS WRITE `path/.claude/agents`.
+    //
+    // Guarding only the workdir leaves the same bypass one level down: the
+    // provisioners reach the target with `create_dir_all` / `fs::write` /
+    // `fs::copy`, all of which FOLLOW symlinks, so a `.claude` link pre-placed
+    // inside an otherwise-innocent scratch dir writes straight into a checkout
+    // while every check above passes.
+    //
+    // Rather than inspect what is there — which is both racy and easy to get
+    // subtly wrong — the probe writes into a directory it CREATES ITSELF.
+    // `create_dir` (not `create_dir_all`) is atomic and fails with
+    // `AlreadyExists` rather than following anything, so a link PRE-PLACED
+    // before this call cannot be inside the target: that is the guarantee, and
+    // it closes the bypass a caller can set up in advance.
+    //
+    // It is NOT a guarantee against a caller acting DURING the call. The new
+    // directory is created with default permissions in a workdir the caller
+    // owns, so a local process running as the same user that observes the new
+    // name can plant `<target>/.claude` (or `.claude/agents`, or a single
+    // `*.md`) as a symlink between `create_dir` and the provisioners' writes,
+    // and those writes follow links. The re-resolution below checks only the
+    // target directory itself, not what appears inside it.
+    //
+    // So the residual is a LOCAL RACE, not a remote one (the route is a
+    // credential door; a foreign Origin never reaches it): a process that can
+    // write into `workdir` and wins the window can redirect this call's writes
+    // — this binary's embedded agent definitions, fixed content the caller
+    // does not choose — to wherever the runner's user can write. A same-user
+    // process gains nothing by it (it could write there directly). A
+    // DIFFERENT local user who owns `workdir` could still rename the probe's
+    // directory away after the re-resolution and swap in a link, which would be
+    // a real, if narrow, capability. The probe narrows that window; it does not
+    // close it, and must not be described as if it did.
+    let target = path.join(format!("probe-{}", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::create_dir(&target) {
+        return refuse(format!(
+            "could not create the probe's own target directory under {workdir:?}: {e}. \
+             The probe never writes into a directory it did not create, so it cannot \
+             continue."
+        ));
+    }
+    // One narrower swap IS checked: the caller cannot PREDICT this name, but it
+    // can OBSERVE it (it owns `workdir` and can watch it with inotify /
+    // ReadDirectoryChangesW), and could replace the directory itself with a
+    // symlink. Re-resolving here and requiring the result to stay under the
+    // vetted workdir turns a swap that lands BEFORE this line into a refusal.
+    // A swap after it, or a link planted inside the directory (see above), is
+    // the residual local window described there, not covered by this check.
+    let target = match std::fs::canonicalize(&target) {
+        Ok(t) if t.starts_with(&path) => t,
+        Ok(t) => {
+            return refuse(format!(
+                "the probe's own target directory resolved to {t:?}, outside the vetted \
+                 workdir {workdir:?}. Refusing rather than writing through it."
+            ))
+        }
+        Err(e) => {
+            return refuse(format!(
+                "could not resolve the probe's own target directory under {workdir:?}: {e}"
+            ))
+        }
+    };
+    let provisioned_into = target.display().to_string();
+
+    let workdir_for_task = provisioned_into.clone();
+    let recorded = match spawn_blocking_tracked(move || {
+        crate::agent_runtime::provision_agent_definitions_recorded(&workdir_for_task)
+    })
+    .await
+    {
+        Ok(reports) => reports,
+        Err(e) => {
+            // A panicked pass answering 200 with `recorded: []` would read to the
+            // harness exactly like a pass that recorded nothing, and its caller
+            // branches on the status code. Say 500 instead.
+            tracing::error!("provision probe task panicked: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "the provisioning pass panicked and recorded nothing verifiable: {e}"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(ProvisionProbeResponse {
+        workdir,
+        provisioned_into,
+        recorded,
+    })
+    .into_response()
+}
+
+/// The git work tree `path` sits in, if any — the directory holding a `.git`
+/// entry at `path` or above it.
+///
+/// A `.git` FILE counts as well as a directory: that is exactly what a linked
+/// worktree has, and a linked worktree of a checkout is precisely the tree this
+/// guard must refuse. Walking parents (rather than shelling out to
+/// `git rev-parse`) keeps the check dependency-free and equally correct on a
+/// box with no git on PATH.
+fn enclosing_git_work_tree(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// The `/health` fields that state this runner's DEFAULT tenant — the tenant a
 /// session that names none is minted into (plan
 /// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
@@ -1833,6 +2125,11 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // Per-local-user connection guard (plan 2026-10-04-runner-loopback-
+        // api-refuses-other-local-users): installed/enabled/supported, the kill
+        // switch's name, and admit/refusal counters. No uid or SID is served —
+        // `/health` is reachable from browser origins; identities are logged.
+        "peerUserGuard": qontinui_runner_lib::peer_user_guard::health_json(),
         // UI Bridge relay principal binding (plan 2026-09-17-ui-bridge-relay-
         // registration-is-unauthenticated): both kill-switch modes, the
         // per-rule wouldRefuse/refused counts and the last 20 (rule, class,
@@ -4526,11 +4823,32 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// carrying the continuation, and withdraws the source — the ONLY way to re-arm a
 /// superseded watch, because `continuation_spawn` is write-once at registration.
 /// coord grants it on the device floor and its core enforces the REGISTRANT rule
-/// (the same floor `coord_withdraw_gate`, already here, rests on), so forwarding it
-/// reaches only gates this device registered. Withheld, the remedy
-/// `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names would
-/// answer `-32601` from inside the product — the supersede would keep losing its
-/// arm silently, which is the defect the verb exists to end.
+/// (the same floor `coord_withdraw_gate`, already here, rests on). Withheld, the
+/// remedy `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names
+/// would answer `-32601` from inside the product — the supersede would keep losing
+/// its arm silently, which is the defect the verb exists to end.
+///
+/// The registrant rule is no longer the WHOLE rule, so forwarding it does not reach
+/// "only gates this device registered" (plan
+/// `2026-09-23-an-adopter-cannot-re-anchor-a-gate-it-did-not-register`). When the
+/// registrant check fails, coord runs a narrower SUPERSESSION arm: a non-registrant
+/// device may re-point a `pr_merged` gate, including a system-registered one with
+/// no recorded registrant. It may do so only when the source's continuation was
+/// never cancelled, and when coord holds a live, tenant-confined
+/// `supersession_declared` row naming the supplied predicate as a recorded
+/// successor. That is a wider REACH under a coord-provable precondition, not a
+/// wider TRUST. `coord_declare_supersession`, forwarded beside it, is the direct
+/// door that writes that row when the successor's title token recorded nothing.
+/// coord verifies every precondition itself (`record_agent_declaration`): it holds a
+/// record of the predecessor, the caller's tenant owns both repos, the successor
+/// LANDED by coord's own record and is not a fork, the successor's title or body
+/// references the predecessor (the provenance link that stops a device pairing two
+/// arbitrary PRs), its author is trusted or may write to the repo, and the
+/// predecessor has not itself landed. Such a row feeds the gate move, the card's
+/// `superseded_by` and the deferred-fail probe, NEVER a coord close: the
+/// superseded-predecessor closer skips agent-declared rows and closes only on a
+/// title declaration. Without that door, when the title recorded nothing, only the
+/// gate's registrant could move it, and no operator twin of the re-point exists.
 ///
 /// `coord_citations_reenrich` is IN because it is a SHIPPED REPAIR ROUTE, and a
 /// repair route an agent cannot reach is the defect it was built to close (plan
@@ -4591,6 +4909,35 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
 ///   default, precedence-aware re-derive, reversible by re-running).
 ///
+/// The overlord's four doors are IN, added WITH coord's grant rather than after a
+/// session hits `-32601` — the order the `coord_memory_supersede` paragraph above
+/// argues for. coord's grant (qontinui-coord#2913 for the proof reads,
+/// qontinui-coord#2957 for the ledger pair) puts all four on the device floor
+/// (`DEVICE_DEFAULT_TOOLS`), each
+/// with a `DoorAdmits::DeviceAgent` HTTP twin, so withholding them here would be
+/// a transport asymmetry rather than a boundary:
+///
+/// * proof reads (plan
+///   `2026-10-03-overlord-never-finishes-a-session-on-an-unproven-claim`) —
+///   `coord_watch_verdict` (twin `GET /coord/overlord/watch-verdict`)
+///   and `coord_session_obligations` (twin
+///   `GET /coord/overlord/session-obligations/:claude_code_session_id`). These are
+///   what lets `/next-move` PROVE a session owes nothing before it calls that
+///   session finished; a session that cannot read them can only assume, and an
+///   assumed "nothing owed" is precisely the false finish the plan exists to end.
+///   Both are reads and carry no authority a session lacks.
+/// * the intervention ledger (plan
+///   `2026-10-01-overlord-session-supervisor-classifies-stops-and-absorbs-avoidable-escalations`
+///   Phase 2) — `coord_overlord_record` (twin
+///   `POST /coord/overlord/interventions`) and `coord_overlord_interventions`
+///   (twin `GET` on the same route), `/next-move`'s store-of-record. The write is
+///   an append-only, self-attributed row about the caller's own intervention, the
+///   same shape as `coord_post_finding`: it records what an overlord did, and
+///   performs nothing.
+///
+/// Forwarding a name coord does not yet serve is harmless — coord answers it as
+/// an unknown tool — so these entries may land ahead of the coord side.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4636,10 +4983,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // directive 2026-10-03, served policy `git-operations`
     // `a-landed-adoption-closes-its-predecessor`). It records the declaration
     // `coord_repoint_gate`'s supersession arm needs when a successor's title
-    // token was missing or not recorded — every precondition (tenant owns both
-    // repos, successor LANDED, successor not a fork) is verified by coord.
-    // Withheld here it would answer `-32601`, and the adoption's last two steps
-    // (move the gate, close the predecessor) would stay operator-only.
+    // token was missing or not recorded — every precondition (coord knows the
+    // predecessor, tenant owns both repos, successor LANDED and not a fork,
+    // successor's text references the predecessor, author trusted or a repo
+    // writer, predecessor not landed) is verified by coord. Withheld here it
+    // would answer `-32601`, and only the gate's registrant could move it. It
+    // never authorizes a coord CLOSE of the predecessor: the
+    // closer skips agent-declared rows and acts only on a title declaration.
     "coord_declare_supersession",
     "coord_diagnose",
     "coord_diff_impact",
@@ -4689,6 +5039,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_notify_sensitive_action",
     "coord_operator_touch_classify",
     "coord_orient",
+    "coord_overlord_interventions",
+    "coord_overlord_record",
     "coord_pending_agent_questions",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
@@ -4726,6 +5078,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_session",
     "coord_secret_presence",
     "coord_send_message",
+    "coord_session_obligations",
     "coord_session_worktrees",
     "coord_set_gate_audience",
     "coord_signature",
@@ -4738,6 +5091,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_unmute_gate",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
+    "coord_watch_verdict",
     "coord_who_is_working_on",
     "coord_withdraw_agent_question",
     "coord_withdraw_gate",
@@ -6746,7 +7100,7 @@ async fn coord_mcp_proxy_handler(
     // Pick the bearer by principal:
     //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
     //    off the async executor), the same fresh token `backend_relay` reads.
-    //  - Agent  → THAT agent's own refreshed JWT from its AGENT_TOKENS slot; a
+    //  - Agent  → THAT agent's own refreshed JWT from its AgentTokenRegistry slot; a
     //    belt-and-suspenders `maybe_refresh` keeps it live on the request path
     //    too. An absent slot (torn-down / restarted agent) is a hard 401.
     // `mut` because the Phase 3a credential gate below may replace this with a
@@ -11584,6 +11938,12 @@ pub fn create_router(
         });
     }
 
+    // Keep the canonical-generation rung's mirror of qontinui-claude-config
+    // fresh (plan 2026-09-03-served-corpus-provenance-at-spawn, Phase 6). A
+    // background timer, never a spawn path: registry resolution only READS the
+    // last loaded snapshot.
+    crate::canonical_corpus::start_refresh_loop();
+
     // Phase 3b — the stale-`.coord-mcp-status` sweep, beside the boot heal that
     // runs inside `reconcile_session_configs` above.
     //
@@ -12134,6 +12494,16 @@ pub fn create_router(
         // answered for each capability it delivers, so a development build's
         // report and a published build's report can be diffed.
         .route("/capability-manifest", get(capability_manifest))
+        // The two session-provisioning rows no other door on this binary can
+        // fill (`fleet_agents`, `agent_definitions`). Writes into a
+        // caller-supplied scratch dir; refuses one inside a git work tree.
+        // Each call RECORDS into the provisioning store: it becomes the
+        // `latest` reading those two manifest rows report, and adds one entry
+        // to the 64-entry per-session ledger index (see the handler's doc).
+        .route(
+            "/capability-manifest/provision-probe",
+            post(capability_manifest_provision_probe),
+        )
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
         // The capture that used to run inline inside `/health` (Phase 1.2).
@@ -12867,6 +13237,8 @@ async fn serve_on_dedicated_runtime(
                  any other subsystem blocks the app runtime's workers."
             );
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
+            let listener =
+                qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
             return axum::serve(listener, router).await.map_err(Into::into);
         }
     };
@@ -12876,6 +13248,12 @@ async fn serve_on_dedicated_runtime(
     // which the listener is owned by a thread that failed to start.
     let served = rt.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        // Refuse every connection whose peer process runs as a different OS
+        // user (plan 2026-10-04-runner-loopback-api-refuses-other-local-users).
+        // Wrapped HERE, on the dedicated runtime, because the guard's accept
+        // task is spawned on the runtime that wraps it.
+        let listener =
+            qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
         axum::serve(listener, router).await
     });
 
@@ -16288,6 +16666,45 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// The overlord's proof reads (plan
+    /// `2026-10-03-overlord-never-finishes-a-session-on-an-unproven-claim`) and
+    /// its intervention-ledger pair (plan
+    /// `2026-10-01-overlord-session-supervisor-classifies-stops-and-absorbs-avoidable-escalations`
+    /// Phase 2): coord's grant (qontinui-coord#2913 for the proof reads,
+    /// qontinui-coord#2957 for the ledger pair) puts all four on the device
+    /// floor, so this door must forward
+    /// them — and the source-text parser the drift verdict runs must read each
+    /// back once.
+    #[test]
+    fn overlord_proof_and_ledger_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_watch_verdict",
+            "coord_session_obligations",
+            "coord_overlord_record",
+            "coord_overlord_interventions",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
     /// The MCP handshake + the legitimate coordination surface forwards.
     #[test]
     fn allows_handshake_and_coordination_tools() {
@@ -18760,7 +19177,7 @@ mod coord_provision_session_gate_tests {
         // Diagnostic only: the registry is process-global and sibling tests
         // mint into it concurrently, so a whole-map before/after equality
         // would race them. The property asserted below is caller-scoped.
-        let before = crate::coord_mcp::proxy_nonces().lock().unwrap().len();
+        let before = crate::coord_mcp::NonceRegistry::global().test_live().len();
 
         let resp = super::provision_session_after_gate(body.as_bytes());
         assert_eq!(resp.status(), 403);
@@ -18777,7 +19194,7 @@ mod coord_provision_session_gate_tests {
             "the refusal names the heal: {err}"
         );
 
-        let registry = crate::coord_mcp::proxy_nonces().lock().unwrap();
+        let registry = crate::coord_mcp::NonceRegistry::global().test_live();
         assert!(
             registry.values().all(|b| b.workdir() != cwd_str),
             "a refused tenant must mint NOTHING for the caller's cwd (registry had {before} \
@@ -21850,5 +22267,267 @@ mod ui_bridge_binding_health_tests {
             production.contains("relay_binding: crate::mcp::relay_binding::RelayBinding::new("),
             "the one instance must be the field on ApiState"
         );
+    }
+}
+
+#[cfg(test)]
+mod provision_probe_tests {
+    use super::{capability_manifest_provision_probe, enclosing_git_work_tree, ProvisionProbeBody};
+    use axum::response::Json;
+
+    /// Drive the handler and return `(status, body)`.
+    async fn probe(workdir: &str) -> (axum::http::StatusCode, String) {
+        let resp = capability_manifest_provision_probe(Json(ProvisionProbeBody {
+            workdir: Some(workdir.to_string()),
+        }))
+        .await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_or_relative_workdir_is_refused_by_shape() {
+        let (status, body) = probe("   ").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(body.contains("absolute"), "refusal names the shape: {body}");
+
+        let (status, body) = probe("relative/scratch").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("absolute"),
+            "a relative path is refused, not resolved against a cwd: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_directory_is_refused_naming_the_path() {
+        let missing = std::env::temp_dir().join("parity-probe-does-not-exist-9d3f1c");
+        let _ = std::fs::remove_dir_all(&missing);
+        let (status, body) = probe(&missing.display().to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        // Since the canonicalize-first fix this is caught one step earlier, by
+        // the resolution itself, so the wording is "could not be resolved"
+        // rather than "not an existing directory". What the test actually
+        // guards is unchanged and is what matters: a 400 that NAMES the path
+        // and tells the caller what to do, rather than a failure further in.
+        assert!(
+            body.contains("could not be resolved"),
+            "refusal says the path did not resolve rather than failing later: {body}"
+        );
+        assert!(
+            body.contains("parity-probe-does-not-exist"),
+            "and it names the path the caller gave: {body}"
+        );
+    }
+
+    /// The guard that keeps this probe from clobbering a checkout's
+    /// hand-authored `.claude/agents/*.md`. A `.git` FILE (a linked worktree)
+    /// counts as much as a directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workdir_inside_a_git_work_tree_is_refused() {
+        let root = std::env::temp_dir().join(format!("parity-probe-repo-{}", std::process::id()));
+        let nested = root.join("nested").join("deep");
+        std::fs::create_dir_all(&nested).expect("create nested scratch");
+        std::fs::write(root.join(".git"), b"gitdir: /elsewhere\n").expect("write .git file");
+
+        assert_eq!(
+            enclosing_git_work_tree(&nested).as_deref(),
+            Some(root.as_path()),
+            "the walk finds the enclosing work tree from a nested dir"
+        );
+
+        let (status, body) = probe(&nested.display().to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("git work tree"),
+            "refusal names WHY, so the caller can fix it: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// THE BYPASS THIS GUARD WAS FIRST WRITTEN WITHOUT.
+    ///
+    /// `is_dir()` and the provisioning writes follow symlinks; a lexical parent
+    /// walk does not. So a link outside any repo whose TARGET sits inside one
+    /// passed every check and then clobbered `.claude/agents` in the checkout.
+    /// The fix is to canonicalize before checking, and this test is the proof —
+    /// it fails against the pre-fix handler.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlink_into_a_git_work_tree_is_refused() {
+        let root =
+            std::env::temp_dir().join(format!("parity-probe-symlink-{}", std::process::id()));
+        let repo = root.join("repo");
+        let inside = repo.join("sub");
+        std::fs::create_dir_all(&inside).expect("create repo/sub");
+        std::fs::write(repo.join(".git"), b"gitdir: /elsewhere\n").expect("write .git");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&inside, &link).expect("symlink");
+
+        // The link itself is outside any work tree by a lexical walk...
+        assert!(
+            enclosing_git_work_tree(&link).is_none(),
+            "precondition: the lexical walk cannot see through the link"
+        );
+        // ...and the handler must refuse it anyway.
+        let (status, body) = probe(&link.display().to_string()).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a symlink into a checkout must be refused: {body}"
+        );
+        assert!(
+            body.contains("git work tree"),
+            "and the refusal must name why: {body}"
+        );
+        assert!(
+            !inside.join(".claude").exists(),
+            "nothing may have been written inside the repository"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// THE BYPASS ONE LEVEL DOWN, found by the review of the first fix: the
+    /// workdir itself is clean, but `<workdir>/.claude` is a symlink into a
+    /// checkout, and every provisioner reaches the target with calls that follow
+    /// symlinks. The probe writes into a directory it creates itself, so a
+    /// pre-placed link is never followed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_dot_claude_inside_the_workdir_is_not_written_through() {
+        let root =
+            std::env::temp_dir().join(format!("parity-probe-dotclaude-{}", std::process::id()));
+        let repo = root.join("repo");
+        let repo_claude = repo.join(".claude");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(repo_claude.join("agents")).expect("create repo/.claude/agents");
+        std::fs::write(repo.join(".git"), b"gitdir: /elsewhere\n").expect("write .git");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        // The trap: an innocent-looking scratch dir whose .claude points into the repo.
+        std::os::unix::fs::symlink(&repo_claude, scratch.join(".claude")).expect("symlink");
+        let canary = repo_claude.join("agents").join("merge-specialist.md");
+        std::fs::write(&canary, b"HAND-AUTHORED\n").expect("write canary");
+
+        // Compare against the CANONICAL paths: the handler canonicalizes, and on
+        // macOS `std::env::temp_dir()` is /var/folders/... which resolves to
+        // /private/var/folders/... The sibling test below already learned this.
+        let scratch_c = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        let repo_c = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
+
+        let (status, body) = probe(&scratch.display().to_string()).await;
+
+        // The call may succeed -- the scratch dir IS outside any work tree. What
+        // must hold is that nothing reached the repository through the link.
+        assert_eq!(
+            std::fs::read_to_string(&canary).expect("canary still readable"),
+            "HAND-AUTHORED\n",
+            "the hand-authored definition must be untouched (status {status}, body {body})"
+        );
+        if status == axum::http::StatusCode::OK {
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let into = parsed["provisioned_into"]
+                .as_str()
+                .expect("provisioned_into");
+            assert!(
+                std::path::Path::new(into).starts_with(&scratch_c),
+                "provisioning must land inside the caller's own scratch dir, not {into}"
+            );
+            assert!(
+                !std::path::Path::new(into).starts_with(&repo_c),
+                "and never inside the repository"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A home directory is not a git work tree, and `~/.claude/agents` holds the
+    /// operator's own hand-authored definitions. The git guard cannot catch it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_home_directory_is_refused() {
+        let Some(home) = dirs::home_dir() else { return };
+        let (status, body) = probe(&home.display().to_string()).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the home dir must be refused: {body}"
+        );
+        assert!(
+            body.contains("home directory"),
+            "and the refusal must say so: {body}"
+        );
+    }
+
+    /// An absent `workdir` must reach the handler's own typed refusal rather than
+    /// serde's 422, which the route's contract promises.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_absent_workdir_field_is_a_typed_refusal() {
+        let resp = capability_manifest_provision_probe(Json(
+            serde_json::from_str::<ProvisionProbeBody>("{}")
+                .expect("an absent workdir deserializes"),
+        ))
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // An EXPLICIT null is the other half of the claim, and it is a different
+        // serde path: `#[serde(default)]` alone covers only a missing field.
+        let resp = capability_manifest_provision_probe(Json(
+            serde_json::from_str::<ProvisionProbeBody>(r#"{"workdir": null}"#)
+                .expect("an explicit null deserializes"),
+        ))
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A scratch dir outside any repo is accepted, and the answer carries the
+    /// row the ledger recorded — the property the parity harness reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scratch_dir_is_probed_and_the_recorded_row_comes_back() {
+        let dir = std::env::temp_dir().join(format!("parity-probe-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch");
+        // Guard the guard: a temp dir that happens to sit inside a repo would
+        // make this test assert the wrong arm. Check the CANONICAL path, which
+        // is what the handler checks — on macOS /var resolves to /private/var.
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if enclosing_git_work_tree(&canonical).is_some() {
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let (status, body) = probe(&dir.display().to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+        assert!(
+            body.contains("agent_definitions"),
+            "the response names the capability it recorded: {body}"
+        );
+        assert!(
+            body.contains("\"workdir\""),
+            "the workdir is echoed so concurrent probes can be matched: {body}"
+        );
+        // The probe never writes into the caller's directory itself.
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let into = parsed["provisioned_into"]
+            .as_str()
+            .expect("provisioned_into");
+        assert_ne!(
+            std::path::Path::new(into),
+            canonical.as_path(),
+            "provisioning must land in a directory the probe created, not the workdir"
+        );
+        assert!(
+            std::path::Path::new(into).starts_with(&canonical),
+            "and that directory must be inside the workdir: {into}"
+        );
+        assert!(
+            !canonical.join(".claude").exists(),
+            "so <workdir>/.claude is never created at all"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

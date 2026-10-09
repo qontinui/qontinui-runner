@@ -5,14 +5,20 @@ use tauri::Manager;
 
 // Self-alias so `qontinui_runner_lib::…` paths resolve INSIDE this crate too.
 //
-// Seven modules (`process_helpers`, `auth`, `fs_atomic`, …) are compiled into
-// BOTH this lib and the `qontinui-runner` bin, and the bin reaches lib items by
-// their external path. Without this alias a call site in one of those shared
-// modules would need a different path depending on which crate is compiling it.
-// With it, `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked` is
-// one spelling that works everywhere — which is what lets the blocking-pool
-// counter be a single static shared by both crates instead of two that each
-// see half the traffic.
+// The bin reaches lib items by their external path. Modules the bin shares
+// with this lib are OWNED here and imported by the bin
+// (`pub(crate) use qontinui_runner_lib::X;` in `main.rs`), so each compiles
+// once and has one set of statics; `crate_roots_ratchet` (a bin test) fails
+// on any module declared in both roots outside its shrinking allowlist.
+// Lib code spells some lib paths `qontinui_runner_lib::…` rather than
+// `crate::…` — `auth`, `process_helpers`, `machine_identity`,
+// `secure_storage`, `env_agent`, `accessibility` and `plan_workunit_adapter`
+// all do — and this alias is what makes that spelling resolve here. For
+// `auth`, which is still declared in both roots (plan
+// `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`
+// Phase 2), it is also what gives its call sites one spelling whichever crate
+// compiles it: `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked`
+// works in both.
 extern crate self as qontinui_runner_lib;
 
 pub mod accessibility;
@@ -28,9 +34,10 @@ pub mod ambient;
 // Pure logic only — no async, no coord/keyring deps. See the module doc.
 pub mod intercept_core;
 pub mod observable_bridge;
-// Windows CREATE_NO_WINDOW spawn helpers. Declared in BOTH the lib and the
-// runner bin (same file, like `coord_doctor`) so lib-crate modules
-// (`profile_cli`, `env_agent`) can suppress console-window flashes too.
+// Windows CREATE_NO_WINDOW spawn helpers. Owned by the lib so lib-crate
+// modules (`profile_cli`, `env_agent`) can suppress console-window flashes
+// too; the runner bin imports this one copy (`main.rs`), so its process-global
+// gauges (`LIVE_PIPE_READERS`, `DETACHED_CHILDREN`) exist once per process.
 pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;
@@ -52,9 +59,9 @@ pub mod runner_breadcrumb;
 pub mod schema_export;
 pub mod tauri_event_payloads;
 
-// Temp-file-then-rename writer. Declared in BOTH the lib and the runner bin
-// (same file, like `process_helpers` / `coord_doctor`) because
-// `secure_storage` — which compiles into both crates — needs it: the encrypted
+// Temp-file-then-rename writer. Owned by the lib and imported by the runner
+// bin, so its `TEMP_SEQ` counter is one static per process — the uniqueness
+// of its temp paths depends on that. `secure_storage` needs it: the encrypted
 // token store MUST be written atomically, or a reader racing the device-JWT
 // refresher's ~5-minute rewrite sees a truncated file and reports the store
 // corrupt (which, with the fail-closed sign-out marker, reads as a logout the
@@ -78,11 +85,11 @@ pub mod auth;
 /// subscriber lane goes through.
 pub mod coord_ws;
 pub mod fs_perms;
+/// Canonical reader for `~/.qontinui/machine.json` — the machine's ONE
+/// durable `device_id`. The runner bin imports it, and `auth` must consult it
+/// before falling back to its own cache.
 pub mod machine_identity;
 pub mod secure_storage;
-/// Canonical reader for `~/.qontinui/machine.json` — the machine's ONE
-/// durable `device_id`. Declared in `main.rs` too, because `auth` compiles
-/// into both crates and must consult it before falling back to its own cache.
 /// The machine's tenant pin — moved out of the bin-only `session` tree so the
 /// LIB can read it too (plan
 /// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` Phase 5a).
@@ -118,11 +125,13 @@ pub mod env_agent;
 
 // THE `source()`-chain renderer, shared by the lib and the bin.
 //
-// Declared INLINE so the nested `error_chain` resolves to `src/util/error_chain.rs`
-// — the very file the bin crate's own `mod util;` (main.rs) compiles. One
-// source of truth, one spelling (`crate::util::error_chain::error_chain`) on
-// both sides, which is what stops a fourth private copy appearing the next
-// time a call site needs a cause.
+// Declared INLINE so the nested `error_chain` resolves to `src/util/error_chain.rs`.
+// The lib OWNS it; the bin's own `util/mod.rs` re-exports this copy
+// (`pub use qontinui_runner_lib::util::error_chain;`) rather than declaring
+// the file again, so it compiles once and has one spelling
+// (`crate::util::error_chain::error_chain`) on both sides — which is what
+// stops a fourth private copy appearing the next time a call site needs a
+// cause.
 //
 // Only `error_chain` is lifted: `util::path_extraction` depends on
 // `crate::executor::file_registry`, which exists in the BIN alone, so
@@ -131,9 +140,9 @@ pub mod util {
     pub mod error_chain;
     // The spawn-failure classifier (fd / commit / no_system_resources /
     // task_limit), its per-episode event, the cached memory reading and the
-    // EMFILE/ENFILE stamp. LIB-only on purpose: `process_helpers` is compiled
-    // into both crates, and both copies must stamp the SAME statics the bin's
-    // heartbeat and the allocator breadcrumb read — so every caller spells it
+    // EMFILE/ENFILE stamp. LIB-only on purpose: `process_helpers` and the
+    // bin's heartbeat and allocator breadcrumb must stamp and read the SAME
+    // statics — so every caller spells it
     // `qontinui_runner_lib::util::resource_exhaustion`, and the bin's own
     // `util/mod.rs` must NOT declare it (a second declaration is a second,
     // half-blind static).
@@ -147,6 +156,13 @@ pub mod util {
 // through. In the LIB so the wrapper and `util::resource_exhaustion` share ONE
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
+
+// Per-local-user connection guard for every runner TCP listener (plan
+// `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a
+// loopback connection whose peer process runs as a different OS user. In the
+// LIB because the `:9876` API (bin) and the pairing / Cognito callback
+// listeners (lib) all wrap their listeners with it.
+pub mod peer_user_guard;
 
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI

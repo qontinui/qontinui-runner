@@ -1687,28 +1687,26 @@ fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
 /// agent_id can register, so this teardown can never strip a newer run's
 /// token, nonces or daemons.
 ///
-/// Holds the three maps it tears down by reference so the drop runs through
-/// [`teardown_in`], which a test can drive over poisoned LOCAL maps.
-/// Production builds it with [`AgentRunTeardown::global`].
+/// Holds the two registries and the daemon map it tears down by reference so
+/// the drop runs through [`teardown_in`], which a test can drive over poisoned
+/// LOCAL instances. Production builds it with [`AgentRunTeardown::global`].
 #[allow(clippy::type_complexity)]
 struct AgentRunTeardown<'a> {
     agent_id: uuid::Uuid,
-    tokens: &'a std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
-    >,
-    nonces: &'a std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    tokens: &'a crate::coord_mcp::AgentTokenRegistry,
+    nonces: &'a crate::coord_mcp::NonceRegistry,
     daemons: &'a std::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
     >,
 }
 
 impl AgentRunTeardown<'static> {
-    /// The production teardown, over the process-global maps.
+    /// The production teardown, over the process-global registries.
     fn global(agent_id: uuid::Uuid) -> Self {
         AgentRunTeardown {
             agent_id,
-            tokens: crate::coord_mcp::agent_tokens(),
-            nonces: crate::coord_mcp::proxy_nonces(),
+            tokens: crate::coord_mcp::AgentTokenRegistry::global(),
+            nonces: crate::coord_mcp::NonceRegistry::global(),
             daemons: crate::agent_daemons::registry(),
         }
     }
@@ -1720,21 +1718,20 @@ impl Drop for AgentRunTeardown<'_> {
     }
 }
 
-/// The per-agent teardown over explicit maps: live-token removal, proxy-nonce
-/// revoke, daemon stop. Every lock it takes recovers a poisoned mutex.
+/// The per-agent teardown over explicit registries: live-token removal,
+/// proxy-nonce revoke, daemon stop. Every lock it takes recovers a poisoned
+/// mutex.
 #[allow(clippy::type_complexity)]
 fn teardown_in(
-    tokens: &std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
-    >,
-    nonces: &std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    tokens: &crate::coord_mcp::AgentTokenRegistry,
+    nonces: &crate::coord_mcp::NonceRegistry,
     daemons: &std::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
     >,
     agent_id: uuid::Uuid,
 ) {
-    crate::coord_mcp::remove_agent_token_in(tokens, agent_id);
-    crate::coord_mcp::revoke_agent_proxy_nonces_in(nonces, agent_id);
+    tokens.remove(agent_id);
+    nonces.revoke_agent_proxy_nonces(agent_id);
     crate::agent_daemons::stop_for_agent_in(daemons, agent_id);
 }
 
@@ -2358,15 +2355,11 @@ fn dispatched_gate_ids(
     DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Atomically claim a `gate_id` for dispatch. Returns `true` if THIS call was
-/// the first to claim it (caller should dispatch); `false` if it was already
-/// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
+/// Atomically claim a `gate_id` at re-delivery `attempt` (0 = first delivery)
+/// for dispatch. Returns `true` if THIS call won the claim (caller should
+/// dispatch); `false` if it must skip as a duplicate. Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
-fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
-    claim_gate_dispatch_attempt(gate_id, 0)
-}
-
-/// [`claim_gate_dispatch`] for re-delivery `attempt` (0 = first delivery).
+///
 /// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
 /// held attempt is THIS one and was released (a local skip that left the row
 /// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
@@ -2383,6 +2376,18 @@ fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
         held.insert(gate_id, (attempt, GateClaimState::Held));
     }
     wins
+}
+
+/// Test shim: [`claim_gate_dispatch_attempt`] at attempt 0 (a first delivery).
+#[cfg(test)]
+fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
+    claim_gate_dispatch_attempt(gate_id, 0)
+}
+
+/// Test shim: [`release_gate_dispatch_attempt`] at attempt 0.
+#[cfg(test)]
+fn release_gate_dispatch(gate_id: uuid::Uuid) {
+    release_gate_dispatch_attempt(gate_id, 0);
 }
 
 /// The in-process state of one gate's highest claimed attempt.
@@ -2409,7 +2414,10 @@ fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     }
 }
 
-/// Release an in-process gate-dispatch claim ([`claim_gate_dispatch`]).
+/// Release the in-process gate-dispatch claim `attempt` holds
+/// ([`claim_gate_dispatch_attempt`]) — a TOMBSTONE, and a no-op when a
+/// different (newer) attempt holds the gate or this attempt is already
+/// [`GateClaimState::Sealed`]. See [`dispatched_gate_ids`].
 ///
 /// **The load-bearing half of the delivery-stall fix.** The dedupe set's ONLY
 /// purpose is the WS+poll double-delivery race: an id must stay claimed only
@@ -2420,12 +2428,6 @@ fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
 /// the process lifetime: the backstop poll re-lists the row every tick and the
 /// dispatcher drops it at the dedupe check forever — the exact mechanism that
 /// stranded 51 continuations pending-with-null-outcomes over 2 days.
-fn release_gate_dispatch(gate_id: uuid::Uuid) {
-    release_gate_dispatch_attempt(gate_id, 0);
-}
-
-/// Release the claim attempt `attempt` holds — a TOMBSTONE, and a no-op when a
-/// different (newer) attempt holds the gate. See [`dispatched_gate_ids`].
 fn release_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
     if let Some(entry) = held.get_mut(&gate_id) {
@@ -2453,13 +2455,13 @@ fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::Hash
 /// Atomically claim a `dispatch_id` for dispatch. Returns `true` if THIS call was
 /// the first to claim it (caller should dispatch); `false` if it was already
 /// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
-/// lock, exactly like [`claim_gate_dispatch`].
+/// lock, exactly like [`claim_gate_dispatch_attempt`].
 fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
     lock_recover(dispatched_dispatch_ids(), "dispatched_dispatch_ids").insert(dispatch_id)
 }
 
 /// Release an in-process unit-dispatch claim ([`claim_dispatch_dispatch`]) —
-/// the sibling of [`release_gate_dispatch`] for the work-unit path. Load
+/// the sibling of [`release_gate_dispatch_attempt`] for the work-unit path. Load
 /// bearing for the unit contract's at-least-once promise: a failed spawn is
 /// deliberately left un-consumed so coord re-lists it, but WITHOUT this
 /// release the re-listed row would be dropped at the in-process dedupe check
@@ -2471,7 +2473,7 @@ fn release_dispatch_dispatch(dispatch_id: uuid::Uuid) {
 /// Release whichever in-process dedupe claim the dispatcher took for this
 /// continuation, per its [`ConsumeTarget`]. Called from every LOCAL-skip exit
 /// of [`run_gate_continuation_inner`] that leaves the row pending on coord
-/// (see [`release_gate_dispatch`] for the invariant). [`ConsumeTarget::None`]
+/// (see [`release_gate_dispatch_attempt`] for the invariant). [`ConsumeTarget::None`]
 /// (legacy, no id) never claimed, so there is nothing to release.
 fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
     match consume_target {
@@ -2495,7 +2497,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   superseded_by:<winner>` and left it pending and re-listed, so the loser
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
-///   for the process lifetime (see [`release_gate_dispatch`]).
+///   for the process lifetime (see [`release_gate_dispatch_attempt`]).
 /// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
 ///   IS still pending on coord, but targeted at another device — coord's
 ///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
@@ -2505,7 +2507,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   is kept for the uncommon one: a later reroute (or the offline re-target)
 ///   can pick THIS device again, and a kept claim would then drop that
 ///   re-delivery at the dedupe check for the process lifetime — the exact
-///   stranding [`release_gate_dispatch`] exists to prevent. The cost of
+///   stranding [`release_gate_dispatch_attempt`] exists to prevent. The cost of
 ///   releasing is at most one more consume claim on a stale duplicate
 ///   delivery, which coord refuses again with the same 409 — while coord is
 ///   reachable. If that later claim instead FAILS (timeout, 5xx), it lands in
@@ -2566,7 +2568,7 @@ enum ClaimOutcome {
 /// in the `SkipSuperseded` match arm, deleting **the call** — not the body of
 /// [`settle_skipped_claim`], which a test did cover — left every test green
 /// and stranded the superseded loser's gate id in
-/// [`release_gate_dispatch`]'s claim set for the process lifetime, so coord's
+/// [`release_gate_dispatch_attempt`]'s claim set for the process lifetime, so coord's
 /// re-listed row could never be re-claimed. The call site was the untested
 /// half. Here there is no such statement to delete: the log, the settle and
 /// the skip/spawn decision are one unit, and
@@ -4413,7 +4415,7 @@ enum ConsumeTarget {
 /// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
 /// 1. **Agent-registry authorization** (`agent-spawn-authorization`), then
-///    **fast-path dedupe**: [`claim_gate_dispatch`]
+///    **fast-path dedupe**: [`claim_gate_dispatch_attempt`]
 ///    against the in-process set — a duplicate delivery (same `gate_id`) is
 ///    dropped here so a continuation delivered by both transports never even
 ///    starts a second task. This is the in-process guard; the network claim
@@ -6444,6 +6446,9 @@ async fn run_continuation_terminal(
             .map(|s| crate::mcp::types::runner_api_port(s.inner()));
         let coord_mcp =
             crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+        // What `<workdir>/.claude/` serves, for the briefing's `[served-corpus: …]`
+        // header line. Bounded, off the runtime worker, fail-soft to UNKNOWN.
+        let served = crate::served_corpus::probe_async(workdir).await;
 
         // The argv, built HERE rather than beside `launch_cfg` above: the briefing
         // it carries gates its memory clause on `coord_mcp`, which the call
@@ -6462,7 +6467,11 @@ async fn run_continuation_terminal(
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
             compose_continuation_system_prompt(
-                crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+                crate::terminal::runner_context(
+                    crate::terminal::spawn_seam_api_port(),
+                    coord_mcp,
+                    &served,
+                ),
                 payload.brief.as_ref(),
             ),
         ));
@@ -7427,6 +7436,7 @@ async fn run_condition_check_terminal(
         crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &crate::served_corpus::probe_async(workdir.as_str()).await,
         ),
     ));
     // Carried to the child env by the capture hint below; from the SAME
@@ -7586,19 +7596,6 @@ async fn run_condition_check_terminal(
     }
 }
 
-/// Resolve the working directory for a gate continuation. Returns
-/// `(workdir, isolated_edit_ctx, agent_id)`.
-///
-/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
-///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
-///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
-///   a non-UUID id, used only for lifecycle correlation).
-/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
-///   [`continuation_fallback_workdir`] picks (the workspace root when the
-///   repo's verified checkout is under it, else that checkout), `None`
-///   context, and a fresh correlation UUID; `Err` with a
-///   `workdir_not_a_checkout` detail when the repo has no verified checkout on
-///   this device.
 /// Derive a stable per-session UUID discriminator for a gate continuation's
 /// worktree claims (Phase 1b, plan
 /// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
@@ -7636,6 +7633,18 @@ fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uu
     }
 }
 
+/// Resolve the working directory for a gate continuation. Returns
+/// `(workdir, isolated_edit_ctx, agent_id)`.
+///
+/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
+///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
+///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
+///   a non-UUID id, used only for lifecycle correlation).
+/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
+///   [`continuation_fallback_workdir`] picks (see its doc for the per-owner
+///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
+///   refusals), `None` context, and a fresh correlation UUID.
+/// - `Err` also when acquire succeeds but returns no worktrees.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
@@ -8741,7 +8750,7 @@ async fn run_agent_subprocess(
         };
 
         // Wire the per-agent durability (agent_pusher) + observability (dirty_poller)
-        // daemons onto the SAME refreshing token slot registered in AGENT_TOKENS, so
+        // daemons onto the SAME refreshing token slot in AgentTokenRegistry, so
         // the proxy, heartbeat, pusher, and poller all read one slot (single-slot
         // invariant — agent_token/mod.rs:1). A credential is guaranteed here —
         // Step 0b refused the launch otherwise — so the daemons spawn iff a coord
@@ -8762,25 +8771,7 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    match provision_agent_definitions(&primary_wt) {
-        Ok(report) => capability_manifest::record_provision(&primary_wt, report),
-        Err(e) => {
-            warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
-            // Still a ROW: an errored pass that leaves no record is exactly the
-            // invisible degradation this ledger exists to end.
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(primary_wt.clone());
-            report.skip(
-                primary_wt.clone(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            capability_manifest::record_provision(&primary_wt, report);
-        }
-    }
+    provision_agent_definitions_recorded(&primary_wt);
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
@@ -9116,6 +9107,51 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
     provision_agent_definitions_from_root(&root, worktree_cwd)
 }
 
+/// Provision the named-subagent defs into `workdir` and RECORD both layers'
+/// session-ledger rows — [`provision_agent_definitions`]'s `agent_definitions`
+/// report here, and the embedded `fleet_agents` floor from inside
+/// [`provision_agent_definitions_from_root`].
+///
+/// Extracted from the spawn path so the capability-manifest provision probe
+/// (`POST /capability-manifest/provision-probe`, plan
+/// `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports`
+/// Phase 5, Fork B) drives the SAME function the real spawn drives rather than
+/// a copy of it. A second call path that can drift from the real one is the
+/// cost Fork B accepted only on that condition — so there is exactly one body,
+/// and both callers are one line.
+///
+/// Fail-soft, unchanged from the spawn path it came from: an errored pass still
+/// leaves a ROW, because an errored pass that leaves no record is the invisible
+/// degradation the ledger exists to end.
+///
+/// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
+/// `fleet_agents` floor is recorded from inside
+/// [`provision_agent_definitions_from_root`], which does not hand it back, so it
+/// is observable on the next manifest read rather than in this value. The spawn
+/// path ignores the return entirely.
+pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
+    let report = match provision_agent_definitions(workdir) {
+        Ok(report) => report,
+        Err(e) => {
+            warn!("agent_runtime: agent-def provisioning errored (continuing): {e:#}");
+            let mut report = ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(workdir.to_string());
+            report.skip(
+                workdir.to_string(),
+                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+            );
+            report
+        }
+    };
+    let echo = report.clone();
+    capability_manifest::record_provision(workdir, report);
+    vec![echo]
+}
+
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in
 /// explicitly (so tests can drive it deterministically without mutating the
 /// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
@@ -9429,6 +9465,9 @@ fn pick_autonomous_git_identity(
 pub(crate) fn finalize_headless_child_env(
     cmd: &mut tokio::process::Command,
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    // What the child's `<workdir>/.claude/` serves — measured by the caller,
+    // for the same reason `coord_mcp` is: it needs I/O `runner_context` forbids.
+    served: &crate::served_corpus::ServedCorpus,
 ) {
     // The coord-mcp outcome is the OPPOSITE case to the port below, and both
     // rules point the same way: ship the value only the right frame knows. The
@@ -9450,7 +9489,7 @@ pub(crate) fn finalize_headless_child_env(
     let runner_api_port = crate::terminal::spawn_seam_api_port();
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
-        crate::terminal::runner_context(runner_api_port, coord_mcp),
+        crate::terminal::runner_context(runner_api_port, coord_mcp, served),
     );
     cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
@@ -9635,7 +9674,8 @@ pub(crate) async fn spawn_claude_child(
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
-    finalize_headless_child_env(&mut cmd, coord_mcp);
+    let served = crate::served_corpus::probe_async(workdir).await;
+    finalize_headless_child_env(&mut cmd, coord_mcp, &served);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
@@ -9839,7 +9879,7 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
             );
         }
         // Proactively refresh the agent's coord-mcp proxy token (OQ4). The 30s
-        // tick ≪ the 30-min refresh margin, so the per-agent JWT in AGENT_TOKENS
+        // tick ≪ the 30-min refresh margin, so the per-agent registry JWT
         // is renewed well before its 4h TTL — independent of coord-mcp call
         // activity. Coord's /agents/:id/refresh-token rejects an ALREADY-expired
         // token, so a live agent must never let it lapse; the request-path
@@ -10812,7 +10852,11 @@ mod tests {
             cmd.env(name, "hunter2");
         }
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
 
@@ -10845,6 +10889,15 @@ mod tests {
                 .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
             "the runner-context briefing must still be exported"
         );
+        // The served-corpus header line the caller measured must reach the
+        // exported briefing verbatim — the headless seam is one of the two
+        // env seams that make it readable by `/whereami`.
+        assert!(
+            envs.iter().any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT"
+                && v.as_deref()
+                    .is_some_and(|b| b.lines().any(|l| l == "[served-corpus: UNKNOWN (test)]"))),
+            "the exported briefing must carry the served-corpus header line"
+        );
     }
 
     /// The non-interactive git credential posture, asserted from the ONE shared
@@ -10858,7 +10911,11 @@ mod tests {
         // shape of coord finding 0056361d.
         cmd.env("GIT_ASKPASS", "/some/gui/askpass");
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::credential_helper::assert_non_interactive_git_posture_tokio(
             &cmd,
@@ -10905,7 +10962,11 @@ mod tests {
         set_bound_port(41_238);
 
         let mut cmd = tokio::process::Command::new("dummy");
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         let envs: std::collections::HashMap<String, String> = cmd
             .as_std()
@@ -11341,6 +11402,7 @@ mod tests {
         let briefing = crate::terminal::runner_context(
             9876,
             crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
         );
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
@@ -14740,12 +14802,12 @@ mod tests {
     }
 
     /// Round-5 review: an `AgentRunTeardown` built over POISONED maps, dropped
-    /// while a panic unwinds, neither aborts nor leaks. All three maps are LOCAL
-    /// copies (poisoning the process-global ones would break parallel tests that
-    /// `expect` on them), each holding an entry for the agent and each poisoned
-    /// before the drop. A panic from any helper inside a drop during unwinding
-    /// aborts the test binary, so this test fails if any teardown helper goes
-    /// back to `expect` on its lock.
+    /// while a panic unwinds, neither aborts nor leaks. The two registries and
+    /// the daemon map are LOCAL instances (poisoning the process-global ones
+    /// would leak into parallel tests that read them), each holding an entry
+    /// for the agent and each poisoned before the drop. A panic from any helper
+    /// inside a drop during unwinding aborts the test binary, so this test fails
+    /// if any teardown helper goes back to `expect` on its lock.
     ///
     /// Global side effects: the revoke's census records the LOCAL map's result
     /// in the process-global last-census record, so the test holds a
@@ -14753,9 +14815,8 @@ mod tests {
     /// a failed assertion included. Not reversible: when a forensics test has
     /// switched the shared rotation log on, the revoke appends one `revoke`
     /// line (this test's unique `teardown-test-<agent>` workdir) and at most one
-    /// `agent_binding_census` line to that file. The revoke also records a
-    /// tombstone for the nonce in the process-global tombstone map; the test
-    /// asserts it and then removes it.
+    /// `agent_binding_census` line to that file. The revoke's tombstone lands
+    /// in the LOCAL registry, where the test asserts it.
     #[test]
     fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
         use std::collections::HashMap;
@@ -14763,9 +14824,8 @@ mod tests {
         let _census_restore = crate::coord_mcp::teardown_poison_tests::census_record_guard();
         let agent = uuid::Uuid::now_v7();
 
-        let tokens: Mutex<HashMap<uuid::Uuid, crate::agent_token::SharedToken>> =
-            Mutex::new(HashMap::new());
-        tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        let tokens = crate::coord_mcp::AgentTokenRegistry::new();
+        tokens.register(
             agent,
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
                 token: "teardown-test-token".into(),
@@ -14774,10 +14834,9 @@ mod tests {
                 health: Default::default(),
             })),
         );
-        let nonces: Mutex<HashMap<String, crate::coord_mcp::NonceBinding>> =
-            Mutex::new(HashMap::new());
+        let nonces = crate::coord_mcp::NonceRegistry::new();
         let nonce = format!("teardown-test-nonce-{agent}");
-        nonces.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        nonces.test_live().insert(
             nonce.clone(),
             crate::coord_mcp::teardown_poison_tests::agent_nonce_binding(agent),
         );
@@ -14788,8 +14847,8 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .insert(agent, Default::default());
 
-        crate::coord_mcp::teardown_poison_tests::poison(&tokens);
-        crate::coord_mcp::teardown_poison_tests::poison(&nonces);
+        crate::coord_mcp::teardown_poison_tests::poison(tokens.test_mutex());
+        crate::coord_mcp::teardown_poison_tests::poison(nonces.test_mutex());
         crate::coord_mcp::teardown_poison_tests::poison(&daemons);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -14807,23 +14866,16 @@ mod tests {
         );
 
         assert!(
-            !tokens
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&agent),
+            tokens.lookup(agent).is_none(),
             "the live-token entry is removed"
         );
         assert!(
-            !nonces
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&nonce),
+            !nonces.test_snapshot().live_contains(&nonce),
             "the agent's proxy nonce is revoked"
         );
-        // The nonce was never in the GLOBAL registry, so this attribution can
-        // only come from the tombstone the teardown recorded.
-        let attribution = crate::coord_mcp::reject_attribution_for_nonce(&nonce).attribution;
-        crate::coord_mcp::teardown_poison_tests::remove_global_tombstone(&nonce);
+        // The nonce is no longer live, so this attribution can only come from
+        // the tombstone the teardown recorded in the same registry.
+        let attribution = nonces.reject_attribution(&nonce).attribution;
         assert_eq!(
             attribution,
             crate::coord_mcp::RejectAttribution::REVOKED,

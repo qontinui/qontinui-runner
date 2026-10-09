@@ -217,6 +217,9 @@ jsonpath-rust = "1"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
+    # GetExtendedTcpTable — the peer-user guard resolves a loopback peer's
+    # owning PID from the TCP owner-PID table (`peer_user_guard::windows`).
+    "Win32_NetworkManagement_IpHelper",
     "Win32_Security",
     "Win32_Security_Authorization",
     # QueryDosDeviceW — resolves `subst` drive aliases so the Projects

@@ -1032,6 +1032,7 @@ mod tests {
         BootClassification {
             crash_recovery,
             prior_marker_at,
+            booted_at_ms: 0,
         }
     }
 

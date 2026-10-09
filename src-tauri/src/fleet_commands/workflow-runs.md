@@ -9,43 +9,84 @@ Find and display workflow runs across all runner instances.
 
 ### Step 1: Discover All Runner Instances
 
-Read every coord/web/runner response through `scripts/lib/envelope.py` / `envelope.sh`; assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative. The per-door key
+Read every runner response through `lib/envelope.py`, which the `command-scripts` skill carries (Python 3.9+, stdlib only); assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative. The per-door key
 names live in the helper's docstring, not here; `--first-of data,.` reads the
 `{data: …}` envelope or a bare body, and an unreadable one prints nothing.
 
 ```bash
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+ENV_PY=$(CS_REL=lib/envelope.py command_script) || exit 1
 # Try each known port to find active instances
-ENV_PY="qontinui-claude-config/scripts/lib/envelope.py"
 for port in 9876 9877 9878; do
-  powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/status\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null \
+  curl -fsS --max-time 2 "http://127.0.0.1:${port}/status" 2>/dev/null \
     | python3 "$ENV_PY" require --door runner-status --first-of data,. | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-print(f'Port {${port}}: {data.get(\"instance_name\", \"primary\")} (running)')
+print(f'Port ${port}: {data.get(\"instance_name\") or \"primary\"} (running)')
 " 2>/dev/null || true
 done
 ```
 
-Also try the instances endpoint for a complete picture:
+Also try the instances endpoint for a complete picture (a new shell, so define
+`command_script` again):
 ```bash
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+ENV_PY=$(CS_REL=lib/envelope.py command_script) || exit 1
 for port in 9876 9877 9878; do
-  powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/instances\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null \
+  curl -fsS --max-time 2 "http://127.0.0.1:${port}/instances" 2>/dev/null \
     | python3 "$ENV_PY" require --door runner-instances --first-of data,. | python3 -c "
 import json, sys
 for inst in json.load(sys.stdin):
-    print(f'  {str(inst.get(\"name\",\"primary\")):20} port:{inst[\"port\"]}  reachable:{inst[\"reachable\"]}')
+    print(f'  {str(inst.get(\"name\") or \"primary\"):20} port:{inst[\"port\"]}  reachable:{inst[\"reachable\"]}')
 " 2>/dev/null && break || true
 done
 ```
 
 ### Step 2: Query Runs from All Active Instances
 
-For each reachable instance, query task runs:
+For each reachable instance, query task runs. The route answers inside the
+runner's `{success, data}` envelope, so read it through the same helper:
 
 ```bash
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+ENV_PY=$(CS_REL=lib/envelope.py command_script) || exit 1
 for port in 9876 9877 9878; do
   echo "=== Port $port ==="
-  powershell -NoProfile -Command "(Invoke-WebRequest -Uri 'http://localhost:${port}/task-runs?limit=30' -UseBasicParsing -TimeoutSec 3).Content" 2>/dev/null | python3 -c "
+  curl -fsS --max-time 3 "http://127.0.0.1:${port}/task-runs?limit=30" 2>/dev/null \
+    | python3 "$ENV_PY" require --door runner-task-runs --first-of data,. 2>/dev/null | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for t in data:
@@ -91,20 +132,22 @@ If the user asks about a specific run or the filter returns a single run:
 
 ```bash
 # Get task details
-powershell -NoProfile -Command "(Invoke-WebRequest -Uri 'http://localhost:{port}/task-runs/{id}' -UseBasicParsing -TimeoutSec 5).Content"
+curl -fsS --max-time 5 "http://127.0.0.1:{port}/task-runs/{id}"
 
 # Get output (last 15000 chars)
-powershell -NoProfile -Command "(Invoke-WebRequest -Uri 'http://localhost:{port}/task-runs/{id}/output?tail_chars=15000' -UseBasicParsing -TimeoutSec 5).Content"
+curl -fsS --max-time 5 "http://127.0.0.1:{port}/task-runs/{id}/output?tail_chars=15000"
 
 # Get workflow state
-powershell -NoProfile -Command "(Invoke-WebRequest -Uri 'http://localhost:{port}/task-runs/{id}/workflow-state' -UseBasicParsing -TimeoutSec 5).Content"
+curl -fsS --max-time 5 "http://127.0.0.1:{port}/task-runs/{id}/workflow-state"
 ```
 
 ### Rules
 
 - Always query ALL active instances — runs may be on any port
-- Use PowerShell `Invoke-WebRequest` for HTTP calls (not curl)
-- Parse JSON with `python3 -c "import json, sys; ..."` (no jq on Windows)
+- Use `curl -fsS --max-time <n>` against `http://127.0.0.1:<port>` for HTTP calls: curl ships with
+  Linux, macOS and Windows 10+, and the runner listens on the IPv4 loopback only, so `localhost`
+  can pay a failed IPv6 connect first
+- Parse JSON with `python3 -c "import json, sys; ..."` (jq is not installed everywhere)
 - Show the port number so the user knows which instance has each run
 - Keep output concise — summarize, don't dump raw JSON
 - If a run has a summary/ai_summary field, show it

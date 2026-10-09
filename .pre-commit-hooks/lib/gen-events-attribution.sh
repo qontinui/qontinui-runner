@@ -42,6 +42,88 @@
 # clear an innocent pusher (they see today's message, no worse), while a
 # too-narrow one would clear a guilty one and lose the signal the hook exists
 # for. Widen freely; never narrow to make a case pass.
+#
+# ONE DELIBERATE NARROWING, AND ITS GUARD
+#
+# Markdown is excluded (GEN_EVENTS_ATTRIBUTION_EXCLUDES below). That is a
+# narrowing, made on evidence rather than to make a case pass: qontinui-runner
+# #1667 pushed three `.md` files under src-tauri/src/fleet_commands/ and was
+# blamed for the bindings, because `src-tauri/src` is a directory prefix and
+# ~100 markdown files live under it. Markdown reaches the binary only as
+# embedded data — `include_str!`/`include_bytes!` into consts, `include_dir!`
+# into directory trees — none of which schemars reads.
+#
+# The narrowing is safe only while that stays true, so it is re-checked on
+# EVERY attribution decision, against the working tree being attributed:
+# `gen_events_markdown_premise_violations` below. If it finds a way markdown
+# could reach `schemas.json`, or cannot run its probe at all, the decision
+# drops the exclusion and attributes against the full list — the wider,
+# never-clears-a-guilty-pusher direction — and says why in
+# ATTRIBUTION_EXCLUDES_DROPPED_REASON. The attribution self-test runs the same
+# function against the real tree, so a violation is also loud at test time.
+#
+# What the guard covers: text or directory embeds (`include_str!`,
+# `include_bytes!`, `include_dir!`) beside `JsonSchema` or a `schemars(`
+# attribute in the same file; a `#[doc = include_*!(..)]` attribute anywhere,
+# including `#[doc = concat!(.., include_str!(..))]`;
+# a single-line `schemars(..)` attribute whose value does not BEGIN with a
+# string or numeric literal (`description`, `title`, `example`, `default`,
+# `extend("key" = EXPR)` — schemars 1 takes expressions for all of them); and
+# a build script that names a markdown path at all; and markdown compiled AS
+# RUST — `include!` with any delimiter (`(`, `[`, `{`, spaced or not),
+# `#[path = "x.md"] mod m;`, `#[cfg_attr(.., path = "x.md")]` and its
+# rustfmt-wrapped form — which is not data at all and can define a JsonSchema
+# type outright.
+#
+# What it does NOT see, stated so nobody mistakes it for a proof:
+#  - an embed in a file with neither `JsonSchema` nor `schemars(`, used by a
+#    JsonSchema type in ANOTHER file through a rustfmt-wrapped attribute whose
+#    value sits on its own line, or through a `macro_rules!` that builds the
+#    attribute;
+#  - a build script that reaches markdown through a path it assembles without
+#    ever writing a `.md"` or `"md"` literal (a glob over a directory, say);
+#  - `include!`/`#[path]` of a markdown file whose name is assembled without a
+#    `.md"` literal (`include!(concat!(env!("OUT_DIR"), "/gen.rs"))` is the
+#    real tree's form, and names no markdown);
+#  - a `#[serde(default)]` or `default = "f"` field whose `Default` impl or `f`
+#    lives in a file with neither `JsonSchema` nor `schemars(` and returns an
+#    embedded markdown const — schemars records the default in the schema;
+#  - a hand-written `impl JsonSchema` that builds its text from an embedded
+#    const defined in another file;
+#  - a runtime read of markdown by the exporter itself —
+#    `src-tauri/src/bin/export_schemas.rs` or `generate_types.sh` reading a
+#    `.md` with `fs::read` — since only build scripts are checked for that;
+#  - a schemars value that BEGINS with a literal and continues into an
+#    expression (`description = "x".to_owned() + BODY`): arm 6 reads only the
+#    first character after the `=`;
+#  - a `#[schemars(schema_with = "f")]` function, or a `json_schema!` body,
+#    that embeds markdown from a file mentioning neither JsonSchema nor
+#    `schemars(`;
+#  - a Cargo `[lib]`/`[[bin]]` `path = "x.md"` — manifests are not probed;
+#  - a markdown file named with an upper-case extension (`include!("x.MD")`):
+#    every `.md"` match is case-sensitive, as is the `*.md` exclusion itself.
+#
+# Reach: the premise probe reads Rust sources only (`*.rs` under the
+# directory-prefix inputs, plus the build scripts), in the working tree
+# including untracked AND gitignored files, since the compiler reads an ignored
+# `.rs` as readily as a tracked one. Not the ~100 markdown command bodies and
+# shell helpers beside them: those DESCRIBE these patterns (a TOML
+# `path = "…"`, prose quoting `include_str!` and JsonSchema) and the compiler
+# never reads them as Rust, so probing them would drop the exclusion on every
+# push and bring #1667 back. The attribution list itself (`ls-files --others
+# --exclude-standard`) still skips ignored inputs, so an edit to an ignored
+# source file is never blamed — a limitation that predates the markdown
+# exclusion and is not changed by it.
+# It errs the other way on purpose elsewhere, and each of these merely costs
+# the exclusion: a raw-string literal (`title = r"x"`), a `true` value, or an
+# `=` inside a string (`title = "a=b"`) in a schemars attribute; and a Rust
+# raw string holding TOML whose line begins `path = "…"` (as
+# src-tauri/src/restate/config.rs has today), which arm 4 reads as a wrapped
+# cfg_attr the day that file also gains a `.md"` literal; and a
+# crate doc `#![doc = include_str!("../README.md")]`, which arm 5 flags on
+# every push. That last is deliberately not carved out: a crate doc cannot
+# reach a schema today, but a carve-out is a narrowing, and the header's rule
+# for those is evidence plus a guard, not convenience.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -51,14 +133,21 @@
 # The list is derived from what actually produces the artifact, not from what
 # has produced a diff so far: `schemas.json` comes from ONE command,
 # `cargo run --bin export_schemas --release` (src-tauri/scripts/generate_types.sh),
-# so the inputs are the whole compiled crate graph plus everything that pins how
-# it compiles. That is why the IN-REPO path dependencies and the toolchain pin
-# are here even though nothing under them derives `JsonSchema` today — the day
-# one does, or the day a feature edit in one of their manifests changes feature
-# unification for `serde`/`chrono`/`uuid`, a narrower list would start clearing
-# guilty pushers with nothing to notice. Out-of-repo inputs (the qontinui-schemas
-# path deps, its TS compile step) are deliberately absent: a push to THIS repo
-# cannot change them, so they can never be this push's fault.
+# so the inputs are the whole compiled crate graph plus the configuration that
+# pins how cargo compiles it (manifests, lockfile, toolchain, cargo config).
+# That is why the IN-REPO path dependencies and the toolchain pin are here
+# even though nothing under them derives `JsonSchema` today — the day one
+# does, or the day a feature edit in one of their manifests changes feature
+# unification for `serde`/`chrono`/`uuid`, a narrower list would start
+# clearing guilty pushers with nothing to notice. Out-of-repo inputs (the
+# qontinui-schemas path deps, its TS compile step) are deliberately absent: a
+# push to THIS repo cannot change them, so they can never be this push's fault.
+#
+# NOT included, deliberately: the non-Rust files build scripts read —
+# src-tauri/tauri.conf.json, src-tauri/capabilities/, src/components/app/
+# tab-types.ts, useAppNavigation.ts, ../dist/*. Counting them would make
+# frontend-only pushes MINE, which is the false blame this split exists to
+# stop, and none of them reaches a JsonSchema type today.
 
 # The base-ref cascade this library measures "before this push" against lives
 # in a NEUTRAL sibling: `lib/push-range.sh`. It was moved out because the cargo
@@ -104,7 +193,30 @@ fi
 # hook — the test said "run me by hand" and the drift guard's own git calls
 # happen to name the repo whose hook is running. Both callers clear the
 # environment before their first `git`.
+#
+# One piece of that environment is kept, as a note rather than as an
+# override: the hook's INDEX. `git commit -a` and `git commit <path>` build
+# the commit from a temporary index (`.git/index.lock`,
+# `.git/next-index-*.lock`) and hand its path to the hook in GIT_INDEX_FILE;
+# the plain `.git/index` is then NOT what is being committed. So its absolute
+# path is recorded in GEN_EVENTS_HOOK_INDEX_FILE, beside the git dir it
+# belongs to (GEN_EVENTS_HOOK_GIT_DIR), and `gen_events_attribution` uses it
+# only for a repo with that same git dir — never for a fixture or the schemas
+# checkout. git exports it absolute for a temporary index and relative
+# (`.git/index`) otherwise, relative to the hook's cwd, which is where this
+# must therefore be called from: before any `cd`.
 gen_events_clear_inherited_git_env() {
+    GEN_EVENTS_HOOK_INDEX_FILE=""
+    GEN_EVENTS_HOOK_GIT_DIR=""
+    if [ -n "${GIT_INDEX_FILE:-}" ]; then
+        case "$GIT_INDEX_FILE" in
+            /*|[A-Za-z]:[/\\]*) GEN_EVENTS_HOOK_INDEX_FILE="$GIT_INDEX_FILE" ;;
+            *)                  GEN_EVENTS_HOOK_INDEX_FILE="$PWD/$GIT_INDEX_FILE" ;;
+        esac
+        # Asked while GIT_DIR (if any) still names the hook's repo.
+        GEN_EVENTS_HOOK_GIT_DIR="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+        [ -n "$GEN_EVENTS_HOOK_GIT_DIR" ] || GEN_EVENTS_HOOK_INDEX_FILE=""
+    fi
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
         GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX \
         GIT_INTERNAL_SUPER_PREFIX GIT_CONFIG GIT_CONFIG_COUNT \
@@ -113,29 +225,435 @@ gen_events_clear_inherited_git_env() {
         GIT_REFLOG_ACTION
 }
 
+# A DIRECTORY entry ends in `/`, a FILE entry does not. Marked rather than
+# inferred, because the names cannot be trusted to say: `rust-toolchain` and
+# `.cargo/config` are files with no extension. The `/` is stripped when the
+# list becomes git pathspecs and read by the premise derivation below; the
+# self-test checks every marking against the real tree.
 GEN_EVENTS_ATTRIBUTION_PATHS=(
-    "src-tauri/src"
+    "src-tauri/src/"
     "src-tauri/build.rs"
     "src-tauri/Cargo.toml"
     "src-tauri/scripts/generate_types.sh"
     # In-repo path dependencies of the crate `export_schemas` links into
     # (`qontinui-db = { path = "./clorinde" }`,
-    #  `qontinui-spec-check = { path = "../crates/spec-check" }`).
-    "src-tauri/clorinde"
-    "crates/spec-check"
+    #  `qontinui-spec-check = { path = "../crates/spec-check" }`,
+    #  `qontinui-runner-stats = { path = "../crates/runner-stats" }`,
+    #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`), and the
+    # vendored crate the root manifest's `[patch.crates-io]` substitutes into
+    # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
+    # crates were missing until 2026-09-30: an edit to either cleared a guilty
+    # pusher. `gen_events_uncovered_path_deps` below now walks the manifests
+    # and reports any in-repo path dependency no entry covers; the
+    # `gen-events-path-deps` pre-commit hook runs it on every Cargo.toml edit,
+    # and the attribution self-test runs it too. To look by hand,
+    # `git grep -n 'path *= *"' -- '*Cargo.toml'`.
+    "src-tauri/clorinde/"
+    "crates/spec-check/"
+    "crates/runner-stats/"
+    "crates/runner-win32/"
+    "vendor/"
     "Cargo.toml"
     "Cargo.lock"
     # The compiler that expands the `schemars` derive. A channel bump is a real
-    # input to the generated JSON and touches none of the paths above.
+    # input to the generated JSON and touches none of the paths above. rustup
+    # searches from the build's cwd upward (the export build runs from
+    # src-tauri) and still reads the legacy extension-less name, so all four.
     "rust-toolchain.toml"
+    "rust-toolchain"
+    "src-tauri/rust-toolchain.toml"
+    "src-tauri/rust-toolchain"
+    # Cargo configuration: `[env]`, rustflags and cfgs apply to the export
+    # build, which runs from src-tauri, as does a root one if it appears —
+    # each under both the current and the legacy extension-less name.
+    "src-tauri/.cargo/config.toml"
+    "src-tauri/.cargo/config"
+    ".cargo/config.toml"
+    ".cargo/config"
 )
+
+# Appended to every pathspec above. Non-glob pathspec magic lets `*` cross `/`,
+# so this one entry reaches every depth under every directory-prefix input.
+# The whole case for it — and the premise guard that keeps it honest — is in
+# the header's "ONE DELIBERATE NARROWING". Nothing else belongs here without a
+# guard of its own.
+GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
+    ':(exclude)*.md'
+)
+
+# Where the premise guard looks, DERIVED from GEN_EVENTS_ATTRIBUTION_PATHS
+# rather than kept as a second list: a hand-kept copy could lose a directory
+# and still pass every test, and markdown in that crate would then be cleared
+# unprobed. Each DIRECTORY input contributes `:(glob)<dir>/**/*.rs` (Rust
+# only — see "Reach" in the header; `**/` also matches zero directories) and
+# `:(glob)<dir>/**/build.rs`; a FILE input named `build.rs` is a build script
+# as it stands. Directory entries are the ones marked with a trailing `/`.
+GEN_EVENTS_PREMISE_PATHS=()
+GEN_EVENTS_PREMISE_BUILD_SCRIPTS=()
+_gen_events_derive_premise_paths() {
+    local entry
+    for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        case "$entry" in
+            */)          GEN_EVENTS_PREMISE_PATHS+=(":(glob)${entry}**/*.rs")
+                         GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=(":(glob)${entry}**/build.rs") ;;
+            build.rs|*/build.rs) GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=("$entry") ;;
+        esac
+    done
+}
+_gen_events_derive_premise_paths
+
+# `path = "…"` (or TOML's single-quoted literal `path = '…'`) values in the
+# manifest at $1, from dependency-shaped sections only — any section whose
+# name contains `dependencies`, and `[patch.*]` — so the `path` of a
+# `[[bin]]`/`[lib]`/`[[test]]` target is not taken for a dependency. Comments
+# are stripped first. The quote class is built from a -v variable because a
+# `'` cannot sit inside the single-quoted awk program.
+_gen_events_cargo_path_deps() {
+    awk -v q="'" '
+        BEGIN { re = "(^|[^_a-zA-Z0-9])path *= *[\"" q "][^\"" q "]*[\"" q "]" }
+        /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+        { sub(/#.*/, "") }
+        sec ~ /dependencies/ || sec ~ /^\[patch/ {
+            s = $0
+            while (match(s, re)) {
+                v = substr(s, RSTART, RLENGTH)
+                sub(/^.*path *= */, "", v)
+                print substr(v, 2, length(v) - 2)
+                s = substr(s, RSTART + RLENGTH)
+            }
+        }' "$1"
+}
+
+# A relative path with `.` and `..` folded away, lexically: `a/b/../../../x`
+# becomes `../x`. No filesystem access, so an out-of-repo sibling that is not
+# checked out (CI) still resolves — to something outside the repo.
+_gen_events_normalize_rel() {
+    local IFS=/ part parts out=() n
+    read -ra parts <<< "$1"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|.) ;;
+            ..) n="${#out[@]}"
+                if [ "$n" -gt 0 ] && [ "${out[$((n - 1))]}" != ".." ]; then
+                    unset "out[$((n - 1))]"; out=("${out[@]}")
+                else
+                    out+=("..")
+                fi ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    printf '%s\n' "${out[*]}"
+}
+
+# Every in-repo path dependency of the export build that no DIRECTORY entry of
+# GEN_EVENTS_ATTRIBUTION_PATHS covers, one `<path> (from <manifest>)` per line;
+# empty when the list is complete. Walks from src-tauri/Cargo.toml and the
+# root Cargo.toml (its [patch.*] and workspace dependencies), following each
+# in-repo dependency to its own manifest. Out-of-repo paths are skipped: a push
+# to this repo cannot change them. The input list names crates by hand, and
+# two were once missing — this is what keeps it honest.
+#
+# Exit 0: the walk ran (its output is the answer). Exit 2: it could not run
+# meaningfully — src-tauri/Cargo.toml is missing, yields no path dependency
+# at all (the export crate has several, so zero means the parser is not
+# seeing them), or awk failed — with an ERROR line. A caller must fail on 2:
+# an empty answer from a walk that read nothing is not "complete".
+gen_events_uncovered_path_deps() {
+    local root="$1" m dir dep deps rel entry covered seen=$'\n'
+    local queue=("src-tauri/Cargo.toml" "Cargo.toml")
+    if [ ! -f "$root/src-tauri/Cargo.toml" ]; then
+        echo "ERROR $root/src-tauri/Cargo.toml does not exist — nothing to walk"
+        return 2
+    fi
+    while [ "${#queue[@]}" -gt 0 ]; do
+        m="${queue[0]}"; queue=("${queue[@]:1}")
+        # Newline-delimited, so a manifest path with a space cannot alias.
+        case "$seen" in *$'\n'"$m"$'\n'*) continue ;; esac
+        seen+="$m"$'\n'
+        [ -f "$root/$m" ] || continue
+        # Captured, not fed through `< <(..)`, so awk's status is not lost.
+        if ! deps="$(_gen_events_cargo_path_deps "$root/$m")"; then
+            echo "ERROR reading path dependencies from $m failed (awk)"
+            return 2
+        fi
+        if [ "$m" = "src-tauri/Cargo.toml" ] && [ -z "$deps" ]; then
+            echo "ERROR src-tauri/Cargo.toml yielded no path dependency at all — the parser is not seeing them"
+            return 2
+        fi
+        dir="$(dirname "$m")"
+        while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            rel="$(_gen_events_normalize_rel "$dir/$dep")"
+            case "$rel" in ..|../*|'') continue ;; esac
+            covered=no
+            for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+                case "$entry" in */) case "$rel/" in "$entry"*) covered=yes ;; esac ;; esac
+            done
+            [ "$covered" = yes ] || printf '%s (from %s)\n' "$rel" "$m"
+            queue+=("$rel/Cargo.toml")
+        done <<< "$deps"
+    done
+    return 0
+}
+
+# The absolute, symlink-resolved form of the file path $1 (its directory must
+# exist); non-zero when it cannot be resolved.
+_gen_events_canon_file() {
+    local d
+    [ -n "$1" ] || return 1
+    d="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s\n' "$d" "$(basename "$1")"
+}
+
+# Record whether git's pre-push protocol is on stdin, for `gen_events_stage`.
+# The fleet's direct pre-push shim runs each hook as `bash <hook> < <copy of
+# git's stdin>` and exports no PRE_COMMIT_* at all, so without this a real
+# push reads as `commit`. Reads stdin through push-range.sh's
+# `push_pushed_refs`, which never blocks (a terminal stdin is skipped, reads
+# are time-bounded) and is safe to consume because the shim hands every hook
+# its own copy. Call it ONCE, before anything else reads stdin. Only a
+# complete ref list (exit 0) counts: a stalled or malformed stream is not
+# evidence of a push. A DELETE-ONLY push reads as `commit` too:
+# push_pushed_refs drops zero-sha lines, since a deletion carries no commits.
+# That costs only wording, on a push that regenerates nothing of its own.
+# An inherited hint is cleared first: it describes some other process.
+gen_events_detect_stage_from_stdin() {
+    unset GEN_EVENTS_STAGE_HINT
+    [ -z "${PRE_COMMIT_TO_REF:-}${PRE_COMMIT_REMOTE_NAME:-}" ] || return 0
+    if push_pushed_refs >/dev/null 2>&1; then
+        GEN_EVENTS_STAGE_HINT=push
+        export GEN_EVENTS_STAGE_HINT
+    fi
+    return 0
+}
+
+# Which hook stage is running: `push` when pre-commit is running a pre-push
+# hook — it sets PRE_COMMIT_TO_REF and PRE_COMMIT_REMOTE_NAME then, and
+# lib/push-range.sh reads the first the same way — otherwise `commit`. A
+# manual `pre-commit run --from-ref .. --to-ref ..` sets PRE_COMMIT_TO_REF
+# too, and reads as `push`: it checks a range of commits, which is what a
+# push is. A plain manual run reads as `commit`. Under the direct pre-push
+# shim, which exports none of those, `gen_events_detect_stage_from_stdin` has
+# read git's own protocol and left GEN_EVENTS_STAGE_HINT=push. The wording of
+# every verdict depends on it: "this push" is false at pre-commit.
+gen_events_stage() {
+    if [ -n "${PRE_COMMIT_TO_REF:-}" ] || [ -n "${PRE_COMMIT_REMOTE_NAME:-}" ] \
+       || [ "${GEN_EVENTS_STAGE_HINT:-}" = "push" ]; then
+        echo push
+    else
+        echo commit
+    fi
+}
+
+# `git grep` in the WORKING TREE of $1, untracked and gitignored files included
+# (`--no-exclude-standard`) — the regeneration compiles the working tree,
+# ignored or not, so that is what the premise is about.
+# $2 names how many pathspecs follow; the rest are grep arguments. Prints
+# matches; exit 1 from git grep is "no match" and is success here. Anything
+# above 1 is a broken probe: printed as an `ERROR` line and returned as 2, so a
+# caller can never read a failed query as a clean tree.
+_gen_events_grep_in() {
+    local dir="$1" n="$2"; shift 2
+    local paths=("${@:1:$n}"); shift "$n"
+    local out err rc=0
+    # stdout only: a warning on stderr must not become a "matched path". The
+    # error text is fetched only when the grep actually failed, by re-running
+    # it with stdout discarded — cheaper and tidier than a temp file.
+    out="$(git -C "$dir" grep --no-color --untracked --no-exclude-standard "$@" -- "${paths[@]}" 2>/dev/null)" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        err="$(git -C "$dir" grep --no-color --untracked --no-exclude-standard "$@" -- "${paths[@]}" 2>&1 >/dev/null || true)"
+        printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "${err%%$'\n'*}"
+        return 2
+    fi
+    [ "$rc" -eq 0 ] && printf '%s\n' "$out"
+    return 0
+}
+
+# The same over the premise paths — what every embed arm reads.
+gen_events_premise_grep() {
+    local dir="$1"; shift
+    _gen_events_grep_in "$dir" "${#GEN_EVENTS_PREMISE_PATHS[@]}" "${GEN_EVENTS_PREMISE_PATHS[@]}" "$@"
+}
+
+# Paths in both of two newline lists, one per line. `comm` over sorted lists
+# rather than a `for f in $list` loop, which would word-split a path with a
+# space.
+#
+# The inputs are fed by `printf` alone — a builtin with no failure to lose
+# inside `<(..)` — so `comm`'s own status, which the caller checks, is the
+# only one that matters. An empty list becomes one empty line, which can
+# only intersect as an empty line, and the caller skips those.
+_gen_events_both() {
+    LC_ALL=C comm -12 <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+# One file-level arm: print "<path>: $1" for each path in both lists $2 and $3.
+# Exit 0 none, 1 some, 2 the intersection itself failed (with an ERROR line).
+# The intersection is captured BEFORE it is looped over: fed straight into a
+# `while` through `< <(..)`, a failing `comm` would lose its status and the arm
+# would read as empty — a clean premise nobody measured.
+_gen_events_premise_arm() {
+    local what="$1" both f hit=0
+    if ! both="$(_gen_events_both "$2" "$3")"; then
+        echo "ERROR intersecting the premise lists failed (comm), so an arm could not run"
+        return 2
+    fi
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s: %s\n' "$f" "$what"
+        hit=1
+    done <<< "$both"
+    [ "$hit" = "1" ] && return 1
+    return 0
+}
+
+# Could markdown in the repo at $1 reach `schemas.json`? Prints one line per
+# way it could. Exit 0: premise holds. Exit 1: violated. Exit 2: the probe
+# itself failed or could not be verified (its ERROR lines are printed too) —
+# which a caller must treat exactly like a violation.
+#
+# File-level arms deliberately over-approximate — co-occurrence in one file,
+# not proof of a data path — because a false alarm only costs a wider list,
+# while a miss clears a guilty pusher.
+gen_events_markdown_premise_violations() {
+    local dir="$1" probe_failed=0 found=0
+    local inc_text md_lit schema inc_dir schemars_attr inc_any as_rust line
+    inc_text="$(gen_events_premise_grep "$dir" -l -E 'include_(str|bytes)!' | LC_ALL=C sort)" || probe_failed=1
+    md_lit="$(gen_events_premise_grep "$dir" -l -E '\.md"' | LC_ALL=C sort)" || probe_failed=1
+    schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
+    inc_dir="$(gen_events_premise_grep "$dir" -l -F 'include_dir!' | LC_ALL=C sort)" || probe_failed=1
+    schemars_attr="$(gen_events_premise_grep "$dir" -l -F 'schemars(' | LC_ALL=C sort)" || probe_failed=1
+    # Every macro delimiter (`include!(`, `include![`, `include!{`, spaced),
+    # `#[path =`, `#[cfg_attr(.., path =`, and a line that BEGINS `path = "` —
+    # the rustfmt-wrapped cfg_attr. Anchored to attribute syntax rather than
+    # any `, path =`: tracing's `debug!(path = %p, ..)` and format!'s named
+    # `path=` sit beside `.md"` literals in four real files, and would drop
+    # the exclusion on every decision.
+    as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"' | LC_ALL=C sort)" || probe_failed=1
+    inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | LC_ALL=C sort -u)" || probe_failed=1
+
+    # A failed probe prints its ERROR line into whichever list it fed, and
+    # `sort` returns 0 over it — so the lists are scanned, not just the flags.
+    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep -q '^ERROR'; then
+        printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep '^ERROR'
+        probe_failed=1
+    fi
+    # Decision-time vacuity. A tree that carries the schema toolchain (the
+    # generator script or the exporter) but in which no file mentions
+    # JsonSchema means the query is not seeing what it should, and every arm
+    # intersecting with that list is unfalsifiable. And a generator with no
+    # exporter beside it is a tree this model does not describe. Both are an
+    # unverifiable premise, not a clean one.
+    local exporter="src-tauri/src/bin/export_schemas.rs" generator="src-tauri/scripts/generate_types.sh"
+    if [ -f "$dir/$generator" ] && [ ! -f "$dir/$exporter" ]; then
+        echo "ERROR $generator exists but $exporter does not — the premise model no longer matches how schemas.json is produced"
+        probe_failed=1
+    fi
+    if { [ -f "$dir/$generator" ] || [ -f "$dir/$exporter" ]; } && [ -z "$schema" ]; then
+        echo "ERROR no file mentions JsonSchema although the schema toolchain is present — the premise probe is not seeing the tree"
+        probe_failed=1
+    fi
+
+    # Arms 1-4 are file-level intersections; `_gen_events_premise_arm`
+    # reports each, and a failed intersection fails the probe rather than
+    # reading as a clean arm.
+    local arm_rc
+    #
+    # Arm 1: text-embeds anything in a file that mentions JsonSchema. No `.md"`
+    # conjunct: a path assembled as `concat!(.., "/x.", "md")` names no `.md"`
+    # literal, and the real tree has no such co-occurrence to spare.
+    _gen_events_premise_arm "include_str!/include_bytes! in a file that mentions JsonSchema" \
+        "$inc_text" "$schema" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    # Arm 2: `include_dir!` embeds whole trees (fleet_skills.rs, fleet_agents.rs
+    # ship markdown this way) and never names a `.md` literal, so any use of it
+    # beside JsonSchema is a violation on its own.
+    _gen_events_premise_arm "include_dir! in a file that mentions JsonSchema" \
+        "$inc_dir" "$schema" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    # Arm 3: any embed in a file that carries a schemars attribute. File-level,
+    # so a rustfmt-wrapped `#[schemars(description = include_str!(..))]` is
+    # caught though no single line holds both halves.
+    _gen_events_premise_arm "include_*! in a file with a schemars( attribute" \
+        "$inc_any" "$schemars_attr" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    # Arm 4: markdown compiled AS RUST. `include!` splices a file in as Rust
+    # source and a `path` attribute makes it a module — either can define a
+    # JsonSchema type, so the file's extension says nothing. File-level (the
+    # macro or attribute anywhere, plus any `.md"` literal anywhere) so a
+    # `concat!` or wrapped form is caught too. The real tree's uses — `#[path]`
+    # to sibling `.rs` modules (including vendored tao's platform `mod.rs`),
+    # `include!` of OUT_DIR-generated `.rs`, and the TOML `path =` in
+    # restate/config.rs — name no markdown, and stay quiet.
+    _gen_events_premise_arm "include!/path attribute in a file that names a .md path" \
+        "$as_rust" "$md_lit" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    # Arm 5: a doc attribute fed from a file becomes the schema's `description`.
+    # Anchored to attribute syntax so `let doc = include_str!(..)` is not one;
+    # an optional `concat!(..` before the embed covers `doc = concat!("x",
+    # include_str!(..))`.
+    line="$(gen_events_premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*(concat!\(.*)?include_(str|bytes)!')" || probe_failed=1
+    if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
+    # Arm 6: schemars 1 takes EXPRESSIONS for description, title, example,
+    # default and `extend("key" = EXPR)`, so any `=` in a schemars attribute
+    # whose value does not BEGIN with a string or numeric literal may be an
+    # embedded const from another file (a literal followed by `+ CONST` is
+    # past its reach — see the header). `[^=!<>]=` so `==`/`!=`/`<=` in an expression are not
+    # read as the assignment; `extend("key" = ..)` matches through the `" =`.
+    line="$(gen_events_premise_grep "$dir" -n -E 'schemars\(.*[^=!<>]=[[:space:]]*[^"[:space:][:digit:]-]')" || probe_failed=1
+    if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
+    # Arm 7: a build script that names a markdown path at all — a `.md"`
+    # literal or an `"md"` extension check. Deliberately not "a read call on a
+    # .md path": build.rs mentions `tokio-console.md` in a message string, and
+    # a read through a const path would slip a read-call pattern anyway.
+    line="$(_gen_events_grep_in "$dir" "${#GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" \
+        "${GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" -n -E '\.md"|"md"')" || probe_failed=1
+    if [ -n "$line" ]; then
+        printf '%s\n' "$line" | sed 's/$/  (a build script naming markdown)/'
+        found=1
+    fi
+
+    [ "$probe_failed" = "1" ] && return 2
+    [ "$found" = "1" ] && return 1
+    return 0
+}
+
+# Read NUL-delimited records from stdin into the global array _GEA_RECS. The
+# producer appends its own exit status as one final `rc=N` record, because a
+# process substitution's status is otherwise lost; anything but `rc=0` last —
+# including a truncated stream whose final path swallowed the sentinel — is
+# a failure. Global rather than a nameref so it runs on bash older than 4.3.
+_gen_events_read_z() {
+    _GEA_RECS=()
+    local rec recs=() n
+    while IFS= read -r -d '' rec; do recs+=("$rec"); done
+    n="${#recs[@]}"
+    [ "$n" -gt 0 ] && [ "${recs[$((n - 1))]}" = "rc=0" ] || return 1
+    [ "$n" -gt 1 ] && _GEA_RECS=("${recs[@]:0:$((n - 1))}")
+    return 0
+}
 
 # Decide attribution for the repo at $1. Sets, in the caller's shell:
 #
 #   ATTRIBUTION_STATE   mine | pre-existing | unavailable
 #   ATTRIBUTION_BASE_REF / ATTRIBUTION_BASE_SHA   what "before this push" meant
 #   ATTRIBUTION_TOUCHED newline-separated codegen inputs this push touches
-#   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable`
+#   ATTRIBUTION_TOUCHED_DETAIL  the same paths as `<path><TAB><source>` lines,
+#                       source one of `committed` (in merge-base..HEAD),
+#                       `staged` (`git diff --cached HEAD`), `unstaged`
+#                       (working tree against the index), `untracked`, or
+#                       `staged-later` (in the real index but not in the one
+#                       a `commit -a` / `commit <path>` is built from). A
+#                       path in several sources gets one line per source —
+#                       see the computation for why. Paths are
+#                       raw, never C-quoted; one holding a tab or newline
+#                       appears in its `printf %q` form (`$'a\tb.rs'`).
+#   ATTRIBUTION_EXCLUDES_DROPPED_REASON  "" when the markdown exclusion
+#                       applied; otherwise why this decision ran on the full,
+#                       unexcluded list (premise violated, or its probe failed)
+#   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable` — including a
+#                       git call that failed, which must never read as "touched
+#                       nothing" and clear the pusher
 #
 # `unavailable` is a distinct state, never folded into either verdict: a
 # shallow clone or a remote-less checkout cannot answer the question, and
@@ -147,6 +665,8 @@ gen_events_attribution() {
     ATTRIBUTION_BASE_REF=""
     ATTRIBUTION_BASE_SHA=""
     ATTRIBUTION_TOUCHED=""
+    ATTRIBUTION_TOUCHED_DETAIL=""
+    ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
     ATTRIBUTION_UNAVAILABLE_REASON=""
 
     if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
@@ -160,7 +680,7 @@ gen_events_attribution() {
 
     local ref
     if ! ref="$(push_base_ref "$repo")"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure this push against"
+        ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure against"
         return 0
     fi
     ATTRIBUTION_BASE_REF="$ref"
@@ -170,24 +690,241 @@ gen_events_attribution() {
         return 0
     fi
 
-    # Three sources, because a push carries all three: commits already made,
-    # anything staged or unstaged (this hook also runs at pre-commit), and
-    # brand-new untracked sources that a `git diff` cannot see.
-    ATTRIBUTION_TOUCHED="$(
-        {
-            git -C "$repo" diff --name-only "$ATTRIBUTION_BASE_SHA" HEAD \
-                -- "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" 2>/dev/null || true
-            git -C "$repo" diff --name-only HEAD \
-                -- "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" 2>/dev/null || true
-            git -C "$repo" ls-files --others --exclude-standard \
-                -- "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" 2>/dev/null || true
-        } | sort -u | sed '/^$/d'
-    )"
+    # The markdown exclusion applies only while its premise holds for the tree
+    # being attributed. `&& rc=0 || rc=$?` rather than a bare assignment: the
+    # hook runs under `set -e`, and a non-zero here is an answer, not a crash.
+    local premise premise_rc
+    premise="$(gen_events_markdown_premise_violations "$repo")" && premise_rc=0 || premise_rc=$?
+    local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]%/}")
+    if [ "$premise_rc" -eq 0 ]; then
+        pathspec+=("${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
+    elif [ "$premise_rc" -eq 1 ]; then
+        ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
+    else
+        # `sed` rather than `grep -m1 || echo`: under pipefail that form can
+        # print a real line AND the fallback.
+        local first_error
+        first_error="$(printf '%s\n' "$premise" | sed -n '/^ERROR/{p;q;}')"
+        ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${first_error:-no ERROR line})"
+    fi
 
-    if [ -n "$ATTRIBUTION_TOUCHED" ]; then
+    # Each call's status is checked, not swallowed: an empty list from a git
+    # that FAILED would read as "touched nothing" and clear the pusher — the
+    # one direction this library must never err in.
+    #
+    # `-z` throughout. Without it git C-quotes any path with non-ASCII, `"`,
+    # `\` or a control character (`"src-tauri/src/\303\251 b.rs"`), and the
+    # label then names a file that does not exist. `--no-renames` so both
+    # halves of a rename are listed: the old path's disappearance moves the
+    # bindings as surely as the new path's arrival.
+    #
+    # Four sources, because a push or a commit carries them all: commits
+    # already made, staged changes, unstaged changes, and brand-new untracked
+    # sources that a `git diff` cannot see. Kept apart rather than merged,
+    # because they are not equally the pusher's: only `committed` is IN a
+    # push, and only `staged` is in the commit being made at pre-commit. The
+    # rest is working tree, which the regeneration reads — so it still makes
+    # the verdict `mine` — but which the author may not realise is involved
+    # (#1667 was blamed for a dirty Cargo.lock it never pushed).
+    #
+    # Staged and unstaged are two calls (`--cached`, then working tree against
+    # the index) rather than one `git diff HEAD`, because at pre-commit that
+    # line IS the question "is it in this commit?". Their union covers
+    # everything `git diff HEAD` did, and slightly more (a path staged and
+    # then reverted in the working tree) — the wider, safe direction.
+    #
+    # Staged and unstaged read the index the commit is actually built from:
+    # the hook's own (see gen_events_clear_inherited_git_env) when this is
+    # the hook's repo, so `commit -a` and `commit <path>` label correctly.
+    #
+    # That alone would make the sources NARROWER than before, and could clear
+    # a committer: under `commit <path>` the temporary index lacks whatever
+    # the real index holds for a later commit — a newly added `.rs`, or a
+    # staged edit whose working copy was restored — and neither diff sees it,
+    # while the untracked listing (which keeps the REAL index, so that a file
+    # staged for later does not read as untracked) does not either. So when
+    # the hook's index is a different file from the real one, a fifth source,
+    # `staged-later`, reads `git diff --cached --ita-visible-in-index HEAD`
+    # against the REAL index, minus paths already labelled `staged`. The
+    # union is then at least what one `git diff HEAD` plus `ls-files
+    # --others` saw before the hook index was honoured, and the verdict cannot
+    # move toward clearing.
+    #
+    # `--ita-visible-in-index` is what makes that true for an intent-to-add
+    # (`git add -N`) input: plain `--cached` hides it, the temporary index
+    # lacks it, and the untracked listing sees it as tracked — so without the
+    # flag `git add -N new.rs; git commit other.txt` read PRE-EXISTING. Only
+    # here: at a plain commit the working-tree diff already reports it, as
+    # "not in this commit" (git does not commit an intent-to-add entry), and
+    # the flag on the `staged` source would call it "staged for this commit",
+    # which is false.
+    local index_env=() staged_later=0
+    if [ -n "${GEN_EVENTS_HOOK_INDEX_FILE:-}" ] && [ -n "${GEN_EVENTS_HOOK_GIT_DIR:-}" ] \
+       && [ "$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)" = "$GEN_EVENTS_HOOK_GIT_DIR" ]; then
+        index_env=(env "GIT_INDEX_FILE=$GEN_EVENTS_HOOK_INDEX_FILE")
+        local real_index hook_index_canon real_index_canon
+        real_index="$(git -C "$repo" rev-parse --path-format=absolute --git-path index 2>/dev/null || true)"
+        hook_index_canon="$(_gen_events_canon_file "$GEN_EVENTS_HOOK_INDEX_FILE" || true)"
+        real_index_canon="$(_gen_events_canon_file "$real_index" || true)"
+        # Unresolvable on either side counts as "different": the extra source
+        # only ever widens.
+        if [ -z "$hook_index_canon" ] || [ "$hook_index_canon" != "$real_index_canon" ]; then
+            staged_later=1
+        fi
+    fi
+    local touched_lines="" detail_lines="" staged_set=$'\n' src
+    for src in committed staged unstaged untracked staged-later; do
+        case "$src" in
+            committed)
+                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z "$ATTRIBUTION_BASE_SHA" HEAD \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so the commits since the merge-base could not be read"; return 0; } ;;
+            staged)
+                _gen_events_read_z < <(${index_env[@]+"${index_env[@]}"} git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff --cached HEAD failed, so the staged changes could not be read"; return 0; } ;;
+            unstaged)
+                _gen_events_read_z < <(${index_env[@]+"${index_env[@]}"} git -C "$repo" diff --name-only --no-renames -z \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff (working tree) failed, so the unstaged changes could not be read"; return 0; } ;;
+            untracked)
+                _gen_events_read_z < <(git -C "$repo" ls-files --others --exclude-standard -z \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git ls-files --others failed, so untracked sources could not be read"; return 0; } ;;
+            staged-later)
+                [ "$staged_later" = "1" ] || continue
+                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached --ita-visible-in-index HEAD \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff --cached HEAD against the real index failed, so inputs staged for a later commit could not be read"; return 0; } ;;
+        esac
+        # A path containing a tab or newline cannot sit in a line-and-tab
+        # format, so it is carried in its `printf %q` form, which emits no raw
+        # tab or newline. It still counts: dropping it would clear a pusher
+        # over a file name.
+        local p
+        for p in ${_GEA_RECS[@]+"${_GEA_RECS[@]}"}; do
+            case "$p" in *$'\t'*|*$'\n'*) p="$(printf '%q' "$p")" ;; esac
+            touched_lines+="$p"$'\n'
+            # Staged for THIS commit already says it; "staged later" too would
+            # be the same fact twice (every `commit -a` path, for one).
+            if [ "$src" = "staged-later" ]; then
+                case "$staged_set" in *$'\n'"$p"$'\n'*) continue ;; esac
+            fi
+            [ "$src" = "staged" ] && staged_set+="$p"$'\n'
+            detail_lines+="$p"$'\t'"$src"$'\n'
+        done
+    done
+
+    ATTRIBUTION_TOUCHED="$(printf '%s' "$touched_lines" | LC_ALL=C sort -u | sed '/^$/d')"
+
+    # One line per (path, source), not one per path with a precedence rule.
+    # A path both committed AND dirty is two facts the reader needs: it is in
+    # the push, and the working tree the regen read differs from what is being
+    # pushed. Collapsing to `committed` would hide the second. LC_ALL=C so TAB
+    # sorts below every path character and a path's lines stay adjacent.
+    ATTRIBUTION_TOUCHED_DETAIL="$(printf '%s' "$detail_lines" | LC_ALL=C sort -u | sed '/^$/d')"
+
+    # Decided from the raw collection, not the sorted rendering of it: the
+    # verdict must not hang on a formatting pipeline.
+    if [ -n "$touched_lines" ]; then
         ATTRIBUTION_STATE="mine"
     else
         ATTRIBUTION_STATE="pre-existing"
     fi
     return 0
+}
+
+# The MINE arm's explanation, on stdout, one line per message line, for the
+# hook to prefix and send to stderr. Lives here rather than in the hook so the
+# self-test can pin it: which lead line, and which label on which file. Reads
+# the ATTRIBUTION_* variables a `mine` decision set.
+#
+# Stage-aware. The hook runs at pre-commit AND pre-push, and "this push" is
+# false at pre-commit: there the staged input IS the change being made.
+# `gen_events_stage` decides which. Two cases it cannot word right, both
+# label-only — the verdict stays on the widening side:
+#  - `git commit --amend` at pre-commit. The commit being replaced is already
+#    in HEAD, so its inputs read `already committed on this branch` although
+#    they are part of the commit being made.
+#  - `git commit -a` over an edit that was staged and then reverted in the
+#    working tree. The real index still holds the staged edit, so it reads
+#    `staged for a later commit`, though `-a` will discard it: there is no
+#    later commit it belongs to.
+#
+# It prints no commands. Earlier versions printed a set-aside recipe (a
+# tag-found stash, then a clean-worktree route), and each revision still had a
+# case where following it did damage in a stash shared by every worktree —
+# globbed names, cwd-relative paths, a staged `git rm` that left a half-made
+# entry behind. What to do with local state is the pusher's call; the message
+# states the facts that call needs.
+gen_events_render_mine() {
+    local stage p src label own=0 earlier=0 local_only=0
+    stage="$(gen_events_stage)"
+
+    # `own`: something in the change being made (committed for a push, staged
+    # for a commit). `earlier`: commits already on the branch, at pre-commit.
+    # `local_only`: working tree outside that change.
+    while IFS=$'\t' read -r p src; do
+        [ -n "$p" ] || continue
+        case "$stage:$src" in
+            push:committed|commit:staged) own=1 ;;
+            commit:committed)             earlier=1 ;;
+            *)                            local_only=1 ;;
+        esac
+    done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
+
+    # Name the change as what it is. With nothing of its own, the drift is
+    # still the author's to look at — the regen read their tree — but saying
+    # THIS change moved the inputs would be the false claim #1667 met.
+    if [ "$own" = "1" ]; then
+        echo "This $stage changes sources that feed them, so the diff below is yours."
+    elif [ "$earlier" = "1" ]; then
+        echo "Commits already on this branch (not this commit) change sources that feed"
+        echo "them, so the diff below is yours to check."
+    else
+        echo "Your working tree (not this $stage's changes) changes sources that feed them,"
+        echo "so the diff below is yours to check."
+    fi
+    echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
+    while IFS=$'\t' read -r p src; do
+        [ -n "$p" ] || continue
+        case "$stage:$src" in
+            push:committed)   label="committed in this push" ;;
+            push:staged)      label="staged, not committed — not part of this push" ;;
+            push:unstaged)    label="uncommitted changes — not part of this push" ;;
+            push:untracked)   label="untracked — not part of this push" ;;
+            push:staged-later) label="staged for a later commit — not part of this push" ;;
+            commit:committed) label="already committed on this branch" ;;
+            commit:staged)    label="staged for this commit" ;;
+            commit:unstaged)  label="unstaged — not in this commit" ;;
+            commit:untracked) label="untracked — not in this commit" ;;
+            commit:staged-later) label="staged for a later commit — not in this commit" ;;
+            *)                label="source unknown: '$src'" ;;
+        esac
+        echo "    $p  ($label)"
+    done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
+
+    # Only when markdown is actually among the blamed paths: otherwise the
+    # dropped exclusion changed nothing this pusher sees, and the line would
+    # be noise. A `%q`-escaped name ends in `'`, hence the optional quote.
+    if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ] \
+       && printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qE "\.md'?\$"; then
+        echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
+    fi
+    # Working tree outside the change being made. At pre-push that is staged,
+    # unstaged and untracked input; at pre-commit, unstaged and untracked.
+    if [ "$local_only" = "1" ]; then
+        if [ "$stage" = "push" ]; then
+            echo "Inputs marked 'not part of this push' are local working-tree state that the"
+            echo "regeneration read. If they are unintended, set them aside so the working tree"
+            echo "matches HEAD and push again; if the drift then disappears, it came from them,"
+            echo "not from this push."
+        else
+            echo "Inputs marked 'not in this commit' are working-tree state that the"
+            echo "regeneration read although this commit does not carry them. If the drift"
+            echo "is theirs, it will follow you to the push unless they are dealt with."
+        fi
+    fi
+    echo "Part of the diff may still be pre-existing — the baseline is a build"
+    echo "artifact in a shared checkout and may have been behind before you began."
 }

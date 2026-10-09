@@ -18,6 +18,9 @@ import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compila
 import { useGitSupervision } from "./useGitSupervision";
 import type { LoadedSpec } from "@/pages/specs/types";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
+import { extractJsonBlock } from "@/pages/ui-bridge-integration/hook-generation/parse";
+import { readPageSource } from "@/pages/ui-bridge-integration/integrationApi";
+import type { ReadPageSourceResult } from "@/pages/ui-bridge-integration/types";
 
 // ============================================================================
 // Types
@@ -73,38 +76,26 @@ export interface RunSyncOptions {
 }
 
 // ============================================================================
-// JSON extraction (mirrors HookGenerationPanel pattern)
+// AI response parsing
 // ============================================================================
 
-const MAX_JSON_BLOCK_SIZE = 1024 * 1024;
+export type SpecSyncResponseResult =
+  | { kind: "parsed"; config: SpecConfig }
+  | { kind: "invalid-json" }
+  | { kind: "no-json-block" };
 
-function extractJsonBlock(content: string): string | null {
-  const jsonRegex = /```json\s*\n([\s\S]*?)```/gi;
-  let match;
-  while ((match = jsonRegex.exec(content)) !== null) {
-    const raw = match[1];
-    if (raw.length > MAX_JSON_BLOCK_SIZE) continue;
-    try {
-      JSON.parse(raw);
-      return raw.trim();
-    } catch {
-      // Not valid JSON, try next block
-    }
+/**
+ * Pull the merged spec config out of one AI turn. The AI answers with a
+ * ```json block (or a bare fence holding an object — see `extractJsonBlock`).
+ */
+export function parseSpecSyncResponse(content: string): SpecSyncResponseResult {
+  const jsonBlock = extractJsonBlock(content);
+  if (!jsonBlock) return { kind: "no-json-block" };
+  try {
+    return { kind: "parsed", config: JSON.parse(jsonBlock) as SpecConfig };
+  } catch {
+    return { kind: "invalid-json" };
   }
-
-  const bareRegex = /```\s*\n(\s*\{[\s\S]*?\})\s*\n```/g;
-  while ((match = bareRegex.exec(content)) !== null) {
-    const raw = match[1];
-    if (raw.length > MAX_JSON_BLOCK_SIZE) continue;
-    try {
-      JSON.parse(raw);
-      return raw.trim();
-    } catch {
-      // Not valid JSON, try next block
-    }
-  }
-
-  return null;
 }
 
 // ============================================================================
@@ -242,11 +233,6 @@ export async function analyzeSpecs(
 // Source reading
 // ============================================================================
 
-interface ReadPageSourceResult {
-  main_source: string;
-  imported_sources: Array<{ path: string; content: string }>;
-}
-
 /**
  * Try to read page source for a spec by deriving the component path from metadata.
  * Returns null if source is unavailable.
@@ -278,20 +264,10 @@ async function tryReadPageSource(
 
   for (const componentPath of candidates) {
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-page-source`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_path: projectPath,
-          component_path: componentPath,
-          max_depth: 2,
-        }),
-        signal,
-      });
+      const data = await readPageSource({ projectPath, componentPath, maxDepth: 2 }, signal);
       if (signal.aborted) return null;
-      const data = await resp.json();
       if (data.success && data.data?.main_source) {
-        return data.data as ReadPageSourceResult;
+        return data.data;
       }
     } catch {
       if (signal.aborted) return null;
@@ -377,24 +353,22 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
     const lastMessage = ai.messages[ai.messages.length - 1];
     if (!lastMessage || lastMessage.role !== "ai") return;
 
-    const jsonBlock = extractJsonBlock(lastMessage.content);
+    const response = parseSpecSyncResponse(lastMessage.content);
     const currentSpec = currentSpecRef.current;
     currentSpecRef.current = null; // Prevent re-processing
 
-    if (jsonBlock) {
-      try {
-        const parsed = JSON.parse(jsonBlock) as SpecConfig;
-        const updatedSpec: LoadedSpec = {
-          ...currentSpec.spec,
-          config: parsed,
-        } as LoadedSpec;
-        onSpecUpdatedRef.current(updatedSpec);
-        resultsRef.current.updated.push(currentSpec.spec.specId);
-        updatedSpecsRef.current.set(currentSpec.spec.specId, parsed);
-      } catch {
-        resultsRef.current.failed.push(currentSpec.spec.specId);
-        warningsRef.current.push(`Failed to parse JSON for ${currentSpec.spec.specId}`);
-      }
+    if (response.kind === "parsed") {
+      const parsed = response.config;
+      const updatedSpec: LoadedSpec = {
+        ...currentSpec.spec,
+        config: parsed,
+      } as LoadedSpec;
+      onSpecUpdatedRef.current(updatedSpec);
+      resultsRef.current.updated.push(currentSpec.spec.specId);
+      updatedSpecsRef.current.set(currentSpec.spec.specId, parsed);
+    } else if (response.kind === "invalid-json") {
+      resultsRef.current.failed.push(currentSpec.spec.specId);
+      warningsRef.current.push(`Failed to parse JSON for ${currentSpec.spec.specId}`);
     } else {
       resultsRef.current.failed.push(currentSpec.spec.specId);
       warningsRef.current.push(`No JSON block in AI response for ${currentSpec.spec.specId}`);

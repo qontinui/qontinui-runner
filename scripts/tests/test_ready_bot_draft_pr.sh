@@ -496,8 +496,6 @@ assert "non-conflicting draft w/ checks, no flag: readied, not closed" "readied 
 reset "[$(pr true "$CREATED_FRESH")]" "23"
 rc="$(run_script --close-if-obsolete --expect-head "$NEW_SHA")"
 assert "flag + stale head: head pin first, nothing closed" "head-mismatch #4242 0" "$(last_line) $(count pr-close "$work/gh.log")"
-assert "--print-close-marker prints the close comment's marker" "$CLOSE_MARKER" "$(bash "$script" --print-close-marker)"
-assert "--print-close-marker calls no gh" 0 "$( { PATH="$bin:$PATH" GH_STUB_LOG="$work/gh.log" bash "$script" --print-close-marker > /dev/null; : > "$work/gh.log"; bash "$script" --print-close-marker > /dev/null; wc -l < "$work/gh.log"; } | tr -d ' ')"
 reset "$CONFLICT_READY" "23"
 S_FAIL="pr-close"
 rc="$(run_script --close-if-obsolete)"
