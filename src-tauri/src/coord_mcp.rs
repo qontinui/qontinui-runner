@@ -2174,6 +2174,13 @@ impl NonceRegistry {
             .cloned()
     }
 
+    /// Mutate one LIVE binding in place — tests only (panics when absent).
+    #[cfg(test)]
+    fn mutate_live_for_test(&self, nonce: &str, f: impl FnOnce(&mut NonceBinding)) {
+        let mut state = self.state();
+        f(state.live.get_mut(nonce).expect("live binding"));
+    }
+
     /// Insert one grace entry directly — tests only.
     #[cfg(test)]
     fn insert_graced_for_test(&self, nonce: String, graced: GracedNonce) {
@@ -8775,10 +8782,10 @@ mod session_tenant_resolution_tests {
         let nonce = read_proxy_nonce(&dir.join(".mcp.json")).expect("nonce");
         let t = tenant(0x67);
         let set = |origin| {
-            let mut map = proxy_nonces().lock().unwrap();
-            let b = map.get_mut(&nonce).expect("live binding");
-            b.session_pin = TenantPin::Pinned(t);
-            b.pin_origin = origin;
+            NonceRegistry::global().mutate_live_for_test(&nonce, |b| {
+                b.session_pin = TenantPin::Pinned(t);
+                b.pin_origin = origin;
+            });
         };
         set(PinOrigin::MachineSampled);
         assert!(
@@ -8868,10 +8875,10 @@ mod session_tenant_resolution_tests {
         let nonce = read_proxy_nonce(&dir.join(".mcp.json")).expect("the config carries a nonce");
         let t = tenant(0x66);
         let set = |origin| {
-            let mut map = proxy_nonces().lock().unwrap();
-            let b = map.get_mut(&nonce).expect("live binding");
-            b.session_pin = TenantPin::Pinned(t);
-            b.pin_origin = origin;
+            NonceRegistry::global().mutate_live_for_test(&nonce, |b| {
+                b.session_pin = TenantPin::Pinned(t);
+                b.pin_origin = origin;
+            });
         };
         set(PinOrigin::MachineSampled);
         assert_eq!(
