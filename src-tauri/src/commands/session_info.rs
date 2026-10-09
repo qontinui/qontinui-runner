@@ -487,8 +487,10 @@ pub struct TenancyCredential {
     pub slot: Option<String>,
     /// Set when `status` is `"unknown"`: `no_session_nonce`,
     /// `coord_mcp_delivery_unrecorded`, `nonce_not_live`,
-    /// `default_slot_binding_unbound`, `default_slot_binding_unknown`, or
-    /// `tenant_unresolvable: <the proxy's refusal>`.
+    /// `default_slot_binding_unbound`, `default_slot_binding_unknown`, or the
+    /// proxy's refusal led by its OWN typed code (`<code>: <message>`, e.g.
+    /// `COORD_MCP_PROXY_TENANT_UNRESOLVABLE: …` or
+    /// `terminal:tenant_declaration_unusable: …`) — see [`refusal_reason`].
     pub reason: Option<String>,
     pub posture: TenancyPosture,
 }
@@ -521,6 +523,23 @@ pub struct SessionTenancy {
     /// default was not recorded, or a session whose credential is unknown, is
     /// `unknown` — the boolean alone used to render both as "not diverged".
     pub divergence: String,
+}
+
+/// The tenancy report's `reason` for a session the proxy would refuse: the
+/// refusal's own typed code, then its message.
+///
+/// Every refusal used to render as `tenant_unresolvable: <body>`, so a declared
+/// tenant this machine is not paired for (a 403 authorization answer) read as
+/// the `machine.json` configuration fault. The code comes from the
+/// [`crate::coord_mcp::ProxyRefusal`] itself; a message that already leads with
+/// it is not prefixed twice.
+fn refusal_reason(refusal: &crate::coord_mcp::ProxyRefusal) -> String {
+    let lead = format!("{}:", refusal.code);
+    if refusal.message.starts_with(&lead) {
+        refusal.message.clone()
+    } else {
+        format!("{lead} {}", refusal.message)
+    }
 }
 
 /// Project the three tenancy reads into [`SessionTenancy`]. Pure.
@@ -605,7 +624,7 @@ pub(crate) fn project_tenancy(
             Err("coord_mcp_delivery_unrecorded".to_string())
         }
         CredentialTenantRead::NotLive => Err("nonce_not_live".to_string()),
-        CredentialTenantRead::Refused(body) => Err(format!("tenant_unresolvable: {body}")),
+        CredentialTenantRead::Refused(refusal) => Err(refusal_reason(refusal)),
     };
     let credential = match &credential_slot {
         Ok((tenant, session_tenant)) => {
@@ -1110,6 +1129,35 @@ pub async fn session_info_get(
 
 #[cfg(test)]
 mod tests {
+    /// The report names each refusal by its OWN code — a declared-tenant 403
+    /// is not reported as the `machine.json` fault — and a message that
+    /// already leads with its code is not prefixed a second time.
+    #[test]
+    fn a_refused_credential_is_reported_under_the_refusals_own_code() {
+        use crate::coord_mcp::ProxyRefusal;
+        let led = ProxyRefusal {
+            status: 403,
+            code: "terminal:tenant_declaration_unusable",
+            retryable: false,
+            message: "terminal:tenant_declaration_unusable: bad declaration".to_string(),
+        };
+        assert_eq!(
+            refusal_reason(&led),
+            "terminal:tenant_declaration_unusable: bad declaration"
+        );
+        let bare = ProxyRefusal {
+            message: "no lead".to_string(),
+            ..led
+        };
+        assert_eq!(
+            refusal_reason(&bare),
+            "terminal:tenant_declaration_unusable: no lead"
+        );
+        let unresolvable = crate::coord_mcp::tenant_unresolvable_error();
+        assert!(refusal_reason(&unresolvable)
+            .starts_with("COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine"));
+    }
+
     /// The defect this classification exists for: a bare shell must NOT be
     /// presented as a real session. Measured live 2026-08-18 — `POST /terminals`
     /// alone produced `confirmed:false, transcriptExists:false` with a
