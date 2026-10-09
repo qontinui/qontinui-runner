@@ -419,8 +419,8 @@ fn config_dir_of_pid(_pid: u32) -> Option<String> {
 /// Session ids a call is resuming RIGHT NOW. Process-wide: two concurrent
 /// requests naming one id would otherwise each pass the (read-only)
 /// preconditions and each spawn.
-static IN_FLIGHT: std::sync::Mutex<std::collections::HashSet<String>> =
-    std::sync::Mutex::new(std::collections::HashSet::new());
+static IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// RAII claim on one id in [`IN_FLIGHT`]; released on drop, including on a
 /// panic or a cancelled future.
