@@ -1069,7 +1069,10 @@ mod tests {
     /// out-of-line `mod name;` (trailing `//` comment allowed) is not skipped,
     /// because its code lives in another file the walk visits on its own
     /// ([`test_mod_skip_end`]); files named `tests.rs` or under a `tests/` dir are
-    /// skipped; `//` lines are skipped; the enclosing function is the last
+    /// skipped, and so is any file opening `#![cfg(test)]` — an extracted test
+    /// module carries no in-file span ([`crate::source_lex::is_test_only_file`],
+    /// plan `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b);
+    /// `//` lines are skipped; the enclosing function is the last
     /// `fn <name>` seen above the use.
     fn scan_pin_readers() -> std::collections::BTreeSet<String> {
         let root = src_root();
@@ -1095,6 +1098,9 @@ mod tests {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let src = std::fs::read_to_string(&path).unwrap();
+                if crate::source_lex::is_test_only_file(&src) {
+                    continue;
+                }
                 let lines: Vec<&str> = src.lines().collect();
                 let mut current_fn = String::from("<none>");
                 let mut i = 0;

@@ -1,7 +1,8 @@
 //! Source-lexing helpers shared by the runner's source-scanning guards.
 //!
 //! The guards that walk `src-tauri/src` and tell production code from test code
-//! (`runner_spawn_sites`, `process_helpers`, `wedge_diagnostics`, and the
+//! (`runner_spawn_sites`, `process_helpers`, `wedge_diagnostics`,
+//! `commands::tenant`'s pin-reader scan, and the
 //! `tests/coord_auth_pin.rs`, `tests/coord_schema_authorship.rs` and
 //! `tests/interactive_signout_marker_guard.rs` integration gates) find test code
 //! by an IN-FILE `#[cfg(test)]` span. A test module moved out of line by
