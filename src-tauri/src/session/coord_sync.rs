@@ -9371,11 +9371,22 @@ mod tests {
         drain_tick(&coord.inner, &mut state).await;
 
         let g = rec.lock().await;
+        let closed = json!({ "state": "closed" });
         assert!(
-            g.patches.iter().any(|(id, _)| *id == session),
+            g.patches
+                .iter()
+                .any(|(id, body)| *id == session && body != &closed),
             "the heartbeat behind the held chunk went out"
         );
-        assert_eq!(g.deletes, vec![session], "and so did the close");
+        // A close is a `PATCH {state:"closed"}` (never a DELETE) since main's
+        // closed-as-PATCH change.
+        assert!(
+            g.patches
+                .iter()
+                .any(|(id, body)| *id == session && body == &closed),
+            "and so did the close"
+        );
+        assert!(g.deletes.is_empty(), "a close is never a DELETE");
         assert!(g.outputs.is_empty());
         drop(g);
         assert_eq!(
