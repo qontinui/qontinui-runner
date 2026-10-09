@@ -17243,7 +17243,11 @@ mod coord_mcp_body_gate_tests {
     /// comments above them must not hide one or add a phantom.
     #[test]
     fn verification_lane_tools_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+        let parsed =
+            crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::whole(
+                include_str!("mcp_api.rs"),
+                "production's drift parser reads the whole trunk file",
+            ))
             .expect("mcp_api.rs parses");
         for tool in [
             "coord_query_verification_metrics",
@@ -17280,7 +17284,11 @@ mod coord_mcp_body_gate_tests {
     /// back once.
     #[test]
     fn overlord_proof_and_ledger_tools_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+        let parsed =
+            crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::whole(
+                include_str!("mcp_api.rs"),
+                "production's drift parser reads the whole trunk file",
+            ))
             .expect("mcp_api.rs parses");
         for tool in [
             "coord_watch_verdict",

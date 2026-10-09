@@ -13847,8 +13847,12 @@ mod tests {
     /// `NonceState`.
     #[test]
     fn nonce_registry_has_one_lock_and_is_the_only_owner_of_the_maps() {
-        let full = include_str!("coord_mcp.rs");
-        let prod = production_source(full);
+        let full = crate::source_pin::ProdSource::whole(
+            include_str!("coord_mcp.rs"),
+            "this pin exercises production_source itself, so it must hand that filter \
+             the test modules it is asserted to strip",
+        );
+        let prod = production_source(&full);
         let squash = |s: &str| s.split_whitespace().collect::<String>();
 
         // The filter itself: production items AFTER the test modules survive
