@@ -1803,22 +1803,21 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // Commit ↔ session lineage push-report (plan
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
             // Body is the payload verbatim ({repo, branch, shas}); coord
-            // resolves the session server-side from (repo, branch). Tenant
-            // comes from the X-Qontinui-Tenant-Id header (post_device_register
-            // posture) — Phase 8b: the OWNING SESSION's binding wins; the
-            // machine.json default only backfills tenant-less legacy rows.
+            // resolves the session server-side from (repo, branch), scoped to
+            // the tenant. That tenant is the VERIFIED BEARER's claim — coord
+            // mounts this route behind require_jwt and reads no tenant header
+            // (plan 2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-
+            // tenant-header), so the request carries only the device bearer
+            // for the row's scope. A send with no bearer — an unpaired runner,
+            // a non-default tenant slot miss, or an `Unresolved` scope on a
+            // multi-bound device (the D2 degrade) — is refused 401, which
+            // `write_failure_outcome` maps to PermanentFailure and Ack-drops;
+            // coord counts it as
+            // coord_commit_report_refusals_total{reason="unauthenticated"}.
             let url = format!("{base}/coord/commits/report");
-            let mut rb = crate::auth::attach_device_auth_for(
-                inner.http.post(&url).json(&rec.payload),
-                scope,
-            );
-            if let Some(tid) = scope
-                .declared_tenant()
-                .or_else(crate::session::dual_write::resolve_active_tenant_id)
-            {
-                rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
-            }
-            rb.send().await
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
+                .send()
+                .await
         }
         "output_chunk" => {
             // Transcript/output chunk (plan
@@ -3618,6 +3617,9 @@ mod tests {
         gate_callers: Vec<Option<String>>,
         /// Bodies accepted by `POST /coord/work-units/upsert`.
         unit_upserts: Vec<JsonValue>,
+        /// `(body, X-Qontinui-Tenant-Id)` per accepted
+        /// `POST /coord/commits/report` (`None` = no tenant header).
+        commit_reports: Vec<(JsonValue, Option<String>)>,
         /// Bodies accepted by `POST /coord/agent-findings`.
         findings: Vec<JsonValue>,
         /// When true, register-gate answers 404 `work_unit_not_found` for any
@@ -3977,6 +3979,21 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/commits/report",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     headers: axum::http::HeaderMap,
+                     Json(body): Json<JsonValue>| async move {
+                        let tenant_header = headers
+                            .get("x-qontinui-tenant-id")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        state.lock().await.commit_reports.push((body, tenant_header));
+                        (AxumStatus::OK, Json(json!({"recorded": 1}))).into_response()
                     },
                 ),
             )
@@ -6859,6 +6876,65 @@ mod tests {
         );
         // No bootstrap upsert fires when the work unit already exists.
         assert!(g.unit_upserts.is_empty());
+        drop(g);
+
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// A `commit_report` row drains to `POST /coord/commits/report` with the
+    /// payload verbatim and NO `X-Qontinui-Tenant-Id` header — coord takes the
+    /// tenant from the verified bearer's claim (plan
+    /// 2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header,
+    /// Phase 2). The payload names an owning tenant, so the row resolves
+    /// `TenantScope::Owned` — the scope under which the retired code DID stamp
+    /// the header, which is what makes this assertion discriminating.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_commit_report_without_tenant_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let payload = json!({
+            "repo": "qontinui/qontinui-runner",
+            "branch": "feat/x",
+            "shas": ["0123456789abcdef0123456789abcdef01234567"],
+            "tenant_id": "c231d9da-0000-4000-8000-000000000001",
+        });
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::CommitReport,
+                payload.clone(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            rec.try_lock()
+                .map(|g| !g.commit_reports.is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.commit_reports.len(), 1, "exactly one commits/report POST");
+        let (body, tenant_header) = &g.commit_reports[0];
+        assert_eq!(body, &payload, "the payload IS the body, verbatim");
+        assert_eq!(
+            tenant_header, &None,
+            "the dead X-Qontinui-Tenant-Id header must not be sent"
+        );
         drop(g);
 
         wait_until(Duration::from_secs(3), || {
