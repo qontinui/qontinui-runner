@@ -373,10 +373,13 @@ const READ_TOOLS: &[&str] = &[
     "coord_merge_order",
     "coord_migration_queue",
     "coord_orient",
+    "coord_overlord_interventions",
     "coord_pr_status",
     "coord_reevaluate_dry",
+    "coord_session_obligations",
     "coord_session_worktrees",
     "coord_verification_queue",
+    "coord_watch_verdict",
     "coord_who_is_working_on",
 ];
 
@@ -952,6 +955,19 @@ mod tests {
         );
         assert_eq!(
             operation_for_call("tools/call", Some("coord_memory_record")),
+            OPERATION_WRITE
+        );
+        // The overlord's proof reads and ledger read are reads; the ledger
+        // append (`coord_overlord_record`) stays a write.
+        for tool in [
+            "coord_watch_verdict",
+            "coord_session_obligations",
+            "coord_overlord_interventions",
+        ] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_overlord_record")),
             OPERATION_WRITE
         );
         // `coord_can` is exact, so the cancel WRITE is not swallowed by it.
