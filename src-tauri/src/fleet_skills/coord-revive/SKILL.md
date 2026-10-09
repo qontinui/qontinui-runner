@@ -1574,8 +1574,8 @@ evict a live peer and will not unlatch your client. Use
   a spent budget no longer skips L5. Every rung the budget was spent on (L1, L2,
   the L4 runner mints) carried that same dead credential, so L5, the
   runner-independent bootstrap credential, is the one door left, and skipping it
-  there reported `BUDGET_EXCEEDED` in exactly the state L5 exists for (device
-  c79a07d5, 2026-10-07: a default-budget run never reached L5; a 600 s run
+  there reported `BUDGET_EXCEEDED` in exactly the state L5 exists for (one fleet
+  device, 2026-10-07: a default-budget run never reached L5; a 600 s run
   reached it LIVE). The exemption prints a `sweep budget … spent, probing
   anyway: <why>` line. It costs one bounded attempt: the session-tenant read
   (a runner GET, only when `$QONTINUI_TERMINAL_ID` is set and L4 did not
