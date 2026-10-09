@@ -1246,7 +1246,10 @@ fn second_review_doors() {
 #[test]
 fn resume_door_is_a_credential_door_and_on_no_allowlist() {
     assert!(is_credential_door("POST", "/control/sessions/resume"));
-    assert!(!is_credential_door("GET", "/control/sessions/restore-census"));
+    assert!(!is_credential_door(
+        "GET",
+        "/control/sessions/restore-census"
+    ));
     for list in [TRUSTED_ROUTES, FOREIGN_ROUTES] {
         assert!(!list.contains(&("POST", "/control/sessions/resume")));
     }
