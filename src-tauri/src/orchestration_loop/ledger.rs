@@ -15,6 +15,7 @@
 //! `artifact` JSONB column round-trips byte-identically to a worker-written
 //! completion report.
 
+use super::conductor::OrchestrationRunConfig;
 use crate::database::pg::completion_reports::CompletionReport;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,51 @@ pub struct Run {
     pub status_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The knobs the run was started with, persisted at create so a re-entry
+    /// (the boot sweep above all) drives it with the SAME config rather than
+    /// the defaults. `None` for a row written before the column existed, or
+    /// one whose stored JSON no longer decodes — the caller then falls back to
+    /// the config it was handed.
+    pub config: Option<OrchestrationRunConfig>,
+    /// Which runner instance drives this run: `QONTINUI_INSTANCE_NAME`, or
+    /// [`PRIMARY_OWNER`] when unset (see [`local_owner_instance`]). A temp
+    /// runner and the primary share one embedded PG cluster, so this is what
+    /// stops the boot sweep of one from relaunching — and double-driving — the
+    /// other's runs. `None` = written before the column existed; such a row is
+    /// never adopted by a sweep, because nothing can say whose it is.
+    pub owner_instance: Option<String>,
+}
+
+/// The `owner_instance` value of the primary runner, which is launched without
+/// `QONTINUI_INSTANCE_NAME`.
+pub const PRIMARY_OWNER: &str = "primary";
+
+/// This process's `owner_instance` value: the supervisor-assigned instance name
+/// of a temp/named runner, or [`PRIMARY_OWNER`] for the primary. The one place
+/// the ownership key is derived, so the writer (`create_run`) and the reader
+/// (the boot sweep) cannot disagree about who "this instance" is.
+///
+/// Fails CLOSED on a NAMELESS secondary, the same boundary
+/// [`crate::instance::owns_shared_root_state`] draws for on-disk state: a
+/// runner with no `QONTINUI_INSTANCE_NAME` that is a secondary by any other
+/// signal (a primary port to proxy to, a non-default API port) is
+/// `unnamed-<port>`, never [`PRIMARY_OWNER`] — otherwise its boot sweep would
+/// relaunch the primary's runs and put a second reconciler on each.
+pub fn local_owner_instance() -> String {
+    owner_instance_for(
+        crate::instance::instance_name(),
+        crate::instance::owns_shared_root_state(),
+        crate::mcp::types::get_mcp_api_port(),
+    )
+}
+
+/// Pure core of [`local_owner_instance`], every input injected.
+fn owner_instance_for(name: Option<String>, is_primary: bool, api_port: u16) -> String {
+    match name {
+        Some(n) => n,
+        None if is_primary => PRIMARY_OWNER.to_string(),
+        None => format!("unnamed-{api_port}"),
+    }
 }
 
 /// One row of `orchestration.subtasks` — a node in the run's subtask DAG.
@@ -159,6 +205,13 @@ pub struct Subtask {
     /// is plain nullable `text` with no CHECK, so this doc and the matching
     /// comment in `atlas/schema.hcl` are the only enumeration there is.
     pub gate_status: Option<String>,
+    /// How many times the boot sweep has put this row back to `Submitted`
+    /// because its worker died with a previous runner process (the report had
+    /// not landed). Bounds re-dispatch across restarts: the sweep fails a row
+    /// rather than take it past [`super::boot_sweep::MAX_RESTART_RESETS`].
+    /// Written ONLY by the sweep — `upsert_subtask` / `splice_subtasks` never
+    /// send it, so a whole-row upsert cannot reset the count.
+    pub restart_resets: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -185,5 +238,19 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", s));
         }
         assert_eq!(SubtaskState::from_str_value("bogus_state"), None);
+    }
+
+    #[test]
+    fn owner_instance_fails_closed_on_a_nameless_secondary() {
+        assert_eq!(
+            owner_instance_for(Some("test-9877".to_string()), false, 9877),
+            "test-9877"
+        );
+        assert_eq!(owner_instance_for(None, true, 9876), PRIMARY_OWNER);
+        assert_eq!(
+            owner_instance_for(None, false, 9880),
+            "unnamed-9880",
+            "a secondary without a name must never claim the primary's runs"
+        );
     }
 }

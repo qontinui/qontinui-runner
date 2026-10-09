@@ -21,6 +21,7 @@
 //! This cleanly separates the orchestrator from the execution target.
 
 pub mod ai_session_executor;
+pub mod boot_sweep;
 pub mod commands;
 pub mod conductor;
 pub mod context_summarizer;

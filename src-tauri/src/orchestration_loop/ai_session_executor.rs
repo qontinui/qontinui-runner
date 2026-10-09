@@ -871,6 +871,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            restart_resets: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

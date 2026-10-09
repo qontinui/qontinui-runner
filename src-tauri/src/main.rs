@@ -5944,6 +5944,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            // Conductor boot sweep (plan 2026-09-23-conductor-e2e-phase1-defects
+            // Phase 2): relaunch every `running` orchestration run THIS instance
+            // owns that a previous process left without a reconciler, after
+            // settling the in-flight rows whose workers died with it. PG and the
+            // `SessionManager` (managed above) are both up here. Detached — it
+            // never delays boot, and every failure is logged, never fatal.
+            if crate::database::pg::pg_available() {
+                info!("Starting conductor boot sweep");
+                let sweep_state = app.state::<Arc<AppState>>().inner().clone();
+                let sweep_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::orchestration_loop::boot_sweep::run_boot_sweep(
+                        sweep_state.orchestration_loops.clone(),
+                        sweep_handle,
+                        sweep_state.pg_db.clone(),
+                    )
+                    .await;
+                });
+            }
+
             // Start memory consolidation scheduler in background
             info!("Starting memory consolidation scheduler");
             let scheduler_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();

@@ -522,6 +522,21 @@ table "runs" {
     null = true
     type = text
   }
+  // The serialized `OrchestrationRunConfig` the run was started with, so a
+  // re-entry (the boot sweep) drives it at the same knobs, not the defaults.
+  // Null for a row written before the column existed.
+  column "config" {
+    null = true
+    type = jsonb
+  }
+  // The runner instance that drives this run: `QONTINUI_INSTANCE_NAME`, or
+  // `primary` when unset. The primary and a temp runner share one embedded
+  // cluster; the boot sweep relaunches only rows it owns. Null = written before
+  // the column existed, and never adopted by a sweep.
+  column "owner_instance" {
+    null = true
+    type = text
+  }
   column "created_at" {
     null    = false
     type    = timestamptz
@@ -612,6 +627,14 @@ table "subtasks" {
   column "gate_status" {
     null = true
     type = text
+  }
+  // How many times the boot sweep put this row back to `submitted` because its
+  // worker died with the runner process (no report had landed). Bounded: the
+  // sweep fails the row instead of taking it past 2.
+  column "restart_resets" {
+    null    = false
+    type    = integer
+    default = 0
   }
   column "created_at" {
     null    = false

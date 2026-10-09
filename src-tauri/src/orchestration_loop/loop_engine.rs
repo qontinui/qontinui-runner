@@ -551,21 +551,80 @@ pub async fn start_orchestration_run(
 ) -> Result<Run, String> {
     let loop_id = run_id.to_string();
 
-    // Refuse to double-start the same run.
+    // Refuse to double-start the same run — and RESERVE its loop slot in the
+    // same critical section. `create_run` is idempotent on `run_id`, so the
+    // 23505 that used to keep two concurrent starts apart is gone; without the
+    // reservation, two callers (the boot sweep racing an operator's re-entry,
+    // or a retried POST) would both pass this check, both run DESIGN, and both
+    // spawn a reconciler over one DAG. The reserved state is the one the
+    // reconciler later drives, so a Stop pressed during DESIGN is not lost:
+    // `stop_rx` already reads `true` when the conductor starts.
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let loop_state = Arc::new(Mutex::new(LoopState::new()));
     {
-        let mgr = states.lock().await;
+        let mut st = loop_state.lock().await;
+        st.running = true;
+        st.phase = LoopPhase::Reconciling;
+        st.started_at = Some(Utc::now());
+        st.stop_tx = Some(stop_tx);
+    }
+    {
+        let mut mgr = states.lock().await;
         if let Some(existing) = mgr.loops.get(&loop_id) {
             let st = existing.lock().await;
             if st.running {
                 return Err(format!("Orchestration run {run_id} is already running"));
             }
         }
+        mgr.loops.insert(loop_id.clone(), loop_state.clone());
+        mgr.metadata.insert(
+            loop_id.clone(),
+            LoopMetadata {
+                label: Some(format!("orchestration:{run_id}")),
+                stop_all_on_error: false,
+            },
+        );
     }
+    // Every exit below that does not spawn the reconciler releases the slot —
+    // only if it still holds OUR state, so it never evicts a later start's.
+    let release = |states: SharedLoopStates, loop_id: String, ours: SharedLoopState| async move {
+        let mut mgr = states.lock().await;
+        if mgr
+            .loops
+            .get(&loop_id)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &ours))
+        {
+            mgr.loops.remove(&loop_id);
+            mgr.metadata.remove(&loop_id);
+        }
+    };
 
-    // Create the run row (status=running).
-    let run = pg
-        .create_run(run_id, goal, recipe, phases, "running")
-        .await?;
+    // Create the run row (status=running), or re-enter the existing one. A
+    // re-entry is refused, typed, for a terminal row or one another instance
+    // owns; a `running` row this instance may drive comes back as stored, and
+    // the STORED goal/phases/config win over this call's arguments — that is
+    // what lets the boot sweep and an operator's re-entry resume the run the
+    // operator actually started rather than a default-knob copy of it.
+    let run = match pg
+        .create_run(
+            run_id,
+            goal,
+            recipe,
+            phases,
+            &config,
+            &super::ledger::local_owner_instance(),
+        )
+        .await
+    {
+        Ok(run) => run,
+        Err(e) => {
+            release(states.clone(), loop_id.clone(), loop_state.clone()).await;
+            return Err(e.into());
+        }
+    };
+    let config = config.resumed_from(run.config.as_ref());
+    let goal = run.goal.as_str();
+    let phases = run.phases.as_slice();
 
     // DESIGN bootstrap (Phase 4): a run with no subtasks yet runs the Planning
     // phase's design pass to produce the initial org-chart, written via the
@@ -577,6 +636,7 @@ pub async fn start_orchestration_run(
     // the empty run ticked to `complete`, which told the operator the opposite
     // of what happened.)
     if let Err(e) = run_design_bootstrap(&app_handle, &pg, run_id, goal, phases).await {
+        release(states.clone(), loop_id.clone(), loop_state.clone()).await;
         let exit = RunExit::design_failed(&e);
         error!(
             "start_orchestration_run: run {run_id} {}: {e}",
@@ -594,27 +654,6 @@ pub async fn start_orchestration_run(
         return Err(format!("Orchestration run {run_id} failed: {e}"));
     }
 
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let loop_state = Arc::new(Mutex::new(LoopState::new()));
-    {
-        let mut st = loop_state.lock().await;
-        st.running = true;
-        st.phase = LoopPhase::Reconciling;
-        st.started_at = Some(Utc::now());
-        st.stop_tx = Some(stop_tx);
-    }
-    {
-        let mut mgr = states.lock().await;
-        mgr.loops.insert(loop_id.clone(), loop_state.clone());
-        mgr.metadata.insert(
-            loop_id.clone(),
-            LoopMetadata {
-                label: Some(format!("orchestration:{run_id}")),
-                stop_all_on_error: false,
-            },
-        );
-    }
-
     // Build live dispatcher + signal source and spawn the conductor.
     let session_mgr = {
         use tauri::Manager;
@@ -624,11 +663,7 @@ pub async fn start_orchestration_run(
     };
     let Some(session_mgr) = session_mgr else {
         // Roll back the registration + run row marker.
-        {
-            let mut mgr = states.lock().await;
-            mgr.loops.remove(&loop_id);
-            mgr.metadata.remove(&loop_id);
-        }
+        release(states.clone(), loop_id.clone(), loop_state.clone()).await;
         let reason = "start_orchestration_run: SessionManager state not available";
         let _ = pg
             .set_run_status(run_id, RunExit::STATUS_FAILED, Some(reason))

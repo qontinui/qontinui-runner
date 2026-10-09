@@ -54,10 +54,19 @@
 //!
 //!    That guarantee covers IN-PROCESS exits only. A runner killed or crashed
 //!    mid-run takes the reconciler with it and leaves its row reading `running`
-//!    with no writer left, and nothing sweeps orphaned rows at boot today — so
-//!    `running` means "running, or last seen running by a process that is
-//!    gone". A boot-time reconcile of `running` rows with no live reconciler is
-//!    the follow-up that would close it.
+//!    with no writer left. The boot sweep ([`super::boot_sweep`]) closes that:
+//!    once PG and the `SessionManager` are up, every `running` run THIS
+//!    instance owns (`orchestration.runs.owner_instance`) and has no registered
+//!    loop for is relaunched through `start_orchestration_run` with its
+//!    persisted config, after its `Working` rows whose worker died with the
+//!    previous process are settled (artifact → `Completed`, none →
+//!    `Submitted` again, bounded by `restart_resets`). Without that step
+//!    [`compute_tick`]'s `Gone` arm would fail each such row after
+//!    `gone_grace_secs` and never re-dispatch it. A row owned by another
+//!    instance, or by nobody (written before the column existed), is left
+//!    reading `running` — so on a shared cluster `running` still means
+//!    "running, or last seen running by a process that is gone" for rows this
+//!    instance does not own.
 //!
 //! ## Testability
 //!
@@ -98,7 +107,16 @@ use crate::database::pg::PgDb;
 
 /// Runtime knobs for a conductor run. Runner-local (not a wire DTO); sensible
 /// conservative defaults so a bare `/orchestrate` works without tuning.
-#[derive(Debug, Clone)]
+///
+/// Persisted verbatim to `orchestration.runs.config` at create
+/// ([`PgDb::create_run`]) and read back when a run is re-entered — above all by
+/// the boot sweep ([`super::boot_sweep`]), which would otherwise relaunch a run
+/// at default knobs that differ from the ones the operator started it with.
+/// `#[serde(default)]` makes the read tolerant of a row written by an older
+/// build: a field it does not carry takes its default rather than failing the
+/// whole decode.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct OrchestrationRunConfig {
     /// Seconds between reconciler ticks.
     pub tick_interval_secs: u64,
@@ -188,6 +206,10 @@ pub struct OrchestrationRunConfig {
     /// value, deliberately re-read each tick rather than carried, so a user
     /// changing the bound in the web settings page takes effect within about a
     /// registry TTL without restarting the run.
+    ///
+    /// Never persisted (`#[serde(skip)]`): it is a per-tick cache of a coord
+    /// value, and a stored one would be stale by the time a relaunch read it.
+    #[serde(skip)]
     pub fanout_bound: Option<u32>,
 }
 
@@ -226,6 +248,21 @@ impl Default for OrchestrationRunConfig {
 }
 
 impl OrchestrationRunConfig {
+    /// The config a (re-)entered run is driven with: the one PERSISTED on its
+    /// row when there is one — the knobs the operator started it with — else
+    /// `self` (the caller's, for a row written before the column existed).
+    /// `fanout_bound` always comes from `self`: it is a per-tick cache that is
+    /// never stored.
+    pub fn resumed_from(self, stored: Option<&OrchestrationRunConfig>) -> Self {
+        match stored {
+            Some(stored) => Self {
+                fanout_bound: self.fanout_bound,
+                ..stored.clone()
+            },
+            None => self,
+        }
+    }
+
     /// How many workers may be dispatched-and-not-terminal at once, honouring
     /// BOTH the run's own conservative cap and the agent registry's declared
     /// `parallel_fanout` bound.
@@ -2551,6 +2588,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            restart_resets: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3200,7 +3238,8 @@ mod tests {
             "elaborate",
             None,
             &["plan".to_string(), "implement".to_string()],
-            "running",
+            &OrchestrationRunConfig::default(),
+            "primary",
         )
         .await
         .expect("create_run");
@@ -3720,9 +3759,16 @@ mod tests {
     async fn gate_register_persists_and_clears_then_dispatches() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
-        pg.create_run(run_id, "gate run", None, &["test".to_string()], "running")
-            .await
-            .expect("create_run");
+        pg.create_run(
+            run_id,
+            "gate run",
+            None,
+            &["test".to_string()],
+            &OrchestrationRunConfig::default(),
+            "primary",
+        )
+        .await
+        .expect("create_run");
 
         // Persist a CI-green test subtask with NO gate yet.
         let mut st = mk_gated("test", 0, &[], "CI green", None, None);
@@ -3861,9 +3907,16 @@ mod tests {
 
         // ---- Case A: NO DRIFT → verify Completed + verdict stored. ----
         let run_a = Uuid::new_v4();
-        pg.create_run(run_a, "verify run", None, &["test".to_string()], "running")
-            .await
-            .unwrap();
+        pg.create_run(
+            run_a,
+            "verify run",
+            None,
+            &["test".to_string()],
+            &OrchestrationRunConfig::default(),
+            "primary",
+        )
+        .await
+        .unwrap();
         let trid = Uuid::new_v4();
         let mut v = mk("verify", 0, &[], SubtaskState::Working);
         v.run_id = run_a;
@@ -3917,7 +3970,8 @@ mod tests {
             "verify run b",
             None,
             &["test".to_string()],
-            "running",
+            &OrchestrationRunConfig::default(),
+            "primary",
         )
         .await
         .unwrap();
@@ -4847,9 +4901,16 @@ mod tests {
         ];
         for (exit, want_status, want_reason, want_phase) in cases {
             let run_id = Uuid::new_v4();
-            pg.create_run(run_id, "exit run", None, &["test".to_string()], "running")
-                .await
-                .expect("create_run");
+            pg.create_run(
+                run_id,
+                "exit run",
+                None,
+                &["test".to_string()],
+                &OrchestrationRunConfig::default(),
+                "primary",
+            )
+            .await
+            .expect("create_run");
             let loop_state: SharedLoopState = Arc::new(tokio::sync::Mutex::new(
                 super::super::loop_engine::LoopState::new(),
             ));
@@ -4912,7 +4973,8 @@ mod tests {
                 "stopped run",
                 None,
                 &["test".to_string()],
-                "running",
+                &OrchestrationRunConfig::default(),
+                "primary",
             )
             .await
             .expect("create_run");
@@ -4956,9 +5018,16 @@ mod tests {
     async fn drift_verdict_failure_is_recorded_on_the_verify_row_then_cleared() {
         let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
-        pg.create_run(run_id, "verify run", None, &["test".to_string()], "running")
-            .await
-            .expect("create_run");
+        pg.create_run(
+            run_id,
+            "verify run",
+            None,
+            &["test".to_string()],
+            &OrchestrationRunConfig::default(),
+            "primary",
+        )
+        .await
+        .expect("create_run");
         let trid = Uuid::new_v4();
         let mut v = mk("verify", 0, &[], SubtaskState::Working);
         v.run_id = run_id;
@@ -5059,7 +5128,8 @@ mod tests {
             "unpaired run",
             None,
             &["test".to_string()],
-            "running",
+            &OrchestrationRunConfig::default(),
+            "primary",
         )
         .await
         .expect("create_run");
@@ -5310,7 +5380,8 @@ mod tests {
             "apply-tick outcome",
             None,
             &["implement".to_string()],
-            "running",
+            &OrchestrationRunConfig::default(),
+            "primary",
         )
         .await
         .expect("create_run");
