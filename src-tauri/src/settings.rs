@@ -3683,6 +3683,16 @@ pub struct Settings {
     /// unchanged. See [`crate::model_gateway`].
     #[serde(default)]
     pub model_gateway: crate::model_gateway::ModelGatewaySettings,
+    /// Permission posture for runner-spawned `claude` sessions (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D7). The
+    /// default keeps each spawn site's bypass flag. `allow_list` replaces it
+    /// with a pre-approved tool list, for machines whose IT-managed Claude Code
+    /// settings disable bypass mode. Read per spawn into
+    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`], so
+    /// every `LaunchSpec` spawn site honours it, and by the scheduler's
+    /// RemoteAgent launch.
+    #[serde(default)]
+    pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
 }
 
 /// Settings → Runner → "Allowed browser origins".
@@ -6328,6 +6338,25 @@ pub fn save_model_gateway(
     normalized.validate()?;
     let stored = normalized.clone();
     update_settings(move |settings| settings.model_gateway = normalized)?;
+    Ok(stored)
+}
+
+/// Get the session permission posture. See [`Settings::claude_session_permission`].
+///
+/// Read-only loader: consulted per spawn by `LaunchConfig::from_settings`.
+pub fn get_claude_session_permission(
+) -> crate::claude_session::launch_spec::SessionPermissionSetting {
+    read_settings_from_disk().settings.claude_session_permission
+}
+
+/// Validate, normalize and persist the session permission posture. Returns what
+/// was stored.
+pub fn save_claude_session_permission(
+    value: crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<crate::claude_session::launch_spec::SessionPermissionSetting, String> {
+    let normalized = value.normalized()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.claude_session_permission = normalized)?;
     Ok(stored)
 }
 
