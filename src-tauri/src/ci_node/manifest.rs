@@ -237,7 +237,16 @@ pub(crate) struct CiReader {
     /// The consumer repo: a bare `name` (same owner as this repo) or
     /// `owner/name`. Coord resolves it against the tenant's repos; the runner
     /// only checks its shape.
+    ///
+    /// A grant is to the consumer REPO, not to a workflow or a branch: every
+    /// ref and event of the consumer is admitted, so anyone who can push a
+    /// workflow to the consumer inherits read access to this repo.
     pub repo: String,
+    /// Admit the consumer's `pull_request_target` runs too. OFF by default:
+    /// that event runs with the base repo's identity on code a fork can
+    /// influence, so coord refuses it unless the entry opts in here.
+    #[serde(default)]
+    pub allow_pull_request_target: bool,
 }
 
 /// One declared repair.
@@ -1173,14 +1182,32 @@ repo = "example-org/other-consumer"
             m.ci_readers,
             vec![
                 CiReader {
-                    repo: "consumer-evals".to_string()
+                    repo: "consumer-evals".to_string(),
+                    allow_pull_request_target: false,
                 },
                 CiReader {
-                    repo: "example-org/other-consumer".to_string()
+                    repo: "example-org/other-consumer".to_string(),
+                    allow_pull_request_target: false,
                 },
             ]
         );
         assert_eq!(m.steps.len(), 1, "a reader grant is not a step");
+    }
+
+    /// `pull_request_target` runs with the BASE repo's secrets and OIDC
+    /// identity on code a fork controls, so a grant is closed to it unless the
+    /// entry opts in explicitly.
+    #[test]
+    fn ci_reader_pull_request_target_is_an_explicit_opt_in_defaulting_off() {
+        let m = parse_and_validate(WITH_CI_READERS).expect("valid");
+        assert!(!m.ci_readers[0].allow_pull_request_target);
+        let text = WITH_CI_READERS.replace(
+            "repo = \"consumer-evals\"",
+            "repo = \"consumer-evals\"\nallow_pull_request_target = true",
+        );
+        let m = parse_and_validate(&text).expect("opt-in parses");
+        assert!(m.ci_readers[0].allow_pull_request_target);
+        assert!(!m.ci_readers[1].allow_pull_request_target);
     }
 
     #[test]
