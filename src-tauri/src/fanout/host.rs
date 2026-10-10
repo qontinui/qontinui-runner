@@ -324,6 +324,10 @@ async fn spawn_member_terminal(
     .await;
     let working_dir = working_dir.unwrap_or_else(|| req.working_dir.clone());
     let handback = isolated_ctx.as_ref().map(|ctx| ctx.handback());
+    // The served-corpus line of the member's briefing, measured against the
+    // directory the member actually runs in, on the blocking pool (the
+    // gate/condition/looping spawns' convention).
+    let served = crate::served_corpus::probe_async(working_dir.as_str()).await;
 
     let result = launch_member(
         app,
@@ -337,6 +341,7 @@ async fn spawn_member_terminal(
             intent_repo,
             working_dir,
             isolated_ctx,
+            served,
         },
     );
     let err = match result {
@@ -387,6 +392,7 @@ struct LaunchInputs {
     intent_repo: Option<String>,
     working_dir: String,
     isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    served: crate::served_corpus::ServedCorpus,
 }
 
 /// Build the member's argv and hand it to the shared spawn seam. Its only
@@ -408,6 +414,7 @@ fn launch_member(
         intent_repo,
         working_dir,
         isolated_ctx,
+        served,
     } = inputs;
 
     // An isolated worktree is the member's own, so it gets the coord-mcp
@@ -431,7 +438,7 @@ fn launch_member(
         None => (Vec::new(), crate::coord_mcp::CoordMcpDelivery::Unknown),
     };
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-        crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+        crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp, &served),
     ));
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
     // `claude --name` for the member, from the same title its tab carries —
