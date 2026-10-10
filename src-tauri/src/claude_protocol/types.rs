@@ -194,9 +194,9 @@ pub struct ResultContent {
 /// Read both from an assistant message's `message.usage` and from the
 /// terminal `result` event's `usage` (see
 /// `claude_session::runner::extract_usage_from_stream_json`). The two prompt
-/// cache counters are billed separately from `input_tokens` (a cache write
-/// at 1.25x the input price, a cache read at 0.1x), so a reader that drops
-/// them under-counts every cached call.
+/// cache counters are billed separately from `input_tokens`, at rates that
+/// differ from the base input price (and, for cache writes, by cache TTL), so
+/// a reader that drops them under-counts every cached call.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UsageInfo {
     #[serde(default)]
