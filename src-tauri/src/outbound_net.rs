@@ -32,6 +32,15 @@
 //! `NO_PROXY` so reqwest, `git` and child processes skip the proxy for them
 //! too. A proxy can therefore never break the runner's calls to itself.
 //!
+//! # Corporate CA trust (Phase 5)
+//!
+//! The same startup step carries decision C3: when the profile names
+//! `network.ca_bundle` it exports `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE`
+//! (the stacks that cannot read the OS store), and on Windows — unless
+//! `network.trust` is `bundled` — it appends `http.sslBackend=schannel` to the
+//! `GIT_CONFIG_*` environment so the runner's `git` and its children trust the
+//! Windows store. [`tls_trust`] holds the per-stack census.
+//!
 //! # What is never logged
 //!
 //! Neither the proxy credential nor the request URL. The coord `/ws` URL and
@@ -52,7 +61,11 @@ use tokio_tungstenite::tungstenite::{
 use tracing::{debug, info, warn};
 
 use crate::coord_ws::CoordWs;
+pub use crate::profiles::TrustMode;
 use crate::profiles::NetworkProfile;
+
+/// Corporate CA trust: the per-stack census and its measurements (Phase 5).
+pub mod tls_trust;
 
 /// Upper bound on the proxy's CONNECT response (status line plus headers).
 /// A proxy that answers with more than this is not speaking HTTP/1.1 CONNECT
@@ -427,6 +440,13 @@ pub struct ProxyEnvOutcome {
     pub no_proxy: String,
     /// The variable NAMES this step wrote.
     pub exported: Vec<String>,
+    /// The profile's `network.trust` (default [`TrustMode::Os`]).
+    pub trust: TrustMode,
+    /// The CA bundle exported to Node / Python, when one was.
+    pub ca_bundle: Option<String>,
+    /// The `http.sslBackend` this step pointed git at, when it did (Windows,
+    /// trust `os`, and no backend already chosen by the operator).
+    pub git_ssl_backend: Option<String>,
 }
 
 const OPERATOR_PROXY_VARS: [&str; 6] = [
@@ -454,6 +474,17 @@ pub fn apply_profile_environment(
     network: Option<&NetworkProfile>,
     profile: Option<&str>,
     env: &mut impl EnvAccess,
+) -> ProxyEnvOutcome {
+    apply_profile_environment_for(network, profile, env, cfg!(windows))
+}
+
+/// [`apply_profile_environment`] with the platform as a parameter, so the
+/// Windows-only git step is testable on every host.
+pub fn apply_profile_environment_for(
+    network: Option<&NetworkProfile>,
+    profile: Option<&str>,
+    env: &mut impl EnvAccess,
+    windows: bool,
 ) -> ProxyEnvOutcome {
     let mut exported = Vec::new();
 
@@ -506,15 +537,73 @@ pub fn apply_profile_environment(
         }
     }
 
+    // Node and Python: the stacks that cannot read the OS store take the
+    // corporate root from a file. An operator's own value wins.
+    let ca_bundle = network
+        .and_then(|n| n.ca_bundle.as_ref())
+        .map(|p| p.display().to_string())
+        .filter(|p| !p.trim().is_empty());
+    if let Some(bundle) = &ca_bundle {
+        for key in ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"] {
+            if non_empty(env, key).is_none() {
+                env.set(key, bundle);
+                exported.push(key.to_string());
+            }
+        }
+    }
+
+    // git on Windows: Git for Windows defaults to its OpenSSL bundle; Schannel
+    // reads the Windows store.
+    let trust = network.and_then(|n| n.trust).unwrap_or_default();
+    let git_ssl_backend = if windows && trust == TrustMode::Os {
+        append_git_config(env, "http.sslBackend", "schannel", &mut exported)
+    } else {
+        None
+    };
+
     ProxyEnvOutcome {
         arm,
         proxy,
         profile: network.and(profile).map(str::to_string),
         no_proxy,
         exported,
+        trust,
+        ca_bundle,
+        git_ssl_backend,
     }
 }
 
+/// Append `key=value` to git's environment config (`GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`), AFTER any entries already
+/// there. Returns the value when it was written; `None` when the operator's
+/// own entries already set `key` (their choice stands) or when an existing
+/// `GIT_CONFIG_COUNT` is not a number (git itself would refuse that
+/// environment, and appending to it cannot repair it).
+fn append_git_config(
+    env: &mut impl EnvAccess,
+    key: &str,
+    value: &str,
+    exported: &mut Vec<String>,
+) -> Option<String> {
+    let count = match non_empty(env, "GIT_CONFIG_COUNT") {
+        None => 0usize,
+        Some(raw) => raw.trim().parse::<usize>().ok()?,
+    };
+    let already = (0..count).any(|i| {
+        env.get(&format!("GIT_CONFIG_KEY_{i}"))
+            .is_some_and(|k| k.trim().eq_ignore_ascii_case(key))
+    });
+    if already {
+        return None;
+    }
+    let key_var = format!("GIT_CONFIG_KEY_{count}");
+    let value_var = format!("GIT_CONFIG_VALUE_{count}");
+    env.set(&key_var, key);
+    env.set(&value_var, value);
+    env.set("GIT_CONFIG_COUNT", &(count + 1).to_string());
+    exported.extend([key_var, value_var, "GIT_CONFIG_COUNT".to_string()]);
+    Some(value.to_string())
+}
 
 /// A proxy URL with any `user:password@` removed, for display. A value that
 /// does not parse as a URL is withheld whole rather than printed raw.
@@ -581,7 +670,10 @@ pub fn log_startup_posture() {
         proxy = outcome.proxy.as_deref().unwrap_or("-"),
         profile = outcome.profile.as_deref().unwrap_or("-"),
         no_proxy = %outcome.no_proxy,
-        "outbound network: proxy rung resolved"
+        trust = ?outcome.trust,
+        ca_bundle = outcome.ca_bundle.as_deref().unwrap_or("-"),
+        git_ssl_backend = outcome.git_ssl_backend.as_deref().unwrap_or("-"),
+        "outbound network: proxy rung and TLS trust resolved"
     );
     if pac_script_configured() == Some(true) && outcome.arm == ProxyEnvArm::None {
         warn!(
@@ -1026,6 +1118,66 @@ mod tests {
         assert_eq!(out.profile, None);
         assert_eq!(env.get("NO_PROXY").as_deref(), Some("127.0.0.1,::1,localhost"));
         assert_eq!(env.get("HTTPS_PROXY"), None);
+    }
+
+    #[test]
+    fn a_ca_bundle_is_exported_to_node_and_python_unless_the_operator_set_one() {
+        let mut env = MapEnv::default();
+        env.set("SSL_CERT_FILE", "/operator/chosen.pem");
+        let n = NetworkProfile {
+            ca_bundle: Some(std::path::PathBuf::from("/corp/root.pem")),
+            ..NetworkProfile::default()
+        };
+        let out = apply_profile_environment_for(Some(&n), Some("dev"), &mut env, false);
+        assert_eq!(env.get("NODE_EXTRA_CA_CERTS").as_deref(), Some("/corp/root.pem"));
+        assert_eq!(env.get("SSL_CERT_FILE").as_deref(), Some("/operator/chosen.pem"));
+        assert_eq!(out.ca_bundle.as_deref(), Some("/corp/root.pem"));
+        assert!(out.exported.contains(&"NODE_EXTRA_CA_CERTS".to_string()));
+        assert!(!out.exported.contains(&"SSL_CERT_FILE".to_string()));
+    }
+
+    #[test]
+    fn on_windows_git_is_pointed_at_schannel_after_existing_entries() {
+        let mut env = MapEnv::default();
+        env.set("GIT_CONFIG_COUNT", "1");
+        env.set("GIT_CONFIG_KEY_0", "core.autocrlf");
+        env.set("GIT_CONFIG_VALUE_0", "false");
+        let out = apply_profile_environment_for(None, None, &mut env, true);
+        assert_eq!(out.git_ssl_backend.as_deref(), Some("schannel"));
+        assert_eq!(env.get("GIT_CONFIG_COUNT").as_deref(), Some("2"));
+        assert_eq!(env.get("GIT_CONFIG_KEY_0").as_deref(), Some("core.autocrlf"));
+        assert_eq!(env.get("GIT_CONFIG_KEY_1").as_deref(), Some("http.sslBackend"));
+        assert_eq!(env.get("GIT_CONFIG_VALUE_1").as_deref(), Some("schannel"));
+        assert_eq!(out.trust, TrustMode::Os);
+    }
+
+    #[test]
+    fn git_is_left_alone_off_windows_when_bundled_or_when_the_operator_chose() {
+        let mut env = MapEnv::default();
+        assert_eq!(apply_profile_environment_for(None, None, &mut env, false).git_ssl_backend, None);
+        assert_eq!(env.get("GIT_CONFIG_COUNT"), None, "never off Windows");
+
+        let bundled = NetworkProfile {
+            trust: Some(TrustMode::Bundled),
+            ..NetworkProfile::default()
+        };
+        let mut env = MapEnv::default();
+        let out = apply_profile_environment_for(Some(&bundled), Some("dev"), &mut env, true);
+        assert_eq!(out.git_ssl_backend, None);
+        assert_eq!(out.trust, TrustMode::Bundled);
+        assert_eq!(env.get("GIT_CONFIG_COUNT"), None, "network.trust=bundled opts out");
+
+        let mut env = MapEnv::default();
+        env.set("GIT_CONFIG_COUNT", "1");
+        env.set("GIT_CONFIG_KEY_0", "http.sslbackend");
+        env.set("GIT_CONFIG_VALUE_0", "openssl");
+        assert_eq!(apply_profile_environment_for(None, None, &mut env, true).git_ssl_backend, None);
+        assert_eq!(env.get("GIT_CONFIG_COUNT").as_deref(), Some("1"), "the operator's backend stands");
+
+        let mut env = MapEnv::default();
+        env.set("GIT_CONFIG_COUNT", "two");
+        assert_eq!(apply_profile_environment_for(None, None, &mut env, true).git_ssl_backend, None);
+        assert_eq!(env.get("GIT_CONFIG_KEY_0"), None, "an unreadable count is not appended to");
     }
 
     #[test]

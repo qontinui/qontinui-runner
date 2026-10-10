@@ -266,8 +266,9 @@ pub struct LayerSpec {
 ///
 /// The count is the point: the plan's original draft claimed fifteen and
 /// enumerated thirteen. Rows 4 and 15 are the two that were missing, and layer
-/// 15 is the one that must never be printed. Layer 16, the outbound proxy rung,
-/// was added by plan `2026-10-10-spec-front-end-phase-9-generic-boundary`.
+/// 15 is the one that must never be printed. Layers 16 (the outbound proxy rung)
+/// and 17 (the TLS trust census) were added by plan
+/// `2026-10-10-spec-front-end-phase-9-generic-boundary`.
 pub const LAYER_SPECS: &[LayerSpec] = &[
     LayerSpec {
         name: "settings_struct",
@@ -454,6 +455,19 @@ pub const LAYER_SPECS: &[LayerSpec] = &[
                     `NO_PROXY` in force, which always exempts loopback. The proxy \
                     is shown with any credential removed",
         anchor: "outbound_net::apply_profile_environment_at_startup",
+        side: LayerSide::Lib,
+        status: LayerStatus::Resolved,
+    },
+    LayerSpec {
+        name: "tls_trust",
+        title: "TLS trust source per stack (corporate CA census)",
+        describes: "which trust source each of the runner's TLS stacks uses — the \
+                    OS store, a bundled root list, or UNKNOWN — for the HTTP \
+                    clients, the WebSocket transports, crash reporting, `git`, the \
+                    `claude` CLI and the Python bridge, each with how its verdict is \
+                    known (measured by a test, configured, or not established), so \
+                    a deployment can show its security team what it trusts",
+        anchor: "outbound_net::tls_trust::census",
         side: LayerSide::Lib,
         status: LayerStatus::Resolved,
     },
@@ -906,6 +920,7 @@ fn resolve_layer(
         "profiles_coord_base" => resolve_profiles_coord_base(now),
         "secure_storage_keyring" => resolve_secure_storage(now),
         "network_proxy" => resolve_network_proxy(now),
+        "tls_trust" => resolve_tls_trust(now),
         // Bin-only layers arrive as data or not at all.
         "settings_struct" => inputs.settings_struct.clone().unwrap_or_else(|| {
             LayerReading::unknown(inputs.observer.missing_injection_reason(spec), now)
@@ -1073,6 +1088,26 @@ fn resolve_network_proxy(now: DateTime<Utc>) -> LayerReading {
     }
 }
 
+/// Layer 17 — the TLS trust census. Always readable: the table is static
+/// apart from what the startup step exported (a CA bundle, git's backend), and
+/// a process that never ran that step reports the rows that do not depend on
+/// it, with git's and the bundle's columns as for an unconfigured machine —
+/// which the source string says.
+fn resolve_tls_trust(now: DateTime<Utc>) -> LayerReading {
+    let outcome = crate::outbound_net::startup_outcome();
+    let rows = crate::outbound_net::tls_trust::census(outcome);
+    LayerReading::known(
+        crate::outbound_net::tls_trust::render_line(&rows),
+        if outcome.is_some() {
+            "outbound_net::tls_trust::census over the startup outcome"
+        } else {
+            "outbound_net::tls_trust::census — this process did not run the startup step, \
+             so no CA bundle or git backend export is reflected"
+        },
+        now,
+    )
+}
+
 /// Layer 15 — the credential store. Permanently withheld.
 ///
 /// There is no `Known` path out of this function, by construction. It does not
@@ -1212,12 +1247,12 @@ mod tests {
         }
     }
 
-    /// The inventory is sixteen layers with unique names (fifteen until the
-    /// outbound proxy rung landed), and the names are asserted against LITERALS — comparing the table to itself would pin
+    /// The inventory is seventeen layers with unique names (fifteen until the
+    /// outbound proxy rung and the TLS trust census landed), and the names are asserted against LITERALS — comparing the table to itself would pin
     /// nothing, and the count is exactly the fact the plan's draft got wrong.
     #[test]
     fn config_report_layer_table_is_the_unique_named_inventory() {
-        assert_eq!(LAYER_SPECS.len(), 16, "the inventory is sixteen layers");
+        assert_eq!(LAYER_SPECS.len(), 17, "the inventory is seventeen layers");
 
         let names: Vec<&str> = LAYER_SPECS.iter().map(|s| s.name).collect();
         assert_eq!(
@@ -1239,6 +1274,7 @@ mod tests {
                 "mcp_json",
                 "secure_storage_keyring",
                 "network_proxy",
+                "tls_trust",
             ]
         );
 
@@ -1307,11 +1343,12 @@ mod tests {
                 ("mcp_json", LayerSide::Bin),
                 ("secure_storage_keyring", LayerSide::Lib),
                 ("network_proxy", LayerSide::Lib),
+                ("tls_trust", LayerSide::Lib),
             ]
         );
         assert_eq!(
             resolved.len(),
-            16,
+            17,
             "after Phase 5 every layer in the inventory is resolved"
         );
     }

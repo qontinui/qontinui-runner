@@ -132,6 +132,14 @@ whether outbound traffic goes through an HTTP proxy and which rung decided it �
 - Owned by: lib
 - Status: reported
 
+## 17. TLS trust source per stack (corporate CA census) (`tls_trust`)
+
+which trust source each of the runner's TLS stacks uses — the OS store, a bundled root list, or UNKNOWN — for the HTTP clients, the WebSocket transports, crash reporting, `git`, the `claude` CLI and the Python bridge, each with how its verdict is known (measured by a test, configured, or not established), so a deployment can show its security team what it trusts
+
+- Resolved by: `outbound_net::tls_trust::census`
+- Owned by: lib
+- Status: reported
+
 ---
 
 A layer marked `UNKNOWN` in the report could **not be read** at the point the report was taken. It is never a default value. A layer marked `WITHHELD` holds credentials and is never printed.
