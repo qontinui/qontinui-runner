@@ -939,8 +939,7 @@ static KICK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// The kick sequence number the pass now running STARTED on — read at the top
 /// of each `refresher_loop` iteration, so every kick at or below it happened
 /// before the pass read any state.
-static PASS_IN_FLIGHT_KICK_SEQ: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PASS_IN_FLIGHT_KICK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The pass-concluded signal (plan
 /// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`
@@ -1266,7 +1265,10 @@ pub(crate) fn pair_bearer_for(
     slot: Option<String>,
     now: i64,
 ) -> PairBearer {
-    if let Some(t) = cognito.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+    if let Some(t) = cognito
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
         return PairBearer::Present(t);
     }
     match slot.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
@@ -1312,14 +1314,16 @@ impl PairMintAttempt {
     /// reads to decide between `expired` (a retry can help) and
     /// `unrefreshable` (only a sign-in can).
     pub(crate) fn verdict(&self) -> DefaultSlotRecovery {
-        if self.dmk_jwt.is_some() || matches!(self.outcome, Some(RefreshOutcome::Replaced { .. }))
-        {
+        if self.dmk_jwt.is_some() || matches!(self.outcome, Some(RefreshOutcome::Replaced { .. })) {
             return DefaultSlotRecovery::Refreshed;
         }
         match (&self.progress, &self.outcome) {
-            (PairProgress::BailNeedsSignIn { rejected_status: None }, _) => {
-                DefaultSlotRecovery::NeedsSignIn
-            }
+            (
+                PairProgress::BailNeedsSignIn {
+                    rejected_status: None,
+                },
+                _,
+            ) => DefaultSlotRecovery::NeedsSignIn,
             (PairProgress::BailNeedsSignIn { .. }, _)
             | (_, Some(RefreshOutcome::BearerRejected { .. })) => {
                 DefaultSlotRecovery::BearerRejected
@@ -2315,10 +2319,7 @@ static DEFAULT_SLOT_RECOVERY: std::sync::Mutex<Option<DefaultSlotRecoveryRecord>
 /// Record how the `Pair` arm's recovery of the default slot concluded.
 /// `slot_token` is what the slot holds NOW, after the attempt — the new
 /// credential on success, the unchanged dead one otherwise.
-pub(crate) fn record_default_slot_recovery(
-    verdict: DefaultSlotRecovery,
-    slot_token: Option<&str>,
-) {
+pub(crate) fn record_default_slot_recovery(verdict: DefaultSlotRecovery, slot_token: Option<&str>) {
     *DEFAULT_SLOT_RECOVERY
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(DefaultSlotRecoveryRecord {
@@ -13578,8 +13579,14 @@ mod default_slot_recovery_tests {
             pair_bearer_for(None, Some("qontinui_runner_legacy_abc".into()), now),
             PairBearer::Present("qontinui_runner_legacy_abc".into())
         );
-        assert_eq!(pair_bearer_for(None, Some("  ".into()), now), PairBearer::Nothing);
-        assert_eq!(pair_bearer_for(Some(" ".into()), None, now), PairBearer::Nothing);
+        assert_eq!(
+            pair_bearer_for(None, Some("  ".into()), now),
+            PairBearer::Nothing
+        );
+        assert_eq!(
+            pair_bearer_for(Some(" ".into()), None, now),
+            PairBearer::Nothing
+        );
     }
 
     #[tokio::test]
@@ -13598,7 +13605,11 @@ mod default_slot_recovery_tests {
         let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
         let got = attempt(&mgr, &base, &bearer, RefreshClass::NoSession).await;
 
-        assert_eq!(*mock.pair_hits.lock().unwrap(), 0, "D1: zero pair-cli requests");
+        assert_eq!(
+            *mock.pair_hits.lock().unwrap(),
+            0,
+            "D1: zero pair-cli requests"
+        );
         assert_eq!(
             *mock.dmk_hits.lock().unwrap(),
             1,
@@ -13625,7 +13636,11 @@ mod default_slot_recovery_tests {
         let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
         let got = attempt(&mgr, &base, &bearer, RefreshClass::NoSession).await;
 
-        assert_eq!(*mock.pair_hits.lock().unwrap(), 0, "D1: zero pair-cli requests");
+        assert_eq!(
+            *mock.pair_hits.lock().unwrap(),
+            0,
+            "D1: zero pair-cli requests"
+        );
         assert_eq!(
             *mock.dmk_hits.lock().unwrap(),
             0,
@@ -13647,10 +13662,8 @@ mod default_slot_recovery_tests {
         let _g = posture_test_lock();
         let now = chrono::Utc::now().timestamp();
         let mgr = setup("d1_transient", Some(&device_jwt(now - 60)), None);
-        let (base, _mock, _stop) = spawn_web(
-            (StatusCode::OK, "{}".into()),
-            (StatusCode::OK, "{}".into()),
-        );
+        let (base, _mock, _stop) =
+            spawn_web((StatusCode::OK, "{}".into()), (StatusCode::OK, "{}".into()));
         let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
         let got = attempt(&mgr, &base, &bearer, RefreshClass::Transient).await;
         assert_eq!(got.progress, PairProgress::BailRefreshFailedExpired);
@@ -13667,7 +13680,10 @@ mod default_slot_recovery_tests {
         let dead = device_jwt(now - 60);
         let mgr = setup("d2_401", Some(&dead), Some("dmk_unit_fixture"));
         let (base, mock, _stop) = spawn_web(
-            (StatusCode::UNAUTHORIZED, r#"{"error":"UNAUTHORIZED"}"#.into()),
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"UNAUTHORIZED"}"#.into(),
+            ),
             (StatusCode::FORBIDDEN, r#"{"error":"revoked"}"#.into()),
         );
 
@@ -13775,7 +13791,10 @@ mod default_slot_recovery_tests {
         let boot = publish(legacy(&dead), now);
         assert_eq!(boot.posture, CoordCredentialPosture::Expired);
         assert_eq!(boot.posture.cta(), Some("retry_refresh"));
-        assert_eq!(boot.last_refresh_outcome, None, "boot: no pass has concluded");
+        assert_eq!(
+            boot.last_refresh_outcome, None,
+            "boot: no pass has concluded"
+        );
 
         // The pass concludes: no bearer, no dmk recovery → `unrefreshable`.
         record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(&dead));
@@ -13948,7 +13967,10 @@ mod default_slot_recovery_tests {
 
         // A "Retry refresh now" kick, then the pass that answers it.
         let seq = KICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
-        assert!(begin_pass() >= seq, "the pass started after the kick answers it");
+        assert!(
+            begin_pass() >= seq,
+            "the pass started after the kick answers it"
+        );
         assert!(
             !wait_for_pass_concluded(seq, Duration::from_millis(20)).await,
             "not concluded before the tick runs"
