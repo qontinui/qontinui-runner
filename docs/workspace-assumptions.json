@@ -392,7 +392,8 @@
       "symbol": "program_stem",
       "excerpt": "for suffix in [\".exe\", \".cmd\", \".bat\", \".ps1\"] {",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "note": "Strips a Windows launcher suffix (.exe/.cmd/.bat/.ps1) off a program name so `claude.cmd` and `claude` match the same CLI profile. On every other OS the names carry no suffix, the loop matches nothing and the bare basename is returned; no Windows tool is invoked."
     },
     {
       "class": "os_bound_tooling",
