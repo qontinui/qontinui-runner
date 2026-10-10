@@ -36,6 +36,17 @@
 //! an honest "not paired" / "coord unreachable" state. A document whose
 //! frontmatter fails to parse degrades to a parameterless prompt carrying
 //! its raw body and a `parse_error`, never dropped.
+//!
+//! ## Authoring templates are not session prompts
+//!
+//! A `prompt_template` whose frontmatter declares `artifact_kind` (coord's
+//! `spec-*` seeds and their `<base>-for-<lob>` variants — plan
+//! `2026-10-10-spec-front-end-phase-6-specification-model-and-studio`
+//! Phase 3) is a template the spec studio renders an artifact from, not a
+//! prompt to type into a session. The picker leaves it out
+//! ([`is_authoring_template`]); offering it would start a session that does
+//! nothing useful. coord's write door requires `artifact_kind` on every spec
+//! template, so the marker is reliable.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -180,6 +191,46 @@ struct PromptFrontmatter {
     default_action: Option<String>,
     #[serde(default)]
     parameters: Vec<SkillParameter>,
+}
+
+/// The one frontmatter key that marks an authoring template. Unknown keys are
+/// ignored, so this parses any prompt template's frontmatter.
+#[derive(Debug, Deserialize)]
+struct AuthoringMarker {
+    #[serde(default)]
+    artifact_kind: Option<String>,
+}
+
+/// True when a document's frontmatter declares a non-empty `artifact_kind` —
+/// an authoring template for the spec studio, which the `/prompt` picker
+/// leaves out. A body with no frontmatter, or frontmatter that does not parse,
+/// is not one: it stays in the picker under the degrade contract of
+/// [`parse_prompt_document`] rather than vanishing.
+fn is_authoring_template(raw_body: &str) -> bool {
+    let Some((frontmatter_str, _)) = split_frontmatter(raw_body) else {
+        return false;
+    };
+    if frontmatter_str.trim().is_empty() {
+        return false;
+    }
+    serde_yaml::from_str::<AuthoringMarker>(frontmatter_str)
+        .ok()
+        .and_then(|m| m.artifact_kind)
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
+/// The picker's per-document decision: `None` for an authoring template
+/// (left out of `/prompt`), else the parsed prompt.
+fn picker_entry(
+    name: &str,
+    description: &str,
+    version: i64,
+    raw_body: &str,
+) -> Option<PromptTemplate> {
+    if is_authoring_template(raw_body) {
+        return None;
+    }
+    Some(parse_prompt_document(name, description, version, raw_body))
 }
 
 /// Normalize a frontmatter `default_action` to the closed set. Unknown or
@@ -530,6 +581,7 @@ pub async fn list_prompt_templates() -> Result<PromptLibraryResponse, String> {
     // 3. Hydrate each summary (bounded N+1 — single-digit library).
     let mut prompts = Vec::new();
     let mut unauthorized = false;
+    let mut excluded_authoring = 0usize;
     for summary in list_documents(&list_body) {
         let Some(name) = summary.get("name").and_then(Value::as_str) else {
             continue;
@@ -594,7 +646,10 @@ pub async fn list_prompt_templates() -> Result<PromptLibraryResponse, String> {
         };
         let doc = unwrap_document(&doc_body);
         let raw_body = doc.get("body").and_then(Value::as_str).unwrap_or_default();
-        prompts.push(parse_prompt_document(name, &description, version, raw_body));
+        match picker_entry(name, &description, version, raw_body) {
+            Some(prompt) => prompts.push(prompt),
+            None => excluded_authoring += 1,
+        }
     }
 
     if unauthorized && prompts.is_empty() {
@@ -606,7 +661,11 @@ pub async fn list_prompt_templates() -> Result<PromptLibraryResponse, String> {
 
     // 4. Store + serve.
     cache_store(new_etag, prompts.clone());
-    debug!(count = prompts.len(), "prompt-library: library fetched");
+    debug!(
+        count = prompts.len(),
+        excluded_authoring_templates = excluded_authoring,
+        "prompt-library: library fetched"
+    );
     Ok(PromptLibraryResponse::ok(prompts, None))
 }
 
@@ -876,6 +935,75 @@ Goal: {{goal}}
         let p = parse_prompt_document("bare", "d", 1, raw);
         assert_eq!(p.parse_error, None);
         assert_eq!(p.body, raw);
+    }
+
+    // ── Authoring templates are left out of the picker ──────────────────
+
+    /// The shape of coord's `test-fix-loop` seed frontmatter: a session prompt.
+    const TEST_FIX_LOOP_BODY: &str = r#"---
+title: Test & fix loop
+category: Testing
+icon: "🔁"
+default_action: spawn
+parameters:
+  - name: focus
+    type: string
+    label: Focus area
+    required: false
+---
+
+Drive this app through its UI Bridge. Focus: {{focus}}
+"#;
+
+    /// The shape of coord's `spec-story` seed frontmatter: an authoring
+    /// template (synthetic content).
+    const SPEC_STORY_BODY: &str = r#"---
+title: Story
+category: Specification
+artifact_kind: story
+line_of_business: generic
+sections:
+  - heading: Story
+    purpose: who needs what, and why
+---
+
+## Story
+
+As a <role>, I want <capability>.
+"#;
+
+    #[test]
+    fn the_picker_excludes_an_artifact_kind_template_and_keeps_test_fix_loop() {
+        let kept = picker_entry("test-fix-loop", "Test & fix loop", 1, TEST_FIX_LOOP_BODY)
+            .expect("test-fix-loop is a session prompt and stays in the picker");
+        assert_eq!(kept.name, "test-fix-loop");
+        assert_eq!(kept.parse_error, None);
+        assert_eq!(kept.category, "Testing");
+        assert_eq!(kept.parameters.len(), 1);
+
+        assert!(
+            picker_entry("spec-story", "Story", 1, SPEC_STORY_BODY).is_none(),
+            "an `artifact_kind` template is an authoring template and must not be listed"
+        );
+        // A tenant's `<base>-for-<lob>` variant is excluded the same way.
+        let variant = SPEC_STORY_BODY.replace("generic", "payments");
+        assert!(picker_entry("spec-story-for-payments", "Story", 2, &variant).is_none());
+    }
+
+    #[test]
+    fn only_a_non_empty_artifact_kind_marks_an_authoring_template() {
+        assert!(is_authoring_template(SPEC_STORY_BODY));
+        assert!(!is_authoring_template(TEST_FIX_LOOP_BODY));
+        // Blank value, no frontmatter, blank block: all stay in the picker.
+        assert!(!is_authoring_template(
+            "---\nartifact_kind: \"  \"\n---\n\nbody\n"
+        ));
+        assert!(!is_authoring_template("Just run the loop.\n"));
+        assert!(!is_authoring_template("---\n \n---\n\nbody\n"));
+        // Unparseable frontmatter degrades to a listed prompt, never vanishes.
+        let broken = "---\nartifact_kind: [unterminated\n---\n\nbody\n";
+        assert!(!is_authoring_template(broken));
+        assert!(picker_entry("broken", "d", 1, broken).is_some());
     }
 
     #[test]
