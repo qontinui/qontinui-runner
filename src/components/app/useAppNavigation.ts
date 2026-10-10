@@ -210,9 +210,20 @@ export function useAppNavigation(): UseAppNavigationReturn {
   // `id` is not in the `RouteInfo` TS interface but the tracker stores the
   // object verbatim and emits it in `page.route`, so the extra field round-trips
   // to consumers reading `page.route.id`.
-  useRouteAwareness({ pattern: activeTab, id: activeTab } as Parameters<
-    typeof useRouteAwareness
-  >[0]);
+  //
+  // `patternSource: "router"` asserts the pattern came from this app's own
+  // routing (the tab table), not from a URL: the runner's journey ledger stores
+  // `page.route.pattern` as a node's `pathnameTemplate` ONLY under that
+  // assertion (plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-
+  // route-pattern, D1). A tab id is a fixed identifier, never user input, so
+  // the assertion is honest. The field is not in the installed SDK's
+  // `RouteInfo` yet (it lands with that plan's Phase 2), so it rides the same
+  // cast as `id`.
+  useRouteAwareness({
+    pattern: activeTab,
+    id: activeTab,
+    patternSource: "router",
+  } as Parameters<typeof useRouteAwareness>[0]);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     // Honor a persisted explicit choice first. Otherwise default-collapse on

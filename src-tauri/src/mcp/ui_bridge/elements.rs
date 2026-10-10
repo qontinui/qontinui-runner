@@ -2907,6 +2907,9 @@ pub async fn ui_bridge_get_snapshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Arc<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // When this snapshot's request began — the journey ledger's evidence
+    // floor for a held navigation (D4).
+    let requested_at = std::time::Instant::now();
     let truthy = |v: &String| {
         let s = v.trim();
         s == "1" || s.eq_ignore_ascii_case("true")
@@ -3155,6 +3158,7 @@ pub async fn ui_bridge_get_snapshot_handler(
                     ),
                     None,
                     Arc::clone(&data),
+                    requested_at,
                 );
             }
             tokio::spawn(async move {
