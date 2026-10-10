@@ -156,17 +156,16 @@ export function recordBelongsToRestore(
  * picker appears and the verification loop answers it
  * (`buildPickerAnswer`). Exported for unit tests.
  *
- * Claude resumes are RENDERED BY THE BACKEND (`build_ai_resume_command`), never
- * assembled here. The backend owns the two decisions a typed resume must not
+ * Every resume, for every provider, is RENDERED BY THE BACKEND
+ * (`build_ai_resume_command`), never assembled here. The backend owns the two decisions a typed resume must not
  * get wrong: which `CLAUDE_CONFIG_DIR` the session runs under (a declared model
  * gateway replaces the recorded subscription dir, so a subscription token can
  * never ride a gateway-routed session) and the permission posture (bypass, or
  * the operator's allow-list). The resume-summary env thresholds ride along
  * under the default `"full"` policy.
  *
- * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
- * sourced from the provider descriptor's `resumeCommand`; a non-Claude
- * provider is rendered from that descriptor here.
+ * A non-Claude provider is rendered there too (review N7): the backend
+ * applies the gateway's provider refusal and validates/quotes the session id.
  */
 export async function buildResumeCmd(
   sessionId: string,

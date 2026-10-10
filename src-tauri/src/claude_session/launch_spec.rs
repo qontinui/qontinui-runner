@@ -455,7 +455,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // `--allow-dangerously-skip-permissions` would re-open bypass.
                 n if allow_list_spec && is_allow_list_owned_flag(n) => {
                     tracing::warn!(
-                        flag = %n,
+                        flag = %flag_name_only(n),
                         "launch template flag dropped: the allow-list permission mode owns it"
                     );
                 }
@@ -480,7 +480,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // what a reader of the launch would never guess.
                 name if caller_owns_append_prompt && is_append_prompt_flag(name) => {
                     tracing::warn!(
-                        flag = %name,
+                        flag = %flag_name_only(name),
                         "launch template flag dropped: the caller's system-prompt carrier owns \
                          the append slot and Claude Code refuses both append flags together"
                     );
@@ -491,7 +491,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // runner does not know yet — could widen what runs.
                 n if allow_list_spec && !is_permitted_under_allow_list(n) => {
                     tracing::warn!(
-                        flag = %n,
+                        flag = %flag_name_only(n),
                         "launch template flag dropped: not permitted under the allow-list \
                          permission mode"
                     );
@@ -501,7 +501,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 _ => {
                     if provided.contains(&unit.name) {
                         tracing::warn!(
-                            flag = %unit.name,
+                            flag = %flag_name_only(&unit.name),
                             "launch template flag dropped: the caller supplies the same flag"
                         );
                     } else {
@@ -715,7 +715,10 @@ fn is_permitted_under_allow_list(token: &str) -> bool {
             | "--verbose"
             | "--debug"
             | "-d"
-            | "--debug-file"
+            // `--debug-file` is NOT here (review L5): it writes to an
+            // arbitrary path. `--ide` and the `*-system-prompt-file` flags
+            // stay: they only READ a prompt file or attach to the IDE, and
+            // grant no tool.
             | "--output-format"
             | "--input-format"
             | "--include-partial-messages"
@@ -728,6 +731,12 @@ fn is_permitted_under_allow_list(token: &str) -> bool {
             | "--exclude-dynamic-system-prompt-sections"
             | "--ide"
     )
+}
+
+/// A template flag's NAME for a log line: the part before an attached `=value`
+/// (review L2). A value can be a path or a secret, and never reaches a log.
+fn flag_name_only(token: &str) -> &str {
+    token.split_once('=').map_or(token, |(name, _)| name)
 }
 
 /// Template flags an [`PermissionMode::AllowList`] spec owns, in either the
@@ -1043,6 +1052,14 @@ mod tests {
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
     }
 
+    /// Review L2: a dropped flag is logged by name only, never its value.
+    #[test]
+    fn flag_name_only_strips_an_attached_value() {
+        assert_eq!(flag_name_only("--debug-file=/secret/path"), "--debug-file");
+        assert_eq!(flag_name_only("--settings={\"k\":\"v\"}"), "--settings");
+        assert_eq!(flag_name_only("--verbose"), "--verbose");
+    }
+
     /// Review N4: under an allow-list only a known-harmless set of template
     /// flags survives — `--plugin-dir` (plugins carry PreToolUse allow hooks)
     /// and any flag the runner does not know are dropped.
@@ -1070,6 +1087,19 @@ mod tests {
         }
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
         assert!(argv.iter().any(|a| a == "--verbose"));
+        // Review L5: `--debug-file` writes to an arbitrary path, so it is not
+        // harmless under an allow-list, in either spelling.
+        let argv = render_argv(
+            &s,
+            &tmpl("claude --debug-file /tmp/d.log --debug-file=/tmp/e.log --verbose"),
+            "claude",
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.starts_with("--debug-file") || a.ends_with(".log")),
+            "{argv:?}"
+        );
         // Outside an allow-list the same template flags still layer in.
         let argv = render_argv(&spec(), &tmpl("claude --plugin-dir /p"), "claude");
         assert_eq!(value_after(&argv, "--plugin-dir"), Some("/p"));

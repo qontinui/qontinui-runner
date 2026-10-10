@@ -37,10 +37,9 @@ impl IsolatedExecutor {
         security_policy: Option<&crate::security::SecurityPolicy>,
         extra_env: &[String],
     ) -> Result<ContainerResult, String> {
-        if let Some(refusal) = crate::model_gateway::container_claude_refusal(
-            command,
-            &crate::model_gateway::resolution(),
-        ) {
+        if let Some(refusal) =
+            crate::model_gateway::container_step_refusal(&crate::model_gateway::resolution())
+        {
             return Err(refusal);
         }
         if !self.docker.is_available() {
@@ -97,10 +96,9 @@ impl IsolatedExecutor {
         }
         // The container WOULD run this step: refuse outright rather than
         // "fall back to host", so the refusal reaches the caller (review N6).
-        if let Some(refusal) = crate::model_gateway::container_claude_refusal(
-            command,
-            &crate::model_gateway::resolution(),
-        ) {
+        if let Some(refusal) =
+            crate::model_gateway::container_step_refusal(&crate::model_gateway::resolution())
+        {
             return Err(refusal);
         }
 
