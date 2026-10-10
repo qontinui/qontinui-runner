@@ -571,14 +571,21 @@ pub fn save_claude_default_launch_command(
 #[tauri::command]
 pub fn get_model_gateway() -> Result<CommandResponse, String> {
     let gateway = settings::get_model_gateway();
-    let valid = gateway.validate();
+    // The tri-state answer (`model_gateway::GatewayState`): an unreadable file
+    // or a reset with the sticky marker present reads "unknown", not "none".
+    let (state, problem) = match crate::model_gateway::state() {
+        crate::model_gateway::GatewayState::NotDeclared => ("not_declared", None),
+        crate::model_gateway::GatewayState::Declared(s) => ("declared", s.validate().err()),
+        crate::model_gateway::GatewayState::Unknown(reason) => ("unknown", Some(reason)),
+    };
     Ok(CommandResponse {
         success: true,
-        message: valid.as_ref().err().cloned(),
+        message: problem.clone(),
         data: Some(serde_json::json!({
             "gateway": gateway,
-            "declared": gateway.is_declared(),
-            "valid": valid.is_ok(),
+            "state": state,
+            "declared": state != "not_declared",
+            "valid": problem.is_none(),
         })),
     })
 }
@@ -689,6 +696,109 @@ pub fn build_ai_launch_command(
     })
 }
 
+/// Render the shell command a restored or operator-resumed Claude tab types:
+/// `[env…] claude <permission> --resume <id>` (review H1).
+///
+/// Every typed resume goes through here, so the frontend never decides the two
+/// things it must not get wrong:
+///
+/// - **The config dir.** A declared model gateway replaces the recorded
+///   subscription dir with the gateway config dir, so a subscription token can
+///   never ride a gateway-routed session. An unresolved gateway refuses.
+/// - **The permission posture.** Bypass by default; `dontAsk` plus the
+///   operator's allow-list when selected.
+///
+/// `full_resume` adds the resume-size thresholds that suppress the CLI's
+/// "Resume from summary?" picker for an unattended restore (#548 item 3).
+/// Templates are deliberately not applied: a resume never layered the
+/// operator's launch template, and an opaque alias cannot carry `--resume`.
+#[tauri::command]
+pub fn build_ai_resume_command(
+    session_id: String,
+    config_dir: Option<String>,
+    is_windows: bool,
+    full_resume: bool,
+) -> Result<CommandResponse, String> {
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        return Err(refusal);
+    }
+    let gateway_dir = crate::model_gateway::session_config_dir_override();
+    let command = render_ai_resume_command(
+        &session_id,
+        config_dir.as_deref(),
+        gateway_dir.as_deref(),
+        is_windows,
+        full_resume,
+        &settings::get_claude_session_permission(),
+    )?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "command": command })),
+    })
+}
+
+/// Pure core of [`build_ai_resume_command`].
+pub(crate) fn render_ai_resume_command(
+    session_id: &str,
+    recorded_config_dir: Option<&str>,
+    gateway_config_dir: Option<&str>,
+    is_windows: bool,
+    full_resume: bool,
+    posture: &crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<String, String> {
+    use crate::claude_session::launch_spec::{
+        render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
+    };
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "refusing to resume: invalid session id '{session_id}'"
+        ));
+    }
+    // The gateway dir wins over whatever account the tab recorded.
+    let config_dir = gateway_config_dir
+        .or(recorded_config_dir)
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if let Some(dir) = config_dir {
+        // The dir is interpolated inside double quotes on both shells; refuse
+        // anything that could close the quote or expand inside it.
+        if dir.contains(['"', '`', '$', '\n', '\r']) {
+            return Err(format!("refusing to resume: unsafe config dir '{dir}'"));
+        }
+    }
+    let spec = LaunchSpec {
+        config_dir: config_dir.map(str::to_string),
+        permission: PermissionMode::BypassPermissions,
+        resume_id: Some(session_id.to_string()),
+        ..Default::default()
+    };
+    let cfg = LaunchConfig {
+        default_template: None,
+        account_command: None,
+        session_permission: posture.clone(),
+    };
+    let body = render_pty_command(&spec, &cfg, is_windows);
+    let mut prefix = String::new();
+    if full_resume {
+        for var in [
+            "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD",
+            "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES",
+        ] {
+            if is_windows {
+                prefix.push_str(&format!("$env:{var}=\"999999999\"; "));
+            } else {
+                prefix.push_str(&format!("{var}=\"999999999\" "));
+            }
+        }
+    }
+    Ok(format!("{prefix}{body}"))
+}
+
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_config")
         .invoke_handler(tauri::generate_handler![
@@ -713,7 +823,98 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_model_gateway,
             get_claude_session_permission,
             save_claude_session_permission,
+            build_ai_resume_command,
             build_ai_launch_command,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod resume_render_tests {
+    use super::render_ai_resume_command;
+    use crate::claude_session::launch_spec::SessionPermissionSetting;
+
+    const SID: &str = "230feb99-2dd7-42d7-92bc-6d36c1883089";
+
+    /// The non-gateway, bypass case types exactly what the frontend used to.
+    #[test]
+    fn default_resume_matches_the_historical_typed_command() {
+        let cmd = render_ai_resume_command(
+            SID,
+            Some("/home/user/.claude"),
+            None,
+            false,
+            true,
+            &SessionPermissionSetting::SiteDefault,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            format!(
+                "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=\"999999999\" \
+                 CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=\"999999999\" \
+                 CLAUDE_CONFIG_DIR=\"/home/user/.claude\" claude --permission-mode \
+                 bypassPermissions --resume {SID}"
+            )
+        );
+        let summary =
+            render_ai_resume_command(SID, None, None, false, false, &Default::default()).unwrap();
+        assert_eq!(
+            summary,
+            format!("claude --permission-mode bypassPermissions --resume {SID}")
+        );
+    }
+
+    /// Review H1: under a gateway the recorded subscription dir is replaced by
+    /// the gateway config dir — a subscription token never rides the session.
+    #[test]
+    fn gateway_dir_replaces_the_recorded_subscription_dir() {
+        let cmd = render_ai_resume_command(
+            SID,
+            Some("/home/user/.claude-subscription"),
+            Some("/cfg/model-gateway/claude-config"),
+            false,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            cmd.starts_with("CLAUDE_CONFIG_DIR=\"/cfg/model-gateway/claude-config\" "),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("claude-subscription"), "{cmd}");
+    }
+
+    /// Review H1/M2: the resume honours the allow-list posture.
+    #[test]
+    fn resume_honours_the_allow_list_posture() {
+        let posture = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string()],
+        };
+        let cmd = render_ai_resume_command(SID, None, None, true, true, &posture).unwrap();
+        assert!(
+            cmd.starts_with("$env:CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=\"999999999\"; "),
+            "{cmd}"
+        );
+        assert!(
+            cmd.ends_with(&format!(
+                "claude --permission-mode dontAsk --allowedTools Read --resume {SID}"
+            )),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("bypassPermissions"));
+    }
+
+    #[test]
+    fn unsafe_ids_and_dirs_are_refused() {
+        let p = SessionPermissionSetting::SiteDefault;
+        assert!(render_ai_resume_command("a; rm -rf /", None, None, false, true, &p).is_err());
+        assert!(render_ai_resume_command("", None, None, false, true, &p).is_err());
+        for dir in ["/x\"; evil", "/x$(evil)", "/x`evil`", "C:/$env:Y"] {
+            assert!(
+                render_ai_resume_command(SID, Some(dir), None, false, true, &p).is_err(),
+                "{dir}"
+            );
+        }
+    }
 }

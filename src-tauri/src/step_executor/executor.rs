@@ -543,7 +543,22 @@ impl StepExecutor {
                         .map(|s| s.as_str())
                         .collect()
                 };
-            let cred_proxy = crate::security::credential_proxy::CredentialProxy::new(&cred_names);
+            // Review M3: while a model gateway is declared (or its state is
+            // unknown) the container never holds the vendor Anthropic key, not
+            // even as a placeholder; a valid gateway instead gets its base URL
+            // and a placeholder for the helper's key, injected for the gateway
+            // host only.
+            let resolution = crate::model_gateway::resolution();
+            let cred_names = if matches!(resolution, crate::model_gateway::Resolution::NoGateway) {
+                cred_names
+            } else {
+                crate::security::credential_proxy::without_vendor_credentials(&cred_names)
+            };
+            let mut cred_proxy =
+                crate::security::credential_proxy::CredentialProxy::new(&cred_names);
+            if let crate::model_gateway::Resolution::Gateway(g) = &resolution {
+                cred_proxy.add_model_gateway(g);
+            }
             ctx = ctx.with_credential_placeholders(cred_proxy.placeholder_env_vars());
             Some(cred_proxy)
         } else {

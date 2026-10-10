@@ -116,7 +116,11 @@ pub(super) fn run_claude_api(
                 if !resp.status().is_success() {
                     let status = resp.status();
                     if status == StatusCode::TOO_MANY_REQUESTS {
-                        mark_current_account_rate_limited(resp.headers());
+                        // A gateway 429 says nothing about a subscription
+                        // account's quota (review L5).
+                        if call.may_mark_account_rate_limited() {
+                            mark_current_account_rate_limited(resp.headers());
+                        }
                     }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!("Claude API error ({}): {}", status, body));
@@ -218,7 +222,11 @@ pub(super) fn run_claude_api_with_overrides(
                 if !resp.status().is_success() {
                     let status = resp.status();
                     if status == StatusCode::TOO_MANY_REQUESTS {
-                        mark_current_account_rate_limited(resp.headers());
+                        // A gateway 429 says nothing about a subscription
+                        // account's quota (review L5).
+                        if call.may_mark_account_rate_limited() {
+                            mark_current_account_rate_limited(resp.headers());
+                        }
                     }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!("Claude API error ({}): {}", status, body));
@@ -329,7 +337,11 @@ pub(super) fn run_claude_api_multimodal(
                 if !resp.status().is_success() {
                     let status = resp.status();
                     if status == StatusCode::TOO_MANY_REQUESTS {
-                        mark_current_account_rate_limited(resp.headers());
+                        // A gateway 429 says nothing about a subscription
+                        // account's quota (review L5).
+                        if call.may_mark_account_rate_limited() {
+                            mark_current_account_rate_limited(resp.headers());
+                        }
                     }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
@@ -431,7 +443,11 @@ pub(super) fn run_claude_api_cached(
                 if !resp.status().is_success() {
                     let status = resp.status();
                     if status == StatusCode::TOO_MANY_REQUESTS {
-                        mark_current_account_rate_limited(resp.headers());
+                        // A gateway 429 says nothing about a subscription
+                        // account's quota (review L5).
+                        if call.may_mark_account_rate_limited() {
+                            mark_current_account_rate_limited(resp.headers());
+                        }
                     }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
@@ -572,7 +588,11 @@ pub(super) fn run_claude_api_with_structured_output(
                 if !resp.status().is_success() {
                     let status = resp.status();
                     if status == StatusCode::TOO_MANY_REQUESTS {
-                        mark_current_account_rate_limited(resp.headers());
+                        // A gateway 429 says nothing about a subscription
+                        // account's quota (review L5).
+                        if call.may_mark_account_rate_limited() {
+                            mark_current_account_rate_limited(resp.headers());
+                        }
                     }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
