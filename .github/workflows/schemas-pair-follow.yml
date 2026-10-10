@@ -105,7 +105,7 @@ jobs:
       followups: ${{ steps.decide.outputs.followups }}
       unknowns: ${{ steps.decide.outputs.unknowns }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -166,14 +166,14 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out main's pair-follow tooling
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: main
           persist-credentials: false
 
       - name: Check out the runner PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ matrix.item.head_sha }}
           path: runner
@@ -224,7 +224,7 @@ jobs:
 
       - name: Upload the pair-follow bundle
         if: steps.pin.outputs.MODE == 'FOLLOW' || steps.pin.outputs.MODE == 'MERGE_ONLY'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pair-follow-${{ matrix.item.pr }}
           path: ${{ runner.temp }}/out/
@@ -242,6 +242,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # remove the stale form-2 label, post the one comment
+      actions: read # list this run's artifacts (the "No bundle" step)
     strategy:
       fail-fast: false
       matrix:
@@ -251,7 +252,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out main's pair-follow tooling
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: main
@@ -260,7 +261,7 @@ jobs:
       - name: Download the pair-follow bundle
         id: dl
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pair-follow-${{ matrix.item.pr }}
           path: ${{ runner.temp }}/out
@@ -280,13 +281,39 @@ jobs:
           printf '%s' "$PLAN_ITEM" > "$RUNNER_TEMP/plan-item.json"
           bash main/scripts/schemas-pair-follow.sh push "$RUNNER_TEMP/plan-item.json" "$RUNNER_TEMP/out" "$RUNNER_TEMP/verify"
 
-      # No bundle means the compute leg skipped (merge conflict, already
-      # contained) or failed. Its own log names which; the verdict job reds on a
-      # failed compute leg.
+      # The download failing has two causes that must not look alike:
+      #  - the compute leg produced NO bundle (skipped: merge conflict, already
+      #    contained; or failed — its own log names which, and the verdict job
+      #    reds on a failed compute leg). That is the intended green path.
+      #  - a bundle WAS produced but could not be downloaded. Then the push
+      #    silently did not happen, so this step fails.
+      # Told apart by listing this run's artifacts for the item's exact name.
+      # (Not a compute-job output: compute is a matrix, and a matrix job's
+      # outputs keep only one leg's value, so they cannot say which PR's
+      # bundle exists.) A listing that cannot be read is UNKNOWN and fails.
       - name: No bundle for this PR
         if: steps.dl.outcome != 'success'
         shell: bash
-        run: echo "No pair-follow bundle for #${{ matrix.item.pr }} — see the compute leg."
+        # A block scalar, not a plain one: in a plain YAML scalar ` #` opens a
+        # COMMENT, so the old one-liner reached bash as `echo "No pair-follow
+        # bundle for` — an unterminated quote that failed this step instead of
+        # printing the note (found by actionlint/shellcheck). The PR number is
+        # passed through env rather than spliced into the script.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ matrix.item.pr }}
+        run: |
+          set -uo pipefail
+          name="pair-follow-${PR_NUMBER}"
+          if ! count="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?name=${name}" --jq '.total_count')"; then
+            echo "::error::Could not list this run's artifacts, so whether a bundle for #${PR_NUMBER} was produced is UNKNOWN; refusing to report a skip."
+            exit 1
+          fi
+          case "${count}" in
+            0) echo "No pair-follow bundle for #${PR_NUMBER} — see the compute leg." ;;
+            ''|*[!0-9]*) echo "::error::Unreadable artifact count '${count}' for ${name}."; exit 1 ;;
+            *) echo "::error::A pair-follow bundle for #${PR_NUMBER} exists (${name}) but could not be downloaded, so it was NOT pushed."; exit 1 ;;
+          esac
 
   verdict:
     name: Pair-follow verdict
