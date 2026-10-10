@@ -1485,6 +1485,14 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 // `capabilities @> '["ci_node"]'::jsonb` filters in coord's `ci_dispatch.rs`
 // read it, and `ci:node` would break all of them for zero capability gain.
 //
+// The memory tiers `mem_ge_<N>` (N in `MEMORY_TIERS_GIB`: 8..256 GiB,
+// cumulative) are the one family outside that grammar, deliberately: plan
+// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6 fixes the
+// spelling as the wire contract `canonical_repos.ci_node_required_capabilities`
+// seeds name, and coord's `@>` containment needs no grammar. Total memory is
+// read once per process (`resource_guard::host_capacity`), not behind
+// `HOST_PROBE_TTL`.
+//
 // `runtime:webview` was added by plan
 // `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 2.
 // That plan named the root cause of its 21 `spawn_failed: no Tauri AppHandle`
@@ -1608,11 +1616,11 @@ fn host_mem_total_bytes() -> Option<u64> {
 /// * **The spelling is a wire contract.** Respelling a token, or removing a
 ///   tier, silently un-targets every repo that requires it, with nothing red on
 ///   either side.
-pub(crate) const MEMORY_TIERS_GIB: [u64; 6] = [8, 16, 32, 64, 128, 256];
+const MEMORY_TIERS_GIB: [u64; 6] = [8, 16, 32, 64, 128, 256];
 
 /// Prefix of the memory-tier capability token: `mem_ge_<N>` for N in
 /// [`MEMORY_TIERS_GIB`].
-pub(crate) const MEMORY_TIER_CAPABILITY_PREFIX: &str = "mem_ge_";
+const MEMORY_TIER_CAPABILITY_PREFIX: &str = "mem_ge_";
 
 /// How far below a tier's nominal size the reported total may fall and still
 /// meet it, in percent.
@@ -1631,6 +1639,10 @@ pub(crate) const MEMORY_TIER_CAPABILITY_PREFIX: &str = "mem_ge_";
 /// N's nominal size — the "nominally that size" case the tolerance exists for.
 /// Common non-power-of-two configurations (12, 24, 48, 96, 192 GiB) all sit
 /// below the 90% line of the tier above them and stay in the tier below.
+///
+/// **A runner inside WSL2 or a VM** reports the VM's allocation (WSL2 defaults
+/// to half the host), not the host's, and advertises that tier. That is the
+/// intended answer: it is the memory a build there actually gets.
 const MEMORY_TIER_TOLERANCE_PERCENT: u64 = 10;
 
 /// The cumulative `mem_ge_<N>` tokens a host with `mem_total_bytes` of total
@@ -7809,12 +7821,13 @@ mod tests {",
     /// non-power-of-two configurations stay in the tier below.
     #[test]
     fn memory_tier_threshold_boundaries() {
-        // 90% of 16 GiB = 14.4 GiB — exactly on the line meets the tier...
+        // 90% of 16 GiB = 14.4 GiB is not a whole number of bytes; `line` is
+        // the first byte at or above it, which meets the tier...
         let line = (16 * GIB_BYTES * 9).div_ceil(10);
         assert!(memory_tier_capabilities(Some(line)).contains(&"mem_ge_16".to_string()));
         // ...one byte under does not.
         assert_eq!(memory_tier_capabilities(Some(line - 1)), vec!["mem_ge_8"]);
-        // A ~7.6 GiB "8 GB" box meets mem_ge_8.
+        // A ~7.44 GiB "8 GB" box meets mem_ge_8 (its line is 7.2 GiB).
         assert_eq!(
             memory_tier_capabilities(Some(7_800_000 * 1024)),
             vec!["mem_ge_8"]
@@ -7855,11 +7868,18 @@ mod tests {",
     }
 
     /// The live probe path: this process can read its own memory, so the
-    /// assembled host set carries at least the tiers its `MemTotal` meets,
-    /// and the tokens agree with the shared resource-guard probe.
+    /// assembled host set carries exactly the tiers its `MemTotal` meets
+    /// (agreeing with the shared resource-guard probe), and at least
+    /// `mem_ge_8` — every dev and CI host is above the 7.2 GiB line.
     #[test]
     fn live_host_capabilities_carry_the_probed_memory_tiers() {
-        let expected = memory_tier_capabilities(crate::resource_guard::host_capacity().mem_bytes);
+        let mem = crate::resource_guard::host_capacity().mem_bytes;
+        assert!(mem.is_some(), "a test host must be able to read its memory");
+        let expected = memory_tier_capabilities(mem);
+        assert!(
+            expected.iter().any(|c| c == "mem_ge_8"),
+            "a test host meets at least mem_ge_8, got {expected:?}"
+        );
         let caps = host_capabilities();
         let got: Vec<&String> = caps
             .iter()
