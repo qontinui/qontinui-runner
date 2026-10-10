@@ -43,6 +43,13 @@ pub struct RemoteTabIdentity {
     /// True when the target holds ring bytes OLDER than the attach seed —
     /// the "Load earlier output" affordance is offered only then.
     pub history_available: bool,
+    /// The last relay-reconnect reattach this tab's pane spliced, with the
+    /// arm derived on the source (plan
+    /// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+    /// Phase 3). `None` until the first reattach. Read from the pane at query
+    /// time by `TerminalManager::remote_identities`, so it is always the
+    /// LATEST reattach, never the attach-time snapshot.
+    pub last_reattach: Option<super::remote_pane_io::ReattachRecord>,
 }
 
 /// What `terminal_attach_remote` returns: the ordinary `TerminalInfo` the

@@ -833,6 +833,7 @@ pub(crate) async fn open_remote_tab(
         remote_terminal_id: attached.terminal_id.clone(),
         grant_jti: minted.grant_jti.clone(),
         history_available: pane.history_range().is_some(),
+        last_reattach: None,
     };
 
     let io: Arc<dyn PaneIo> = pane.clone();
@@ -1431,6 +1432,7 @@ mod remote_close_tests {
             remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
             grant_jti: "01a0905e".into(),
             history_available: false,
+            last_reattach: None,
         }
     }
 
@@ -1819,6 +1821,7 @@ mod interactivity_command_tests {
             remote_terminal_id: "rt-1".into(),
             grant_jti: "jti-1".into(),
             history_available: false,
+            last_reattach: None,
         }
     }
 

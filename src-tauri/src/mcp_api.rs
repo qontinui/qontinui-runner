@@ -13548,6 +13548,12 @@ pub fn create_router(
     #[cfg(debug_assertions)]
     let base_router = base_router.merge(crate::mcp::debug_graceful_exit::routes());
 
+    // Debug-only wire hold (`POST /__debug/terminals/{id}/wire-hold`) for the
+    // A5 reattach acceptance: pauses a remote tab's wire so drift can accrue
+    // before a relay kick. Same cfg gate as its module declaration.
+    #[cfg(debug_assertions)]
+    let base_router = base_router.merge(crate::mcp::debug_wire_hold::routes());
+
     // Canonical JSON 404 for unmatched routes. axum's default fallback returns
     // an empty body with no Content-Type, which both breaks the canonical
     // envelope contract and trips the debug envelope_audit layer (it sees a

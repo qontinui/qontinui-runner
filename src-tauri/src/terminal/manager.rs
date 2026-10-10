@@ -265,11 +265,24 @@ impl TerminalManager {
 
     /// Every live remote tab's identity keyed by local terminal id — what a
     /// reconnecting webview reads to re-badge tabs `terminal_list` cannot.
+    ///
+    /// `last_reattach` is read from each tab's pane NOW, not from the
+    /// identity recorded at attach: a reattach happens later, on every relay
+    /// reconnect, and only the pane knows the latest one.
     pub fn remote_identities(&self) -> HashMap<TerminalId, super::types::RemoteTabIdentity> {
-        self.remote_identities
+        let mut map = self
+            .remote_identities
             .lock()
             .map(|m| m.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Ok(panes) = self.remote_panes.lock() {
+            for (id, identity) in map.iter_mut() {
+                if let Some(pane) = panes.get(id) {
+                    identity.last_reattach = pane.last_reattach();
+                }
+            }
+        }
+        map
     }
 
     /// Create a new terminal session, returning its info.
@@ -1072,6 +1085,60 @@ mod tests {
         );
     }
 
+    /// A5 Phase 3: `remote_identities` reports the pane's LATEST reattach,
+    /// not the attach-time snapshot (which never has one).
+    #[test]
+    fn remote_identities_carry_the_panes_latest_reattach() {
+        use crate::terminal::remote_pane_io::tests::RecordingSink;
+        use crate::terminal::remote_pane_io::{
+            AttachedRing, ReattachArm, RemoteFrameSink, RemotePaneIo,
+        };
+        use crate::terminal::types::RemoteTabIdentity;
+        use std::sync::Arc;
+
+        let tm = TerminalManager::new();
+        tm.set_remote_identity(
+            "tab",
+            RemoteTabIdentity {
+                device_id: "device-1".into(),
+                device_label: "spaceship".into(),
+                session_id: "session-1".into(),
+                remote_terminal_id: "remote-term".into(),
+                grant_jti: "jti-1".into(),
+                history_available: false,
+                last_reattach: None,
+            },
+        );
+        let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "remote-term",
+            "grant.jwt",
+            sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        tm.set_remote_pane("tab", pane.clone());
+        assert_eq!(tm.remote_identities()["tab"].last_reattach, None);
+
+        let _ = pane.reattach_frame("reattach:jti-1");
+        let ring = AttachedRing {
+            buffer: Vec::new(),
+            start_offset: 0,
+            total_bytes_produced: 1_000_000,
+            history_start: Some(0),
+        };
+        pane.record_reattach(&ring, 64 * 1024);
+        let got = tm.remote_identities()["tab"]
+            .last_reattach
+            .clone()
+            .expect("the pane's record");
+        assert_eq!(got.arm, ReattachArm::ReattachFromHave);
+        let v = serde_json::to_value(tm.remote_identities()).unwrap();
+        assert_eq!(v["tab"]["lastReattach"]["arm"], "reattach_from_have");
+    }
+
     /// Every close path clears BOTH remote maps. `close` and `close_all`
     /// always did; `close_after_graceful_exit` cleared only the identity, so
     /// a remote tab torn down by `graceful_exit` leaked its pane.
@@ -1096,6 +1163,7 @@ mod tests {
                     remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
                     grant_jti: "jti-1".into(),
                     history_available: false,
+                    last_reattach: None,
                 },
             );
             let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
