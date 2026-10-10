@@ -870,20 +870,32 @@ pub(crate) fn snapshot_view(body: &serde_json::Value) -> &serde_json::Value {
 async fn run_worker(pg_db: Arc<PgDb>, mut rx: mpsc::Receiver<JourneyEvent>) {
     let mut cursors = Cursors::default();
     loop {
-        // A held edge (D4) must close at its deadline even when no further
-        // event arrives for its cursor, so wake for the earliest one.
-        let event = match cursors.next_hold_deadline() {
-            Some(deadline) => tokio::select! {
-                ev = rx.recv() => ev,
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                    Some(JourneyEvent::Sweep)
-                }
-            },
-            None => rx.recv().await,
+        let Some(event) = next_event(&mut rx, &cursors).await else {
+            break;
         };
-        let Some(event) = event else { break };
         process_event(&pg_db, &mut cursors, event).await;
         health::set_pending_open(cursors.pending_count() as u64);
+    }
+}
+
+/// The worker's next event. A held edge (D4) must close even when no further
+/// event arrives for its cursor, so the worker also wakes at
+/// [`Cursors::next_hold_deadline`] (a hold's deadline plus `HOLD_GRACE`) and
+/// sweeps. `biased`: an event already queued — typically the snapshot taken
+/// inside the window — is always processed before the timer's sweep.
+pub(crate) async fn next_event(
+    rx: &mut mpsc::Receiver<JourneyEvent>,
+    cursors: &Cursors,
+) -> Option<JourneyEvent> {
+    match cursors.next_hold_deadline() {
+        Some(wake) => tokio::select! {
+            biased;
+            ev = rx.recv() => ev,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {
+                Some(JourneyEvent::Sweep)
+            }
+        },
+        None => rx.recv().await,
     }
 }
 
@@ -1561,6 +1573,89 @@ mod tests {
             );
         }
         assert_eq!(cached_answer(&ProbeCache::Unprobed, t0), None);
+    }
+
+    // ---- D4: the worker's hold timer -----------------------------------------
+
+    /// The review's race: a snapshot requested inside the window (4.8 s) that
+    /// answers after the deadline (5.3 s) must close the edge as `changed`.
+    /// Drives the worker's own event source: with the timer ALREADY due, the
+    /// queued snapshot still comes first (`biased`), and only with nothing
+    /// queued does the timer's sweep close the hold as unobserved.
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_timer_never_beats_an_in_window_snapshot() {
+        use crate::journey::cursor::{HoldRule, HOLD_GRACE, HOLD_WINDOW};
+        use std::time::Duration;
+        // A hold that began long enough ago that its timer is already due.
+        let began = Instant::now() - (HOLD_WINDOW + HOLD_GRACE + Duration::from_secs(1));
+        let navigate = ActionSpec::navigation(
+            "navigate",
+            qontinui_types::journey::NavigationTriggerKind::Push,
+        );
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"]),
+            AffordanceIndex::default(),
+            began,
+        );
+        c.open_held(
+            &key(),
+            &navigate,
+            Provenance::default(),
+            None,
+            began,
+            Some(HoldRule::UntilChanged),
+        );
+        assert!(
+            c.next_hold_deadline().is_some_and(|w| w <= Instant::now()),
+            "timer due"
+        );
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let taken_at = began + Duration::from_millis(4800);
+        tx.send(JourneyEvent::Snapshot {
+            key: key(),
+            app_version: None,
+            snapshot: Arc::new(json!({})),
+            taken_at,
+        })
+        .await
+        .unwrap();
+        let Some(JourneyEvent::Snapshot { taken_at: t, .. }) = next_event(&mut rx, &c).await else {
+            panic!("the queued snapshot must be served before the due timer");
+        };
+        let edge = c
+            .observe_taken(
+                &key(),
+                Observed {
+                    node: node("detail", &["open"]),
+                    digest: "d2".into(),
+                },
+                AffordanceIndex::default(),
+                t,
+                began + Duration::from_millis(5300),
+            )
+            .expect("an in-window change closes the held edge");
+        assert_eq!(edge.outcome, EdgeOutcome::Changed);
+
+        // Nothing queued: the due timer yields a Sweep, which closes a hold
+        // past its deadline plus the grace as unobserved.
+        c.open_held(
+            &key(),
+            &navigate,
+            Provenance::default(),
+            None,
+            began,
+            Some(HoldRule::UntilChanged),
+        );
+        assert!(matches!(
+            next_event(&mut rx, &c).await,
+            Some(JourneyEvent::Sweep)
+        ));
+        let swept = c.sweep(Instant::now());
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].outcome, EdgeOutcome::ToNodeUnobserved);
     }
 
     // ---- D6: runner_instance ------------------------------------------------
