@@ -1533,7 +1533,7 @@ async fn bounded_window_visible(
     }
 
     let window = window.clone();
-    let handle = tokio::task::spawn_blocking(move || {
+    let handle = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let visible = window.is_visible().ok();
         // Released HERE, by the thread that was parked — not by the awaiting
         // task. See the single-flight note above: this is the whole fix.
@@ -1982,9 +1982,11 @@ async fn health(
     // `resolve_tenant_pin` is a synchronous file read (machine.json), so it
     // goes to the blocking pool like every other I/O in this handler. A join
     // error established nothing about the pin — `Unresolvable`, never a guess.
-    let pin = tokio::task::spawn_blocking(crate::session::tenant_pin::resolve_tenant_pin)
-        .await
-        .unwrap_or(crate::session::tenant_pin::TenantPin::Unresolvable);
+    let pin = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+        crate::session::tenant_pin::resolve_tenant_pin,
+    )
+    .await
+    .unwrap_or(crate::session::tenant_pin::TenantPin::Unresolvable);
     let (active_tenant_id_json, active_tenant_pin) = active_tenant_health_fields(pin);
 
     // AI provider circuit breaker states
@@ -4925,7 +4927,9 @@ fn hand_off_transport_rung(
     // then fails is arm (c), counted by the emitter itself as
     // `outboxWriteFailed`.
     transport_rung_emitted_counter().fetch_add(1, Ordering::Relaxed);
-    tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        emitter.emit(lane, &obs)
+    });
 }
 
 /// The raw `x-qontinui-failure-class` declaration, for
@@ -5924,17 +5928,19 @@ async fn coord_mcp_doctor_handler(
     match doctor_scope_from_request(&headers, &params) {
         Err(body) => (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response(),
         Ok(scope) => {
-            let report = tokio::task::spawn_blocking(move || match &scope {
-                DoctorRequestScope::Machine => crate::coord_mcp::doctor::report_for(
-                    crate::coord_mcp::doctor::DoctorScope::Machine,
-                ),
-                DoctorRequestScope::Workdir(w) => crate::coord_mcp::doctor::report_for(
-                    crate::coord_mcp::doctor::DoctorScope::Workdir(w),
-                ),
-                DoctorRequestScope::Session(n) => crate::coord_mcp::doctor::report_for(
-                    crate::coord_mcp::doctor::DoctorScope::Session(n),
-                ),
-            })
+            let report = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                move || match &scope {
+                    DoctorRequestScope::Machine => crate::coord_mcp::doctor::report_for(
+                        crate::coord_mcp::doctor::DoctorScope::Machine,
+                    ),
+                    DoctorRequestScope::Workdir(w) => crate::coord_mcp::doctor::report_for(
+                        crate::coord_mcp::doctor::DoctorScope::Workdir(w),
+                    ),
+                    DoctorRequestScope::Session(n) => crate::coord_mcp::doctor::report_for(
+                        crate::coord_mcp::doctor::DoctorScope::Session(n),
+                    ),
+                },
+            )
             .await
             .unwrap_or_else(|e| {
                 // A join failure is UNKNOWN about the credential, not a verdict
@@ -12391,11 +12397,13 @@ pub fn create_router(
             // Warm the stdio-shim selftest cache off the request path, so the
             // first spawn after boot reads a verdict instead of running the
             // probe inline on a tokio worker (`coord_mcp::cached_stdio_shim_probe`).
-            tokio::task::spawn_blocking(crate::coord_mcp::warm_stdio_shim_probe);
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                crate::coord_mcp::warm_stdio_shim_probe,
+            );
             let census_task = {
                 let open = workdirs.clone();
                 let all = all_record_workdirs;
-                tokio::task::spawn_blocking(move || {
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
                     crate::coord_mcp::census_on_disk_mcp_configs(
                         open.iter().map(String::as_str),
                         all.iter().map(String::as_str),
@@ -19988,9 +19996,12 @@ mod coord_provision_session_gate_tests {
             region.contains("\"activeTenantPin\": active_tenant_pin"),
             "{region}"
         );
+        let squeezed: String = region.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            region.contains("spawn_blocking(crate::session::tenant_pin::resolve_tenant_pin)"),
-            "the pin must be read LIVE from resolve_tenant_pin(), on the blocking pool"
+            squeezed
+                .contains("spawn_blocking_tracked(crate::session::tenant_pin::resolve_tenant_pin)"),
+            "the pin must be read LIVE from resolve_tenant_pin(), on the blocking pool \
+             (through the tracked wrapper, so the body counts toward the thread guard)"
         );
         assert!(
             region.contains("active_tenant_health_fields(pin)"),

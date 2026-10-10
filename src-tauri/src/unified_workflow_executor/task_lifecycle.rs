@@ -632,7 +632,7 @@ impl LoopController {
                         let pg = pg_db.clone();
                         let record_clone = record.clone();
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            tokio::task::block_in_place(|| {
+                            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                                 handle.block_on(async move {
                                     if let Err(e) = pg.insert_worktree(&record_clone).await {
                                         warn!("PG insert_worktree failed: {}", e);

@@ -729,7 +729,7 @@ pub fn build_builder_prompt(
         // callers, tests, bootstrap paths), the helper short-circuits to
         // "" and the recognition prompt skips the manifest section.
         let wrapper_manifest = match app_state {
-            Some(s) => tokio::task::block_in_place(|| {
+            Some(s) => qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     super::wrapper_manifest::build_manifest(s, brief_runner_port).await
                 })

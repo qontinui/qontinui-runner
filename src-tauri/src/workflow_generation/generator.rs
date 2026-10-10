@@ -1115,7 +1115,7 @@ pub fn generate_workflow(
                 // runtime — the common path. `block_in_place` keeps the
                 // worker thread happy.
                 let maybe_specs_root = tokio::runtime::Handle::try_current().ok().and_then(|rt| {
-                    tokio::task::block_in_place(|| {
+                    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                         rt.block_on(crate::spec_api::storage::resolve_specs_root(
                             &pg_for_resolve,
                             &app_id,
@@ -2494,7 +2494,7 @@ fn run_builder_agent(
         // runtime". When `app_state` is `None`, the helper short-circuits
         // to "" and the recognition prompt skips the manifest section.
         let wrapper_manifest = match app_state {
-            Some(s) => tokio::task::block_in_place(|| {
+            Some(s) => qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     super::wrapper_manifest::build_manifest(s, runner_port).await
                 })

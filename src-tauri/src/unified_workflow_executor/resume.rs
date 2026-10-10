@@ -989,7 +989,7 @@ impl ResumeManager {
         let pg = self.pg_db.clone();
         let eid = execution_id.to_string();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 handle.block_on(async move { pg.get_workflow_execution_state(&eid).await })
             })
         }));
@@ -1028,7 +1028,7 @@ impl ResumeManager {
         let pg = self.pg_db.clone();
         let eid = execution_id.to_string();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 handle.block_on(async move { pg.get_all_workflow_step_checkpoints(&eid).await })
             })
         }))
@@ -1080,7 +1080,7 @@ impl ResumeManager {
         let pg = self.pg_db.clone();
         let id = execution_id.to_string();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 handle.block_on(async move { pg.get_task_run(&id).await })
             })
         }))

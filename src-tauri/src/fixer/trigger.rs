@@ -49,7 +49,7 @@ fn should_launch_fixer_sync(
     let pg = pg_db.clone();
     let src_id = source_task_run_id.to_string();
     let exc_id = exclude_fixer_id.map(|s| s.to_string());
-    tokio::task::block_in_place(move || {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(move || {
         tokio::runtime::Handle::current()
             .block_on(async { should_launch_fixer_pg(&pg, &src_id, exc_id.as_deref()).await })
     })
@@ -237,7 +237,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
     let workflow_name = {
         let pg = pg_db.clone();
         let src_id = source_task_run_id.clone();
-        tokio::task::block_in_place(move || {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(move || {
             tokio::runtime::Handle::current()
                 .block_on(async { pg.get_task_run_workflow_name(&src_id).await })
         })?
@@ -266,7 +266,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         .with_is_fixer(true)
         .with_fixer_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.create_task_run(&input))
     })?;
 

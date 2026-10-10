@@ -175,7 +175,7 @@ pub fn validate_recommendation(
     let rec_id = recommendation_id.to_string();
 
     // Get recommendation details from PG
-    let rec = tokio::task::block_in_place(|| {
+    let rec = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.get_recommendation(&rec_id))
     })?
     .ok_or_else(|| format!("Recommendation not found: {}", rec_id))?;
@@ -244,7 +244,7 @@ fn get_post_apply_metrics(
     let rec_id = recommendation_id.to_string();
 
     let applied_at: Option<String> = {
-        let rec = tokio::task::block_in_place(|| {
+        let rec = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current().block_on(pg_db.get_recommendation(recommendation_id))
         })?
         .ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))?;

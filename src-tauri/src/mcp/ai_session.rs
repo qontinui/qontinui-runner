@@ -1212,14 +1212,16 @@ pub(crate) async fn session_commit_state_inner(
     // `rev-parse --show-toplevel` per distinct parent directory of the touched
     // files, plus two calls per repo (the mid-merge `rev-parse --git-dir` and
     // the `status --porcelain`), each bounded by `GIT_TIMEOUT` on its own.
-    tokio::task::spawn_blocking(move || commit_state_from_touched_files(files))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("commit-state probe task failed: {e}"),
-            )
-        })
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        commit_state_from_touched_files(files)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("commit-state probe task failed: {e}"),
+        )
+    })
 }
 
 /// Steps 3-5 of [`session_commit_state_inner`]: bucket the touched files by

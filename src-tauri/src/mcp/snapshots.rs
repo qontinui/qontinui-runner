@@ -1312,7 +1312,7 @@ async fn file_changes_handler(
     let allocated = live_allocation_bases(&state);
 
     // Disk and git reads are blocking; keep them off the async executor.
-    let assembled = tokio::task::spawn_blocking(move || {
+    let assembled = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         assemble_file_changes(
             &snapshots,
             &touched,

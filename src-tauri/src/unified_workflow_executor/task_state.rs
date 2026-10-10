@@ -27,7 +27,7 @@ impl LoopController {
             let pg = self.app_state.pg_db.clone();
             let id = task_id_to_check.clone();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| {
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                     handle.block_on(async move { pg.get_task_run(&id).await })
                 })
             }))
@@ -85,7 +85,7 @@ impl LoopController {
             let pg = self.app_state.pg_db.clone();
             let id = task_id_to_check.clone();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| {
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                     handle.block_on(async move { pg.get_task_run(&id).await })
                 })
             }))

@@ -107,7 +107,7 @@ pub fn get_failure_analysis(
     let since = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
     debug!(days, %since, "Running failure analysis (PG)");
 
-    let mut analysis = tokio::task::block_in_place(|| {
+    let mut analysis = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.get_failure_analysis(&since, &category))
     })?;
 

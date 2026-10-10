@@ -1377,7 +1377,9 @@ impl ClaudeSession {
     /// back to Tauri's process-wide runtime for std-thread callers.
     pub(super) fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
         match tokio::runtime::Handle::try_current() {
-            Ok(rt) => tokio::task::block_in_place(|| rt.block_on(fut)),
+            Ok(rt) => {
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| rt.block_on(fut))
+            }
             Err(_) => tauri::async_runtime::block_on(fut),
         }
     }

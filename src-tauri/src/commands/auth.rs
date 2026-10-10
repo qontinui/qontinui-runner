@@ -1040,6 +1040,9 @@ pub async fn promote_runner_tier_to_account() -> Result<SetRunnerTierResult, Str
     use qontinui_runner_lib::profiles::TierWrite;
 
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // Counted for the wedge diagnostics' blocking-pool saturation figure —
+        // same reason as `set_runner_tier`'s body above.
+        let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
         match settings::promote_tier_to_account() {
             Ok((TierWrite::Written, path)) => {
                 info!(
@@ -1840,7 +1843,7 @@ pub async fn get_coord_credential_posture() -> Option<serde_json::Value> {
 #[tauri::command]
 pub async fn get_binding_gap_asks() -> Option<Vec<serde_json::Value>> {
     let path = crate::mcp::device_jwt_refresher::binding_gap_ask_path()?;
-    tokio::task::spawn_blocking(move || {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         // Re-checked against coord's bound set under the ask window on EVERY
         // read: an ask outlives the pass that recorded it, and must not keep
         // asking to re-pair a tenant coord unbound while the heartbeat was down.

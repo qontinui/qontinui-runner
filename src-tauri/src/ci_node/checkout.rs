@@ -835,7 +835,11 @@ async fn delete_dispatch_root(dispatch_root: PathBuf) {
             let _held = lock.lock().await;
             if dispatch_root.exists() {
                 let target = dispatch_root.clone();
-                match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await {
+                match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    std::fs::remove_dir_all(&target)
+                })
+                .await
+                {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Ok(Err(e)) => Err(format!("not removable: {e}")),

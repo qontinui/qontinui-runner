@@ -19,7 +19,7 @@ fn resolve_working_dir(pg_db: &Arc<PgDb>, execution_id: &str) -> Result<String, 
     let pg = pg_db.clone();
     let worktrees_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 handle.block_on(async move { pg.list_worktrees(None).await })
             })
         }))

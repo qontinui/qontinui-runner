@@ -1105,7 +1105,9 @@ pub(crate) fn start_refresh_loop() {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_secs(5)).await;
         loop {
-            if let Err(e) = tokio::task::spawn_blocking(refresh).await {
+            if let Err(e) =
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(refresh).await
+            {
                 warn!("canonical_corpus: refresh task panicked ({e})");
             }
             tokio::time::sleep(LATEST.next_delay()).await;

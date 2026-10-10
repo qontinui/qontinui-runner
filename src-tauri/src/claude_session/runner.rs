@@ -293,7 +293,9 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
 /// back to Tauri's process-wide runtime when not inside one.
 fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
-        Ok(rt) => tokio::task::block_in_place(|| rt.block_on(fut)),
+        Ok(rt) => {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| rt.block_on(fut))
+        }
         Err(_) => tauri::async_runtime::block_on(fut),
     }
 }

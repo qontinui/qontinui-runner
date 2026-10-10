@@ -190,7 +190,7 @@ impl OptimizationPipeline {
             );
 
             // Execute each generation request via the LLM (sync, blocking)
-            let responses = tokio::task::block_in_place(|| {
+            let responses = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 let mut out: Vec<(String, String, String)> = Vec::with_capacity(requests.len());
                 for req in &requests {
                     let context = crate::ai_router::TaskContext::from_prompt(&req.llm_prompt);
@@ -362,26 +362,27 @@ impl OptimizationPipeline {
 
             // Build the judge prompt and call the LLM judge
             let judge_prompt = pairwise_judge::build_pairwise_prompt(&judge_input, swap);
-            let judge_result = tokio::task::block_in_place(|| {
-                let context = crate::ai_router::TaskContext::from_prompt(&judge_prompt);
-                let resp = crate::ai_provider::routing::run_prompt_with_routing(
-                    &judge_prompt,
-                    &context,
-                    None,
-                );
-                if resp.success {
-                    pairwise_judge::parse_pairwise_response(&resp.output, swap)
-                } else {
-                    warn!(err = ?resp.error, "Pairwise judge LLM call failed");
-                    pairwise_judge::PairwiseJudgeResult {
-                        winner: pairwise_judge::PairwiseWinner::Tie,
-                        rationale: String::new(),
-                        confidence: 0.0,
-                        scores_a: None,
-                        scores_b: None,
+            let judge_result =
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+                    let context = crate::ai_router::TaskContext::from_prompt(&judge_prompt);
+                    let resp = crate::ai_provider::routing::run_prompt_with_routing(
+                        &judge_prompt,
+                        &context,
+                        None,
+                    );
+                    if resp.success {
+                        pairwise_judge::parse_pairwise_response(&resp.output, swap)
+                    } else {
+                        warn!(err = ?resp.error, "Pairwise judge LLM call failed");
+                        pairwise_judge::PairwiseJudgeResult {
+                            winner: pairwise_judge::PairwiseWinner::Tie,
+                            rationale: String::new(),
+                            confidence: 0.0,
+                            scores_a: None,
+                            scores_b: None,
+                        }
                     }
-                }
-            });
+                });
 
             // Map judge winner to candidate ID
             let winner_id = match judge_result.winner {

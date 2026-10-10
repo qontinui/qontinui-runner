@@ -29,7 +29,7 @@ pub fn should_launch_optimizer(
     let opt_type = optimizer_type.as_str().to_string();
     let source_id = source_task_run_id.to_string();
 
-    let result = tokio::task::block_in_place(|| {
+    let result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.should_launch_optimizer(&opt_type, &source_id))
     })?;
 
@@ -67,7 +67,7 @@ fn should_launch_meta_prompt_optimizer(pg_db: &std::sync::Arc<crate::database::p
     {
         let pg = pg_db.clone();
         let at = target.agent_type.clone();
-        let has_pool = tokio::task::block_in_place(|| {
+        let has_pool = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current().block_on(pg.get_active_duel_pool(&at))
         });
         if matches!(has_pool, Ok(Some(_))) {
@@ -195,7 +195,7 @@ pub fn check_and_launch_optimizers(
     {
         let pg = deps.app_state.pg_db.clone();
         let trid = source_task_run_id.clone();
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current().block_on(async {
                 crate::spec_experimentation::compliance::auto_extract_spec_compliance(&pg, &trid)
                     .await;
@@ -222,7 +222,7 @@ pub fn check_and_launch_optimizers(
 
     // Recompute agentic metric baselines from accumulated successful runs.
     // Fast — only queries learning_outcomes aggregates, no LLM calls.
-    if let Err(e) = tokio::task::block_in_place(|| {
+    if let Err(e) = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.recompute_agentic_baselines())
     })
     .map(|_| ())
@@ -507,7 +507,7 @@ fn launch_optimizer_internal(
     );
 
     // Query completed optimizer run count for style rotation (PromptWizard-inspired diversity)
-    let style_index: u32 = tokio::task::block_in_place(|| {
+    let style_index: u32 = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(
             deps.app_state
                 .pg_db
@@ -735,7 +735,7 @@ pub fn check_and_launch_optimizers_with_pg(
     {
         let pg_clone = pg_db.clone();
         let trid = source_task_run_id.clone();
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current().block_on(async {
                 crate::spec_experimentation::compliance::auto_extract_spec_compliance(
                     &pg_clone, &trid,
@@ -750,7 +750,7 @@ pub fn check_and_launch_optimizers_with_pg(
     super::parser::auto_apply_high_confidence(pg_db, None);
     auto_evaluate_outcomes(pg_db);
     auto_evaluate_canaries(pg_db, Some(&deps.app_handle));
-    if let Err(e) = tokio::task::block_in_place(|| {
+    if let Err(e) = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.recompute_agentic_baselines())
     })
     .map(|_| ())

@@ -1729,9 +1729,10 @@ fn memoized_reading<T: Clone>(
 /// [`thread_count_reading`], memoized for [`THREAD_READING_TTL`].
 ///
 /// **This is the form the spawn gate reads.** `resource_guard`'s
-/// `thread_lane_verdict` is the single call site, which is what keeps every
-/// consumer of the thread lane — the continuation guard, `precheck_spawn` and
-/// `admit_spawn` alike — behind one snapshot per window. Anything that wants the
+/// `live_thread_grading` is the single call site, which is what keeps every
+/// consumer of the thread lane — the continuation guard, `precheck_spawn`,
+/// `admit_spawn` and `/health`'s `threadCensus.untrackedBodiesUpperBound` alike
+/// — behind one snapshot per window. Anything that wants the
 /// count at a specific instant (the health monitor's own 60 s line, the fleet
 /// publisher's 30 s sample) calls [`thread_count_reading`] directly and pays for
 /// its own reading.
@@ -1762,20 +1763,37 @@ pub(crate) fn thread_name_census_memoized() -> Option<ThreadNameCensus> {
 }
 
 /// The memoized census as the `/health` object serves it under `threadCensus`:
-/// `{ total, byName: [{name, count}], sessionThreads, sampledAt }`, or JSON
-/// `null` when the
-/// census is UNKNOWN — never an empty list (served policy
-/// `verification-and-evidence` `silent-empty-is-unknown`).
+/// `{ total, byName: [{name, count}], sessionThreads, sampledAt,
+/// untrackedBodiesUpperBound }`, or JSON `null` when the census is UNKNOWN —
+/// never an empty list (served policy `verification-and-evidence`
+/// `silent-empty-is-unknown`).
+///
+/// Census and bound come from ONE [`crate::resource_guard::live_thread_grading`]
+/// call — the same function the spawn gate's thread lane grades on — so
+/// `untrackedBodiesUpperBound` is the `idle_pool` that lane subtracted, never a
+/// second derivation here that could drift from it (plan `2026-09-22-runner-
+/// untracked-blocking-bodies-are-invisible-to-the-idle-pool-grading`, Phase 3).
 pub(crate) fn thread_name_census_json() -> serde_json::Value {
-    match thread_name_census_memoized() {
-        Some(census) => thread_name_census_to_json(&census),
+    let grading = crate::resource_guard::live_thread_grading();
+    match grading.census.as_ref() {
+        Some(census) => thread_name_census_to_json(census, grading.untracked_bodies_upper_bound()),
         None => serde_json::Value::Null,
     }
 }
 
 /// PURE projection of a census onto the wire shape, so the key names and the
 /// timestamp format are pinned by a test rather than by a reader.
-fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
+///
+/// `untracked_bodies_upper_bound` is pool threads this process cannot
+/// attribute — genuinely idle ones plus tokio-internal (`tokio::fs`,
+/// `tokio::process`) bodies no seam in this crate can track. It is served as
+/// `null`, never `0`, when UNKNOWN (the thread count could not be read), so a
+/// `Proceed` from the thread lane is read beside its blind spot rather than as
+/// a clean guard.
+fn thread_name_census_to_json(
+    census: &ThreadNameCensus,
+    untracked_bodies_upper_bound: Option<usize>,
+) -> serde_json::Value {
     let sampled_at = chrono::DateTime::<chrono::Utc>::from(census.sampled_at).to_rfc3339();
     serde_json::json!({
         "total": census.total,
@@ -1789,6 +1807,7 @@ fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
         // summed for it.
         "sessionThreads": census.session_threads,
         "sampledAt": sampled_at,
+        "untrackedBodiesUpperBound": untracked_bodies_upper_bound,
     })
 }
 
@@ -2218,8 +2237,9 @@ mod tests {
     #[test]
     fn the_census_json_shape_is_pinned() {
         let c = census(&[("tokio-rt-worker", 325), ("terminal-reader-*", 19)]);
-        let v = thread_name_census_to_json(&c);
+        let v = thread_name_census_to_json(&c, Some(273));
         assert_eq!(v["total"], 344);
+        assert_eq!(v["untrackedBodiesUpperBound"], 273);
         assert_eq!(v["byName"][0]["name"], "tokio-rt-worker");
         assert_eq!(v["byName"][0]["count"], 325);
         assert_eq!(v["byName"][1]["name"], "terminal-reader-*");
@@ -2227,6 +2247,22 @@ mod tests {
         assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
         assert_eq!(v["sessionThreads"], 19);
         assert!(v.get("by_name").is_none(), "wire keys are camelCase");
+    }
+
+    /// An UNKNOWN bound is served as an explicit JSON `null` — the key present,
+    /// the value null — never `0`, which would read as "no blind spot", and
+    /// never an absent key, which a reader cannot tell from an older build.
+    #[test]
+    fn an_unknown_untracked_bound_is_served_as_null_not_zero() {
+        let c = census(&[("app-rt", 40)]);
+        let v = thread_name_census_to_json(&c, None);
+        assert!(
+            v.as_object()
+                .is_some_and(|o| o.contains_key("untrackedBodiesUpperBound")),
+            "the key must be present: {v}"
+        );
+        assert!(v["untrackedBodiesUpperBound"].is_null(), "{v}");
+        assert_ne!(v["untrackedBodiesUpperBound"], 0);
     }
 
     /// `top=` carries the first three rows as `name=count`, and reads
