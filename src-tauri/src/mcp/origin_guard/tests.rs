@@ -1423,9 +1423,31 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/analytics/token-usage/task-runs"),
     ("POST", "/api/v1/devices/pair-cli"),
     ("POST", "/api/v1/devices/pair-codes/{code}/redeem"),
+    // Outbound qontinui-web URL, not a runner route: a mock web server in device_jwt_refresher tests; GET is the scanner reading a header `.get(` in the handler closure.
+    (
+        "GET",
+        "/api/v1/devices/{device_id}/machine-credential/exchange",
+    ),
     (
         "POST",
         "/api/v1/devices/{device_id}/machine-credential/exchange",
+    ),
+    // Outbound qontinui-web URL, not a runner route (device_jwt_refresher test mock); GET is a header `.get(`.
+    ("GET", "/api/v1/devices/{device_id}/machine-credential/mint"),
+    // Outbound qontinui-web URL, not a runner route (device_jwt_refresher test mock).
+    (
+        "POST",
+        "/api/v1/devices/{device_id}/machine-credential/mint",
+    ),
+    // Outbound qontinui-web URL, not a runner route (device_jwt_refresher test mock); GET is a header `.get(`.
+    (
+        "GET",
+        "/api/v1/devices/{device_id}/machine-credential/self-mint",
+    ),
+    // Outbound qontinui-web URL, not a runner route (device_jwt_refresher test mock).
+    (
+        "POST",
+        "/api/v1/devices/{device_id}/machine-credential/self-mint",
     ),
     ("GET", "/auth/runner-token-callback"),
     ("POST", "/backup/info"),
