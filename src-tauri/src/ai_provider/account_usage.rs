@@ -96,6 +96,11 @@ use tracing::info;
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
+    // Subscription accounts are off while a model gateway is declared: there
+    // is nothing to pick between (`crate::model_gateway`).
+    if crate::model_gateway::gateway_declared() {
+        return;
+    }
     // The EFFECTIVE mode — the local roster/settings mode resolved against the
     // fleet's `account_selection_mode` policy and this machine's pin — never
     // the raw settings field: the spawn path (`config::get_effective_config_dir`)

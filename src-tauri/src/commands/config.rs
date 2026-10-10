@@ -565,6 +565,44 @@ pub fn save_claude_default_launch_command(
     })
 }
 
+/// Get the model gateway declaration (`settings.model_gateway`). See
+/// [`crate::model_gateway`]. The api-key-helper is a command line, not a key:
+/// no secret is returned.
+#[tauri::command]
+pub fn get_model_gateway() -> Result<CommandResponse, String> {
+    let gateway = settings::get_model_gateway();
+    let valid = gateway.validate();
+    Ok(CommandResponse {
+        success: true,
+        message: valid.as_ref().err().cloned(),
+        data: Some(serde_json::json!({
+            "gateway": gateway,
+            "declared": gateway.is_declared(),
+            "valid": valid.is_ok(),
+        })),
+    })
+}
+
+/// Save the model gateway declaration. An empty `base_url` clears it. An
+/// invalid declaration is refused with the reason and nothing is written.
+#[tauri::command]
+pub fn save_model_gateway(
+    gateway: crate::model_gateway::ModelGatewaySettings,
+) -> Result<CommandResponse, String> {
+    let stored = settings::save_model_gateway(gateway)?;
+    info!(
+        "Saved model gateway: declared={} headers={} helper={}",
+        stored.is_declared(),
+        stored.headers.len(),
+        stored.api_key_helper.is_some()
+    );
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Saved model gateway".to_string()),
+        data: Some(serde_json::json!({ "gateway": stored })),
+    })
+}
+
 /// Build the PTY launch command for a new AI (`/spawn-ai`) session, routed
 /// through the shared launch-spec builder ([`crate::claude_session::launch_spec`]).
 ///
@@ -596,6 +634,10 @@ pub fn build_ai_launch_command(
         render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
     };
 
+    // A declared model gateway owns the session's account: the typed
+    // `CLAUDE_CONFIG_DIR` prefix names the gateway config dir, never the
+    // subscription account the UI picked (`crate::model_gateway`).
+    let config_dir = crate::model_gateway::session_config_dir_override().unwrap_or(config_dir);
     let cfg = LaunchConfig::from_settings(Some(&config_dir));
     let spec = LaunchSpec {
         config_dir: Some(config_dir),
@@ -640,6 +682,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_claude_account_launch_commands,
             get_claude_default_launch_command,
             save_claude_default_launch_command,
+            get_model_gateway,
+            save_model_gateway,
             build_ai_launch_command,
         ])
         .build()

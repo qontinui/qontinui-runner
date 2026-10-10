@@ -944,7 +944,7 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
     let provider = settings::get_ai_settings().provider;
     match provider {
         AiProvider::ClaudeApi => {
-            if super::claude_api_warm::resolve_warm_credential().is_some() {
+            if super::claude_api_warm::warm_path_available() {
                 debug!("oneshot_for_settings: ClaudeApi → OneshotClaudeApiWarm (warm credential resolved)");
                 Box::new(OneshotClaudeApiWarm::new())
             } else {
@@ -955,7 +955,7 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
             }
         }
         AiProvider::ClaudeCli => {
-            if super::claude_api_warm::resolve_warm_credential().is_some() {
+            if super::claude_api_warm::warm_path_available() {
                 debug!("oneshot_for_settings: ClaudeCli → OneshotClaudeApiWarm");
                 Box::new(OneshotClaudeApiWarm::new())
             } else {
