@@ -324,6 +324,15 @@ async fn spawn_member_terminal(
     .await;
     let working_dir = working_dir.unwrap_or_else(|| req.working_dir.clone());
     let handback = isolated_ctx.as_ref().map(|ctx| ctx.handback());
+    // An isolated worktree is the member's own, so it gets the fleet commands
+    // and skills before the served-corpus probe below reads its `.claude/` —
+    // provision first, then measure, as the looping spawn does. A shared
+    // checkout gets neither: writing them there would clobber the operator's
+    // own files.
+    if isolated_ctx.is_some() {
+        crate::fleet_commands::provision_fleet_commands_for_session(&working_dir);
+        crate::fleet_skills::provision_fleet_skills_for_session(&working_dir);
+    }
     // The served-corpus line of the member's briefing, measured against the
     // directory the member actually runs in, on the blocking pool (the
     // gate/condition/looping spawns' convention).
@@ -417,10 +426,10 @@ fn launch_member(
         served,
     } = inputs;
 
-    // An isolated worktree is the member's own, so it gets the coord-mcp
-    // config and the fleet commands the gate-continuation path writes into
-    // its worktree. A shared checkout gets neither — writing them there would
-    // clobber the operator's own files — and the briefing asserts no liveness.
+    // An isolated worktree also gets the coord-mcp config the gate-continuation
+    // path writes into its worktree (its fleet commands and skills were
+    // provisioned before the served-corpus probe). A shared checkout gets
+    // none, and the briefing asserts no liveness.
     let (add_dir_args, coord_mcp) = match isolated_ctx.as_ref() {
         Some(ctx) => {
             let bound_port = app
@@ -431,8 +440,6 @@ fn launch_member(
                 bound_port,
                 req.tenant_id,
             );
-            crate::fleet_commands::provision_fleet_commands_for_session(&working_dir);
-            crate::fleet_skills::provision_fleet_skills_for_session(&working_dir);
             (ctx.claude_add_dir_args(), delivery)
         }
         None => (Vec::new(), crate::coord_mcp::CoordMcpDelivery::Unknown),
