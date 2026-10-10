@@ -958,6 +958,86 @@ pub fn refuse_remote_frame<P: FnOnce() -> AcceptRemoteAttach>(
     }
 }
 
+/// The admission half `terminal_attach` and `terminal_end` share (target
+/// role), pure over the grant table and a terminal resolver: parse the
+/// `remote` block (REQUIRED — a frame with none is refused
+/// `remote_block_required`, because [`gate_remote_frame`] passes such frames
+/// as the operator-web path), look the grant up (source device
+/// cross-checked), and resolve the grant ROW's session — never the frame's —
+/// to a local terminal through `resolve_terminal`. Binds nothing.
+///
+/// `Ok` carries the block, the grant, and the resolver's answer: `None` when no
+/// local terminal hosts that session, which each caller answers in its own
+/// vocabulary (attach refuses `session_not_local`; end answers `not_found`).
+/// `Err` is the exact refusal frame to send back.
+///
+/// `frame_type` names the frame in the `remote_block_required` message only.
+fn resolve_remote_grant_session<T, P, R>(
+    grants: &RemoteAttachGrants,
+    preference: P,
+    data: &Value,
+    now: u64,
+    frame_type: &str,
+    resolve_terminal: R,
+) -> Result<(RemoteBlock, AttachGrant, Option<(String, T)>), Value>
+where
+    P: FnOnce() -> AcceptRemoteAttach,
+    R: FnOnce(Uuid) -> Option<(String, T)>,
+{
+    let request_id = data.get("request_id").cloned().unwrap_or(Value::Null);
+    let block = match parse_remote_block(data) {
+        Some(Ok(block)) => block,
+        Some(Err(())) => return Err(refusal_frame(AttachRefusal::GrantUnknown, data, None)),
+        None => {
+            return Err(json!({
+                "type": "error",
+                "code": "remote_block_required",
+                "message": format!(
+                    "{frame_type} carries no remote block — a remote {frame_type} is admitted only under a coord-minted grant"
+                ),
+                "request_id": request_id,
+                "remote": remote_echo(data),
+            }));
+        }
+    };
+
+    let grant = match grants.lookup(
+        &block.grant_jti,
+        block.source_device_id.as_deref(),
+        preference(),
+        now,
+    ) {
+        Ok(grant) => grant,
+        Err(refusal) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                code = refusal.code(),
+                frame_type,
+                "remote attach: {frame_type} refused"
+            );
+            return Err(refusal_frame(refusal, data, None));
+        }
+    };
+
+    // The table row came from coord directly; the frame's session_id came
+    // from the grant claim via the backend. They should agree — the table
+    // wins, and a disagreement is logged.
+    if let Some(named) = block.session_id {
+        if named != grant.session_id {
+            warn!(
+                grant_jti = %block.grant_jti,
+                table_session = %grant.session_id,
+                frame_session = %named,
+                frame_type,
+                "remote attach: frame names a different session than the grant — using the grant's"
+            );
+        }
+    }
+
+    let resolved = resolve_terminal(grant.session_id);
+    Ok((block, grant, resolved))
+}
+
 /// The decision half of `terminal_attach` (target role), pure over the grant
 /// table and a terminal resolver so it is testable without a
 /// `TerminalManager`. Parses the `remote` block, looks the grant up (source
@@ -976,53 +1056,16 @@ where
     P: FnOnce() -> AcceptRemoteAttach,
     R: FnOnce(Uuid) -> Option<(String, T)>,
 {
-    let request_id = data.get("request_id").cloned().unwrap_or(Value::Null);
-    let block = match parse_remote_block(data) {
-        Some(Ok(block)) => block,
-        Some(Err(())) => return Err(refusal_frame(AttachRefusal::GrantUnknown, data, None)),
-        None => {
-            return Err(json!({
-                "type": "error",
-                "code": "remote_block_required",
-                "message": "terminal_attach carries no remote block — a remote attach is admitted only under a coord-minted grant",
-                "request_id": request_id,
-                "remote": remote_echo(data),
-            }));
-        }
-    };
-
-    let grant = match grants.lookup(
-        &block.grant_jti,
-        block.source_device_id.as_deref(),
-        preference(),
+    let (block, grant, resolved) = resolve_remote_grant_session(
+        grants,
+        preference,
+        data,
         now,
-    ) {
-        Ok(grant) => grant,
-        Err(refusal) => {
-            warn!(
-                grant_jti = %block.grant_jti,
-                code = refusal.code(),
-                "remote attach: terminal_attach refused"
-            );
-            return Err(refusal_frame(refusal, data, None));
-        }
-    };
+        "terminal_attach",
+        resolve_terminal,
+    )?;
 
-    // The table row came from coord directly; the frame's session_id came
-    // from the grant claim via the backend. They should agree — the table
-    // wins, and a disagreement is logged.
-    if let Some(named) = block.session_id {
-        if named != grant.session_id {
-            warn!(
-                grant_jti = %block.grant_jti,
-                table_session = %grant.session_id,
-                frame_session = %named,
-                "remote attach: frame names a different session than the grant — using the grant's"
-            );
-        }
-    }
-
-    let Some((terminal_id, terminal)) = resolve_terminal(grant.session_id) else {
+    let Some((terminal_id, terminal)) = resolved else {
         warn!(
             grant_jti = %block.grant_jti,
             session = %grant.session_id,
@@ -1051,6 +1094,387 @@ where
         ));
     }
     Ok((block, grant, terminal_id, terminal))
+}
+
+// ---------------------------------------------------------------------------
+// Target role — remote END (plan
+// `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 1)
+// ---------------------------------------------------------------------------
+
+/// A `terminal_end` the grant table admitted.
+#[derive(Debug)]
+pub enum AdmittedEnd<T> {
+    /// The grant's session resolves to `terminal_id` on this device.
+    Terminal {
+        block: RemoteBlock,
+        grant: AttachGrant,
+        terminal_id: String,
+        terminal: T,
+    },
+    /// The grant is valid but no local terminal hosts its session any more —
+    /// answered `not_found` ("already gone"), not refused.
+    NotLocal {
+        block: RemoteBlock,
+        grant: AttachGrant,
+    },
+}
+
+/// The decision half of `terminal_end` (target role). The authority to END is
+/// the attach grant (D3): an attach grant already admits `terminal_input`, so
+/// its holder could type `/exit` today.
+///
+/// What this enforces, and the reviewers' target (plan Risks, "a grant for
+/// session A must not end session B"):
+///
+/// - the terminal is resolved from the grant ROW's `session_id`, never from
+///   the wire. A terminal id the frame names — top-level `terminal_id` or
+///   `remote.terminal_id` — is only COMPARED against the resolved one, and a
+///   disagreement is refused `attach_terminal_mismatch`;
+/// - a grant already bound to a terminal (an open tab's grant) must be bound
+///   to the resolved one, or it is refused the same way;
+/// - a frame with no `remote` block is refused `remote_block_required`;
+/// - it BINDS NOTHING. A grant bound only to end a session and then answered
+///   `refused` would keep `is_terminal_attached` forwarding that terminal's
+///   output to a relay with no listener until the grant expired. An open
+///   tab's existing binding is left as it was, which is what carries the
+///   terminal's `terminal_exit` back to that tab when the end closes the PTY.
+pub fn admit_terminal_end<T, P, R>(
+    grants: &RemoteAttachGrants,
+    preference: P,
+    data: &Value,
+    now: u64,
+    resolve_terminal: R,
+) -> Result<AdmittedEnd<T>, Value>
+where
+    P: FnOnce() -> AcceptRemoteAttach,
+    R: FnOnce(Uuid) -> Option<(String, T)>,
+{
+    let (block, grant, resolved) = resolve_remote_grant_session(
+        grants,
+        preference,
+        data,
+        now,
+        "terminal_end",
+        resolve_terminal,
+    )?;
+
+    let named_top = data
+        .get("terminal_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let named_block = block
+        .terminal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some((terminal_id, terminal)) = resolved else {
+        info!(
+            grant_jti = %block.grant_jti,
+            session = %grant.session_id,
+            "remote end: no local terminal hosts that coord session — answering not_found"
+        );
+        return Ok(AdmittedEnd::NotLocal { block, grant });
+    };
+
+    for named in [named_top, named_block, grant.terminal_id.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if named != terminal_id {
+            warn!(
+                grant_jti = %block.grant_jti,
+                session = %grant.session_id,
+                resolved = %terminal_id,
+                named,
+                "remote end: frame or grant names a terminal other than the grant's session — refused"
+            );
+            return Err(refusal_frame(
+                AttachRefusal::TerminalMismatch,
+                data,
+                Some(&terminal_id),
+            ));
+        }
+    }
+
+    Ok(AdmittedEnd::Terminal {
+        block,
+        grant,
+        terminal_id,
+        terminal,
+    })
+}
+
+/// The outcome vocabulary of a remote end — the wire spelling on
+/// `terminal_ended` / `remote_terminal_ended`, and the source command's typed
+/// result. `Unknown` is never rendered as ended: a timeout, a transport
+/// failure and a close whose effect was not observed all land there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndOutcome {
+    Ended,
+    Refused,
+    StillRunning,
+    Unknown,
+    NotFound,
+}
+
+impl EndOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EndOutcome::Ended => "ended",
+            EndOutcome::Refused => "refused",
+            EndOutcome::StillRunning => "still_running",
+            EndOutcome::Unknown => "unknown",
+            EndOutcome::NotFound => "not_found",
+        }
+    }
+
+    /// Parse the wire spelling. Anything unrecognised is `Unknown` — a peer
+    /// speaking a newer vocabulary must never be read as `ended`.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "ended" => EndOutcome::Ended,
+            "refused" => EndOutcome::Refused,
+            "still_running" => EndOutcome::StillRunning,
+            "not_found" => EndOutcome::NotFound,
+            _ => EndOutcome::Unknown,
+        }
+    }
+}
+
+/// What a remote end did: the outcome, HOW it ended (`via`: `graceful`,
+/// `no_live_claude`, `force`), and why it did not (`reason`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndVerdict {
+    pub outcome: EndOutcome,
+    pub via: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl EndVerdict {
+    fn new(outcome: EndOutcome, via: Option<&str>, reason: Option<String>) -> Self {
+        Self {
+            outcome,
+            via: via.map(str::to_string),
+            reason,
+        }
+    }
+}
+
+/// The next step after `graceful_exit` answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GracefulEndStep {
+    /// Final — reply with this.
+    Verdict(EndVerdict),
+    /// `NoLiveClaude`: a bare shell. Close the PTY and answer from the close
+    /// (D5) — the graceful protection guards an in-flight Claude turn or an
+    /// unsent draft, and with no Claude there is neither.
+    CloseBareShell,
+}
+
+fn pids(p: &[u32]) -> String {
+    p.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+}
+
+/// Map `TerminalManager::graceful_exit`'s answer EXPLICITLY, one arm per
+/// variant (plan Phase 1 table). A variant added later does not compile until
+/// it is mapped here.
+pub fn graceful_end_step(
+    result: &Result<crate::terminal::graceful_exit::GracefulExitOutcome, String>,
+) -> GracefulEndStep {
+    use crate::terminal::graceful_exit::GracefulExitOutcome as G;
+    let refused = |reason: String| {
+        GracefulEndStep::Verdict(EndVerdict::new(EndOutcome::Refused, None, Some(reason)))
+    };
+    match result {
+        Ok(G::Exited { .. }) => {
+            GracefulEndStep::Verdict(EndVerdict::new(EndOutcome::Ended, Some("graceful"), None))
+        }
+        Ok(G::NoLiveClaude) => GracefulEndStep::CloseBareShell,
+        Ok(G::ExitStuck {
+            waited_ms,
+            claude_pids,
+            last_probe_unreadable,
+        }) => GracefulEndStep::Verdict(EndVerdict::new(
+            EndOutcome::StillRunning,
+            None,
+            Some(format!(
+                "exit_stuck: claude (pids {}) still alive after {waited_ms} ms{} — nothing was \
+                 killed",
+                pids(claude_pids),
+                if *last_probe_unreadable {
+                    "; the last probe could not read the process table"
+                } else {
+                    ""
+                }
+            )),
+        )),
+        Ok(G::Refused { reason, .. }) => refused(format!("refused: {reason}")),
+        Ok(G::CloseRefused { reason, .. }) => refused(format!("close_refused: {reason}")),
+        Ok(G::WriteFailed { error, .. }) => refused(format!("write_failed: {error}")),
+        Ok(G::ProbeUnavailable { detail }) => refused(format!("probe_unavailable: {detail}")),
+        Ok(G::CloseOutcomeUnknown { detail, .. }) => GracefulEndStep::Verdict(EndVerdict::new(
+            EndOutcome::Unknown,
+            None,
+            Some(format!("close_outcome_unknown: {detail}")),
+        )),
+        Err(e) => GracefulEndStep::Verdict(close_failure_verdict(e)),
+    }
+}
+
+/// A `TerminalManager` "not found" error is `not_found`; any other failure to
+/// act is `unknown` — nothing observed that the terminal is gone.
+fn close_failure_verdict(e: &str) -> EndVerdict {
+    if e.contains("not found") {
+        EndVerdict::new(EndOutcome::NotFound, None, Some(e.to_string()))
+    } else {
+        EndVerdict::new(EndOutcome::Unknown, None, Some(e.to_string()))
+    }
+}
+
+/// Map a `tm.close` result: `Ok` is `ended` via `via`.
+pub fn close_verdict(result: Result<(), String>, via: &str) -> EndVerdict {
+    match result {
+        Ok(()) => EndVerdict::new(EndOutcome::Ended, Some(via), None),
+        Err(e) => close_failure_verdict(&e),
+    }
+}
+
+/// Run a remote end against injected effects, so the ordering ("a refused
+/// graceful exit never reaches the close"; "force never types `/exit`") is
+/// testable without a PTY. `graceful` is `TerminalManager::graceful_exit`,
+/// `close` is `tm.close`; each runs at most once.
+pub async fn execute_terminal_end<G, GF, C, CF>(force: bool, graceful: G, close: C) -> EndVerdict
+where
+    G: FnOnce() -> GF,
+    GF: std::future::Future<
+        Output = Result<crate::terminal::graceful_exit::GracefulExitOutcome, String>,
+    >,
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = Result<(), String>>,
+{
+    if force {
+        return close_verdict(close().await, "force");
+    }
+    match graceful_end_step(&graceful().await) {
+        GracefulEndStep::Verdict(v) => v,
+        GracefulEndStep::CloseBareShell => close_verdict(close().await, "no_live_claude"),
+    }
+}
+
+/// The `reason` a second concurrent `terminal_end` on one terminal answers with.
+pub const END_ALREADY_RUNNING: &str = "end_already_running";
+
+/// Per-terminal single-flight for `terminal_end` (TARGET role).
+///
+/// Each `terminal_end` runs in its own task (`runs_off_read_loop`), so two ends
+/// for one terminal — a double click, a retry after a source-side timeout, a
+/// bulk close overlapping a tab's own end — would otherwise drive two
+/// `graceful_exit`s (two `/exit`s typed, two deadlines, two closes racing) at
+/// the same PTY. The second is answered `refused` / [`END_ALREADY_RUNNING`]
+/// instead, and never starts a driver. The slot is held by an
+/// [`EndSlotGuard`], so it is released on every path the first end leaves by
+/// — reply, error, and panic unwinding alike.
+#[derive(Debug, Default)]
+pub struct EndSlots {
+    running: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Holds one terminal's end slot; dropping it frees the slot.
+#[derive(Debug)]
+pub struct EndSlotGuard<'a> {
+    slots: &'a EndSlots,
+    terminal_id: String,
+}
+
+impl EndSlots {
+    fn running(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        // A panic while the set was held cannot leave it half-written (every
+        // mutation is one insert/remove), so a poisoned lock is still sound.
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take `terminal_id`'s slot, or `None` when an end already holds it.
+    pub fn try_acquire(&self, terminal_id: &str) -> Option<EndSlotGuard<'_>> {
+        if !self.running().insert(terminal_id.to_string()) {
+            return None;
+        }
+        Some(EndSlotGuard {
+            slots: self,
+            terminal_id: terminal_id.to_string(),
+        })
+    }
+
+    /// Whether an end currently holds `terminal_id`'s slot.
+    pub fn is_running(&self, terminal_id: &str) -> bool {
+        self.running().contains(terminal_id)
+    }
+}
+
+impl Drop for EndSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.slots.running().remove(&self.terminal_id);
+    }
+}
+
+/// The process-wide end slots `handle_terminal_end` single-flights through.
+pub fn end_slots() -> &'static EndSlots {
+    static SLOTS: OnceLock<EndSlots> = OnceLock::new();
+    SLOTS.get_or_init(EndSlots::default)
+}
+
+/// Run `drive` (the end's driver — `execute_terminal_end`) only if no other
+/// end holds `terminal_id`'s slot; otherwise answer `refused` /
+/// [`END_ALREADY_RUNNING`] without calling it. The slot is held across the
+/// whole `drive` future and freed by the guard however it finishes.
+pub async fn single_flight_end<D, DF>(slots: &EndSlots, terminal_id: &str, drive: D) -> EndVerdict
+where
+    D: FnOnce() -> DF,
+    DF: std::future::Future<Output = EndVerdict>,
+{
+    let Some(_slot) = slots.try_acquire(terminal_id) else {
+        return EndVerdict::new(
+            EndOutcome::Refused,
+            None,
+            Some(format!(
+                "{END_ALREADY_RUNNING}: an end for terminal {terminal_id} is already running \
+                 on this device"
+            )),
+        );
+    };
+    drive().await
+}
+
+/// The target's `terminal_ended` reply. Echoes the frame's `request_id` and
+/// `remote` block (plus a top-level `grant_jti`) — the keys the relay
+/// correlates a target reply by, exactly as `terminal_attached` carries them.
+pub fn terminal_ended_frame(
+    data: &Value,
+    session_id: Option<Uuid>,
+    terminal_id: Option<&str>,
+    verdict: &EndVerdict,
+) -> Value {
+    let remote = remote_echo(data);
+    let mut frame = json!({
+        "type": "terminal_ended",
+        "request_id": data.get("request_id").cloned().unwrap_or(Value::Null),
+        "session_id": session_id.map(|s| s.to_string()),
+        "terminal_id": terminal_id,
+        "outcome": verdict.outcome.as_str(),
+        "grant_jti": remote["grant_jti"].clone(),
+        "remote": remote,
+    });
+    if let Some(via) = &verdict.via {
+        frame["via"] = json!(via);
+    }
+    if let Some(reason) = &verdict.reason {
+        frame["reason"] = json!(reason);
+    }
+    frame
 }
 
 /// The `remote` echo the backend routes a target-side reply by: the frame's
@@ -2276,6 +2700,93 @@ fn relay_not_connected(what: &str) -> AttachError {
 
 type PendingAttach = oneshot::Sender<Result<AttachedReply, AttachError>>;
 type PendingCreate = oneshot::Sender<Result<CreatedReply, AttachError>>;
+type PendingEnd = oneshot::Sender<EndReply>;
+
+/// Drop guard for one `pending_end` entry — see [`RemoteAttachClient::end`].
+struct PendingEndGuard<'a> {
+    pending: &'a Mutex<HashMap<String, PendingEnd>>,
+    request_id: String,
+}
+
+impl Drop for PendingEndGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.remove(&self.request_id);
+    }
+}
+
+/// How long a remote end waits for `remote_terminal_ended`.
+///
+/// The top rung of a fixed ladder (plan
+/// `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 2): the
+/// target's graceful deadline (`graceful_exit::DEFAULT_DEADLINE`, 60 s) < the
+/// relay's `pending_end` TTL (75 s) < this (90 s). Each rung outlasts the one
+/// below it, so a slow-but-honest `/exit` is answered by the target rather
+/// than timed out here — and a timeout here is `unknown`, NEVER `ended`.
+pub const END_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The answer to a remote end, as the source sees it: the target's
+/// `terminal_ended` rebuilt by the relay as `remote_terminal_ended`, a
+/// correlated refusal (`refused` with the refusal code as `reason`), or a
+/// local `unknown` (timeout, transport failure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndReply {
+    pub outcome: EndOutcome,
+    pub session_id: Option<String>,
+    pub terminal_id: Option<String>,
+    pub via: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl EndReply {
+    /// An answer this side decided without the target: `unknown` (a timeout
+    /// or a transport failure) or `refused` (a correlated refusal frame).
+    pub fn local(outcome: EndOutcome, reason: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            session_id: None,
+            terminal_id: None,
+            via: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Which grant a `remote_terminal_end` is sent under — the two relay paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndGrant<'a> {
+    /// An open tab's grant, already attached on this relay socket: sent as
+    /// `grant_jti`, with the tab's target `terminal_id` when known.
+    Attached {
+        grant_jti: &'a str,
+        terminal_id: Option<&'a str>,
+    },
+    /// A grant minted for this end: sent as the `grant` JWT.
+    Fresh { grant: &'a str },
+}
+
+/// Parse a `remote_terminal_ended` frame. The outcome is REQUIRED: a frame
+/// with none is `unknown`, never `ended`.
+fn parse_ended(data: &Value) -> EndReply {
+    let text = |k: &str| {
+        data.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    };
+    EndReply {
+        outcome: text("outcome")
+            .map(|o| EndOutcome::parse(&o))
+            .unwrap_or(EndOutcome::Unknown),
+        session_id: text("session_id"),
+        terminal_id: text("terminal_id"),
+        via: text("via"),
+        reason: text("reason"),
+    }
+}
 
 /// The source side's routing table and outbound queue.
 pub struct RemoteAttachClient {
@@ -2294,6 +2805,9 @@ pub struct RemoteAttachClient {
     /// map would make "an attach reply resolved a create waiter" a type the
     /// compiler cannot refuse. The error arms consult both, in that order.
     pending_create: Mutex<HashMap<String, PendingCreate>>,
+    /// Waiters for `remote_terminal_ended`, keyed by the request id this side
+    /// minted — separate for the same reason `pending_create` is.
+    pending_end: Mutex<HashMap<String, PendingEnd>>,
     /// Output that arrived between the `remote_terminal_attached` reply and
     /// `register_pane`, keyed by grant jti. Without it those frames were
     /// dropped ("output for no live pane") AND the pane's `remote_offset`
@@ -2395,6 +2909,7 @@ impl RemoteAttachClient {
             panes: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pending_create: Mutex::new(HashMap::new()),
+            pending_end: Mutex::new(HashMap::new()),
             pending_output: Mutex::new(HashMap::new()),
         }
     }
@@ -2619,6 +3134,90 @@ impl RemoteAttachClient {
         self.pending_create.lock().ok()?.remove(request_id)
     }
 
+    fn take_pending_end(&self, request_id: &str) -> Option<PendingEnd> {
+        self.pending_end.lock().ok()?.remove(request_id)
+    }
+
+    /// END a session on another device (plan
+    /// `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3):
+    /// send `remote_terminal_end` under an attach grant and wait for the
+    /// relay's `remote_terminal_ended`.
+    ///
+    /// The relay distinguishes its two paths by what the frame carries (the
+    /// Phase 2 wire contract): an OPEN tab's grant, already attached on this
+    /// socket, is named by `grant_jti` (plus the tab's `terminal_id`); a FRESH
+    /// grant is carried as the `grant` JWT itself, exactly as
+    /// `remote_terminal_attach` carries it, and is never attached first. The
+    /// target resolves the terminal from the grant's session either way and
+    /// only compares a named one.
+    ///
+    /// Never fails: every non-answer is an [`EndReply`] with outcome
+    /// `unknown` — a timeout is not an end.
+    pub async fn end(&self, grant: EndGrant<'_>, force: bool, timeout: Duration) -> EndReply {
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending_end.lock() {
+            pending.insert(request_id.clone(), tx);
+        }
+        // Removes the waiter on EVERY exit, including the one no `return`
+        // spells: this future being DROPPED before it settles (the HTTP caller
+        // of `/ui-bridge/tauri/invoke` disconnecting). Without it the entry
+        // outlived its only reader until the next reconnect drained the map.
+        // Removal is by a fresh uuid, so it never touches another end's slot,
+        // and after a reply it is a no-op (the inbound arm already took it).
+        let _waiter = PendingEndGuard {
+            pending: &self.pending_end,
+            request_id: request_id.clone(),
+        };
+        // See `attach`: an unheld pump means the frame would never be sent.
+        if !self.outbound_pump_state().0 {
+            self.take_pending_end(&request_id);
+            let e = relay_not_connected("end");
+            return EndReply::local(EndOutcome::Unknown, format!("{}: {}", e.code, e.message));
+        }
+        let mut frame = json!({
+            "type": "remote_terminal_end",
+            "request_id": request_id,
+            "force": force,
+        });
+        match grant {
+            EndGrant::Attached {
+                grant_jti,
+                terminal_id,
+            } => {
+                frame["grant_jti"] = json!(grant_jti);
+                if let Some(t) = terminal_id.map(str::trim).filter(|t| !t.is_empty()) {
+                    frame["terminal_id"] = json!(t);
+                }
+            }
+            EndGrant::Fresh { grant } => {
+                frame["grant"] = json!(grant);
+            }
+        }
+        if let Err(e) = self.send(frame) {
+            self.take_pending_end(&request_id);
+            return EndReply::local(EndOutcome::Unknown, format!("relay_unavailable: {e}"));
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_canceled)) => EndReply::local(
+                EndOutcome::Unknown,
+                "end_canceled: the end request was dropped before a reply arrived",
+            ),
+            Err(_elapsed) => {
+                self.take_pending_end(&request_id);
+                EndReply::local(
+                    EndOutcome::Unknown,
+                    format!(
+                        "timeout: no remote_terminal_ended within {}s — the session may or may \
+                         not have ended on the target",
+                        timeout.as_secs()
+                    ),
+                )
+            }
+        }
+    }
+
     /// Present a CREATE grant through the relay and wait for the target to
     /// spawn a PTY and answer `remote_terminal_created`.
     ///
@@ -2772,6 +3371,20 @@ impl RemoteAttachClient {
                     .to_string(),
             }));
         }
+        // An END in flight cannot be answered on a new socket either. Whether
+        // the target acted on it is not known — `unknown`, never `ended`.
+        let stranded_ends: Vec<PendingEnd> = self
+            .pending_end
+            .lock()
+            .map(|mut p| p.drain().map(|(_, tx)| tx).collect())
+            .unwrap_or_default();
+        for tx in stranded_ends {
+            let _ = tx.send(EndReply::local(
+                EndOutcome::Unknown,
+                "relay_disconnected: the relay connection dropped while the end was in flight — \
+                 the session may or may not have ended on the target",
+            ));
+        }
         // The same for an ATTACH still waiting for its first reply: the relay
         // released the attachment with the socket and the reply can never
         // arrive on a new one, so a "timeout" 20 s from now would mean nothing.
@@ -2897,8 +3510,9 @@ impl RemoteAttachClient {
     }
 
     /// Route one inbound frame. Returns `true` when this client consumed it.
-    /// Handles `remote_terminal_created|attached|output|exit|buffer|error|input_ack` and
-    /// a generic `error` whose `request_id` names a pending attach.
+    /// Handles `remote_terminal_created|attached|ended|output|exit|buffer|error|input_ack`
+    /// and a generic `error` whose `request_id` names a pending attach, create
+    /// or end.
     ///
     /// `created` was omitted from this list while its arm existed below, and
     /// the relay dispatcher did not route it either — the two omissions agreed
@@ -2963,6 +3577,20 @@ impl RemoteAttachClient {
                         terminal_id = %reply.terminal_id,
                         "remote create: remote_terminal_created with no pending request — a \
                          terminal was spawned on the target and nothing here is waiting for it"
+                    ),
+                }
+                true
+            }
+            "remote_terminal_ended" => {
+                let reply = parse_ended(data);
+                match request_id.and_then(|rid| self.take_pending_end(rid)) {
+                    Some(tx) => {
+                        let _ = tx.send(reply);
+                    }
+                    None => warn!(
+                        request_id = ?request_id,
+                        outcome = reply.outcome.as_str(),
+                        "remote end: remote_terminal_ended with no pending request"
                     ),
                 }
                 true
@@ -3099,6 +3727,20 @@ impl RemoteAttachClient {
                     let _ = tx.send(Err(AttachError { code, message }));
                     return true;
                 }
+                // A target's refusal of a `terminal_end` (bad grant, missing
+                // block, terminal mismatch), translated by the relay.
+                //
+                // Or the RELAY's report that it FORWARDED the end and can get
+                // no answer (`end_reply_timeout`, `target_not_connected`,
+                // `listener_lost`) — `unknown`, see [`end_error_reply`].
+                if let Some(tx) = request_id.and_then(|rid| self.take_pending_end(rid)) {
+                    let _ = tx.send(end_error_reply(
+                        EndErrorFrame::RemoteTerminalError,
+                        &code,
+                        &message,
+                    ));
+                    return true;
+                }
                 // A refused RE-attach names the pane in its request id.
                 let jti = grant_jti
                     .or_else(|| request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)));
@@ -3138,10 +3780,16 @@ impl RemoteAttachClient {
                 // `create_grant_invalid` / `_expired` / `_wrong_source`,
                 // `target_not_connected`, `grant_consumed` — arrives as a bare
                 // `error` correlated by the request id this side minted.
-                let Some(tx) = request_id.and_then(|rid| self.take_pending_create(rid)) else {
+                if let Some(tx) = request_id.and_then(|rid| self.take_pending_create(rid)) {
+                    let _ = tx.send(Err(AttachError { code, message }));
+                    return true;
+                }
+                // The relay's refusal of a `remote_terminal_end` (grant
+                // invalid / expired / not registered, target not connected).
+                let Some(tx) = request_id.and_then(|rid| self.take_pending_end(rid)) else {
                     return false;
                 };
-                let _ = tx.send(Err(AttachError { code, message }));
+                let _ = tx.send(end_error_reply(EndErrorFrame::BareError, &code, &message));
                 true
             }
             _ => false,
@@ -3226,6 +3874,63 @@ impl Drop for PendingEntryGuard<'_> {
         let _ = self.client.take_pending(self.request_id);
     }
 }
+
+/// Which frame a correlated end error arrived as — the half of the mapping the
+/// code alone cannot supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndErrorFrame {
+    /// `{"type":"remote_terminal_error", code, request_id}` — the end WAS
+    /// forwarded to the target. Either the target refused it, or the relay
+    /// lost the way to its answer.
+    RemoteTerminalError,
+    /// `{"type":"error", code, request_id}` — the relay refused the end or
+    /// could not forward it: nothing reached the target.
+    BareError,
+}
+
+/// `remote_terminal_error` codes meaning the end was FORWARDED and no answer
+/// can come: the relay's `pending_end` TTL lapsed (`end_reply_timeout`), or
+/// the target's connection (`target_not_connected`) or the relay's listener
+/// for it (`listener_lost`) went away after the forward. The target may be
+/// mid-`/exit`, so these are `unknown`, never `refused`.
+const END_FORWARDED_UNANSWERED_CODES: &[&str] = &[
+    END_REPLY_TIMEOUT_CODE,
+    "target_not_connected",
+    "listener_lost",
+];
+
+/// Map a correlated error on an end to its reply, on frame TYPE plus code —
+/// never on the code alone, because `target_not_connected` means opposite
+/// things on the two frames:
+///
+/// - `remote_terminal_error` + a code in [`END_FORWARDED_UNANSWERED_CODES`] →
+///   `unknown` (forwarded, unanswerable); any other code → `refused` (the
+///   target's own refusal: bad grant, missing block, terminal mismatch).
+/// - bare `error` → always `refused`: nothing was forwarded
+///   (`target_not_connected` here means never sent), or the relay refused it
+///   (`end_already_pending`, grant invalid / expired / not registered).
+///
+/// The code leads the reason so the caller can branch on it (e.g. an expired
+/// open-tab grant → mint). None of these closes an open tab: a correlated end
+/// error resolves the end's waiter and returns before any pane is settled.
+fn end_error_reply(frame: EndErrorFrame, code: &str, message: &str) -> EndReply {
+    let reason = if message.is_empty() {
+        code.to_string()
+    } else {
+        format!("{code}: {message}")
+    };
+    let outcome = match frame {
+        EndErrorFrame::RemoteTerminalError if END_FORWARDED_UNANSWERED_CODES.contains(&code) => {
+            EndOutcome::Unknown
+        }
+        EndErrorFrame::RemoteTerminalError | EndErrorFrame::BareError => EndOutcome::Refused,
+    };
+    EndReply::local(outcome, reason)
+}
+
+/// The relay's code for an end whose target never answered within its
+/// `pending_end` TTL (75 s).
+pub const END_REPLY_TIMEOUT_CODE: &str = "end_reply_timeout";
 
 const REATTACH_PREFIX: &str = "reattach:";
 const HISTORY_PREFIX: &str = "history:";
@@ -4412,7 +5117,959 @@ mod tests {
         assert_eq!(err["code"], "remote_block_required");
     }
 
+    // ---- terminal_end (plan 2026-09-30-close-remote-sessions-from-the-local-runner) ----
+
+    fn end_frame(remote: Option<Value>, terminal_id: Option<&str>) -> Value {
+        let mut f = json!({"type": "terminal_end", "request_id": "end-1", "force": false});
+        if let Some(r) = remote {
+            f["remote"] = r;
+        }
+        if let Some(t) = terminal_id {
+            f["terminal_id"] = json!(t);
+        }
+        f
+    }
+
+    /// Session A (the grant's, `Uuid::from_u128(7)`) lives in `term-A`;
+    /// session B in `term-B`. Records which session the resolver was asked for.
+    fn two_sessions(asked: &StdMutex<Vec<Uuid>>) -> impl FnOnce(Uuid) -> Option<(String, ())> + '_ {
+        move |sid: Uuid| {
+            asked.lock().unwrap().push(sid);
+            if sid == Uuid::from_u128(7) {
+                Some(("term-A".to_string(), ()))
+            } else if sid == Uuid::from_u128(8) {
+                Some(("term-B".to_string(), ()))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn end_admit(
+        table: &RemoteAttachGrants,
+        frame: &Value,
+        asked: &StdMutex<Vec<Uuid>>,
+    ) -> Result<AdmittedEnd<()>, Value> {
+        admit_terminal_end(
+            table,
+            || AcceptRemoteAttach::Tenant,
+            frame,
+            NOW,
+            two_sessions(asked),
+        )
+    }
+
+    #[test]
+    fn terminal_end_ends_the_grants_session_and_binds_nothing() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", None, NOW + 600), NOW);
+        let asked = StdMutex::new(Vec::new());
+        let admitted = end_admit(
+            &table,
+            &end_frame(
+                Some(json!({"grant_jti": "j1", "source_device_id": "src-device"})),
+                None,
+            ),
+            &asked,
+        )
+        .expect("admitted");
+        let AdmittedEnd::Terminal { terminal_id, .. } = admitted else {
+            panic!("expected a terminal");
+        };
+        assert_eq!(terminal_id, "term-A");
+        assert_eq!(*asked.lock().unwrap(), vec![Uuid::from_u128(7)]);
+        assert!(
+            !table.is_terminal_attached("term-A", NOW),
+            "an end must not bind the grant — output would be forwarded to a relay with no \
+             listener until the grant expired"
+        );
+    }
+
+    /// **The authorization check reviewers were asked to target: a grant for
+    /// session A cannot end session B.** The frame claims session B and names
+    /// B's terminal; the grant row is for A. Resolution uses the ROW, so the
+    /// named terminal disagrees and the frame is refused. Were the handler to
+    /// resolve from the frame's `session_id` (the check deleted), this would
+    /// admit `term-B` and the test fails.
+    #[test]
+    fn a_grant_for_session_a_cannot_end_session_b() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", None, NOW + 600), NOW);
+        let b = Uuid::from_u128(8).to_string();
+        let asked = StdMutex::new(Vec::new());
+
+        // Frame names B's session AND B's terminal (top level).
+        let err = end_admit(
+            &table,
+            &end_frame(
+                Some(json!({"grant_jti": "j1", "session_id": b})),
+                Some("term-B"),
+            ),
+            &asked,
+        )
+        .expect_err("refused");
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["code"], "attach_terminal_mismatch");
+        assert_eq!(*asked.lock().unwrap(), vec![Uuid::from_u128(7)]);
+
+        // B's terminal named inside the remote block: refused the same way.
+        let err = end_admit(
+            &table,
+            &end_frame(
+                Some(json!({"grant_jti": "j1", "session_id": b, "terminal_id": "term-B"})),
+                None,
+            ),
+            &StdMutex::new(Vec::new()),
+        )
+        .expect_err("refused");
+        assert_eq!(err["code"], "attach_terminal_mismatch");
+
+        // Naming B's session and NO terminal resolves A's — never B's.
+        let AdmittedEnd::Terminal { terminal_id, .. } = end_admit(
+            &table,
+            &end_frame(Some(json!({"grant_jti": "j1", "session_id": b})), None),
+            &StdMutex::new(Vec::new()),
+        )
+        .expect("admitted") else {
+            panic!("expected a terminal");
+        };
+        assert_eq!(terminal_id, "term-A");
+        assert!(!table.is_terminal_attached("term-B", NOW));
+    }
+
+    #[test]
+    fn terminal_end_without_a_remote_block_is_refused() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", None, NOW + 600), NOW);
+        let err = end_admit(
+            &table,
+            &end_frame(None, Some("term-A")),
+            &StdMutex::new(vec![]),
+        )
+        .expect_err("remote_block_required");
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["code"], "remote_block_required");
+        assert_eq!(err["request_id"], "end-1");
+    }
+
+    #[test]
+    fn terminal_end_refuses_unknown_expired_and_wrong_source_grants() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", None, NOW + 600), NOW);
+        let asked = StdMutex::new(Vec::new());
+        let err = end_admit(
+            &table,
+            &end_frame(Some(json!({"grant_jti": "ghost"})), None),
+            &asked,
+        )
+        .expect_err("unknown");
+        assert_eq!(err["code"], "attach_grant_unknown");
+        let err = end_admit(
+            &table,
+            &end_frame(
+                Some(json!({"grant_jti": "j1", "source_device_id": "intruder"})),
+                None,
+            ),
+            &asked,
+        )
+        .expect_err("wrong source");
+        assert_eq!(err["code"], "attach_grant_unknown");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "no terminal resolved for a refused grant"
+        );
+
+        let expired = RemoteAttachGrants::new();
+        expired.insert(grant("j-exp", None, NOW + 10), NOW);
+        let err = admit_terminal_end(
+            &expired,
+            || AcceptRemoteAttach::Tenant,
+            &end_frame(Some(json!({"grant_jti": "j-exp"})), None),
+            NOW + 11,
+            |_sid: Uuid| Some(("term-A".to_string(), ())),
+        )
+        .expect_err("expired");
+        assert_eq!(err["code"], "attach_grant_expired");
+
+        let err = admit_terminal_end(
+            &table,
+            || AcceptRemoteAttach::Off,
+            &end_frame(Some(json!({"grant_jti": "j1"})), None),
+            NOW,
+            |_sid: Uuid| Some(("term-A".to_string(), ())),
+        )
+        .expect_err("disabled");
+        assert_eq!(err["code"], "remote_attach_disabled");
+    }
+
+    /// An open tab's grant stays bound through an end (that binding is what
+    /// carries the PTY's `terminal_exit` back to the tab) — and a grant bound
+    /// to a DIFFERENT terminal than its session now resolves to is refused.
+    #[test]
+    fn an_open_tabs_binding_is_kept_and_a_stale_binding_is_refused() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j-tab", Some("term-A"), NOW + 600), NOW);
+        let admitted = end_admit(
+            &table,
+            &end_frame(Some(json!({"grant_jti": "j-tab"})), Some("term-A")),
+            &StdMutex::new(vec![]),
+        );
+        assert!(matches!(admitted, Ok(AdmittedEnd::Terminal { .. })));
+        assert!(table.is_terminal_attached("term-A", NOW));
+
+        table.insert(grant("j-stale", Some("term-OLD"), NOW + 600), NOW);
+        let err = end_admit(
+            &table,
+            &end_frame(Some(json!({"grant_jti": "j-stale"})), None),
+            &StdMutex::new(vec![]),
+        )
+        .expect_err("stale binding");
+        assert_eq!(err["code"], "attach_terminal_mismatch");
+        assert_eq!(err["terminal_id"], "term-A");
+    }
+
+    /// A refused end leaves an unbound grant unbound — the "grant not left
+    /// bound after refused" property, at the admission layer (the handler never
+    /// calls `bind`).
+    #[test]
+    fn a_refused_end_leaves_the_grant_unbound() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", None, NOW + 600), NOW);
+        let _ = end_admit(
+            &table,
+            &end_frame(Some(json!({"grant_jti": "j1"})), Some("term-B")),
+            &StdMutex::new(vec![]),
+        )
+        .expect_err("mismatch");
+        assert!(!table.is_terminal_attached("term-A", NOW));
+        assert!(!table.is_terminal_attached("term-B", NOW));
+        // Still usable by a later attach: the row was not consumed.
+        assert!(table.bind("j1", "term-A"));
+    }
+
+    #[test]
+    fn a_session_with_no_local_terminal_is_not_found_not_refused() {
+        let table = RemoteAttachGrants::new();
+        table.insert(
+            AttachGrant {
+                session_id: Uuid::from_u128(99),
+                ..grant("j-gone", None, NOW + 600)
+            },
+            NOW,
+        );
+        let admitted = end_admit(
+            &table,
+            &end_frame(Some(json!({"grant_jti": "j-gone"})), None),
+            &StdMutex::new(vec![]),
+        )
+        .expect("admitted as not local");
+        assert!(matches!(admitted, AdmittedEnd::NotLocal { .. }));
+    }
+
+    fn exited() -> crate::terminal::graceful_exit::GracefulExitOutcome {
+        crate::terminal::graceful_exit::GracefulExitOutcome::Exited {
+            waited_ms: 10,
+            claude_pids: vec![1],
+        }
+    }
+
+    /// Every `GracefulExitOutcome` variant, mapped per the plan's table. The
+    /// match is exhaustive so a new variant cannot compile without a row here.
+    #[test]
+    fn every_graceful_exit_outcome_maps_per_the_plan_table() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome as G;
+        let all = [
+            exited(),
+            G::ExitStuck {
+                waited_ms: 60_000,
+                claude_pids: vec![1],
+                last_probe_unreadable: false,
+            },
+            G::Refused {
+                reason: "unsent draft".to_string(),
+                claude_pids: vec![1],
+            },
+            G::NoLiveClaude,
+            G::ProbeUnavailable {
+                detail: "ps failed".to_string(),
+            },
+            G::WriteFailed {
+                error: "EPIPE".to_string(),
+                claude_pids: vec![1],
+            },
+            G::CloseRefused {
+                waited_ms: 5,
+                claude_pids: vec![1],
+                reason: "relaunched".to_string(),
+            },
+            G::CloseOutcomeUnknown {
+                waited_ms: 5,
+                claude_pids: vec![1],
+                detail: "panicked".to_string(),
+            },
+        ];
+        for outcome in all {
+            let step = graceful_end_step(&Ok(outcome.clone()));
+            let expected = match &outcome {
+                G::Exited { .. } => Some((EndOutcome::Ended, Some("graceful"), None)),
+                G::NoLiveClaude => None,
+                G::ExitStuck { .. } => Some((EndOutcome::StillRunning, None, Some("exit_stuck"))),
+                G::Refused { .. } => {
+                    Some((EndOutcome::Refused, None, Some("refused: unsent draft")))
+                }
+                G::CloseRefused { .. } => {
+                    Some((EndOutcome::Refused, None, Some("close_refused: relaunched")))
+                }
+                G::WriteFailed { .. } => {
+                    Some((EndOutcome::Refused, None, Some("write_failed: EPIPE")))
+                }
+                G::ProbeUnavailable { .. } => Some((
+                    EndOutcome::Refused,
+                    None,
+                    Some("probe_unavailable: ps failed"),
+                )),
+                G::CloseOutcomeUnknown { .. } => {
+                    Some((EndOutcome::Unknown, None, Some("close_outcome_unknown")))
+                }
+            };
+            match (expected, step) {
+                (None, GracefulEndStep::CloseBareShell) => {}
+                (Some((o, via, reason)), GracefulEndStep::Verdict(v)) => {
+                    assert_eq!(v.outcome, o, "{outcome:?}");
+                    assert_eq!(v.via.as_deref(), via, "{outcome:?}");
+                    match reason {
+                        Some(prefix) => assert!(
+                            v.reason.as_deref().is_some_and(|r| r.starts_with(prefix)),
+                            "{outcome:?}: {v:?}"
+                        ),
+                        None => assert_eq!(v.reason, None, "{outcome:?}"),
+                    }
+                }
+                (e, s) => panic!("{outcome:?}: expected {e:?}, got {s:?}"),
+            }
+        }
+        // The not-found `Err` graceful_exit returns for a vanished terminal.
+        let GracefulEndStep::Verdict(v) =
+            graceful_end_step(&Err("Terminal session not found: t1".to_string()))
+        else {
+            panic!("an Err is final");
+        };
+        assert_eq!(v.outcome, EndOutcome::NotFound);
+    }
+
+    /// Records what `execute_terminal_end` did to the terminal.
+    #[derive(Default)]
+    struct EndEffects {
+        graceful_calls: std::sync::atomic::AtomicUsize,
+        close_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn run_end(
+        effects: &EndEffects,
+        force: bool,
+        graceful: Result<crate::terminal::graceful_exit::GracefulExitOutcome, String>,
+        close: Result<(), String>,
+    ) -> EndVerdict {
+        use std::sync::atomic::Ordering::SeqCst;
+        execute_terminal_end(
+            force,
+            || async {
+                effects.graceful_calls.fetch_add(1, SeqCst);
+                graceful
+            },
+            || async {
+                effects.close_calls.fetch_add(1, SeqCst);
+                close
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_refused_graceful_end_never_reaches_the_close_so_the_pty_survives() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fx = EndEffects::default();
+        let v = run_end(
+            &fx,
+            false,
+            Ok(
+                crate::terminal::graceful_exit::GracefulExitOutcome::Refused {
+                    reason: "the prompt holds an unsent draft".to_string(),
+                    claude_pids: vec![42],
+                },
+            ),
+            Ok(()),
+        )
+        .await;
+        assert_eq!(v.outcome, EndOutcome::Refused);
+        assert!(v.reason.unwrap().contains("unsent draft"));
+        assert_eq!(fx.graceful_calls.load(SeqCst), 1);
+        assert_eq!(
+            fx.close_calls.load(SeqCst),
+            0,
+            "a refusal must not close the PTY"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_shell_is_closed_and_answered_ended_via_no_live_claude() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fx = EndEffects::default();
+        let v = run_end(
+            &fx,
+            false,
+            Ok(crate::terminal::graceful_exit::GracefulExitOutcome::NoLiveClaude),
+            Ok(()),
+        )
+        .await;
+        assert_eq!(v.outcome, EndOutcome::Ended);
+        assert_eq!(v.via.as_deref(), Some("no_live_claude"));
+        assert_eq!(fx.close_calls.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_graceful_exit_that_closed_the_tab_is_not_closed_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fx = EndEffects::default();
+        let v = run_end(&fx, false, Ok(exited()), Ok(())).await;
+        assert_eq!(v.outcome, EndOutcome::Ended);
+        assert_eq!(v.via.as_deref(), Some("graceful"));
+        assert_eq!(fx.close_calls.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn force_kills_without_typing_exit() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fx = EndEffects::default();
+        let v = run_end(&fx, true, Ok(exited()), Ok(())).await;
+        assert_eq!(v.outcome, EndOutcome::Ended);
+        assert_eq!(v.via.as_deref(), Some("force"));
+        assert_eq!(fx.graceful_calls.load(SeqCst), 0, "force never types /exit");
+        assert_eq!(fx.close_calls.load(SeqCst), 1);
+
+        let fx = EndEffects::default();
+        let v = run_end(
+            &fx,
+            true,
+            Ok(exited()),
+            Err("Terminal session not found: t1".to_string()),
+        )
+        .await;
+        assert_eq!(v.outcome, EndOutcome::NotFound);
+        let v = run_end(
+            &EndEffects::default(),
+            true,
+            Ok(exited()),
+            Err("close task failed: cancelled".to_string()),
+        )
+        .await;
+        assert_eq!(
+            v.outcome,
+            EndOutcome::Unknown,
+            "an unobserved close is never ended"
+        );
+    }
+
+    /// Two concurrent ends on ONE terminal: the second is refused
+    /// `end_already_running` and never starts a driver; the first proceeds and
+    /// its slot is released when it finishes.
+    #[tokio::test]
+    async fn a_second_concurrent_end_on_one_terminal_is_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Arc::new(EndSlots::default());
+        let drivers = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+
+        let first = {
+            let slots = slots.clone();
+            let drivers = drivers.clone();
+            tokio::spawn(async move {
+                single_flight_end(&slots, "term-A", || async move {
+                    drivers.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    EndVerdict::new(EndOutcome::Ended, Some("graceful"), None)
+                })
+                .await
+            })
+        };
+        started_rx.await.expect("first end started");
+        assert!(slots.is_running("term-A"));
+
+        let second = single_flight_end(&slots, "term-A", || {
+            let drivers = drivers.clone();
+            async move {
+                drivers.fetch_add(1, Ordering::SeqCst);
+                EndVerdict::new(EndOutcome::Ended, Some("graceful"), None)
+            }
+        })
+        .await;
+        assert_eq!(second.outcome, EndOutcome::Refused);
+        assert!(second
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with(END_ALREADY_RUNNING));
+        assert_eq!(drivers.load(Ordering::SeqCst), 1, "no second driver");
+
+        // A different terminal is not blocked by term-A's end.
+        let other = single_flight_end(&slots, "term-B", || async {
+            EndVerdict::new(EndOutcome::Ended, Some("force"), None)
+        })
+        .await;
+        assert_eq!(other.outcome, EndOutcome::Ended);
+
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap();
+        assert_eq!(first.outcome, EndOutcome::Ended);
+        assert!(!slots.is_running("term-A"), "slot released after the end");
+
+        // And a later end on the same terminal runs again.
+        let again = single_flight_end(&slots, "term-A", || async {
+            EndVerdict::new(EndOutcome::NotFound, None, None)
+        })
+        .await;
+        assert_eq!(again.outcome, EndOutcome::NotFound);
+    }
+
+    /// A driver that panics (or whose task is cancelled) still frees the slot:
+    /// the guard is released by unwinding, not by a reply path.
+    #[tokio::test]
+    async fn a_panicking_end_releases_its_slot() {
+        let slots = Arc::new(EndSlots::default());
+        let s = slots.clone();
+        let panicked = tokio::spawn(async move {
+            single_flight_end(&s, "term-P", || async {
+                panic!("driver blew up");
+            })
+            .await
+        })
+        .await;
+        assert!(panicked.unwrap_err().is_panic());
+        assert!(!slots.is_running("term-P"));
+
+        let s = slots.clone();
+        let parked = tokio::spawn(async move {
+            single_flight_end(&s, "term-C", std::future::pending::<EndVerdict>).await
+        });
+        tokio::task::yield_now().await;
+        while !slots.is_running("term-C") {
+            tokio::task::yield_now().await;
+        }
+        parked.abort();
+        assert!(parked.await.unwrap_err().is_cancelled());
+        assert!(!slots.is_running("term-C"));
+    }
+
+    #[test]
+    fn terminal_ended_frame_carries_the_contract_fields() {
+        let frame = end_frame(
+            Some(json!({"grant_jti": "j1", "source_device_id": "src-device"})),
+            None,
+        );
+        let v = terminal_ended_frame(
+            &frame,
+            Some(Uuid::from_u128(7)),
+            Some("term-A"),
+            &EndVerdict {
+                outcome: EndOutcome::Ended,
+                via: Some("graceful".to_string()),
+                reason: None,
+            },
+        );
+        assert_eq!(v["type"], "terminal_ended");
+        assert_eq!(v["request_id"], "end-1");
+        assert_eq!(v["session_id"], Uuid::from_u128(7).to_string());
+        assert_eq!(v["terminal_id"], "term-A");
+        assert_eq!(v["outcome"], "ended");
+        assert_eq!(v["via"], "graceful");
+        assert!(v.get("reason").is_none());
+        assert_eq!(v["grant_jti"], "j1");
+        assert_eq!(v["remote"]["source_device_id"], "src-device");
+        assert_eq!(v["remote"]["grant_jti"], "j1");
+
+        let v = terminal_ended_frame(
+            &frame,
+            Some(Uuid::from_u128(7)),
+            None,
+            &EndVerdict {
+                outcome: EndOutcome::NotFound,
+                via: None,
+                reason: Some("session_not_local".to_string()),
+            },
+        );
+        assert!(v["terminal_id"].is_null(), "nullable, and present");
+        assert_eq!(v["outcome"], "not_found");
+        assert_eq!(v["reason"], "session_not_local");
+    }
+
+    #[test]
+    fn the_outcome_vocabulary_round_trips_and_fails_closed() {
+        for o in [
+            EndOutcome::Ended,
+            EndOutcome::Refused,
+            EndOutcome::StillRunning,
+            EndOutcome::Unknown,
+            EndOutcome::NotFound,
+        ] {
+            assert_eq!(EndOutcome::parse(o.as_str()), o);
+            assert_eq!(serde_json::to_value(o).unwrap(), json!(o.as_str()));
+        }
+        assert_eq!(EndOutcome::parse("ENDED_ISH"), EndOutcome::Unknown);
+        assert_eq!(EndOutcome::parse(""), EndOutcome::Unknown);
+    }
+
     // ---- source-side client -----------------------------------------------
+
+    #[tokio::test]
+    async fn end_sends_the_contract_frame_and_the_ended_reply_wakes_it() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Attached {
+                    grant_jti: "jti-1",
+                    terminal_id: Some("remote-term"),
+                },
+                true,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let sent = pump.recv().await.expect("frame sent");
+        assert_eq!(sent["type"], "remote_terminal_end");
+        // The open-tab path names the attached grant and never re-sends the JWT.
+        assert!(sent.get("grant").is_none());
+        assert_eq!(sent["grant_jti"], "jti-1");
+        assert_eq!(sent["terminal_id"], "remote-term");
+        assert_eq!(sent["force"], true);
+        let rid = sent["request_id"].as_str().unwrap().to_string();
+        // Routed as the relay dispatch arm routes it.
+        assert!(client.handle_inbound(
+            "remote_terminal_ended",
+            &json!({
+                "type": "remote_terminal_ended",
+                "request_id": rid,
+                "session_id": "s-1",
+                "terminal_id": "remote-term",
+                "outcome": "ended",
+                "via": "force",
+            }),
+        ));
+        let reply = task.await.unwrap();
+        assert_eq!(reply.outcome, EndOutcome::Ended);
+        assert_eq!(reply.via.as_deref(), Some("force"));
+        assert_eq!(reply.terminal_id.as_deref(), Some("remote-term"));
+        assert!(client.pending_end.lock().unwrap().is_empty());
+    }
+
+    /// A caller that goes away (the `/ui-bridge/tauri/invoke` HTTP client
+    /// disconnecting) DROPS the `end` future mid-wait. Its waiter must go with
+    /// it, not sit in `pending_end` until the next reconnect.
+    #[tokio::test]
+    async fn a_dropped_end_future_leaves_no_waiter_behind() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Fresh { grant: "g" },
+                false,
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        // The frame was sent, so the waiter is registered and parked.
+        let _sent = pump.recv().await.expect("frame sent");
+        assert_eq!(client.pending_end.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            client.pending_end.lock().unwrap().is_empty(),
+            "a dropped end must not leak its pending_end entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_grant_end_names_no_terminal() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Fresh { grant: "g" },
+                false,
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        let sent = pump.recv().await.expect("frame sent");
+        // The fresh-grant path carries the JWT, as `remote_terminal_attach` does.
+        assert_eq!(sent["grant"], "g");
+        assert!(sent.get("grant_jti").is_none());
+        assert!(sent.get("terminal_id").is_none());
+        assert_eq!(sent["force"], false);
+        let reply = task.await.unwrap();
+        assert_eq!(
+            reply.outcome,
+            EndOutcome::Unknown,
+            "a timeout is never ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_end_timeout_is_unknown_and_clears_the_pending_slot() {
+        let client = RemoteAttachClient::new();
+        let _pump = client.lock_outbound().await;
+        let reply = client
+            .end(
+                EndGrant::Fresh { grant: "g" },
+                false,
+                Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        assert!(reply.reason.unwrap().starts_with("timeout"));
+        assert!(client.pending_end.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_end_with_no_relay_is_unknown_and_nothing_waits() {
+        let client = RemoteAttachClient::new();
+        let reply = client
+            .end(
+                EndGrant::Fresh { grant: "g" },
+                false,
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        assert!(reply.reason.unwrap().starts_with("relay_unavailable"));
+        assert!(client.pending_end.lock().unwrap().is_empty());
+    }
+
+    /// A correlated refusal — the relay's bare `error` or the target's
+    /// translated `remote_terminal_error` — resolves the end as `refused`
+    /// with the code leading the reason.
+    #[tokio::test]
+    async fn correlated_errors_resolve_a_pending_end_as_refused() {
+        for msg_type in ["error", "remote_terminal_error"] {
+            let client = Arc::new(RemoteAttachClient::new());
+            let mut pump = client.lock_outbound().await;
+            let c = client.clone();
+            let task = tokio::spawn(async move {
+                c.end(
+                    EndGrant::Fresh { grant: "g" },
+                    false,
+                    Duration::from_secs(5),
+                )
+                .await
+            });
+            let sent = pump.recv().await.expect("frame sent");
+            let rid = sent["request_id"].as_str().unwrap().to_string();
+            assert!(client.handle_inbound(
+                msg_type,
+                &json!({
+                    "type": msg_type,
+                    "request_id": rid,
+                    "code": "attach_grant_expired",
+                    "message": "the attach grant has expired",
+                }),
+            ));
+            let reply = task.await.unwrap();
+            assert_eq!(reply.outcome, EndOutcome::Refused, "{msg_type}");
+            assert!(
+                reply
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("attach_grant_expired"),
+                "{msg_type}"
+            );
+        }
+    }
+
+    /// The relay's own `end_reply_timeout` is `unknown`, not `refused` — and
+    /// neither it nor `end_already_pending` may close an open tab.
+    #[tokio::test]
+    async fn a_relay_end_timeout_is_unknown_and_never_fatal_to_a_tab() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Attached {
+                    grant_jti: "jti-tab",
+                    terminal_id: None,
+                },
+                false,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let sent = pump.recv().await.expect("frame sent");
+        let rid = sent["request_id"].as_str().unwrap().to_string();
+        assert!(client.handle_inbound(
+            "remote_terminal_error",
+            &json!({
+                "type": "remote_terminal_error",
+                "request_id": rid,
+                "grant_jti": "jti-tab",
+                "code": END_REPLY_TIMEOUT_CODE,
+                "message": "the target did not answer",
+            }),
+        ));
+        let reply = task.await.unwrap();
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        assert!(!is_fatal_remote_error(END_REPLY_TIMEOUT_CODE));
+        assert!(!is_fatal_remote_error("end_already_pending"));
+    }
+
+    /// Send an end, answer it with one correlated error frame, return the reply.
+    async fn end_answered_by(
+        client: &Arc<RemoteAttachClient>,
+        grant: EndGrant<'static>,
+        msg_type: &str,
+        code: &str,
+        grant_jti: Option<&str>,
+    ) -> EndReply {
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.end(grant, false, Duration::from_secs(5)).await });
+        let sent = pump.recv().await.expect("frame sent");
+        let rid = sent["request_id"].as_str().unwrap().to_string();
+        let mut frame = json!({
+            "type": msg_type,
+            "request_id": rid,
+            "code": code,
+            "message": "m",
+        });
+        if let Some(j) = grant_jti {
+            frame["grant_jti"] = json!(j);
+        }
+        assert!(client.handle_inbound(msg_type, &frame), "{msg_type}/{code}");
+        task.await.unwrap()
+    }
+
+    /// `target_not_connected` means opposite things on the two frames: on a
+    /// `remote_terminal_error` the end was forwarded and the target dropped
+    /// before answering (`unknown`); on a bare `error` it was never sent
+    /// (`refused`). The mapping is on frame type plus code.
+    #[tokio::test]
+    async fn target_not_connected_is_unknown_when_forwarded_and_refused_when_never_sent() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let forwarded = end_answered_by(
+            &client,
+            EndGrant::Fresh { grant: "g" },
+            "remote_terminal_error",
+            "target_not_connected",
+            None,
+        )
+        .await;
+        assert_eq!(forwarded.outcome, EndOutcome::Unknown);
+        assert!(forwarded
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("target_not_connected"));
+
+        let never_sent = end_answered_by(
+            &client,
+            EndGrant::Fresh { grant: "g" },
+            "error",
+            "target_not_connected",
+            None,
+        )
+        .await;
+        assert_eq!(never_sent.outcome, EndOutcome::Refused);
+        assert!(never_sent
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("target_not_connected"));
+    }
+
+    /// `listener_lost` after the forward is `unknown` — and, correlated to an
+    /// end, it does not close the open tab whose grant the end rode on, even
+    /// though the same code IS fatal to an uncorrelated pane error.
+    #[tokio::test]
+    async fn listener_lost_on_an_end_is_unknown_and_keeps_the_tab() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let pane = new_pane(&client, "jti-tab", AttachedRing::default());
+        client.register_pane(pane.clone());
+        let reply = end_answered_by(
+            &client,
+            EndGrant::Attached {
+                grant_jti: "jti-tab",
+                terminal_id: None,
+            },
+            "remote_terminal_error",
+            "listener_lost",
+            Some("jti-tab"),
+        )
+        .await;
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        assert!(client.pane("jti-tab").is_some(), "tab kept");
+        assert!(!pane.is_finished(), "tab still live");
+    }
+
+    /// Every other `remote_terminal_error` code is the target's own refusal,
+    /// and `end_already_pending` (a bare `error`) is the relay's.
+    #[tokio::test]
+    async fn target_refusals_and_end_already_pending_are_refused() {
+        let client = Arc::new(RemoteAttachClient::new());
+        for (msg_type, code) in [
+            ("remote_terminal_error", "remote_block_required"),
+            ("remote_terminal_error", "attach_terminal_mismatch"),
+            ("error", "end_already_pending"),
+            ("error", "listener_lost"),
+            ("error", END_REPLY_TIMEOUT_CODE),
+        ] {
+            let reply = end_answered_by(
+                &client,
+                EndGrant::Fresh { grant: "g" },
+                msg_type,
+                code,
+                None,
+            )
+            .await;
+            assert_eq!(reply.outcome, EndOutcome::Refused, "{msg_type}/{code}");
+            assert!(reply.reason.as_deref().unwrap().starts_with(code));
+        }
+        assert!(!is_fatal_remote_error("end_already_pending"));
+        assert!(!is_fatal_remote_error("target_not_connected"));
+    }
+
+    #[tokio::test]
+    async fn a_relay_drop_settles_a_pending_end_as_unknown() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Fresh { grant: "g" },
+                false,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let _ = pump.recv().await.expect("frame sent");
+        client.on_relay_disconnected();
+        let reply = task.await.unwrap();
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        assert!(reply.reason.unwrap().starts_with("relay_disconnected"));
+    }
+
+    #[test]
+    fn an_ended_reply_without_an_outcome_is_unknown() {
+        let reply = parse_ended(&json!({"type": "remote_terminal_ended", "request_id": "r"}));
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        let reply = parse_ended(&json!({"outcome": "still_running", "reason": "exit_stuck"}));
+        assert_eq!(reply.outcome, EndOutcome::StillRunning);
+        assert_eq!(reply.reason.as_deref(), Some("exit_stuck"));
+    }
 
     fn attached_frame(request_id: &str, jti: &str, buf: &[u8], start: u64) -> Value {
         json!({
@@ -6069,6 +7726,22 @@ mod grant_gate_tests {
         assert!(
             !attach.contains("GrantFamily::Create"),
             "attach handler must not spend the create family's budget"
+        );
+
+        // `terminal_end` presents a FRESH attach grant immediately after the
+        // mint — the same directive/frame race the attach re-read closes.
+        let end = handler_body(RELAY, "async fn handle_terminal_end(");
+        assert!(
+            end.contains("GrantFamily::Attach"),
+            "end handler lost its family"
+        );
+        assert!(
+            end.contains("crate::session::attach::catch_up_now_within("),
+            "end handler must re-read the ATTACH feed"
+        );
+        assert!(
+            !end.contains("crate::session::create::catch_up_now_within("),
+            "end handler must not consult the create feed"
         );
     }
 
