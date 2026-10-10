@@ -1581,6 +1581,25 @@ async fn tail_session(
         if let Some(t) = tailer.as_ref() {
             use crate::session::session_transcript_tailer::Admit;
             let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
+            // Token usage (plan `2026-10-09-kpi-telemetry-and-dashboards`
+            // Phase 1) — counted for every tailed session, bound or not,
+            // BEFORE the transcript gates below: binding and consent decide
+            // what is SHIPPED, at flush time, not what is counted. Same
+            // two-step: the steady state applies inline; a first sighting or
+            // a gap (which reads the file's history) goes to a blocking
+            // thread and is awaited, so this tail's batches stay ordered.
+            if !t.try_observe_usage(&session_id, &path, file_start, &bytes) {
+                let (t, sid, p, b) = (t.clone(), session_id.clone(), path.clone(), bytes.clone());
+                if let Err(e) =
+                    spawn_blocking_tracked(move || t.observe_usage(&sid, &p, file_start, &b)).await
+                {
+                    warn!(
+                        "transcript_watcher: usage read for {} failed to run: {} (the usage \
+                         cursor is unchanged; the next batch retries)",
+                        session_id, e
+                    );
+                }
+            }
             let verdict = t.admit(
                 &session_id,
                 bytes.len(),

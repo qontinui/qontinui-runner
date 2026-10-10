@@ -199,6 +199,13 @@ struct Inner {
     /// constructible without one (tests, ephemeral registrars). Unattached →
     /// the arm misses.
     terminal_coord_lookup: OnceLock<TerminalCoordLookup>,
+    /// Runs at the top of [`AiCoordRegistrar::close_session`], while the
+    /// session's binding and tenant are still recorded, so a consumer can
+    /// queue its last rows for the session AHEAD of the `Closed` row (plan
+    /// `2026-10-09-kpi-telemetry-and-dashboards` Phase 1: the transcript
+    /// tailer's final `usage_totals`). Argument: the close's `session_key`.
+    /// Unattached → nothing runs.
+    close_observer: OnceLock<CloseObserver>,
     /// Test-only observability for the Phase-1 handle hook: counts every
     /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
     /// incremented BEFORE the attached-store gate — so unit tests (which
@@ -211,6 +218,9 @@ struct Inner {
 /// See [`Inner::terminal_coord_lookup`]. Argument: a harness id; answers the
 /// coord row of the live terminal PINNED to it.
 type TerminalCoordLookup = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
+
+/// See [`Inner::close_observer`].
+type CloseObserver = Box<dyn Fn(&str) + Send + Sync>;
 
 /// How many predecessors [`resolve_adoption_chain`] follows before giving up —
 /// each hop is one `/clear` inside the same provider process.
@@ -278,6 +288,7 @@ impl AiCoordRegistrar {
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
+                close_observer: OnceLock::new(),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -307,6 +318,47 @@ impl AiCoordRegistrar {
         if self.inner.terminal_coord_lookup.set(Box::new(f)).is_err() {
             warn!("ai_coord_register: terminal coord lookup already attached — ignoring");
         }
+    }
+
+    /// Attach the close observer (once, at startup). See
+    /// [`Inner::close_observer`]. It runs synchronously inside
+    /// [`Self::close_session`] with no registrar lock held, so it may call
+    /// back into this registrar (e.g. [`Self::record_usage_totals`]).
+    pub fn attach_close_observer(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        if self.inner.close_observer.set(Box::new(f)).is_err() {
+            warn!("ai_coord_register: close observer already attached — ignoring");
+        }
+    }
+
+    /// Queue a `usage_totals` row for the coord session `session_key` is bound
+    /// to (plan `2026-10-09-kpi-telemetry-and-dashboards` Phase 1). `payload`
+    /// is [`crate::session::usage_totals::usage_totals_payload`]'s shape; the
+    /// owning tenant is stamped on so the drain presents that tenant's slot.
+    ///
+    /// The coord row is resolved across every runner-hosted plane
+    /// ([`Self::resolve_coord_session_id`]): this registrar's own sessions
+    /// AND terminal-hosted `claude` panes pinned to `session_key`. A terminal
+    /// session carries no tenant stamp here; the drain resolves its tenant
+    /// from the session registry, as for its other rows.
+    ///
+    /// `Ok(None)` when no plane knows `session_key` — an UNCOVERED session,
+    /// which the KPI layer counts as such. No binding is invented for it.
+    pub fn record_usage_totals(
+        &self,
+        session_key: &str,
+        payload: serde_json::Value,
+    ) -> std::io::Result<Option<Uuid>> {
+        let Some(session_id) = self.resolve_coord_session_id(session_key) else {
+            return Ok(None);
+        };
+        let payload = self.stamp_tenant(session_id, payload);
+        self.inner.outbox.record(
+            self.inner.machine_id,
+            session_id,
+            SessionEventKind::UsageTotals,
+            payload,
+        )?;
+        Ok(Some(session_id))
     }
 
     /// Resolve the coord row of harness id `claude_session_id` ITSELF, across
@@ -1327,6 +1379,19 @@ impl AiCoordRegistrar {
     /// `claude_session_id`. A key from neither plane is an index miss, which is
     /// the documented no-op.
     pub fn close_session(&self, session_key: &str) {
+        // Before anything is evicted: the observer's rows (the session's final
+        // usage totals) resolve through the binding and tenant evicted below,
+        // and must queue AHEAD of the `Closed` row.
+        //
+        // The observer runs synchronously and may briefly wait: the tailer
+        // serialises its close flush with its periodic usage flush, so a close
+        // that lands mid-pass waits for that one pass (a handful of outbox
+        // appends) before its own row is queued.
+        if self.resolve_coord_session_id(session_key).is_some() {
+            if let Some(observer) = self.inner.close_observer.get() {
+                observer(session_key);
+            }
+        }
         let session_id = {
             // Evict reverse first, capturing the coord id.
             let Some(id) = self
@@ -2323,6 +2388,35 @@ mod tests {
             last.payload["session_status"],
             json!("working"),
             "an unmark tells coord the session is working again"
+        );
+    }
+
+    /// `usage_totals` reaches terminal-hosted sessions too: the row is
+    /// addressed through the terminal-plane arm when this registrar's own
+    /// index does not know the session, and an unknown session gets no row.
+    #[test]
+    fn usage_totals_resolve_through_the_terminal_plane() {
+        let (reg, _dir) = registrar();
+        let pinned = Uuid::new_v4().to_string();
+        let terminal_coord_id = Uuid::new_v4();
+        {
+            let pinned = pinned.clone();
+            reg.attach_terminal_coord_lookup(move |csid| {
+                (csid == pinned).then_some(terminal_coord_id)
+            });
+        }
+        assert_eq!(
+            reg.record_usage_totals(&pinned, json!({"claude_code_session_id": pinned, "models": []}))
+                .unwrap(),
+            Some(terminal_coord_id)
+        );
+        let last = reg.inner.outbox.pending().unwrap().pop().unwrap();
+        assert_eq!(last.event_kind, SessionEventKind::UsageTotals.as_str());
+        assert_eq!(last.session_id, terminal_coord_id);
+        assert_eq!(
+            reg.record_usage_totals("unknown", json!({"models": []})).unwrap(),
+            None,
+            "an uncovered session gets no row"
         );
     }
 
