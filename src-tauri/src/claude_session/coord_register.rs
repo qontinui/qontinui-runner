@@ -2406,15 +2406,19 @@ mod tests {
             });
         }
         assert_eq!(
-            reg.record_usage_totals(&pinned, json!({"claude_code_session_id": pinned, "models": []}))
-                .unwrap(),
+            reg.record_usage_totals(
+                &pinned,
+                json!({"claude_code_session_id": pinned, "models": []})
+            )
+            .unwrap(),
             Some(terminal_coord_id)
         );
         let last = reg.inner.outbox.pending().unwrap().pop().unwrap();
         assert_eq!(last.event_kind, SessionEventKind::UsageTotals.as_str());
         assert_eq!(last.session_id, terminal_coord_id);
         assert_eq!(
-            reg.record_usage_totals("unknown", json!({"models": []})).unwrap(),
+            reg.record_usage_totals("unknown", json!({"models": []}))
+                .unwrap(),
             None,
             "an uncovered session gets no row"
         );

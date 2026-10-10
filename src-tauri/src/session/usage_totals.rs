@@ -671,7 +671,13 @@ impl UsageLedger {
     /// batch starts at this file's cursor and the subagent sweep is done),
     /// else does NOTHING and returns `false`, and the caller runs
     /// [`Self::observe`] on a blocking thread. Never touches the filesystem.
-    pub fn try_observe(&self, watch_key: &str, path: &Path, file_start: u64, appended: &str) -> bool {
+    pub fn try_observe(
+        &self,
+        watch_key: &str,
+        path: &Path,
+        file_start: u64,
+        appended: &str,
+    ) -> bool {
         let (session, is_subagent) = transcript_owner(watch_key, path);
         if self.is_excluded(&session) {
             return true;
@@ -680,7 +686,10 @@ impl UsageLedger {
             // The workflow check reads the main transcript's head.
             return false;
         }
-        if !self.plan(&session, is_subagent, path, file_start).is_empty() {
+        if !self
+            .plan(&session, is_subagent, path, file_start)
+            .is_empty()
+        {
             return false;
         }
         self.apply(
@@ -892,7 +901,10 @@ fn list_subagent_transcripts(dir: &Path) -> Vec<PathBuf> {
 /// The `usage_totals` outbox payload: the Claude Code session id (the wire
 /// PATH key — not the coord `sessions.id`, which is the outbox lane) and the
 /// models array that is the request body verbatim.
-pub fn usage_totals_payload(claude_session_id: &str, models: &[ModelUsageTotals]) -> serde_json::Value {
+pub fn usage_totals_payload(
+    claude_session_id: &str,
+    models: &[ModelUsageTotals],
+) -> serde_json::Value {
     serde_json::json!({
         "claude_code_session_id": claude_session_id,
         "models": models,
@@ -944,12 +956,20 @@ mod tests {
     fn parse_skips_non_assistant_synthetic_and_malformed() {
         assert!(parse_usage_line(&user_line()).is_none());
         assert!(parse_usage_line("{\"usage\": not json").is_none());
-        assert!(
-            parse_usage_line(&line("m1", "<synthetic>", [0, 0, 0, 0], "2026-10-09T10:00:00Z"))
-                .is_none()
-        );
-        let o = parse_usage_line(&line("m1", "claude-opus-5-5", [1, 2, 3, 4], "2026-10-09T10:00:00Z"))
-            .unwrap();
+        assert!(parse_usage_line(&line(
+            "m1",
+            "<synthetic>",
+            [0, 0, 0, 0],
+            "2026-10-09T10:00:00Z"
+        ))
+        .is_none());
+        let o = parse_usage_line(&line(
+            "m1",
+            "claude-opus-5-5",
+            [1, 2, 3, 4],
+            "2026-10-09T10:00:00Z",
+        ))
+        .unwrap();
         assert_eq!(o.key, "m1");
         assert_eq!(o.tokens, [1, 2, 3, 4]);
         assert_eq!(o.at.unwrap().to_rfc3339(), "2026-10-09T10:00:00+00:00");
@@ -971,7 +991,10 @@ mod tests {
         let a = parse_usage_line(&v.to_string()).unwrap();
         let b = parse_usage_line(&v.to_string()).unwrap();
         assert!(a.key.starts_with("line:"));
-        assert_eq!(a.key, b.key, "the digest key is stable, so a re-read dedups");
+        assert_eq!(
+            a.key, b.key,
+            "the digest key is stable, so a re-read dedups"
+        );
     }
 
     /// The measured rule: duplicate lines of one response count once, and the
@@ -989,7 +1012,12 @@ mod tests {
             line("m1", "claude-opus-5-5", [10, 40, 100, 1000], ts),
             line("m1", "claude-opus-5-5", [10, 500, 100, 1000], ts),
             user_line(),
-            line("m2", "claude-opus-5-5", [5, 7, 0, 2000], "2026-10-09T10:05:00Z"),
+            line(
+                "m2",
+                "claude-opus-5-5",
+                [5, 7, 0, 2000],
+                "2026-10-09T10:05:00Z",
+            ),
         ]
         .concat();
         std::fs::write(&p, &batch).unwrap();
@@ -1000,8 +1028,14 @@ mod tests {
         assert_eq!(t.cache_creation_input_tokens, 100);
         assert_eq!(t.cache_read_input_tokens, 3000);
         assert_eq!(t.turn_count, 2);
-        assert_eq!(t.first_turn_at.unwrap().to_rfc3339(), "2026-10-09T10:00:00+00:00");
-        assert_eq!(t.last_turn_at.unwrap().to_rfc3339(), "2026-10-09T10:05:00+00:00");
+        assert_eq!(
+            t.first_turn_at.unwrap().to_rfc3339(),
+            "2026-10-09T10:00:00+00:00"
+        );
+        assert_eq!(
+            t.last_turn_at.unwrap().to_rfc3339(),
+            "2026-10-09T10:05:00+00:00"
+        );
 
         // Re-ingesting the same bytes changes nothing (idempotent).
         let v = ledger.snapshot("s1").unwrap().version;
@@ -1016,8 +1050,18 @@ mod tests {
         let p = dir.path().join("s1.jsonl");
         let batch = [
             line("a", "claude-opus-5-5", [1, 2, 3, 4], "2026-10-09T10:00:00Z"),
-            line("b", "claude-haiku-4-5-20251001", [10, 20, 30, 40], "2026-10-09T10:01:00Z"),
-            line("c", "claude-haiku-4-5-20251001", [1, 1, 1, 1], "2026-10-09T10:02:00Z"),
+            line(
+                "b",
+                "claude-haiku-4-5-20251001",
+                [10, 20, 30, 40],
+                "2026-10-09T10:01:00Z",
+            ),
+            line(
+                "c",
+                "claude-haiku-4-5-20251001",
+                [1, 1, 1, 1],
+                "2026-10-09T10:02:00Z",
+            ),
         ]
         .concat();
         std::fs::write(&p, &batch).unwrap();
@@ -1038,8 +1082,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path().join("s1.jsonl");
         let batch = [
-            line("a", "some-unpriced-model-x", [100, 100, 0, 0], "2026-10-09T10:00:00Z"),
-            line("b", "claude-haiku-4-5", [1000, 1000, 0, 0], "2026-10-09T10:00:00Z"),
+            line(
+                "a",
+                "some-unpriced-model-x",
+                [100, 100, 0, 0],
+                "2026-10-09T10:00:00Z",
+            ),
+            line(
+                "b",
+                "claude-haiku-4-5",
+                [1000, 1000, 0, 0],
+                "2026-10-09T10:00:00Z",
+            ),
         ]
         .concat();
         std::fs::write(&p, &batch).unwrap();
@@ -1072,21 +1126,43 @@ mod tests {
         let sub1 = subdir.join("agent-aaa.jsonl");
         std::fs::write(
             &sub1,
-            line("s1", "claude-opus-5-5", [1, 10, 0, 100], "2026-10-09T09:00:00Z")
-                + &line("s1", "claude-opus-5-5", [1, 30, 0, 100], "2026-10-09T09:00:00Z"),
+            line(
+                "s1",
+                "claude-opus-5-5",
+                [1, 10, 0, 100],
+                "2026-10-09T09:00:00Z",
+            ) + &line(
+                "s1",
+                "claude-opus-5-5",
+                [1, 30, 0, 100],
+                "2026-10-09T09:00:00Z",
+            ),
         )
         .unwrap();
-        let mbatch = line("p1", "claude-opus-5-5", [2, 5, 0, 50], "2026-10-09T10:00:00Z");
+        let mbatch = line(
+            "p1",
+            "claude-opus-5-5",
+            [2, 5, 0, 50],
+            "2026-10-09T10:00:00Z",
+        );
         std::fs::write(&main, &mbatch).unwrap();
 
         ledger.observe(parent, &main, 0, &mbatch);
         let t = one(&ledger.snapshot(parent).unwrap().models, "claude-opus-5-5");
         assert_eq!((t.input_tokens, t.output_tokens, t.turn_count), (3, 35, 2));
-        assert_eq!(t.first_turn_at.unwrap().to_rfc3339(), "2026-10-09T09:00:00+00:00");
+        assert_eq!(
+            t.first_turn_at.unwrap().to_rfc3339(),
+            "2026-10-09T09:00:00+00:00"
+        );
 
         // A second subagent appears and is tailed live under its own stem.
         let sub2 = subdir.join("agent-bbb.jsonl");
-        let sbatch = line("s2", "claude-haiku-4-5", [4, 4, 4, 4], "2026-10-09T10:10:00Z");
+        let sbatch = line(
+            "s2",
+            "claude-haiku-4-5",
+            [4, 4, 4, 4],
+            "2026-10-09T10:10:00Z",
+        );
         std::fs::write(&sub2, &sbatch).unwrap();
         ledger.observe("agent-bbb", &sub2, 0, &sbatch);
         // The first subagent is also tailed live from 0: the sweep already
@@ -1097,7 +1173,10 @@ mod tests {
         let models = ledger.snapshot(parent).unwrap().models;
         assert_eq!(one(&models, "claude-opus-5-5").output_tokens, 35);
         assert_eq!(one(&models, "claude-haiku-4-5").turn_count, 1);
-        assert!(ledger.snapshot("agent-bbb").is_none(), "no row keyed on a subagent stem");
+        assert!(
+            ledger.snapshot("agent-bbb").is_none(),
+            "no row keyed on a subagent stem"
+        );
         assert_eq!(ledger.session_count(), 1);
     }
 
@@ -1108,9 +1187,18 @@ mod tests {
         let ledger = UsageLedger::new();
         let dir = tempdir().unwrap();
         let p = dir.path().join("s1.jsonl");
-        let history = line("old", "claude-opus-5-5", [100, 100, 100, 100], "2026-10-08T10:00:00Z")
-            + &user_line();
-        let batch = line("new", "claude-opus-5-5", [1, 1, 1, 1], "2026-10-09T10:00:00Z");
+        let history = line(
+            "old",
+            "claude-opus-5-5",
+            [100, 100, 100, 100],
+            "2026-10-08T10:00:00Z",
+        ) + &user_line();
+        let batch = line(
+            "new",
+            "claude-opus-5-5",
+            [1, 1, 1, 1],
+            "2026-10-09T10:00:00Z",
+        );
         std::fs::write(&p, history.clone() + &batch).unwrap();
         let start = history.len() as u64;
         assert!(
@@ -1120,10 +1208,18 @@ mod tests {
         ledger.observe("s1", &p, start, &batch);
         let t = one(&ledger.snapshot("s1").unwrap().models, "claude-opus-5-5");
         assert_eq!((t.input_tokens, t.turn_count), (101, 2));
-        assert_eq!(t.first_turn_at.unwrap().to_rfc3339(), "2026-10-08T10:00:00+00:00");
+        assert_eq!(
+            t.first_turn_at.unwrap().to_rfc3339(),
+            "2026-10-08T10:00:00+00:00"
+        );
 
         // Steady state: the next batch starts at the cursor and needs no read.
-        let next = line("next", "claude-opus-5-5", [1, 0, 0, 0], "2026-10-09T10:01:00Z");
+        let next = line(
+            "next",
+            "claude-opus-5-5",
+            [1, 0, 0, 0],
+            "2026-10-09T10:01:00Z",
+        );
         let at = start + batch.len() as u64;
         assert!(ledger.try_observe("s1", &p, at, &next));
         assert_eq!(
@@ -1186,7 +1282,10 @@ mod tests {
         assert_eq!(d.len(), 1);
         ledger.mark_emitted("s1", d[0].version);
         assert!(ledger.dirty().is_empty());
-        assert!(ledger.snapshot("s1").is_some(), "close still ships clean totals");
+        assert!(
+            ledger.snapshot("s1").is_some(),
+            "close still ships clean totals"
+        );
 
         let later = Instant::now() + Duration::from_secs(10);
         assert_eq!(ledger.evict_idle(later, Duration::from_secs(60)), 0);
@@ -1206,29 +1305,52 @@ mod tests {
         let main = dir.path().join(format!("{parent}.jsonl"));
         std::fs::write(
             &main,
-            line("p1", "claude-opus-5-5", [100, 100, 0, 0], "2026-10-09T08:00:00Z"),
+            line(
+                "p1",
+                "claude-opus-5-5",
+                [100, 100, 0, 0],
+                "2026-10-09T08:00:00Z",
+            ),
         )
         .unwrap();
         let subdir = dir.path().join(parent).join("subagents");
         std::fs::create_dir_all(&subdir).unwrap();
         std::fs::write(
             subdir.join("agent-old.jsonl"),
-            line("o1", "claude-opus-5-5", [10, 10, 0, 0], "2026-10-09T09:00:00Z"),
+            line(
+                "o1",
+                "claude-opus-5-5",
+                [10, 10, 0, 0],
+                "2026-10-09T09:00:00Z",
+            ),
         )
         .unwrap();
         let live = subdir.join("agent-live.jsonl");
-        let batch = line("l1", "claude-opus-5-5", [1, 1, 0, 0], "2026-10-09T10:00:00Z");
+        let batch = line(
+            "l1",
+            "claude-opus-5-5",
+            [1, 1, 0, 0],
+            "2026-10-09T10:00:00Z",
+        );
         std::fs::write(&live, &batch).unwrap();
 
         assert!(!ledger.try_observe("agent-live", &live, 0, &batch));
         ledger.observe("agent-live", &live, 0, &batch);
         let t = one(&ledger.snapshot(parent).unwrap().models, "claude-opus-5-5");
         assert_eq!((t.input_tokens, t.turn_count), (111, 3));
-        assert_eq!(t.first_turn_at.unwrap().to_rfc3339(), "2026-10-09T08:00:00+00:00");
+        assert_eq!(
+            t.first_turn_at.unwrap().to_rfc3339(),
+            "2026-10-09T08:00:00+00:00"
+        );
 
         // The main transcript's own later batch (from its cursor) adds only
         // what is new.
-        let more = line("p2", "claude-opus-5-5", [1000, 0, 0, 0], "2026-10-09T11:00:00Z");
+        let more = line(
+            "p2",
+            "claude-opus-5-5",
+            [1000, 0, 0, 0],
+            "2026-10-09T11:00:00Z",
+        );
         let at = std::fs::metadata(&main).unwrap().len();
         assert!(ledger.try_observe(parent, &main, at, &more));
         let t = one(&ledger.snapshot(parent).unwrap().models, "claude-opus-5-5");
@@ -1245,14 +1367,24 @@ mod tests {
         let dir = tempdir().unwrap();
         let parent = "33333333-2222-3333-4444-555555555555";
         let main = dir.path().join(format!("{parent}.jsonl"));
-        let a = line("m1", "claude-opus-5-5", [1, 0, 0, 0], "2026-10-09T10:00:00Z");
+        let a = line(
+            "m1",
+            "claude-opus-5-5",
+            [1, 0, 0, 0],
+            "2026-10-09T10:00:00Z",
+        );
         std::fs::write(&main, &a).unwrap();
         let subdir = dir.path().join(parent).join("subagents");
         std::fs::create_dir_all(&subdir).unwrap();
         let sub = subdir.join("agent-x.jsonl");
         std::fs::write(
             &sub,
-            line("s1", "claude-opus-5-5", [10, 0, 0, 0], "2026-10-09T10:00:00Z"),
+            line(
+                "s1",
+                "claude-opus-5-5",
+                [10, 0, 0, 0],
+                "2026-10-09T10:00:00Z",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1262,10 +1394,18 @@ mod tests {
         }
         ledger.observe(parent, &main, 0, &a);
         let t = one(&ledger.snapshot(parent).unwrap().models, "claude-opus-5-5");
-        assert_eq!(t.input_tokens, 1, "the unreadable subagent is not yet counted");
+        assert_eq!(
+            t.input_tokens, 1,
+            "the unreadable subagent is not yet counted"
+        );
 
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let b = line("m2", "claude-opus-5-5", [100, 0, 0, 0], "2026-10-09T10:01:00Z");
+        let b = line(
+            "m2",
+            "claude-opus-5-5",
+            [100, 0, 0, 0],
+            "2026-10-09T10:01:00Z",
+        );
         assert!(
             !ledger.try_observe(parent, &main, a.len() as u64, &b),
             "the sweep is still owed, so the batch needs the blocking path"
@@ -1307,12 +1447,18 @@ mod tests {
         ledger.mark_emitted("s1", d[0].version);
         ledger.request_resend("s1", t0);
         assert!(
-            ledger.dirty_at(t0 + Duration::from_secs(24 * 3600)).is_empty(),
+            ledger
+                .dirty_at(t0 + Duration::from_secs(24 * 3600))
+                .is_empty(),
             "no re-send past the attempt cap"
         );
 
         ledger.request_resend("never-seen", t0);
-        assert_eq!(ledger.session_count(), 1, "a resend never creates a session");
+        assert_eq!(
+            ledger.session_count(),
+            1,
+            "a resend never creates a session"
+        );
     }
 
     #[test]
@@ -1331,9 +1477,15 @@ mod tests {
     #[test]
     fn owner_of_a_subagent_transcript_is_the_grandparent_directory() {
         let p = Path::new("/c/projects/enc/abc-123/subagents/agent-x1.jsonl");
-        assert_eq!(transcript_owner("agent-x1", p), ("abc-123".to_string(), true));
+        assert_eq!(
+            transcript_owner("agent-x1", p),
+            ("abc-123".to_string(), true)
+        );
         let m = Path::new("/c/projects/enc/abc-123.jsonl");
-        assert_eq!(transcript_owner("abc-123", m), ("abc-123".to_string(), false));
+        assert_eq!(
+            transcript_owner("abc-123", m),
+            ("abc-123".to_string(), false)
+        );
     }
 
     #[test]

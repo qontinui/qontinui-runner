@@ -154,7 +154,9 @@ use uuid::Uuid;
 use crate::claude_session::coord_register::{AiCoordRegistrar, TranscriptBindRefusal};
 
 use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
-use super::usage_totals::{usage_totals_payload, UsageLedger, USAGE_FLUSH_INTERVAL, USAGE_IDLE_EVICT};
+use super::usage_totals::{
+    usage_totals_payload, UsageLedger, USAGE_FLUSH_INTERVAL, USAGE_IDLE_EVICT,
+};
 
 /// Upper bound on one replay emit. Each emit is one outbox append + fsync and
 /// one offset reservation, so a multi-megabyte prefix is replayed as a handful
@@ -653,7 +655,8 @@ impl SessionTranscriptTailer {
         file_start: u64,
         appended: &str,
     ) -> bool {
-        self.usage.try_observe(session_key, path, file_start, appended)
+        self.usage
+            .try_observe(session_key, path, file_start, appended)
     }
 
     /// Queue a `usage_totals` row for every BOUND session whose totals changed
@@ -767,9 +770,9 @@ impl SessionTranscriptTailer {
                 // Outbox fsyncs and the settings read are blocking I/O — off
                 // the async runtime.
                 let t = tailer.clone();
-                let f = match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                    t.flush_usage_once(crate::settings::get_cloud_sync_enabled())
-                })
+                let f = match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                    move || t.flush_usage_once(crate::settings::get_cloud_sync_enabled()),
+                )
                 .await
                 {
                     Ok(f) => f,
@@ -2802,25 +2805,47 @@ mod tests {
         let (t, registrar, outbox) = tailer(dir.path());
         let csid = Uuid::new_v4().to_string();
         let path = jsonl(dir.path(), &csid, "");
-        let batch = usage_line("m1", "claude-opus-5-5", 10) + &usage_line("m1", "claude-opus-5-5", 30);
+        let batch =
+            usage_line("m1", "claude-opus-5-5", 10) + &usage_line("m1", "claude-opus-5-5", 30);
         append(&path, &batch);
         t.on_appended_gated(&csid, &path, 0, &batch, false, false);
 
         let f = t.flush_usage_once(true);
-        assert_eq!((f.queued, f.uncovered), (0, 1), "unbound = uncovered, no row");
+        assert_eq!(
+            (f.queued, f.uncovered),
+            (0, 1),
+            "unbound = uncovered, no row"
+        );
         assert!(usage_rows(&outbox).is_empty());
 
         let coord_id = sniff_register(&registrar, &csid);
-        assert_eq!(t.flush_usage_once(false).queued, 0, "Gate 1 off queues nothing");
+        assert_eq!(
+            t.flush_usage_once(false).queued,
+            0,
+            "Gate 1 off queues nothing"
+        );
         assert_eq!(t.flush_usage_once(true).queued, 1);
         let rows = usage_rows(&outbox);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, coord_id, "the lane is the coord session");
-        assert_eq!(rows[0].payload["claude_code_session_id"], serde_json::json!(csid));
+        assert_eq!(
+            rows[0].session_id, coord_id,
+            "the lane is the coord session"
+        );
+        assert_eq!(
+            rows[0].payload["claude_code_session_id"],
+            serde_json::json!(csid)
+        );
         let m = &rows[0].payload["models"][0];
-        assert_eq!(m["output_tokens"], serde_json::json!(30), "deduped at the max");
+        assert_eq!(
+            m["output_tokens"],
+            serde_json::json!(30),
+            "deduped at the max"
+        );
         assert_eq!(m["turn_count"], serde_json::json!(1));
-        assert!(m["cost_usd"].is_null(), "an unpriced model's cost is null, never 0");
+        assert!(
+            m["cost_usd"].is_null(),
+            "an unpriced model's cost is null, never 0"
+        );
 
         assert_eq!(t.flush_usage_once(true).queued, 0, "unchanged: not re-sent");
         let more = usage_line("m2", "claude-opus-5-5", 5);
@@ -2863,7 +2888,10 @@ mod tests {
         );
         let last_usage = kinds.iter().rposition(|k| k == "usage_totals").unwrap();
         let closed = kinds.iter().position(|k| k == "closed").unwrap();
-        assert!(last_usage < closed, "usage rows precede the Closed row: {kinds:?}");
+        assert!(
+            last_usage < closed,
+            "usage rows precede the Closed row: {kinds:?}"
+        );
         assert_eq!(t.usage.session_count(), 0, "a closed session is forgotten");
     }
 
@@ -2921,6 +2949,10 @@ mod tests {
             rows.windows(2).all(|w| w[0] <= w[1]),
             "totals must never decrease with seq: {rows:?}"
         );
-        assert_eq!(*rows.last().unwrap(), 200, "the close row carries the final totals");
+        assert_eq!(
+            *rows.last().unwrap(),
+            200,
+            "the close row carries the final totals"
+        );
     }
 }

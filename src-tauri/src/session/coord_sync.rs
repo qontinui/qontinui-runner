@@ -1516,10 +1516,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     // `usage_totals`: the newest pending row of each (lane, Claude Code
     // session) supersedes the older ones, which are ACKed unsent; a row inside
     // its own backoff sits this tick out.
-    let pending_keys: HashSet<(Uuid, i64)> = pending.iter().map(|r| (r.session_id, r.seq)).collect();
+    let pending_keys: HashSet<(Uuid, i64)> =
+        pending.iter().map(|r| (r.session_id, r.seq)).collect();
     state.usage_retry.retain(|k, _| pending_keys.contains(k));
     let mut newest_usage: HashMap<(Uuid, String), i64> = HashMap::new();
-    for r in pending.iter().filter(|r| is_usage_totals_kind(&r.event_kind)) {
+    for r in pending
+        .iter()
+        .filter(|r| is_usage_totals_kind(&r.event_kind))
+    {
         let csid = r
             .payload
             .get("claude_code_session_id")
@@ -7706,7 +7710,11 @@ mod tests {
         let csid = Uuid::new_v4();
         let (path_id, body) = usage_totals_request(&usage_payload(csid, 7)).unwrap();
         assert_eq!(path_id, csid);
-        assert_eq!(body.as_object().unwrap().len(), 1, "tenant_id never reaches coord");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            1,
+            "tenant_id never reaches coord"
+        );
         assert_eq!(body["models"][0]["output_tokens"], json!(7));
         assert!(body["models"][0]["cost_usd"].is_null());
 
@@ -7750,7 +7758,12 @@ mod tests {
         let csid = Uuid::new_v4();
         for out in [5, 9, 12] {
             outbox
-                .record(machine, lane, SessionEventKind::UsageTotals, usage_payload(csid, out))
+                .record(
+                    machine,
+                    lane,
+                    SessionEventKind::UsageTotals,
+                    usage_payload(csid, out),
+                )
                 .unwrap();
         }
         let mut state = DrainState::default();
@@ -7788,7 +7801,12 @@ mod tests {
         let lane = Uuid::new_v4();
         let csid = Uuid::new_v4();
         outbox
-            .record(machine, lane, SessionEventKind::UsageTotals, usage_payload(csid, 1))
+            .record(
+                machine,
+                lane,
+                SessionEventKind::UsageTotals,
+                usage_payload(csid, 1),
+            )
             .unwrap();
         outbox
             .record(machine, lane, SessionEventKind::Heartbeat, json!({}))
@@ -7803,18 +7821,30 @@ mod tests {
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1, "the usage row is kept, not dropped");
         assert_eq!(pending[0].event_kind, "usage_totals");
-        assert!(!state.retry.contains_key(&lane), "the session is not blocked");
+        assert!(
+            !state.retry.contains_key(&lane),
+            "the session is not blocked"
+        );
         assert!(state.quarantined.is_empty());
 
         // Inside its backoff: the next tick does not ask again — not even for
         // a newer row that supersedes it (it inherits the backoff).
         drain_tick(&coord.inner, &mut state).await;
         outbox
-            .record(machine, lane, SessionEventKind::UsageTotals, usage_payload(csid, 2))
+            .record(
+                machine,
+                lane,
+                SessionEventKind::UsageTotals,
+                usage_payload(csid, 2),
+            )
             .unwrap();
         drain_tick(&coord.inner, &mut state).await;
         assert_eq!(rec.lock().await.usage_attempts, 1, "no tight loop");
-        assert_eq!(outbox.pending().unwrap().len(), 1, "the older row was superseded");
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the older row was superseded"
+        );
 
         // Backoff elapsed and coord migrated: delivered.
         rec.lock().await.usage_status = None;
