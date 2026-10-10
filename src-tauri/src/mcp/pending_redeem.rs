@@ -227,19 +227,34 @@ pub(crate) async fn poll_pending_redeem(
         }
         204 => PollOutcome::NothingPending,
         401 | 403 => {
+            // Never fail on the body: the code only feeds logs and backoff keys.
             let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-            let detail_code = body
-                .get("detail")
-                .and_then(|d| d.get("code"))
-                .and_then(|c| c.as_str())
-                .map(str::to_string);
             PollOutcome::Refused {
                 status,
-                detail_code,
+                detail_code: refusal_code(&body),
             }
         }
         _ => PollOutcome::Unexpected { status },
     }
+}
+
+/// web's typed refusal code, wherever this backend put it:
+///
+/// 1. top-level `error` — what qontinui-web's app error handler emits for an
+///    `HTTPException` whose detail is `{code, message}` (`{"error": <code>,
+///    "message": ...}`);
+/// 2. `detail.code` — FastAPI's default shape, when no handler rewrites it;
+/// 3. nothing — e.g. an older handler that stringified the whole detail dict
+///    under `message`. The caller then keys on the status alone.
+pub(crate) fn refusal_code(body: &serde_json::Value) -> Option<String> {
+    let non_empty = |v: Option<&serde_json::Value>| {
+        v.and_then(|c| c.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+    };
+    non_empty(body.get("error"))
+        .or_else(|| non_empty(body.get("detail").and_then(|d| d.get("code"))))
 }
 
 /// The side effects of a claimed redeem, behind a seam so the pass is testable
@@ -1062,6 +1077,56 @@ mod tests {
         .await;
         assert_eq!(r, PassResult::Redeemed);
         assert_eq!(fx.calls(), vec!["redeem", "clear_anchor", "kick_relay"]);
+    }
+
+    /// Every refusal body shape web has emitted yields the typed code, or the
+    /// status alone — never a failure.
+    #[tokio::test]
+    async fn a_refusal_code_is_read_from_every_body_shape() {
+        let anchor = device_jwt(DID, now_unix());
+        let cases: [(Option<serde_json::Value>, Option<&str>); 5] = [
+            // web's app error handler (the fix in flight): top-level `error`.
+            (
+                Some(serde_json::json!({
+                    "error": "device_credential_revoked",
+                    "message": "This device's credential was revoked."
+                })),
+                Some("device_credential_revoked"),
+            ),
+            // FastAPI's default `detail` object.
+            (
+                Some(serde_json::json!({"detail": {"code": "device_mismatch", "message": "m"}})),
+                Some("device_mismatch"),
+            ),
+            // An older handler: the detail dict stringified under `message`.
+            (
+                Some(serde_json::json!({
+                    "error": "",
+                    "message": "{'code': 'device_credential_revoked', 'message': 'x'}"
+                })),
+                None,
+            ),
+            // Not JSON / empty body.
+            (None, None),
+            // JSON, but no code anywhere.
+            (Some(serde_json::json!({"message": "Forbidden"})), None),
+        ];
+        for (body, want) in cases {
+            let web = spawn_web(StatusCode::FORBIDDEN, body.clone());
+            assert_eq!(
+                poll_pending_redeem(&web.base, DID, &anchor).await,
+                PollOutcome::Refused {
+                    status: 403,
+                    detail_code: want.map(str::to_string)
+                },
+                "{body:?}"
+            );
+        }
+        // Top-level `error` wins over `detail.code` when both are present.
+        assert_eq!(
+            refusal_code(&serde_json::json!({"error": "a", "detail": {"code": "b"}})).as_deref(),
+            Some("a")
+        );
     }
 
     #[test]
