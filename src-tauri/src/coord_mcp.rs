@@ -9603,7 +9603,8 @@ struct ReusableInCwdNonce {
 /// `session_tenant: None` a key PINNED to a tenant is reused only when that
 /// tenant is the machine's current pin — otherwise a tenant-less session would
 /// silently present another tenant's credential (a tenant-B worktree key, say).
-/// An unpinned key is reused as before, and so is a machine-SAMPLED key pinned
+/// An unpinned (or unresolvable) key is reused as before — it falls through to
+/// the same rows a fresh mint would — and so is a machine-SAMPLED key pinned
 /// to the machine's own tenant. An EXPLICITLY pinned key is NOT reused for a
 /// tenant-less spawn, even when it names the machine's tenant: an explicit pin
 /// sits at row 1 and outranks the workspace and repo tiers a fresh tenant-less
