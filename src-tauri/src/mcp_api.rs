@@ -3023,9 +3023,16 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
+    // Ambiguity (two sessions on one workdir) deliberately reads as "no
+    // primary-chain hit" here: the lifecycle fallback below resolves only a
+    // workdir with exactly one admitted record, so it cannot guess between them.
     let task_run_id = app
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
+        .and_then(|sm| match sm.task_run_id_for_workdir(&workdir) {
+            crate::claude_session::WorkdirTaskRun::Found(id) => Some(id),
+            crate::claude_session::WorkdirTaskRun::NoCandidate
+            | crate::claude_session::WorkdirTaskRun::Ambiguous => None,
+        });
     match task_run_id {
         // Primary chain hit.
         Some(task_run_id) => {
@@ -3921,11 +3928,19 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let task_run_id = app
+    let task_run_id = match app
         .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .task_run_id_for_workdir(&workdir)
-        .ok_or(EventLaneMiss::NoTaskRun)?;
+    {
+        crate::claude_session::WorkdirTaskRun::Found(id) => id,
+        crate::claude_session::WorkdirTaskRun::NoCandidate => return Err(EventLaneMiss::NoTaskRun),
+        // Several sessions claim this workdir: a task run owns its calls, so
+        // refuse rather than file one under any lane.
+        crate::claude_session::WorkdirTaskRun::Ambiguous => {
+            return Err(EventLaneMiss::AiAmbiguousWorkdir)
+        }
+    };
     app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
@@ -3963,6 +3978,10 @@ enum EventLaneMiss {
     /// The task run exists but never registered with coord, so it holds no
     /// `coord.sessions.id`.
     AiSessionUnregistered,
+    /// Terminal-less binding whose workdir is claimed by SEVERAL runner-managed
+    /// sessions (or whose session table could not be read). REFUSED: the task
+    /// run owns that workdir's calls, so no lane is guessed.
+    AiAmbiguousWorkdir,
 }
 
 impl EventLaneMiss {
@@ -3977,6 +3996,7 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => "ai_plane_state_missing",
             Self::NoTaskRun => "no_task_run",
             Self::AiSessionUnregistered => "ai_session_unregistered",
+            Self::AiAmbiguousWorkdir => "ai_ambiguous_workdir",
         }
     }
 
@@ -3991,7 +4011,8 @@ impl EventLaneMiss {
             Self::NoWorkdir
             | Self::AiPlaneStateMissing
             | Self::NoTaskRun
-            | Self::AiSessionUnregistered => "ai_plane",
+            | Self::AiSessionUnregistered
+            | Self::AiAmbiguousWorkdir => "ai_plane",
         }
     }
 
@@ -4008,12 +4029,13 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => 5,
             Self::NoTaskRun => 6,
             Self::AiSessionUnregistered => 7,
+            Self::AiAmbiguousWorkdir => 8,
         }
     }
 
     /// Every miss, in counter-slot order — `ALL[i].index() == i`, asserted in
     /// the tests so the two orderings cannot drift.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::NoNonce,
         Self::NoTerminalManager,
         Self::TerminalGone,
@@ -4022,6 +4044,7 @@ impl EventLaneMiss {
         Self::AiPlaneStateMissing,
         Self::NoTaskRun,
         Self::AiSessionUnregistered,
+        Self::AiAmbiguousWorkdir,
     ];
 }
 
@@ -13660,6 +13683,7 @@ mod transport_rung_counter_tests {
     #[test]
     fn lane_miss_ai_session_unregistered_moves_only_its_series() {
         assert_only_this_series_moves(EventLaneMiss::AiSessionUnregistered);
+        assert_only_this_series_moves(EventLaneMiss::AiAmbiguousWorkdir);
     }
 
     /// `ALL[i].index() == i`, and every label is distinct — the two orderings
@@ -14871,6 +14895,7 @@ mod self_id_chain_tests {
             EventLaneMiss::AiPlaneStateMissing,
             EventLaneMiss::NoTaskRun,
             EventLaneMiss::AiSessionUnregistered,
+            EventLaneMiss::AiAmbiguousWorkdir,
         ];
         let mut labels: Vec<&str> = all.iter().map(|m| m.as_str()).collect();
         labels.sort_unstable();
