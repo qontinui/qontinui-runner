@@ -916,9 +916,10 @@ pub(crate) fn pin_account_selection_for_test(
 /// retry loop's rate-limit rotation): an isolated ambient, THEN the fleet pin
 /// at "no fleet opinion".
 ///
-/// The ORDER is the point of the helper. Every test that takes both locks
-/// takes them in this order, and no test takes the fleet pin before the
-/// ambient, so the pair cannot deadlock. The ambient points
+/// Both guards are children of `env_lock` (the ambient holds it directly, the
+/// fleet pin through [`crate::test_env::hierarchy_lock`]), and `env_lock` is
+/// reentrant per thread, so the pair cannot deadlock against any other test
+/// whatever order that test takes them in. The ambient points
 /// `QONTINUI_CONFIG_DIR` / `HOME` at an empty temp dir, so the per-instance
 /// roster is empty. The machine-global roster is NOT reliably isolated: it
 /// resolves through `dirs::config_dir()`, which is empty only on Linux under
@@ -930,16 +931,20 @@ pub(crate) fn pin_account_selection_for_test(
 /// holder against every other fleet-pin holder, including the test that
 /// publishes a temp dir into `RESOLVED_CONFIG_DIR`.
 ///
-/// Returned as a tuple: fields drop in declaration order, so the ambient is
-/// restored first and the fleet pin is released last.
+/// Returned as a tuple whose fields drop in declaration order — the fleet pin
+/// FIRST, then the ambient: the REVERSE of acquisition, which `EnvLockGuard`
+/// requires. The ambient took `env_lock` first, so its guard owns the real
+/// mutex; dropping it before the pin would release `env_lock` while the pin's
+/// nested guard still counted as held — a silent loss of exclusion over the
+/// pin's restore.
 #[cfg(test)]
 pub(crate) fn isolated_ambient_with_fleet_pin() -> (
-    qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
     AccountSelectionPin,
+    qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
 ) {
     let ambient = crate::test_env::isolated_ambient();
     let pin = pin_account_selection_for_test(None);
-    (ambient, pin)
+    (pin, ambient)
 }
 
 /// Normalize coord's `effective_level` onto an account-selection mode. PURE.
