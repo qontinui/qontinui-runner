@@ -1,8 +1,10 @@
 //! Device-scoped poller for the fleet-policy domains this runner consumes:
 //! `install_interception` (P3 + P4 of
 //! `2026-06-08-fleet-policy-channel-redesign.md`), `fleet_resources` (Part B
-//! item 3 of `2026-08-07-runner-resource-guard-and-session-protection.md`) and
-//! `plan_capture` (Phase 4 of `2026-08-10-plan-and-prompt-library-in-web.md`).
+//! item 3 of `2026-08-07-runner-resource-guard-and-session-protection.md`),
+//! `plan_capture` (Phase 4 of `2026-08-10-plan-and-prompt-library-in-web.md`)
+//! and `account_selection_mode` (Phase 1 of
+//! `2026-09-27-fleet-policy-domain-for-account-selection-mode.md`).
 //!
 //! Coord exposes `GET /coord/fleet-policy?domain=<d>` (FleetPrincipal /
 //! device-JWT gated) which returns the EFFECTIVE interception level resolved
@@ -164,6 +166,29 @@
 //!   process that actually builds the prompt.
 //! - Degradation is logged ONCE, on a transition, PER DOCUMENT.
 //!
+//! For the account-selection mode (the fifth cache,
+//! [`fleet_account_selection_mode`]) the safe value is **no fleet opinion**
+//! (`None`): the machine's own local mode governs, exactly as it did before
+//! this domain existed.
+//!
+//! - Before the FIRST successful poll ⇒ `None`.
+//! - A poll ERROR ⇒ the LAST-GOOD value is kept.
+//! - A coord **404** ⇒ reset to `None`.
+//! - A coord **401** ⇒ the LAST-GOOD value is kept: it is a statement about the
+//!   device credential, not the tenant's policy, and resetting on it would flip
+//!   every unpinned machine between the fleet mode and its local mode each
+//!   time a device JWT lapses (the same reasoning as plan capture's 401 arm).
+//! - A 2xx NO-ROW answer (`resolved_scope == "none"`) ⇒ `None`: coord's
+//!   domain default for an unlisted domain is `off`, which is not a mode.
+//! - Any level that is not one of the three `AccountSelectionMode` wire
+//!   spellings (`manual` / `least_usage` / `highest_expected_usage`) ⇒ `None`.
+//! - Unpaired ⇒ SKIPPED quietly, cache untouched.
+//! - A poisoned lock ⇒ `None`.
+//!
+//! A `Some` fleet value is FORCE-APPLIED over the local mode unless the machine
+//! is pinned — [`crate::claude_accounts::resolve_selection_mode`] owns that
+//! rule; this module only caches the fleet's half of it.
+//!
 //! **Disk persistence is PER RUNNER INSTANCE.** The store lives in the
 //! directory [`crate::settings::resolve_config_dir`] names — the NON-creating
 //! resolver, because every door into the cache is a read (see
@@ -183,6 +208,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
+use crate::settings::AccountSelectionMode;
 pub(crate) use qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureVerdict;
 
 /// How often the loop refreshes the cached effective level. 45s sits in the
@@ -251,6 +277,20 @@ const PLAN_CAPTURE_DEFAULT_LEVEL: &str = PLAN_CAPTURE_RECORD;
 /// an authorization to capture. Spelled separately from [`DEFAULT_MODE`] too:
 /// the two domains' `off` merely coincide.
 const PLAN_CAPTURE_UNRECOGNISED_LEVEL: &str = "off";
+
+/// The fleet-policy domain carrying the fleet's Claude **account-selection
+/// mode** (plan `2026-09-27-fleet-policy-domain-for-account-selection-mode`).
+///
+/// Data, not schema, for the same reason as [`PLAN_CAPTURE_DOMAIN`]: coord's
+/// `domain` column is plain `TEXT` with no allowlist, and `put_fleet_policy`
+/// does not validate `level`, so `highest_expected_usage` is stored as-is.
+///
+/// Its vocabulary is [`AccountSelectionMode::as_str`]'s three wire spellings;
+/// its resting value is NO fleet opinion (`None`), not a mode — see
+/// [`normalize_account_selection_level`]. Scope band is **tenant-wide**: the
+/// mode is a machine-global fact (it lives in `claude-accounts.json`), and a
+/// machine is not repo-scoped.
+const ACCOUNT_SELECTION_DOMAIN: &str = "account_selection_mode";
 
 // ===========================================================================
 // Process-global cache
@@ -771,6 +811,183 @@ fn plan_capture_log_key(outcome: &PollOutcome) -> String {
 }
 
 // ===========================================================================
+// Process-global cache #5 — the tenant-wide account-selection mode
+// ===========================================================================
+//
+// Numbered #5 though it sits here: it is the third LEVEL-carrying domain and
+// belongs beside the plan-capture level it mirrors, while #4 (the briefings)
+// kept its number when this cache was added.
+
+/// The cached fleet account-selection mode. `None` = the fleet has NO opinion
+/// (the resting and fail-safe value) — never a made-up default mode, because a
+/// default mode here would be FORCE-APPLIED over every unpinned machine's local
+/// choice.
+static ACCOUNT_SELECTION_MODE: OnceLock<RwLock<Option<AccountSelectionMode>>> = OnceLock::new();
+
+/// The cache's INITIAL value, as a named function so a test can assert the
+/// shipping expression (see [`new_plan_capture_cache`]).
+fn new_account_selection_cache() -> RwLock<Option<AccountSelectionMode>> {
+    RwLock::new(None)
+}
+
+fn account_selection_cache() -> &'static RwLock<Option<AccountSelectionMode>> {
+    ACCOUNT_SELECTION_MODE.get_or_init(new_account_selection_cache)
+}
+
+/// The fleet's account-selection mode, `None` when the fleet has no opinion
+/// (before the first successful poll, after an auth/absent reset, on a no-row
+/// or unrecognised answer, and on a poisoned lock).
+///
+/// SYNCHRONOUS + lock-only — read on the spawn path by
+/// [`crate::claude_accounts::effective_selection_mode`] /
+/// [`crate::claude_accounts::resolve_for_cli_settings`], which must not do
+/// network I/O. This is the fleet's HALF of the decision only; the pin and the
+/// local mode are combined with it by
+/// [`crate::claude_accounts::resolve_selection_mode`].
+pub(crate) fn fleet_account_selection_mode() -> Option<AccountSelectionMode> {
+    account_selection_cache().read().ok().and_then(|g| *g)
+}
+
+/// Overwrite the cached fleet account-selection mode. Internal — only the poll
+/// loop calls this (and the test guard below).
+fn set_account_selection_mode(mode: Option<AccountSelectionMode>) {
+    if let Ok(mut g) = account_selection_cache().write() {
+        *g = mode;
+    }
+}
+
+/// Test-only RAII pin over the fleet account-selection cache. Same two jobs as
+/// [`PlanCaptureLevelPin`] — it SERIALIZES every test that pins the cache
+/// (whichever module it lives in) and RESTORES `None` on `Drop`, so a failing
+/// assertion cannot leak a fleet mode into the next test's account decision.
+///
+/// A mutex of its own rather than the plan-capture one: the two caches are read
+/// by disjoint code (the spawn-time briefing vs. the account picker), so
+/// sharing a lock would only serialize unrelated tests.
+///
+/// **It sits UNDER `env_lock` in the test-lock hierarchy**, exactly like
+/// [`PlanCaptureLevelPin`]: it is acquired through
+/// [`crate::test_env::hierarchy_lock`], which takes `env_lock` FIRST and holds
+/// it for the pin's life. `env_lock` is reentrant per thread, so a test may
+/// take this pin and `env_lock` / `isolated_ambient()` / the plan-capture pin
+/// in EITHER order without an AB/BA cycle. `env_test_lock_hierarchy_guard.rs`
+/// enforces the shape.
+///
+/// Field order is load-bearing: `Drop::drop` restores the cache first, then the
+/// [`crate::test_env::TestLockGuard`] releases the pin mutex and then the env
+/// lock — so the restore runs while BOTH locks are still held.
+///
+/// NEVER compiled into a release binary.
+#[cfg(test)]
+pub(crate) struct AccountSelectionPin(crate::test_env::TestLockGuard);
+
+#[cfg(test)]
+impl AccountSelectionPin {
+    /// Pin the fleet mode to `mode`. Callable repeatedly under one guard.
+    pub(crate) fn set(&self, mode: Option<AccountSelectionMode>) {
+        set_account_selection_mode(mode);
+    }
+}
+
+#[cfg(test)]
+impl Drop for AccountSelectionPin {
+    fn drop(&mut self) {
+        set_account_selection_mode(None);
+    }
+}
+
+/// Acquire the pin with the fleet mode set to `mode`. Blocks until any other
+/// pinning test has released it; restores "no fleet opinion" on drop.
+#[cfg(test)]
+pub(crate) fn pin_account_selection_for_test(
+    mode: Option<AccountSelectionMode>,
+) -> AccountSelectionPin {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The hierarchy root (`env_lock`) FIRST, then this pin's own mutex — see
+    // [`AccountSelectionPin`]. Poison-recovering: a previous pinning test that
+    // panicked already restored `None` in its `Drop`, so the data is fine.
+    let pin = AccountSelectionPin(crate::test_env::hierarchy_lock(&LOCK));
+    pin.set(mode);
+    pin
+}
+
+/// The guards a test holds when it reaches account selection through a
+/// production path that reads the machine roster (the config report, the
+/// retry loop's rate-limit rotation): an isolated ambient, THEN the fleet pin
+/// at "no fleet opinion".
+///
+/// Both guards are children of `env_lock` (the ambient holds it directly, the
+/// fleet pin through [`crate::test_env::hierarchy_lock`]), and `env_lock` is
+/// reentrant per thread, so the pair cannot deadlock against any other test
+/// whatever order that test takes them in. The ambient points
+/// `QONTINUI_CONFIG_DIR` / `HOME` at an empty temp dir, so the per-instance
+/// roster is empty. The machine-global roster is NOT reliably isolated: it
+/// resolves through `dirs::config_dir()`, which is empty only on Linux under
+/// the fixture with `XDG_CONFIG_HOME` unset or pointed at cargo-guard's
+/// per-run sandbox. On Windows (`dirs` ignores HOME/USERPROFILE) or with an
+/// exported `XDG_CONFIG_HOME` under raw cargo, the REAL roster may be read — so
+/// a test that can reach a `RESOLVED_CONFIG_DIR` writer must also hold
+/// `ai_provider::config::ResolvedConfigDirRestore`. The pin serializes the
+/// holder against every other fleet-pin holder, including the test that
+/// publishes a temp dir into `RESOLVED_CONFIG_DIR`.
+///
+/// Returned as a tuple whose fields drop in declaration order — the fleet pin
+/// FIRST, then the ambient: the REVERSE of acquisition, which `EnvLockGuard`
+/// requires. The ambient took `env_lock` first, so its guard owns the real
+/// mutex; dropping it before the pin would release `env_lock` while the pin's
+/// nested guard still counted as held — a silent loss of exclusion over the
+/// pin's restore.
+#[cfg(test)]
+pub(crate) fn isolated_ambient_with_fleet_pin() -> (
+    AccountSelectionPin,
+    qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+) {
+    let ambient = crate::test_env::isolated_ambient();
+    let pin = pin_account_selection_for_test(None);
+    (pin, ambient)
+}
+
+/// Normalize coord's `effective_level` onto an account-selection mode. PURE.
+///
+/// Trimmed, ASCII-case-insensitive match against the three
+/// [`AccountSelectionMode::as_str`] spellings ⇒ `Some(mode)`. Absent, empty, a
+/// typo, and coord's own no-row fallback `off` ⇒ `None`: a level this runner
+/// cannot identify is "no fleet opinion", never a guessed mode — a guessed mode
+/// would be force-applied over every unpinned machine.
+fn normalize_account_selection_level(raw: Option<&str>) -> Option<AccountSelectionMode> {
+    let level = raw?.trim().to_ascii_lowercase();
+    [
+        AccountSelectionMode::Manual,
+        AccountSelectionMode::LeastUsage,
+        AccountSelectionMode::HighestExpectedUsage,
+    ]
+    .into_iter()
+    .find(|mode| mode.as_str() == level)
+}
+
+/// The WRITE, if any, that `outcome` implies for the account-selection cache.
+/// PURE — the fail-safe contract itself, shaped like
+/// [`next_plan_capture_level`].
+///
+/// - `None` ⇒ do not write at all (unpaired, or a transient failure: the
+///   last-good value is kept because no write happened).
+/// - `Some(None)` ⇒ write "no fleet opinion" (an absent/auth reset, or an
+///   authoritative no-row answer).
+/// - `Some(Some(mode))` ⇒ the fleet names a mode.
+fn next_account_selection(outcome: &PollOutcome) -> Option<Option<AccountSelectionMode>> {
+    match outcome {
+        PollOutcome::Updated(level) => Some(normalize_account_selection_level(Some(level))),
+        PollOutcome::UpdatedNoRow | PollOutcome::ResetOff(_) => Some(None),
+        PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => None,
+    }
+}
+
+/// Render a fleet account-selection value for a log line or the config report.
+fn describe_account_selection(mode: Option<AccountSelectionMode>) -> &'static str {
+    mode.map_or("(no fleet opinion — local mode governs)", |m| m.as_str())
+}
+
+// ===========================================================================
 // Process-global cache #4 — the operator-editable session-briefing documents
 // ===========================================================================
 
@@ -1012,10 +1229,15 @@ pub(crate) struct FleetPolicyDial {
     /// means the level is the unconfirmed default and the write paths are
     /// held — so a never-answered runner is distinguishable from an armed one.
     pub(crate) plan_capture_answered: bool,
+    /// Cache 5 — the fleet's account-selection mode as its wire spelling, or
+    /// `None` when the fleet has NO opinion (the resting value: the local mode
+    /// governs). Not a string with a resting default like caches 1 and 3,
+    /// because "no opinion" is not a mode and must not render as one.
+    pub(crate) account_selection_mode: Option<&'static str>,
     /// Cache 4 — one entry per name in [`BRIEFING_NAMES`], always all three
     /// (an absent document is `present: false`, never a missing entry).
     pub(crate) briefings: Vec<BriefingDial>,
-    /// `false`, always, for caches 1-3 — see the type docs. Kept as a FIELD
+    /// `false`, always, for caches 1-3 and 5 — see the type docs. Kept as a FIELD
     /// rather than a comment so the consumer's honesty is data-driven: a future
     /// stamp on those caches flips this and the report gains the fact without
     /// the consumer inventing one in the meantime.
@@ -1055,6 +1277,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         plan_capture_default: PLAN_CAPTURE_DEFAULT_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
         plan_capture_answered: plan_capture_answered(),
+        account_selection_mode: fleet_account_selection_mode().map(AccountSelectionMode::as_str),
         briefings: BRIEFING_NAMES
             .iter()
             .map(|name| match cache.get(*name) {
@@ -2088,8 +2311,9 @@ pub fn start_poller(api_state: Arc<ApiState>) -> Arc<PollerState> {
 /// Outcome of a single poll attempt. Factored out so the loop's logging stays
 /// edge-triggered (log only on a transition, never every tick).
 ///
-/// SHARED by both LEVEL-carrying domains ([`DOMAIN`] and
-/// [`PLAN_CAPTURE_DOMAIN`]) — they cache different vocabularies but classify
+/// SHARED by all three LEVEL-carrying domains ([`DOMAIN`],
+/// [`PLAN_CAPTURE_DOMAIN`] and [`ACCOUNT_SELECTION_DOMAIN`]) — they cache
+/// different vocabularies but classify
 /// coord's answers identically, and one enum is what keeps them from drifting
 /// apart on what a 404 means. ([`CONTROLS_DOMAIN`] needs its own because it
 /// carries floors, not a level.)
@@ -2099,9 +2323,10 @@ enum PollOutcome {
     Updated(String),
     /// Coord returned 2xx and said NO ROW exists for the domain
     /// (`resolved_scope == "none"`) — an authoritative answer whose content is
-    /// the domain's own default. Produced by the plan-capture domain only
-    /// ([`plan_capture_outcome_for_body`]); the interception domain never yields
-    /// it and treats it as its fail-safe if it ever did.
+    /// the domain's own default. Produced by the plan-capture
+    /// ([`plan_capture_outcome_for_body`]) and account-selection
+    /// ([`account_selection_outcome_for_body`]) domains; the interception
+    /// domain never yields it and treats it as its fail-safe if it ever did.
     UpdatedNoRow,
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
@@ -2245,10 +2470,10 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     }
 
     info!(
-        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN}, \
-         interval={}s, fail-safe defaults: mode={DEFAULT_MODE}, session floors unset; domain \
-         default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture writes held until \
-         coord answers)",
+        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN},\
+         {ACCOUNT_SELECTION_DOMAIN}, interval={}s, fail-safe defaults: mode={DEFAULT_MODE}, \
+         session floors unset, account selection unset (local mode governs); domain default: \
+         plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture writes held until coord answers)",
         POLL_INTERVAL.as_secs()
     );
 
@@ -2264,6 +2489,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     // A KEY, not an outcome — see `plan_capture_log_key` for why the whole
     // value is the wrong thing to compare for this domain.
     let mut last_logged_plan_capture: Option<String> = None;
+    let mut last_logged_account_selection: Option<String> = None;
     // One key PER DOCUMENT: the three session-briefing documents fail
     // independently (coord can serve one and 404 another), so a shared marker
     // would suppress one document's transition because another's was logged.
@@ -2447,6 +2673,87 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                 }
             }
             last_logged_plan_capture = Some(plan_capture_key);
+        }
+
+        // Fifth cache: the tenant-wide fleet account-selection mode. Its own
+        // request and its own cache, so no other domain's failure withholds it.
+        let account_selection_outcome = poll_account_selection_once().await;
+        if let Some(next_mode) = next_account_selection(&account_selection_outcome) {
+            set_account_selection_mode(next_mode);
+        }
+        // The same outcome-shaped key as plan capture: a varying error message
+        // must not reopen the edge every tick.
+        let account_selection_key = plan_capture_log_key(&account_selection_outcome);
+        if is_new_outcome(
+            last_logged_account_selection.as_ref(),
+            &account_selection_key,
+        ) {
+            match &account_selection_outcome {
+                PollOutcome::Updated(level) => {
+                    let mode = normalize_account_selection_level(Some(level));
+                    info!(
+                        "fleet_policy_poller: fleet account-selection mode \
+                         ({ACCOUNT_SELECTION_DOMAIN}) = {}{} — applies to every UNPINNED machine",
+                        describe_account_selection(mode),
+                        if mode.is_none() {
+                            format!(" (coord sent unrecognised level {level:?})")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    // A fleet-wide `manual` is force-applied like any other
+                    // mode, but `manual` means "spawn on THIS machine's
+                    // configured config_dir" — an unpinned machine without one
+                    // has no account to spawn on. Said once, loudly, on the
+                    // transition, so the operator's PUT is not a silent outage.
+                    if mode == Some(AccountSelectionMode::Manual) {
+                        // Pin and config_dir from ONE document (the
+                        // roster-overlaid settings): a pinned machine is not
+                        // governed by the fleet, so it has nothing to warn about.
+                        let cli = crate::settings::get_ai_settings().claude_cli;
+                        let no_local_dir = cli
+                            .config_dir
+                            .as_deref()
+                            .is_none_or(|d| d.trim().is_empty());
+                        if !cli.account_selection_pinned && no_local_dir {
+                            warn!(
+                                "fleet_policy_poller: the fleet says {ACCOUNT_SELECTION_DOMAIN}=manual \
+                                 and this machine is not pinned, but it has NO local config_dir — \
+                                 spawns will find no account until one is configured or the \
+                                 machine is pinned"
+                            );
+                        }
+                    }
+                }
+                PollOutcome::UpdatedNoRow => {
+                    info!(
+                        "fleet_policy_poller: coord reported no {ACCOUNT_SELECTION_DOMAIN} row \
+                         for this tenant (resolved_scope={RESOLVED_SCOPE_NONE}) — no fleet \
+                         opinion, each machine's local mode governs"
+                    );
+                }
+                PollOutcome::SkippedNoJwt => {
+                    info!(
+                        "fleet_policy_poller: no device JWT yet (unpaired) — skipping the \
+                         {ACCOUNT_SELECTION_DOMAIN} poll, the local mode governs"
+                    );
+                }
+                PollOutcome::ResetOff(status) => {
+                    info!(
+                        "fleet_policy_poller: coord returned {status} for \
+                         {ACCOUNT_SELECTION_DOMAIN} (auth/absent) — reset to no fleet opinion, \
+                         the local mode governs"
+                    );
+                }
+                PollOutcome::Kept(err) => {
+                    warn!(
+                        "fleet_policy_poller: {ACCOUNT_SELECTION_DOMAIN} poll failed ({err}) — \
+                         keeping last-good fleet account-selection mode ({})",
+                        describe_account_selection(fleet_account_selection_mode())
+                    );
+                }
+            }
+            last_logged_account_selection = Some(account_selection_key);
         }
 
         // Fourth cache: the three operator-editable session-briefing documents.
@@ -2650,6 +2957,57 @@ async fn poll_plan_capture_once() -> PlanCapturePoll {
             outcome: plan_capture_outcome_for_error(e),
             resolved_scope: None,
         },
+    }
+}
+
+/// Classify a 2xx account-selection body. PURE.
+///
+/// `resolved_scope == "none"` is coord saying no row exists and its domain
+/// default applied — for an unlisted domain that default is `off`, which is
+/// not a mode — so it is [`PollOutcome::UpdatedNoRow`], which
+/// [`next_account_selection`] maps to "no fleet opinion" whatever level string
+/// rode along. Any other 2xx is [`PollOutcome::Updated`] carrying the level as
+/// coord sent it (trimmed; empty when absent); [`next_account_selection`]
+/// normalizes it, so an unrecognised level is "no opinion" too.
+fn account_selection_outcome_for_body(body: &FleetPolicyResponse) -> PollOutcome {
+    if body.resolved_scope.as_deref().map(str::trim) == Some(RESOLVED_SCOPE_NONE) {
+        return PollOutcome::UpdatedNoRow;
+    }
+    PollOutcome::Updated(
+        body.effective_level
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Map a fetch failure onto the ACCOUNT-SELECTION cache outcome. PURE.
+///
+/// The shared [`level_outcome_for_error`] for everything but a **401**, which
+/// KEEPS last-good (like [`plan_capture_outcome_for_error`]): a rejected device
+/// token says nothing about the tenant's policy, and resetting on it would make
+/// every unpinned machine's account rotation flip to its local mode and back
+/// each time the ~4h device JWT lapses before the refresher replaces it. A 404
+/// still resets to "no fleet opinion".
+fn account_selection_outcome_for_error(err: FetchError) -> PollOutcome {
+    match err {
+        FetchError::AuthOrAbsent(401) => PollOutcome::Kept(
+            "coord rejected the device token (401) — non-authoritative for the tenant's \
+             account_selection_mode policy, keeping last-good"
+                .to_string(),
+        ),
+        other => level_outcome_for_error(other),
+    }
+}
+
+/// One poll of the [`ACCOUNT_SELECTION_DOMAIN`] cache. See
+/// [`account_selection_outcome_for_body`] for the 2xx arms and
+/// [`account_selection_outcome_for_error`] for why a 401 keeps.
+async fn poll_account_selection_once() -> PollOutcome {
+    match fetch_fleet_policy(ACCOUNT_SELECTION_DOMAIN).await {
+        Ok(body) => account_selection_outcome_for_body(&body),
+        Err(e) => account_selection_outcome_for_error(e),
     }
 }
 
@@ -4135,5 +4493,197 @@ mod tests {
         // A restored document is `cached` by default — it has NOT been checked
         // against coord in this process.
         assert_eq!(doc.provenance, BriefingProvenance::Cached);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache #5 — the fleet account-selection mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn account_selection_domain_is_pinned() {
+        // The domain string is the wire contract with the operator's PUT — a
+        // rename here silently detaches every runner from the fleet value.
+        assert_eq!(ACCOUNT_SELECTION_DOMAIN, "account_selection_mode");
+    }
+
+    /// Calls the SHIPPING init: a runner that has never reached coord must
+    /// hold NO fleet opinion, never a default mode it would force-apply.
+    #[test]
+    fn fresh_account_selection_cache_holds_no_fleet_opinion() {
+        let fresh = new_account_selection_cache();
+        assert_eq!(*fresh.read().unwrap(), None);
+    }
+
+    #[test]
+    fn only_the_three_wire_spellings_name_a_fleet_mode() {
+        use AccountSelectionMode::*;
+        assert_eq!(
+            normalize_account_selection_level(Some("manual")),
+            Some(Manual)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("least_usage")),
+            Some(LeastUsage)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("highest_expected_usage")),
+            Some(HighestExpectedUsage)
+        );
+        // Trimmed and ASCII-case-insensitive, like plan capture.
+        assert_eq!(
+            normalize_account_selection_level(Some("  Highest_Expected_Usage ")),
+            Some(HighestExpectedUsage)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("LEAST_USAGE")),
+            Some(LeastUsage)
+        );
+        // Coord's no-row fallback for an unlisted domain, other domains'
+        // vocabularies, typos and blanks are all "no opinion".
+        for raw in [
+            "off",
+            "record",
+            "gate",
+            "least-usage",
+            "leastusage",
+            "highest_expected",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                normalize_account_selection_level(Some(raw)),
+                None,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(normalize_account_selection_level(None), None);
+    }
+
+    #[test]
+    fn account_selection_fail_safe_contract_holds_on_every_arm() {
+        // A named mode is written.
+        assert_eq!(
+            next_account_selection(&PollOutcome::Updated("least_usage".into())),
+            Some(Some(AccountSelectionMode::LeastUsage))
+        );
+        // An unrecognised level is WRITTEN as "no opinion" — it is a real
+        // answer, not a failure, so it must displace a previous fleet mode.
+        assert_eq!(
+            next_account_selection(&PollOutcome::Updated("off".into())),
+            Some(None)
+        );
+        // No row / absent / auth ⇒ no fleet opinion.
+        assert_eq!(
+            next_account_selection(&PollOutcome::UpdatedNoRow),
+            Some(None)
+        );
+        assert_eq!(
+            next_account_selection(&PollOutcome::ResetOff(404)),
+            Some(None)
+        );
+        // The loop never produces ResetOff(401) for this domain (see
+        // `account_selection_outcome_for_error`), but the pure mapper stays
+        // total over the enum.
+        assert_eq!(
+            next_account_selection(&PollOutcome::ResetOff(401)),
+            Some(None)
+        );
+        // Unpaired or transient ⇒ NO write: last-good is kept.
+        assert_eq!(next_account_selection(&PollOutcome::SkippedNoJwt), None);
+        assert_eq!(
+            next_account_selection(&PollOutcome::Kept("request: timeout".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn account_selection_body_maps_no_row_to_no_opinion_and_rows_to_their_level() {
+        let decode = |raw: &str| serde_json::from_str::<FleetPolicyResponse>(raw).unwrap();
+        // What coord answers for a tenant that never set the domain.
+        let no_row = decode(
+            r#"{"domain":"account_selection_mode","effective_level":"off","resolved_scope":"none"}"#,
+        );
+        assert_eq!(
+            account_selection_outcome_for_body(&no_row),
+            PollOutcome::UpdatedNoRow
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_body(&no_row)),
+            Some(None)
+        );
+        // An explicit tenant row.
+        let row =
+            decode(r#"{"effective_level":" highest_expected_usage ","resolved_scope":"tenant"}"#);
+        assert_eq!(
+            account_selection_outcome_for_body(&row),
+            PollOutcome::Updated("highest_expected_usage".into())
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_body(&row)),
+            Some(Some(AccountSelectionMode::HighestExpectedUsage))
+        );
+        // A 2xx with no level at all is "no opinion", not an error.
+        let bare = decode(r#"{"domain":"account_selection_mode"}"#);
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_body(&bare)),
+            Some(None)
+        );
+        // Fetch failures: a 404 resets to no opinion; a 401 KEEPS last-good
+        // (a credential blip must not flip every unpinned machine's rotation);
+        // unpaired and transient failures write nothing.
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(
+                FetchError::AuthOrAbsent(404)
+            )),
+            Some(None)
+        );
+        assert!(matches!(
+            account_selection_outcome_for_error(FetchError::AuthOrAbsent(401)),
+            PollOutcome::Kept(_)
+        ));
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(
+                FetchError::AuthOrAbsent(401)
+            )),
+            None
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(FetchError::NoJwt)),
+            None
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(FetchError::Failed(
+                "x".into()
+            ))),
+            None
+        );
+    }
+
+    /// The reader, the pin guard and the dial agree on every value the cache
+    /// can hold.
+    #[test]
+    fn account_selection_pin_reader_and_dial_agree() {
+        {
+            let pin = pin_account_selection_for_test(Some(AccountSelectionMode::Manual));
+            assert_eq!(
+                fleet_account_selection_mode(),
+                Some(AccountSelectionMode::Manual)
+            );
+            assert_eq!(dial_snapshot().account_selection_mode, Some("manual"));
+            pin.set(None);
+            assert_eq!(fleet_account_selection_mode(), None);
+            assert_eq!(dial_snapshot().account_selection_mode, None);
+            pin.set(Some(AccountSelectionMode::HighestExpectedUsage));
+        }
+        let _pin = pin_account_selection_for_test(None);
+        assert_eq!(fleet_account_selection_mode(), None);
+        assert_eq!(
+            describe_account_selection(None),
+            "(no fleet opinion — local mode governs)"
+        );
+        assert_eq!(
+            describe_account_selection(Some(AccountSelectionMode::LeastUsage)),
+            "least_usage"
+        );
     }
 }

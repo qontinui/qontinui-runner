@@ -105,6 +105,28 @@ pub fn get_resolved_config_dir() -> Option<String> {
         .and_then(|cached| cached.clone())
 }
 
+/// Test-only RAII guard: captures `RESOLVED_CONFIG_DIR` when built and writes
+/// it back on drop, so whatever a test (or a production path it drives, such as
+/// the retry loop's rate-limit rotation) publishes there cannot outlive the
+/// test — including when an assertion panics. It restores; it does not
+/// serialize — hold `pin_account_selection_for_test` for that.
+#[cfg(test)]
+pub(crate) struct ResolvedConfigDirRestore(Option<String>);
+
+#[cfg(test)]
+impl ResolvedConfigDirRestore {
+    pub(crate) fn capture() -> Self {
+        Self(get_resolved_config_dir())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ResolvedConfigDirRestore {
+    fn drop(&mut self) {
+        set_resolved_config_dir(self.0.take());
+    }
+}
+
 /// Which arm of [`get_effective_config_dir`] decided the answer — including
 /// the two arms that decide there is NO answer.
 ///
@@ -193,7 +215,17 @@ impl std::fmt::Display for ClaudeConfigDirSource {
 pub fn get_effective_config_dir(
     cli_settings: &settings::ClaudeCliSettings,
 ) -> (Option<String>, ClaudeConfigDirSource) {
-    let (candidate, source) = match cli_settings.account_selection_mode {
+    // The EFFECTIVE mode, not the raw field: a locally-`manual`, UNPINNED
+    // machine under a fleet auto mode has the picker rotate
+    // (`pick_best_account` reads the same resolver), and matching the raw
+    // field here would discard that pick and spawn on the manual `config_dir`
+    // — the fleet value would half-apply. Resolved off `cli_settings` itself —
+    // callers hand in a roster-overlaid settings document (normally
+    // `get_ai_settings().claude_cli`, the same source `effective_selection_mode`
+    // reads) — so the mode and its pin come from the document this function
+    // was given.
+    let mode = crate::claude_accounts::resolve_for_cli_settings(cli_settings);
+    let (candidate, source) = match mode {
         // Both auto modes (`LeastUsage` and `HighestExpectedUsage`) pin their
         // choice via the same `RESOLVED_CONFIG_DIR` set by `pick_best_account`
         // — the source names predate `HighestExpectedUsage` but still apply:
@@ -828,10 +860,24 @@ mod tests {
     /// that was never set up and a runner whose login expired.
     ///
     /// Deliberately `Manual`-only: the `LeastUsage` arms read the process-global
-    /// `RESOLVED_CONFIG_DIR`, and a test that mutated it would race every other
-    /// test in this crate. The arms exercised here touch no shared state.
+    /// `RESOLVED_CONFIG_DIR`. What IS serialized: every test holding
+    /// `pin_account_selection_for_test` (directly or through
+    /// `isolated_ambient_with_fleet_pin`) — this one,
+    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned` (the one test
+    /// that publishes a dir there), the `config_report_cmd` tests that reach
+    /// `get_effective_config_dir` through the report, and
+    /// `retry::tests::test_retry_succeeds_on_second_attempt` (whose 429 reaches
+    /// `rotate_account_on_rate_limit`. On Linux under the fixture/cargo-guard
+    /// its roster is empty and rotation writes nothing; elsewhere it may read
+    /// the real roster and rotate, and its restore guard puts the value back).
+    /// A test touching `RESOLVED_CONFIG_DIR` WITHOUT that pin is not
+    /// serialized against them.
     #[test]
     fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
+        // The mode is resolved against the process-global fleet cache; pin it
+        // to "no fleet opinion" so a concurrently running poller test cannot
+        // turn these `Manual` fixtures into an auto mode.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let unconfigured = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
             config_dir: None,
@@ -856,12 +902,104 @@ mod tests {
         );
     }
 
+    /// A config dir with live credentials: a `.credentials.json` expiring a
+    /// day out and carrying no refresh token, so the check is pure (no
+    /// refresh is ever requested) and passes on expiry alone.
+    fn dir_with_live_credentials() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 86_400_000;
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-oauth-test",
+                "refreshToken": "",
+                "expiresAt": expires_at_ms,
+                "scopes": ["user:inference"],
+            }
+        });
+        std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
+        let path = dir.path().to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    /// **The half-apply guarantee, pinned at the decision site.** Under a fleet
+    /// auto mode an UNPINNED machine whose local mode is `Manual` must take an
+    /// auto arm (the pick `pick_best_account` resolved, else the `config_dir`
+    /// fallback) and never the `Manual` arm. A PINNED machine keeps `Manual`.
+    ///
+    /// Held under the fleet pin for the whole test. That serializes it against
+    /// every test that also takes `pin_account_selection_for_test` — and ONLY
+    /// those: the other tests in this module, the `config_report_cmd` tests
+    /// that reach `get_effective_config_dir`, and the retry test whose 429
+    /// reaches `rotate_account_on_rate_limit`. `RESOLVED_CONFIG_DIR` is set
+    /// explicitly per arm and restored on drop, and the restore guard is
+    /// declared AFTER the temp dirs so it drops FIRST: a deleted path is never
+    /// left published. The retry test also reaches a writer (the rate-limit
+    /// rotation): on Linux under the fixture/cargo-guard its roster is empty
+    /// and nothing is written; elsewhere it may read the real roster and
+    /// rotate, which is why it too restores on drop — and the shared fleet pin
+    /// keeps it from running while this test is mid-assertion.
+    #[test]
+    fn effective_config_dir_follows_the_fleet_mode_unless_pinned() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::LeastUsage,
+        ));
+        // Temp dirs FIRST, restore guard AFTER: locals drop in reverse order,
+        // so the published pick is restored before its directory is deleted.
+        let (_manual_guard, manual_dir) = dir_with_live_credentials();
+        let (_picked_guard, picked_dir) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+
+        let unpinned_manual = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            account_selection_pinned: false,
+            config_dir: Some(manual_dir.clone()),
+            ..Default::default()
+        };
+        let pinned_manual = settings::ClaudeCliSettings {
+            account_selection_pinned: true,
+            ..unpinned_manual.clone()
+        };
+
+        // (a) Unpinned, with a picker result: the PICK wins, not the manual dir.
+        set_resolved_config_dir(Some(picked_dir.clone()));
+        assert_eq!(
+            get_effective_config_dir(&unpinned_manual),
+            (
+                Some(picked_dir.clone()),
+                ClaudeConfigDirSource::LeastUsageResolved
+            )
+        );
+        // (a') Unpinned, no picker result: the auto arm's fallback — still not
+        // the `Manual` arm, even though it lands on the same dir.
+        set_resolved_config_dir(None);
+        assert_eq!(
+            get_effective_config_dir(&unpinned_manual),
+            (
+                Some(manual_dir.clone()),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback
+            )
+        );
+
+        // (b) Pinned: the fleet is ignored, the `Manual` arm decides — and a
+        // picker result is ignored with it.
+        set_resolved_config_dir(Some(picked_dir));
+        assert_eq!(
+            get_effective_config_dir(&pinned_manual),
+            (Some(manual_dir), ClaudeConfigDirSource::Manual)
+        );
+    }
+
     /// A per-request override is returned VERBATIM and names itself — it is the
     /// one path that skips the credential check here, so a report that showed
     /// it as `manual_config_dir` would be claiming a validation that did not
     /// happen.
     #[test]
     fn effective_config_dir_override_is_verbatim_and_names_itself() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let cli = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
             config_dir: Some("/configured/but/ignored".to_string()),

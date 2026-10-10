@@ -113,6 +113,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             account_selection_mode:
               result.data.claude_cli?.account_selection_mode ||
               DEFAULT_AI_SETTINGS.claude_cli.account_selection_mode,
+            // Left undefined when the runner did not report it, so a save
+            // sends "not provided" and the stored pin is kept.
+            account_selection_pinned: result.data.claude_cli?.account_selection_pinned,
             auto_migrate_on_token_exhaustion:
               result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
             auto_continue_after_migration:
@@ -226,6 +229,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         configDir: settings.claude_cli.config_dir || null,
         accountSelectionMode:
           settings.claude_cli.account_selection_mode || "highest_expected_usage",
+        // `undefined` (unknown — never loaded, never toggled) is omitted by the
+        // invoke and read as `None` by the command, which KEEPS the stored pin.
+        accountSelectionPinned: settings.claude_cli.account_selection_pinned,
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
         model: settings.claude_api.model,

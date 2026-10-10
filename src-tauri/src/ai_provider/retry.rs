@@ -520,6 +520,18 @@ mod tests {
 
     #[test]
     fn test_retry_succeeds_on_second_attempt() {
+        // The 429 below reaches `rotate_account_on_rate_limit`, which WRITES
+        // `RESOLVED_CONFIG_DIR` when the roster holds two or more accounts.
+        // On Linux under the isolated ambient + cargo-guard's XDG sandbox the
+        // roster is empty and rotation writes nothing; elsewhere (Windows,
+        // where `dirs::config_dir()` ignores HOME, or an exported
+        // XDG_CONFIG_HOME under raw cargo) it may read the REAL roster and
+        // rotate. The restore guard is what keeps that from leaking out of the
+        // test on every platform; the fleet pin serializes it against the
+        // config test that reads the same global. The restore is declared
+        // AFTER the pin so it runs while the pin is still held.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
+        let _restore = crate::ai_provider::config::ResolvedConfigDirRestore::capture();
         use std::sync::atomic::{AtomicU32, Ordering};
         let call_count = AtomicU32::new(0);
 
