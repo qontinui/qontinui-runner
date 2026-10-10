@@ -133,33 +133,111 @@ impl EarsCategory {
         }
     }
 
-    /// Classify a requirement sentence by its EARS keyword, ignoring case and
-    /// leading whitespace:
+    /// Classify a requirement sentence by its EARS template, ignoring case,
+    /// leading whitespace and a list prefix (`1.`, `2)`, `-`, `*`, `•`).
     ///
-    /// * `If … then …` → [`EarsCategory::UnwantedBehavior`] (the `then` is
-    ///   what makes it EARS: a bare "If" with no "then" is not classified);
-    /// * `While … when …` → [`EarsCategory::Complex`];
-    /// * `When …` → [`EarsCategory::EventDriven`];
-    /// * `While …` → [`EarsCategory::StateDriven`];
-    /// * `Where …` → [`EarsCategory::Optional`];
-    /// * `The … shall …` → [`EarsCategory::Ubiquitous`];
+    /// Every pattern requires `shall` — a sentence with no `shall` is not an
+    /// EARS requirement. The sentence is read as comma-separated clauses, and
+    /// the keyword that completes a pattern must OPEN a clause before the one
+    /// holding `shall` (or open that clause itself), never sit inside the
+    /// trigger or after `shall`:
+    ///
+    /// * `If <trigger>, then the <system> shall …` →
+    ///   [`EarsCategory::UnwantedBehavior`]. Without commas
+    ///   (`IF x THEN the API shall …`) the `then` must follow at least one
+    ///   trigger word, not follow `and`/`or`/`but`, and precede the subject.
+    ///   "If the user logs in and then logs out, the session shall end" is
+    ///   NOT unwanted behaviour: its `then` is inside the trigger.
+    /// * `While <state>, when <event>, the <system> shall …` →
+    ///   [`EarsCategory::Complex`] (the `when` before `shall`; a `when` after
+    ///   `shall` belongs to the response).
+    /// * `When <event>, the <system> shall …` → [`EarsCategory::EventDriven`];
+    /// * `While <state>, the <system> shall …` → [`EarsCategory::StateDriven`];
+    /// * `Where <feature>, the <system> shall …` → [`EarsCategory::Optional`];
+    /// * `The <system> shall …` → [`EarsCategory::Ubiquitous`];
     /// * anything else → [`EarsCategory::NotApplicable`].
+    ///
+    /// This is a keyword reading of the template, not a parser: it is meant to
+    /// suggest a category, never to overrule one an author set.
     pub fn classify(sentence: &str) -> EarsCategory {
-        let lower = sentence.trim_start().to_lowercase();
-        let words: Vec<&str> = lower
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
+        const CONJUNCTIONS: [&str; 3] = ["and", "or", "but"];
+        let lower = strip_list_prefix(sentence).to_lowercase();
+        let clauses: Vec<Vec<&str>> = lower
+            .split(',')
+            .map(|clause| {
+                clause
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .collect::<Vec<&str>>()
+            })
+            .filter(|words| !words.is_empty())
             .collect();
-        let has = |word: &str| words.iter().skip(1).any(|w| *w == word);
-        match words.first().copied() {
-            Some("if") if has("then") => EarsCategory::UnwantedBehavior,
-            Some("while") if has("when") => EarsCategory::Complex,
-            Some("when") => EarsCategory::EventDriven,
-            Some("while") => EarsCategory::StateDriven,
-            Some("where") => EarsCategory::Optional,
-            Some("the") if has("shall") => EarsCategory::Ubiquitous,
+        let Some(shall_at) = clauses.iter().position(|c| c.contains(&"shall")) else {
+            return EarsCategory::NotApplicable;
+        };
+        let first = &clauses[0];
+        // A trigger needs at least one word after its keyword.
+        let has_trigger = first.len() >= 2 && first[1] != "shall";
+        // Within one clause: index of `word` strictly between a trigger and
+        // `shall`, opening the main clause (not after a conjunction), with a
+        // subject between it and `shall`.
+        let inline_keyword = |words: &[&str], word: &str| -> bool {
+            let Some(shall) = words.iter().position(|w| *w == "shall") else {
+                return false;
+            };
+            (2..shall)
+                .any(|i| words[i] == word && !CONJUNCTIONS.contains(&words[i - 1]) && i + 1 < shall)
+        };
+        // A later clause (up to and including the `shall` clause) opened by `word`.
+        let opens_clause = |word: &str| clauses[1..=shall_at].iter().any(|c| c[0] == word);
+
+        match first[0] {
+            "if" if has_trigger => {
+                let then_opens_shall_clause = shall_at >= 1 && clauses[shall_at][0] == "then";
+                let then_inline = shall_at == 0 && inline_keyword(first, "then");
+                if then_opens_shall_clause || then_inline {
+                    EarsCategory::UnwantedBehavior
+                } else {
+                    EarsCategory::NotApplicable
+                }
+            }
+            "while" if has_trigger => {
+                let when_before_shall = if shall_at == 0 {
+                    inline_keyword(first, "when")
+                } else {
+                    opens_clause("when")
+                };
+                if when_before_shall {
+                    EarsCategory::Complex
+                } else {
+                    EarsCategory::StateDriven
+                }
+            }
+            "when" if has_trigger => EarsCategory::EventDriven,
+            "where" if has_trigger => EarsCategory::Optional,
+            "the" if shall_at == 0 => EarsCategory::Ubiquitous,
             _ => EarsCategory::NotApplicable,
         }
+    }
+}
+
+/// Drop a leading list marker — `1.`, `12)`, `-`, `*` or `•` followed by
+/// whitespace — and surrounding whitespace, so a numbered requirement list
+/// classifies line by line.
+fn strip_list_prefix(sentence: &str) -> &str {
+    let trimmed = sentence.trim();
+    let rest = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+    let had_digits = rest.len() != trimmed.len();
+    let after_marker = if had_digits {
+        rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'))
+    } else {
+        rest.strip_prefix('-')
+            .or_else(|| rest.strip_prefix('*'))
+            .or_else(|| rest.strip_prefix('•'))
+    };
+    match after_marker {
+        Some(tail) if tail.starts_with(char::is_whitespace) => tail.trim_start(),
+        _ => trimmed,
     }
 }
 
@@ -626,35 +704,21 @@ pub fn format_criteria_for_builder(criteria: &AcceptanceCriteria) -> String {
     if !ears_criteria.is_empty() {
         section.push_str("\n#### Trigger/Action Details\n\n");
         for c in &ears_criteria {
-            let trigger_str = c.trigger.as_deref().unwrap_or("(not specified)");
             let action_str = c.action.as_deref().unwrap_or("(not specified)");
-            let pattern = match c.ears_category {
-                EarsCategory::EventDriven => {
-                    format!(
-                        "- `{}`: **When** {} **then** {} -- generate setup+trigger+assert steps\n",
-                        c.id, trigger_str, action_str
-                    )
-                }
-                EarsCategory::StateDriven => {
-                    format!(
-                        "- `{}`: **While** {} **verify** {} -- generate state-setup+assert steps\n",
-                        c.id, trigger_str, action_str
-                    )
-                }
-                EarsCategory::Complex => {
-                    format!(
-                        "- `{}`: **While/When** {} **then** {} -- generate state-setup+trigger+assert steps\n",
-                        c.id, trigger_str, action_str
-                    )
-                }
-                EarsCategory::UnwantedBehavior => {
-                    format!(
-                        "- `{}`: **If** {} **then** {} -- generate fault-injection+assert steps\n",
-                        c.id, trigger_str, action_str
-                    )
-                }
-                _ => String::new(),
+            let steps = match c.ears_category {
+                EarsCategory::EventDriven => "generate setup+trigger+assert steps",
+                EarsCategory::StateDriven => "generate state-setup+assert steps",
+                EarsCategory::Complex => "generate state-setup+trigger+assert steps",
+                EarsCategory::UnwantedBehavior => "generate fault-injection+assert steps",
+                _ => continue,
             };
+            let pattern = format!(
+                "- `{}`: {} -- {}\n",
+                c.id,
+                c.ears_category
+                    .render("system", c.trigger.as_deref(), action_str),
+                steps
+            );
             section.push_str(&pattern);
         }
     }
@@ -1168,6 +1232,75 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_rejects_keywords_in_the_wrong_place() {
+        let negatives = [
+            // `then` inside the trigger, not opening the response clause.
+            "If the user logs in and then logs out, the session shall end",
+            // No trigger between `If` and `then`.
+            "If-then rules shall apply",
+            // No `shall` at all.
+            "If, then",
+            "If the cache is cold, then warm it",
+            "When the user submits the form",
+            "The system encrypts data at rest",
+            // `shall` present but the opening word is no EARS keyword.
+            "Users shall be notified",
+            // `then` after a conjunction, comma-less form.
+            "If the job fails or then retries the worker shall alert",
+        ];
+        for sentence in negatives {
+            assert_eq!(
+                EarsCategory::classify(sentence),
+                EarsCategory::NotApplicable,
+                "{sentence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_a_when_after_shall_is_not_complex() {
+        assert_eq!(
+            EarsCategory::classify("While uploading, the system shall show progress when asked"),
+            EarsCategory::StateDriven
+        );
+        assert_eq!(
+            EarsCategory::classify("While uploading the system shall show progress when asked"),
+            EarsCategory::StateDriven
+        );
+    }
+
+    #[test]
+    fn test_classify_strips_a_list_prefix() {
+        let cases = [
+            (
+                "1. If the disk is full, then the system shall reject the upload",
+                EarsCategory::UnwantedBehavior,
+            ),
+            (
+                "12) When a file is dropped, the uploader shall start",
+                EarsCategory::EventDriven,
+            ),
+            (
+                "- The system shall log every request",
+                EarsCategory::Ubiquitous,
+            ),
+            (
+                "* Where SSO is enabled, the app shall hide the password field",
+                EarsCategory::Optional,
+            ),
+            (
+                "• While offline, the app shall queue writes",
+                EarsCategory::StateDriven,
+            ),
+            // A number that is not a list marker is part of the sentence.
+            ("3 users shall be admins", EarsCategory::NotApplicable),
+        ];
+        for (sentence, expected) in cases {
+            assert_eq!(EarsCategory::classify(sentence), expected, "{sentence:?}");
+        }
+    }
+
+    #[test]
     fn test_classify_inverts_render() {
         for category in EarsCategory::CLASSIFIED {
             let trigger = match category {
@@ -1205,7 +1338,7 @@ mod tests {
             output.contains("**unwanted_behavior** criteria: Generate a **fault-injection step**")
         );
         assert!(output.contains(
-            "- `save-survives-500`: **If** the save request returns a 500 error **then** show an error banner and keep the form contents -- generate fault-injection+assert steps"
+            "- `save-survives-500`: If the save request returns a 500 error, then the system shall show an error banner and keep the form contents -- generate fault-injection+assert steps"
         ));
     }
 
