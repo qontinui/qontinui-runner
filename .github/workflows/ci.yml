@@ -974,7 +974,9 @@ jobs:
       # binaries, this branch builds 29 — and an absolute written here went
       # stale inside a single PR. It will not stay true by itself:
       # recovering doctests needs a second cargo invocation, which is precisely
-      # what pays the rebuild above. Tracked as a follow-up.
+      # what pays the rebuild above. The day it stops being true is caught by
+      # `src-tauri/tests/lib_doctests_are_not_silently_skipped.rs`, which fails
+      # on any lib doctest this split would silently skip.
       - name: Run Rust tests
         id: run_rust_tests
         timeout-minutes: 20
@@ -1343,18 +1345,53 @@ jobs:
         # The secret presence check runs INSIDE the shell, not in `if:` — the
         # `secrets` context is not available to step-level `if:` (only job-level
         # `if:` and step `env:`/`run:`/`with:`). Setting an empty env var is
-        # safe; we early-exit before invoking cargo.
+        # safe; we early-exit before running anything.
+        #
+        # ⚠️ NO CARGO HERE, for the same reason as `Run Rust tests`: the package
+        # is an input to itself, so a second cargo invocation finds it Dirty and
+        # recompiles the main crate. On this leg that would be an unthrottled
+        # (no CARGO_BUILD_JOBS) recompile inside a step with no bound of its
+        # own. The step used to run `cargo test --bin qontinui-runner …`. The
+        # secret is unset today, so it exits above before any of this runs, and
+        # the rebuild would land on whoever sets it. It runs the bin's
+        # unit-test binary the build step already produced instead. That
+        # binary's `Executable` line in the build log names
+        # `deps/qontinui_runner-<16 hex>`. The lib is `qontinui_runner_lib-…`,
+        # which the pattern below does not match.
         if: matrix.platform == 'ubuntu-22.04'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
             echo "ANTHROPIC_API_KEY secret not set — skipping live AI smoke test."
             exit 0
           fi
+          # KEEP THIS `cd` — cargo runs a test binary from the package manifest
+          # directory, and so must we (see `Run Rust tests`).
           cd src-tauri
-          cargo test --bin qontinui-runner -- --ignored --exact \
-            util::path_extraction::tests::test_extract_paths_via_ai_real_call
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          BIN=""
+          if [ -f "$BUILD_LOG" ]; then
+            ESC=$(printf '\033')
+            BIN=$(sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+              | sed -n 's/^[[:space:]]*Executable `\(.*[/\\]qontinui_runner-[0-9a-f]\{16\}\(\.exe\)\{0,1\}\)`[[:space:]]*$/\1/p' \
+              | head -n 1)
+          fi
+          if [ -z "$BIN" ]; then
+            echo "::warning title=Live AI smoke not run::found no qontinui_runner bin test binary in $BUILD_LOG. This is UNKNOWN, not a pass."
+            exit 1
+          fi
+          # `--exact` on a renamed test matches nothing, and libtest exits 0 on
+          # `0 passed`. A smoke that ran nothing would read as green, so it has
+          # to show the one pass.
+          "${BIN//\\//}" --ignored --exact \
+            util::path_extraction::tests::test_extract_paths_via_ai_real_call \
+            2>&1 | tee "$RUNNER_TEMP/live-ai-smoke.log"
+          if ! grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/live-ai-smoke.log"; then
+            echo "::warning title=Live AI smoke ran no test::the smoke binary did not report exactly one passing test. The test was probably renamed. This is UNKNOWN, not a pass."
+            exit 1
+          fi
         continue-on-error: true
 
       - name: Build Tauri app (development)
