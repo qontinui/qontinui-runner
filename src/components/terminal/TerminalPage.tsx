@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
@@ -1357,7 +1358,7 @@ function TerminalPageInner({
       });
     } catch (e) {
       workflowGen.setNotification({
-        message: `Structured session failed to start: ${e instanceof Error ? e.message : String(e)}`,
+        message: `Structured session failed to start: ${describeThrown(e, "no detail")}`,
         type: "error",
       });
       return;
