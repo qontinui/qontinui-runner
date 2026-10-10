@@ -1424,6 +1424,7 @@ mod relay_timeout_tests {
                 reason: Some("served-sha heartbeat is STALE".into()),
                 required_sha: Some("f521e1012e1e".into()),
                 served_sha: None,
+                input_ack: None,
             }),
         ]
     }
