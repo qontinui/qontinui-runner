@@ -30,6 +30,19 @@ pub struct PhaseCostBreakdown {
     pub cost_usd: f64,
 }
 
+/// Convert a `phase_token_usage.cost_cents` value (or a sum of them) to USD.
+///
+/// `cost_cents` holds WHOLE cents: the writer stores `round(usd * 100)`
+/// (`ai_pricing::calculate_cost_cents*`, and
+/// `database::pg::token_usage::PhaseCost`). So dollars are cents / 100. This
+/// used to divide by 100_000 on the belief that the column held
+/// "hundredths of cents", which rendered every dashboard dollar figure 1000x
+/// too low. A negative value cannot be written (the writer clamps), and is
+/// read as zero rather than as a refund.
+pub fn cost_cents_to_usd(cost_cents: i64) -> f64 {
+    cost_cents.max(0) as f64 / 100.0
+}
+
 /// Fetch the cost dashboard summary for the last N days.
 ///
 /// Queries phase_token_usage for token totals, cache metrics, and per-phase
@@ -50,14 +63,14 @@ pub async fn get_cost_dashboard(
     let mut total_output: u64 = 0;
     let mut total_cache_creation: u64 = 0;
     let mut total_cache_read: u64 = 0;
-    let mut total_cost_cents: u64 = 0;
+    let mut total_cost_cents: i64 = 0;
 
     for (phase, input, output, creation, read, cost) in &rows {
         total_input += *input as u64;
         total_output += *output as u64;
         total_cache_creation += *creation as u64;
         total_cache_read += *read as u64;
-        total_cost_cents += *cost as u64;
+        total_cost_cents += (*cost).max(0);
 
         per_phase.push(PhaseCostBreakdown {
             phase: phase.clone(),
@@ -65,14 +78,13 @@ pub async fn get_cost_dashboard(
             output_tokens: *output as u64,
             cache_creation_tokens: *creation as u64,
             cache_read_tokens: *read as u64,
-            // cost_cents is in hundredths-of-cents (microdollars * 100)
-            cost_usd: *cost as f64 / 100_000.0,
+            cost_usd: cost_cents_to_usd(*cost),
         });
     }
 
     let total_tokens = total_input + total_output;
-    // cost_cents is in hundredths-of-cents
-    let total_cost_usd = total_cost_cents as f64 / 100_000.0;
+    // Sum whole cents first, convert once: exact integer addition.
+    let total_cost_usd = cost_cents_to_usd(total_cost_cents);
 
     // Cache hit rate = cache_read / (cache_read + cache_creation + regular_input)
     let cache_denominator =
@@ -166,4 +178,36 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_active_budget_status,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cost_cents_to_usd;
+
+    #[test]
+    fn whole_cents_convert_to_dollars() {
+        assert_eq!(cost_cents_to_usd(0), 0.0);
+        assert_eq!(cost_cents_to_usd(1), 0.01);
+        assert_eq!(cost_cents_to_usd(1_234), 12.34);
+        assert_eq!(cost_cents_to_usd(-5), 0.0);
+    }
+
+    /// Pin a phase_token_usage row as the writer produces it to the dollar
+    /// figure the dashboard shows: 1M input + 1M output tokens on Sonnet 4 is
+    /// $3 + $15 = $18.00, stored as `cost_cents = 1800`. The old /100_000
+    /// conversion rendered it as $0.018.
+    #[test]
+    fn a_written_phase_token_usage_row_reads_back_as_its_dollar_cost() {
+        let model = "claude-sonnet-4-20250514";
+        let cost_cents =
+            crate::ai_pricing::calculate_cost_cents_or_estimate(1_000_000, 1_000_000, model);
+        assert_eq!(
+            cost_cents, 1_800,
+            "fixture premise: Sonnet 4 at $3/$15 per MTok"
+        );
+        assert_eq!(cost_cents_to_usd(i64::from(cost_cents)), 18.0);
+
+        let usd = crate::ai_pricing::calculate_cost_usd(1_000_000, 1_000_000, model);
+        assert!((cost_cents_to_usd(i64::from(cost_cents)) - usd).abs() < 0.005);
+    }
 }
