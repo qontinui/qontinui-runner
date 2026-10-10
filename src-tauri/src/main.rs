@@ -1660,8 +1660,13 @@ fn main() {
     // `outbound_net::connect_ws`), `git` and the spawned `claude` CLI agree
     // (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`, C2). HERE,
     // beside the other `set_var`, because writing the environment is sound only
-    // before the runtime below starts any thread. Logged once logging exists
-    // (`outbound_net::log_startup_posture` in `run_app`).
+    // while no other thread exists — before the runtime below. The one thing
+    // the step runs besides env writes is the Windows-only `git config` probe
+    // (when the profile says `network.trust: "os"`); it runs FIRST and waits
+    // (bounded) for its pipe-reader threads to finish, and every env write
+    // happens after it. Nothing is logged here — logging does not exist yet;
+    // the outcome, including a failed probe, is logged by
+    // `outbound_net::log_startup_posture` in `run_app`.
     qontinui_runner_lib::outbound_net::apply_profile_environment_at_startup();
 
     // Install the startup-panic hook FIRST, before any other setup. Panics

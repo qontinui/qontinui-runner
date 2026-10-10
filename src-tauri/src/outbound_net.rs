@@ -28,17 +28,23 @@
 //! # Loopback always bypasses
 //!
 //! `127.0.0.1`, `::1` and `localhost` are never proxied by [`connect_ws`],
-//! checked before the matcher. Whenever an ENVIRONMENT proxy is in force,
-//! [`apply_profile_environment`] also appends them to `NO_PROXY`, so reqwest,
-//! `git` and child processes skip the proxy for them too.
+//! checked before the matcher, and [`apply_profile_environment`] always puts
+//! them in the exported `NO_PROXY`, so reqwest, `git` and child processes skip
+//! any proxy — environment OR OS system proxy — for them too. A proxy can
+//! therefore never break the runner's calls to itself. (`hyper-util` has no
+//! implicit loopback bypass, and the WinINet `<local>` entry matches nothing
+//! there, so without this a Windows or macOS system proxy would receive
+//! `http://127.0.0.1:*`.)
 //!
-//! When no environment proxy is in force it leaves `NO_PROXY` exactly as it
-//! found it: `hyper-util` reads the Windows registry bypass list
-//! (`ProxyOverride`) only while `NO_PROXY` is unset, so exporting one would
-//! silently send every host IT exempted through the system proxy. When an
-//! environment proxy IS in force on Windows, that bypass list is folded into
-//! the exported union (converted the way `hyper-util` converts it), so the
-//! hosts IT exempted stay exempt.
+//! Exporting `NO_PROXY` switches off `hyper-util`'s own read of the Windows
+//! registry bypass list (`ProxyOverride`), which it consults only while
+//! `NO_PROXY` is unset. So when the operator set no `NO_PROXY`, the exported
+//! list is a strict SUPERSET of that registry list (converted the way
+//! `hyper-util` converts it) plus the profile's `network.no_proxy` plus
+//! loopback: every host IT exempted stays exempt. When the operator DID set
+//! `NO_PROXY`, `hyper-util` was never going to read the registry list, so it
+//! is not folded in; the operator's entries are kept and the profile's entries
+//! and loopback are appended. An operator `NO_PROXY=*` is left untouched.
 //!
 //! # Proxies the WebSocket path cannot use
 //!
@@ -504,6 +510,9 @@ pub struct ProxyEnvOutcome {
     pub git_ssl_backend: Option<String>,
     /// Why git was or was not pointed at Schannel.
     pub git_trust: GitTrustDecision,
+    /// `NODE_EXTRA_CA_CERTS` as it stands after this step — the operator's
+    /// own value or the exported bundle — i.e. what Node actually adds.
+    pub node_extra_ca_certs: Option<String>,
 }
 
 const OPERATOR_PROXY_VARS: [&str; 6] = [
@@ -607,6 +616,12 @@ pub fn apply_profile_environment_with(
 ) -> ProxyEnvOutcome {
     let mut exported = Vec::new();
 
+    // The git probe spawns a subprocess (and pipe-reader threads), so it runs
+    // FIRST: every environment write below happens after it has finished.
+    let trust = network.and_then(|n| n.trust);
+    let git_probe =
+        (system.windows && trust == Some(TrustMode::Os)).then(|| (system.git_tls_configured)());
+
     let operator = OPERATOR_PROXY_VARS.iter().find_map(|k| non_empty(env, k));
     let profile_proxy = network
         .and_then(|n| n.proxy_url.as_deref())
@@ -629,9 +644,8 @@ pub fn apply_profile_environment_with(
     let operator_proxies_nothing = existing
         .as_deref()
         .is_some_and(|v| v.split(',').any(|e| e.trim() == "*"));
-    let no_proxy = if arm == ProxyEnvArm::None || operator_proxies_nothing {
-        // No environment proxy: an exported NO_PROXY would only switch off
-        // the OS bypass list. `*`: the operator already exempted everything.
+    let no_proxy = if operator_proxies_nothing {
+        // `*`: the operator already exempted everything.
         existing.unwrap_or_default()
     } else {
         let mut entries: Vec<String> = Vec::new();
@@ -641,11 +655,10 @@ pub fn apply_profile_environment_with(
                 entries.push(entry.to_string());
             }
         };
-        for source in [
-            existing.as_deref(),
-            network.and_then(|n| n.no_proxy.as_deref()),
-            system.system_bypass.as_deref(),
-        ] {
+        // The registry list stands in for an operator NO_PROXY only when there
+        // is none: that is exactly when hyper-util would have read it.
+        let base = existing.as_deref().or(system.system_bypass.as_deref());
+        for source in [base, network.and_then(|n| n.no_proxy.as_deref())] {
             for e in source.unwrap_or_default().split(',') {
                 push(e);
             }
@@ -677,17 +690,17 @@ pub fn apply_profile_environment_with(
             exported.push("NODE_EXTRA_CA_CERTS".to_string());
         }
     }
+    let node_extra_ca_certs = non_empty(env, "NODE_EXTRA_CA_CERTS");
 
     // git on Windows, only on an explicit `network.trust: "os"` and only when
     // the machine's git config has not chosen a TLS backend or CA file.
-    let trust = network.and_then(|n| n.trust);
     let git_trust = if !system.windows {
         GitTrustDecision::NotWindows
     } else {
         match trust {
             None => GitTrustDecision::NotRequested,
             Some(TrustMode::Bundled) => GitTrustDecision::Bundled,
-            Some(TrustMode::Os) => match (system.git_tls_configured)() {
+            Some(TrustMode::Os) => match git_probe.flatten() {
                 None => GitTrustDecision::ConfigUnreadable,
                 Some(true) => GitTrustDecision::OperatorConfigured,
                 Some(false) => append_git_config(env, "http.sslBackend", "schannel", &mut exported),
@@ -706,6 +719,7 @@ pub fn apply_profile_environment_with(
         ca_bundle,
         git_ssl_backend,
         git_trust,
+        node_extra_ca_certs,
     }
 }
 
@@ -743,19 +757,30 @@ pub fn windows_system_bypass() -> Option<String> {
     }
 }
 
+/// The git config keys that mean "the machine chose git's TLS trust".
+/// Matches the plain and the URL-scoped (`http.<url>.sslCAInfo`) spellings.
+const GIT_TLS_KEYS_PATTERN: &str = "^http\\.(.+\\.)?(sslbackend|sslcainfo)$";
+
 /// Whether the machine's git config (system, global, or this directory's)
 /// names `http.sslBackend` or `http.sslCAInfo`. `None` when git could not be
 /// run or answered something other than "found" / "not found".
 fn machine_git_tls_configured() -> Option<bool> {
     let mut cmd = crate::process_helpers::scrubbed_git(std::ffi::OsStr::new("git"));
-    cmd.args(["config", "--get-regexp", "^http\\.(sslbackend|sslcainfo)$"]);
+    cmd.args(["config", "--get-regexp", GIT_TLS_KEYS_PATTERN]);
     let out = crate::process_helpers::output_with_timeout_labeled(
         cmd,
         Duration::from_secs(5),
         "outbound_net: git config --get-regexp http.ssl*",
     )
-    .ok()?;
-    match out.status.code() {
+    .ok();
+    // The helper's pipe readers are detached threads that finish on EOF; let
+    // them drain (bounded) so no helper thread is alive when `main` writes the
+    // environment right after this returns.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while crate::process_helpers::live_pipe_readers() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match out?.status.code() {
         Some(0) => Some(true),
         Some(1) => Some(false),
         _ => None,
@@ -869,6 +894,13 @@ pub fn log_startup_posture() {
         git_ssl_backend = outcome.git_ssl_backend.as_deref().unwrap_or("-"),
         "outbound network: proxy rung and TLS trust resolved"
     );
+    if outcome.git_trust == GitTrustDecision::ConfigUnreadable {
+        warn!(
+            "outbound network: network.trust is \"os\" but `git config` could not be read at \
+             startup (git missing, or the 5 s probe timed out before logging existed); git was \
+             left on the machine's own TLS configuration"
+        );
+    }
     if pac_script_configured() == Some(true) && outcome.arm == ProxyEnvArm::None {
         warn!(
             "outbound network: UNKNOWN: a PAC script is configured; set network.proxy_url in \
@@ -1287,8 +1319,14 @@ mod tests {
             self.0.get(key).cloned()
         }
         fn set(&mut self, key: &str, value: &str) {
+            ENV_WRITES.with(|w| w.set(w.get() + 1));
             self.0.insert(key.to_string(), value.to_string());
         }
+    }
+
+    thread_local! {
+        /// Writes made through any [`MapEnv`] on this test thread.
+        static ENV_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn net(proxy: Option<&str>, no_proxy: Option<&str>) -> NetworkProfile {
@@ -1526,12 +1564,13 @@ mod tests {
     // Review fixes (H1, H2, M1, M2, L1) — written failing-first.
     // ---------------------------------------------------------------------
 
-    /// H1: with no environment proxy in force, NO_PROXY is left exactly as it
-    /// was. Exporting it would make hyper-util skip the Windows registry
-    /// bypass list (`ProxyOverride`), which it reads only when no NO_PROXY is
-    /// set — sending intranet hosts IT exempted through the system proxy.
+    /// C1: with no environment proxy in force, NO_PROXY is still exported —
+    /// as a STRICT SUPERSET of the Windows registry bypass list (so the hosts
+    /// IT exempted stay exempt; H1) plus loopback. hyper-util has no implicit
+    /// loopback bypass and `<local>` matches nothing, so without loopback here
+    /// reqwest would send `http://127.0.0.1:*` to the system proxy.
     #[test]
-    fn no_env_proxy_leaves_no_proxy_untouched() {
+    fn no_env_proxy_exports_the_bypass_list_and_loopback() {
         let mut env = MapEnv::default();
         let out = apply(
             None,
@@ -1539,12 +1578,113 @@ mod tests {
             &sys(true, Some("intranet.example.test"), None),
         );
         assert_eq!(out.arm, ProxyEnvArm::None);
-        assert_eq!(env.get("NO_PROXY"), None, "NO_PROXY must not be exported");
-        assert_eq!(env.get("no_proxy"), None);
-        assert!(!out
-            .exported
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case("no_proxy")));
+        let want = "intranet.example.test,127.0.0.1,::1,localhost";
+        assert_eq!(env.get("NO_PROXY").as_deref(), Some(want));
+        assert_eq!(env.get("no_proxy").as_deref(), Some(want));
+        // The matcher reqwest builds (system proxy on, env NO_PROXY set, so the
+        // registry list is not consulted) routes the runner's own API direct.
+        let m = Matcher::builder()
+            .http("http://system-proxy.example.test:8080")
+            .https("http://system-proxy.example.test:8080")
+            .no(want)
+            .build();
+        for direct in [
+            "http://127.0.0.1:9876/health",
+            "http://localhost:9876/",
+            "https://wiki.intranet.example.test/",
+        ] {
+            assert!(m.intercept(&direct.parse().unwrap()).is_none(), "{direct}");
+        }
+        assert!(m
+            .intercept(&"https://coord.example.test/".parse().unwrap())
+            .is_some());
+    }
+
+    /// C1: the profile's `network.no_proxy` is honoured without a proxy too.
+    #[test]
+    fn profile_no_proxy_is_honoured_without_an_env_proxy() {
+        let mut env = MapEnv::default();
+        let n = net(None, Some(".corp.example.test"));
+        let out = apply(Some(&n), &mut env, &sys(false, None, None));
+        assert_eq!(out.no_proxy, ".corp.example.test,127.0.0.1,::1,localhost");
+        assert_eq!(env.get("NO_PROXY").as_deref(), Some(out.no_proxy.as_str()));
+    }
+
+    /// W3: the git probe (which spawns a subprocess and reader threads) runs
+    /// BEFORE any environment write, so every `set_var` happens after it.
+    #[test]
+    fn the_git_probe_runs_before_any_env_write() {
+        static WRITES_AT_PROBE: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(usize::MAX);
+        ENV_WRITES.with(|w| w.set(0));
+        let probe: &dyn Fn() -> Option<bool> = &|| {
+            WRITES_AT_PROBE.store(
+                ENV_WRITES.with(|w| w.get()),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Some(false)
+        };
+        let n = NetworkProfile {
+            proxy_url: Some("http://proxy.example.test:3128".into()),
+            no_proxy: Some(".corp.example.test".into()),
+            ca_bundle: Some(std::path::PathBuf::from("/corp/root.pem")),
+            trust: Some(TrustMode::Os),
+        };
+        let mut env = MapEnv::default();
+        let out = apply(
+            Some(&n),
+            &mut env,
+            &SystemInputs {
+                windows: true,
+                system_bypass: None,
+                git_tls_configured: probe,
+            },
+        );
+        assert_eq!(out.git_trust, GitTrustDecision::Schannel);
+        assert_eq!(
+            WRITES_AT_PROBE.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the probe must run before the first env write"
+        );
+    }
+
+    /// W2: a URL-scoped `http.<url>.sslCAInfo` / `.sslBackend` counts as the
+    /// machine having chosen git's TLS trust.
+    #[test]
+    fn the_git_tls_key_pattern_matches_url_scoped_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("gitconfig");
+        let probe = |body: &str| -> Option<i32> {
+            std::fs::write(&cfg, body).unwrap();
+            let mut cmd = crate::process_helpers::scrubbed_git(std::ffi::OsStr::new("git"));
+            cmd.arg("config")
+                .arg("--file")
+                .arg(&cfg)
+                .args(["--get-regexp", GIT_TLS_KEYS_PATTERN]);
+            crate::process_helpers::output_with_timeout(cmd, Duration::from_secs(20))
+                .ok()
+                .and_then(|o| o.status.code())
+        };
+        if probe("").is_none() {
+            eprintln!("git not runnable here — pattern not exercised");
+            return;
+        }
+        for (body, want) in [
+            ("[http]\n\tsslBackend = openssl\n", 0),
+            ("[http]\n\tsslCAInfo = /etc/corp.pem\n", 0),
+            (
+                "[http \"https://git.example.test/\"]\n\tsslCAInfo = /etc/corp.pem\n",
+                0,
+            ),
+            (
+                "[http \"https://git.example.test/\"]\n\tsslBackend = schannel\n",
+                0,
+            ),
+            ("[http]\n\tsslVerify = true\n", 1),
+            ("[core]\n\tautocrlf = false\n", 1),
+        ] {
+            assert_eq!(probe(body), Some(want), "{body:?}");
+        }
     }
 
     /// L3: an operator's `NO_PROXY=*` (proxy nothing) is left alone.
@@ -1665,7 +1805,7 @@ mod tests {
             eprintln!("skipped: writes the user's Internet Settings; runs on CI only");
             return;
         }
-        for k in OPERATOR_PROXY_VARS {
+        for k in OPERATOR_PROXY_VARS.iter().chain(&["NO_PROXY", "no_proxy"]) {
             assert!(
                 std::env::var(k).is_err(),
                 "{k} is set on this CI host; the registry arm cannot be isolated"
@@ -1679,9 +1819,38 @@ mod tests {
                 KEY_READ | KEY_WRITE,
             )
             .unwrap();
-        let prev_enable: Option<u32> = key.get_value("ProxyEnable").ok();
-        let prev_server: Option<String> = key.get_value("ProxyServer").ok();
-        let prev_override: Option<String> = key.get_value("ProxyOverride").ok();
+
+        /// Restores the three values on drop — including when an assertion
+        /// or an unwrap below panics.
+        struct Restore {
+            key: winreg::RegKey,
+            enable: Option<u32>,
+            server: Option<String>,
+            overrides: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = match self.enable {
+                    Some(v) => self.key.set_value("ProxyEnable", &v),
+                    None => self.key.delete_value("ProxyEnable"),
+                };
+                let _ = match &self.server {
+                    Some(v) => self.key.set_value("ProxyServer", v),
+                    None => self.key.delete_value("ProxyServer"),
+                };
+                let _ = match &self.overrides {
+                    Some(v) => self.key.set_value("ProxyOverride", v),
+                    None => self.key.delete_value("ProxyOverride"),
+                };
+            }
+        }
+        let guard = Restore {
+            enable: key.get_value("ProxyEnable").ok(),
+            server: key.get_value("ProxyServer").ok(),
+            overrides: key.get_value("ProxyOverride").ok(),
+            key,
+        };
+        let key = &guard.key;
         key.set_value("ProxyEnable", &1u32).unwrap();
         key.set_value("ProxyServer", &"registry-proxy.example.test:8123")
             .unwrap();
@@ -1720,19 +1889,7 @@ mod tests {
         )
         .is_none();
 
-        match prev_override {
-            Some(v) => key.set_value("ProxyOverride", &v).unwrap(),
-            None => key.delete_value("ProxyOverride").unwrap(),
-        }
-
-        match prev_enable {
-            Some(v) => key.set_value("ProxyEnable", &v).unwrap(),
-            None => key.delete_value("ProxyEnable").unwrap(),
-        }
-        match prev_server {
-            Some(v) => key.set_value("ProxyServer", &v).unwrap(),
-            None => key.delete_value("ProxyServer").unwrap(),
-        }
+        drop(guard);
         assert_eq!(seen.as_deref(), Some("registry-proxy.example.test:8123"));
         assert!(
             intranet_direct_system,

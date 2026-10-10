@@ -69,7 +69,6 @@ pub fn census(outcome: Option<&ProxyEnvOutcome>) -> Vec<TrustRow> {
 /// [`census`] with the platform as a parameter, so both arms are testable on
 /// any host.
 pub fn census_for(outcome: Option<&ProxyEnvOutcome>, windows: bool) -> Vec<TrustRow> {
-    let ca_bundle = outcome.and_then(|o| o.ca_bundle.as_deref());
     let mut rows = vec![
         TrustRow {
             stack: "reqwest 0.13 (HTTP clients, OTLP export, updater)",
@@ -167,9 +166,12 @@ pub fn census_for(outcome: Option<&ProxyEnvOutcome>, windows: bool) -> Vec<Trust
 
     rows.push(TrustRow {
         stack: "claude CLI (Node)",
-        source: match ca_bundle {
+        source: match outcome.and_then(|o| o.node_extra_ca_certs.as_deref()) {
             Some(p) => format!("Node's bundled Mozilla roots + NODE_EXTRA_CA_CERTS={p}"),
-            None => "Node's bundled Mozilla roots".into(),
+            None if outcome.is_some() => "Node's bundled Mozilla roots".into(),
+            None => "Node's bundled Mozilla roots (this process did not run the startup \
+                     step; NODE_EXTRA_CA_CERTS not reflected)"
+                .into(),
         },
         verdict: TrustVerdict::Bundled,
         basis: "measured on Linux by outbound_net::tls_trust::tests::\
@@ -613,6 +615,7 @@ mod tests {
             git_ssl_backend: (git_trust == GitTrustDecision::Schannel)
                 .then(|| "schannel".to_string()),
             git_trust,
+            node_extra_ca_certs: ca.map(str::to_string),
         }
     }
 

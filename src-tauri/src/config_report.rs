@@ -452,8 +452,9 @@ pub const LAYER_SPECS: &[LayerSpec] = &[
                     `HTTP_PROXY` / `ALL_PROXY`, the active profile's \
                     `network.proxy_url` exported at startup, or none (on Windows \
                     and macOS the OS system proxy may still apply) — plus the \
-                    `NO_PROXY` in force (exported, with loopback and the Windows \
-                    bypass list, only while an environment proxy is in force), and \
+                    `NO_PROXY` in force (always exported with loopback, as a \
+                    superset of the Windows bypass list unless the operator set \
+                    their own; an operator `*` is left alone), and \
                     whether the WebSocket transports tunnel through it or go DIRECT \
                     past a socks5/https proxy they cannot use. The proxy is shown \
                     with any credential removed",
