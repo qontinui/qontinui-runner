@@ -410,8 +410,8 @@ impl std::fmt::Display for HeaderRejection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderDecl {
     /// No such key in the status blockquote (including a plan whose only
-    /// `Area:` line sits outside it, e.g. in a second blockquote after a blank
-    /// line). Not a defect — nothing is warned.
+    /// `Area:` / `Initiative-Item:` line sits outside it, e.g. in a second
+    /// blockquote after a blank line). Not a defect — nothing is warned.
     Absent,
     /// A key whose value satisfies [`is_kebab_case`].
     Accepted(String),
@@ -444,13 +444,13 @@ fn key_on_line(line: &str, key: &KebabHeader) -> Option<(usize, HeaderDecl)> {
         }
     };
 
-    // (a) The bolded key, anywhere on the line: `**Area:**` (and the
+    // (a) The bolded key, anywhere on the line: e.g. `**Area:**` (and the
     //     Status-style `**Area: x**`, whose closer follows the value).
     if let Some(pos) = line.find(key.bold) {
         consider(pos, header_value(&line[pos + key.bold.len()..]));
     }
     // (b) The unbolded key, ONLY as the first token after `>`: prose such as
-    //     "covers the grey Area: see below" never counts.
+    //     "covers the grey Area: see below" never counts (same for any key).
     let lead = line.len() - line.trim_start().len();
     let after_gt = line
         .trim_start()
@@ -472,7 +472,7 @@ fn key_on_line(line: &str, key: &KebabHeader) -> Option<(usize, HeaderDecl)> {
     while let Some(rel) = line[from..].find(key.italic) {
         let pos = from + rel;
         from = pos + 1;
-        // Part of the bolded `**Area:**`, which (a) already handles.
+        // Part of the bolded key (e.g. `**Area:**`), which (a) already handles.
         if line[..pos].ends_with('*') {
             continue;
         }
@@ -2112,10 +2112,6 @@ mod tests {
     // every delimiting rule: present in each accepted spelling, absent,
     // malformed, near-miss, and ignored outside the status block.
 
-    fn item_rej(value: impl Into<String>) -> HeaderDecl {
-        HeaderDecl::Rejected(HeaderRejection::NotKebab(value.into()))
-    }
-
     #[test]
     fn extract_initiative_item_applies_the_kebab_fixtures() {
         for ok in KEBAB_ACCEPTED {
@@ -2135,7 +2131,7 @@ mod tests {
         }
         for bad in ["a--b", "a-", "-a", "A", "one_screen", "One-Screen"] {
             let body = format!("# T\n\n> **Status: DRAFT.**\n> **Initiative-Item:** `{bad}`\n");
-            assert_eq!(extract_initiative_item(&body), item_rej(bad), "{bad:?}");
+            assert_eq!(extract_initiative_item(&body), rej(bad), "{bad:?}");
         }
     }
 
