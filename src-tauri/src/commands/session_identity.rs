@@ -145,3 +145,12 @@ pub async fn session_identity_uninstall() -> Result<CommandResponse, String> {
         ),
     })
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    session_identity_status,
+    session_identity_install,
+    session_identity_uninstall,
+);

@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tracing::error;
 use uuid::Uuid;
 
@@ -249,22 +248,6 @@ pub async fn session_handoff(
     })
 }
 
-/// Tauri plugin bundle. main.rs adds one `.plugin(commands::session::plugin())`
-/// to wire all five commands.
-pub fn plugin() -> TauriPlugin<tauri::Wry> {
-    PluginBuilder::<tauri::Wry>::new("qontinui_session")
-        .invoke_handler(tauri::generate_handler![
-            session_start,
-            session_focus,
-            session_close,
-            session_describe,
-            session_list,
-            session_steal,
-            session_handoff,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,3 +334,16 @@ mod tests {
         assert!(json.get("plan_slug").is_none(), "{json}");
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    session_close,
+    session_describe,
+    session_focus,
+    session_list,
+    session_start,
+    session_steal,
+    session_handoff,
+);

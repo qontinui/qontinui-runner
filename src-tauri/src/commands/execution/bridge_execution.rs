@@ -222,3 +222,13 @@ pub async fn get_bridge_info(
         None => Err(format!("Bridge not found: {}", bridge_id)),
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_bridge_info,
+    list_bridges,
+    run_workflow_on_bridge,
+    transfer_gui_lock,
+);

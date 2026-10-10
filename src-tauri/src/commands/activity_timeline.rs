@@ -3,8 +3,6 @@
 //! Provides full-text search, time-range queries, and statistics over captured
 //! screen text from UI Bridge snapshots, OCR, and accessibility trees.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info};
 
@@ -336,19 +334,18 @@ pub async fn get_oneshot_stats() -> Result<crate::ai_provider::OneshotStats, Str
     Ok(crate::ai_provider::snapshot_oneshot_stats())
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_activity_timeline")
-        .invoke_handler(tauri::generate_handler![
-            insert_activity_entry,
-            search_activity_timeline,
-            search_activity_timeline_filtered,
-            get_activity_timeline_range,
-            get_activity_timeline_entry,
-            get_activity_timeline_for_task_run,
-            delete_activity_timeline_entry,
-            get_activity_timeline_stats,
-            get_scripted_output_stats,
-            get_oneshot_stats,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    delete_activity_timeline_entry,
+    get_activity_timeline_entry,
+    get_activity_timeline_for_task_run,
+    get_activity_timeline_range,
+    get_activity_timeline_stats,
+    get_scripted_output_stats,
+    get_oneshot_stats,
+    insert_activity_entry,
+    search_activity_timeline,
+    search_activity_timeline_filtered,
+);

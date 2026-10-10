@@ -18,8 +18,6 @@ use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -2392,34 +2390,6 @@ pub async fn list_wsv_disagreements(
         .await
 }
 
-/// Tauri plugin exposing all AI-settings commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_ai_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_ai_settings,
-            save_ai_settings,
-            save_gemini_settings,
-            save_ai_api_key_command,
-            delete_ai_api_key_command,
-            has_ai_api_key,
-            test_ai_connection,
-            check_claude_cli_auth,
-            check_accounts_usage,
-            get_claude_accounts,
-            switch_claude_account,
-            refresh_claude_cli_auth,
-            get_agentic_settings,
-            save_agentic_settings,
-            get_wsv_settings,
-            save_wsv_settings,
-            test_wsv_connection,
-            list_wsv_disagreements,
-            get_provider_circuit_states,
-            reset_provider_circuit,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod exhaustion_tests {
     use super::*;
@@ -2484,3 +2454,29 @@ mod exhaustion_tests {
         assert!(probe_result_exhausted(&usage(0.50, Some("BLOCKED"), None)));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    check_accounts_usage,
+    check_claude_cli_auth,
+    delete_ai_api_key_command,
+    get_agentic_settings,
+    get_ai_settings,
+    get_claude_accounts,
+    get_provider_circuit_states,
+    get_wsv_settings,
+    has_ai_api_key,
+    list_wsv_disagreements,
+    refresh_claude_cli_auth,
+    reset_provider_circuit,
+    save_agentic_settings,
+    save_ai_api_key_command,
+    save_ai_settings,
+    save_gemini_settings,
+    save_wsv_settings,
+    switch_claude_account,
+    test_ai_connection,
+    test_wsv_connection,
+);

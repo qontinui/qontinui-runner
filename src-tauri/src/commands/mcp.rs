@@ -16,8 +16,6 @@ use crate::mcp_client::{
     McpToolInfo, UpdateMcpServerInput,
 };
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -337,26 +335,6 @@ pub async fn get_task_run_mcp_calls(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_mcp")
-        .invoke_handler(tauri::generate_handler![
-            list_mcp_servers,
-            get_mcp_server,
-            create_mcp_server,
-            update_mcp_server,
-            delete_mcp_server,
-            connect_mcp_server,
-            disconnect_mcp_server,
-            get_mcp_servers_status,
-            get_mcp_server_status,
-            list_mcp_server_tools,
-            call_mcp_tool,
-            get_task_run_mcp_calls,
-        ])
-        .build()
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -381,3 +359,21 @@ mod tests {
         assert_eq!(response.error, Some("error".to_string()));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    call_mcp_tool,
+    connect_mcp_server,
+    create_mcp_server,
+    delete_mcp_server,
+    disconnect_mcp_server,
+    get_mcp_server,
+    get_mcp_server_status,
+    get_mcp_servers_status,
+    get_task_run_mcp_calls,
+    list_mcp_server_tools,
+    list_mcp_servers,
+    update_mcp_server,
+);

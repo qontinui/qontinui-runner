@@ -11,8 +11,6 @@ use crate::commands::compartments::{BridgeCompartment, StorageCompartment};
 use crate::error::AppError;
 use crate::executor::{require_running_bridge_compartment, with_default_bridge_compartment};
 use crate::safe_eprintln;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -266,17 +264,15 @@ pub async fn clear_action_log(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_state_machine")
-        .invoke_handler(tauri::generate_handler![
-            execute_transition,
-            navigate_to_state,
-            navigate_to_multiple_states,
-            get_active_states,
-            get_available_transitions,
-            get_action_log_view,
-            clear_action_log,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    clear_action_log,
+    execute_transition,
+    get_action_log_view,
+    get_active_states,
+    get_available_transitions,
+    navigate_to_multiple_states,
+    navigate_to_state,
+);

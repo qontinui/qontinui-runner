@@ -10,8 +10,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json;
 use std::fs;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -389,19 +387,17 @@ fn load_findings_data_impl() -> Result<String, AppError> {
     Ok(data)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_storage")
-        .invoke_handler(tauri::generate_handler![
-            save_screenshot_to_disk,
-            save_video_to_disk,
-            get_local_storage_usage,
-            delete_old_sessions,
-            clear_all_storage,
-            get_storage_paths,
-            read_image_as_base64,
-            save_findings_data,
-            load_findings_data,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    clear_all_storage,
+    delete_old_sessions,
+    get_local_storage_usage,
+    get_storage_paths,
+    load_findings_data,
+    read_image_as_base64,
+    save_findings_data,
+    save_screenshot_to_disk,
+    save_video_to_disk,
+);

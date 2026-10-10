@@ -11,8 +11,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -1378,20 +1376,6 @@ pub async fn generate_workflow_standalone(
     }
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_transcript")
-        .invoke_handler(tauri::generate_handler![
-            transcript_list_sessions,
-            transcript_read_session,
-            transcript_read_user_prompts,
-            transcript_get_latest,
-            transcript_session_digests,
-            transcript_find_external_processes,
-            generate_workflow_standalone,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2113,3 +2097,16 @@ mod tests {
         );
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    generate_workflow_standalone,
+    transcript_find_external_processes,
+    transcript_get_latest,
+    transcript_list_sessions,
+    transcript_read_session,
+    transcript_read_user_prompts,
+    transcript_session_digests,
+);

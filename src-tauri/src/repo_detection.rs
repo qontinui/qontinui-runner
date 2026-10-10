@@ -170,3 +170,8 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
     serde_json::from_str::<serde_json::Value>(&body_text)
         .map_err(|e| format!("parse register body: {e} (raw: {body_text})"))
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(register_repo_with_coord, tenant_for_repo,);

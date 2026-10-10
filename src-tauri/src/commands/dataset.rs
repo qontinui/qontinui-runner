@@ -13,8 +13,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 use zip::ZipArchive;
@@ -524,11 +522,7 @@ pub fn package_dataset(
     package_dataset_impl(config, &state).map_err(String::from)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_dataset")
-        .invoke_handler(tauri::generate_handler![scan_local_images, package_dataset,])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(package_dataset, scan_local_images,);

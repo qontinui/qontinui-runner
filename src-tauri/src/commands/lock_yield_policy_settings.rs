@@ -7,8 +7,6 @@
 use crate::error::AppError;
 use crate::settings::{self, LockYieldPolicySettings};
 use anyhow::Result;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -69,16 +67,10 @@ pub fn save_lock_yield_policy_settings(
         .map_err(String::from)
 }
 
-/// Tauri plugin exposing the lock-yield-policy settings commands.
-///
-/// Left in place for parity with the rest of `commands/*_settings.rs`;
-/// the runtime registration goes through main.rs's central
-/// `generate_handler!`.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_lock_yield_policy_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_lock_yield_policy_settings,
-            save_lock_yield_policy_settings,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_lock_yield_policy_settings,
+    save_lock_yield_policy_settings,
+);

@@ -11,8 +11,6 @@ use crate::config::{ConfigLoader, QontinuiConfig};
 use crate::error::AppError;
 use crate::executor::file_logger;
 use crate::settings;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 
@@ -620,27 +618,26 @@ pub fn build_ai_launch_command(
     })
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_config")
-        .invoke_handler(tauri::generate_handler![
-            load_configuration,
-            get_current_configuration,
-            get_last_config_path,
-            save_last_workflow_id,
-            save_last_monitor_index,
-            save_last_monitor_indices,
-            get_auto_load_last_config,
-            save_auto_load_last_config,
-            get_include_summary_step_by_default,
-            save_include_summary_step_by_default,
-            get_workspace_paths,
-            get_claude_config_dirs,
-            save_claude_config_dirs,
-            get_claude_account_launch_commands,
-            save_claude_account_launch_commands,
-            get_claude_default_launch_command,
-            save_claude_default_launch_command,
-            build_ai_launch_command,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    build_ai_launch_command,
+    get_auto_load_last_config,
+    get_claude_account_launch_commands,
+    get_claude_config_dirs,
+    get_claude_default_launch_command,
+    get_current_configuration,
+    get_include_summary_step_by_default,
+    get_last_config_path,
+    get_workspace_paths,
+    load_configuration,
+    save_auto_load_last_config,
+    save_claude_account_launch_commands,
+    save_claude_config_dirs,
+    save_claude_default_launch_command,
+    save_include_summary_step_by_default,
+    save_last_monitor_index,
+    save_last_monitor_indices,
+    save_last_workflow_id,
+);

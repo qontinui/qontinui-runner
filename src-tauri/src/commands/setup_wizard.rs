@@ -1995,3 +1995,24 @@ mod tests {
         );
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    check_setup_completed,
+    complete_setup,
+    detect_project_framework_for_setup,
+    discover_claude_config_dirs,
+    github_clone_repo,
+    github_connect_url,
+    github_list_repos,
+    save_ai_provider_from_setup,
+    save_dev_services_from_setup,
+    save_log_sources_from_setup,
+    scan_workspace_for_setup,
+    suggest_dev_services_for_setup,
+    suggest_log_sources_for_setup,
+    suggest_process_configs_for_setup,
+    suggest_workspace_sources_for_setup,
+);

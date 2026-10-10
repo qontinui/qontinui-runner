@@ -19,8 +19,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -365,9 +363,7 @@ pub async fn scan_spec_drift(app_id: String, project_root: String) -> Result<Dri
     Ok(report)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_spec_drift")
-        .invoke_handler(tauri::generate_handler![scan_spec_drift,])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(scan_spec_drift,);

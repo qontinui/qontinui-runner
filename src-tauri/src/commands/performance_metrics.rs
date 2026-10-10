@@ -13,8 +13,6 @@
 use crate::commands::compartments::StorageCompartment;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 // =============================================================================
@@ -378,18 +376,6 @@ fn calculate_percentiles(durations: &[u64]) -> (u64, u64, u64) {
     (p50, p95, p99)
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_performance_metrics")
-        .invoke_handler(tauri::generate_handler![
-            get_performance_dashboard,
-            get_action_performance,
-            get_transition_reliability,
-            get_element_resolution_metrics,
-            get_success_rate_trend,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,3 +424,14 @@ mod tests {
         assert!(TimeRange::AllTime.cutoff().is_none());
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_action_performance,
+    get_element_resolution_metrics,
+    get_performance_dashboard,
+    get_success_rate_trend,
+    get_transition_reliability,
+);

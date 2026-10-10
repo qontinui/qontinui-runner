@@ -19,8 +19,6 @@ use crate::str_utils::truncate_str;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{info, warn};
 
 // ============================================================================
@@ -597,16 +595,15 @@ pub fn get_latest_plan_content() -> Result<CommandResponse, String> {
     })
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_terminal_analysis")
-        .invoke_handler(tauri::generate_handler![
-            analyze_session_summary,
-            analyze_architecture,
-            analyze_change_impact,
-            analyze_plan_progress,
-            analyze_cross_tab,
-            analyze_page_architecture,
-            get_latest_plan_content,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    analyze_architecture,
+    analyze_change_impact,
+    analyze_cross_tab,
+    analyze_page_architecture,
+    analyze_plan_progress,
+    analyze_session_summary,
+    get_latest_plan_content,
+);

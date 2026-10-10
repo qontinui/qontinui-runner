@@ -35,8 +35,6 @@
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{info, warn};
 
 use crate::settings::{self, SavedProject};
@@ -887,18 +885,6 @@ pub fn set_project_terminal_page(id: String, page_id: Option<String>) -> Result<
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_saved_projects")
-        .invoke_handler(tauri::generate_handler![
-            list_saved_projects,
-            save_saved_projects,
-            add_saved_project,
-            remove_saved_project,
-        ])
-        .build()
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1432,3 +1418,20 @@ mod tests {
         assert!(!projects[0].id.is_empty());
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    add_saved_project,
+    bind_project_processes,
+    discover_projects,
+    list_saved_projects,
+    project_snapshot,
+    remove_saved_project,
+    save_saved_projects,
+    set_project_front_page,
+    autoconfigure_project,
+    set_project_pinned,
+    set_project_terminal_page,
+);

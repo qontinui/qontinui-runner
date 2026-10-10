@@ -1206,3 +1206,16 @@ mod tests {
         );
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    assign_session_to_window,
+    close_empty_terminal_windows,
+    close_terminal_window,
+    focus_runner_window,
+    get_window_assignments,
+    list_runner_windows,
+    open_terminal_window,
+);

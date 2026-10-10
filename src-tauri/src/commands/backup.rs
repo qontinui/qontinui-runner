@@ -10,8 +10,6 @@ use crate::database::pg::{parse_workflow_id, PgDb};
 use crate::database::ImportResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -833,13 +831,12 @@ pub async fn import_all_data_impl(
     })
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_backup")
-        .invoke_handler(tauri::generate_handler![
-            get_export_summary,
-            export_all_data,
-            get_import_preview,
-            import_all_data,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    export_all_data,
+    get_export_summary,
+    get_import_preview,
+    import_all_data,
+);

@@ -15,8 +15,6 @@ use crate::config_facade::{keychain_keys, playwright_keychain};
 use crate::error::AppError;
 use crate::settings::{self, PlaywrightSettings};
 use anyhow::Result;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -191,14 +189,12 @@ pub fn get_playwright_test_password_internal() -> Option<String> {
     settings::get_playwright_settings().test_password
 }
 
-/// Tauri plugin exposing all Playwright settings commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_playwright_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_playwright_settings,
-            save_playwright_settings,
-            has_playwright_test_password,
-            delete_playwright_test_password,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    delete_playwright_test_password,
+    get_playwright_settings,
+    has_playwright_test_password,
+    save_playwright_settings,
+);

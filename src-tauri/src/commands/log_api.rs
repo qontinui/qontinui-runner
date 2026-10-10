@@ -400,3 +400,18 @@ pub async fn clear_log_api_store(
         data: None,
     })
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    clear_log_api_store,
+    sync_action_logs,
+    sync_ai_output_logs,
+    sync_all_logs,
+    sync_general_logs,
+    sync_image_logs,
+    sync_issues,
+    sync_project_logs,
+    sync_rag_logs,
+);

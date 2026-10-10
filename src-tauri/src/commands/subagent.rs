@@ -17,3 +17,8 @@ pub async fn analyze_with_subagent(request: SubagentAnalysisRequest) -> Result<S
         .map_err(|e| format!("subagent task join error: {}", e))?
         .map_err(|e| e.to_string())
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(analyze_with_subagent,);

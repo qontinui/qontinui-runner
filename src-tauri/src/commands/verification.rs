@@ -6,8 +6,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use super::CommandResponse;
@@ -257,14 +255,12 @@ pub fn update_verification_status(status: String) -> CommandResponse {
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_verification")
-        .invoke_handler(tauri::generate_handler![
-            save_pending_verification,
-            load_pending_verification,
-            clear_pending_verification,
-            update_verification_status,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    clear_pending_verification,
+    load_pending_verification,
+    save_pending_verification,
+    update_verification_status,
+);

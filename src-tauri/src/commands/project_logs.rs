@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::error::AppError;
@@ -740,18 +738,16 @@ pub fn append_project_log(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_project_logs")
-        .invoke_handler(tauri::generate_handler![
-            get_project_log_config,
-            save_project_log_config,
-            list_project_configs,
-            delete_project_config,
-            read_log_source,
-            read_project_logs,
-            get_project_directories,
-            append_project_log,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    append_project_log,
+    delete_project_config,
+    get_project_directories,
+    get_project_log_config,
+    list_project_configs,
+    read_log_source,
+    read_project_logs,
+    save_project_log_config,
+);

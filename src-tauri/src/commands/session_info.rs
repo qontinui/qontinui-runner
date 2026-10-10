@@ -2284,3 +2284,8 @@ mod tests {
         assert_eq!(dv["prs"]["reason"], serde_json::json!("db_error"));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(session_info_get,);

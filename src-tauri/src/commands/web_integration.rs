@@ -22,7 +22,6 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tracing::{debug, info, warn};
 
@@ -973,19 +972,6 @@ pub async fn redeem_pair_code(
     })
 }
 
-/// Tauri plugin exposing all web-integration commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_web_integration")
-        .invoke_handler(tauri::generate_handler![
-            get_web_integration_status,
-            get_settings_health,
-            save_web_integration_settings,
-            test_web_integration_connection,
-            redeem_pair_code,
-        ])
-        .build()
-}
-
 // ---------------------------------------------------------------------------
 // Regression tests — IPC wire contract (Phase 3H)
 // ---------------------------------------------------------------------------
@@ -1250,3 +1236,14 @@ mod ipc_wire_contract_tests {
         assert!(me.ends_with("/api/v1/devices/me"));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_settings_health,
+    get_web_integration_status,
+    redeem_pair_code,
+    save_web_integration_settings,
+    test_web_integration_connection,
+);

@@ -7,8 +7,6 @@
 
 use crate::database::DatabaseStats;
 use crate::error::AppError;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -145,15 +143,7 @@ pub async fn explain_query_plan(
         .map_err(String::from)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_database")
-        .invoke_handler(tauri::generate_handler![
-            optimize_database,
-            get_database_stats,
-            explain_query_plan,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(explain_query_plan, get_database_stats, optimize_database,);

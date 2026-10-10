@@ -7,8 +7,6 @@
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 /// Information about a single screenshot file
@@ -142,13 +140,6 @@ pub async fn list_screenshots() -> ScreenshotsResponse {
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_screenshots")
-        .invoke_handler(tauri::generate_handler![list_screenshots,])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,3 +164,8 @@ mod tests {
         assert_eq!(response.error, Some("Test error".to_string()));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(list_screenshots,);

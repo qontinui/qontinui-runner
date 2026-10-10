@@ -13,8 +13,6 @@
 use crate::error::AppError;
 use crate::otel::OtelConfig;
 use crate::settings;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -70,12 +68,7 @@ pub fn update_otel_settings(config: OtelConfig) -> Result<CommandResponse, Strin
     update_otel_settings_impl(config).map_err(String::from)
 }
 
-/// Tauri plugin exposing all OpenTelemetry settings commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_otel_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_otel_settings,
-            update_otel_settings,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(get_otel_settings, update_otel_settings,);

@@ -144,3 +144,8 @@ pub async fn devenv_install_cli_path() -> Result<CommandResponse, String> {
         ),
     })
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(devenv_enroll, devenv_enroll_status, devenv_install_cli_path,);

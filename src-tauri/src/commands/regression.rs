@@ -10,8 +10,6 @@
 //! (not Clorinde) until the alembic chain catches up with the
 //! `regression_*` tables and `schema.pg.sql.generated` can be regenerated.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 use uuid::Uuid;
@@ -187,23 +185,17 @@ pub async fn list_regression_runs_for_suite(
         .await
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// The runner currently uses the central `tauri::generate_handler![...]`
-/// in `main.rs` for command registration, but the module-plugin scaffolding
-/// is kept consistent with the rest of `commands/*` for future migration.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_regression")
-        .invoke_handler(tauri::generate_handler![
-            save_regression_suite,
-            record_regression_run,
-            record_regression_diagnosis,
-            record_assertion_executions_batch,
-            query_assertion_executions_for_suite,
-            get_recent_diagnoses_for_suite,
-            list_regression_suites,
-            get_regression_suite_by_id,
-            list_regression_runs_for_suite,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_recent_diagnoses_for_suite,
+    get_regression_suite_by_id,
+    list_regression_runs_for_suite,
+    list_regression_suites,
+    query_assertion_executions_for_suite,
+    record_assertion_executions_batch,
+    record_regression_diagnosis,
+    record_regression_run,
+    save_regression_suite,
+);

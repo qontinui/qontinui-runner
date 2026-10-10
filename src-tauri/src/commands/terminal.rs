@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Manager;
 use tracing::{debug, info, warn};
 
@@ -2849,42 +2848,6 @@ async fn poll_and_verify_pinned_session<F>(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// Non-generic because handlers accept concrete `tauri::AppHandle`.
-pub fn plugin() -> TauriPlugin<tauri::Wry> {
-    PluginBuilder::<tauri::Wry>::new("qontinui_terminal")
-        .invoke_handler(tauri::generate_handler![
-            terminal_create,
-            terminal_write,
-            terminal_resize,
-            terminal_set_title,
-            terminal_close,
-            terminal_list,
-            terminal_ack,
-            terminal_flow_reset,
-            terminal_save_scrollback,
-            terminal_get_saved_scrollback,
-            terminal_cleanup_scrollback,
-            terminal_collect_session_metadata,
-            terminal_get_bracketed_paste,
-            terminal_get_grid,
-            terminal_grid_text,
-            terminal_grid_search,
-            terminal_grid_diff,
-            terminal_session_record_open,
-            terminal_session_record_close,
-            terminal_session_list_open,
-            terminal_session_list_history,
-            terminal_session_mark_restore_pending,
-            terminal_session_clear_restore_pending,
-            terminal_session_rebind_terminal,
-            terminal_report_tree_reset,
-            terminal_report_bridge_registration_failure,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3636,3 +3599,41 @@ mod tests {
         );
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    terminal_ack,
+    terminal_cleanup_scrollback,
+    terminal_close,
+    terminal_collect_session_metadata,
+    terminal_create,
+    terminal_flow_reset,
+    terminal_get_bracketed_paste,
+    terminal_probe_claude,
+    terminal_get_grid,
+    terminal_get_saved_scrollback,
+    terminal_get_scrollback,
+    terminal_grid_diff,
+    terminal_grid_search,
+    terminal_grid_text,
+    terminal_list,
+    terminal_migrate_session_account,
+    terminal_report_tree_reset,
+    terminal_report_bridge_registration_failure,
+    terminal_resize,
+    terminal_save_scrollback,
+    terminal_session_clear_restore_pending,
+    terminal_claude_session_list_live,
+    terminal_session_list_history,
+    terminal_session_list_open,
+    terminal_session_mark_restore_pending,
+    terminal_session_record_close,
+    terminal_session_set_finished,
+    terminal_session_record_open,
+    terminal_session_rebind_terminal,
+    terminal_set_title,
+    terminal_set_visibility,
+    terminal_write,
+);

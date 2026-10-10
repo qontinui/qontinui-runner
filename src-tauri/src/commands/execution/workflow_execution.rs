@@ -565,3 +565,15 @@ pub fn get_workflow_required_screens(
         })),
     })
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_resolved_initial_states,
+    get_workflow_required_screens,
+    pause_execution,
+    resume_execution,
+    start_execution,
+    stop_execution,
+);

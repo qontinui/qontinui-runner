@@ -36,3 +36,8 @@ pub fn coord_doctor_run() -> DoctorReport {
 pub fn coord_doctor_text() -> String {
     coord_doctor_run().render()
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(coord_doctor_run, coord_doctor_text,);

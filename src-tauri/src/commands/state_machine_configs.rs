@@ -3,8 +3,6 @@
 //! These commands allow the runner frontend to create, read, update, and delete
 //! state machine configurations (configs, states, transitions) stored in PostgreSQL.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -350,32 +348,30 @@ process.stdout.write(emitPersistedStateMachineJSON(result.states, result.transit
     Ok(json)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_state_machine_configs")
-        .invoke_handler(tauri::generate_handler![
-            sm_list_configs,
-            sm_get_config,
-            sm_create_config,
-            sm_update_config,
-            sm_delete_config,
-            sm_create_state,
-            sm_update_state,
-            sm_delete_state,
-            sm_create_transition,
-            sm_update_transition,
-            sm_delete_transition,
-            sm_import_config,
-            sm_save_thumbnails,
-            sm_get_thumbnails,
-            sm_save_capture_screenshots,
-            sm_get_capture_screenshots,
-            sm_get_capture_screenshot_image,
-            sm_move_pending_screenshots,
-            sm_delete_capture_screenshots,
-            sm_backfill_capture_screenshot_dimensions,
-            sm_audit_capture_screenshot_bounds,
-            sm_generate_static,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    sm_audit_capture_screenshot_bounds,
+    sm_backfill_capture_screenshot_dimensions,
+    sm_create_config,
+    sm_create_state,
+    sm_create_transition,
+    sm_delete_capture_screenshots,
+    sm_delete_config,
+    sm_delete_state,
+    sm_delete_transition,
+    sm_generate_static,
+    sm_get_capture_screenshot_image,
+    sm_get_capture_screenshots,
+    sm_get_config,
+    sm_get_thumbnails,
+    sm_import_config,
+    sm_list_configs,
+    sm_move_pending_screenshots,
+    sm_save_capture_screenshots,
+    sm_save_thumbnails,
+    sm_update_config,
+    sm_update_state,
+    sm_update_transition,
+);

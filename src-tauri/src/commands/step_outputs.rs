@@ -8,8 +8,6 @@
 use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -934,12 +932,7 @@ fn parse_console_output(console_output: &Option<String>) -> Option<Vec<serde_jso
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_step_outputs")
-        .invoke_handler(tauri::generate_handler![
-            collect_step_outputs,
-            get_step_outputs_for_test_builder,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(collect_step_outputs, get_step_outputs_for_test_builder,);

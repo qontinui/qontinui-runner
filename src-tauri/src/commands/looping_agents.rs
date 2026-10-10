@@ -7,10 +7,9 @@
 //! declared in `main.rs` (NOT `lib.rs`) and is therefore invisible to
 //! `cargo test --lib`; keeping logic out of here keeps it tested.
 //!
-//! Registered directly in main.rs's `generate_handler![...]` list (NOT the
-//! plugin pattern — a `plugin()` fn that main.rs never calls ships commands
-//! that silently don't exist; that exact failure shipped the DOA clone
-//! picker).
+//! Registered by this module's `crate::ipc_group!(...)` list (see
+//! `crate::ipc_registry`) — NOT a Tauri plugin, whose commands the frontend's
+//! bare `invoke(...)` cannot reach.
 
 use std::sync::Arc;
 
@@ -73,3 +72,12 @@ pub fn looping_agent_set_enabled(
     );
     Ok(status_snapshot(&app, &rec))
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    looping_agents_list,
+    looping_agent_status,
+    looping_agent_set_enabled,
+);

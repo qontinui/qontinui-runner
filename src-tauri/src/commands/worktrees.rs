@@ -259,3 +259,8 @@ async fn attribute_files_to_sessions_pg(
 
     sessions
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(merge_worktree, merge_worktree_force,);

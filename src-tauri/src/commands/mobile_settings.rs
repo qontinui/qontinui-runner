@@ -13,8 +13,6 @@
 
 use crate::error::AppError;
 use crate::settings::{self, MobileSettings};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -95,12 +93,7 @@ pub fn save_mobile_settings(
     .map_err(String::from)
 }
 
-/// Tauri plugin exposing all mobile settings commands.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_mobile_settings")
-        .invoke_handler(tauri::generate_handler![
-            get_mobile_settings,
-            save_mobile_settings,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(get_mobile_settings, save_mobile_settings,);

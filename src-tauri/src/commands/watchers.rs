@@ -3,8 +3,6 @@
 //! CRUD operations for watcher definitions. Each watcher queries the activity
 //! timeline on a schedule, reasons with AI, and triggers an action.
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -77,16 +75,14 @@ pub async fn set_watcher_enabled(
     Ok(updated)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_watchers")
-        .invoke_handler(tauri::generate_handler![
-            create_watcher,
-            get_watcher,
-            list_watchers,
-            update_watcher,
-            delete_watcher,
-            set_watcher_enabled,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    create_watcher,
+    delete_watcher,
+    get_watcher,
+    list_watchers,
+    set_watcher_enabled,
+    update_watcher,
+);

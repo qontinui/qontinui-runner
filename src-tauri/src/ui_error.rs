@@ -80,8 +80,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tokio::sync::RwLock;
 
 /// A single unhandled frontend error.
@@ -1557,16 +1555,10 @@ pub async fn get_ui_error(
     Ok(app_state.ui_error.get().await)
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_ui_error")
-        .invoke_handler(tauri::generate_handler![
-            report_ui_error,
-            clear_ui_error,
-            get_ui_error,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(clear_ui_error, get_ui_error, report_ui_error,);
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2178,8 +2170,8 @@ mod tests {
     /// The anchor must be a whole identifier, so `has_ui_error`,
     /// `ui_error_snapshot` and `gather_ui_error_signals` are not matches. The
     /// only exemption is `ui_error::report_ui_error` / `ui_error::clear_ui_error`
-    /// — the FRONTEND's own `#[tauri::command]`s, named once in `main.rs`'s
-    /// `invoke_handler` list. Those are the sanctioned writer, not a bypass.
+    /// — the FRONTEND's own `#[tauri::command]`s, registered once in this
+    /// module's `ipc_group!` list. Those are the sanctioned writer, not a bypass.
     #[expect(
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"

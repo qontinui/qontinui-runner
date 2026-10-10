@@ -22,3 +22,8 @@ pub async fn doctor_get_status(
         None => Ok(vec![]), // Doctor not started yet
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(doctor_get_status,);

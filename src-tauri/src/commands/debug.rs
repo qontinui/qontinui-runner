@@ -7,8 +7,7 @@
 
 use crate::settings;
 use serde_json;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::{Runtime, State};
+use tauri::State;
 use tracing::{error, info};
 
 use super::compartments::BridgeCompartment;
@@ -103,14 +102,7 @@ pub async fn set_debug_settings(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_debug")
-        .invoke_handler(tauri::generate_handler![
-            get_debug_settings,
-            set_debug_settings,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(get_debug_settings, set_debug_settings,);

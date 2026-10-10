@@ -55,3 +55,12 @@ pub fn get_helper_answers() -> Result<CommandResponse, String> {
         ),
     })
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_helper_answers,
+    get_helper_tasks_settings,
+    save_helper_tasks_settings,
+);

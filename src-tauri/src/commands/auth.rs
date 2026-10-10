@@ -29,8 +29,6 @@ use crate::error::AppError;
 use crate::mcp::device_jwt_refresher::{refresh_cognito_bearer, RefreshClass};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -1872,35 +1870,6 @@ pub async fn get_binding_gap_asks() -> Option<Vec<serde_json::Value>> {
     .flatten()
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_auth")
-        .invoke_handler(tauri::generate_handler![
-            logout,
-            check_auth_status,
-            get_device_info,
-            get_user_projects,
-            get_access_token_for_websocket,
-            is_api_ready,
-            get_api_port,
-            get_runner_tier,
-            set_runner_tier,
-            cognito_sign_in,
-            cognito_sign_in_password,
-            qontinui_sign_out,
-            sign_out_full,
-            reset_credential_store,
-            device_jwt_present,
-            get_coord_device_token,
-            kick_device_jwt_refresher_cmd,
-            get_coord_credential_posture,
-            get_binding_gap_asks,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2518,3 +2487,29 @@ mod device_token_door_tests {
         assert_eq!(parse_device_token_tenant(Some(&t.to_string())), Ok(Some(t)));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    check_auth_status,
+    device_jwt_present,
+    get_access_token_for_websocket,
+    get_coord_device_token,
+    get_api_port,
+    get_device_info,
+    get_user_projects,
+    is_api_ready,
+    get_runner_tier,
+    kick_device_jwt_refresher_cmd,
+    get_coord_credential_posture,
+    get_binding_gap_asks,
+    logout,
+    qontinui_sign_out,
+    reset_credential_store,
+    sign_out_full,
+    set_runner_tier,
+    promote_runner_tier_to_account,
+    cognito_sign_in,
+    cognito_sign_in_password,
+);

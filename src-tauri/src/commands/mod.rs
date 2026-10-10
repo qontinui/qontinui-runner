@@ -28,61 +28,20 @@
 //!
 //! # Handler registration
 //!
-//! Modules are transitioning to Tauri plugin self-registration. Two patterns
-//! coexist:
+//! Every module that defines `#[tauri::command]` fns registers them with ONE
+//! `crate::ipc_group!(...)` invocation (conventionally at the bottom of the
+//! file) listing the bare fn names. `crate::ipc_registry` routes each invoke
+//! by name to the owning module's generated handler, so adding a command is a
+//! one-file edit; a module's FIRST command also needs its entry in
+//! `ipc_registry::GROUPS`. `tests/tauri_commands_are_registered.rs` fails for
+//! a command no `ipc_group!` lists, a group missing from `GROUPS`, and a name
+//! registered twice (plan `2026-10-02-split-run-app-invoke-handler`).
 //!
-//! **Plugin pattern (preferred)** — module exposes `pub fn plugin<R: Runtime>()
-//! -> TauriPlugin<R>` holding its own `tauri::generate_handler![...]`. main.rs
-//! adds one `.plugin(commands::foo::plugin())` call. Adding a command to a
-//! migrated module is a single-file edit.
-//!
-//! **Central pattern (legacy)** — handlers listed in main.rs's central
-//! `tauri::generate_handler![...]`. Requires editing main.rs for every new
-//! command; tracked for migration.
-//!
-//! Migrated modules: clipboard, debug, dev_findings, file_browser,
-//! window_manager, checks, checkpoints, comparison, container_settings,
-//! dag_workflows, database, dataset, discoveries, event_search, findings,
-//! hooks, issues, known_issues, playwright_settings, self_healing_settings,
-//! execution_variables, mobile_settings, otel_settings, security_settings,
-//! ai_settings, accessibility, web_integration, activity_timeline,
-//! agentic_metrics, ai_data, cost_dashboard, learning, performance_metrics,
-//! recap, terminal_analysis, token_analytics, transcript, adaptive_learning,
-//! ai_generation, ai_session, backup, checkpoint_browser, config, context,
-//! library_sync, logging, meta_optimizer, rag, auth, state_machine,
-//! websocket, video, interaction, storage, extraction, screenshot,
-//! screenshots, script_emitter, verification, project_logs,
-//! global_log_sources, execution_reporting, workflow_events,
-//! state_machine_configs, spec_drift, ui_bridge_baselines, state_explorer,
-//! tiered_info, task_sync, step_outputs, testing, shell_commands, mcp,
-//! mobile, setup_wizard, saved_projects, test_orchestrator,
-//! orchestration_loop_configs, scripted_output_settings, watchers,
-//! durable_execution, flow, ui_bridge, terminal, instances, execution
-//! (as of this commit).
-//!
-//! All `commands/*` modules are now migrated to the plugin pattern. So are
-//! the subsystem command modules living outside `commands/`: `error_monitor`,
-//! `doctor`, `mcp::backend_relay`, `process_capture`, `orchestration_loop`,
-//! `spec_experimentation`, plus the module-level handlers in `ui_error.rs`
-//! and `crash_dumps.rs`. main.rs no longer holds a central
-//! `tauri::generate_handler![...]` — every command self-registers through
-//! its owning module's `plugin()` fn.
-//!
-//! Note: ai_session, meta_optimizer, rag, flow, ui_bridge, terminal, and
-//! execution use a non-generic `plugin() -> TauriPlugin<tauri::Wry>` because
-//! they accept concrete `tauri::AppHandle` parameters in some commands.
-//! Modules without `AppHandle` parameters use the generic
-//! `plugin<R: Runtime>() -> TauriPlugin<R>` form.
-//!
-//! To migrate a module `foo.rs`:
-//! 1. Add `use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};` and
-//!    `use tauri::Runtime;` at the top.
-//! 2. Add `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` at the bottom that
-//!    returns `PluginBuilder::new("qontinui_foo").invoke_handler(...).build()`.
-//! 3. In `main.rs`, remove the module's entries from the central
-//!    `generate_handler!` list and add `.plugin(commands::foo::plugin())`
-//!    right after the existing per-module plugin block.
-//! 4. Plugin name convention: `qontinui_<module_name>` (lowercase snake_case).
+//! Do NOT register app commands through a Tauri plugin: plugin commands are
+//! invokable only as `plugin:<name>|<cmd>`, the frontend invokes bare names,
+//! and the per-module plugin split was reverted at `1f1d807f6` for exactly
+//! that ("Command not found"). `#[tauri::command(rename = ...)]` is refused
+//! too — `ipc_group!` routes by the fn name.
 //!
 //! # Migrating a module to a compartment (Workstream C)
 //!

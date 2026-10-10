@@ -425,3 +425,8 @@ mod overlap_tests {
         server.abort();
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(list_overlapping_intents, resolve_escalation,);

@@ -16,8 +16,6 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -462,14 +460,12 @@ pub fn capture_screenshot_via_python(
     })?
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_screenshot")
-        .invoke_handler(tauri::generate_handler![
-            get_screenshot_monitors,
-            capture_screenshot,
-            capture_and_upload_screenshot,
-            capture_screenshot_via_python,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    capture_and_upload_screenshot,
+    capture_screenshot,
+    capture_screenshot_via_python,
+    get_screenshot_monitors,
+);

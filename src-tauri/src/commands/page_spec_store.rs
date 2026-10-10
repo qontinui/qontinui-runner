@@ -128,3 +128,8 @@ pub async fn delete_page_spec<R: Runtime>(
     }
     Ok(())
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(delete_page_spec, load_user_specs, save_page_spec,);

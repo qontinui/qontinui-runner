@@ -350,3 +350,8 @@ mod tests {
         assert!(matches!(parsed.kind, ClaimKindDto::Phase));
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(claims_acquire, claims_release, claims_steal,);

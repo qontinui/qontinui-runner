@@ -3,7 +3,6 @@
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::CommandResponse;
 use crate::database::{CheckpointData, SessionEvent};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::{Emitter, State};
 
@@ -168,23 +167,19 @@ pub async fn settings_get_all(
     app_state.pg_db().get_all_settings().await
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-///
-/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_checkpoints")
-        .invoke_handler(tauri::generate_handler![
-            checkpoint_get,
-            checkpoint_save,
-            checkpoint_delete,
-            checkpoint_list_active,
-            checkpoint_status,
-            checkpoint_history,
-            session_create,
-            session_update_status,
-            setting_get,
-            setting_set,
-            settings_get_all,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    checkpoint_delete,
+    checkpoint_get,
+    checkpoint_history,
+    checkpoint_list_active,
+    checkpoint_save,
+    checkpoint_status,
+    session_create,
+    session_update_status,
+    setting_get,
+    setting_set,
+    settings_get_all,
+);

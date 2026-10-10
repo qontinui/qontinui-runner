@@ -8,8 +8,6 @@
 use crate::error::AppError;
 use crate::video_recorder::VideoRecordingConfig;
 use serde_json;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -128,13 +126,11 @@ fn get_video_recording_status_impl(
     })
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_video")
-        .invoke_handler(tauri::generate_handler![
-            start_video_recording,
-            stop_video_recording,
-            get_video_recording_status,
-        ])
-        .build()
-}
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(
+    get_video_recording_status,
+    start_video_recording,
+    stop_video_recording,
+);

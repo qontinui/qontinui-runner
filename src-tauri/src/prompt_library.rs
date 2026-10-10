@@ -896,3 +896,8 @@ Goal: {{goal}}
         assert!(list_documents(&serde_json::json!({})).is_empty());
     }
 }
+
+// Tauri commands this module owns — the ONLY registration site (see
+// `crate::ipc_registry`). A `#[tauri::command]` fn missing here is
+// unreachable from the frontend.
+crate::ipc_group!(list_prompt_templates,);
