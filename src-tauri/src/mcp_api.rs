@@ -3983,15 +3983,18 @@ fn resolve_event_lane_via_lifecycle(
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
     let tm = app.and_then(|a| a.try_state::<Arc<crate::terminal::TerminalManager>>());
-    event_lane_lifecycle_leg(&records, workdir, target_canon.as_deref(), |terminal_id| {
-        match tm.as_ref() {
+    event_lane_lifecycle_leg(
+        &records,
+        workdir,
+        target_canon.as_deref(),
+        |terminal_id| match tm.as_ref() {
             None => TerminalLaneProbe::NoManager,
             Some(tm) => match tm.get(terminal_id) {
                 None => TerminalLaneProbe::Gone,
                 Some(t) => TerminalLaneProbe::Live(t.coord_session_id()),
             },
-        }
-    })
+        },
+    )
 }
 
 /// The pure leg-3 decision for the event lane (unit-testable without a Tauri
@@ -4690,7 +4693,10 @@ fn select_lifecycle_candidate_censused(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     workdir: &str,
     target_canon: Option<&std::path::Path>,
-) -> (Result<LifecycleCandidate, LifecycleMiss>, LifecycleMissCensus) {
+) -> (
+    Result<LifecycleCandidate, LifecycleMiss>,
+    LifecycleMissCensus,
+) {
     let mut matched = 0usize;
     let mut admitted = 0usize;
     let mut candidates: Vec<LifecycleCandidate> = Vec::new();
@@ -15161,7 +15167,11 @@ mod self_id_chain_tests {
             TerminalLaneProbe::Live(Some(lane))
         });
         assert_eq!(got, Ok(lane));
-        assert_eq!(probed, vec!["T1".to_string()], "must probe the record's terminal");
+        assert_eq!(
+            probed,
+            vec!["T1".to_string()],
+            "must probe the record's terminal"
+        );
         // The lane is the TERMINAL's coord.sessions id, not the anchor (a
         // coord.agent_sessions id — the wrong id space for session_events).
         assert_ne!(got, Ok(uuid_of(ANCHOR_A)));
@@ -15207,9 +15217,7 @@ mod self_id_chain_tests {
     fn lifecycle_leg_reports_a_live_terminal_without_a_coord_session() {
         let records = [lane_rec(ANCHOR_A, "T1")];
         assert_eq!(
-            event_lane_lifecycle_leg(&records, "D:/repo", None, |_| TerminalLaneProbe::Live(
-                None
-            )),
+            event_lane_lifecycle_leg(&records, "D:/repo", None, |_| TerminalLaneProbe::Live(None)),
             Err(EventLaneMiss::LifecycleTerminalHasNoCoordSession)
         );
         assert_eq!(
