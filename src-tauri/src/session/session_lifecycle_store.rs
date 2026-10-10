@@ -4577,6 +4577,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         closed_at: None,
         close_reason: None,
         provider: DEFAULT_PROVIDER.to_string(),
+        lane: SessionLane::Pty,
         origin: None,
         restore_pending_at: None,
         confirmed_at: None,
