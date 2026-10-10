@@ -14,6 +14,7 @@
 use tracing::{debug, info, warn};
 
 use crate::ai_router::TaskContext;
+use crate::database::pg::token_usage::PhaseCost;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 
@@ -52,37 +53,6 @@ pub(super) fn record_phase_token_usage(
     output_tokens: Option<u64>,
     duration_ms: Option<u64>,
 ) {
-    record_phase_token_usage_with_target(
-        pg_db,
-        task_run_id,
-        phase,
-        stage_index,
-        iteration,
-        model_used,
-        provider_used,
-        input_tokens,
-        output_tokens,
-        duration_ms,
-        None,
-        None,
-    );
-}
-
-/// Record phase token usage with optional UI Bridge target app attribution.
-pub(super) fn record_phase_token_usage_with_target(
-    pg_db: &std::sync::Arc<PgDb>,
-    task_run_id: &str,
-    phase: &str,
-    stage_index: Option<u32>,
-    iteration: Option<u32>,
-    model_used: Option<&str>,
-    provider_used: Option<&str>,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    duration_ms: Option<u64>,
-    target_app: Option<&str>,
-    target_page_url: Option<&str>,
-) {
     record_phase_token_usage_with_cache(
         pg_db,
         task_run_id,
@@ -96,20 +66,60 @@ pub(super) fn record_phase_token_usage_with_target(
         duration_ms,
         None,
         None,
-        target_app,
-        target_page_url,
+        None,
+        None,
+        None,
     );
 }
 
-/// Record phase token usage including prompt cache metrics.
+/// Decide the cost triple a `phase_token_usage` row records.
 ///
-/// When `cache_creation_tokens` or `cache_read_tokens` are `Some`, the cost
-/// calculation uses `calculate_cost_cents_with_cache_or_estimate` for accurate
-/// pricing (cache writes at 1.25x, reads at 0.1x base input price).
+/// - A provider-REPORTED cost (Claude CLI `total_cost_usd`) wins: it is what
+///   the call was billed at, at full precision.
+/// - Otherwise the cost is ESTIMATED from the token counts against the
+///   cache-aware price table (cache writes 1.25x, reads 0.1x base input).
+///   For a model the catalog cannot price, `ai_pricing::pricing_or_fallback`
+///   borrows a same-family price and logs that it did — an announced
+///   estimate, never a fabricated zero. `cost_cents` is the whole-cent figure
+///   `calculate_cost_cents_with_cache_or_estimate` produces; `cost_microusd`
+///   carries the same estimate without the whole-cent rounding.
+/// - With no model or no token counts there is nothing to price: the row
+///   keeps `cost_cents = 0` and records NULL for both `cost_microusd` and
+///   `cost_source` — unknown, not "estimated at $0".
 ///
-/// The recorded figure is an ESTIMATE for any model the catalog cannot price —
-/// `ai_pricing::pricing_or_fallback` says so in the log, naming the model whose
-/// price was borrowed.
+/// A reported value that is negative or non-finite is not a cost; it falls
+/// through to the estimate.
+pub(super) fn resolve_phase_cost(
+    reported_cost_usd: Option<f64>,
+    model_used: Option<&str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+) -> PhaseCost {
+    if let Some(reported) = reported_cost_usd.filter(|c| c.is_finite() && *c >= 0.0) {
+        return PhaseCost::reported(reported);
+    }
+    match (model_used, input_tokens, output_tokens) {
+        (Some(model), Some(input), Some(output)) => {
+            PhaseCost::estimated(crate::ai_pricing::calculate_cost_usd_with_cache(
+                input,
+                output,
+                cache_creation_tokens,
+                cache_read_tokens,
+                model,
+            ))
+        }
+        _ => PhaseCost::cents_only(0),
+    }
+}
+
+/// Record phase token usage including prompt cache metrics and, when the
+/// provider reported one, its own cost figure.
+///
+/// The cost recorded is decided by [`resolve_phase_cost`]: the reported cost
+/// when present (`cost_source = 'reported'`), else a cache-aware price-table
+/// estimate (`'estimated'`), with the sub-cent value in `cost_microusd`.
 pub(super) fn record_phase_token_usage_with_cache(
     pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
@@ -123,6 +133,7 @@ pub(super) fn record_phase_token_usage_with_cache(
     duration_ms: Option<u64>,
     cache_creation_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
+    reported_cost_usd: Option<f64>,
     target_app: Option<&str>,
     target_page_url: Option<&str>,
 ) {
@@ -134,36 +145,22 @@ pub(super) fn record_phase_token_usage_with_cache(
     if input == 0 && output == 0 {
         return;
     }
-    // Cost estimation: use cache-aware pricing when cache tokens are present
-    let cost_cents = if let (Some(input_t), Some(output_t)) = (input_tokens, output_tokens) {
-        if let Some(model) = model_used {
-            // The `_or_estimate` variants, not the `Option` ones: `cost_cents`
-            // is non-nullable and `Commands::prior_consumption` reads this row
-            // back as a run's already-billed spend against
-            // `max_cost_per_run_usd`. `.unwrap_or(0)` on an unpriced model
-            // therefore did not merely under-report — it handed a resumed run a
-            // budget it had already spent. An announced estimate is the honest
-            // value here; zero never was.
-            if cache_creation > 0 || cache_read > 0 {
-                crate::ai_pricing::calculate_cost_cents_with_cache_or_estimate(
-                    input_t,
-                    output_t,
-                    cache_creation,
-                    cache_read,
-                    model,
-                ) as u64
-            } else {
-                crate::ai_pricing::calculate_cost_cents_or_estimate(input_t, output_t, model) as u64
-            }
-        } else {
-            0u64
-        }
-    } else {
-        0u64
-    };
+    // `cost_cents` is non-nullable and `Commands::prior_consumption` reads
+    // this row back as a run's already-billed spend against
+    // `max_cost_per_run_usd`, so an unpriced model must never coerce to `0` —
+    // `resolve_phase_cost` estimates (and announces it) instead.
+    let cost = resolve_phase_cost(
+        reported_cost_usd,
+        model_used,
+        input_tokens,
+        output_tokens,
+        cache_creation,
+        cache_read,
+    );
     info!(
-        "Recording phase token usage: task={}, phase={}, input={}, output={}, cache_create={}, cache_read={}{}",
+        "Recording phase token usage: task={}, phase={}, input={}, output={}, cache_create={}, cache_read={}, cost_cents={}, cost_microusd={:?}, cost_source={:?}{}",
         task_run_id, phase, input, output, cache_creation, cache_read,
+        cost.cents, cost.microusd, cost.source,
         target_app.map(|a| format!(", app={}", a)).unwrap_or_default()
     );
 
@@ -187,7 +184,7 @@ pub(super) fn record_phase_token_usage_with_cache(
                     pg_provider.as_deref(),
                     input,
                     output,
-                    cost_cents,
+                    cost,
                     duration_ms,
                     cache_creation,
                     cache_read,
@@ -1342,4 +1339,85 @@ pub(super) fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
     })
     .join()
     .map_err(|_| "Embedding thread join failed".to_string())?
+}
+
+#[cfg(test)]
+mod phase_cost_tests {
+    use super::resolve_phase_cost;
+    use crate::database::pg::token_usage::{CostSource, PhaseCost};
+
+    #[test]
+    fn a_reported_cost_wins_and_keeps_sub_cent_precision() {
+        // $0.0042 is under half a cent: whole cents alone would record a
+        // fabricated $0. The microdollar column keeps the real figure.
+        let cost = resolve_phase_cost(
+            Some(0.0042),
+            Some("claude-sonnet-4-20250514"),
+            Some(1_000_000),
+            Some(1_000_000),
+            0,
+            0,
+        );
+        assert_eq!(
+            cost,
+            PhaseCost {
+                cents: 0,
+                microusd: Some(4_200),
+                source: Some(CostSource::Reported),
+            }
+        );
+    }
+
+    #[test]
+    fn a_reported_cost_keeps_cost_cents_consistent() {
+        let cost = resolve_phase_cost(Some(0.036894), None, None, None, 0, 0);
+        assert_eq!(cost.cents, 4);
+        assert_eq!(cost.microusd, Some(36_894));
+        assert_eq!(cost.source, Some(CostSource::Reported));
+    }
+
+    #[test]
+    fn without_a_reported_cost_the_cache_aware_estimate_is_recorded() {
+        let (input, output, creation, read) = (10_000, 2_000, 4_000, 50_000);
+        let model = "claude-sonnet-4-20250514";
+        let cost = resolve_phase_cost(None, Some(model), Some(input), Some(output), creation, read);
+        let usd =
+            crate::ai_pricing::calculate_cost_usd_with_cache(input, output, creation, read, model);
+        assert_eq!(cost.source, Some(CostSource::Estimated));
+        assert_eq!(cost.microusd, Some((usd * 1_000_000.0).round() as i64));
+        assert_eq!(
+            cost.cents,
+            u64::from(
+                crate::ai_pricing::calculate_cost_cents_with_cache_or_estimate(
+                    input, output, creation, read, model
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn a_negative_reported_cost_falls_back_to_the_estimate() {
+        let cost = resolve_phase_cost(
+            Some(-0.5),
+            Some("claude-sonnet-4-20250514"),
+            Some(1_000),
+            Some(1_000),
+            0,
+            0,
+        );
+        assert_eq!(cost.source, Some(CostSource::Estimated));
+    }
+
+    #[test]
+    fn nothing_to_price_is_unknown_not_an_estimated_zero() {
+        let cost = resolve_phase_cost(None, None, Some(1_000), Some(1_000), 0, 0);
+        assert_eq!(
+            cost,
+            PhaseCost {
+                cents: 0,
+                microusd: None,
+                source: None,
+            }
+        );
+    }
 }

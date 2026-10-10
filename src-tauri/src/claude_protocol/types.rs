@@ -189,13 +189,26 @@ pub struct ResultContent {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Usage information.
-#[derive(Debug, Clone, Deserialize)]
+/// Usage information — the ONE stream-json `usage` shape.
+///
+/// Read both from an assistant message's `message.usage` and from the
+/// terminal `result` event's `usage` (see
+/// `claude_session::runner::extract_usage_from_stream_json`). The two prompt
+/// cache counters are billed separately from `input_tokens` (a cache write
+/// at 1.25x the input price, a cache read at 0.1x), so a reader that drops
+/// them under-counts every cached call.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct UsageInfo {
     #[serde(default)]
     pub input_tokens: Option<u64>,
     #[serde(default)]
     pub output_tokens: Option<u64>,
+    /// Tokens written to the prompt cache by this call.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Tokens served from the prompt cache by this call.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

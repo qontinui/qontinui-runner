@@ -12960,7 +12960,10 @@ CREATE TABLE project.phase_token_usage (
     cache_read_tokens bigint DEFAULT 0 NOT NULL,
     target_app text,
     target_page_url text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    cost_source text,
+    cost_microusd bigint,
+    CONSTRAINT ck_phase_token_usage_cost_source CHECK ((cost_source = ANY (ARRAY['reported'::text, 'estimated'::text])))
 );
 
 

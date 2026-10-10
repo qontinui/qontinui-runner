@@ -20,8 +20,7 @@ use super::{
     build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
     decode_journalled_ai_output, execute_prompt_response_mode, extract_and_preread_failure_files,
     get_active_sdk_app_name, journalled_step, preread_previously_edited_files,
-    record_phase_token_usage, record_phase_token_usage_with_cache,
-    record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
+    record_phase_token_usage, record_phase_token_usage_with_cache, REFLECTION_MODE_PREAMBLE,
 };
 
 // =============================================================================
@@ -250,6 +249,9 @@ impl AgenticExecutor {
                             parsed: None,
                             input_tokens: None,
                             output_tokens: None,
+                            cache_creation_tokens: None,
+                            cache_read_tokens: None,
+                            reported_cost_usd: None,
                             tools_used: Vec::new(),
                             tools_rejected: Vec::new(),
                         },
@@ -331,6 +333,7 @@ impl AgenticExecutor {
                                 Some(duration_ms),
                                 resp.cache_creation_tokens,
                                 resp.cache_read_tokens,
+                                None,
                                 target_app.as_deref(),
                                 None,
                             );
@@ -525,6 +528,9 @@ impl AgenticExecutor {
                                 parsed: None,
                                 input_tokens: resp.input_tokens,
                                 output_tokens: resp.output_tokens,
+                                cache_creation_tokens: resp.cache_creation_tokens,
+                                cache_read_tokens: resp.cache_read_tokens,
+                                reported_cost_usd: None,
                                 // API-provider path does not surface per-tool
                                 // telemetry (Phase 4); CLI path does.
                                 tools_used: Vec::new(),
@@ -650,6 +656,9 @@ impl AgenticExecutor {
                     parsed,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
+                    reported_cost_usd: None,
                     tools_used: Vec::new(),
                     tools_rejected: Vec::new(),
                 },
@@ -1321,6 +1330,9 @@ impl AgenticExecutor {
                 parsed: parsed_output,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_read_tokens: result.cache_read_tokens,
+                reported_cost_usd: result.reported_cost_usd,
                 tools_used: session_tools_used,
                 tools_rejected: session_tools_rejected,
             }
@@ -1345,6 +1357,9 @@ impl AgenticExecutor {
                 parsed: parsed_output,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_read_tokens: result.cache_read_tokens,
+                reported_cost_usd: result.reported_cost_usd,
                 tools_used: session_tools_used,
                 tools_rejected: session_tools_rejected,
             }
@@ -1356,11 +1371,13 @@ impl AgenticExecutor {
 
         // Record token usage for the main AI session and build LLM metrics
         let (session_input_tokens, session_output_tokens) = outcome.token_usage();
+        let (session_cache_creation, session_cache_read, session_reported_cost_usd) =
+            outcome.cache_usage_and_reported_cost();
         let session_model = config.resolve_model_for_phase("agentic");
         let session_provider = config.resolve_provider_for_phase("agentic");
         {
             let target_app = get_active_sdk_app_name(&self.app_state);
-            record_phase_token_usage_with_target(
+            record_phase_token_usage_with_cache(
                 &self.app_state.pg_db,
                 &config.execution_id,
                 "agentic",
@@ -1371,26 +1388,35 @@ impl AgenticExecutor {
                 session_input_tokens,
                 session_output_tokens,
                 Some(duration_ms.max(0) as u64),
+                session_cache_creation,
+                session_cache_read,
+                session_reported_cost_usd,
                 target_app.as_deref(),
                 None,
             );
 
             // Emit realtime cost update for the main AI session
             {
-                let cost_usd = if let (Some(input), Some(output)) =
-                    (session_input_tokens, session_output_tokens)
-                {
-                    crate::ai_pricing::calculate_cost_usd_with_cache(
-                        input,
-                        output,
-                        0,
-                        0,
-                        session_model
-                            .as_deref()
-                            .unwrap_or("claude-sonnet-4-20250514"),
-                    )
-                } else {
-                    0.0
+                // The CLI's reported cost is what the session was billed at;
+                // the cache-aware price table is the fallback when it is absent.
+                let cost_usd = match (
+                    session_reported_cost_usd,
+                    session_input_tokens,
+                    session_output_tokens,
+                ) {
+                    (Some(reported), _, _) => reported,
+                    (None, Some(input), Some(output)) => {
+                        crate::ai_pricing::calculate_cost_usd_with_cache(
+                            input,
+                            output,
+                            session_cache_creation.unwrap_or(0),
+                            session_cache_read.unwrap_or(0),
+                            session_model
+                                .as_deref()
+                                .unwrap_or("claude-sonnet-4-20250514"),
+                        )
+                    }
+                    _ => 0.0,
                 };
 
                 let cumulative = self
@@ -1407,8 +1433,8 @@ impl AgenticExecutor {
                     Some(iteration),
                     session_input_tokens.unwrap_or(0),
                     session_output_tokens.unwrap_or(0),
-                    0,
-                    0,
+                    session_cache_creation.unwrap_or(0),
+                    session_cache_read.unwrap_or(0),
                     cost_usd,
                     cumulative,
                 );

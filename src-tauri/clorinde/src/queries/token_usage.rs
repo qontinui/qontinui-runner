@@ -8,6 +8,7 @@ pub struct CreatePhaseTokenUsageParams<
     T4: crate::StringSql,
     T5: crate::StringSql,
     T6: crate::StringSql,
+    T7: crate::StringSql,
 > {
     pub task_run_id: T1,
     pub phase: T2,
@@ -23,6 +24,8 @@ pub struct CreatePhaseTokenUsageParams<
     pub cache_read_tokens: Option<i64>,
     pub target_app: Option<T5>,
     pub target_page_url: Option<T6>,
+    pub cost_microusd: Option<i64>,
+    pub cost_source: Option<T7>,
 }
 #[derive(Debug)]
 pub struct GetIterationTokenTotalsParams<T1: crate::StringSql> {
@@ -279,7 +282,7 @@ where
 pub struct CreatePhaseTokenUsageStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn create_phase_token_usage() -> CreatePhaseTokenUsageStmt {
     CreatePhaseTokenUsageStmt(
-        "INSERT INTO phase_token_usage (task_run_id, phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, cache_creation_tokens, cache_read_tokens, target_app, target_page_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        "INSERT INTO phase_token_usage (task_run_id, phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, cache_creation_tokens, cache_read_tokens, target_app, target_page_url, cost_microusd, cost_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         None,
     )
 }
@@ -302,6 +305,7 @@ impl CreatePhaseTokenUsageStmt {
         T4: crate::StringSql,
         T5: crate::StringSql,
         T6: crate::StringSql,
+        T7: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
@@ -319,6 +323,8 @@ impl CreatePhaseTokenUsageStmt {
         cache_read_tokens: &'a Option<i64>,
         target_app: &'a Option<T5>,
         target_page_url: &'a Option<T6>,
+        cost_microusd: &'a Option<i64>,
+        cost_source: &'a Option<T7>,
     ) -> Result<u64, tokio_postgres::Error> {
         client
             .execute(
@@ -338,6 +344,8 @@ impl CreatePhaseTokenUsageStmt {
                     cache_read_tokens,
                     target_app,
                     target_page_url,
+                    cost_microusd,
+                    cost_source,
                 ],
             )
             .await
@@ -352,11 +360,12 @@ impl<
     T4: crate::StringSql,
     T5: crate::StringSql,
     T6: crate::StringSql,
+    T7: crate::StringSql,
 > crate::client::async_::Params<
     'a,
     'a,
     'a,
-    CreatePhaseTokenUsageParams<T1, T2, T3, T4, T5, T6>,
+    CreatePhaseTokenUsageParams<T1, T2, T3, T4, T5, T6, T7>,
     std::pin::Pin<
         Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
     >,
@@ -365,7 +374,7 @@ impl<
     fn params(
         &'a self,
         client: &'a C,
-        params: &'a CreatePhaseTokenUsageParams<T1, T2, T3, T4, T5, T6>,
+        params: &'a CreatePhaseTokenUsageParams<T1, T2, T3, T4, T5, T6, T7>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
     > {
@@ -387,6 +396,8 @@ impl<
                     &params.cache_read_tokens,
                     &params.target_app,
                     &params.target_page_url,
+                    &params.cost_microusd,
+                    &params.cost_source,
                 ),
         )
     }
