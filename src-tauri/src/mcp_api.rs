@@ -1905,8 +1905,11 @@ async fn health(
         // calls that never got a `coord.sessions` lane by the FIRST gate
         // they failed (one key per `EventLaneMiss` variant, present even at
         // zero — an absent key is UNKNOWN, a zero is a number; a
-        // terminal-less call on a workdir with no task run reports the
-        // lifecycle leg's `lifecycle_*` gate, not `no_task_run`);
+        // terminal-less call on a workdir NO session claims reports the
+        // lifecycle leg's `lifecycle_*` gate; one several sessions claim
+        // reports `ai_ambiguous_workdir` and never reaches that leg;
+        // `no_task_run` is retained for series stability but is no longer
+        // produced);
         // `drainDropped` is what the outbox drain Ack-dropped on a 404
         // (coord does not know the lane), a 405 (no ingest route) or any
         // other 4xx (`other4xx` — the shared classifier's PermanentFailure,
@@ -3025,9 +3028,16 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
+    // Ambiguity (two sessions on one workdir) deliberately reads as "no
+    // primary-chain hit" here: the lifecycle fallback below resolves only a
+    // workdir with exactly one admitted record, so it cannot guess between them.
     let task_run_id = app
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
+        .and_then(|sm| match sm.task_run_id_for_workdir(&workdir) {
+            crate::claude_session::WorkdirTaskRun::Found(id) => Some(id),
+            crate::claude_session::WorkdirTaskRun::NoCandidate
+            | crate::claude_session::WorkdirTaskRun::Ambiguous => None,
+        });
     match task_run_id {
         // Primary chain hit.
         Some(task_run_id) => {
@@ -3873,8 +3883,9 @@ fn open_only(
 ///    registrar holds.
 /// 3. **Lifecycle** (plan
 ///    `2026-09-18-runner-transport-rung-rows-never-reach-coord-despite-a-serving-emitter`,
-///    Phase 2). Runs ONLY when leg 2 found no task run on the workdir
-///    ([`EventLaneMiss::NoTaskRun`]): nonce → workdir → the single admitted
+///    Phase 2). Runs ONLY when leg 2 found NO candidate on the workdir
+///    ([`WorkdirTaskRun::NoCandidate`](crate::claude_session::WorkdirTaskRun)):
+///    nonce → workdir → the single admitted
 ///    OPEN lifecycle record on that workdir (the SAME admission loop the
 ///    caller-identity chain's [`resolve_caller_via_lifecycle`] decides
 ///    through — [`select_lifecycle_candidate_censused`]) → its terminal →
@@ -3886,9 +3897,12 @@ fn open_only(
 ///    [`event_lane_lifecycle_leg`].
 ///
 ///    Leg 3 does NOT run after the other leg-2 misses. `NoWorkdir` leaves it
-///    nothing to key on. `AiSessionUnregistered` means the workdir DOES host
-///    a task run, which owns that workdir's calls — falling through would file
-///    the task run's call under a sibling terminal's lane. And
+///    nothing to key on. `AiAmbiguousWorkdir` means SEVERAL sessions claim the
+///    workdir (`WorkdirTaskRun::Ambiguous`) — a task run owns its calls, so a
+///    lifecycle lookup could file this call under a sibling terminal's lane.
+///    `AiSessionUnregistered` means the workdir DOES host a task run, which
+///    owns that workdir's calls — falling through would file the task run's
+///    call under a sibling terminal's lane. And
 ///    `AiPlaneStateMissing` is a mis-wired host (production installs both
 ///    halves), which a fallthrough would mask rather than report.
 ///
@@ -3949,22 +3963,44 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let Some(task_run_id) = app
+    let found = app
         .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
-        .task_run_id_for_workdir(&workdir)
-    else {
-        // Leg 3 — no task run on this workdir, so the caller is (at best) an
-        // interactive terminal session; the lifecycle store names it. Its
-        // miss REPLACES `NoTaskRun` as the reported reason, so `no_task_run`
-        // stops counting calls leg 3 then resolves, and each `lifecycle_*`
-        // series names the gate that actually refused.
-        return resolve_event_lane_via_lifecycle(app, &workdir);
+        .task_run_id_for_workdir(&workdir);
+    let task_run_id = match event_lane_after_workdir_lookup(found) {
+        WorkdirLegNext::TaskRun(id) => id,
+        WorkdirLegNext::TryLifecycle => return resolve_event_lane_via_lifecycle(app, &workdir),
+        WorkdirLegNext::Refuse(miss) => return Err(miss),
     };
     app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
         .ok_or(EventLaneMiss::AiSessionUnregistered)
+}
+
+/// What leg 2's workdir lookup licenses next — the pure decision between the
+/// AI plane and leg 3, so the combination is unit-testable without a Tauri app.
+///
+/// - `Found` → that task run's registrar lane.
+/// - `NoCandidate` (no session claims the workdir) → leg 3, the ONLY arm that
+///   may look the session up in the lifecycle store.
+/// - `Ambiguous` (several sessions claim it) → refuse. A task run owns that
+///   workdir's calls, so a lifecycle lookup could file one under a sibling
+///   interactive terminal's lane, the misattribution leg 3 exists to refuse.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkdirLegNext {
+    TaskRun(String),
+    TryLifecycle,
+    Refuse(EventLaneMiss),
+}
+
+fn event_lane_after_workdir_lookup(found: crate::claude_session::WorkdirTaskRun) -> WorkdirLegNext {
+    use crate::claude_session::WorkdirTaskRun;
+    match found {
+        WorkdirTaskRun::Found(id) => WorkdirLegNext::TaskRun(id),
+        WorkdirTaskRun::NoCandidate => WorkdirLegNext::TryLifecycle,
+        WorkdirTaskRun::Ambiguous => WorkdirLegNext::Refuse(EventLaneMiss::AiAmbiguousWorkdir),
+    }
 }
 
 /// Leg 3 of [`resolve_event_lane_session_id`]: the state-dependent half of
@@ -4094,14 +4130,19 @@ enum EventLaneMiss {
     /// Terminal-less binding, and the AI-plane state (`SessionManager` /
     /// `AiCoordRegistrar`) is not installed on this host.
     AiPlaneStateMissing,
-    /// Terminal-less binding whose workdir hosts no runner-managed task run,
-    /// AND leg 3 was not attempted. Since Phase 2 leg 3 always runs on this
-    /// branch and reports its own reason instead, so this series is expected
-    /// to stay at zero; a non-zero value means the fallthrough regressed.
+    /// UNREACHABLE since Phase 2: a workdir no session claims
+    /// (`WorkdirTaskRun::NoCandidate`) runs leg 3 and reports its own
+    /// `lifecycle_*` reason, and an ambiguous one reports `AiAmbiguousWorkdir`.
+    /// The variant and its `/health` series are kept (a removed key reads as
+    /// UNKNOWN, not zero); a non-zero value means the leg-3 fallthrough regressed.
     NoTaskRun,
     /// The task run exists but never registered with coord, so it holds no
     /// `coord.sessions.id`.
     AiSessionUnregistered,
+    /// Terminal-less binding whose workdir is claimed by SEVERAL runner-managed
+    /// sessions (or whose session table could not be read). REFUSED: the task
+    /// run owns that workdir's calls, so no lane is guessed.
+    AiAmbiguousWorkdir,
     /// Leg 3: the `SessionLifecycleStore` (or, for every backing terminal,
     /// the `TerminalManager`) is not in Tauri state on this host.
     LifecycleStateMissing,
@@ -4137,6 +4178,7 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => "ai_plane_state_missing",
             Self::NoTaskRun => "no_task_run",
             Self::AiSessionUnregistered => "ai_session_unregistered",
+            Self::AiAmbiguousWorkdir => "ai_ambiguous_workdir",
             Self::LifecycleStateMissing => "lifecycle_state_missing",
             Self::LifecycleNoRecord => "lifecycle_no_record",
             Self::LifecycleUnadmitted => "lifecycle_unadmitted",
@@ -4158,7 +4200,8 @@ impl EventLaneMiss {
             Self::NoWorkdir
             | Self::AiPlaneStateMissing
             | Self::NoTaskRun
-            | Self::AiSessionUnregistered => "ai_plane",
+            | Self::AiSessionUnregistered
+            | Self::AiAmbiguousWorkdir => "ai_plane",
             Self::LifecycleStateMissing
             | Self::LifecycleNoRecord
             | Self::LifecycleUnadmitted
@@ -4182,19 +4225,20 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => 5,
             Self::NoTaskRun => 6,
             Self::AiSessionUnregistered => 7,
-            Self::LifecycleStateMissing => 8,
-            Self::LifecycleNoRecord => 9,
-            Self::LifecycleUnadmitted => 10,
-            Self::LifecycleAnchorNotUuid => 11,
-            Self::LifecycleAmbiguous => 12,
-            Self::LifecycleTerminalGone => 13,
-            Self::LifecycleTerminalHasNoCoordSession => 14,
+            Self::AiAmbiguousWorkdir => 8,
+            Self::LifecycleStateMissing => 9,
+            Self::LifecycleNoRecord => 10,
+            Self::LifecycleUnadmitted => 11,
+            Self::LifecycleAnchorNotUuid => 12,
+            Self::LifecycleAmbiguous => 13,
+            Self::LifecycleTerminalGone => 14,
+            Self::LifecycleTerminalHasNoCoordSession => 15,
         }
     }
 
     /// Every miss, in counter-slot order — `ALL[i].index() == i`, asserted in
     /// the tests so the two orderings cannot drift.
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::NoNonce,
         Self::NoTerminalManager,
         Self::TerminalGone,
@@ -4203,6 +4247,7 @@ impl EventLaneMiss {
         Self::AiPlaneStateMissing,
         Self::NoTaskRun,
         Self::AiSessionUnregistered,
+        Self::AiAmbiguousWorkdir,
         Self::LifecycleStateMissing,
         Self::LifecycleNoRecord,
         Self::LifecycleUnadmitted,
@@ -13888,6 +13933,7 @@ mod transport_rung_counter_tests {
     #[test]
     fn lane_miss_ai_session_unregistered_moves_only_its_series() {
         assert_only_this_series_moves(EventLaneMiss::AiSessionUnregistered);
+        assert_only_this_series_moves(EventLaneMiss::AiAmbiguousWorkdir);
     }
 
     /// Phase 2's leg-3 series, each moving only itself.
@@ -15145,6 +15191,29 @@ mod self_id_chain_tests {
     }
 
     // ---- Phase 2: the event lane's lifecycle leg (leg 3) -------------------
+
+    /// The combination of the workdir lookup and leg 3: only a workdir NO
+    /// session claims may reach the lifecycle store; an ambiguous one is
+    /// refused as its own series (never leg 3, never a lane), and a found task
+    /// run keeps its own lane.
+    #[test]
+    fn only_a_workdir_nobody_claims_reaches_the_lifecycle_leg() {
+        use super::{event_lane_after_workdir_lookup, WorkdirLegNext};
+        use crate::claude_session::WorkdirTaskRun;
+        assert_eq!(
+            event_lane_after_workdir_lookup(WorkdirTaskRun::NoCandidate),
+            WorkdirLegNext::TryLifecycle
+        );
+        assert_eq!(
+            event_lane_after_workdir_lookup(WorkdirTaskRun::Ambiguous),
+            WorkdirLegNext::Refuse(EventLaneMiss::AiAmbiguousWorkdir)
+        );
+        assert_eq!(
+            event_lane_after_workdir_lookup(WorkdirTaskRun::Found("t".to_string())),
+            WorkdirLegNext::TaskRun("t".to_string())
+        );
+        assert_eq!(EventLaneMiss::AiAmbiguousWorkdir.leg(), "ai_plane");
+    }
 
     /// A lifecycle record for `csid` on `D:/repo`, hosted by terminal `tid`.
     fn lane_rec(csid: &str, tid: &str) -> TerminalSessionRecord {
