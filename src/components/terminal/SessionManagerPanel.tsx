@@ -46,6 +46,7 @@ const STATUS_GROUP_LABELS: Record<SessionLiveStatus, string> = {
   error: "Error",
   completed: "Completed",
   dormant: "Recent",
+  unknown: "State unknown",
 };
 
 /** Group sessions by the current groupBy mode. Returns [groupKey, sessions][] */

@@ -1,0 +1,19 @@
+{
+  "channel": "hook",
+  "cli_version": "2.1.285",
+  "event": "StopFailure",
+  "variants": [
+    {
+      "cwd": "string",
+      "effort": {
+        "level": "string"
+      },
+      "error": "string",
+      "hook_event_name": "string",
+      "last_assistant_message": "string",
+      "prompt_id": "string",
+      "session_id": "string",
+      "transcript_path": "string"
+    }
+  ]
+}

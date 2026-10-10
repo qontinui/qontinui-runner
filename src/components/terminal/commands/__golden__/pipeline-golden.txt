@@ -693,7 +693,7 @@
 /restart --tenant	literal	terminal.restart	[["zone","--tenant"]]	error:invalid-zone	error /restart: "--tenant" is not a zone number
 /restart 1 gmail fix the bug	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /restart: "1 gmail fix the bug" is not a zone number
 /restart 1 gmail fix the bug --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /restart: "1 gmail fix the bug --tenant" is not a zone number
-/restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable	error /restart: session state is idle
+/restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable	error /restart: session state is unknown
 /restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone	error /restart: "3 --tenant" is not a zone number
 /restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone	error /restart: "3 best" is not a zone number
 /restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone	error /restart: "3 best --tenant" is not a zone number
@@ -747,7 +747,7 @@
 /save-workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound	-
 /save-workflow 3 best	literal	terminal.save-workflow	[]	unbound	-
 /save-workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound	-
-/select	fuzzy	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select	fuzzy	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select "1 gmail fix the bug"	none	-	null	none	-
 /select "1 gmail fix the bug" --tenant	none	-	null	none	-
 /select "3 best"	none	-	null	none	-
@@ -771,44 +771,44 @@
 /select needs_input --tenant	none	-	null	none	-
 /select needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
 /select needsinput --tenant	none	-	null	none	-
+/select unknown	pattern	terminal.select-by-state	[["state","unknown"]]	ok	noop /select-by-state · no zones selected — unknown
+/select unknown --tenant	none	-	null	none	-
 /select working	pattern	terminal.select-by-state	[["state","working"]]	ok	noop /select-by-state · no zones selected — working
 /select working --tenant	none	-	null	none	-
-/select-by-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state completed	pattern	terminal.select-by-state	[["state","completed"]]	ok	noop /select-by-state · no zones selected — completed
-/select-by-state completed --tenant	literal	terminal.select-by-state	[["state","completed --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-by-state error	pattern	terminal.select-by-state	[["state","error"]]	ok	noop /select-by-state · no zones selected — error
-/select-by-state error --tenant	literal	terminal.select-by-state	[["state","error --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select-by-state idle	pattern	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
-/select-by-state idle --tenant	literal	terminal.select-by-state	[["state","idle --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state idle --tenant	literal	terminal.select-by-state	[["state","idle --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select-by-state needs input	pattern	terminal.select-by-state	[["state","needs input"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-/select-by-state needs input --tenant	literal	terminal.select-by-state	[["state","needs input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state needs input --tenant	literal	terminal.select-by-state	[["state","needs input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select-by-state needs-input	pattern	terminal.select-by-state	[["state","needs-input"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-/select-by-state needs-input --tenant	literal	terminal.select-by-state	[["state","needs-input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state needs-input --tenant	literal	terminal.select-by-state	[["state","needs-input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select-by-state needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-/select-by-state needs_input --tenant	literal	terminal.select-by-state	[["state","needs_input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state needs_input --tenant	literal	terminal.select-by-state	[["state","needs_input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select-by-state needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-/select-by-state needsinput --tenant	literal	terminal.select-by-state	[["state","needsinput --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state needsinput --tenant	literal	terminal.select-by-state	[["state","needsinput --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-by-state unknown	pattern	terminal.select-by-state	[["state","unknown"]]	ok	noop /select-by-state · no zones selected — unknown
+/select-by-state unknown --tenant	literal	terminal.select-by-state	[["state","unknown --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /select-by-state working	pattern	terminal.select-by-state	[["state","working"]]	ok	noop /select-by-state · no zones selected — working
-/select-by-state working --tenant	literal	terminal.select-by-state	[["state","working --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+/select-by-state working --tenant	literal	terminal.select-by-state	[["state","working --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+/select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 /session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
 /session names "1 gmail fix the bug"	none	-	null	none	-
 /session names "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -1881,7 +1881,7 @@ restart "3 best" --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	
 restart --tenant	literal	terminal.restart	[["zone","--tenant"]]	error:invalid-zone	error /restart: "--tenant" is not a zone number
 restart 1 gmail fix the bug	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /restart: "1 gmail fix the bug" is not a zone number
 restart 1 gmail fix the bug --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /restart: "1 gmail fix the bug --tenant" is not a zone number
-restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable	error /restart: session state is idle
+restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable	error /restart: session state is unknown
 restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone	error /restart: "3 --tenant" is not a zone number
 restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone	error /restart: "3 best" is not a zone number
 restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone	error /restart: "3 best --tenant" is not a zone number
@@ -1935,7 +1935,7 @@ save-workflow 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound	-
 save-workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound	-
 save-workflow 3 best	literal	terminal.save-workflow	[]	unbound	-
 save-workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound	-
-select	fuzzy	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select	fuzzy	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select "1 gmail fix the bug"	none	-	null	none	-
 select "1 gmail fix the bug" --tenant	none	-	null	none	-
 select "3 best"	none	-	null	none	-
@@ -1959,44 +1959,44 @@ select needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok
 select needs_input --tenant	none	-	null	none	-
 select needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
 select needsinput --tenant	none	-	null	none	-
+select unknown	pattern	terminal.select-by-state	[["state","unknown"]]	ok	noop /select-by-state · no zones selected — unknown
+select unknown --tenant	none	-	null	none	-
 select working	pattern	terminal.select-by-state	[["state","working"]]	ok	noop /select-by-state · no zones selected — working
 select working --tenant	none	-	null	none	-
-select-by-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state completed	pattern	terminal.select-by-state	[["state","completed"]]	ok	noop /select-by-state · no zones selected — completed
-select-by-state completed --tenant	literal	terminal.select-by-state	[["state","completed --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-by-state error	pattern	terminal.select-by-state	[["state","error"]]	ok	noop /select-by-state · no zones selected — error
-select-by-state error --tenant	literal	terminal.select-by-state	[["state","error --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select-by-state idle	pattern	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
-select-by-state idle --tenant	literal	terminal.select-by-state	[["state","idle --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state idle --tenant	literal	terminal.select-by-state	[["state","idle --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select-by-state needs input	pattern	terminal.select-by-state	[["state","needs input"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-select-by-state needs input --tenant	literal	terminal.select-by-state	[["state","needs input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state needs input --tenant	literal	terminal.select-by-state	[["state","needs input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select-by-state needs-input	pattern	terminal.select-by-state	[["state","needs-input"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-select-by-state needs-input --tenant	literal	terminal.select-by-state	[["state","needs-input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state needs-input --tenant	literal	terminal.select-by-state	[["state","needs-input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select-by-state needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-select-by-state needs_input --tenant	literal	terminal.select-by-state	[["state","needs_input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state needs_input --tenant	literal	terminal.select-by-state	[["state","needs_input --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select-by-state needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok	ok /select-by-state ✓ selected 1 zone — needs-input
-select-by-state needsinput --tenant	literal	terminal.select-by-state	[["state","needsinput --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state needsinput --tenant	literal	terminal.select-by-state	[["state","needsinput --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-by-state unknown	pattern	terminal.select-by-state	[["state","unknown"]]	ok	noop /select-by-state · no zones selected — unknown
+select-by-state unknown --tenant	literal	terminal.select-by-state	[["state","unknown --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 select-by-state working	pattern	terminal.select-by-state	[["state","working"]]	ok	noop /select-by-state · no zones selected — working
-select-by-state working --tenant	literal	terminal.select-by-state	[["state","working --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+select-by-state working --tenant	literal	terminal.select-by-state	[["state","working --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state	literal	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
+select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
 session names "1 gmail fix the bug"	none	-	null	none	-
 session names "1 gmail fix the bug" --tenant	none	-	null	none	-
@@ -2499,7 +2499,7 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.save-workflow [valid] do the thing	ai	terminal.save-workflow	[]	error:no-workflow	error /save-workflow: generate a workflow first via /generate
 «ai» terminal.select-by-state [alien] do the thing	ai	terminal.select-by-state	[["nonsense","x"]]	refused	error /select-by-state: takes no argument named "nonsense"
 «ai» terminal.select-by-state [bool] do the thing	ai	terminal.select-by-state	[]	refused	error /select-by-state: "state" must be text or a number (got true/false)
-«ai» terminal.select-by-state [empty] do the thing	ai	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+«ai» terminal.select-by-state [empty] do the thing	ai	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 «ai» terminal.select-by-state [valid] do the thing	ai	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
 «ai» terminal.show-shortcuts [alien] do the thing	ai	terminal.show-shortcuts	[["nonsense","x"]]	refused	error /shortcuts: takes no arguments (got "nonsense")
 «ai» terminal.show-shortcuts [bool] do the thing	ai	terminal.show-shortcuts	[]	refused	error /shortcuts: "count" must be text or a number (got true/false)
@@ -2659,7 +2659,7 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.save-workflow [valid]	direct	terminal.save-workflow	[]	threw	error /save-workflow: generate a workflow first via /generate
 «direct» terminal.select-by-state [alien]	direct	terminal.select-by-state	[["nonsense","x"]]	threw	error /select-by-state: takes no argument named "nonsense"
 «direct» terminal.select-by-state [bool]	direct	terminal.select-by-state	[["state",true]]	threw	error /select-by-state: "state" must be text or a number (got true/false)
-«direct» terminal.select-by-state [empty]	direct	terminal.select-by-state	[]	threw	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+«direct» terminal.select-by-state [empty]	direct	terminal.select-by-state	[]	threw	error /select-by-state: state must be one of: unknown, idle, working, needs-input, completed, error
 «direct» terminal.select-by-state [valid]	direct	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
 «direct» terminal.show-shortcuts [alien]	direct	terminal.show-shortcuts	[["nonsense","x"]]	threw	error /shortcuts: takes no arguments (got "nonsense")
 «direct» terminal.show-shortcuts [bool]	direct	terminal.show-shortcuts	[["count",true]]	threw	error /shortcuts: "count" must be text or a number (got true/false)

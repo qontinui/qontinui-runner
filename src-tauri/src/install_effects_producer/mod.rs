@@ -1217,6 +1217,13 @@ async fn post_shim_beacon(Json(req): Json<ShimBeaconRequest>) -> Json<ApiRespons
         detail = %req.detail.as_deref().unwrap_or(""),
         "control/shim-beacon: identity shim invoked"
     );
+    // Delivery evidence for `HookDelivery` (plan 2026-09-20-terminal-session-
+    // state-…, Phase 4): did the shim append `--settings` for this pane?
+    crate::terminal::agent_state::note_shim_beacon(
+        req.terminal_id.as_deref().unwrap_or(""),
+        req.tool.as_deref().unwrap_or(""),
+        req.detail.as_deref().unwrap_or(""),
+    );
     Json(ApiResponse::success(()))
 }
 

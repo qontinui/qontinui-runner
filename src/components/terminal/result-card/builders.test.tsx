@@ -105,6 +105,7 @@ describe("buildMetricsCardSpec", () => {
 
   it("omits Time-in-state when stateTimeAccum is all-zero", () => {
     const stateTimeAccum: Record<SessionState, number> = {
+      unknown: 0,
       idle: 0,
       working: 0,
       "needs-input": 0,
@@ -117,6 +118,7 @@ describe("buildMetricsCardSpec", () => {
 
   it("includes + formats Time-in-state when working > 1000ms", () => {
     const stateTimeAccum: Record<SessionState, number> = {
+      unknown: 0,
       idle: 0,
       working: 65_000, // 1m5s
       "needs-input": 0,

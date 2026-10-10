@@ -29,11 +29,19 @@
 //!     corresponding materialized script. **`permissions.allow` rides this same
 //!     carrier** (it pre-approves `mcp__coord-mcp`), which is why the file is
 //!     built structurally rather than by text surgery — see [`build_settings`].
-//!     The `Stop` key is registered ONLY when the continuation flag is armed
-//!     (see [`StopHookRegistration`]); a dark session gets the `-nostop` file,
-//!     which has no `Stop` key at all, so Claude never spawns `bash` for it once
-//!     per assistant turn. The two variants use DISTINCT FILENAMES because the
+//!     The `Stop` COMMAND hook is registered ONLY when the continuation flag is
+//!     armed (see [`StopHookRegistration`]); a dark session gets the `-nostop`
+//!     file, which has no Stop COMMAND hook (the http agent-event Stop hook is
+//!     present when the runner port resolves), so Claude never spawns `bash`
+//!     for it once per assistant turn. The two variants use DISTINCT FILENAMES because the
 //!     hook dir is machine-global — see [`session_restore_dir`].
+//!   * the agent-event `type: "http"` hooks ([`AGENT_EVENT_HOOKS`], plan
+//!     `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+//!     Phase 3) — merged into BOTH Stop variants, POSTing to this runner's
+//!     `/terminals/agent-event`. Their URL bakes in the runner API port, so the
+//!     port is a filename component too: `claude_hook_settings[-nostop]-p<port>.json`
+//!     ([`AgentEventHooks`]); with no resolvable port the entries are omitted
+//!     and the historical names are used.
 //!
 //! **Exactly one of the two carrier names exists on a given box per posture**,
 //! so nothing outside this module should name one: in the DEFAULT (dark)
@@ -97,7 +105,8 @@ const HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_s
 /// The script is materialized UNCONDITIONALLY (so [`hook_files`] stays
 /// variant-independent), but its REGISTRATION in the delivered settings is
 /// gated on the flag — see [`StopHookRegistration`]. A dark session therefore
-/// gets no `Stop` key at all rather than a registered hook whose script exits
+/// gets no Stop COMMAND hook (the http agent-event Stop hook is present when
+/// the runner port resolves) rather than a registered hook whose script exits
 /// immediately: the script-level early exit still cost one `bash` spawn per
 /// assistant turn, which is exactly what the gating removes.
 const STOP_HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
@@ -180,10 +189,96 @@ const STOP_HOOK_SCRIPT_PLACEHOLDER: &str = "@@STOP_HOOK_SCRIPT@@";
 const PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER: &str = "@@PRECOMPACT_HOOK_SCRIPT@@";
 const POLICY_HOOK_SCRIPT_PLACEHOLDER: &str = "@@POLICY_HOOK_SCRIPT@@";
 
+/// The agent-event hook entries (bundled) — plan
+/// `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+/// Phase 3, as re-decided after its Phase 1 probe (D2): `type: "http"` hooks,
+/// no relay binary. Seven events — `SessionStart`, `UserPromptSubmit`,
+/// `PermissionRequest`, `Notification`, `Stop`, `StopFailure`, `SessionEnd` —
+/// each POSTing the CLI's own hook payload to
+/// `http://127.0.0.1:<port>/terminals/agent-event`, where the runner projects
+/// it to an allowlist on parse (`qontinui_runner_lib::agent_event`).
+///
+/// Why these properties, each measured or documented rather than assumed:
+/// - **http, not command**: zero process spawn per event on a saturated box,
+///   no Git Bash, nothing to bundle. PROBE.md Q5: http hooks work on 2.1.285,
+///   the body is the same JSON a command hook reads, loopback answers in
+///   5–14 ms.
+/// - **no `async`**: the hooks docs say `async` is a COMMAND-hook field only;
+///   http hooks do not support it. The 1 s `timeout` is what bounds a down or
+///   wedged runner's cost to the CLI instead (a connection failure, timeout or
+///   non-2xx is a non-blocking error — the CLI carries on).
+/// - **the terminal id rides a header**: the URL is static, so the pane's
+///   identity is `X-Qontinui-Terminal: $QONTINUI_TERMINAL_ID`, which the docs
+///   say is interpolated only for variables named in `allowedEnvVars`. The
+///   ingest route also maps the body's `session_id` to a terminal, so a CLI
+///   that does not interpolate still lands.
+/// - **no `statusLine`, ever**: PROBE.md Q1 — any statusLine hides
+///   `esc to interrupt` and `? for shortcuts`, which the runner keys on.
+/// - **no `PreToolUse`/`PostToolUse`**: turn-grain only; the tool-grain channel
+///   belongs to plan `2026-08-11-coord-hook-sourced-agent-status`.
+///
+/// The PORT is baked into the URL, and the carrier directory is shared by every
+/// runner on the machine, so the port is a FILENAME component of the carrier —
+/// see [`AgentEventHooks::file_suffix`].
+const AGENT_EVENT_HOOKS: &str =
+    include_str!("../../resources/session-restore/claude_agent_event_hooks.json");
+
+/// Placeholder for the runner API port in [`AGENT_EVENT_HOOKS`]'s URLs.
+const RUNNER_API_PORT_PLACEHOLDER: &str = "@@RUNNER_API_PORT@@";
+
+/// Whether the delivered carrier registers the http agent-event hooks, and
+/// against which runner API port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentEventHooks {
+    /// Register them, POSTing to this port.
+    Registered { port: u16 },
+    /// The port did not resolve — omit them (a URL naming port 0 would be a
+    /// hook that fails on every event).
+    Omitted,
+}
+
+impl AgentEventHooks {
+    /// `0` ⇒ [`AgentEventHooks::Omitted`].
+    pub fn from_port(port: u16) -> Self {
+        if port == 0 {
+            AgentEventHooks::Omitted
+        } else {
+            AgentEventHooks::Registered { port }
+        }
+    }
+
+    /// Live read: the port this runner BOUND (the same one the PTY child's
+    /// `QONTINUI_RUNNER_API_PORT` names).
+    pub fn from_env() -> Self {
+        Self::from_port(crate::terminal::spawn_seam_api_port())
+    }
+
+    /// The carrier FILENAME component for this variant. The carrier dir is
+    /// machine-global, and the port is baked into the file's CONTENT, so two
+    /// runners on different ports must never share a name — the same rule
+    /// [`HOOK_SETTINGS_NAME_NOSTOP`] documents for the Stop variants.
+    /// [`AgentEventHooks::Omitted`] keeps the historical names (no suffix).
+    fn file_suffix(self) -> String {
+        match self {
+            AgentEventHooks::Registered { port } => format!("-p{port}"),
+            AgentEventHooks::Omitted => String::new(),
+        }
+    }
+
+    /// Stable wire string, for diagnostics.
+    pub fn describe(self) -> String {
+        match self {
+            AgentEventHooks::Registered { port } => format!("registered (port {port})"),
+            AgentEventHooks::Omitted => "omitted (runner API port unresolved)".to_string(),
+        }
+    }
+}
+
 /// Whether the delivered settings registers the `Stop` continuation hook.
 ///
 /// The Stop-hook SCRIPT is always materialized; this decides only whether the
-/// settings file carries a `hooks.Stop` key. Claude Code spawns `bash` once per
+/// settings file carries the `hooks.Stop` COMMAND hook (the http agent-event
+/// Stop hook rides both variants when the runner port resolves). Claude Code spawns `bash` once per
 /// assistant turn for every registered `Stop` hook — even one that exits
 /// immediately — so a dark session must not register it at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -199,6 +294,7 @@ impl StopHookRegistration {
     /// `Registered`.
     pub fn from_mode(mode: crate::mcp::continuation_verdict::Mode) -> Self {
         use crate::mcp::continuation_verdict::Mode;
+
         match mode {
             Mode::Off => StopHookRegistration::Omitted,
             Mode::Observe | Mode::On => StopHookRegistration::Registered,
@@ -242,8 +338,39 @@ impl StopHookRegistration {
 /// `base_dir.join(reg.settings_name())` would compile, agree on the day it was
 /// written, and start lying the first time either half moved, which is exactly
 /// the defect class the config report exists to expose.
-pub fn settings_path(base_dir: &Path, reg: StopHookRegistration) -> PathBuf {
-    base_dir.join(reg.settings_name())
+pub fn settings_path(
+    base_dir: &Path,
+    reg: StopHookRegistration,
+    events: AgentEventHooks,
+) -> PathBuf {
+    base_dir.join(settings_file_name(reg, events))
+}
+
+/// The carrier's file name for a (Stop variant, agent-event variant) pair:
+/// `claude_hook_settings[-nostop][-p<port>].json`. Every per-process
+/// difference in the carrier's content is a component of this name.
+fn settings_file_name(reg: StopHookRegistration, events: AgentEventHooks) -> String {
+    let base = reg.settings_name();
+    let stem = base.strip_suffix(".json").unwrap_or(base);
+    format!("{stem}{}.json", events.file_suffix())
+}
+
+/// What the carrier THIS process materialized into [`session_restore_dir`]
+/// says about the agent-event hooks — the spawn-time evidence
+/// `HookDelivery` weighs (plan Phase 4). Read from the materialize cache, so
+/// it costs a lock and no IO; `NotMaterialized` until the first spawn.
+pub fn agent_event_carrier_evidence() -> qontinui_runner_lib::agent_event::CarrierEvidence {
+    use qontinui_runner_lib::agent_event::CarrierEvidence;
+    let dir = session_restore_dir();
+    match MATERIALIZED
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&dir).map(|(_, events, _)| *events))
+    {
+        Some(AgentEventHooks::Registered { .. }) => CarrierEvidence::WithEvents,
+        Some(AgentEventHooks::Omitted) => CarrierEvidence::WithoutEvents,
+        None => CarrierEvidence::NotMaterialized,
+    }
 }
 
 /// Env var the runner injects at spawn carrying the absolute path of the
@@ -290,7 +417,11 @@ pub fn session_restore_dir() -> PathBuf {
 ///
 /// Reads the live flag; see [`materialize_with`] for the explicit-variant form.
 pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
-    materialize_with(base_dir, StopHookRegistration::from_env())
+    materialize_with(
+        base_dir,
+        StopHookRegistration::from_env(),
+        AgentEventHooks::from_env(),
+    )
 }
 
 /// The `--settings <path>` argv pair for a spawn that execs `claude` DIRECTLY,
@@ -352,8 +483,12 @@ fn settings_args_from(path: Option<PathBuf>) -> Vec<String> {
 
 /// [`materialize`] with the `Stop`-hook registration variant supplied
 /// explicitly (the unit-test surface; production reads the env).
-pub fn materialize_with(base_dir: &Path, stop: StopHookRegistration) -> Option<PathBuf> {
-    materialize_from_template(base_dir, stop, HOOK_SETTINGS)
+pub fn materialize_with(
+    base_dir: &Path,
+    stop: StopHookRegistration,
+    events: AgentEventHooks,
+) -> Option<PathBuf> {
+    materialize_from_template(base_dir, stop, events, HOOK_SETTINGS)
 }
 
 /// [`materialize_with`] against an explicit settings template. Private seam:
@@ -363,9 +498,10 @@ pub fn materialize_with(base_dir: &Path, stop: StopHookRegistration) -> Option<P
 fn materialize_from_template(
     base_dir: &Path,
     stop: StopHookRegistration,
+    events: AgentEventHooks,
     template: &str,
 ) -> Option<PathBuf> {
-    if let Some(settings_path) = cached_materialization(base_dir, stop) {
+    if let Some(settings_path) = cached_materialization(base_dir, stop, events) {
         return Some(settings_path);
     }
     if let Err(e) = std::fs::create_dir_all(base_dir) {
@@ -418,31 +554,36 @@ fn materialize_from_template(
     // OWN `@@…@@` placeholder to that script's absolute path, and (when dark)
     // dropping the `Stop` key entirely. serde_json does the JSON escaping, so a
     // Windows path needs no hand-rolled backslash doubling.
-    let settings = match build_settings(
+    let settings = match build_settings_with_events(
         template,
+        AGENT_EVENT_HOOKS,
         &script_path,
         &stop_script_path,
         &precompact_script_path,
         &policy_script_path,
         stop,
+        events,
     ) {
         Some(s) => s,
         None => {
             tracing::warn!(
-                path = %settings_path(base_dir, stop).display(),
+                path = %settings_path(base_dir, stop, events).display(),
                 "session-restore: claude hook settings template malformed — --settings hook delivery off (identity still pinned)"
             );
             return None;
         }
     };
-    let settings_path = settings_path(base_dir, stop);
+    let settings_path = settings_path(base_dir, stop, events);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
         return None;
     }
 
     if let Ok(mut done) = MATERIALIZED.lock() {
-        done.insert(base_dir.to_path_buf(), (stop, settings_path.clone()));
+        done.insert(
+            base_dir.to_path_buf(),
+            (stop, events, settings_path.clone()),
+        );
     }
     Some(settings_path)
 }
@@ -573,12 +714,93 @@ fn build_settings(
     serde_json::to_string_pretty(&root).ok()
 }
 
+/// [`build_settings`] plus the agent-event http hooks when `events` registers
+/// them. The command-hook half is built exactly as before (Stop settled, every
+/// `command` resolved) and only THEN are the http entries merged in, so:
+///
+/// - the dark Stop variant still drops the `bash` Stop COMMAND, yet keeps the
+///   http `Stop` entry — an http hook spawns nothing, which is the whole
+///   reason the command was gated;
+/// - [`resolve_commands`] never sees an http entry (it has no `command`).
+///
+/// Each http entry is APPENDED to the first matcher block of an event the
+/// template already registers (`SessionStart`, and `Stop` when armed), and
+/// registered as a new block for any other event. `None` — the whole carrier
+/// fails open — when the events template is malformed, names a placeholder
+/// that survives substitution, or is not all `type: "http"`; the shipped
+/// template is pinned well-formed by a test.
+#[allow(clippy::too_many_arguments)]
+fn build_settings_with_events(
+    template: &str,
+    events_template: &str,
+    session: &Path,
+    stop: &Path,
+    precompact: &Path,
+    policy: &Path,
+    reg: StopHookRegistration,
+    events: AgentEventHooks,
+) -> Option<String> {
+    let built = build_settings(template, session, stop, precompact, policy, reg)?;
+    let AgentEventHooks::Registered { port } = events else {
+        return Some(built);
+    };
+    let mut root: serde_json::Value = serde_json::from_str(&built).ok()?;
+    let rendered = events_template.replace(RUNNER_API_PORT_PLACEHOLDER, &port.to_string());
+    if rendered.contains("@@") {
+        return None;
+    }
+    let event_root: serde_json::Value = serde_json::from_str(&rendered).ok()?;
+    let event_hooks = event_root.get("hooks")?.as_object()?;
+    if event_hooks.is_empty() {
+        return None;
+    }
+    let hooks = root.get_mut("hooks")?.as_object_mut()?;
+    for (event, blocks) in event_hooks {
+        let blocks = blocks.as_array()?;
+        if blocks.is_empty() {
+            return None;
+        }
+        let mut entries = Vec::new();
+        for block in blocks {
+            let inner = block.get("hooks")?.as_array()?;
+            if inner.is_empty() {
+                return None;
+            }
+            for entry in inner {
+                let obj = entry.as_object()?;
+                if obj.get("type")?.as_str()? != "http" || obj.get("url")?.as_str().is_none() {
+                    return None;
+                }
+                entries.push(entry.clone());
+            }
+        }
+        match hooks.get_mut(event.as_str()) {
+            Some(existing) => {
+                let first = existing
+                    .as_array_mut()?
+                    .first_mut()?
+                    .as_object_mut()?
+                    .get_mut("hooks")?
+                    .as_array_mut()?;
+                first.extend(entries);
+            }
+            None => {
+                hooks.insert(event.clone(), serde_json::json!([{ "hooks": entries }]));
+            }
+        }
+    }
+    serde_json::to_string_pretty(&root).ok()
+}
+
 /// Base dirs whose hook set this process has already materialized, mapped to
-/// the registration variant it was built under and the settings path
+/// the (Stop, agent-event) variant it was built under and the settings path
 /// [`materialize_with`] returned. The variant is part of the VALUE (not just
 /// the key) so a mismatch is detectable and forces a rewrite.
+#[allow(clippy::type_complexity)]
 static MATERIALIZED: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, (StopHookRegistration, PathBuf)>>,
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, (StopHookRegistration, AgentEventHooks, PathBuf)>,
+    >,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Every file a [`materialize`] under `reg` is responsible for, in `base_dir`.
@@ -594,13 +816,13 @@ static MATERIALIZED: once_cell::sync::Lazy<
 /// after a flag flip). That is fine and harmless — every instance's spawn
 /// points `--settings` at its own name — so DO NOT "clean it up": deleting the
 /// other variant's file would be reaching into another live process's delivery.
-fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
+fn hook_files(base_dir: &Path, reg: StopHookRegistration, events: AgentEventHooks) -> [PathBuf; 5] {
     [
         base_dir.join(HOOK_SCRIPT_NAME),
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
         base_dir.join(POLICY_HOOK_SCRIPT_NAME),
-        settings_path(base_dir, reg),
+        settings_path(base_dir, reg, events),
     ]
 }
 
@@ -617,12 +839,20 @@ fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
 /// nothing about what another runner instance sharing the machine-global dir
 /// may have written. What makes that safe is the per-variant FILE NAME, not
 /// this cache — no other instance writes the name this variant reads.
-fn cached_materialization(base_dir: &Path, want: StopHookRegistration) -> Option<PathBuf> {
-    let (cached_variant, settings_path) = MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
-    if cached_variant != want {
+fn cached_materialization(
+    base_dir: &Path,
+    want: StopHookRegistration,
+    want_events: AgentEventHooks,
+) -> Option<PathBuf> {
+    let (cached_variant, cached_events, settings_path) =
+        MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
+    if cached_variant != want || cached_events != want_events {
         return None;
     }
-    if hook_files(base_dir, want).iter().all(|p| p.exists()) {
+    if hook_files(base_dir, want, want_events)
+        .iter()
+        .all(|p| p.exists())
+    {
         Some(settings_path)
     } else {
         None
@@ -647,6 +877,10 @@ mod tests {
     use super::*;
 
     use crate::mcp::continuation_verdict::Mode;
+
+    /// The agent-event variant every materializing test runs under: the
+    /// production shape (events registered), on a port no real runner uses.
+    const EV: AgentEventHooks = AgentEventHooks::Registered { port: 49_876 };
 
     /// The direct-exec carrier: a resolved path becomes the two-token pair, in
     /// that order, with the path VERBATIM (it is a Windows absolute path in
@@ -682,7 +916,7 @@ mod tests {
         assert!(settings_path.exists());
         assert_eq!(
             settings_path.file_name().unwrap().to_string_lossy(),
-            reg.settings_name()
+            settings_file_name(reg, EV)
         );
 
         // All four scripts exist alongside it — registration is gated,
@@ -762,9 +996,15 @@ mod tests {
             1,
             "exactly ONE SessionStart registration — the policy hook is a              sibling command inside it, never a second matcher block"
         );
-        let session_start_cmds = session_start[0]["hooks"]
+        // COMMAND entries only: the agent-event http hook (plan
+        // 2026-09-20-terminal-session-state-…, Phase 3) is appended to this
+        // same block, and spawns nothing.
+        let session_start_cmds: Vec<&serde_json::Value> = session_start[0]["hooks"]
             .as_array()
-            .expect("SessionStart block has a hooks array");
+            .expect("SessionStart block has a hooks array")
+            .iter()
+            .filter(|h| h["type"] == "command")
+            .collect();
         assert_eq!(
             session_start_cmds.len(),
             2,
@@ -897,8 +1137,8 @@ mod tests {
     #[test]
     fn materialize_registered_writes_all_files_and_registers_stop() {
         let tmp = tempfile::tempdir().unwrap();
-        let settings_path =
-            materialize_with(tmp.path(), StopHookRegistration::Registered).expect("materialize ok");
+        let settings_path = materialize_with(tmp.path(), StopHookRegistration::Registered, EV)
+            .expect("materialize ok");
         let v =
             assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Registered);
 
@@ -924,16 +1164,39 @@ mod tests {
         assert!(stop_text.contains("stop_hook_active"));
     }
 
+    /// The `Stop` entries of a parsed settings file that spawn a process
+    /// (`type: "command"`, i.e. the continuation stop-hook script). The
+    /// agent-event `type: "http"` `Stop` hook spawns nothing and is not one.
+    fn stop_command_hooks(v: &serde_json::Value) -> usize {
+        v["hooks"]["Stop"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .flat_map(|b| b["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter(|h| h["type"] != "http")
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     #[test]
     fn materialize_omitted_drops_the_stop_key_and_keeps_everything_else() {
-        let tmp = tempfile::tempdir().unwrap();
-        let settings_path =
-            materialize_with(tmp.path(), StopHookRegistration::Omitted).expect("materialize ok");
-        let v =
-            assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Omitted);
-
-        // THE POINT: a dark session gets no `Stop` key at all, so Claude never
-        // spawns `bash` for it once per assistant turn.
+        // Without the agent-event hooks, a dark session gets no `Stop` key at
+        // all, so Claude never spawns `bash` for it once per assistant turn.
+        let bare = tempfile::tempdir().unwrap();
+        let settings_path = materialize_with(
+            bare.path(),
+            StopHookRegistration::Omitted,
+            AgentEventHooks::Omitted,
+        )
+        .expect("materialize ok");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            v["hooks"]["SessionStart"].is_array(),
+            "everything else is kept"
+        );
         assert!(
             v["hooks"]["Stop"].is_null(),
             "no Stop registration when the continuation flag is dark"
@@ -942,6 +1205,20 @@ mod tests {
             !v["hooks"].as_object().unwrap().contains_key("Stop"),
             "the Stop key is REMOVED, not merely nulled"
         );
+
+        // With them, the only `Stop` entry is the agent-event http hook (the
+        // verdict's turn-end edge) — still nothing that spawns a process.
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV)
+            .expect("materialize ok");
+        let v =
+            assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Omitted);
+        assert_eq!(
+            stop_command_hooks(&v),
+            0,
+            "no Stop COMMAND registration when the continuation flag is dark"
+        );
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
     }
 
     /// FIX 1 — the hook dir is MACHINE-GLOBAL (every runner instance on the box
@@ -953,8 +1230,8 @@ mod tests {
     #[test]
     fn the_two_variants_write_distinct_settings_files_that_coexist() {
         let tmp = tempfile::tempdir().unwrap();
-        let armed = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
-        let dark = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let armed = materialize_with(tmp.path(), StopHookRegistration::Registered, EV).unwrap();
+        let dark = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV).unwrap();
         assert_ne!(
             armed, dark,
             "the two variants must not share one machine-global filename"
@@ -970,16 +1247,18 @@ mod tests {
             armed_v["hooks"]["Stop"][0]["hooks"][0]["command"].is_string(),
             "the ARMED file still registers Stop after a dark materialize ran in the same dir"
         );
-        assert!(
-            !dark_v["hooks"].as_object().unwrap().contains_key("Stop"),
-            "the DARK file has no Stop key"
+        assert_eq!(
+            stop_command_hooks(&dark_v),
+            0,
+            "the DARK file has no Stop command (only the agent-event http hook)"
         );
 
         // Simulate the cross-instance case the shared dir makes possible: the
         // OTHER variant's file is clobbered by another process. The armed
         // instance's cached path is unaffected, because it is a different file.
         std::fs::write(&dark, "{}").unwrap();
-        let armed_again = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let armed_again =
+            materialize_with(tmp.path(), StopHookRegistration::Registered, EV).unwrap();
         assert_eq!(armed_again, armed);
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&armed_again).unwrap()).unwrap();
@@ -1007,14 +1286,14 @@ mod tests {
     #[test]
     fn a_cache_hit_skips_the_rewrite_and_a_deleted_file_forces_one() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let a = materialize_with(tmp.path(), StopHookRegistration::Registered, EV).unwrap();
         let original = std::fs::read_to_string(&a).unwrap();
 
         // Cache HIT is observable: clobber the settings content, call again with
         // the same (base_dir, variant) — all four files still exist, so the call
         // short-circuits and our clobbered bytes are still there.
         std::fs::write(&a, "{\"clobbered\":true}").unwrap();
-        let b = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let b = materialize_with(tmp.path(), StopHookRegistration::Registered, EV).unwrap();
         assert_eq!(a, b, "stable settings path across calls");
         assert_eq!(
             std::fs::read_to_string(&b).unwrap(),
@@ -1025,7 +1304,7 @@ mod tests {
         // Cache MISS on a missing file: delete the settings file and the next
         // call falls through to a full rewrite that restores it.
         std::fs::remove_file(&a).unwrap();
-        let c = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let c = materialize_with(tmp.path(), StopHookRegistration::Registered, EV).unwrap();
         assert_eq!(a, c);
         assert_eq!(
             std::fs::read_to_string(&c).unwrap(),
@@ -1036,7 +1315,7 @@ mod tests {
         // Same for a deleted SCRIPT — the existence check covers all four.
         std::fs::write(&c, "{\"clobbered\":true}").unwrap();
         std::fs::remove_file(tmp.path().join(STOP_HOOK_SCRIPT_NAME)).unwrap();
-        let d = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let d = materialize_with(tmp.path(), StopHookRegistration::Registered, EV).unwrap();
         assert_eq!(
             std::fs::read_to_string(&d).unwrap(),
             original,
@@ -1058,19 +1337,22 @@ mod tests {
         let dark = materialize(dark_dir.path()).unwrap();
         assert_eq!(
             dark.file_name().unwrap().to_string_lossy(),
-            HOOK_SETTINGS_NAME_NOSTOP,
+            settings_file_name(StopHookRegistration::Omitted, AgentEventHooks::from_env()),
             "the DEFAULT posture delivers the no-Stop settings file"
         );
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dark).unwrap()).unwrap();
-        assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"));
+        assert_eq!(stop_command_hooks(&v), 0, "no Stop command when dark");
 
         let armed_dir = tempfile::tempdir().unwrap();
         std::env::set_var(FLAG_ENV, "observe");
         let armed = materialize(armed_dir.path()).unwrap();
         assert_eq!(
             armed.file_name().unwrap().to_string_lossy(),
-            HOOK_SETTINGS_NAME,
+            settings_file_name(
+                StopHookRegistration::Registered,
+                AgentEventHooks::from_env()
+            ),
             "an armed flag delivers the Stop-registering settings file"
         );
     }
@@ -1078,9 +1360,9 @@ mod tests {
     #[test]
     fn materialize_omitted_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let a = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV).unwrap();
         let before = std::fs::read_to_string(&a).unwrap();
-        let b = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let b = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV).unwrap();
         assert_eq!(a, b, "stable settings path across calls");
         assert!(a.exists());
         assert_eq!(
@@ -1100,7 +1382,7 @@ mod tests {
             StopHookRegistration::Omitted,
         ] {
             let tmp = tempfile::tempdir().unwrap();
-            let settings_path = materialize_with(tmp.path(), reg).unwrap();
+            let settings_path = materialize_with(tmp.path(), reg, EV).unwrap();
             let text = std::fs::read_to_string(&settings_path).unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&text).expect("emitted settings is valid JSON");
@@ -1488,9 +1770,9 @@ mod tests {
             StopHookRegistration::Registered,
             StopHookRegistration::Omitted,
         ] {
-            let settings_path = tmp.path().join(reg.settings_name());
+            let settings_path = tmp.path().join(settings_file_name(reg, EV));
             assert!(
-                materialize_from_template(tmp.path(), reg, "{ not json").is_none(),
+                materialize_from_template(tmp.path(), reg, EV, "{ not json").is_none(),
                 "{reg:?}: a malformed template degrades to no --settings"
             );
             assert!(
@@ -1504,8 +1786,10 @@ mod tests {
         }
 
         // A later good build still works — the failed attempt cached nothing.
-        let dark_settings = tmp.path().join(HOOK_SETTINGS_NAME_NOSTOP);
-        let ok = materialize_with(tmp.path(), StopHookRegistration::Omitted);
+        let dark_settings = tmp
+            .path()
+            .join(settings_file_name(StopHookRegistration::Omitted, EV));
+        let ok = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV);
         assert_eq!(ok.as_deref(), Some(dark_settings.as_path()));
         assert!(dark_settings.exists());
     }
@@ -1575,5 +1859,192 @@ mod tests {
             STOP_HOOK_SCRIPT.contains(HOOK_SETTINGS_NAME),
             "{STOP_HOOK_SCRIPT_NAME} is armed-only, so its header must name `{HOOK_SETTINGS_NAME}`"
         );
+    }
+
+    // ---- agent-event http hooks (plan 2026-09-20-terminal-session-state-…,
+    // Phase 3, D2 re-decided: http hooks, no relay) --------------------------
+
+    /// Every http entry the carrier at `path` registers, by event.
+    fn http_entries(v: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        let mut out = Vec::new();
+        for (event, blocks) in v["hooks"].as_object().unwrap() {
+            for block in blocks.as_array().unwrap() {
+                for entry in block["hooks"].as_array().unwrap() {
+                    if entry["type"] == "http" {
+                        out.push((event.clone(), entry.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn agent_event_carrier_both_stop_variants_register_every_http_event() {
+        use qontinui_runner_lib::agent_event::INGESTED_EVENTS;
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = materialize_with(tmp.path(), reg, EV).expect("materialize ok");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let entries = http_entries(&v);
+            for event in INGESTED_EVENTS {
+                let hits: Vec<_> = entries.iter().filter(|(e, _)| e == event).collect();
+                assert_eq!(hits.len(), 1, "{reg:?}: exactly one http hook for {event}");
+                let entry = &hits[0].1;
+                assert_eq!(
+                    entry["url"], "http://127.0.0.1:49876/terminals/agent-event",
+                    "{reg:?} {event}: url carries the port"
+                );
+                assert_eq!(
+                    entry["headers"]["X-Qontinui-Terminal"],
+                    "$QONTINUI_TERMINAL_ID"
+                );
+                assert_eq!(
+                    entry["allowedEnvVars"],
+                    serde_json::json!(["QONTINUI_TERMINAL_ID"]),
+                    "{event}: header interpolation needs the allowlist"
+                );
+                let timeout = entry["timeout"].as_u64().expect("a timeout");
+                assert!((1..=2).contains(&timeout), "{event}: short timeout");
+                assert!(
+                    entry.get("async").is_none(),
+                    "{event}: http hooks do not support `async`"
+                );
+            }
+            assert_eq!(
+                entries.len(),
+                INGESTED_EVENTS.len(),
+                "{reg:?}: no extra http hooks"
+            );
+            let hooks = v["hooks"].as_object().unwrap();
+            for forbidden in ["PreToolUse", "PostToolUse"] {
+                assert!(!hooks.contains_key(forbidden), "{reg:?}: no {forbidden}");
+            }
+            assert!(
+                v.get("statusLine").is_none(),
+                "{reg:?}: never a statusLine (PROBE.md Q1)"
+            );
+            // The dark variant keeps the http Stop but still spawns no bash.
+            let stop_commands = hooks["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|b| b["hooks"].as_array().unwrap().iter())
+                .filter(|h| h["type"] == "command")
+                .count();
+            let want = usize::from(reg == StopHookRegistration::Registered);
+            assert_eq!(
+                stop_commands, want,
+                "{reg:?}: Stop command gating unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_event_carrier_two_ports_yield_two_distinct_filenames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a_ev = AgentEventHooks::Registered { port: 41_001 };
+        let b_ev = AgentEventHooks::Registered { port: 41_002 };
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let a = materialize_with(tmp.path(), reg, a_ev).unwrap();
+            let b = materialize_with(tmp.path(), reg, b_ev).unwrap();
+            assert_ne!(a, b, "{reg:?}: two ports must never share a carrier name");
+            assert!(
+                a.exists() && b.exists(),
+                "neither write clobbered the other"
+            );
+            assert!(std::fs::read_to_string(&a).unwrap().contains(":41001/"));
+            assert!(std::fs::read_to_string(&b).unwrap().contains(":41002/"));
+            assert!(!std::fs::read_to_string(&a).unwrap().contains(":41002/"));
+        }
+        // …and all four names are distinct from each other.
+        let mut names: Vec<String> = [a_ev, b_ev, AgentEventHooks::Omitted]
+            .iter()
+            .flat_map(|ev| {
+                [
+                    settings_file_name(StopHookRegistration::Registered, *ev),
+                    settings_file_name(StopHookRegistration::Omitted, *ev),
+                ]
+            })
+            .collect();
+        let n = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), n, "{names:?}");
+    }
+
+    #[test]
+    fn agent_event_carrier_omitted_registers_no_http_hook_and_keeps_legacy_names() {
+        assert_eq!(AgentEventHooks::from_port(0), AgentEventHooks::Omitted);
+        assert_eq!(
+            AgentEventHooks::from_port(9876),
+            AgentEventHooks::Registered { port: 9876 }
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let path = materialize_with(tmp.path(), reg, AgentEventHooks::Omitted).unwrap();
+            assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                reg.settings_name(),
+                "the port-less carrier keeps its historical name"
+            );
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(
+                http_entries(&v).is_empty(),
+                "{reg:?}: no http hook without a port"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_event_carrier_template_is_all_http_over_the_ingested_events() {
+        use qontinui_runner_lib::agent_event::INGESTED_EVENTS;
+        let v: serde_json::Value = serde_json::from_str(AGENT_EVENT_HOOKS).unwrap();
+        let mut events: Vec<&str> = v["hooks"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        events.sort_unstable();
+        let mut want = INGESTED_EVENTS.to_vec();
+        want.sort_unstable();
+        assert_eq!(events, want);
+        assert!(!AGENT_EVENT_HOOKS.contains("statusLine"));
+        assert!(!AGENT_EVENT_HOOKS.contains("\"command\""));
+        // A malformed events template fails the whole build open, never half.
+        let p = Path::new("/tmp/x.sh");
+        for bad in [
+            "{ not json",
+            r#"{"hooks":{}}"#,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://127.0.0.1:@@WHO@@/x"}]}]}}"#,
+        ] {
+            assert!(
+                build_settings_with_events(
+                    HOOK_SETTINGS,
+                    bad,
+                    p,
+                    p,
+                    p,
+                    p,
+                    StopHookRegistration::Omitted,
+                    EV
+                )
+                .is_none(),
+                "{bad}"
+            );
+        }
     }
 }

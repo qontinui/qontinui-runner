@@ -335,7 +335,13 @@ export type ZoneAssignments = Record<number, string>;
 
 // ── Session State (for status borders) ─────────────────────────────────────
 
-export type SessionState = "idle" | "working" | "needs-input" | "completed" | "error";
+/**
+ * `unknown` means nothing has been observed for the tab yet — rendered as its
+ * own neutral chip and excluded from every StatusStrip count. It is never
+ * silently rendered as `idle` (plan
+ * `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`).
+ */
+export type SessionState = "unknown" | "idle" | "working" | "needs-input" | "completed" | "error";
 
 const BASE_STORAGE_KEY = "qontinui-zone-layout";
 

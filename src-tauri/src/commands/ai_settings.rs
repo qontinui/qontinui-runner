@@ -1445,6 +1445,10 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
         })
         .collect();
     crate::ai_provider::record_account_usage(&samples);
+    // The same results are each account's `oauth_probe` headroom reading
+    // (plan 2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping
+    // Phase 6).
+    crate::terminal::agent_metrics::record_oauth_results(results);
 }
 
 /// Probe every configured account and refresh the selection usage snapshot.

@@ -1467,11 +1467,16 @@ pub struct TerminalSession {
     /// see the `terminal::scan_gate` module docs for why the ordering is
     /// load-bearing.
     grid_generation: Arc<AtomicU64>,
-    /// The last state-bearing OSC 9999 agent-status payload this pane reported
-    /// and when it arrived. Written by the reader thread
-    /// ([`crate::terminal::agent_status_sideband::dispatch`]); read by wind-down
-    /// eligibility through [`Self::last_agent_status`].
-    agent_status_last: Arc<Mutex<Option<ObservedAgentState>>>,
+    /// This pane's agent truth (plan
+    /// `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+    /// Phase 3) — the ONE per-terminal reducer slot every source offers into:
+    /// the hook ingest (`POST /terminals/agent-event`), the OSC 9999 sideband
+    /// (written by the reader thread through
+    /// [`crate::terminal::agent_status_sideband::dispatch`]) and the webview's
+    /// fallback detectors. Replaced the sideband-only `agent_status_last`;
+    /// wind-down still reads the sideband's own last report from it through
+    /// [`Self::last_agent_status`].
+    agent_state: Arc<Mutex<crate::terminal::agent_state::AgentStateSlot>>,
     /// Grid-idle continuity for wind-down: extends an idle window only while the
     /// grid generation has not moved between observations
     /// ([`qontinui_runner_lib::wind_down::GridIdleTracker`]).
@@ -1898,9 +1903,11 @@ impl TerminalSession {
         // a clone for the OSC 9999 agent-status sideband: a payload for a
         // terminal with no coord mirror has nowhere to go and is dropped.
         let coord_session_id: Arc<Mutex<Option<uuid::Uuid>>> = Arc::new(Mutex::new(None));
-        // Runner-local last OSC 9999 state, written by the reader thread even
-        // when there is no coord mirror (wind-down reads it, not coord).
-        let agent_status_last: Arc<Mutex<Option<ObservedAgentState>>> = Arc::new(Mutex::new(None));
+        // Runner-local agent truth; the reader thread offers OSC 9999 states
+        // into it even when there is no coord mirror (wind-down reads it).
+        let agent_state = Arc::new(Mutex::new(
+            crate::terminal::agent_state::AgentStateSlot::for_terminal(),
+        ));
 
         // Spawn reader thread: reads PTY output → interceptor → scrollback + Tauri event
         let reader_id = id.clone();
@@ -1921,7 +1928,7 @@ impl TerminalSession {
         let reader_grid = grid.clone();
         let reader_grid_generation = grid_generation.clone();
         let reader_coord_session_id = coord_session_id.clone();
-        let reader_agent_status_last = agent_status_last.clone();
+        let reader_agent_state = agent_state.clone();
         // Per-session OSC 9999 coalescer — see
         // `terminal::agent_status_sideband::SidebandRateLimiter`. Lives on the
         // reader thread (plus its deferred-flush tasks), NOT in a
@@ -2192,7 +2199,7 @@ impl TerminalSession {
                                     crate::terminal::agent_status_sideband::dispatch(
                                         &reader_id,
                                         &reader_coord_session_id,
-                                        &reader_agent_status_last,
+                                        &reader_agent_state,
                                         &reader_agent_status_limiter,
                                         payload,
                                     );
@@ -2414,7 +2421,7 @@ impl TerminalSession {
             grid,
             coord_session_id,
             spawn_name: std::sync::OnceLock::new(),
-            agent_status_last,
+            agent_state,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
             exit_snapshot,
@@ -3571,12 +3578,23 @@ impl TerminalSession {
     /// skipped: the slot is diagnostic evidence, and silently losing it on one
     /// panic elsewhere would make the phantom-turn detector read "no input" —
     /// the exact false positive it must not produce.
+    ///
+    /// Real input (not a control response) is then offered to the agent-state
+    /// slot, AFTER the input lock is released: when the pane's published
+    /// verdict is a `NeedsYou`, this input may be the human's answer, and
+    /// [`crate::terminal::agent_state::on_pty_input`] schedules one debounced
+    /// publish off this thread so the answered state reaches the webview now.
     fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
-        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
-        match slot {
-            InputSlot::Write => slots.last_write = Some(obs),
-            InputSlot::Submit => slots.last_submit = Some(obs),
-            InputSlot::ControlResponse => slots.last_control_response = Some(obs),
+        {
+            let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+            match slot {
+                InputSlot::Write => slots.last_write = Some(obs),
+                InputSlot::Submit => slots.last_submit = Some(obs),
+                InputSlot::ControlResponse => slots.last_control_response = Some(obs),
+            }
+        }
+        if slot != InputSlot::ControlResponse {
+            crate::terminal::agent_state::on_pty_input(&self.id, &self.agent_state);
         }
     }
 
@@ -4478,10 +4496,15 @@ impl TerminalSession {
     /// The last state-bearing OSC 9999 payload this pane reported. `Ok(None)`
     /// means it never reported one; `Err` means the slot could not be read.
     pub fn last_agent_status(&self) -> Result<Option<ObservedAgentState>, String> {
-        self.agent_status_last
+        self.agent_state
             .lock()
-            .map(|slot| slot.clone())
-            .map_err(|e| format!("agent-status slot poisoned: {e}"))
+            .map(|slot| slot.sideband_view())
+            .map_err(|e| format!("agent-state slot poisoned: {e}"))
+    }
+
+    /// This pane's agent-truth slot (see the field docs).
+    pub fn agent_state_slot(&self) -> &Arc<Mutex<crate::terminal::agent_state::AgentStateSlot>> {
+        &self.agent_state
     }
 
     /// Gracefully exit the `claude` in this pane (plan
@@ -5420,7 +5443,9 @@ pub(crate) mod tests {
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
             spawn_name: std::sync::OnceLock::new(),
-            agent_status_last: Arc::new(Mutex::new(None)),
+            agent_state: Arc::new(Mutex::new(
+                crate::terminal::agent_state::AgentStateSlot::for_terminal(),
+            )),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),

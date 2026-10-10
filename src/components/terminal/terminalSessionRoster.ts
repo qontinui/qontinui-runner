@@ -33,7 +33,7 @@ export interface RosterTab {
 }
 
 /** Mirrors `TerminalSessionState` from `@/lib/terminal-sessions-registry`. */
-export type RosterSessionState = "idle" | "working" | "needs-input" | "completed" | "error";
+export type RosterSessionState = "unknown" | "idle" | "working" | "needs-input" | "completed" | "error";
 
 /** One roster row. */
 export interface RosterRow {
@@ -43,7 +43,7 @@ export interface RosterRow {
   title: string;
   isReconnecting: boolean;
   /**
-   * Session-state-machine status, same source and same `"idle"` default as
+   * Session-state-machine status, same source and same `"unknown"` default as
    * `TerminalSessionEntry.state`. `"error"` / `"completed"` are what the page's
    * own exit handler writes for a dead PTY.
    */
@@ -82,7 +82,7 @@ export function buildTerminalSessionRoster(
       zoneIndex,
       title: t.title,
       isReconnecting: Boolean(t.isReconnecting),
-      state: sessionStates?.[t.id] ?? "idle",
+      state: sessionStates?.[t.id] ?? "unknown",
       isAlive: Boolean(t.isAlive),
       exitCode: t.exitCode ?? null,
     };
