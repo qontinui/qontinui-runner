@@ -950,7 +950,12 @@ describe("retry refresh CTA reports the concluded posture", () => {
       since: 1_791_337_100,
     })!;
     expect(retryErrorSurvives(timedOut.signal, concluded)).toBe(false);
-    expect(credentialDarkPresentation(concluded).ctaLabel).toBe("Sign in to re-pair");
+    // The formatter is injected: the default `formatSince` goes through
+    // `toLocaleTimeString`, whose first call initialises ICU/timezone data and
+    // took >5 s on a cold Windows CI runner. Nothing here is about the clock.
+    expect(credentialDarkPresentation(concluded, () => "03:57").ctaLabel).toBe(
+      "Sign in to re-pair",
+    );
   });
 
   it("a 'did not recover' does not outlive a recovery (no resurfacing on a later dark episode)", () => {
