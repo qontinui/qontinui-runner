@@ -5421,7 +5421,7 @@ async fn refresher_loop(
         // Dark posture → ask web whether an operator authorized a redeem. A
         // landed redeem re-runs the pass on the fresh credential.
         let wrong_tier = matches!(decision, Decision::IdleWrongTier);
-        let web_base = resolve_pair_base(&settings_snapshot);
+        let (web_base, _web_base_arm) = resolve_pair_base(&settings_snapshot);
         if crate::mcp::pending_redeem::on_refresher_pass(&web_base, wrong_tier).await {
             continue;
         }

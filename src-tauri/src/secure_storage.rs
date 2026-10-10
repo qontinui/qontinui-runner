@@ -663,7 +663,7 @@ struct StoredTokens {
 ///
 /// The ONE helper both the anchor slot ([`refresh_redeem_anchor`]) and
 /// `mcp::pending_redeem::select_anchor` use.
-pub(crate) fn pending_redeem_anchor_exp(token: &str, device_id: &str) -> Option<i64> {
+pub fn pending_redeem_anchor_exp(token: &str, device_id: &str) -> Option<i64> {
     use base64::Engine as _;
     let want = uuid::Uuid::parse_str(device_id.trim()).ok()?;
     let mut parts = token.trim().splitn(3, '.');
