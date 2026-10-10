@@ -3784,6 +3784,63 @@ fn redact_value(
     }
 }
 
+/// Repository / worktree CONTENT over `http_request` follows the owning
+/// tenant's `egress_code_mirror` switch: 409 `egress_off`, and the loopback
+/// API is never called. Audited against
+/// [`crate::mcp::relay_path_policy::RELAY_ALLOWED`], the routes that return
+/// repo or worktree content are:
+///
+/// - `GET /files/read?path=` — a file's bytes;
+/// - `GET /files/browse?path=` — a directory's listing (the repo's tree);
+/// - `POST /worktrees/diff` (`repo_path` in the body) — a branch's diff.
+///
+/// `GET /files/roots` (the configured root directories), `GET /worktrees`
+/// (worktree paths and branch names) and the merge / remove actions return
+/// no file content. The owner is the session working in the path's closest
+/// enclosing directory ([`crate::egress::path_session_tenant`]); a path no
+/// session owns, sessions of different tenants sharing it, or a request
+/// naming no path is judged by the strictest bound tenant.
+fn code_mirror_egress_refusal(
+    request_id: &Value,
+    raw_path: &str,
+    query: &str,
+    body: &[u8],
+) -> Option<Value> {
+    let segments = crate::mcp::relay_path_policy::normalize_relay_path(raw_path)?;
+    let target: Option<String> = match segments.as_slice() {
+        [r, leaf] if r == "files" && (leaf == "read" || leaf == "browse") => {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(k, _)| k == "path")
+                .map(|(_, v)| v.into_owned())
+        }
+        [r, leaf] if r == "worktrees" && leaf == "diff" => serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("repo_path")?.as_str().map(str::to_string)),
+        _ => return None,
+    };
+    let scope = target.as_deref().map_or(
+        crate::egress::SessionScope::Unresolved,
+        crate::egress::path_session_tenant,
+    );
+    let flow = crate::egress::Flow::CodeMirror;
+    if crate::egress::permit_or_count_session(flow, scope) {
+        return None;
+    }
+    let body = serde_json::json!({
+        "error": "egress_off",
+        "flow": flow.key(),
+        "domain": flow.domain(),
+        "message": crate::egress::refusal_message(flow),
+    })
+    .to_string();
+    Some(http_relay_response(
+        request_id,
+        409,
+        serde_json::json!({ "content-type": "application/json" }),
+        STANDARD.encode(body.as_bytes()),
+    ))
+}
+
 /// Handle a generic `http_request` relay command (mobile remote-runner
 /// connection). Self-calls the runner's own local Axum server over loopback
 /// and returns the response as a `command_response` frame. See
@@ -3881,6 +3938,9 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
             RELAY_MAX_BODY_BYTES
         );
         return http_relay_error(&request_id, 413, "request body exceeds relay size limit");
+    }
+    if let Some(refusal) = code_mirror_egress_refusal(&request_id, raw_path, query, &body_bytes) {
+        return refusal;
     }
 
     // Build the loopback URL from the supplied base (caller derives it from
@@ -9343,6 +9403,80 @@ mod egress_tests {
         let frame = serde_json::json!({"request_id": "rq", "method": "GET", "path": "/processes/p1/output"});
         let reply = relay_http_to_base(&counter.http_base(), &frame).await;
         assert_eq!(reply["status"], 409, "{reply}");
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Repo / worktree content over `http_request` follows the OWNING
+    /// tenant's code-mirror switch: the tenant of the session working in the
+    /// path's closest enclosing directory.
+    #[tokio::test]
+    async fn repo_content_reads_follow_the_owning_tenants_code_mirror() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000b);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _off = pin_for(Flow::CodeMirror, tenant, Level::Off);
+        let _t = fake_session_tenant("/work/wt-t", SessionScope::Tenant(tenant));
+        let _o = fake_session_tenant("/work/wt-o", SessionScope::DeviceDefault);
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let refused = |reply: &serde_json::Value| {
+            assert_eq!(reply["status"], 409, "{reply}");
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(reply["body_b64"].as_str().unwrap())
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "egress_off");
+            assert_eq!(body["flow"], "code_mirror");
+        };
+        for path in ["/files/read", "/files/browse"] {
+            let frame = serde_json::json!({
+                "request_id": "rq", "method": "GET", "path": path,
+                "query": "path=%2Fwork%2Fwt-t",
+            });
+            refused(&relay_http_to_base(&counter.http_base(), &frame).await);
+        }
+        let diff = |repo: &str| {
+            let body = serde_json::json!({
+                "branch_name": "b", "source_branch": "main", "repo_path": repo, "full_diff": true
+            })
+            .to_string();
+            serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": "/worktrees/diff",
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            })
+        };
+        refused(&relay_http_to_base(&counter.http_base(), &diff("/work/wt-t")).await);
+        assert_eq!(counter.count(), 0, "nothing reached the loopback API");
+
+        // Another tenant's (here the device default's) content still flows.
+        let frame = serde_json::json!({
+            "request_id": "rq", "method": "GET", "path": "/files/read",
+            "query": "path=%2Fwork%2Fwt-o",
+        });
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_ne!(reply["status"], 409, "{reply}");
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+    }
+
+    /// A path no session owns — or a request naming no path — is judged by
+    /// the strictest bound tenant's code-mirror switch.
+    #[tokio::test]
+    async fn unattributable_repo_content_takes_the_strictest_bound_tenant() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000c);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _off = pin_for(Flow::CodeMirror, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let counter = crate::egress::test_support::ConnCounter::start();
+        for frame in [
+            serde_json::json!({"request_id": "rq", "method": "GET", "path": "/files/read",
+                               "query": "path=%2Fnobody%2Fx"}),
+            serde_json::json!({"request_id": "rq", "method": "GET", "path": "/files/read"}),
+            serde_json::json!({"request_id": "rq", "method": "POST", "path": "/worktrees/diff"}),
+        ] {
+            let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+            assert_eq!(reply["status"], 409, "{frame}: {reply}");
+        }
         assert_eq!(counter.count(), 0);
     }
 
