@@ -620,6 +620,9 @@ const PROMPT_MODE_TEMPLATE_FLAGS: &[&str] = &[
     "--disallowedTools",
     "--disallowed-tools",
     "--teammate-mode",
+    // A display name changes nothing about permission posture.
+    "--name",
+    "-n",
 ];
 
 /// Whether a prompted launch keeps template flag `name` (`--flag` or
@@ -967,6 +970,14 @@ mod tests {
     #[test]
     fn template_name_kept_when_spec_has_none() {
         let argv = render_argv(&spec(), &tmpl("claude --name old"), "claude");
+        assert_eq!(value_after(&argv, "--name"), Some("old"));
+    }
+
+    #[test]
+    fn prompted_launch_keeps_the_template_name() {
+        let mut s = spec();
+        s.permission = PermissionMode::Prompt;
+        let argv = render_argv(&s, &tmpl("claude --name old"), "claude");
         assert_eq!(value_after(&argv, "--name"), Some("old"));
     }
 
