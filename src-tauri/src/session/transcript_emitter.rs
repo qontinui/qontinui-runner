@@ -521,7 +521,11 @@ impl TranscriptEmitter {
     /// [`AiCoordRegistrar::session_id_for`], whose own doc records that the
     /// old `task_run_id` parameter name "described one caller, not the key".
     pub fn emit(&self, session_key: &str, text: &str) {
-        if !crate::egress::transcript_sync_permitted() {
+        // Asked in the tenant the registrar recorded for this session (the
+        // device's default scope when it recorded none).
+        if !crate::egress::transcript_sync_gate_for(self.registrar.recorded_tenant(session_key))
+            .is_open()
+        {
             return;
         }
         self.emit_inner(session_key, text);

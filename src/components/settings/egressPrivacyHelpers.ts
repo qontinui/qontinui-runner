@@ -75,7 +75,9 @@ export function describeEgressSource(source: string, decidedBy?: string | null):
       ? "this deployment's default (self-hosted coord)"
       : decidedBy === "tenant_row"
         ? "set for this project in the web console"
-        : null;
+        : decidedBy === "legacy_store"
+          ? "an earlier runner's saved answer"
+          : null;
   switch (source) {
     case "coord":
       return origin ?? "decided by coord";
@@ -85,6 +87,8 @@ export function describeEgressSource(source: string, decidedBy?: string | null):
       return "this machine's profile default";
     case "product_default":
       return "product default";
+    case "unknown":
+      return "unknown — coord has not answered for this project yet, so it is refused until it does";
     default:
       return `unrecognised source "${source}"`;
   }

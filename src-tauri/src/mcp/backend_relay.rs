@@ -2429,7 +2429,7 @@ async fn handle_outbound(
                 let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
 
                 // Per-tenant egress switches (terminal stream, telemetry).
-                if !outbound_egress_permitted(channel) {
+                if !outbound_egress_permitted(channel, &event) {
                     continue;
                 }
 
@@ -2886,13 +2886,35 @@ const EGRESS_GATED_RELAY_FRAMES: &[(&str, &str)] = &[
     ("chat_get_output", "chat_output"),
 ];
 
+/// The tenant of the session a relay frame (or a forwarded event's payload)
+/// names: the open session on its terminal id, else the session the
+/// AI-session registrar recorded for its task-run id. `None` — no id, or a
+/// session this runner does not know — asks in the default scope. Both wire
+/// spellings are read: frames use snake_case, `AiOutputEvent` camelCase.
+fn relay_session_tenant(data: &Value) -> Option<uuid::Uuid> {
+    let field = |snake: &str, camel: &str| {
+        data.get(snake)
+            .or_else(|| data.get(camel))
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(terminal_id) = field("terminal_id", "terminalId") {
+        return crate::egress::terminal_session_tenant(terminal_id);
+    }
+    field("task_run_id", "taskRunId").and_then(crate::egress::task_run_session_tenant)
+}
+
 /// `Some(refusal frame)` when `msg_type` is a gated relay frame and the
-/// terminal-stream switch is off. Checked live on every frame.
+/// terminal-stream switch is off in the tenant of the session the frame names
+/// ([`relay_session_tenant`]). Checked live on every frame.
 fn terminal_egress_refusal(msg_type: &str, data: &Value) -> Option<Value> {
     let (_, reply_type) = EGRESS_GATED_RELAY_FRAMES
         .iter()
         .find(|(frame, _)| *frame == msg_type)?;
-    if crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) {
+    if crate::egress::permit_or_count_for(
+        crate::egress::Flow::TerminalStream,
+        relay_session_tenant(data),
+    ) {
         return None;
     }
     Some(crate::egress::egress_refusal_frame(
@@ -2907,11 +2929,14 @@ fn terminal_egress_refusal(msg_type: &str, data: &Value) -> Option<Value> {
 /// (`ai-output`, `session-state`) follow `egress_terminal_stream`, and
 /// `ui-error` / `recent-crash` follow `egress_telemetry` (checked live, unlike
 /// the boot-time crash reporter). Every other channel is not an egress flow.
-fn outbound_egress_permitted(channel: &str) -> bool {
+/// The session channels ask in the tenant of the session the event's payload
+/// names ([`relay_session_tenant`]); telemetry is device-wide.
+fn outbound_egress_permitted(channel: &str, event: &Value) -> bool {
     use crate::egress::Flow;
     match channel {
         "terminal-output" | "terminal-exit" | "ai-output" | "session-state" => {
-            crate::egress::permit_or_count(Flow::TerminalStream)
+            let tenant = event.get("payload").and_then(relay_session_tenant);
+            crate::egress::permit_or_count_for(Flow::TerminalStream, tenant)
         }
         "ui-error" | "recent-crash" => crate::egress::permit_or_count(Flow::Telemetry),
         _ => true,
@@ -3552,6 +3577,50 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
     )
 }
 
+/// The `http_request` routes that read a session's or process's output back
+/// out over the relay — `/task-runs/{id}/output`, `/session-state`, `/events`
+/// and `/processes/{id}/output` — stop at the tenant's `egress_terminal_stream`
+/// switch, like the typed `terminal_*` / `chat_get_output` frames: 409
+/// `egress_off`, and the loopback API is never called. Decided on the same
+/// normalised path the relay's path policy uses. A task-run read asks in the
+/// tenant the registrar recorded for that run; a process id names no session,
+/// so a process read asks in the default scope.
+fn http_request_egress_refusal(request_id: &Value, raw_path: &str) -> Option<Value> {
+    let segments = crate::mcp::relay_path_policy::normalize_relay_path(raw_path)?;
+    let (streams_output, tenant) = match segments.as_slice() {
+        [route, run, leaf] if route == "task-runs" => {
+            let streams = matches!(leaf.as_str(), "output" | "session-state" | "events");
+            (
+                streams,
+                streams
+                    .then(|| crate::egress::task_run_session_tenant(run))
+                    .flatten(),
+            )
+        }
+        [route, _, leaf] if route == "processes" => (leaf == "output", None),
+        _ => (false, None),
+    };
+    if !streams_output
+        || crate::egress::permit_or_count_for(crate::egress::Flow::TerminalStream, tenant)
+    {
+        return None;
+    }
+    let flow = crate::egress::Flow::TerminalStream;
+    let body = serde_json::json!({
+        "error": "egress_off",
+        "flow": flow.key(),
+        "domain": flow.domain(),
+        "message": crate::egress::refusal_message(flow),
+    })
+    .to_string();
+    Some(http_relay_response(
+        request_id,
+        409,
+        serde_json::json!({ "content-type": "application/json" }),
+        STANDARD.encode(body.as_bytes()),
+    ))
+}
+
 /// Handle a generic `http_request` relay command (mobile remote-runner
 /// connection). Self-calls the runner's own local Axum server over loopback
 /// and returns the response as a `command_response` frame. See
@@ -3620,6 +3689,9 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
             "http_request relay: refused a path that is not reachable over this arm"
         );
         return http_relay_error(&request_id, 403, verdict.message());
+    }
+    if let Some(refusal) = http_request_egress_refusal(&request_id, raw_path) {
+        return refusal;
     }
 
     let path = raw_path.trim_start_matches('/');
@@ -8945,18 +9017,36 @@ mod egress_tests {
     #[test]
     fn the_outbound_forwarder_follows_each_channels_own_switch() {
         let _t = pin(Flow::TerminalStream, Level::Off);
-        assert!(!outbound_egress_permitted("terminal-output"));
-        assert!(!outbound_egress_permitted("terminal-exit"));
+        assert!(!outbound_egress_permitted(
+            "terminal-output",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "terminal-exit",
+            &serde_json::Value::Null
+        ));
         assert!(
-            outbound_egress_permitted("ui-error"),
+            outbound_egress_permitted("ui-error", &serde_json::Value::Null),
             "telemetry is still on"
         );
-        assert!(outbound_egress_permitted("phase-result"));
+        assert!(outbound_egress_permitted(
+            "phase-result",
+            &serde_json::Value::Null
+        ));
         drop(_t);
         let _m = pin(Flow::Telemetry, Level::Off);
-        assert!(!outbound_egress_permitted("ui-error"));
-        assert!(!outbound_egress_permitted("recent-crash"));
-        assert!(outbound_egress_permitted("terminal-output"));
+        assert!(!outbound_egress_permitted(
+            "ui-error",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "recent-crash",
+            &serde_json::Value::Null
+        ));
+        assert!(outbound_egress_permitted(
+            "terminal-output",
+            &serde_json::Value::Null
+        ));
     }
 
     /// M4: relay channels carrying AI session content ride the terminal
@@ -8965,8 +9055,14 @@ mod egress_tests {
     #[test]
     fn ai_session_content_follows_the_terminal_stream_switch() {
         let _t = pin(Flow::TerminalStream, Level::Off);
-        assert!(!outbound_egress_permitted("ai-output"));
-        assert!(!outbound_egress_permitted("session-state"));
+        assert!(!outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "session-state",
+            &serde_json::Value::Null
+        ));
         let data = serde_json::json!({"request_id": "r-9", "session_id": "s-1"});
         let refusal = terminal_egress_refusal("chat_get_output", &data).expect("refused");
         assert_eq!(refusal["error"], "egress_off");
@@ -8974,8 +9070,106 @@ mod egress_tests {
         assert_eq!(refusal["request_id"], "r-9");
         drop(_t);
         let _on = pin(Flow::TerminalStream, Level::On);
-        assert!(outbound_egress_permitted("ai-output"));
+        assert!(outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
         assert!(terminal_egress_refusal("chat_get_output", &data).is_none());
+    }
+
+    /// Re-review 3: the `http_request` arm's session-output reads ride the
+    /// terminal-streaming switch: 409 `egress_off`, and no loopback call.
+    #[tokio::test]
+    async fn http_request_session_output_reads_are_refused_while_the_switch_is_off() {
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        for path in [
+            "/task-runs/11111111-1111-1111-1111-111111111111/output",
+            "/task-runs/11111111-1111-1111-1111-111111111111/session-state",
+            "/task-runs/11111111-1111-1111-1111-111111111111/events",
+            "/processes/p1/output",
+        ] {
+            let frame = serde_json::json!({"request_id": "rq", "method": "GET", "path": path});
+            let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+            assert_eq!(reply["status"], 409, "{path}: {reply}");
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(reply["body_b64"].as_str().unwrap())
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "egress_off", "{path}");
+        }
+        assert_eq!(counter.count(), 0, "nothing may reach the loopback API");
+    }
+
+    /// Item 9: a relay frame naming a session this runner knows asks in THAT
+    /// session's tenant, not the device default. The default scope is pinned
+    /// ON and the session's tenant OFF, so only a tenant-routed check refuses.
+    #[test]
+    fn session_frames_ask_in_the_sessions_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0001);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", Some(tenant));
+        let _r = fake_session_tenant("run-tenant", Some(tenant));
+        for (frame, _) in EGRESS_GATED_RELAY_FRAMES {
+            let data = if *frame == "chat_get_output" {
+                serde_json::json!({"task_run_id": "run-tenant"})
+            } else {
+                serde_json::json!({"terminal_id": "t-tenant"})
+            };
+            assert!(
+                terminal_egress_refusal(frame, &data).is_some(),
+                "{frame}: the session's tenant has the switch off"
+            );
+        }
+        // A frame naming no known session asks in the default scope (on).
+        assert!(terminal_egress_refusal(
+            "terminal_buffer",
+            &serde_json::json!({"terminal_id": "t-other"})
+        )
+        .is_none());
+    }
+
+    /// Item 9: the forwarder asks in the tenant of the session the event's
+    /// payload names — `terminal_id` for terminal frames, `taskRunId` for an
+    /// `AiOutputEvent`.
+    #[test]
+    fn the_outbound_forwarder_asks_in_the_events_session_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0005);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", Some(tenant));
+        let _r = fake_session_tenant("run-tenant", Some(tenant));
+        let terminal = serde_json::json!({"payload": {"terminal_id": "t-tenant"}});
+        let ai = serde_json::json!({"payload": {"taskRunId": "run-tenant"}});
+        assert!(!outbound_egress_permitted("terminal-output", &terminal));
+        assert!(!outbound_egress_permitted("terminal-exit", &terminal));
+        assert!(!outbound_egress_permitted("ai-output", &ai));
+        assert!(!outbound_egress_permitted("session-state", &ai));
+        let other = serde_json::json!({"payload": {"terminal_id": "t-other"}});
+        assert!(outbound_egress_permitted("terminal-output", &other));
+        assert!(outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_request_task_run_reads_ask_in_the_runs_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0002);
+        let run = "22222222-2222-2222-2222-222222222222";
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _r = fake_session_tenant(run, Some(tenant));
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let path = format!("/task-runs/{run}/output");
+        let frame = serde_json::json!({"request_id": "rq", "method": "GET", "path": path});
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_eq!(reply["status"], 409, "{reply}");
+        assert_eq!(counter.count(), 0, "nothing may reach the loopback API");
     }
 
     /// Both checks are wired where they act: before dispatch, and before the
@@ -8993,7 +9187,9 @@ mod egress_tests {
         let dispatch = cmd.find("match msg_type.as_str()").unwrap();
         assert!(gate < dispatch);
         let out = src.split_once("\nasync fn handle_outbound(").unwrap().1;
-        let gate = out.find("outbound_egress_permitted(channel)").unwrap();
+        let gate = out
+            .find("outbound_egress_permitted(channel, &event)")
+            .unwrap();
         let build = out.find("let relay_msg = match channel").unwrap();
         assert!(gate < build);
     }

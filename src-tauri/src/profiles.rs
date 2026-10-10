@@ -218,13 +218,14 @@ pub fn load_strict() -> Result<ResolvedProfile> {
 /// What the profile loader can say about the active profile's `egress` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveEgress {
-    /// No profiles.json at all (or no home directory to hold one): the machine
-    /// has no profile opinion.
+    /// No profiles.json at all — MEASURED (or no home directory to hold one):
+    /// the machine has no profile opinion.
     FileAbsent,
     /// The active profile, and its `egress` block when it has one.
     Profile(Option<EgressProfile>),
     /// profiles.json is PRESENT but could not be used — unreadable,
-    /// unparseable, or naming an active profile it does not define. Carries
+    /// unparseable, naming an active profile it does not define, or its
+    /// existence could not even be checked. Carries
     /// why. A reader of the egress switches treats this as `off`.
     Unreadable(String),
 }
@@ -244,8 +245,17 @@ pub fn active_egress_profile_at(
     path: &std::path::Path,
     env_active: Option<String>,
 ) -> ActiveEgress {
-    if !path.exists() {
-        return ActiveEgress::FileAbsent;
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return ActiveEgress::FileAbsent,
+        // Whether the file is there could not even be checked: that is not a
+        // measured absence.
+        Err(e) => {
+            return ActiveEgress::Unreadable(format!(
+                "cannot check whether {} exists: {e}",
+                path.display()
+            ))
+        }
     }
     match read_active_profile_at(path, env_active) {
         Ok((_, profile)) => ActiveEgress::Profile(profile.egress),

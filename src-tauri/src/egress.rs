@@ -57,31 +57,54 @@
 //!   self-hosted coord's egress `off`.
 //!
 //! A no-row answer with `default_source: "product"` is coord having NO opinion
-//! for this tenant ([`CoordAnswer::NoOpinion`]): it clears rungs 1 and 2 for
-//! that scope (a deleted tenant row must not live on in the store) and lets the
-//! machine profile, then the product default, answer. It is never persisted and
-//! never outranks a profile's `off`. A no-row answer with no `default_source`
-//! at all comes from a coord that predates the egress family
-//! ([`CoordAnswer::NotAnEgressAnswer`]) — its level is that coord's generic
-//! unknown-domain `off`, so it changes nothing.
+//! for this tenant ([`CoordAnswer::NoOpinion`]): it replaces any decision held
+//! for that scope (a deleted tenant row must not live on in the store) and
+//! lets the machine profile, then the product default, answer — it never
+//! outranks a profile's `off`. A no-row answer with no `default_source` at all
+//! comes from a coord that predates the egress family
+//! ([`CoordAnswer::NotAnEgressAnswer`]): it marks the scope answered (no
+//! longer UNKNOWN) without overriding anything already held.
 //!
-//! ## Scope: per coord deployment and per tenant
+//! ## Scope: per coord deployment and per tenant; UNKNOWN fails closed
 //!
 //! Answers are keyed by [`ScopeKey`] — the coord base URL plus the tenant —
 //! both in memory and in the store, so a runner re-pointed at another coord,
 //! or re-paired into another tenant, never inherits the previous one's
-//! switches. A call site that knows the tenant of the session it is sending
-//! for asks [`permit_for`] with it (the session-output drain, the terminal
-//! output pipe, transcript-bind); everything else asks for the device's
-//! default tenant.
+//! switches. The poller asks coord once per tenant this device holds a
+//! credential for, presenting THAT tenant's credential, and files each answer
+//! under the tenant the presented credential names. A call site that knows
+//! its session's tenant asks [`permit_for`] with it; everything else asks in
+//! the default scope, whose tenant is the one a new session is stamped with
+//! (`session::resolve_new_session_tenant`), so the two agree. A move of the
+//! default scope (re-pairing, a new coord) takes effect once coord has
+//! answered for the new scope; until then the stricter of the two applies.
 //!
-//! **The remaining multi-tenant limit.** The poller asks coord with the
-//! device's DEFAULT credential, so only the default tenant's switches are
-//! polled. A session owned by another tenant this device is bound to is
-//! evaluated against that tenant's last persisted answer (from a process in
-//! which it was the default), else the machine profile, else the product
-//! default — not against a live answer. `/health` `egress.scope` names the
-//! polled scope and states this.
+//! A scope that names a tenant but holds no answer — polled or persisted — is
+//! UNKNOWN ([`LevelSource::Unknown`]) and every flow fails closed there, never
+//! the product default. A device with no tenant at all has no tenant policy
+//! to wait for, and the profile, then the product default, answer.
+//!
+//! Which paths know their session's tenant:
+//!
+//! - the session-output drain (the record's owning session), the PTY output
+//!   pipe (the session's scope), transcript-bind (the caller's tenant), the
+//!   transcript tailer / watcher and emitter (the tenant the registrar
+//!   recorded for the session), and the code mirror (the agent token's
+//!   `tenant_id` claim) — all ask in that tenant;
+//! - the web relay (`terminal_*`, `chat_get_output`, the `http_request`
+//!   task-run reads and the `terminal-*` / `ai-output` / `session-state`
+//!   forwards) and the target side of remote terminal attach ask in the tenant
+//!   of the session the frame names — the open session on its terminal
+//!   ([`terminal_session_tenant`]) or the registrar's record for its task run
+//!   ([`task_run_session_tenant`]) — and in the default scope when the frame
+//!   names no session this runner knows;
+//! - what cannot be routed asks in the default scope: an `http_request` read
+//!   of `/processes/{id}/output` (a process id names no session), the SOURCE
+//!   side of remote attach (the terminal lives on another device, so there is
+//!   no local session to ask about), and the relay's `ui-error` /
+//!   `recent-crash` forwards (telemetry, device-wide);
+//! - telemetry, the update check and the skill mirror are device-wide and ask
+//!   in the default scope.
 //!
 //! ## Where each switch is enforced
 //!
@@ -136,7 +159,8 @@ pub(crate) const EGRESS_DOMAINS: [&str; 6] = [
 /// File name of the persisted-answer store, under the per-instance config dir.
 const STORE_FILE: &str = "egress-levels.json";
 
-/// Store schema version. A file carrying another value is treated as absent.
+/// Store schema version. A schema-1 file is migrated (its `off` values, into
+/// the default scope); any other value is treated as absent.
 const STORE_SCHEMA: u32 = 2;
 
 /// The `resolved_scope` coord answers when no policy row exists.
@@ -148,10 +172,11 @@ const DEFAULT_SOURCE_DEPLOYMENT_PROFILE: &str = "deployment_profile";
 /// The `default_source` of coord's product default — coord has no opinion.
 const DEFAULT_SOURCE_PRODUCT: &str = "product";
 
-/// What `/health` says about the polled scope's limit.
-const SCOPE_NOTE: &str = "only the device's default tenant is polled; a session of another \
-     bound tenant is evaluated against that tenant's persisted answer, else the machine \
-     profile, else the product default";
+/// What `/health` says about how scopes are polled and judged.
+const SCOPE_NOTE: &str = "every tenant this device holds a credential for is polled with that \
+     credential; a tenant with no polled or persisted answer is UNKNOWN and every flow fails \
+     closed for it; a device with no tenant at all uses the machine profile, else the product \
+     default";
 
 /// One outbound data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -256,6 +281,9 @@ pub(crate) enum CoordOrigin {
     TenantRow,
     /// No row; a self-hosted coord's `COORD_DEPLOYMENT_PROFILE` default.
     DeploymentProfile,
+    /// An `off` carried over from a schema-1 store, which did not record what
+    /// decided it. Kept (fail-closed) until coord answers for the scope.
+    LegacyStore,
 }
 
 impl CoordOrigin {
@@ -263,6 +291,7 @@ impl CoordOrigin {
         match self {
             CoordOrigin::TenantRow => "tenant_row",
             CoordOrigin::DeploymentProfile => "deployment_profile",
+            CoordOrigin::LegacyStore => "legacy_store",
         }
     }
 }
@@ -274,6 +303,17 @@ pub(crate) struct Decision {
     pub(crate) decided_by: CoordOrigin,
 }
 
+/// What coord has said about one flow in one scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// A decision (rungs 1/2).
+    Decided(Decision),
+    /// Coord answered and holds no decision for this tenant — its product
+    /// default, or a coord that predates the egress family. The machine
+    /// profile, then the product default, answer.
+    NoOpinion,
+}
+
 /// Which C6 rung produced a verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LevelSource {
@@ -281,6 +321,10 @@ pub(crate) enum LevelSource {
     Persisted(CoordOrigin),
     Profile,
     ProductDefault,
+    /// The scope names a tenant, and neither this process nor the store holds
+    /// any answer for it: the tenant's switch is UNKNOWN, and the flow fails
+    /// closed rather than assuming the product default.
+    Unknown,
 }
 
 impl LevelSource {
@@ -290,6 +334,7 @@ impl LevelSource {
             LevelSource::Persisted(_) => "persisted",
             LevelSource::Profile => "profile",
             LevelSource::ProductDefault => "product_default",
+            LevelSource::Unknown => "unknown",
         }
     }
 
@@ -297,7 +342,7 @@ impl LevelSource {
     pub(crate) const fn decided_by(self) -> Option<CoordOrigin> {
         match self {
             LevelSource::Coord(o) | LevelSource::Persisted(o) => Some(o),
-            LevelSource::Profile | LevelSource::ProductDefault => None,
+            LevelSource::Profile | LevelSource::ProductDefault | LevelSource::Unknown => None,
         }
     }
 }
@@ -309,24 +354,35 @@ pub(crate) struct EgressVerdict {
     pub(crate) source: LevelSource,
 }
 
-/// The C6 ladder. PURE: the first rung holding a level wins.
+/// The C6 ladder. PURE.
+///
+/// The first of `coord` / `persisted` that holds an answer decides: a decision
+/// is its level, and "no opinion" hands over to the profile, then the product
+/// default. With neither, a scope that names a tenant (`tenant_known`) is
+/// UNKNOWN and refuses; a scope with no tenant at all (an unpaired device)
+/// has no tenant policy to wait for, and the profile, then the product
+/// default, answer.
 pub(crate) fn resolve(
-    coord: Option<Decision>,
-    persisted: Option<Decision>,
+    coord: Option<Answer>,
+    persisted: Option<Answer>,
     profile: Option<Level>,
+    tenant_known: bool,
 ) -> EgressVerdict {
-    let (level, source) = if let Some(d) = coord {
-        (d.level, LevelSource::Coord(d.decided_by))
-    } else if let Some(d) = persisted {
-        (d.level, LevelSource::Persisted(d.decided_by))
-    } else if let Some(l) = profile {
-        (l, LevelSource::Profile)
-    } else {
-        (Level::On, LevelSource::ProductDefault)
-    };
-    EgressVerdict {
+    let verdict = |level: Level, source| EgressVerdict {
         allowed: level == Level::On,
         source,
+    };
+    let fallthrough = || match profile {
+        Some(l) => verdict(l, LevelSource::Profile),
+        None => verdict(Level::On, LevelSource::ProductDefault),
+    };
+    match (coord, persisted) {
+        (Some(Answer::Decided(d)), _) => verdict(d.level, LevelSource::Coord(d.decided_by)),
+        (Some(Answer::NoOpinion), _) => fallthrough(),
+        (None, Some(Answer::Decided(d))) => verdict(d.level, LevelSource::Persisted(d.decided_by)),
+        (None, Some(Answer::NoOpinion)) => fallthrough(),
+        (None, None) if tenant_known => verdict(Level::Off, LevelSource::Unknown),
+        (None, None) => fallthrough(),
     }
 }
 
@@ -343,9 +399,10 @@ pub(crate) fn profile_level(raw: Option<&str>) -> Option<Level> {
 /// Rung 3 from what the profile loader read. PURE.
 ///
 /// Only an ABSENT profiles.json is "no opinion". A file that is present but
-/// unreadable or unparseable, or that names an active profile it does not
-/// define, reads `off`: the machine was configured, and a configuration this
-/// runner cannot read is never an authorisation to send.
+/// unreadable or unparseable, whose existence cannot even be checked, or that
+/// names an active profile it does not define, reads `off`: the machine was
+/// configured, and a configuration this runner cannot read is never an
+/// authorisation to send.
 pub(crate) fn profile_rung(read: &qontinui_runner_lib::profiles::ActiveEgress) -> Option<Level> {
     use qontinui_runner_lib::profiles::ActiveEgress;
     match read {
@@ -364,11 +421,13 @@ pub(crate) enum CoordAnswer {
     /// default. Rung 1, and persisted as rung 2.
     Authoritative(Decision),
     /// No row and coord's PRODUCT default: coord has no opinion for this
-    /// tenant. Clears rungs 1 and 2 for the scope; never persisted.
+    /// tenant. Replaces any decision for the scope (a deleted tenant row must
+    /// not live on in the store); the profile answers.
     NoOpinion,
     /// A no-row answer from a coord that does not know the egress family (no
     /// `default_source`), or names a default this runner cannot interpret.
-    /// Changes nothing.
+    /// Coord answered, so the scope is no longer UNKNOWN, but it says nothing
+    /// that could override a decision already held.
     NotAnEgressAnswer,
 }
 
@@ -377,6 +436,12 @@ pub(crate) enum CoordAnswer {
 /// Within an authoritative answer, an unreadable level is `off`: coord said
 /// something about this flow, and a level we cannot identify is never an
 /// authorisation to send.
+///
+/// The `default_source` values (`deployment_profile`, `product`) are those of
+/// the coord change adding the egress family (qontinui-coord branch
+/// `agent/eb2155ed4152-01a123e8b4fe/p9c-6-3a-egress-domains-and-ingest`, Phase 6
+/// of this plan); until that lands on coord's main they are a runner-side
+/// reading of that branch, and any other value is not interpreted.
 pub(crate) fn classify_coord_answer(
     effective_level: Option<&str>,
     resolved_scope: Option<&str>,
@@ -418,8 +483,8 @@ impl ScopeKey {
     }
 }
 
-type Decisions = [Option<Decision>; 6];
-type ScopedDecisions = HashMap<ScopeKey, Decisions>;
+type Answers = [Option<Answer>; 6];
+type ScopedAnswers = HashMap<ScopeKey, Answers>;
 
 /// The persisted-answer store's on-disk shape.
 #[derive(Debug, Serialize, Deserialize)]
@@ -433,62 +498,107 @@ struct StoreFile {
 struct StoreScope {
     #[serde(flatten)]
     key: ScopeKey,
-    /// domain → decision. Unknown domains and unreadable entries are dropped.
+    /// domain → `{level, decided_by}` or `{no_opinion: true}`. Unknown domains
+    /// and unreadable entries are dropped.
     levels: std::collections::BTreeMap<String, Value>,
+}
+
+/// One stored answer, as JSON.
+fn encode_answer(answer: Answer) -> Value {
+    match answer {
+        Answer::Decided(d) => serde_json::to_value(d).unwrap_or(Value::Null),
+        Answer::NoOpinion => json!({ "no_opinion": true }),
+    }
+}
+
+/// One stored answer, from JSON; `None` when unreadable.
+fn decode_answer(value: &Value) -> Option<Answer> {
+    if value.get("no_opinion").and_then(Value::as_bool) == Some(true) {
+        return Some(Answer::NoOpinion);
+    }
+    serde_json::from_value::<Decision>(value.clone())
+        .ok()
+        .map(Answer::Decided)
+}
+
+/// A schema-1 store: `{domain: "on"|"off"}` with no scope. Its `off` values
+/// are carried into `default_scope` as legacy decisions (fail-closed); its `on`
+/// values are dropped, since nothing said which coord or tenant chose them.
+fn decode_legacy_store(raw: &Value, default_scope: &ScopeKey) -> ScopedAnswers {
+    let mut answers: Answers = [None; 6];
+    if let Some(levels) = raw.get("levels").and_then(Value::as_object) {
+        for (domain, level) in levels {
+            let off = level.as_str().and_then(Level::parse) == Some(Level::Off);
+            if let (Some(flow), true) = (Flow::from_domain(domain), off) {
+                answers[flow.index()] = Some(Answer::Decided(Decision {
+                    level: Level::Off,
+                    decided_by: CoordOrigin::LegacyStore,
+                }));
+            }
+        }
+    }
+    let mut out = ScopedAnswers::new();
+    if answers.iter().any(Option::is_some) {
+        out.insert(default_scope.clone(), answers);
+    }
+    out
 }
 
 /// Decode a store file. PURE. A corrupt file, a foreign schema, unknown
 /// domains and unreadable entries all read as absent — never a panic, never a
-/// guess.
-fn decode_store(raw: &str) -> ScopedDecisions {
-    let mut out = ScopedDecisions::new();
-    let file: StoreFile = match serde_json::from_str(raw) {
+/// guess. A schema-1 file is migrated ([`decode_legacy_store`]).
+fn decode_store(raw: &str, default_scope: &ScopeKey) -> ScopedAnswers {
+    let mut out = ScopedAnswers::new();
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("egress: persisted levels unreadable — treating as absent: {e}");
+            return out;
+        }
+    };
+    match value.get("schema").and_then(Value::as_u64) {
+        Some(1) => return decode_legacy_store(&value, default_scope),
+        Some(s) if s == u64::from(STORE_SCHEMA) => {}
+        other => {
+            warn!(
+                "egress: persisted levels carry schema {other:?} (expected {STORE_SCHEMA}) — \
+                 treating as absent"
+            );
+            return out;
+        }
+    }
+    let file: StoreFile = match serde_json::from_value(value) {
         Ok(f) => f,
         Err(e) => {
             warn!("egress: persisted levels unreadable — treating as absent: {e}");
             return out;
         }
     };
-    if file.schema != STORE_SCHEMA {
-        warn!(
-            "egress: persisted levels carry schema {} (expected {STORE_SCHEMA}) — treating as \
-             absent",
-            file.schema
-        );
-        return out;
-    }
     for scope in file.scopes {
-        let mut decisions: Decisions = [None; 6];
+        let mut answers: Answers = [None; 6];
         for (domain, entry) in &scope.levels {
-            let (Some(flow), Ok(decision)) = (
-                Flow::from_domain(domain),
-                serde_json::from_value::<Decision>(entry.clone()),
-            ) else {
-                continue;
-            };
-            decisions[flow.index()] = Some(decision);
+            if let (Some(flow), Some(answer)) = (Flow::from_domain(domain), decode_answer(entry)) {
+                answers[flow.index()] = Some(answer);
+            }
         }
         out.insert(
             ScopeKey::new(&scope.key.coord_base, scope.key.tenant_id),
-            decisions,
+            answers,
         );
     }
     out
 }
 
 /// Encode a store file. PURE apart from the timestamp.
-fn encode_store(scopes: &ScopedDecisions) -> Vec<u8> {
+fn encode_store(scopes: &ScopedAnswers) -> Vec<u8> {
     let mut entries: Vec<StoreScope> = scopes
         .iter()
-        .filter(|(_, d)| d.iter().any(Option::is_some))
-        .map(|(key, decisions)| StoreScope {
+        .filter(|(_, a)| a.iter().any(Option::is_some))
+        .map(|(key, answers)| StoreScope {
             key: key.clone(),
             levels: Flow::ALL
                 .into_iter()
-                .filter_map(|f| {
-                    let d = decisions[f.index()]?;
-                    Some((f.domain().to_string(), serde_json::to_value(d).ok()?))
-                })
+                .filter_map(|f| Some((f.domain().to_string(), encode_answer(answers[f.index()]?))))
                 .collect(),
         })
         .collect();
@@ -505,10 +615,10 @@ fn encode_store(scopes: &ScopedDecisions) -> Vec<u8> {
 
 /// Read the store at `path`. READS ONLY: a missing file (or a missing parent
 /// directory) is first boot and creates nothing.
-fn load_store(path: &Path) -> ScopedDecisions {
+fn load_store(path: &Path, default_scope: &ScopeKey) -> ScopedAnswers {
     match std::fs::read_to_string(path) {
-        Ok(raw) => decode_store(&raw),
-        Err(_) => ScopedDecisions::new(),
+        Ok(raw) => decode_store(&raw, default_scope),
+        Err(_) => ScopedAnswers::new(),
     }
 }
 
@@ -516,7 +626,7 @@ fn load_store(path: &Path) -> ScopedDecisions {
 /// the one writer — rather than as a side effect of resolving the path (the
 /// `persist_briefings` precedent). Best-effort: a failure costs durability
 /// across the next restart, never the in-memory state.
-fn persist_store(path: &Path, scopes: &ScopedDecisions) {
+fn persist_store(path: &Path, scopes: &ScopedAnswers) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!("egress: store dir create failed (best-effort): {e}");
@@ -531,13 +641,18 @@ fn persist_store(path: &Path, scopes: &ScopedDecisions) {
 /// The process's switch state: one instance in production ([`state`]), and
 /// private instances in tests.
 pub(crate) struct EgressState {
-    /// Rung 1 — this process's authoritative coord answers, per scope.
-    coord: RwLock<ScopedDecisions>,
+    /// Rung 1 — this process's coord answers, per scope.
+    coord: RwLock<ScopedAnswers>,
     /// Rung 2 — what the store held at boot, updated as answers are persisted.
-    persisted: RwLock<ScopedDecisions>,
-    /// The scope the poller asks about: the device's default tenant at the
-    /// coord it talks to. A call that names no tenant is evaluated here.
+    persisted: RwLock<ScopedAnswers>,
+    /// The DEFAULT scope: this coord and the tenant a new session is stamped
+    /// with ([`crate::session::resolve_new_session_tenant`]). A call that
+    /// names no tenant is evaluated here.
     current: RwLock<ScopeKey>,
+    /// A default scope the poller has moved to but coord has not answered for
+    /// yet. Until it has, a call that names no tenant gets the STRICTER of the
+    /// old and new scope's verdicts.
+    pending: RwLock<Option<ScopeKey>>,
     /// Rung 3 — the profile's `egress.default`, read once.
     profile: Option<Level>,
     /// Where rung 2 lives; `None` when the config dir does not resolve.
@@ -554,11 +669,15 @@ impl EgressState {
         profile: Option<Level>,
         current: ScopeKey,
     ) -> Self {
-        let persisted = store_path.as_deref().map(load_store).unwrap_or_default();
+        let persisted = store_path
+            .as_deref()
+            .map(|p| load_store(p, &current))
+            .unwrap_or_default();
         Self {
-            coord: RwLock::new(ScopedDecisions::new()),
+            coord: RwLock::new(ScopedAnswers::new()),
             persisted: RwLock::new(persisted),
             current: RwLock::new(current),
+            pending: RwLock::new(None),
             profile,
             store_path,
             refused: Default::default(),
@@ -566,14 +685,14 @@ impl EgressState {
         }
     }
 
-    fn lookup(map: &RwLock<ScopedDecisions>, key: &ScopeKey, flow: Flow) -> Option<Decision> {
+    fn lookup(map: &RwLock<ScopedAnswers>, key: &ScopeKey, flow: Flow) -> Option<Answer> {
         map.read()
             .unwrap_or_else(|p| p.into_inner())
             .get(key)
-            .and_then(|d| d[flow.index()])
+            .and_then(|a| a[flow.index()])
     }
 
-    /// The polled scope.
+    /// The default scope.
     pub(crate) fn current_scope(&self) -> ScopeKey {
         self.current
             .read()
@@ -581,69 +700,105 @@ impl EgressState {
             .clone()
     }
 
-    /// Move the polled scope (the poller, each tick).
-    pub(crate) fn set_current_scope(&self, key: ScopeKey) {
-        *self.current.write().unwrap_or_else(|p| p.into_inner()) = key;
+    fn pending_scope(&self) -> Option<ScopeKey> {
+        self.pending
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
-    /// The scope for a call: `tenant` when the caller knows it, else the
-    /// device's default; always at the coord the poller talks to.
-    fn scope_for(&self, tenant: Option<Uuid>) -> ScopeKey {
-        let current = self.current_scope();
-        ScopeKey {
-            tenant_id: tenant.or(current.tenant_id),
-            coord_base: current.coord_base,
+    /// Move the default scope (the poller, each tick). The move takes effect
+    /// once coord has answered for the new scope; until then it is pending.
+    pub(crate) fn set_current_scope(&self, key: ScopeKey) {
+        let mut pending = self.pending.write().unwrap_or_else(|p| p.into_inner());
+        if key == self.current_scope() {
+            *pending = None;
+        } else {
+            *pending = Some(key);
         }
     }
 
-    /// The C6 verdict for `flow` in `tenant`'s scope (`None` = the device's
-    /// default tenant). Lock-only, safe on any path.
-    pub(crate) fn permit_for(&self, flow: Flow, tenant: Option<Uuid>) -> EgressVerdict {
-        let key = self.scope_for(tenant);
+    fn verdict_in(&self, key: &ScopeKey, flow: Flow) -> EgressVerdict {
         resolve(
-            Self::lookup(&self.coord, &key, flow),
-            Self::lookup(&self.persisted, &key, flow),
+            Self::lookup(&self.coord, key, flow),
+            Self::lookup(&self.persisted, key, flow),
             self.profile,
+            key.tenant_id.is_some(),
         )
     }
 
-    /// [`Self::permit_for`] in the default tenant's scope.
+    /// The C6 verdict for `flow` in `tenant`'s scope (`None` = the default
+    /// scope). Lock-only, safe on any path.
+    pub(crate) fn permit_for(&self, flow: Flow, tenant: Option<Uuid>) -> EgressVerdict {
+        let current = self.current_scope();
+        if let Some(t) = tenant {
+            return self.verdict_in(&ScopeKey::new(&current.coord_base, Some(t)), flow);
+        }
+        let old = self.verdict_in(&current, flow);
+        match self.pending_scope() {
+            // The stricter of the two: a refusal in either scope refuses.
+            Some(next) => {
+                let new = self.verdict_in(&next, flow);
+                if old.allowed && !new.allowed {
+                    new
+                } else {
+                    old
+                }
+            }
+            None => old,
+        }
+    }
+
+    /// [`Self::permit_for`] in the default scope.
     pub(crate) fn permit(&self, flow: Flow) -> EgressVerdict {
         self.permit_for(flow, None)
     }
 
     /// Apply one classified coord answer for `flow` in scope `key`.
     ///
-    /// - authoritative: rung 1 holds it, and the store is rewritten when (and
-    ///   only when) the persisted value changes — a steady state rewrites
-    ///   nothing;
-    /// - no opinion (the product default): rungs 1 and 2 are cleared for the
-    ///   scope, so a deleted tenant row does not live on in the store and the
-    ///   profile answers;
-    /// - not an egress answer: nothing.
+    /// - authoritative: rung 1 holds the decision;
+    /// - no opinion (the product default): rung 1 holds "no opinion", which
+    ///   replaces a decision (a deleted tenant row must not live on) and lets
+    ///   the profile answer;
+    /// - not an egress answer: coord answered, so a scope holding nothing is
+    ///   no longer UNKNOWN ("no opinion"); a scope already holding an answer
+    ///   keeps it.
+    ///
+    /// The store is rewritten when (and only when) the persisted value changes.
+    /// A pending default scope becomes current once it has an answer.
     pub(crate) fn apply_coord_answer(&self, key: &ScopeKey, flow: Flow, answer: CoordAnswer) {
         let i = flow.index();
+        let held =
+            Self::lookup(&self.coord, key, flow).or(Self::lookup(&self.persisted, key, flow));
         let next = match answer {
-            CoordAnswer::Authoritative(d) => Some(d),
-            CoordAnswer::NoOpinion => None,
-            CoordAnswer::NotAnEgressAnswer => return,
+            CoordAnswer::Authoritative(d) => Answer::Decided(d),
+            CoordAnswer::NoOpinion => Answer::NoOpinion,
+            CoordAnswer::NotAnEgressAnswer => held.unwrap_or(Answer::NoOpinion),
         };
         self.coord
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .entry(key.clone())
-            .or_insert([None; 6])[i] = next;
+            .or_insert([None; 6])[i] = Some(next);
+        self.promote_pending(key);
         let snapshot = {
             let mut persisted = self.persisted.write().unwrap_or_else(|p| p.into_inner());
-            let current = persisted.get(key).and_then(|d| d[i]);
-            if current == next {
+            if persisted.get(key).and_then(|a| a[i]) == Some(next) {
                 return;
             }
-            persisted.entry(key.clone()).or_insert([None; 6])[i] = next;
+            persisted.entry(key.clone()).or_insert([None; 6])[i] = Some(next);
             persisted.clone()
         };
         if let Some(path) = &self.store_path {
             persist_store(path, &snapshot);
+        }
+    }
+
+    fn promote_pending(&self, answered: &ScopeKey) {
+        let mut pending = self.pending.write().unwrap_or_else(|p| p.into_inner());
+        if pending.as_ref() == Some(answered) {
+            *self.current.write().unwrap_or_else(|p| p.into_inner()) = answered.clone();
+            *pending = None;
         }
     }
 
@@ -664,8 +819,9 @@ impl EgressState {
         }
     }
 
-    /// The `/health` `egress` object over this state: `scope` (the polled
-    /// coord + tenant, and the multi-tenant limit) plus one entry per flow.
+    /// The `/health` `egress` object over this state: `scope` (the default
+    /// coord + tenant, any pending move, and how other tenants are treated)
+    /// plus one entry per flow, evaluated in the default scope.
     pub(crate) fn health_json(&self) -> Value {
         let current = self.current_scope();
         let mut out = serde_json::Map::new();
@@ -674,6 +830,7 @@ impl EgressState {
             json!({
                 "coord_base": current.coord_base,
                 "tenant_id": current.tenant_id,
+                "pending_tenant_id": self.pending_scope().map(|p| p.tenant_id),
                 "note": SCOPE_NOTE,
             }),
         );
@@ -725,20 +882,20 @@ fn production_profile_level() -> Option<Level> {
     level
 }
 
-/// The scope a fresh process starts on: the coord base this runner resolves
-/// and the device's declared default tenant.
+/// The default scope a fresh process starts on: the coord base this runner
+/// resolves and the tenant a new session is stamped with — the SAME resolver
+/// the session paths use, so a session of the default binding and a call that
+/// names no tenant land in one scope.
 #[cfg(not(test))]
 fn production_scope() -> ScopeKey {
     let (base, _source) = qontinui_runner_lib::profiles::coord_base_with_source();
-    ScopeKey::new(
-        &base,
-        crate::session::dual_write::resolve_active_tenant_id(),
-    )
+    ScopeKey::new(&base, crate::session::resolve_new_session_tenant())
 }
 
 /// The process-global state. Test builds never touch the real config dir or
-/// profile: their global starts empty (every flow at the product default), and
-/// tests pin levels per thread through [`test_support::pin`].
+/// profile: their global starts empty with no tenant (every flow at the
+/// product default), and tests pin levels per thread through
+/// [`test_support::pin`].
 fn state() -> &'static EgressState {
     static STATE: OnceLock<EgressState> = OnceLock::new();
     STATE.get_or_init(|| {
@@ -757,12 +914,12 @@ fn state() -> &'static EgressState {
     })
 }
 
-/// The C6 verdict for `flow` in `tenant`'s scope (`None` = the device's
-/// default tenant). Lock-only — safe from synchronous spawn paths,
-/// keystroke-rate relay handlers and the boot sequence.
+/// The C6 verdict for `flow` in `tenant`'s scope (`None` = the default scope).
+/// Lock-only — safe from synchronous spawn paths, keystroke-rate relay
+/// handlers and the boot sequence.
 pub(crate) fn permit_for(flow: Flow, tenant: Option<Uuid>) -> EgressVerdict {
     #[cfg(test)]
-    if let Some(level) = test_support::pinned(flow) {
+    if let Some(level) = test_support::pinned_for(flow, tenant) {
         return EgressVerdict {
             allowed: level == Level::On,
             source: LevelSource::Coord(CoordOrigin::TenantRow),
@@ -771,7 +928,64 @@ pub(crate) fn permit_for(flow: Flow, tenant: Option<Uuid>) -> EgressVerdict {
     state().permit_for(flow, tenant)
 }
 
-/// [`permit_for`] in the device's default tenant's scope.
+/// The app handle the session-tenant lookups read the lifecycle store and
+/// the AI-session registrar through. Installed once at boot, after both are
+/// managed; before that (and in a process that never installs it) every
+/// lookup answers `None`, i.e. the default scope.
+static SESSION_TENANT_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Install the handle [`terminal_session_tenant`] / [`task_run_session_tenant`]
+/// read through. Idempotent: a second install is ignored.
+pub(crate) fn install_session_tenant_lookup(app: tauri::AppHandle) {
+    let _ = SESSION_TENANT_APP.set(app);
+}
+
+/// The tenant the open session on terminal `terminal_id` was spawned for (the
+/// lifecycle store's `tenant_id`), or `None` — no open session there, a
+/// session spawned for the device default, or the lookup not installed — in
+/// which case the caller asks in the default scope. A stamped tenant that is
+/// not a UUID reads as `None` too (and is logged): it names no scope coord
+/// could have answered for.
+pub(crate) fn terminal_session_tenant(terminal_id: &str) -> Option<Uuid> {
+    #[cfg(test)]
+    if let Some(faked) = test_support::faked_session_tenant(terminal_id) {
+        return faked;
+    }
+    use tauri::Manager;
+    let app = SESSION_TENANT_APP.get()?;
+    let store = app.try_state::<std::sync::Arc<
+        crate::session::session_lifecycle_store::SessionLifecycleStore,
+    >>()?;
+    let stamped = store.find_open_by_terminal(terminal_id)?.tenant_id?;
+    match Uuid::parse_str(&stamped) {
+        Ok(t) => Some(t),
+        Err(_) => {
+            warn!(
+                terminal_id,
+                stamped, "egress: session tenant is not a UUID — asking in the default scope"
+            );
+            None
+        }
+    }
+}
+
+/// The tenant the AI-session registrar recorded for the session behind
+/// `task_run_id` (its R4 key), or `None` — not registered by this process, no
+/// tenant resolved, or the lookup not installed — in which case the caller
+/// asks in the default scope.
+pub(crate) fn task_run_session_tenant(task_run_id: &str) -> Option<Uuid> {
+    #[cfg(test)]
+    if let Some(faked) = test_support::faked_session_tenant(task_run_id) {
+        return faked;
+    }
+    use tauri::Manager;
+    let app = SESSION_TENANT_APP.get()?;
+    let registrar =
+        app.try_state::<std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
+    registrar.recorded_tenant(task_run_id)
+}
+
+/// [`permit_for`] in the default scope.
 pub(crate) fn permit(flow: Flow) -> EgressVerdict {
     permit_for(flow, None)
 }
@@ -786,7 +1000,7 @@ pub(crate) fn permit_or_count_for(flow: Flow, tenant: Option<Uuid>) -> bool {
     allowed
 }
 
-/// [`permit_or_count_for`] in the default tenant's scope.
+/// [`permit_or_count_for`] in the default scope.
 pub(crate) fn permit_or_count(flow: Flow) -> bool {
     permit_or_count_for(flow, None)
 }
@@ -797,7 +1011,7 @@ pub(crate) fn apply_coord_answer(key: &ScopeKey, flow: Flow, answer: CoordAnswer
     state().apply_coord_answer(key, flow, answer);
 }
 
-/// Move the polled scope (the poller's write door, each tick).
+/// Move the default scope (the poller's write door, each tick).
 pub(crate) fn set_current_scope(key: ScopeKey) {
     state().set_current_scope(key);
 }
@@ -808,7 +1022,7 @@ pub(crate) enum TranscriptGate {
     Open,
     /// The user's own `cloud_sync_enabled` toggle is off.
     UserConsentOff,
-    /// The tenant's `egress_transcript_sync` switch is off.
+    /// The tenant's `egress_transcript_sync` switch is off (or UNKNOWN).
     TenantSwitchOff,
 }
 
@@ -834,8 +1048,8 @@ pub(crate) fn transcript_gate_with(
     }
 }
 
-/// Transcript sync's gate for a session of `tenant` (`None` = the device's
-/// default tenant): the tenant's `egress_transcript_sync` AND the user's own
+/// Transcript sync's gate for a session of `tenant` (`None` = the default
+/// scope): the tenant's `egress_transcript_sync` AND the user's own
 /// `cloud_sync_enabled`. Every egress path of the transcript / tenant-memory
 /// family reads this (or [`transcript_sync_permitted`]), never the user's
 /// toggle bare — `no_bare_cloud_sync_reads_outside_the_allowed_files`
@@ -847,7 +1061,7 @@ pub(crate) fn transcript_sync_gate_for(tenant: Option<Uuid>) -> TranscriptGate {
     )
 }
 
-/// [`transcript_sync_gate_for`] in the default tenant's scope, as a bool.
+/// [`transcript_sync_gate_for`] in the default scope, as a bool.
 pub(crate) fn transcript_sync_permitted() -> bool {
     transcript_sync_gate_for(None).is_open()
 }
@@ -876,25 +1090,29 @@ pub(crate) fn telemetry_permitted_at_boot() -> bool {
     verdict.allowed
 }
 
-/// The refusal frame a relay handler answers instead of sending `flow`'s
-/// bytes, typed as the reply the caller is waiting for (`terminal_response`,
-/// `chat_output`). `request_id` / `terminal_id` / `session_id` are echoed so
-/// the web side can correlate it; the console renders `message`.
-pub(crate) fn egress_refusal_frame(reply_type: &str, flow: Flow, data: &Value) -> Value {
-    let message = match flow {
+/// The human sentence for a refused flow.
+pub(crate) const fn refusal_message(flow: Flow) -> &'static str {
+    match flow {
         Flow::TerminalStream => "Terminal streaming is off for this project",
         Flow::TranscriptSync => "Transcript sync is off for this project",
         Flow::CodeMirror => "The code mirror is off for this project",
         Flow::Telemetry => "Telemetry is off for this project",
         Flow::UpdateCheck => "Update checks are off for this project",
         Flow::SkillMirror => "The skill mirror is off for this project",
-    };
+    }
+}
+
+/// The refusal frame a relay handler answers instead of sending `flow`'s
+/// bytes, typed as the reply the caller is waiting for (`terminal_response`,
+/// `chat_output`). `request_id` / `terminal_id` / `session_id` are echoed so
+/// the web side can correlate it; the console renders `message`.
+pub(crate) fn egress_refusal_frame(reply_type: &str, flow: Flow, data: &Value) -> Value {
     json!({
         "type": reply_type,
         "error": "egress_off",
         "flow": flow.key(),
         "domain": flow.domain(),
-        "message": message,
+        "message": refusal_message(flow),
         "request_id": data.get("request_id").cloned().unwrap_or(Value::Null),
         "terminal_id": data.get("terminal_id").cloned().unwrap_or(Value::Null),
         "session_id": data.get("session_id").cloned().unwrap_or(Value::Null),
@@ -906,7 +1124,7 @@ pub(crate) fn terminal_refusal_frame(data: &Value) -> Value {
     egress_refusal_frame("terminal_response", Flow::TerminalStream, data)
 }
 
-/// `GET /health` `egress`: the polled `scope`, and every flow's `{allowed,
+/// `GET /health` `egress`: the default `scope`, and every flow's `{allowed,
 /// source, decided_by, domain, applies_at_next_start, refused}` (telemetry
 /// adds `in_effect`).
 pub(crate) fn health_json() -> Value {
@@ -926,13 +1144,78 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use uuid::Uuid;
 
     thread_local! {
         static PINS: RefCell<[Option<Level>; 6]> = const { RefCell::new([None; 6]) };
+        static TENANT_PINS: RefCell<Vec<(Flow, Uuid, Level)>> = const { RefCell::new(Vec::new()) };
+        static SESSION_TENANTS: RefCell<Vec<(String, Option<Uuid>)>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(crate) fn pinned(flow: Flow) -> Option<Level> {
         PINS.with(|p| p.borrow()[flow.index()])
+    }
+
+    /// The pin for `flow` in `tenant`'s scope: a tenant pin when one is set
+    /// for that tenant, else the flow-wide pin.
+    pub(crate) fn pinned_for(flow: Flow, tenant: Option<Uuid>) -> Option<Level> {
+        if let Some(t) = tenant {
+            let hit = TENANT_PINS.with(|p| {
+                p.borrow()
+                    .iter()
+                    .rev()
+                    .find(|(f, pt, _)| *f == flow && *pt == t)
+                    .map(|(_, _, l)| *l)
+            });
+            if hit.is_some() {
+                return hit;
+            }
+        }
+        pinned(flow)
+    }
+
+    /// RAII pin for one flow in ONE tenant's scope on this thread.
+    pub(crate) struct TenantPin;
+
+    impl Drop for TenantPin {
+        fn drop(&mut self) {
+            TENANT_PINS.with(|p| {
+                p.borrow_mut().pop();
+            });
+        }
+    }
+
+    pub(crate) fn pin_for(flow: Flow, tenant: Uuid, level: Level) -> TenantPin {
+        TENANT_PINS.with(|p| p.borrow_mut().push((flow, tenant, level)));
+        TenantPin
+    }
+
+    /// `Some(answer)` when a test faked the tenant of session key `key` (a
+    /// terminal id or a task-run id) on this thread.
+    pub(crate) fn faked_session_tenant(key: &str) -> Option<Option<Uuid>> {
+        SESSION_TENANTS.with(|m| {
+            m.borrow()
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, t)| *t)
+        })
+    }
+
+    /// RAII fake: session key `key` belongs to `tenant` on this thread.
+    pub(crate) struct FakeSessionTenant;
+
+    impl Drop for FakeSessionTenant {
+        fn drop(&mut self) {
+            SESSION_TENANTS.with(|m| {
+                m.borrow_mut().pop();
+            });
+        }
+    }
+
+    pub(crate) fn fake_session_tenant(key: &str, tenant: Option<Uuid>) -> FakeSessionTenant {
+        SESSION_TENANTS.with(|m| m.borrow_mut().push((key.to_string(), tenant)));
+        FakeSessionTenant
     }
 
     /// RAII pin for one flow on this thread; restored on drop (including on a
@@ -1097,11 +1380,12 @@ mod tests {
     fn resolution_takes_the_first_rung_with_a_value() {
         use Level::{Off, On};
         let d = |level| {
-            Some(Decision {
+            Some(Answer::Decided(Decision {
                 level,
                 decided_by: CoordOrigin::TenantRow,
-            })
+            }))
         };
+        let no = Some(Answer::NoOpinion);
         let row = LevelSource::Coord(CoordOrigin::TenantRow);
         let kept = LevelSource::Persisted(CoordOrigin::TenantRow);
         let cases = [
@@ -1112,14 +1396,33 @@ mod tests {
             ((None, None, Some(Off)), (false, LevelSource::Profile)),
             ((None, None, Some(On)), (true, LevelSource::Profile)),
             ((None, None, None), (true, LevelSource::ProductDefault)),
+            // "No opinion" hands over to the profile, even over a stale
+            // persisted decision.
+            ((no, d(Off), Some(On)), (true, LevelSource::Profile)),
+            ((None, no, None), (true, LevelSource::ProductDefault)),
         ];
         for ((c, p, prof), (allowed, source)) in cases {
             assert_eq!(
-                resolve(c, p, prof),
+                resolve(c, p, prof, false),
                 EgressVerdict { allowed, source },
                 "coord={c:?} persisted={p:?} profile={prof:?}"
             );
         }
+        // A scope naming a tenant with no answer at all is UNKNOWN and
+        // refuses, whatever the profile says; an answer clears it.
+        for prof in [None, Some(On), Some(Off)] {
+            assert_eq!(
+                resolve(None, None, prof, true),
+                EgressVerdict {
+                    allowed: false,
+                    source: LevelSource::Unknown
+                }
+            );
+        }
+        assert_eq!(
+            resolve(no, None, None, true).source,
+            LevelSource::ProductDefault
+        );
     }
 
     #[test]
@@ -1214,6 +1517,22 @@ mod tests {
             profile_rung(&active_egress_profile_at(&path, None)),
             Some(Level::Off)
         );
+        // Re-review 7: a profiles.json whose existence cannot even be
+        // checked is unusable, not absent.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let hidden = locked.join("profiles.json");
+            let readable = std::fs::metadata(&hidden).is_ok();
+            let read = active_egress_profile_at(&hidden, None);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if !readable {
+                assert_eq!(profile_rung(&read), Some(Level::Off), "{read:?}");
+            }
+        }
         // The env override picks the profile, as at runtime.
         assert_eq!(
             profile_rung(&active_egress_profile_at(&path, Some("x".into()))),
@@ -1229,7 +1548,8 @@ mod tests {
         let first = EgressState::new(Some(path.clone()), None, key(Some(TENANT_A)));
         assert_eq!(
             first.permit(Flow::CodeMirror).source,
-            LevelSource::ProductDefault
+            LevelSource::Unknown,
+            "a tenant scope with no answer yet"
         );
         first.apply_coord_answer(&key(Some(TENANT_A)), Flow::CodeMirror, row(Level::Off));
         assert_eq!(
@@ -1250,12 +1570,12 @@ mod tests {
                 source: LevelSource::Persisted(CoordOrigin::TenantRow)
             }
         );
-        // A flow coord never answered falls to the profile rung.
+        // A flow coord never answered for this tenant is UNKNOWN.
         assert_eq!(
             second.permit(Flow::Telemetry),
             EgressVerdict {
-                allowed: true,
-                source: LevelSource::Profile
+                allowed: false,
+                source: LevelSource::Unknown
             }
         );
     }
@@ -1308,11 +1628,14 @@ mod tests {
         assert!(!st.permit_for(Flow::TerminalStream, Some(TENANT_A)).allowed);
         assert_eq!(
             st.permit_for(Flow::TerminalStream, Some(TENANT_B)).source,
-            LevelSource::ProductDefault,
-            "tenant A's off must not apply to tenant B's session"
+            LevelSource::Unknown,
+            "tenant A's answer is not tenant B's"
         );
+        st.apply_coord_answer(&key(Some(TENANT_B)), Flow::TerminalStream, row(Level::On));
+        assert!(st.permit_for(Flow::TerminalStream, Some(TENANT_B)).allowed);
         // Re-paired into tenant B: the default scope moves with it.
         st.set_current_scope(key(Some(TENANT_B)));
+        st.apply_coord_answer(&key(Some(TENANT_B)), Flow::TerminalStream, row(Level::On));
         assert!(st.permit(Flow::TerminalStream).allowed);
         // Re-pointed at another coord: none of the first coord's answers.
         let other = EgressState::new(
@@ -1322,7 +1645,7 @@ mod tests {
         );
         assert_eq!(
             other.permit(Flow::TerminalStream).source,
-            LevelSource::ProductDefault
+            LevelSource::Unknown
         );
         // The same coord + tenant after a restart: restored.
         let back = EgressState::new(Some(path), None, key(Some(TENANT_A)));
@@ -1332,6 +1655,72 @@ mod tests {
         );
         // A trailing slash is the same coord.
         assert_eq!(key(None), ScopeKey::new("http://coord.example", None));
+    }
+
+    /// Re-review 1: the poller keyed its answers by the machine.json pin
+    /// (`None` on an unpinned device) while sessions are stamped with the
+    /// default binding (`Some(T)`); a session must still see the decision.
+    #[test]
+    fn a_session_of_the_default_binding_sees_the_polled_decision() {
+        let t = Uuid::from_u128(0x77);
+        let st = EgressState::new(None, None, key(None));
+        st.apply_coord_answer(&key(None), Flow::TerminalStream, row(Level::Off));
+        assert!(
+            !st.permit_for(Flow::TerminalStream, Some(t)).allowed,
+            "the default binding's session must not fall to the product default"
+        );
+    }
+
+    /// Re-review 2: a TENANT with neither a polled nor a persisted decision is
+    /// UNKNOWN and fails closed — never the product default.
+    #[test]
+    fn a_known_tenant_without_any_decision_fails_closed() {
+        let st = EgressState::new(None, None, key(Some(TENANT_A)));
+        let v = st.permit(Flow::CodeMirror);
+        assert!(!v.allowed, "UNKNOWN must refuse, got {v:?}");
+        assert_eq!(v.source.as_str(), "unknown");
+    }
+
+    /// Re-review 5: moving the polled scope keeps the stricter of the old and
+    /// new scope until the new one has an answer.
+    #[test]
+    fn a_scope_move_keeps_the_stricter_answer_until_the_new_scope_answers() {
+        let st = EgressState::new(None, None, key(Some(TENANT_A)));
+        st.apply_coord_answer(&key(Some(TENANT_A)), Flow::SkillMirror, row(Level::Off));
+        st.apply_coord_answer(&key(Some(TENANT_B)), Flow::SkillMirror, row(Level::On));
+        st.set_current_scope(key(Some(TENANT_B)));
+        assert!(
+            !st.permit(Flow::SkillMirror).allowed,
+            "old scope's off still holds"
+        );
+        st.apply_coord_answer(&key(Some(TENANT_B)), Flow::SkillMirror, row(Level::On));
+        assert!(
+            st.permit(Flow::SkillMirror).allowed,
+            "the new scope answered: it governs"
+        );
+    }
+
+    /// Re-review 6: a schema-1 store's `off` values migrate into the default
+    /// scope (fail-closed); its `on` values are dropped.
+    #[test]
+    fn a_schema_one_store_migrates_its_offs_into_the_default_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STORE_FILE);
+        std::fs::write(
+            &path,
+            r#"{"schema":1,"written_at":"x","levels":{"egress_code_mirror":"off","egress_telemetry":"on"}}"#,
+        )
+        .unwrap();
+        let st = EgressState::new(Some(path), Some(Level::On), key(None));
+        assert!(
+            !st.permit(Flow::CodeMirror).allowed,
+            "a legacy off survives"
+        );
+        assert_eq!(
+            st.permit(Flow::Telemetry).source,
+            LevelSource::Profile,
+            "a legacy on is dropped"
+        );
     }
 
     #[test]
@@ -1350,44 +1739,53 @@ mod tests {
 
     #[test]
     fn a_corrupt_or_foreign_store_reads_as_absent() {
-        assert!(decode_store("{not json").is_empty());
-        assert!(decode_store(r#"{"schema":1,"written_at":"x","levels":{}}"#).is_empty());
+        let k = key(None);
+        assert!(decode_store("{not json", &k).is_empty());
+        assert!(decode_store(r#"{"schema":9,"written_at":"x","scopes":[]}"#, &k).is_empty());
+        assert!(decode_store(r#"{"schema":1,"written_at":"x","levels":{}}"#, &k).is_empty());
         let mixed = decode_store(
             r#"{"schema":2,"written_at":"x","scopes":[{"coord_base":"http://c/","tenant_id":null,
                 "levels":{"egress_telemetry":{"level":"off","decided_by":"tenant_row"},
                 "egress_unknown":{"level":"off","decided_by":"tenant_row"},
-                "egress_code_mirror":{"level":"maybe","decided_by":"tenant_row"}}}]}"#,
+                "egress_code_mirror":{"level":"maybe","decided_by":"tenant_row"},
+                "egress_skill_mirror":{"no_opinion":true}}}]}"#,
+            &k,
         );
         let d = mixed[&ScopeKey::new("http://c", None)];
-        assert_eq!(
-            d[Flow::Telemetry.index()].map(|d| d.level),
-            Some(Level::Off)
-        );
+        assert!(matches!(
+            d[Flow::Telemetry.index()],
+            Some(Answer::Decided(Decision {
+                level: Level::Off,
+                ..
+            }))
+        ));
         assert_eq!(d[Flow::CodeMirror.index()], None);
+        assert_eq!(d[Flow::SkillMirror.index()], Some(Answer::NoOpinion));
         // A missing file creates nothing.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent").join(STORE_FILE);
-        assert!(load_store(&path).is_empty());
+        assert!(load_store(&path, &k).is_empty());
         assert!(!path.parent().unwrap().exists());
     }
 
     #[test]
     fn encode_then_decode_round_trips() {
-        let mut scopes = ScopedDecisions::new();
-        let mut a: Decisions = [None; 6];
-        a[Flow::SkillMirror.index()] = Some(Decision {
+        let mut scopes = ScopedAnswers::new();
+        let mut a: Answers = [None; 6];
+        a[Flow::SkillMirror.index()] = Some(Answer::Decided(Decision {
             level: Level::Off,
             decided_by: CoordOrigin::DeploymentProfile,
-        });
-        let mut b: Decisions = [None; 6];
-        b[Flow::UpdateCheck.index()] = Some(Decision {
+        }));
+        a[Flow::Telemetry.index()] = Some(Answer::NoOpinion);
+        let mut b: Answers = [None; 6];
+        b[Flow::UpdateCheck.index()] = Some(Answer::Decided(Decision {
             level: Level::On,
             decided_by: CoordOrigin::TenantRow,
-        });
+        }));
         scopes.insert(key(Some(TENANT_A)), a);
         scopes.insert(key(None), b);
         let raw = String::from_utf8(encode_store(&scopes)).unwrap();
-        assert_eq!(decode_store(&raw), scopes);
+        assert_eq!(decode_store(&raw, &key(None)), scopes);
     }
 
     #[test]
@@ -1408,10 +1806,7 @@ mod tests {
         assert_eq!(obj.len(), 7, "the scope plus six flows");
         assert_eq!(v["scope"]["coord_base"], "http://coord.example");
         assert_eq!(v["scope"]["tenant_id"], json!(TENANT_A));
-        assert!(v["scope"]["note"]
-            .as_str()
-            .unwrap()
-            .contains("default tenant"));
+        assert!(v["scope"]["note"].as_str().unwrap().contains("UNKNOWN"));
         for flow in Flow::ALL {
             let e = &obj[flow.key()];
             assert_eq!(e["domain"], flow.domain());
@@ -1425,7 +1820,11 @@ mod tests {
         assert_eq!(v["update_check"]["decided_by"], "deployment_profile");
         assert_eq!(v["code_mirror"]["allowed"], false);
         assert_eq!(v["code_mirror"]["refused"], 1);
-        assert_eq!(v["telemetry"]["source"], "profile");
+        assert_eq!(
+            v["telemetry"]["source"], "unknown",
+            "tenant A has no telemetry answer"
+        );
+        assert_eq!(v["telemetry"]["allowed"], false);
         assert!(v["telemetry"]["decided_by"].is_null());
         assert_eq!(v["telemetry"]["applies_at_next_start"], true);
         assert!(
@@ -1646,6 +2045,197 @@ mod tests {
         println!("egress drift check PASSED against {}", path.display());
     }
 
+    /// `src` with every comment blanked (string literals kept), and a copy with
+    /// string literals blanked too. Newlines are kept, so byte offsets map to
+    /// the same lines in all three. Handles `//`, `/* */`, `"…"` with escapes,
+    /// raw strings `r#"…"#`, and char literals (so `'"'` is not a string).
+    fn strip_rust(src: &str) -> (String, String) {
+        let b = src.as_bytes();
+        let mut code = b.to_vec();
+        let mut bare = b.to_vec();
+        let blank = |v: &mut Vec<u8>, from: usize, to: usize| {
+            for c in v.iter_mut().take(to).skip(from) {
+                if *c != b'\n' {
+                    *c = b' ';
+                }
+            }
+        };
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    let end = b[i..]
+                        .iter()
+                        .position(|&c| c == b'\n')
+                        .map_or(b.len(), |p| i + p);
+                    blank(&mut code, i, end);
+                    blank(&mut bare, i, end);
+                    i = end;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    let end = src
+                        .get(i + 2..)
+                        .and_then(|r| r.find("*/"))
+                        .map_or(b.len(), |p| i + 2 + p + 2);
+                    blank(&mut code, i, end);
+                    blank(&mut bare, i, end);
+                    i = end;
+                }
+                b'r' if matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
+                    && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                {
+                    let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                    if b.get(i + 1 + hashes) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let body = i + 2 + hashes;
+                    let end = src
+                        .get(body..)
+                        .and_then(|r| r.find(&close))
+                        .map_or(b.len(), |p| body + p + close.len());
+                    blank(&mut bare, i, end);
+                    i = end;
+                }
+                b'"' => {
+                    let mut j = i + 1;
+                    while j < b.len() && b[j] != b'"' {
+                        j += if b[j] == b'\\' { 2 } else { 1 };
+                    }
+                    let end = (j + 1).min(b.len());
+                    blank(&mut bare, i, end);
+                    i = end;
+                }
+                b'\'' => {
+                    // A char literal (`'x'`, `'\n'`, `'"'`) — not a lifetime.
+                    let len = if b.get(i + 1) == Some(&b'\\') {
+                        b[i + 2..].iter().position(|&c| c == b'\'').map(|p| p + 3)
+                    } else if b.get(i + 2) == Some(&b'\'') {
+                        Some(3)
+                    } else {
+                        None
+                    };
+                    i += len.unwrap_or(1);
+                }
+                _ => i += 1,
+            }
+        }
+        (
+            String::from_utf8_lossy(&code).into_owned(),
+            String::from_utf8_lossy(&bare).into_owned(),
+        )
+    }
+
+    /// 1-based lines of `src` that read the user's transcript-sync consent
+    /// bare: the getter; the `cloud_sync_enabled` identifier anywhere in code
+    /// (a field read, a destructuring, a struct carrying the raw toggle); a
+    /// JSON index `x["cloud_sync_enabled"]`; and the settings command
+    /// `get_cloud_sync_settings(…)` outside the module that defines it
+    /// (`owns_settings_getter`). Comments never count, nor does the word inside
+    /// an ordinary string (a log line, a schema).
+    fn consent_read_lines(src: &str, owns_settings_getter: bool) -> Vec<usize> {
+        let (code, bare) = strip_rust(src);
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut offsets = Vec::new();
+        let word = "cloud_sync_enabled";
+        for (i, _) in bare.match_indices(word) {
+            let before = i.checked_sub(1).map(|j| bare.as_bytes()[j]);
+            let after = bare.as_bytes().get(i + word.len()).copied();
+            if !before.is_some_and(ident) && !after.is_some_and(ident) {
+                offsets.push(i);
+            }
+        }
+        // The getters as whole words: `in_process_get_cloud_sync_settings` is a
+        // different function.
+        let whole = |needle: &str| -> Vec<usize> {
+            bare.match_indices(needle)
+                .filter(|(i, _)| {
+                    !i.checked_sub(1)
+                        .map(|j| bare.as_bytes()[j])
+                        .is_some_and(ident)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        offsets.extend(whole("get_cloud_sync_enabled"));
+        if !owns_settings_getter {
+            offsets.extend(whole("get_cloud_sync_settings("));
+        }
+        for (i, _) in code.match_indices("[\"cloud_sync_enabled\"]") {
+            let before = i.checked_sub(1).map(|j| code.as_bytes()[j]);
+            if before.is_some_and(|c| ident(c) || c == b')' || c == b']') {
+                offsets.push(i);
+            }
+        }
+        let mut lines: Vec<usize> = offsets
+            .into_iter()
+            .map(|i| src.get(..i).map_or(0, |pre| pre.matches('\n').count()) + 1)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// Re-review 9: the transcript and code-mirror paths that know their
+    /// session ask in that session's tenant (the relay and remote-attach
+    /// paths are covered behaviourally in their own modules' `egress_tests`).
+    #[test]
+    fn session_aware_paths_ask_in_the_sessions_tenant() {
+        let squash = |src: &str| src.split_whitespace().collect::<String>();
+        let tailer = squash(include_str!("session/session_transcript_tailer.rs"));
+        assert!(
+            tailer.contains(&squash(
+                "transcript_sync_gate_for(self.registrar.recorded_tenant(session_key))"
+            )),
+            "the tailer asks in the session's recorded tenant"
+        );
+        assert!(
+            tailer.contains(&squash("self.transcript_sync_open(session_key),")),
+            "the tailer's own admit uses the session-tenant gate"
+        );
+        let watcher = squash(include_str!("terminal/transcript_watcher.rs"));
+        assert!(
+            watcher.contains(&squash("t.transcript_sync_open(&session_id)")),
+            "the watcher asks the tailer's session-tenant gate"
+        );
+        let emitter = squash(include_str!("session/transcript_emitter.rs"));
+        assert!(
+            emitter.contains(&squash(
+                "transcript_sync_gate_for(self.registrar.recorded_tenant(session_key))"
+            )),
+            "the emitter asks in the session's recorded tenant"
+        );
+        let pusher = squash(include_str!("agent_pusher/mod.rs"));
+        assert!(
+            pusher.contains(&squash(
+                "permit_or_count_for(crate::egress::Flow::CodeMirror, crate::auth::jwt_tenant_claim(token),"
+            )),
+            "the code mirror asks in the agent token's tenant"
+        );
+    }
+
+    /// L8: the scanner does not cut a line at a `//` inside a string, and
+    /// catches destructuring, JSON-index and settings-command reads.
+    #[test]
+    fn the_consent_scanner_sees_through_strings_and_catches_every_read_shape() {
+        let src = r##"
+let url = "http://x"; let on = s.cloud_sync_enabled;
+let Settings { cloud_sync_enabled, .. } = load();
+let v = body["cloud_sync_enabled"];
+let r = crate::commands::cloud_sync_settings::get_cloud_sync_settings(); in_process_get_cloud_sync_settings(&a);
+// a comment naming cloud_sync_enabled is fine
+let schema = r#"{"required":["cloud_sync_enabled"]}"#;
+let label = "blocked by cloud_sync_enabled";
+"##;
+        assert_eq!(consent_read_lines(src, false), vec![2, 3, 4, 5]);
+        assert_eq!(
+            consent_read_lines(src, true),
+            vec![2, 3, 4],
+            "the defining module may call its own command"
+        );
+    }
+
     /// No egress path may read the user consent bare: every read outside the
     /// settings plumbing, this module and the reporting surfaces goes through
     /// [`transcript_sync_permitted`], so a new egress path cannot skip the
@@ -1681,19 +2271,9 @@ mod tests {
                     continue;
                 }
                 let src = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in src.lines().enumerate() {
-                    let code = line.split("//").next().unwrap_or("");
-                    // The getter, AND a bare `.cloud_sync_enabled` field read
-                    // (a struct carrying the raw user toggle past the gate).
-                    let field_read = code.match_indices(".cloud_sync_enabled").any(|(i, m)| {
-                        !code
-                            .get(i + m.len()..)
-                            .and_then(|rest| rest.chars().next())
-                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                    });
-                    if code.contains("get_cloud_sync_enabled") || field_read {
-                        offenders.push(format!("{rel}:{}", n + 1));
-                    }
+                let module_owns_settings_getter = rel == "commands/cloud_sync_settings.rs";
+                for n in consent_read_lines(&src, module_owns_settings_getter) {
+                    offenders.push(format!("{rel}:{n}"));
                 }
             }
         }

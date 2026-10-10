@@ -918,9 +918,16 @@ pub fn gate_remote_frame<P: FnOnce() -> AcceptRemoteAttach>(
 ) -> Result<Option<AttachGrant>, AttachRefusal> {
     match parse_remote_block(data) {
         None => Ok(None),
-        // A remote frame streams this terminal to another device: the tenant's
-        // `egress_terminal_stream` switch is checked before any grant work.
-        Some(_) if !crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) => {
+        // A remote frame streams this terminal to another device: the
+        // `egress_terminal_stream` switch of the tenant whose session is on
+        // that terminal (the default scope when none is known) is checked
+        // before any grant work.
+        Some(_)
+            if !crate::egress::permit_or_count_for(
+                crate::egress::Flow::TerminalStream,
+                terminal_id.and_then(crate::egress::terminal_session_tenant),
+            ) =>
+        {
             Err(AttachRefusal::EgressOff)
         }
         Some(Err(())) => {
@@ -1002,10 +1009,6 @@ where
         }
     };
 
-    if !crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) {
-        return Err(refusal_frame(AttachRefusal::EgressOff, data, None));
-    }
-
     let grant = match grants.lookup(
         &block.grant_jti,
         block.source_device_id.as_deref(),
@@ -1056,6 +1059,15 @@ where
         // i.e. after the relay has translated this frame.
         return Err(refusal_frame(AttachRefusal::SessionNotLocal, data, None));
     };
+
+    // The attach streams that terminal out: asked in the tenant of the session
+    // on it (the default scope when none is known), before anything is bound.
+    if !crate::egress::permit_or_count_for(
+        crate::egress::Flow::TerminalStream,
+        crate::egress::terminal_session_tenant(&terminal_id),
+    ) {
+        return Err(refusal_frame(AttachRefusal::EgressOff, data, None));
+    }
 
     // Bind at first use; a re-attach must land on the same terminal.
     if !grants.bind(&block.grant_jti, &terminal_id) {
@@ -2404,7 +2416,10 @@ impl Default for RemoteAttachClient {
 /// switch is off: an attached pane sends keystrokes and resizes out through
 /// the relay and pulls a terminal stream through it (plan
 /// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). Refused
-/// before any frame is queued.
+/// before any frame is queued. Asked in the DEFAULT scope: the terminal being
+/// attached lives on another device, so no local session — and no session
+/// tenant — exists to ask in; the relay socket the frames leave on is the
+/// device default's.
 fn source_role_egress_check() -> Result<(), AttachError> {
     if crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) {
         return Ok(());
@@ -6985,6 +7000,79 @@ mod egress_tests {
                 .unwrap_err(),
             AttachRefusal::GrantUnknown
         );
+    }
+
+    /// Item 9: the target-side gate asks in the tenant of the session on the
+    /// terminal the frame names (default scope pinned ON, that tenant OFF).
+    #[test]
+    fn a_remote_frame_asks_in_the_terminal_sessions_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = Uuid::from_u128(0x7e7a_0003);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", Some(tenant));
+        let table = RemoteAttachGrants::new();
+        let data = json!({"remote": {"grant_jti": "j-1"}, "terminal_id": "t-tenant"});
+        assert_eq!(
+            gate_remote_frame(
+                &table,
+                || AcceptRemoteAttach::Tenant,
+                &data,
+                Some("t-tenant"),
+                0
+            )
+            .unwrap_err(),
+            AttachRefusal::EgressOff
+        );
+        // Another terminal: the default scope (on) lets the grant decide.
+        assert_eq!(
+            gate_remote_frame(
+                &table,
+                || AcceptRemoteAttach::Tenant,
+                &data,
+                Some("t-other"),
+                0
+            )
+            .unwrap_err(),
+            AttachRefusal::GrantUnknown
+        );
+    }
+
+    /// Item 9: `terminal_attach` asks in the tenant of the session on the
+    /// terminal the grant resolves to.
+    #[test]
+    fn an_attach_asks_in_the_resolved_terminals_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = Uuid::from_u128(0x7e7a_0004);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", Some(tenant));
+        let table = RemoteAttachGrants::new();
+        let session = Uuid::from_u128(0x5e55);
+        table.insert(
+            AttachGrant {
+                grant_jti: "j-t".into(),
+                source_device_id: "src-device".into(),
+                session_id: session,
+                terminal_id: None,
+                expires_at: 10_000,
+            },
+            0,
+        );
+        let frame = json!({
+            "type": "terminal_attach",
+            "request_id": "rq",
+            "remote": {"grant_jti": "j-t"},
+        });
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &frame,
+            1,
+            |_| Some(("t-tenant".to_string(), ())),
+        )
+        .unwrap_err();
+        assert_eq!(err["code"], AttachRefusal::EgressOff.code(), "{err}");
     }
 
     #[tokio::test]

@@ -1594,7 +1594,7 @@ async fn tail_session(
             let verdict = t.admit(
                 &session_id,
                 bytes.len(),
-                crate::egress::transcript_sync_permitted(),
+                t.transcript_sync_open(&session_id),
             );
             // Same two-step for a batch whose consent was withheld (Gate 1
             // off): a tracked session's mark moves past it, so no later gap

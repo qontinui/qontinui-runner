@@ -4479,6 +4479,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // below); best-effort at startup then every 30s.
                 session_pr_reconciler::start(lifecycle_store.clone());
                 app.manage(lifecycle_store);
+                // The egress switches' session-tenant lookups (relay frames,
+                // remote attach) read the lifecycle store and the AI-session
+                // registrar through this handle; both are managed by now.
+                egress::install_session_tenant_lookup(app.handle().clone());
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
                 // child process / remote host / `cat`'d file emits). This hook

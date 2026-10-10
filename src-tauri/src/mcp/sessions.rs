@@ -1122,9 +1122,13 @@ pub(crate) async fn transcript_bind_core(
     };
 
     // 3. Transcript sync's gate — the tenant's `egress_transcript_sync` switch
-    // and the user's own toggle — in the caller's tenant scope (a tenant that
-    // does not resolve here is refused at step 4; the gate then reads the
-    // device's default scope, which can only refuse more). Off writes nothing.
+    // and the user's own toggle — asked in the caller's tenant, which the
+    // nonce resolves here. A nonce that resolves to no tenant (`Ok(None)`)
+    // writes under the device default, so the default scope is the right one
+    // to ask. A resolution that FAILS also lands on the default scope here,
+    // which says nothing about the caller's tenant — harmless only because
+    // step 4 then refuses (`tenant_unresolvable`) before anything is bound or
+    // written. Closed writes nothing.
     let tenant_hint = (env.session_tenant)(&nonce).ok().flatten();
     match (env.transcript_gate)(tenant_hint) {
         crate::egress::TranscriptGate::Open => {}

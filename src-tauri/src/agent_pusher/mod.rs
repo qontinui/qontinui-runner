@@ -586,7 +586,12 @@ async fn push_one(
     // The tenant's `egress_code_mirror` switch, read on EVERY tick so a flip
     // takes effect within one cadence. Checked before the git child exists:
     // with the switch off no process is spawned and no connection is made.
-    if !crate::egress::permit_or_count(crate::egress::Flow::CodeMirror) {
+    // Asked in the tenant the agent token names (its `tenant_id` claim) — the
+    // tenant coord files the pushed branch under — else the default scope.
+    if !crate::egress::permit_or_count_for(
+        crate::egress::Flow::CodeMirror,
+        crate::auth::jwt_tenant_claim(token),
+    ) {
         return Ok(PushOutcome::SkippedEgressOff);
     }
     let origin_url = build_origin_url(&state.coord_http_base, &target.repo)?;
