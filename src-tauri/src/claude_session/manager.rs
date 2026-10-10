@@ -108,12 +108,14 @@ impl SessionManager {
     ///   `.mcp.json` every session launched there reads, so matching it would
     ///   attribute a stranger's call to this session.
     ///
-    /// Sessions with neither carry no stored cwd to match, so they resolve
-    /// `None` (the proxy then omits the caller-session header and coord keeps
-    /// its fuzzy fallback), and so do two DIFFERENT sessions claiming the same
-    /// workdir — see [`identifying_candidate`]. O(N) over active sessions
-    /// (bounded by the operator's live terminal count).
-    pub fn task_run_id_for_workdir(&self, workdir: &str) -> Option<String> {
+    /// Sessions with neither carry no stored cwd to match, so they answer
+    /// [`WorkdirTaskRun::NoCandidate`]; two DIFFERENT sessions claiming the same
+    /// workdir answer [`WorkdirTaskRun::Ambiguous`] — see
+    /// [`identifying_candidate`]. The two are distinct answers because only the
+    /// first licenses a caller to look for the session elsewhere (the lifecycle
+    /// store): an ambiguous workdir DOES host a task run, which owns its calls.
+    /// O(N) over active sessions (bounded by the operator's live terminal count).
+    pub fn task_run_id_for_workdir(&self, workdir: &str) -> WorkdirTaskRun {
         // Snapshot (task_run_id, worktree path) pairs under the lock, then do
         // the filesystem checks AFTER releasing it. This runs on every proxied
         // coord_* call (session-fabric Phase 0 caller self-identification), and
@@ -122,25 +124,18 @@ impl SessionManager {
         // snapshot clones one String + PathBuf per worktree path (a multi-repo
         // context contributes one per repo); the syscalls happen lock-free.
         let candidates: Vec<WorkdirCandidate> = {
-            let guard = self.sessions.lock().ok()?;
-            let mut out = Vec::with_capacity(guard.len());
-            for (task_run_id, session) in guard.iter() {
-                if let Some(wt) = session.worktree() {
-                    out.push(WorkdirCandidate {
-                        task_run_id: task_run_id.clone(),
-                        path: wt.path.clone(),
-                        parked: false,
-                    });
-                }
-                for path in session.isolated_worktree_paths() {
-                    out.push(WorkdirCandidate {
-                        task_run_id: task_run_id.clone(),
-                        path,
-                        parked: true,
-                    });
-                }
-            }
-            out
+            // A poisoned lock is UNKNOWN, not "no task run": reporting it as
+            // `NoCandidate` would let a caller fall through to a guess.
+            let Ok(guard) = self.sessions.lock() else {
+                return WorkdirTaskRun::Ambiguous;
+            };
+            workdir_candidates(guard.iter().map(|(task_run_id, session)| {
+                (
+                    task_run_id.as_str(),
+                    session.worktree().map(|wt| wt.path.clone()),
+                    session.isolated_worktree_paths(),
+                )
+            }))
         };
         identifying_candidate(
             &candidates,
@@ -353,6 +348,25 @@ impl SessionManager {
     }
 }
 
+/// What [`SessionManager::task_run_id_for_workdir`] found.
+///
+/// Tri-state on purpose. An `Option` collapsed two different facts into `None`:
+/// nothing on this workdir (a caller may then look the session up elsewhere,
+/// e.g. the lifecycle store), and SEVERAL sessions on it (some task run owns
+/// the workdir's calls, so a lookup elsewhere could file one session's call
+/// under a sibling's identity — exactly the misattribution the ambiguity
+/// refusal exists to prevent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkdirTaskRun {
+    /// Exactly one session identifies the workdir.
+    Found(String),
+    /// No session claims the workdir.
+    NoCandidate,
+    /// Different sessions claim it (or the session table was unreadable): the
+    /// caller must NOT guess, and must not fall through to another source.
+    Ambiguous,
+}
+
 /// One session's claim on a workdir, snapshotted under the `sessions` lock so
 /// the filesystem checks run after it is released.
 struct WorkdirCandidate {
@@ -373,7 +387,7 @@ struct WorkdirCandidate {
 /// context naming the canonical checkout never matches; that probe runs only
 /// on a path match.
 ///
-/// AMBIGUITY RESOLVES TO `None`: when the accepted matches name more than one
+/// AMBIGUITY RESOLVES TO [`WorkdirTaskRun::Ambiguous`]: when the accepted matches name more than one
 /// session (two contexts on one root, a promoted path and another session's
 /// parked one), HashMap order would otherwise pick the caller at random. No
 /// header beats a wrong one — the same rule the terminal leg applies. Pure over
@@ -383,7 +397,7 @@ fn identifying_candidate(
     workdir: &str,
     canon_of_workdir: impl FnOnce() -> Option<std::path::PathBuf>,
     is_allocation_root: impl Fn(&std::path::Path) -> bool,
-) -> Option<String> {
+) -> WorkdirTaskRun {
     let accepted = |c: &&WorkdirCandidate| !c.parked || is_allocation_root(&c.path);
     let literal: Vec<&WorkdirCandidate> = candidates
         .iter()
@@ -403,12 +417,41 @@ fn identifying_candidate(
         literal
     };
     let mut ids = hits.iter().map(|c| c.task_run_id.as_str());
-    let first = ids.next()?;
+    let Some(first) = ids.next() else {
+        return WorkdirTaskRun::NoCandidate;
+    };
     if ids.all(|id| id == first) {
-        Some(first.to_string())
+        WorkdirTaskRun::Found(first.to_string())
     } else {
-        None
+        WorkdirTaskRun::Ambiguous
     }
+}
+
+/// The snapshot half of [`SessionManager::task_run_id_for_workdir`]: one
+/// candidate per promoted worktree and one per parked context path, from
+/// `(task_run_id, promoted path, parked paths)` tuples. Separate from the lock
+/// so the loop is testable against real parked contexts.
+fn workdir_candidates<'a>(
+    sessions: impl IntoIterator<Item = (&'a str, Option<std::path::PathBuf>, Vec<std::path::PathBuf>)>,
+) -> Vec<WorkdirCandidate> {
+    let mut out = Vec::new();
+    for (task_run_id, promoted, parked) in sessions {
+        if let Some(path) = promoted {
+            out.push(WorkdirCandidate {
+                task_run_id: task_run_id.to_string(),
+                path,
+                parked: false,
+            });
+        }
+        for path in parked {
+            out.push(WorkdirCandidate {
+                task_run_id: task_run_id.to_string(),
+                path,
+                parked: true,
+            });
+        }
+    }
+    out
 }
 
 /// Is `path` itself an agent worktree allocation root (not a descendant, and
@@ -487,7 +530,7 @@ mod tests {
             || panic!("a literal hit must not canonicalize"),
             |_| true,
         );
-        assert_eq!(hit.as_deref(), Some("worker"));
+        assert_eq!(hit, WorkdirTaskRun::Found("worker".to_string()));
     }
 
     /// A `shared_branch` context names the canonical checkout, which is not an
@@ -502,7 +545,7 @@ mod tests {
             || None,
             |_| false,
         );
-        assert_eq!(hit, None);
+        assert_eq!(hit, WorkdirTaskRun::NoCandidate);
     }
 
     /// A promoted worktree keeps matching without the allocation-root probe,
@@ -516,7 +559,7 @@ mod tests {
             || None,
             |_| panic!("a promoted path must not consult the allocation-root probe"),
         );
-        assert_eq!(hit.as_deref(), Some("promoted"));
+        assert_eq!(hit, WorkdirTaskRun::Found("promoted".to_string()));
     }
 
     /// Two different sessions accepted on one workdir: no header beats a
@@ -531,14 +574,14 @@ mod tests {
             || None,
             |_| true,
         );
-        assert_eq!(ambiguous, None);
+        assert_eq!(ambiguous, WorkdirTaskRun::Ambiguous);
         let same = identifying_candidate(
             &[candidate("a", wt, false), candidate("a", wt, true)],
             wt,
             || None,
             |_| true,
         );
-        assert_eq!(same.as_deref(), Some("a"));
+        assert_eq!(same, WorkdirTaskRun::Found("a".to_string()));
     }
 
     /// No literal match falls through to the canonical compare, and a parked
@@ -555,14 +598,85 @@ mod tests {
             || std::fs::canonicalize(&base).ok(),
             |_| true,
         );
-        assert_eq!(hit.as_deref(), Some("worker"));
+        assert_eq!(hit, WorkdirTaskRun::Found("worker".to_string()));
         let refused = identifying_candidate(
             &[candidate("worker", &dotted, true)],
             &base_str,
             || std::fs::canonicalize(&base).ok(),
             |_| false,
         );
-        assert_eq!(refused, None);
+        assert_eq!(refused, WorkdirTaskRun::NoCandidate);
+    }
+
+    /// Real parked contexts through the real snapshot loop
+    /// (`workdir_candidates` over `ClaudeSession::isolated_worktree_paths`'
+    /// own projection) and the real allocation-root predicate
+    /// (`allocated_worktree_for_path_in`, the core of `is_agent_allocation_root`),
+    /// on a temp worktree root: an agent allocation root identifies its worker;
+    /// the canonical checkout named by a `shared_branch` row does not; and two
+    /// sessions parked on the same allocation (the old first-match-wins case)
+    /// are Ambiguous.
+    #[test]
+    fn parked_contexts_resolve_through_the_real_snapshot_and_root_predicate() {
+        use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+        use crate::agent_worktree::MaterializedWorktree;
+        fn ctx(paths: &[&std::path::Path]) -> IsolatedEditContext {
+            IsolatedEditContext::for_test(
+                paths
+                    .iter()
+                    .map(|p| MaterializedWorktree {
+                        repo: "r".to_string(),
+                        branch: "b".to_string(),
+                        parent_sha: String::new(),
+                        worktree_path: p.to_path_buf(),
+                        push_ref: String::new(),
+                        parent_sha_provenance: Default::default(),
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("agent-worktrees");
+        let alloc = root.join("agent1").join("repo");
+        std::fs::create_dir_all(alloc.join(".git")).unwrap();
+        let sub = alloc.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        let canonical = tmp.path().join("repo-canonical");
+        std::fs::create_dir_all(canonical.join(".git")).unwrap();
+        let is_root = |p: &std::path::Path| {
+            crate::agent_worktree::canonical_paths::allocated_worktree_for_path_in(&root, p)
+                .is_some_and(|r| crate::agent_worktree::canonical_paths::paths_equal(&r, p))
+        };
+        let parked = |c: &IsolatedEditContext| -> Vec<std::path::PathBuf> {
+            c.worktrees
+                .iter()
+                .map(|w| w.worktree_path.clone())
+                .collect()
+        };
+        let (worker, chat) = (ctx(&[&alloc]), ctx(&[&canonical, &sub]));
+        let cands = workdir_candidates([
+            ("worker", None, parked(&worker)),
+            ("chat", None, parked(&chat)),
+        ]);
+        let ask = |wd: &std::path::Path| {
+            identifying_candidate(&cands, &wd.to_string_lossy(), || None, is_root)
+        };
+        assert_eq!(ask(&alloc), WorkdirTaskRun::Found("worker".to_string()));
+        // `shared_branch` row naming the canonical checkout: refused.
+        assert_eq!(ask(&canonical), WorkdirTaskRun::NoCandidate);
+        // A descendant of an allocation is not an allocation ROOT.
+        assert_eq!(ask(&sub), WorkdirTaskRun::NoCandidate);
+        // A second session parked on the same allocation: first-match-wins is gone.
+        let twin = ctx(&[&alloc]);
+        let cands2 = workdir_candidates([
+            ("worker", None, parked(&worker)),
+            ("twin", None, parked(&twin)),
+        ]);
+        assert_eq!(
+            identifying_candidate(&cands2, &alloc.to_string_lossy(), || None, is_root),
+            WorkdirTaskRun::Ambiguous
+        );
     }
 
     #[test]
