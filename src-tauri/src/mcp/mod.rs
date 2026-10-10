@@ -60,6 +60,11 @@ pub mod debug_graceful_exit;
 /// module docs for why the gate is load-bearing.
 #[cfg(debug_assertions)]
 pub mod debug_wedge;
+/// Debug-profile wire hold on a remote tab's source (plan
+/// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`
+/// Phase 2). Present in every dev-profile runner; see the module docs.
+#[cfg(debug_assertions)]
+pub mod debug_wire_hold;
 pub mod decision_trail_api;
 pub mod development_intelligence;
 pub mod device_jwt_refresher;

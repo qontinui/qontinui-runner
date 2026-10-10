@@ -989,6 +989,7 @@ pub(crate) async fn open_remote_tab(
         grant_jti: minted.grant_jti.clone(),
         history_available: pane.history_range().is_some(),
         tenant,
+        last_reattach: None,
     };
 
     let io: Arc<dyn PaneIo> = pane.clone();
@@ -1796,6 +1797,7 @@ mod remote_close_tests {
             grant_jti: "01a0905e".into(),
             history_available: false,
             tenant: None,
+            last_reattach: None,
         }
     }
 
@@ -2185,6 +2187,7 @@ mod interactivity_command_tests {
             grant_jti: "jti-1".into(),
             history_available: false,
             tenant: None,
+            last_reattach: None,
         }
     }
 
