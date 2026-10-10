@@ -35,6 +35,8 @@ terminal.copy-names	canonical	[]	error:no-sessions	invoke	true	-	error
 terminal.copy-names	empty	[]	error:no-sessions	invoke	true	-	error
 terminal.doc-finder	canonical	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]	ok
 terminal.doc-finder	empty	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]	ok
+terminal.elevated	canonical	[]	ok	invoke	true	launched 1 elevated terminal	ok
+terminal.elevated	empty	[]	ok	invoke	true	launched 1 elevated terminal	ok
 terminal.export-all	canonical	[]	ok	ctx.exportAll	true	exported 2 session	ok
 terminal.export-all	empty	[]	ok	ctx.exportAll	true	exported 2 session	ok
 terminal.focus	alternate	[["target","needs-input"]]	ok	zone.focusNextNeedsInput	true	focused 1 zone	ok
