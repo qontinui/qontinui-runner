@@ -160,3 +160,31 @@ describe("buildHookGenPrompt — RN smoke test reads coherently", () => {
     expect(prompt).toContain("Component Actions");
   });
 });
+
+/**
+ * Plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern:
+ * every integrated app is generated from this prompt, so it must teach a route
+ * PATTERN derived from the router's params (asserted with `patternSource:
+ * "router"`), never the concrete pathname — which carries user input and leaked
+ * verbatim into the journey ledger.
+ */
+describe("buildHookGenPrompt — route patterns never come from the pathname", () => {
+  const frameworks = ["next.js", "react", "expo_router"];
+
+  for (const framework of frameworks) {
+    const prompt = buildHookGenPrompt({ framework, project_path: "/x" }, [
+      "route-awareness",
+    ]);
+
+    it(`${framework}: teaches routePatternFromParams with patternSource`, () => {
+      expect(prompt).toContain("routePatternFromParams(");
+      expect(prompt).toContain("patternSource: 'router'");
+    });
+
+    it(`${framework}: never generates \`pattern: <pathname>\` code`, () => {
+      expect(prompt).not.toMatch(/pattern: (location\.)?pathname,/);
+      expect(prompt).not.toMatch(/pattern: matches\[/);
+      expect(prompt).not.toContain("routeStack: matches.map(m => m.pathname)");
+    });
+  }
+});

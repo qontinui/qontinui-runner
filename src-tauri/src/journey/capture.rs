@@ -48,7 +48,7 @@ use tracing::warn;
 use crate::database::pg::PgDb;
 
 use super::cursor::{
-    failure_hint, ActionSpec, CursorKey, Cursors, EdgeDraft, Observed, Provenance,
+    failure_hint, ActionSpec, CursorKey, Cursors, EdgeDraft, HoldRule, Observed, Provenance,
 };
 use super::frontier;
 use super::health;
@@ -65,13 +65,70 @@ use super::node::{
 pub(crate) const RUNNER_BUILD_ID: &str = env!("RUNNER_BUILD_ID");
 
 /// The runner instance label, with the same meaning as
-/// `co_occurrence_observations.runner_instance`: `QONTINUI_RUNNER_ROLE`, else
-/// `primary` — byte-for-byte the expression the snapshot handler always used,
-/// now shared so the two ledgers cannot label one runner differently.
+/// `co_occurrence_observations.runner_instance` — shared so the two ledgers
+/// cannot label one runner differently. See [`resolve_runner_instance`] for
+/// the order (plan
+/// `2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern`
+/// D6): it derives from the instance identity the supervisor already gives
+/// every secondary, instead of reading `primary` for a temp runner.
 pub(crate) fn runner_instance() -> String {
-    std::env::var("QONTINUI_RUNNER_ROLE")
-        .ok()
-        .unwrap_or_else(|| "primary".to_string())
+    let env = |k: &str| std::env::var(k).ok();
+    let name = crate::instance::instance_name();
+    // `owns_shared_root_state` is false for ANY secondary signal; with no
+    // instance name that is exactly the nameless secondary
+    // `resolve_data_subdir` quarantines.
+    let nameless_secondary = name.is_none() && !crate::instance::owns_shared_root_state();
+    resolve_runner_instance(
+        env("QONTINUI_RUNNER_ROLE").as_deref(),
+        env("QONTINUI_RUNNER_ID").as_deref(),
+        name.as_deref(),
+        nameless_secondary,
+    )
+}
+
+/// Pure core of [`runner_instance`], in order:
+/// 1. `QONTINUI_RUNNER_ROLE` when set (non-blank);
+/// 2. the kind of `QONTINUI_RUNNER_ID` by `RunnerKind::from_id` — `temp` for
+///    `test-*`, `named` for `named-*`;
+/// 3. the kind of `QONTINUI_INSTANCE_NAME` — `temp` when it is a `test-*` id
+///    (the supervisor names a temp runner by its id), else `named` (any other
+///    named secondary);
+/// 4. `secondary` for a secondary with no name (`resolve_data_subdir`'s
+///    quarantine case);
+/// 5. `primary`.
+pub(crate) fn resolve_runner_instance(
+    role: Option<&str>,
+    runner_id: Option<&str>,
+    instance_name: Option<&str>,
+    nameless_secondary: bool,
+) -> String {
+    use qontinui_types::wire::runner_kind::RunnerKind;
+    fn present(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    if let Some(role) = present(role) {
+        return role.to_string();
+    }
+    if let Some(id) = present(runner_id) {
+        match RunnerKind::from_id(id) {
+            RunnerKind::Temp { .. } => return "temp".to_string(),
+            RunnerKind::Named { .. } => return "named".to_string(),
+            // `Primary`, `External`, and any kind a newer schemas crate adds
+            // say nothing about which secondary this is: fall through.
+            _ => {}
+        }
+    }
+    if let Some(name) = present(instance_name) {
+        return match RunnerKind::from_id(name) {
+            RunnerKind::Temp { .. } => "temp",
+            _ => "named",
+        }
+        .to_string();
+    }
+    if nameless_secondary {
+        return "secondary".to_string();
+    }
+    "primary".to_string()
 }
 
 /// Did a control-route action act on the UI, and did it fail?
@@ -166,20 +223,79 @@ pub(crate) fn record_sdk_result(
     response: &serde_json::Value,
     action: ActionSpec,
 ) {
+    record_sdk_result_held(
+        state,
+        active_app,
+        scope,
+        ipc_fallback,
+        response,
+        action,
+        None,
+    );
+}
+
+/// [`record_sdk_result`] for a navigation that may answer before it has run
+/// (D4): when the response says `executed: false`, the edge is HELD under
+/// `rule` instead of closing on the next snapshot.
+pub(crate) fn record_sdk_navigation_result(
+    state: &Arc<crate::mcp::types::ApiState>,
+    active_app: Option<(String, Option<String>)>,
+    scope: Option<&str>,
+    ipc_fallback: bool,
+    response: &serde_json::Value,
+    action: ActionSpec,
+    rule: HoldRule,
+) {
+    let hold = delivered_unexecuted(response).then_some(rule);
+    record_sdk_result_held(
+        state,
+        active_app,
+        scope,
+        ipc_fallback,
+        response,
+        action,
+        hold,
+    );
+}
+
+fn record_sdk_result_held(
+    state: &Arc<crate::mcp::types::ApiState>,
+    active_app: Option<(String, Option<String>)>,
+    scope: Option<&str>,
+    ipc_fallback: bool,
+    response: &serde_json::Value,
+    action: ActionSpec,
+    hold: Option<HoldRule>,
+) {
     let Some((key, app_version)) = sdk_action_target(active_app, scope, ipc_fallback, response)
     else {
         return;
     };
-    record_action(
+    let failed = response.get("success") == Some(&serde_json::Value::Bool(false));
+    enqueue_edge_observation(
         state.app_state.pg_db.clone(),
-        key,
-        action,
-        Provenance {
-            app_version,
-            run_id: None,
+        JourneyEvent::Action {
+            key,
+            provenance: Provenance {
+                app_version,
+                run_id: None,
+            },
+            action,
+            hint: failure_hint(failed),
+            hold,
+            at: Instant::now(),
         },
-        response.get("success") == Some(&serde_json::Value::Bool(false)),
     );
+}
+
+/// Did the SDK relay answer a fire-and-forget command — `delivered` but
+/// `executed: false` (`ui-bridge` `command-relay.ts`, `DEFAULT_FIRE_AND_FORGET`
+/// = `pageNavigate`, `pageRefresh`)? Read at the top level or under `data`.
+/// Only an explicit `false` counts: an absent field is a command that ran.
+pub(crate) fn delivered_unexecuted(response: &serde_json::Value) -> bool {
+    let unexecuted =
+        |v: &serde_json::Value| v.get("executed") == Some(&serde_json::Value::Bool(false));
+    unexecuted(response) || response.get("data").is_some_and(unexecuted)
 }
 
 /// `failure_origin` of a request the RUNNER rejected before touching any UI
@@ -614,6 +730,11 @@ pub(crate) enum JourneyEvent {
         provenance: Provenance,
         action: ActionSpec,
         hint: Option<EdgeOutcome>,
+        /// Hold the edge until a snapshot satisfies this rule (D4); `None`
+        /// closes it on the next snapshot.
+        hold: Option<HoldRule>,
+        /// When the handler saw the action complete.
+        at: Instant,
     },
     /// A successful, UNFILTERED snapshot of the cursor's page (closes a
     /// pending edge). May be the SDK's `{success, data}` envelope; the worker
@@ -622,8 +743,12 @@ pub(crate) enum JourneyEvent {
         key: CursorKey,
         app_version: Option<String>,
         snapshot: Arc<serde_json::Value>,
+        /// When the snapshot's request began: a snapshot requested before a
+        /// held action completed is not evidence of where it led (D4).
+        taken_at: Instant,
     },
-    /// Close every pending edge older than the TTL (the retention tick).
+    /// Close every pending edge older than the TTL, or past its hold window
+    /// (the retention tick, and the worker's own hold-deadline timer).
     Sweep,
 }
 
@@ -666,16 +791,19 @@ pub(crate) fn record_action(
             provenance,
             action,
             hint: failure_hint(failed),
+            hold: None,
+            at: Instant::now(),
         },
     );
 }
 
-/// A successful, unfiltered snapshot.
+/// A successful, unfiltered snapshot whose request began at `taken_at`.
 pub(crate) fn record_snapshot(
     pg_db: Arc<PgDb>,
     key: CursorKey,
     app_version: Option<String>,
     snapshot: Arc<serde_json::Value>,
+    taken_at: Instant,
 ) {
     enqueue_edge_observation(
         pg_db,
@@ -683,6 +811,7 @@ pub(crate) fn record_snapshot(
             key,
             app_version,
             snapshot,
+            taken_at,
         },
     );
 }
@@ -723,6 +852,8 @@ pub(crate) fn record_diff(
             provenance,
             action: ActionSpec::with_diff(request_body),
             hint: diff_outcome_hint(response, failed),
+            hold: None,
+            at: Instant::now(),
         },
     );
 }
@@ -738,7 +869,19 @@ pub(crate) fn snapshot_view(body: &serde_json::Value) -> &serde_json::Value {
 
 async fn run_worker(pg_db: Arc<PgDb>, mut rx: mpsc::Receiver<JourneyEvent>) {
     let mut cursors = Cursors::default();
-    while let Some(event) = rx.recv().await {
+    loop {
+        // A held edge (D4) must close at its deadline even when no further
+        // event arrives for its cursor, so wake for the earliest one.
+        let event = match cursors.next_hold_deadline() {
+            Some(deadline) => tokio::select! {
+                ev = rx.recv() => ev,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    Some(JourneyEvent::Sweep)
+                }
+            },
+            None => rx.recv().await,
+        };
+        let Some(event) = event else { break };
         process_event(&pg_db, &mut cursors, event).await;
         health::set_pending_open(cursors.pending_count() as u64);
     }
@@ -751,8 +894,10 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
             provenance,
             action,
             hint,
+            hold,
+            at,
         } => {
-            if let Some(displaced) = cursors.open(&key, &action, provenance, hint, Instant::now()) {
+            if let Some(displaced) = cursors.open_held(&key, &action, provenance, hint, at, hold) {
                 write_edge(pg, displaced).await;
             }
         }
@@ -760,6 +905,7 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
             key,
             app_version,
             snapshot,
+            taken_at,
         } => {
             let node = resolve_node(pg, &key.app_id, app_version, Arc::clone(&snapshot)).await;
             let affordances = extract_affordances(snapshot_view(&snapshot));
@@ -767,7 +913,13 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
                 node: node.clone(),
                 digest: affordance_digest(&affordances),
             };
-            let closed = cursors.observe(&key, observed, affordances.clone(), Instant::now());
+            let closed = cursors.observe_taken(
+                &key,
+                observed,
+                affordances.clone(),
+                taken_at,
+                Instant::now(),
+            );
             let run_id = closed.as_ref().and_then(|d| d.provenance.run_id.clone());
             if let Some(draft) = closed {
                 write_edge(pg, draft).await;
@@ -803,6 +955,9 @@ async fn resolve_node(
     snapshot: Arc<serde_json::Value>,
 ) -> JourneyNode {
     let identity = page_identity(snapshot_view(&snapshot));
+    if identity.template_untrusted {
+        health::record_template_untrusted();
+    }
     let lookup = match identity.spec_lookup_label.clone() {
         None => SpecLookup::NoSpec,
         Some(page_id) => {
@@ -1406,6 +1561,61 @@ mod tests {
             );
         }
         assert_eq!(cached_answer(&ProbeCache::Unprobed, t0), None);
+    }
+
+    // ---- D6: runner_instance ------------------------------------------------
+
+    #[test]
+    fn runner_instance_reads_temp_for_a_test_id() {
+        let id = "test-6f1c2a9e-0d4b-4f6e-9a51-3c2b7d8e9f00";
+        assert_eq!(resolve_runner_instance(None, Some(id), None, false), "temp");
+        // The supervisor names a temp runner by its id, so the instance name
+        // alone classifies it too.
+        assert_eq!(resolve_runner_instance(None, None, Some(id), true), "temp");
+    }
+
+    #[test]
+    fn runner_instance_order() {
+        assert_eq!(
+            resolve_runner_instance(Some("canary"), Some("test-1"), Some("x"), true),
+            "canary",
+            "an explicit role wins"
+        );
+        assert_eq!(
+            resolve_runner_instance(Some("  "), Some("named-blue"), None, true),
+            "named",
+            "a blank role is no role"
+        );
+        assert_eq!(
+            resolve_runner_instance(None, Some("some-external"), Some("Blue Theme"), true),
+            "named",
+            "an unclassifiable id falls through to the instance name"
+        );
+        assert_eq!(
+            resolve_runner_instance(None, None, None, true),
+            "secondary"
+        );
+        assert_eq!(resolve_runner_instance(None, None, None, false), "primary");
+        assert_eq!(
+            resolve_runner_instance(None, Some("primary"), None, false),
+            "primary"
+        );
+    }
+
+    // ---- D4: fire-and-forget detection ---------------------------------------
+
+    #[test]
+    fn only_an_explicit_executed_false_is_fire_and_forget() {
+        assert!(delivered_unexecuted(&json!({
+            "success": true, "fireAndForget": true, "delivered": true, "executed": false
+        })));
+        assert!(delivered_unexecuted(
+            &json!({"success": true, "data": {"delivered": true, "executed": false}})
+        ));
+        assert!(!delivered_unexecuted(&json!({"success": true})));
+        assert!(!delivered_unexecuted(
+            &json!({"success": true, "data": {"executed": true}})
+        ));
     }
 
     // ---- privacy -----------------------------------------------------------

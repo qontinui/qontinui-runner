@@ -17,6 +17,21 @@
 //! interactive-affordance digests must be equal too. Two `unmodelled:unknown`
 //! nodes share a key while being any two pages, so without the digest a dead
 //! click could not be told from a navigation.
+//!
+//! **Held edges** (plan
+//! `2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern`
+//! D4). A fire-and-forget navigation — the SDK relay answers `pageNavigate` /
+//! `pageRefresh` with `delivered: true, executed: false` before the page has
+//! loaded — must not be closed by the next snapshot, which can precede the
+//! load and read as a false `no_change`. Such an edge is HELD:
+//! - [`HoldRule::UntilChanged`] (navigate): closes on the first snapshot
+//!   [`outcome_of`] would NOT call `no_change` — a different node key OR a
+//!   different affordance digest;
+//! - [`HoldRule::UntilNextSnapshot`] (refresh, which legitimately lands on the
+//!   same page): closes on the first snapshot TAKEN after the hold began;
+//! - either way, a snapshot taken before the hold began is never evidence of
+//!   where the action led, and after [`HOLD_WINDOW`] the edge closes as the
+//!   existing `to_node_unobserved` (destination unknown) — never a new outcome.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -32,6 +47,30 @@ use super::node::{component_action_fingerprint, unknown_node, AffordanceIndex};
 /// a snapshot two minutes after an action is not evidence of where that
 /// action led.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(120);
+
+/// How long a HELD edge waits for its closing snapshot before it closes as
+/// `to_node_unobserved` (D4).
+pub(crate) const HOLD_WINDOW: Duration = Duration::from_secs(5);
+
+/// How a held edge decides which snapshot closes it (D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldRule {
+    /// A fire-and-forget navigation: close on the first snapshot that
+    /// [`outcome_of`] would not classify `no_change`.
+    UntilChanged,
+    /// A fire-and-forget refresh: close on the first snapshot taken after the
+    /// hold began, whatever it shows.
+    UntilNextSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hold {
+    rule: HoldRule,
+    /// When the hold began. A snapshot taken before this is not evidence.
+    began: Instant,
+    /// When the hold expires into `to_node_unobserved`.
+    deadline: Instant,
+}
 
 /// One pending-edge slot per app, runner instance and scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -368,11 +407,36 @@ struct PendingEdge {
     hint: Option<EdgeOutcome>,
     provenance: Provenance,
     opened_at: Instant,
+    hold: Option<Hold>,
 }
 
 impl PendingEdge {
+    /// Past the TTL, or a held edge past its hold window: either way the
+    /// next close is `to_node_unobserved`.
     fn is_stale(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.opened_at) >= PENDING_TTL
+            || self.hold.is_some_and(|h| now >= h.deadline)
+    }
+
+    /// May this snapshot close the edge? Always, for an unheld edge.
+    fn closes_on(&self, observed: &Observed, taken_at: Instant) -> bool {
+        let Some(hold) = self.hold else {
+            return true;
+        };
+        if taken_at < hold.began {
+            return false;
+        }
+        match hold.rule {
+            HoldRule::UntilNextSnapshot => true,
+            HoldRule::UntilChanged => {
+                outcome_of(
+                    &self.from_node,
+                    self.from_digest.as_deref(),
+                    Some(observed),
+                    None,
+                ) != EdgeOutcome::NoChange
+            }
+        }
     }
 
     fn close(self, key: &CursorKey, to: Option<&Observed>) -> EdgeDraft {
@@ -417,6 +481,27 @@ impl Cursors {
         hint: Option<EdgeOutcome>,
         now: Instant,
     ) -> Option<EdgeDraft> {
+        self.open_held(key, action, provenance, hint, now, None)
+    }
+
+    /// [`Self::open`], HOLDING the edge under `hold` (D4). A failed action
+    /// (an `error` hint) is never held: nothing was delivered to wait for.
+    pub(crate) fn open_held(
+        &mut self,
+        key: &CursorKey,
+        action: &ActionSpec,
+        provenance: Provenance,
+        hint: Option<EdgeOutcome>,
+        now: Instant,
+        hold: Option<HoldRule>,
+    ) -> Option<EdgeDraft> {
+        let hold = hold
+            .filter(|_| hint != Some(EdgeOutcome::Error))
+            .map(|rule| Hold {
+                rule,
+                began: now,
+                deadline: now + HOLD_WINDOW,
+            });
         let cursor = self.map.entry(key.clone()).or_default();
         let displaced = cursor.pending.take().map(|p| p.close(key, None));
         cursor.pending = Some(PendingEdge {
@@ -430,6 +515,7 @@ impl Cursors {
             hint,
             provenance,
             opened_at: now,
+            hold,
         });
         displaced
     }
@@ -445,20 +531,48 @@ impl Cursors {
         affordances: AffordanceIndex,
         now: Instant,
     ) -> Option<EdgeDraft> {
+        self.observe_taken(key, observed, affordances, now, now)
+    }
+
+    /// [`Self::observe`] for a snapshot TAKEN at `taken_at` (its request
+    /// began then) and processed at `now`. A HELD edge stays pending until a
+    /// snapshot satisfies its [`HoldRule`]; the snapshot still becomes the
+    /// cursor's last node either way.
+    pub(crate) fn observe_taken(
+        &mut self,
+        key: &CursorKey,
+        observed: Observed,
+        affordances: AffordanceIndex,
+        taken_at: Instant,
+        now: Instant,
+    ) -> Option<EdgeDraft> {
         let cursor = self.map.entry(key.clone()).or_default();
-        let closed = cursor.pending.take().map(|p| {
-            if p.is_stale(now) {
-                p.close(key, None)
-            } else {
-                p.close(key, Some(&observed))
+        let closed = match cursor.pending.take() {
+            None => None,
+            Some(p) if p.is_stale(now) => Some(p.close(key, None)),
+            Some(p) if p.closes_on(&observed, taken_at) => Some(p.close(key, Some(&observed))),
+            Some(held) => {
+                cursor.pending = Some(held);
+                None
             }
-        });
+        };
         cursor.last = Some(observed);
         cursor.last_affordances = affordances;
         closed
     }
 
-    /// Close every pending edge older than [`PENDING_TTL`] as unobserved.
+    /// The earliest hold deadline among open edges, so the worker can close
+    /// an expired hold on time rather than at the next hourly sweep.
+    pub(crate) fn next_hold_deadline(&self) -> Option<Instant> {
+        self.map
+            .values()
+            .filter_map(|c| c.pending.as_ref().and_then(|p| p.hold))
+            .map(|h| h.deadline)
+            .min()
+    }
+
+    /// Close every pending edge older than [`PENDING_TTL`] (or past its hold
+    /// window) as unobserved.
     pub(crate) fn sweep(&mut self, now: Instant) -> Vec<EdgeDraft> {
         let mut drafts = Vec::new();
         for (key, cursor) in &mut self.map {
@@ -863,6 +977,210 @@ mod tests {
         assert_eq!(swept[0].key, key());
         assert_eq!(swept[0].outcome, EdgeOutcome::ToNodeUnobserved);
         assert_eq!(c.pending_count(), 1, "the fresh edge stays pending");
+    }
+
+    // ---- D4: held fire-and-forget navigations ------------------------------
+
+    fn navigate() -> ActionSpec {
+        ActionSpec::navigation("navigate", NavigationTriggerKind::Push)
+    }
+
+    fn refresh() -> ActionSpec {
+        ActionSpec::navigation("refresh", NavigationTriggerKind::Initial)
+    }
+
+    /// The 2026-10-09 false `no_change` (rows aa5a8fdd / d21c5a93): an
+    /// `executed: false` navigate followed only by snapshots of the page it
+    /// left closes as `to_node_unobserved` once the window passes — never
+    /// `no_change`.
+    #[test]
+    fn an_unexecuted_navigate_then_an_unchanged_snapshot_is_unobserved_not_no_change() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        let soon = now + Duration::from_millis(200);
+        assert!(
+            c.observe_taken(
+                &key(),
+                seen("home", &["idle"], "d1"),
+                AffordanceIndex::default(),
+                soon,
+                soon
+            )
+            .is_none(),
+            "an unchanged snapshot inside the window does not close a held navigate"
+        );
+        assert_eq!(c.pending_count(), 1);
+        assert_eq!(c.next_hold_deadline(), Some(now + HOLD_WINDOW));
+        let late = now + HOLD_WINDOW;
+        let edge = c
+            .observe_taken(
+                &key(),
+                seen("home", &["idle"], "d1"),
+                AffordanceIndex::default(),
+                late,
+                late,
+            )
+            .expect("the expired hold closes");
+        assert_eq!(edge.outcome, EdgeOutcome::ToNodeUnobserved);
+        assert!(edge.to_node.is_none());
+    }
+
+    #[test]
+    fn an_expired_hold_is_swept_as_unobserved() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        assert!(c.sweep(now + Duration::from_secs(1)).is_empty());
+        let swept = c.sweep(now + HOLD_WINDOW);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].outcome, EdgeOutcome::ToNodeUnobserved);
+        assert_eq!(c.next_hold_deadline(), None);
+    }
+
+    #[test]
+    fn a_held_navigate_closes_on_a_changed_key_or_a_changed_digest() {
+        for (to, label) in [
+            (seen("detail", &["open"], "d1"), "different key"),
+            (seen("home", &["idle"], "d2"), "same key, different digest"),
+        ] {
+            let now = t0();
+            let mut c = Cursors::default();
+            c.observe(
+                &key(),
+                seen("home", &["idle"], "d1"),
+                AffordanceIndex::default(),
+                now,
+            );
+            c.open_held(
+                &key(),
+                &navigate(),
+                Provenance::default(),
+                None,
+                now,
+                Some(HoldRule::UntilChanged),
+            );
+            let t = now + Duration::from_secs(1);
+            let edge = c
+                .observe_taken(&key(), to, AffordanceIndex::default(), t, t)
+                .unwrap_or_else(|| panic!("{label}: must close"));
+            assert_eq!(edge.outcome, EdgeOutcome::Changed, "{label}");
+            assert!(edge.to_node.is_some(), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_taken_before_the_hold_began_never_closes_it() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            AffordanceIndex::default(),
+            now,
+        );
+        let action_at = now + Duration::from_millis(500);
+        c.open_held(
+            &key(),
+            &refresh(),
+            Provenance::default(),
+            None,
+            action_at,
+            Some(HoldRule::UntilNextSnapshot),
+        );
+        // Requested before the refresh answered, processed after it.
+        assert!(c
+            .observe_taken(
+                &key(),
+                seen("other", &["x"], "d9"),
+                AffordanceIndex::default(),
+                now,
+                action_at + Duration::from_millis(10),
+            )
+            .is_none());
+        assert_eq!(c.pending_count(), 1);
+    }
+
+    #[test]
+    fn a_held_refresh_closes_on_the_next_snapshot_even_if_unchanged() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open_held(
+            &key(),
+            &refresh(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilNextSnapshot),
+        );
+        let t = now + Duration::from_millis(300);
+        let edge = c
+            .observe_taken(
+                &key(),
+                seen("home", &["idle"], "d1"),
+                AffordanceIndex::default(),
+                t,
+                t,
+            )
+            .expect("a refresh closes on the first snapshot after it");
+        assert_eq!(edge.outcome, EdgeOutcome::NoChange);
+        assert_eq!(edge.trigger.action_type, "refresh");
+    }
+
+    #[test]
+    fn a_failed_navigate_is_never_held() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            failure_hint(true),
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        assert_eq!(c.next_hold_deadline(), None);
+        let edge = c
+            .observe(
+                &key(),
+                seen("home", &["idle"], "d1"),
+                AffordanceIndex::default(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(edge.outcome, EdgeOutcome::Error);
     }
 
     // ---- triggers ----------------------------------------------------------
