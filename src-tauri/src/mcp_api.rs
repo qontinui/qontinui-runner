@@ -1987,6 +1987,31 @@ async fn health(
         .unwrap_or(crate::session::tenant_pin::TenantPin::Unresolvable);
     let (active_tenant_id_json, active_tenant_pin) = active_tenant_health_fields(pin);
 
+    // The machine's capability (plan
+    // 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated,
+    // Phase 1) and the shadow ladder scale derived from it (Phase 2). Blocking —
+    // a registry read and pagefile stats on Windows, a `/proc/meminfo` read on
+    // Linux — so it goes to the blocking pool like the pin read above. A join
+    // error established nothing: every field is UNKNOWN with that reason, never
+    // a zero.
+    let (machine_capability_json, commit_ladder_shadow_json) =
+        match tokio::task::spawn_blocking(crate::fleet::machine_capability::probe).await {
+            Ok(capability) => (
+                serde_json::to_value(&capability).unwrap_or(serde_json::Value::Null),
+                crate::resource_guard::commit_ladder_shadow_health_json(Ok(&capability)),
+            ),
+            Err(e) => {
+                let reason = format!("capability probe task failed: {e}");
+                (
+                    serde_json::to_value(crate::fleet::machine_capability::unknown_everywhere(
+                        &reason,
+                    ))
+                    .unwrap_or(serde_json::Value::Null),
+                    crate::resource_guard::commit_ladder_shadow_health_json(Err(&reason)),
+                )
+            }
+        };
+
     // AI provider circuit breaker states
     let ai_provider_states: Vec<serde_json::Value> =
         crate::ai_provider::circuit_breaker::all_provider_states()
@@ -2613,6 +2638,23 @@ async fn health(
         // only populates where the fleet resource sample publishes, and `null`
         // there means the 256/400 floor by design, not a fault.
         "threadCeilings": crate::resource_guard::thread_ceilings_health_json(),
+        // How big this machine is (plan
+        // 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated,
+        // Phase 1): `commitLimit`, `commitLimitSource`, `commitCharged`,
+        // `physTotal`, `cores`, `pagefileAllocated`, `pagefileMax`,
+        // `pagefileFixed`, and `capabilityUnknown` naming the reason for every
+        // null field — a null is UNKNOWN, never zero. On Linux `commitLimit` is
+        // `/proc/meminfo` `CommitLimit`, NOT `MemTotal`. See
+        // `fleet::machine_capability`.
+        "machineCapability": machine_capability_json,
+        // Phase 2, SHADOW: the factor the resource guard's byte ladder WOULD be
+        // scaled by on this machine (`armed: false` — no verdict uses it; the
+        // per-rung comparison is logged edge-triggered under the
+        // `resource_guard::commit_ladder_shadow` target). `scaleSource` says
+        // why (`derived` | `below_reference` | `unknown_identity`); when the
+        // probe task failed, `scale`/`scaleSource` are null and `reason` says
+        // why — the object is always present.
+        "commitLadderShadow": commit_ladder_shadow_json,
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was

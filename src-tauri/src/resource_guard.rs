@@ -914,6 +914,811 @@ pub(crate) fn machine_thread_shift(baseline: Option<usize>) -> usize {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// The commit ladder's machine scale — SHADOW ONLY
+// ---------------------------------------------------------------------------
+//
+// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+// Phase 2. The byte-ladder mirror of `machine_thread_shift` directly above, and
+// deliberately the same shape: one machine-derived term applied to the WHOLE
+// ladder after the fold and the clamp, identity on both UNKNOWN arms, pure over
+// an injected input. The difference is only the operator — a thread ladder is
+// re-based by ADDITION onto a measured idle floor, a byte ladder is re-scaled by
+// MULTIPLICATION against the machine's size — and both preserve the ladder's
+// order for the same reason: the operation is monotone.
+//
+// NOTHING HERE CHANGES A VERDICT. `note_commit_ladder_shadow` logs what each
+// rung WOULD be at the derived scale beside what the shipped rungs decide, so
+// Phase 2's soak can count the spawns and builds the scaled ladder would have
+// refused that the shipped one admitted. Phase 4 — arming it — is gated on that
+// count.
+
+/// The commit limit of the machine the shipped byte ladder is already correct
+/// for: 32 GiB. The byte-lane analogue of [`CALIBRATION_BASELINE`].
+///
+/// **Provisional — Phase 2's soak confirms or moves it**, exactly as
+/// [`CALIBRATION_BASELINE`] earned its 151 by measurement rather than by
+/// assertion. 32 GiB is a 16 GiB box with Windows' default system-managed
+/// pagefile (≈1× RAM): the smallest machine this fleet expects to host a
+/// runner, and the size at which the shipped 3 / 1.5 GiB session floors are a
+/// sane 9.4 % / 4.7 % of the limit. On the MSI operator box (71.71 GiB commit
+/// limit) the same 1.5 GiB is 2.1 % — `CreateProcess` had been failing with
+/// `os error 1455` for minutes before free commit got that low.
+pub(crate) const REFERENCE_COMMIT_LIMIT: u64 = 32 * 1024 * 1024 * 1024;
+
+/// The largest factor [`commit_ladder_scale`] will apply (4.0).
+///
+/// Bounds what a huge — or misreported — commit limit may compose, for the
+/// reason [`SESSION_FLOOR_MAX_BYTES`]' own doc gives: an unreachable floor does
+/// not make the guard stricter, it makes the machine unusable, and 13 of the
+/// gate's 17 seams (measured at `0def8f7ce`) are unattended with nobody to press
+/// "Start anyway". It binds on a 368 GB box (`merytshost`), whose linear factor
+/// would be 11.5; the byte-lane mirror of [`AT_REST_BASELINE_MAX`].
+pub(crate) const SCALE_MAX: f64 = 4.0;
+
+/// How far to scale this machine's byte ladder, as a factor. PURE.
+///
+/// ## Why the ladder scales at all
+///
+/// A byte floor is a HEADROOM figure wearing an absolute number's clothes, the
+/// same way [`machine_thread_shift`]'s doc says a thread ceiling is. 3 GiB and
+/// 1.5 GiB were chosen by their POSITION in a ladder of other constants
+/// (`settings.rs`' floor doc: `cargo-guard.sh` 5, supervisor 5, `ci_node` 4,
+/// warn lighter than all three, critical heaviest) — the ladder is ORDERED but
+/// not SCALED. Order is a relation among the rungs; scale is a relation to the
+/// box. Enforced as absolutes on a machine twice the size they were calibrated
+/// for, they are not a stricter guard: they fire only after the box is already
+/// failing to create processes.
+///
+/// ## Why the lower clamp is 1.0
+///
+/// A box SMALLER than [`REFERENCE_COMMIT_LIMIT`] gets today's constants, byte
+/// for byte — never looser ones. The same non-loosening discipline as
+/// [`tighten`], and the same reason [`machine_thread_shift`] returns `0` rather
+/// than a negative shift on a below-baseline machine. It is also what makes the
+/// derivation behaviour-neutral on every machine at or below the reference,
+/// which is the property to verify first.
+///
+/// ## The UNKNOWN arms
+///
+/// No commit limit, and a commit limit of `0`, both give EXACTLY `1.0` — the
+/// shipped ladder. A capability gap must never loosen protection and must never
+/// manufacture any: `0` is not "a box with no memory", it is a probe that
+/// answered nonsense, and it is never divided by. The capability block already
+/// records why the field is UNKNOWN (`capability_unknown`), so this function
+/// only has to refuse to guess.
+pub(crate) fn commit_ladder_scale(
+    capability: &crate::fleet::machine_capability::MachineCapability,
+) -> f64 {
+    match capability.commit_limit {
+        None | Some(0) => 1.0,
+        Some(limit) => (limit as f64 / REFERENCE_COMMIT_LIMIT as f64).clamp(1.0, SCALE_MAX),
+    }
+}
+
+/// WHY [`commit_ladder_scale`] gave the factor it gave — so a `1.0` on
+/// `/health` or in the shadow log says which of three very different things it
+/// is. PURE.
+///
+/// - `"unknown_identity"` — no usable commit limit (absent or `0`): the
+///   shipped ladder because the machine's size is UNKNOWN.
+/// - `"below_reference"` — a measured limit at or below
+///   [`REFERENCE_COMMIT_LIMIT`]: the shipped ladder because it is already
+///   correct for a box this size (the lower clamp).
+/// - `"derived"` — a measured limit above the reference: the factor is the
+///   box's own (possibly clamped at [`SCALE_MAX`]).
+pub(crate) fn commit_ladder_scale_source(
+    capability: &crate::fleet::machine_capability::MachineCapability,
+) -> &'static str {
+    match capability.commit_limit {
+        None | Some(0) => "unknown_identity",
+        Some(limit) if limit <= REFERENCE_COMMIT_LIMIT => "below_reference",
+        Some(_) => "derived",
+    }
+}
+
+/// The `/health` `commitLadderShadow` block. `Err(reason)` when the capability
+/// probe never ran: the SAME object with `scale` and `scaleSource` null and the
+/// reason beside them — never a bare `null`, which a reader cannot tell from a
+/// build that serves no such block.
+pub(crate) fn commit_ladder_shadow_health_json(
+    capability: Result<&crate::fleet::machine_capability::MachineCapability, &str>,
+) -> serde_json::Value {
+    let (scale, source, reason) = match capability {
+        Ok(c) => (
+            serde_json::json!(commit_ladder_scale(c)),
+            serde_json::json!(commit_ladder_scale_source(c)),
+            serde_json::Value::Null,
+        ),
+        Err(reason) => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::json!(reason),
+        ),
+    };
+    serde_json::json!({
+        "armed": false,
+        "scale": scale,
+        "scaleSource": source,
+        "reason": reason,
+        "referenceCommitLimit": REFERENCE_COMMIT_LIMIT,
+        "scaleMax": SCALE_MAX,
+    })
+}
+
+/// `base × scale`, never below `base`. At (or below, or NaN) a scale of `1.0`
+/// the answer is `base` itself, not a float round-trip of it — which is what
+/// makes the identity property hold byte for byte for every `u64`.
+fn scale_bytes(base: u64, scale: f64) -> u64 {
+    if scale.is_nan() || scale <= 1.0 {
+        return base;
+    }
+    // `as` from f64 saturates at u64::MAX, so an absurd product cannot wrap.
+    ((base as f64 * scale).round() as u64).max(base)
+}
+
+/// Every free-commit rung the runner enforces, in bytes, at one scale — plus
+/// the two composition caps, which scale WITH the ladder.
+///
+/// ## Why the caps scale too (the `merytshost` finding)
+///
+/// [`SESSION_FLOOR_MAX_BYTES`] and
+/// [`crate::ci_node::admission::MAX_SESSION_DEFER_FLOOR_GB`] are themselves
+/// capability-blind constants of the same quantity. Scale the rungs into FIXED
+/// caps and the ladder inverts at the top: at scale 4.0 the `ci_node` reject
+/// (16 GiB, uncapped) would sit above the defer (32 → capped 12) and the
+/// session warn (12 → capped 12) would collide with it. At one scale for rungs
+/// and caps alike the caps never bind on the shipped ladder, and the order
+/// survives — which is the property the shadow tests pin.
+///
+/// The cargo-guard / supervisor rungs (5 GiB) are out-of-process and are not
+/// modelled here; Phase 4 scales their commit arms in their own repos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitLadder {
+    /// Session WARN floor: the effective (folded, coerced) warn floor × scale,
+    /// capped at [`Self::session_cap`].
+    pub(crate) session_warn: u64,
+    /// Session CRITICAL floor, likewise.
+    pub(crate) session_critical: u64,
+    /// [`SESSION_FLOOR_MAX_BYTES`] × scale.
+    pub(crate) session_cap: u64,
+    /// `ci_node`'s defer floor — `defer_commit_floor_gb`'s rule at this scale:
+    /// `max(DEFER_FREE_COMMIT_GB × s, min(⌈session warn⌉, ci_defer_cap))`, the
+    /// session term present only while the guard is enabled.
+    pub(crate) ci_defer: u64,
+    /// `MAX_SESSION_DEFER_FLOOR_GB` × scale.
+    pub(crate) ci_defer_cap: u64,
+    /// `ci_node`'s hard reject floor: `MIN_FREE_COMMIT_GB` × scale.
+    pub(crate) ci_reject: u64,
+}
+
+/// The whole byte ladder at `scale`, from the EFFECTIVE session floors (i.e.
+/// after [`merge_floors`]' fold, cap and [`coerce_ladder`], exactly where
+/// [`machine_thread_shift`] sits on the other lane). PURE.
+///
+/// At `scale == 1.0` every field equals the shipped rung byte for byte —
+/// including `ci_defer`, which reproduces `defer_commit_floor_gb`'s
+/// round-UP-to-whole-GiB of the session term.
+pub(crate) fn scaled_commit_ladder(effective: &SessionGuardSettings, scale: f64) -> CommitLadder {
+    use crate::ci_node::admission::{
+        DEFER_FREE_COMMIT_GB, MAX_SESSION_DEFER_FLOOR_GB, MIN_FREE_COMMIT_GB,
+    };
+    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let session_cap = scale_bytes(SESSION_FLOOR_MAX_BYTES, scale);
+    let session_warn = scale_bytes(effective.warn_free_commit_bytes, scale).min(session_cap);
+    let session_critical =
+        scale_bytes(effective.critical_free_commit_bytes, scale).min(session_cap);
+
+    let ci_defer_cap = scale_bytes(MAX_SESSION_DEFER_FLOOR_GB * GIB_BYTES, scale);
+    let ci_defer_base = scale_bytes(DEFER_FREE_COMMIT_GB * GIB_BYTES, scale);
+    // `probe_headroom` hands the session term to `defer_commit_floor_gb` only
+    // while the guard is enabled; a disabled guard contributes no term.
+    let ci_defer = if effective.enabled {
+        let session_term = session_warn.div_ceil(GIB_BYTES).saturating_mul(GIB_BYTES);
+        ci_defer_base.max(session_term.min(ci_defer_cap))
+    } else {
+        ci_defer_base
+    };
+
+    CommitLadder {
+        session_warn,
+        session_critical,
+        session_cap,
+        ci_defer,
+        ci_defer_cap,
+        ci_reject: scale_bytes(MIN_FREE_COMMIT_GB * GIB_BYTES, scale),
+    }
+}
+
+/// The factor the admitted-concurrency alternative would scale the ladder by.
+/// PURE. `None` when host memory is unreadable.
+///
+/// Plan resolved Open question 1: linear-in-the-commit-limit is the scale
+/// Phase 4 arms, and this is the more principled alternative the soak prices
+/// beside it — size the floor to cover exactly the build burst `ci_node` has
+/// PROMISED to allow (`admitted × per-build share`, in `host_sizing`'s own
+/// units). Expressed as a factor on the shipped `ci_node` defer floor, the rung
+/// whose whole job is to hold headroom for a build: `burst / 8 GiB`, clamped to
+/// `[1.0, SCALE_MAX]` by the same argument as [`commit_ladder_scale`].
+///
+/// It is NOT the armed candidate, for the reason the plan records: it is
+/// derived from `sysinfo` physical RAM (not the commit limit) and describes the
+/// `ci_node` lane only, so it cannot scale the session pair or the
+/// out-of-process rungs — and one scale covering every rung is what keeps the
+/// ladder ordered.
+pub(crate) fn admitted_concurrency_scale(
+    host: crate::ci_node::host_sizing::HostCapacity,
+    admitted: u32,
+) -> Option<f64> {
+    let burst = crate::ci_node::host_sizing::admitted_build_burst_bytes(host, admitted)?;
+    let defer = crate::ci_node::admission::DEFER_FREE_COMMIT_GB * 1024 * 1024 * 1024;
+    Some((burst as f64 / defer as f64).clamp(1.0, SCALE_MAX))
+}
+
+/// What one ladder decides on one free-commit reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LadderVerdicts {
+    /// The session gate's verdict word: `"proceed"`, `"warn"` or `"critical"`.
+    pub(crate) session: &'static str,
+    /// `ci_node` would DEFER a build on the commit arm (the swap and saturation
+    /// arms are not a function of the ladder and are not shadowed).
+    pub(crate) ci_defer: bool,
+    /// `ci_node` would REJECT a build.
+    pub(crate) ci_reject: bool,
+}
+
+/// Judge `free` against `ladder`. PURE. The session verdict goes through
+/// [`evaluate`] itself, so the shadow cannot drift from the real gate's
+/// boundaries (strictly below) or its disabled-guard arm.
+///
+/// Byte comparisons for `ci_node` are exact against its integer-GiB rule at
+/// scale 1.0: `free / GiB < n` ⇔ `free < n × GiB`.
+pub(crate) fn ladder_verdicts(
+    free: u64,
+    effective: &SessionGuardSettings,
+    ladder: &CommitLadder,
+) -> LadderVerdicts {
+    let scaled = SessionGuardSettings {
+        warn_free_commit_bytes: ladder.session_warn,
+        critical_free_commit_bytes: ladder.session_critical,
+        ..effective.clone()
+    };
+    let session = evaluate(Lane::Host.as_str(), Some(free), &scaled)
+        .tripped()
+        .map(|(word, _)| word)
+        .unwrap_or("proceed");
+    LadderVerdicts {
+        session,
+        ci_defer: free < ladder.ci_defer,
+        ci_reject: free < ladder.ci_reject,
+    }
+}
+
+/// One shadow observation: the scale, both ladders, and what each decides.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CommitLadderShadow {
+    pub(crate) scale: f64,
+    /// [`commit_ladder_scale_source`] — why the scale is what it is.
+    pub(crate) scale_source: &'static str,
+    pub(crate) shipped: CommitLadder,
+    pub(crate) scaled: CommitLadder,
+    /// `None` when the free-commit reading is UNKNOWN — both ladders then fail
+    /// open, exactly as the real gate does, and there is nothing to compare.
+    pub(crate) verdicts: Option<(LadderVerdicts, LadderVerdicts)>,
+    /// The admitted-concurrency alternative's factor (resolved OQ1), or `None`
+    /// when host memory is unreadable.
+    pub(crate) alternative_scale: Option<f64>,
+}
+
+/// Assemble a [`CommitLadderShadow`]. PURE over every input.
+pub(crate) fn commit_ladder_shadow(
+    capability: &crate::fleet::machine_capability::MachineCapability,
+    effective: &SessionGuardSettings,
+    free_commit: Option<u64>,
+    alternative_scale: Option<f64>,
+) -> CommitLadderShadow {
+    let scale = commit_ladder_scale(capability);
+    let shipped = scaled_commit_ladder(effective, 1.0);
+    let scaled = scaled_commit_ladder(effective, scale);
+    CommitLadderShadow {
+        scale,
+        scale_source: commit_ladder_scale_source(capability),
+        shipped,
+        scaled,
+        verdicts: free_commit.map(|free| {
+            (
+                ladder_verdicts(free, effective, &shipped),
+                ladder_verdicts(free, effective, &scaled),
+            )
+        }),
+        alternative_scale,
+    }
+}
+
+/// What makes two shadow observations "the same line".
+///
+/// The scales are keyed at hundredths: a fixed pagefile's commit limit never
+/// moves, and a system-managed one grows in large steps, so a sub-1 % scale
+/// drift is not new information — while every would-be rung is a function of
+/// the (keyed) shipped ladder and the (keyed) scale, so "a rung changed" and
+/// "the key changed" coincide. The verdict pairs are keyed too: a reading
+/// crossing a rung of EITHER ladder is precisely the event the soak counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShadowKey {
+    scale_centi: i64,
+    /// So `below_reference` ↔ `unknown_identity` — both 1.0 — still logs: a
+    /// capability that goes dark is news even when the factor does not move.
+    scale_source: &'static str,
+    alternative_centi: Option<i64>,
+    shipped: CommitLadder,
+    verdicts: Option<(LadderVerdicts, LadderVerdicts)>,
+}
+
+impl CommitLadderShadow {
+    fn key(&self) -> ShadowKey {
+        let centi = |s: f64| (s * 100.0).round() as i64;
+        ShadowKey {
+            scale_centi: centi(self.scale),
+            scale_source: self.scale_source,
+            alternative_centi: self.alternative_scale.map(centi),
+            shipped: self.shipped,
+            verdicts: self.verdicts,
+        }
+    }
+}
+
+/// The last shadow key logged — the edge trigger's memory.
+static LAST_SHADOW: Mutex<Option<ShadowKey>> = Mutex::new(None);
+
+/// Record `key` as current; `true` iff it differs from the last one. PURE over
+/// the slot it is handed, so the edge discipline is testable without the
+/// process-global.
+fn shadow_edge(last: &mut Option<ShadowKey>, key: ShadowKey) -> bool {
+    if *last == Some(key) {
+        return false;
+    }
+    *last = Some(key);
+    true
+}
+
+/// Log, edge-triggered, what the scaled commit ladder WOULD decide beside what
+/// the shipped one does. **Changes no verdict.**
+///
+/// Called from the fleet sampler's host lane (`collect_host_lane`), which runs
+/// every ~30 s on a blocking-pool thread and is off every spawn path. Every
+/// input is handed in from what that loop already holds — the free-commit
+/// reading and the capability built around it, the session-guard and
+/// `ci_node` settings out of the one settings document it loads anyway, and a
+/// [`HostCapacity`](crate::ci_node::host_sizing::HostCapacity) built from its
+/// own memory reading and core count — so this function makes no memory
+/// syscall, no settings read and no sysinfo refresh of its own. Its one impure
+/// read is [`effective_session_floors`]' lock on the fleet-floor cache.
+/// Hooking it into [`effective_session_floors`] instead would have put all of
+/// that on the spawn path, which is the cost this module's gate is argued
+/// never to pay. The sampler runs on the primary only, which is the right
+/// population for the soak: every runner on a box reads the same machine.
+///
+/// Edge-triggered with [`note_ladder_coercion`]'s discipline — a line only
+/// when the scale, the rungs or either ladder's verdict CHANGES — because an
+/// unconditional line would be ~2,880 identical lines a day saying nothing new.
+/// The first observation after boot always logs, which is what gives the soak
+/// its baseline.
+pub(crate) fn note_commit_ladder_shadow(
+    capability: &crate::fleet::machine_capability::MachineCapability,
+    free_commit: Option<u64>,
+    session_guard: &SessionGuardSettings,
+    ci_node: &crate::settings::CiNodeSettings,
+    host: crate::ci_node::host_sizing::HostCapacity,
+) {
+    let effective = effective_session_floors(session_guard, Lane::Host.as_str());
+    let admitted = ci_node.effective_max_concurrent_builds_for(host);
+    let alternative = admitted_concurrency_scale(host, admitted);
+    let shadow = commit_ladder_shadow(capability, &effective, free_commit, alternative);
+
+    {
+        let mut last = LAST_SHADOW.lock().unwrap_or_else(|e| e.into_inner());
+        if !shadow_edge(&mut last, shadow.key()) {
+            return;
+        }
+    }
+
+    let rungs = |l: &CommitLadder| {
+        format!(
+            "session warn {} / critical {} (cap {}), ci_node defer {} (cap {}) / reject {}",
+            format_gib(l.session_warn),
+            format_gib(l.session_critical),
+            format_gib(l.session_cap),
+            format_gib(l.ci_defer),
+            format_gib(l.ci_defer_cap),
+            format_gib(l.ci_reject),
+        )
+    };
+    let verdict = |v: &LadderVerdicts| {
+        format!(
+            "session={} ci_defer={} ci_reject={}",
+            v.session, v.ci_defer, v.ci_reject
+        )
+    };
+    let (shipped_verdict, scaled_verdict, disagree) = match shadow.verdicts {
+        Some((shipped, scaled)) => (verdict(&shipped), verdict(&scaled), shipped != scaled),
+        None => (
+            "UNKNOWN (free commit unreadable — fails open)".to_string(),
+            "UNKNOWN (free commit unreadable — fails open)".to_string(),
+            false,
+        ),
+    };
+    let alternative_rungs = shadow
+        .alternative_scale
+        .map(|s| rungs(&scaled_commit_ladder(&effective, s)))
+        .unwrap_or_else(|| "UNKNOWN (host memory unreadable)".to_string());
+    tracing::info!(
+        target: "resource_guard::commit_ladder_shadow",
+        scale = shadow.scale,
+        scale_source = shadow.scale_source,
+        commit_limit = ?capability.commit_limit,
+        commit_limit_source = capability.commit_limit_source,
+        free_commit = ?free_commit,
+        alternative_scale = ?shadow.alternative_scale,
+        ci_admitted_builds = admitted,
+        verdicts_disagree = disagree,
+        "resource_guard: SHADOW commit ladder (plan 2026-09-23 Phase 2; enforces nothing) — \
+         scale {:.2} (commit limit {} / reference {}, clamp [1, {SCALE_MAX}]). \
+         Shipped: {} → {shipped_verdict}. Scaled: {} → {scaled_verdict}. \
+         Admitted-concurrency alternative ({admitted} builds × per-build share): {}",
+        shadow.scale,
+        capability
+            .commit_limit
+            .map(format_gib)
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+        format_gib(REFERENCE_COMMIT_LIMIT),
+        rungs(&shadow.shipped),
+        rungs(&shadow.scaled),
+        alternative_rungs,
+    );
+}
+
+#[cfg(test)]
+mod commit_ladder_scale_tests {
+    use super::*;
+    use crate::ci_node::admission::{
+        defer_commit_floor_gb, DEFER_FREE_COMMIT_GB, MAX_SESSION_DEFER_FLOOR_GB, MIN_FREE_COMMIT_GB,
+    };
+    use crate::ci_node::host_sizing::HostCapacity;
+    use crate::fleet::machine_capability::MachineCapability;
+
+    const GIB_U: u64 = 1024 * 1024 * 1024;
+
+    fn capability(commit_limit: Option<u64>) -> MachineCapability {
+        MachineCapability {
+            commit_limit,
+            commit_limit_source: "test",
+            commit_charged: None,
+            phys_total: None,
+            cores: None,
+            pagefile_allocated: None,
+            pagefile_max: None,
+            pagefile_fixed: None,
+            capability_unknown: BTreeMap::new(),
+        }
+    }
+
+    fn gib(bytes: u64) -> f64 {
+        bytes as f64 / GIB
+    }
+
+    fn assert_gib(actual: u64, expected: f64, what: &str) {
+        assert!(
+            (gib(actual) - expected).abs() < 0.01,
+            "{what}: {:.4} GiB, expected {expected:.2}",
+            gib(actual)
+        );
+    }
+
+    /// The shipped ladder, spelled from the SHIPPED constants — not from
+    /// `scaled_commit_ladder` — so the identity test compares against the
+    /// numbers that are enforced today.
+    fn shipped_constants(effective: &SessionGuardSettings) -> CommitLadder {
+        CommitLadder {
+            session_warn: effective.warn_free_commit_bytes,
+            session_critical: effective.critical_free_commit_bytes,
+            session_cap: SESSION_FLOOR_MAX_BYTES,
+            ci_defer: defer_commit_floor_gb(
+                effective
+                    .enabled
+                    .then_some(effective.warn_free_commit_bytes),
+            ) * GIB_U,
+            ci_defer_cap: MAX_SESSION_DEFER_FLOOR_GB * GIB_U,
+            ci_reject: MIN_FREE_COMMIT_GB * GIB_U,
+        }
+    }
+
+    /// Behaviour-neutrality, the property to verify first: at or below the
+    /// reference, every would-be rung equals the shipped constant BYTE FOR
+    /// BYTE — for the defaults and for operator-raised floors, guard on or off.
+    #[test]
+    fn at_or_below_the_reference_every_rung_is_the_shipped_constant() {
+        let defaults = SessionGuardSettings::default();
+        let raised = SessionGuardSettings {
+            warn_free_commit_bytes: 5 * GIB_U + 123,
+            critical_free_commit_bytes: 2 * GIB_U,
+            ..SessionGuardSettings::default()
+        };
+        let disabled = SessionGuardSettings {
+            enabled: false,
+            ..SessionGuardSettings::default()
+        };
+        for limit in [
+            1,
+            8 * GIB_U,
+            24 * GIB_U,
+            REFERENCE_COMMIT_LIMIT - 1,
+            REFERENCE_COMMIT_LIMIT,
+        ] {
+            let scale = commit_ladder_scale(&capability(Some(limit)));
+            assert_eq!(scale, 1.0, "L = {limit}");
+            for effective in [&defaults, &raised, &disabled] {
+                assert_eq!(
+                    scaled_commit_ladder(effective, scale),
+                    shipped_constants(effective),
+                    "L = {limit}, floors {effective:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_capability_is_exactly_the_identity() {
+        assert_eq!(commit_ladder_scale(&capability(None)), 1.0);
+        assert_eq!(commit_ladder_scale(&capability(Some(0))), 1.0);
+    }
+
+    /// S4 — a 1.0 says WHY: unknown, or small enough that the shipped ladder
+    /// already fits.
+    #[test]
+    fn the_scale_source_names_why() {
+        assert_eq!(
+            commit_ladder_scale_source(&capability(None)),
+            "unknown_identity"
+        );
+        assert_eq!(
+            commit_ladder_scale_source(&capability(Some(0))),
+            "unknown_identity"
+        );
+        assert_eq!(
+            commit_ladder_scale_source(&capability(Some(REFERENCE_COMMIT_LIMIT))),
+            "below_reference"
+        );
+        assert_eq!(
+            commit_ladder_scale_source(&capability(Some(REFERENCE_COMMIT_LIMIT + 1))),
+            "derived"
+        );
+    }
+
+    /// W3 — the probe-failed block is the same object, scale null + reason.
+    #[test]
+    fn the_health_block_on_a_failed_probe_is_an_object_with_a_reason() {
+        let failed = commit_ladder_shadow_health_json(Err("join failed"));
+        assert!(failed["scale"].is_null());
+        assert!(failed["scaleSource"].is_null());
+        assert_eq!(failed["reason"], "join failed");
+        assert_eq!(failed["armed"], false);
+        let ok = commit_ladder_shadow_health_json(Ok(&capability(Some(75_191_424 * 1024))));
+        assert_eq!(ok["scaleSource"], "derived");
+        assert!(ok["reason"].is_null());
+    }
+
+    /// The MSI operator box: 75,191,424 KB = 71.71 GiB ⇒ 2.24, and the plan's
+    /// worked-example rungs.
+    #[test]
+    fn the_msi_worked_example() {
+        let scale = commit_ladder_scale(&capability(Some(75_191_424 * 1024)));
+        assert!((scale - 2.24).abs() < 0.005, "scale {scale}");
+        let l = scaled_commit_ladder(&SessionGuardSettings::default(), scale);
+        assert_gib(l.session_warn, 6.72, "session warn");
+        assert_gib(l.session_critical, 3.36, "session critical");
+        assert_gib(l.ci_reject, 8.96, "ci_node reject");
+        assert_gib(
+            l.ci_defer,
+            17.93,
+            "ci_node defer (cap scaled, so it does not bind)",
+        );
+        assert_gib(l.session_cap, 26.89, "session cap");
+    }
+
+    /// `merytshost`, 368 GB: SCALE_MAX binds, and with the caps scaled the
+    /// ladder the plan found inverted through FIXED caps stays ordered.
+    #[test]
+    fn the_merytshost_worked_example() {
+        let scale = commit_ladder_scale(&capability(Some(368_000_000_000)));
+        assert_eq!(scale, SCALE_MAX);
+        let l = scaled_commit_ladder(&SessionGuardSettings::default(), scale);
+        assert_eq!(l.ci_defer, 32 * GIB_U);
+        assert_eq!(l.ci_reject, 16 * GIB_U);
+        assert_eq!(l.session_warn, 12 * GIB_U);
+        assert_eq!(l.session_critical, 6 * GIB_U);
+        assert_eq!(l.session_cap, 48 * GIB_U);
+        assert_eq!(l.ci_defer_cap, 48 * GIB_U);
+    }
+
+    /// Property over [1.0, SCALE_MAX]: the scaled ladder keeps its order —
+    /// defer > reject > warn > critical — and NO CAP IS EVER THE THING THAT
+    /// ORDERS TWO RUNGS: every rung equals its unclamped `base × scale`.
+    #[test]
+    fn the_scaled_ladder_keeps_its_order_and_no_cap_ever_binds() {
+        let effective = SessionGuardSettings::default();
+        let mut scale = 1.0;
+        while scale <= SCALE_MAX + 1e-9 {
+            let l = scaled_commit_ladder(&effective, scale);
+            assert!(l.ci_defer > l.ci_reject, "s={scale}: {l:?}");
+            assert!(l.ci_reject > l.session_warn, "s={scale}: {l:?}");
+            assert!(l.session_warn > l.session_critical, "s={scale}: {l:?}");
+            assert_eq!(
+                l.session_warn,
+                scale_bytes(effective.warn_free_commit_bytes, scale)
+            );
+            assert_eq!(
+                l.session_critical,
+                scale_bytes(effective.critical_free_commit_bytes, scale)
+            );
+            assert_eq!(l.ci_defer, scale_bytes(DEFER_FREE_COMMIT_GB * GIB_U, scale));
+            assert!(l.session_warn < l.session_cap && l.ci_defer < l.ci_defer_cap);
+            scale += 0.01;
+        }
+    }
+
+    /// The same "no cap binds" property for EVERY floor the fold can produce:
+    /// `merge_floors` caps a floor at 12 GiB, so `base ≤ cap` ⇒ `base·s ≤
+    /// cap·s`, and the coerced `critical ≤ warn` survives scaling.
+    #[test]
+    fn no_folded_floor_is_ever_clamped_by_the_scaled_cap() {
+        for warn_gib in [1u64, 3, 6, 12] {
+            for crit_gib in [1u64, 2, 6, 12] {
+                let local = SessionGuardSettings {
+                    warn_free_commit_bytes: warn_gib * GIB_U,
+                    critical_free_commit_bytes: crit_gib * GIB_U,
+                    ..SessionGuardSettings::default()
+                };
+                let effective = merge_floors(&local, SessionFloors::default());
+                for scale in [1.0, 1.5, 2.24, 3.3, SCALE_MAX] {
+                    let l = scaled_commit_ladder(&effective, scale);
+                    assert_eq!(
+                        l.session_warn,
+                        scale_bytes(effective.warn_free_commit_bytes, scale)
+                    );
+                    assert!(l.session_critical <= l.session_warn, "{l:?}");
+                }
+            }
+        }
+    }
+
+    /// Scaling never loosens: every rung at s ≥ 1 is at least its shipped value.
+    #[test]
+    fn scaling_never_loosens_a_rung() {
+        let effective = SessionGuardSettings::default();
+        let shipped = scaled_commit_ladder(&effective, 1.0);
+        for scale in [f64::NAN, 0.0, 0.5, 1.0, 2.0, SCALE_MAX] {
+            let l = scaled_commit_ladder(&effective, scale);
+            assert!(l.session_warn >= shipped.session_warn);
+            assert!(l.session_critical >= shipped.session_critical);
+            assert!(l.ci_defer >= shipped.ci_defer);
+            assert!(l.ci_reject >= shipped.ci_reject);
+        }
+    }
+
+    /// The admitted-concurrency alternative, on the MSI box: 2 admitted
+    /// builds × 5 jobs × 3 GiB = 30 GiB burst ⇒ 30 / 8 = 3.75.
+    #[test]
+    fn the_admitted_concurrency_alternative_is_priced() {
+        let msi = HostCapacity {
+            mem_bytes: Some(33_248_384 * 1024),
+            cpus: 16,
+        };
+        let s = admitted_concurrency_scale(msi, 2).unwrap();
+        assert!((s - 3.75).abs() < 1e-9, "{s}");
+        let merytshost = HostCapacity {
+            mem_bytes: Some(368_000_000_000),
+            cpus: 48,
+        };
+        assert_eq!(admitted_concurrency_scale(merytshost, 12), Some(SCALE_MAX));
+        let blind = HostCapacity {
+            mem_bytes: None,
+            cpus: 16,
+        };
+        assert_eq!(admitted_concurrency_scale(blind, 2), None);
+    }
+
+    /// The shadow puts the two ladders' verdicts side by side — 5 GiB free on
+    /// the MSI box proceeds today and would WARN (and reject a build) scaled.
+    #[test]
+    fn the_shadow_reports_both_verdicts_and_decides_nothing() {
+        let effective = SessionGuardSettings::default();
+        let cap = capability(Some(75_191_424 * 1024));
+        let shadow = commit_ladder_shadow(&cap, &effective, Some(5 * GIB_U), None);
+        let (shipped, scaled) = shadow.verdicts.unwrap();
+        assert_eq!(
+            shipped,
+            LadderVerdicts {
+                session: "proceed",
+                ci_defer: true,
+                ci_reject: false
+            }
+        );
+        assert_eq!(
+            scaled,
+            LadderVerdicts {
+                session: "warn",
+                ci_defer: true,
+                ci_reject: true
+            }
+        );
+        // The real gate, on the same reading and the same floors, still says
+        // what the SHIPPED ladder says.
+        assert_eq!(
+            evaluate(Lane::Host.as_str(), Some(5 * GIB_U), &effective),
+            SpawnGate::Proceed
+        );
+        // UNKNOWN reading ⇒ nothing to compare, both fail open.
+        assert_eq!(
+            commit_ladder_shadow(&cap, &effective, None, None).verdicts,
+            None
+        );
+    }
+
+    /// The shipped verdicts at scale 1.0 agree with the real `ci_node` rules.
+    #[test]
+    fn shipped_ci_verdicts_match_the_integer_gib_rules() {
+        let effective = SessionGuardSettings::default();
+        let shipped = scaled_commit_ladder(&effective, 1.0);
+        for free in [
+            0,
+            GIB_U,
+            4 * GIB_U - 1,
+            4 * GIB_U,
+            7 * GIB_U + 5,
+            8 * GIB_U,
+            20 * GIB_U,
+        ] {
+            let v = ladder_verdicts(free, &effective, &shipped);
+            assert_eq!(
+                v.ci_reject,
+                crate::ci_node::admission::commit_below_floor(free, MIN_FREE_COMMIT_GB),
+                "free {free}"
+            );
+            assert_eq!(
+                v.ci_defer,
+                free / GIB_U < defer_commit_floor_gb(Some(effective.warn_free_commit_bytes)),
+                "free {free}"
+            );
+        }
+    }
+
+    /// Edge trigger: the same observation twice logs once; a verdict crossing
+    /// logs again.
+    #[test]
+    fn the_shadow_is_edge_triggered() {
+        let effective = SessionGuardSettings::default();
+        let cap = capability(Some(75_191_424 * 1024));
+        let mut last = None;
+        let a = commit_ladder_shadow(&cap, &effective, Some(20 * GIB_U), None).key();
+        assert!(shadow_edge(&mut last, a));
+        assert!(!shadow_edge(&mut last, a));
+        let same_band = commit_ladder_shadow(&cap, &effective, Some(21 * GIB_U), None).key();
+        assert!(
+            !shadow_edge(&mut last, same_band),
+            "no rung crossed, no line"
+        );
+        let crossed = commit_ladder_shadow(&cap, &effective, Some(5 * GIB_U), None).key();
+        assert!(shadow_edge(&mut last, crossed));
+        // A source change at the SAME scale (1.0 either way) still logs.
+        let mut last = None;
+        let small = commit_ladder_shadow(&capability(Some(GIB_U)), &effective, None, None).key();
+        let dark = commit_ladder_shadow(&capability(None), &effective, None, None).key();
+        assert!(shadow_edge(&mut last, small));
+        assert!(shadow_edge(&mut last, dark));
+    }
+}
+
 /// What a lane measures, and therefore which direction is bad.
 ///
 /// This exists because a verdict has to be able to describe either lane
