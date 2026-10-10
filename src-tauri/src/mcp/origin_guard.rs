@@ -216,6 +216,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // `EnforceDoors`, a Foreign origin reaches it while the identically
     // capable `POST /terminals/{id}/write` is refused.
     "POST /__debug/terminals/{id}/graceful-exit",
+    // `debug_assertions` builds only, and outside `/terminals/*` for the same
+    // reason as the entry above. It drives a pane's source: a hold pauses a
+    // remote tab's wire, silencing its output until released — the same
+    // class as `POST /terminals/{id}/write`, so the same door.
+    "POST /__debug/terminals/{id}/wire-hold",
     // Writes `.claude/agents/*.md` into a caller-named directory (plan
     // `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-
     // reports` Phase 5). `GET /capability-manifest` beside it is a pure read

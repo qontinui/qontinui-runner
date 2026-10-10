@@ -24,6 +24,32 @@ export interface RemoteTabIdentity {
   remoteTerminalId: string;
   /** True when the target still holds output OLDER than the attach seed. */
   historyAvailable: boolean;
+  /**
+   * The last relay-reconnect reattach this tab spliced (Rust `ReattachRecord`),
+   * `null` before the first one. Optional because only
+   * `terminal_remote_identities` fills it; the attach-time payloads carry null.
+   */
+  lastReattach?: RemoteReattachRecord | null;
+}
+
+/** Which reattach path the target took, derived on the source (Rust `ReattachArm`). */
+export type RemoteReattachArm =
+  | "unknown"
+  | "indistinguishable"
+  | "ring_rolled"
+  | "reattach_from_have"
+  | "fresh_tail";
+
+/** Rust `ReattachRecord` (serde camelCase); offsets are in the TARGET's stream. */
+export interface RemoteReattachRecord {
+  haveOffset: number;
+  startOffset: number;
+  ringStartOffset: number | null;
+  totalBytesProduced: number;
+  arm: RemoteReattachArm;
+  lostBytesMarked: number;
+  /** RFC 3339 UTC. */
+  at: string;
 }
 
 /** Runner-local `TerminalInfo` + `remote`, as `terminal_attach_remote` returns. */

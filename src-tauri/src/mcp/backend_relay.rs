@@ -1149,6 +1149,14 @@ async fn relay_loop(
                             "Backend relay kicked while connected — tearing down \
                              connection to re-evaluate idle gate (tier/enabled/JWT)"
                         );
+                        // A kick tears the socket down exactly as a drop does,
+                        // so every remote pane is owed the same settlement —
+                        // without it a kick left in-flight creates/attaches
+                        // to time out blaming the target and wrote no
+                        // lost-relay notice into live panes.
+                        settle_remote_panes_after_connection_end(
+                            connected_ack.load(Ordering::Relaxed),
+                        );
                         mark_disconnected(&api_state).await;
                         backoff_ms = 2000;
                         reset_quick_disconnects();
@@ -1161,13 +1169,7 @@ async fn relay_loop(
                     RelayLoopExit::HandlerEnded => {}
                 }
 
-                // Remote session tabs (Phase 4): a connection that had reached
-                // the `connected` ack was carrying every live remote pane's
-                // frames. Say so IN each pane; nothing closes, and the next
-                // `connected` re-presents the grants.
-                if connected_ack.load(Ordering::Relaxed) {
-                    crate::mcp::remote_terminal::client().on_relay_disconnected();
-                }
+                settle_remote_panes_after_connection_end(connected_ack.load(Ordering::Relaxed));
                 mark_disconnected(&api_state).await;
 
                 // If the socket died BEFORE the backend's `connected` ack, the
@@ -5794,6 +5796,23 @@ pub mod commands {
     }
 }
 
+/// Remote session tabs (Phase 4): the relay connection ended — by a drop OR
+/// by a kick. A connection that had reached the `connected` ack was carrying
+/// every live remote pane's frames, so settle them: pending creates and
+/// first-reply attaches are answered `relay_disconnected`, and each live pane
+/// gets the in-band lost-relay notice. Nothing closes, and the next
+/// `connected` re-presents the grants.
+///
+/// ONE function for both loop-exit arms so a kick (`POST
+/// /web-integration/relay/kick`, the A5 acceptance trigger) stays a faithful
+/// drop to every remote pane. The `Shutdown` arm deliberately does not call
+/// it: the process is going away and nothing will reconnect.
+fn settle_remote_panes_after_connection_end(reached_connected: bool) {
+    if reached_connected {
+        crate::mcp::remote_terminal::client().on_relay_disconnected();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Phase 5.3 unit tests — `is_unauthorized` discrimination.
@@ -5850,6 +5869,61 @@ mod tests {
         assert!(
             region.contains("create.block.grant_jti"),
             "the jti must come from the ADMITTED block, as terminal_attached does"
+        );
+    }
+
+    /// A relay KICK must settle remote panes exactly as a drop does (plan
+    /// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+    /// Phase 1). The `Kicked` arm `continue`s past the fall-through teardown,
+    /// so before the fix a kick of a `connected` socket left pending creates
+    /// and attaches to time out blaming the target and wrote no lost-relay
+    /// notice — which made `POST /web-integration/relay/kick` an unfaithful
+    /// stand-in for the drop A5 exists to prove.
+    ///
+    /// The loop body owns a live socket and a global client, so the invariant
+    /// is pinned on the source shape: the `Kicked` arm calls the shared
+    /// teardown, guarded on the `connected` ack, BEFORE it continues; the
+    /// drop path calls the same function; `Shutdown` does not.
+    #[test]
+    fn a_relay_kick_settles_remote_panes_like_a_drop() {
+        const SRC: &str = include_str!("backend_relay.rs");
+        const TEARDOWN: &str = "settle_remote_panes_after_connection_end(";
+
+        // `split_once`, not byte slicing: the `string_slice` ratchet only falls.
+        let arm_region = |arm: &str, end: &str| -> &str {
+            let (_, rest) = SRC
+                .split_once(arm)
+                .unwrap_or_else(|| panic!("{arm} not found — loop shape changed?"));
+            let (region, _) = rest
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{arm} does not end with {end}"));
+            region
+        };
+
+        let kicked = arm_region("RelayLoopExit::Kicked => {", "continue;");
+        let (_, after_call) = kicked
+            .split_once(TEARDOWN)
+            .expect("the Kicked arm must run the remote-pane teardown before it continues");
+        // The guard must be the call's ARGUMENT, not merely nearby.
+        assert!(
+            after_call
+                .trim_start()
+                .starts_with("connected_ack.load(Ordering::Relaxed)"),
+            "the Kicked arm's teardown must be guarded on the `connected` ack, as a drop's is"
+        );
+
+        let shutdown = arm_region("RelayLoopExit::Shutdown => {", "return;");
+        assert!(
+            !shutdown.contains(TEARDOWN),
+            "Shutdown must not settle panes — nothing will reconnect"
+        );
+
+        // The drop path (HandlerEnded falls through the match) uses the SAME
+        // function, so the two cannot drift apart.
+        let fallthrough = arm_region("RelayLoopExit::HandlerEnded => {}", "mark_disconnected(");
+        assert!(
+            fallthrough.contains(TEARDOWN),
+            "the drop path must share the kick's teardown function"
         );
     }
 

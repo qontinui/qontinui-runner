@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
-use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
+use crate::terminal::remote_pane_io::{AttachedRing, ReattachArm, RemoteFrameSink, RemotePaneIo};
 
 // ---------------------------------------------------------------------------
 // Target role — grants
@@ -2916,10 +2916,30 @@ impl RemoteAttachClient {
                     Some(rid) if rid.starts_with(REATTACH_PREFIX) => {
                         if let Some(pane) = self.pane(&reply.grant_jti) {
                             pane.note_reattached();
+                            // Classify BEFORE the splice moves the offset.
+                            let record =
+                                pane.record_reattach(&reply.ring, REMOTE_ATTACH_TAIL_BYTES as u64);
                             pane.splice_replay(&reply.ring);
+                            pane.reassert_flow_after_reattach();
+                            if record.arm == ReattachArm::FreshTail {
+                                warn!(
+                                    grant_jti = %reply.grant_jti,
+                                    have_offset = record.have_offset,
+                                    start_offset = record.start_offset,
+                                    ring_start_offset = ?record.ring_start_offset,
+                                    lost_bytes_marked = record.lost_bytes_marked,
+                                    "remote attach: reattach shipped a fresh tail although the \
+                                     target's ring still held what this pane presented — a \
+                                     FALSE loss was marked"
+                                );
+                            }
                             info!(
                                 grant_jti = %reply.grant_jti,
                                 terminal_id = %reply.terminal_id,
+                                arm = ?record.arm,
+                                have_offset = record.have_offset,
+                                start_offset = record.start_offset,
+                                total_bytes_produced = record.total_bytes_produced,
                                 "remote attach: reattached after relay reconnect"
                             );
                         }
@@ -4645,6 +4665,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes, b"0123456789ABCDE");
+    }
+
+    /// A5 (plan
+    /// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+    /// Phase 3): the reattach reply is classified on the SOURCE against the
+    /// `have_offset` it presented, and the pane keeps the latest record — a
+    /// true reattach first, then a fresh tail that marks a FALSE loss.
+    #[tokio::test]
+    async fn reattach_reply_is_classified_against_the_have_offset_sent() {
+        let client = RemoteAttachClient::new();
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-a5",
+            "remote-term",
+            "grant.jwt",
+            client.sink(),
+            80,
+            24,
+            AttachedRing {
+                buffer: b"x".to_vec(),
+                start_offset: 199_999,
+                total_bytes_produced: 200_000,
+                history_start: Some(0),
+            },
+        ));
+        client.register_pane(pane.clone());
+        assert!(pane.last_reattach().is_none());
+
+        let reply = |start: u64, total: u64, buf: &[u8]| {
+            let mut f = attached_frame("reattach:jti-a5", "jti-a5", buf, start);
+            f["total_bytes_produced"] = json!(total);
+            f["ring_start_offset"] = json!(0);
+            f
+        };
+
+        // 1. The target shipped from `have`: the arm A5 passes on.
+        client.on_relay_connected();
+        let frame = client.lock_outbound().await.try_recv().unwrap();
+        assert_eq!(frame["have_offset"], 200_000);
+        assert!(client.handle_inbound("remote_terminal_attached", &reply(200_000, 300_000, b"new")));
+        let rec = pane.last_reattach().expect("recorded");
+        assert_eq!(rec.arm, ReattachArm::ReattachFromHave);
+        assert_eq!(
+            (rec.have_offset, rec.start_offset, rec.ring_start_offset),
+            (200_000, 200_000, Some(0))
+        );
+        assert_eq!(rec.total_bytes_produced, 300_000);
+        assert_eq!(rec.lost_bytes_marked, 0);
+
+        // 2. A later reconnect answered with a bounded tail although the ring
+        // still held [have, start): a FALSE loss, and the record is the latest.
+        client.on_relay_connected();
+        let frame = client.lock_outbound().await.try_recv().unwrap();
+        assert_eq!(frame["have_offset"], 200_003);
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &reply(250_000, 400_000, b"tail")
+        ));
+        let rec = pane.last_reattach().expect("recorded");
+        assert_eq!(rec.arm, ReattachArm::FreshTail);
+        assert_eq!(rec.have_offset, 200_003);
+        assert_eq!(rec.lost_bytes_marked, 250_000 - 200_003);
     }
 
     // ---- Phase 5: flow gates, ring slicing, lazy history -----------------

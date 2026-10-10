@@ -1628,6 +1628,21 @@ fn loopback_laundering_routes_are_doors() {
     assert!(is_credential_door("POST", "/ui-bridge/ai/network-probe"));
 }
 
+/// The debug pane-driving doors sit outside `/terminals/*` (their first
+/// segment is `__debug`), so each needs its own entry — pinned so a rename of
+/// either route cannot silently hand it to a Foreign origin.
+#[test]
+fn debug_terminal_routes_are_doors() {
+    assert!(is_credential_door(
+        "POST",
+        "/__debug/terminals/{id}/graceful-exit"
+    ));
+    assert!(is_credential_door(
+        "POST",
+        "/__debug/terminals/{id}/wire-hold"
+    ));
+}
+
 #[test]
 fn door_grammar() {
     assert!(door_matches("/files/*", "GET", "/files/read"));
