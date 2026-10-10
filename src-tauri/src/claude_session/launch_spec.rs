@@ -69,6 +69,15 @@ impl LaunchConfig {
     /// its account's config dir and hands it here).
     pub fn from_settings(config_dir: Option<&str>) -> Self {
         let default_template = crate::settings::get_claude_default_launch_command();
+        // A per-account command belongs to a subscription account, and those
+        // are off while a model gateway is declared (it may be an alias that
+        // pins its own account dir). Only the machine-global template applies.
+        if crate::model_gateway::gateway_declared() {
+            return Self {
+                default_template,
+                account_command: None,
+            };
+        }
         let account_command = config_dir.and_then(|dir| {
             crate::settings::get_claude_account_launch_commands()
                 .get(dir)

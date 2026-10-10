@@ -102,6 +102,13 @@ pub struct MigrationOutcome {
 pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'static str) {
     use tauri::Manager;
 
+    // Migration moves a session between subscription accounts, and those are
+    // off while a model gateway is declared (`crate::model_gateway`).
+    if crate::model_gateway::gateway_declared() {
+        crate::model_gateway::note_subscription_path_off("account_migration");
+        return;
+    }
+
     let Some(app) = crate::tauri_app_handle::current() else {
         return;
     };
@@ -715,6 +722,10 @@ pub fn migrate_session(
     dst_config_dir: &str,
 ) -> Result<MigrationOutcome, String> {
     use tauri::Manager;
+
+    if crate::model_gateway::gateway_declared() {
+        return Err(crate::model_gateway::SUBSCRIPTION_OFF_REASON.to_string());
+    }
 
     let working_dir = record.working_dir.clone().ok_or_else(|| {
         "session record has no working_dir — cannot locate transcript".to_string()

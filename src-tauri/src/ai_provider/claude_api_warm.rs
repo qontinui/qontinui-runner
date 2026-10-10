@@ -62,7 +62,8 @@ fn mark_current_account_rate_limited(headers: &reqwest::header::HeaderMap) {
     super::config::mark_account_rate_limited_with_duration(&dir, Duration::from_secs(secs));
 }
 
-/// A credential usable for authenticating to `api.anthropic.com`.
+/// A vendor credential usable for authenticating to `api.anthropic.com` (never
+/// sent to a model gateway, see `crate::model_gateway::ModelCall`).
 ///
 /// Both variants are sent as `x-api-key: <token>`. The enum exists so call
 /// sites can log/telemetry which path served the request, not because the
@@ -192,6 +193,37 @@ fn resolve_oauth_from_path(creds_path: &Path) -> Option<String> {
     Some(token)
 }
 
+/// Whether the warm path can serve a call right now: a valid declared model
+/// gateway, or (with none declared) a resolvable vendor credential.
+pub(super) fn warm_path_available() -> bool {
+    match crate::model_gateway::current() {
+        Ok(Some(_)) => true,
+        Ok(None) => resolve_warm_credential().is_some(),
+        Err(_) => false,
+    }
+}
+
+/// The route for a warm call plus a log label for its auth: the declared model
+/// gateway (`"gateway"`), else the vendor host with the best warm credential
+/// (`"api_key"` / `"oauth"`). A missing vendor credential carries
+/// [`WARM_NO_CREDENTIAL_MARKER`] so callers can tell it from an HTTP failure.
+fn resolve_warm_call() -> Result<(crate::model_gateway::ModelCall, &'static str), String> {
+    let mut label = "gateway";
+    let call = crate::model_gateway::ModelCall::resolve(|| {
+        match resolve_warm_credential() {
+        Some(c) => {
+            label = c.kind_label();
+            Ok(c.token().to_string())
+        }
+        None => Err(format!(
+            "{}: no Claude credential available for warm path (neither keychain API key nor OAuth credentials file).",
+            WARM_NO_CREDENTIAL_MARKER
+        )),
+    }
+    })?;
+    Ok((call, label))
+}
+
 /// Long-lived blocking HTTP client, built once and reused across emit calls.
 ///
 /// Keeps connections pooled with a 5-minute idle timeout and a 60-second TCP
@@ -292,20 +324,15 @@ pub(crate) fn run_claude_api_warm(
     let model = model_override.unwrap_or(&settings.model);
     let max_tokens = max_tokens_override.unwrap_or(settings.max_tokens);
 
-    let credential = match resolve_warm_credential() {
-        Some(c) => c,
-        None => {
-            return AiResponse::error(format!(
-                "{}: no Claude credential available for warm path (neither keychain API key nor OAuth credentials file).",
-                WARM_NO_CREDENTIAL_MARKER
-            ));
-        }
+    let (call, auth_label) = match resolve_warm_call() {
+        Ok(v) => v,
+        Err(e) => return AiResponse::error(e),
     };
 
     info!(
         "Running Claude API (warm) model={} auth={} system_len={} user_len={} cache_marker={}",
         model,
-        credential.kind_label(),
+        auth_label,
         system_prefix.len(),
         user_message.len(),
         system_prefix.len() >= min_cacheable_chars(model),
@@ -327,14 +354,12 @@ pub(crate) fn run_claude_api_warm(
     let client = warm_client();
 
     retry_with_backoff("Claude API (warm)", || {
-        let request = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            credential.token(),
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
-        .header("content-type", "application/json")
-        .json(&request_body);
+        let request = call
+            .post_blocking(client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
+            .header("content-type", "application/json")
+            .json(&request_body);
         let response = request.send();
 
         match response {
@@ -421,20 +446,15 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
     let model = model_override.unwrap_or(&settings.model);
     let max_tokens = max_tokens_override.unwrap_or(settings.max_tokens);
 
-    let credential = match resolve_warm_credential() {
-        Some(c) => c,
-        None => {
-            return AiResponse::error(format!(
-                "{}: no Claude credential available for warm path (neither keychain API key nor OAuth credentials file).",
-                WARM_NO_CREDENTIAL_MARKER
-            ));
-        }
+    let (call, auth_label) = match resolve_warm_call() {
+        Ok(v) => v,
+        Err(e) => return AiResponse::error(e),
     };
 
     info!(
         "Running Claude API (warm, structured) model={} auth={} schema={} system_len={} user_len={} cache_marker={}",
         model,
-        credential.kind_label(),
+        auth_label,
         schema_name,
         system_prefix.len(),
         user_message.len(),
@@ -469,15 +489,13 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
     let client = warm_client();
 
     retry_with_backoff("Claude API (warm, structured)", || {
-        let response = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            credential.token(),
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send();
+        let response = call
+            .post_blocking(client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send();
 
         match response {
             Ok(resp) => {

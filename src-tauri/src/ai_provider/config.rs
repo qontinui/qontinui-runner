@@ -149,6 +149,10 @@ pub enum ClaudeConfigDirSource {
     /// No candidate at all: neither a resolved dir nor a configured
     /// `config_dir`.
     Unconfigured,
+    /// A model gateway is declared: every session runs under the runner-owned
+    /// gateway config dir, and subscription accounts are off
+    /// ([`crate::model_gateway`]). Wins over a request override too.
+    ModelGateway,
 }
 
 impl ClaudeConfigDirSource {
@@ -161,6 +165,7 @@ impl ClaudeConfigDirSource {
             ClaudeConfigDirSource::Manual => "manual_config_dir",
             ClaudeConfigDirSource::RejectedNoCredentials => "rejected_no_credentials",
             ClaudeConfigDirSource::Unconfigured => "unconfigured",
+            ClaudeConfigDirSource::ModelGateway => "model_gateway",
         }
     }
 }
@@ -193,6 +198,9 @@ impl std::fmt::Display for ClaudeConfigDirSource {
 pub fn get_effective_config_dir(
     cli_settings: &settings::ClaudeCliSettings,
 ) -> (Option<String>, ClaudeConfigDirSource) {
+    if let Some(dir) = crate::model_gateway::session_config_dir_override() {
+        return (Some(dir), ClaudeConfigDirSource::ModelGateway);
+    }
     let (candidate, source) = match cli_settings.account_selection_mode {
         // Both auto modes (`LeastUsage` and `HighestExpectedUsage`) pin their
         // choice via the same `RESOLVED_CONFIG_DIR` set by `pick_best_account`
@@ -241,6 +249,11 @@ pub fn get_effective_config_dir_with_override(
     cli_settings: &settings::ClaudeCliSettings,
     override_dir: Option<&str>,
 ) -> (Option<String>, ClaudeConfigDirSource) {
+    // A per-request account is a subscription account; with a gateway declared
+    // those are off, so the gateway dir wins over the override as well.
+    if let Some(dir) = crate::model_gateway::session_config_dir_override() {
+        return (Some(dir), ClaudeConfigDirSource::ModelGateway);
+    }
     match override_dir {
         Some(dir) => (
             Some(dir.to_string()),
@@ -580,6 +593,10 @@ pub fn account_known_exhausted(config_dir: &str) -> bool {
 /// `claude_config_dirs`. Returns `true` if a switch happened, `false` if
 /// no alternative is available.
 pub fn rotate_account_on_rate_limit() -> bool {
+    if crate::model_gateway::gateway_declared() {
+        crate::model_gateway::note_subscription_path_off("rotate_account_on_rate_limit");
+        return false;
+    }
     let config_dirs = settings::get_claude_config_dirs();
     if config_dirs.len() < 2 {
         return false;

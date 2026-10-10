@@ -510,7 +510,8 @@ impl StepExecutor {
         if let Some(ref wf_profile) = self.workflow_security_profile {
             security_settings.default_profile = wf_profile.clone();
         }
-        let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
+        let security_policy =
+            crate::security::PolicyEngine::resolve_for_runtime(None, &security_settings);
         let audit_logger =
             crate::security::audit::AuditLogger::new(security_settings.audit_enabled);
 

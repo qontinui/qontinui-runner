@@ -142,6 +142,38 @@ impl PolicyEngine {
         })
     }
 
+    /// [`Self::resolve`] for a live execution: the resolved policy with the
+    /// declared model gateway's host allowed ([`Self::allow_model_gateway`]).
+    /// Every production caller resolves through this, so a restrictive profile
+    /// cannot refuse the gateway the install declared.
+    pub fn resolve_for_runtime(
+        workflow_policy: Option<&SecurityPolicy>,
+        settings: &SecuritySettings,
+    ) -> SecurityPolicy {
+        let mut policy = Self::resolve(workflow_policy, settings);
+        if let Some(host) = crate::model_gateway::current_host() {
+            Self::allow_model_gateway(&mut policy, &host);
+        }
+        policy
+    }
+
+    /// Append the model gateway's host to `allowed_domains` unless the list
+    /// already matches it (plan `2026-10-09-spec-front-end-of-the-software-factory`
+    /// Phase 9, decision record
+    /// `gateway-tenants-route-every-model-call-through-the-gateway`).
+    ///
+    /// Only the allow-list is touched, which is what an `AllowList` network
+    /// mode reads. A profile that disables the network outright, or that
+    /// names the host in `denied_domains`, is an explicit operator posture and
+    /// is left as it is.
+    pub fn allow_model_gateway(policy: &mut SecurityPolicy, host: &str) {
+        let host = host.trim().to_ascii_lowercase();
+        if host.is_empty() || domain_matches_list(&host, &policy.network.allowed_domains) {
+            return;
+        }
+        policy.network.allowed_domains.push(host);
+    }
+
     /// Evaluate whether a command is allowed under the given policy.
     pub fn evaluate_command(policy: &SecurityPolicy, command: &str) -> Result<(), PolicyDenial> {
         let ap = &policy.actions;
@@ -662,6 +694,44 @@ mod tests {
         assert!(PolicyEngine::evaluate_network(&policy, "api.anthropic.com", "https").is_ok());
         assert!(PolicyEngine::evaluate_network(&policy, "api.openai.com", "https").is_ok());
         assert!(PolicyEngine::evaluate_network(&policy, "evil.com", "https").is_err());
+    }
+
+    #[test]
+    fn model_gateway_host_is_allowed_by_a_restrictive_profile() {
+        let mut policy = SecurityPolicy {
+            network: NetworkPolicy {
+                mode: NetworkMode::AllowList,
+                allowed_domains: vec!["api.anthropic.com".to_string()],
+                ..Default::default()
+            },
+            ..SecurityPolicy::permissive()
+        };
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_err());
+        PolicyEngine::allow_model_gateway(&mut policy, "LLM-GW.example.com");
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_ok());
+        // Idempotent: a second call (or a host already matched by a wildcard)
+        // adds nothing.
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert_eq!(policy.network.allowed_domains.len(), 2);
+        policy.network.allowed_domains = vec!["*.example.com".to_string()];
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert_eq!(
+            policy.network.allowed_domains,
+            vec!["*.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_gateway_does_not_override_a_disabled_network() {
+        let mut policy = SecurityPolicy {
+            network: NetworkPolicy {
+                mode: NetworkMode::Disabled,
+                ..Default::default()
+            },
+            ..SecurityPolicy::permissive()
+        };
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_err());
     }
 
     #[test]

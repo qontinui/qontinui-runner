@@ -3677,6 +3677,12 @@ pub struct Settings {
     /// runner restart.
     #[serde(default)]
     pub api: ApiSettings,
+    /// Model gateway declaration (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D12). An
+    /// empty `base_url` (the default) means no gateway: every behavior is
+    /// unchanged. See [`crate::model_gateway`].
+    #[serde(default)]
+    pub model_gateway: crate::model_gateway::ModelGatewaySettings,
 }
 
 /// Settings → Runner → "Allowed browser origins".
@@ -6306,6 +6312,23 @@ pub fn get_remote_create_settings() -> RemoteCreateSettings {
 /// Persist the remote-create preference.
 pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), String> {
     update_settings(|settings| settings.remote_create.accept_remote_create = pref)
+}
+
+/// Get the model gateway declaration. See [`crate::model_gateway`].
+pub fn get_model_gateway() -> crate::model_gateway::ModelGatewaySettings {
+    crate::model_gateway::current_settings()
+}
+
+/// Validate, normalize and persist the model gateway declaration. An invalid
+/// declaration is refused and nothing is written. Returns what was stored.
+pub fn save_model_gateway(
+    value: crate::model_gateway::ModelGatewaySettings,
+) -> Result<crate::model_gateway::ModelGatewaySettings, String> {
+    let normalized = value.normalized();
+    normalized.validate()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.model_gateway = normalized)?;
+    Ok(stored)
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see

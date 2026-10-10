@@ -7,6 +7,17 @@
 //! covers all token cost. The subprocess inherits whatever auth the
 //! operator's `claude` install has.
 //!
+//! **Exception: an install that declares a model gateway.** The accepted
+//! decision record `gateway-tenants-route-every-model-call-through-the-gateway`
+//! (2026-10-10) supersedes the rule above for gateway tenants only. Their
+//! spawned `claude` children run under the runner-owned gateway
+//! `CLAUDE_CONFIG_DIR`, with `ANTHROPIC_BASE_URL` pointed at the gateway and the
+//! key supplied by the operator's `apiKeyHelper`. Subscription accounts and
+//! account rotation are off. The env is applied by the credential scrub this
+//! module's spawn seam already calls last (`finalize_headless_child_env`); the
+//! mechanism is [`crate::model_gateway`]. Every other install keeps the rule
+//! unchanged.
+//!
 //! ## Flow
 //!
 //! 1. `spawn_runtime()` connects this runner to coord's `/ws` and

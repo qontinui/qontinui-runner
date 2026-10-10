@@ -265,6 +265,9 @@ mod session_pr_reconciler; // Runner-local per-session PR attribution → projec
 mod session_attribution;
 mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
+// Model gateway (plan 2026-10-09-spec-front-end-of-the-software-factory Phase 9, D12):
+// where every model call goes when an install declares a gateway.
+mod model_gateway;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
 // axum router construction) write a `runner-panic.log` the supervisor can
@@ -2919,6 +2922,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::get_claude_account_launch_commands,
             commands::config::get_claude_config_dirs,
             commands::config::get_claude_default_launch_command,
+            commands::config::get_model_gateway,
             commands::config::get_current_configuration,
             commands::config::get_include_summary_step_by_default,
             commands::config::get_last_config_path,
@@ -2928,6 +2932,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::save_claude_account_launch_commands,
             commands::config::save_claude_config_dirs,
             commands::config::save_claude_default_launch_command,
+            commands::config::save_model_gateway,
             commands::config::save_include_summary_step_by_default,
             commands::config::save_last_monitor_index,
             commands::config::save_last_monitor_indices,
