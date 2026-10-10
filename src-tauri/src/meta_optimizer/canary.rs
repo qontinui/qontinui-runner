@@ -74,7 +74,7 @@ pub fn start_canary(
     percentage: i64,
 ) -> Result<String, String> {
     let percentage = percentage.clamp(1, 100);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             pg_db
                 .start_canary(recommendation_id, percentage as f64)
@@ -85,7 +85,9 @@ pub fn start_canary(
 
 /// Get all active canary rollouts.
 pub fn get_active_canaries(pg_db: &Arc<PgDb>) -> Result<Vec<CanaryRollout>, String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_active_canaries()))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.get_active_canaries())
+    })
 }
 
 /// Update the traffic percentage for an active canary rollout.
@@ -99,7 +101,7 @@ pub fn update_canary_percentage(
 ) -> Result<(), String> {
     let pct = new_percentage.clamp(1, 100);
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.update_canary_percentage(canary_id, pct))
     })
 }
@@ -107,7 +109,9 @@ pub fn update_canary_percentage(
 /// Get completed canary rollouts (promoted or rolled back) for history display.
 pub fn get_canary_history(pg_db: &Arc<PgDb>, limit: u32) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.min(100) as i64;
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_canary_history(limit)))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.get_canary_history(limit))
+    })
 }
 
 /// Get the canary prompt overrides for a recommendation.
@@ -117,7 +121,7 @@ pub fn get_canary_prompt_overrides(
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.get_canary_prompt_overrides(recommendation_id))
     })
 }
@@ -128,14 +132,14 @@ pub fn get_canary_config_overrides(
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.get_canary_config_overrides(recommendation_id))
     })
 }
 
 /// Probabilistic check: should this run use the canary config?
 pub fn should_apply_canary(pg_db: &Arc<PgDb>, recommendation_id: &str) -> bool {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.should_apply_canary(recommendation_id))
     })
     .unwrap_or(false)
@@ -151,7 +155,7 @@ pub fn record_canary_run(
     duration_ms: f64,
 ) -> Result<(), String> {
     // PG-primary: load current metrics from PG, update, write back
-    let pg_result = tokio::task::block_in_place(|| {
+    let pg_result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             let (baseline_json, canary_json) = pg_db.get_canary_metrics(canary_id).await?;
             let mut baseline: CanaryMetrics =
@@ -200,7 +204,9 @@ pub fn record_canary_run(
 /// Uses statistical tests (proportion z-test, confidence intervals, effect size)
 /// instead of simple threshold-based verdicts.
 pub fn evaluate_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<CanaryEvaluation, String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.evaluate_canary(canary_id)))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.evaluate_canary(canary_id))
+    })
 }
 
 /// Promote a canary: apply the recommendation globally.
@@ -212,7 +218,7 @@ pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> 
     let canary_id_str = canary_id.to_string();
 
     // Get recommendation_id from PG
-    let rec_id: String = tokio::task::block_in_place(|| {
+    let rec_id: String = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             let conn = pg_db
                 .pool()
@@ -234,7 +240,7 @@ pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> 
     super::recommendations::apply_recommendation_with_side_effects(pg_db, &rec_id)?;
 
     // Update canary status
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.promote_canary(&canary_id_str))
     })?;
 
@@ -263,7 +269,7 @@ pub fn rollback_canary_with_eval(
         .unwrap_or_else(|| "{}".to_string());
 
     // Get rec_id from PG
-    let rec_id: String = tokio::task::block_in_place(|| {
+    let rec_id: String = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             let conn = pg_db
                 .pool()
@@ -282,7 +288,7 @@ pub fn rollback_canary_with_eval(
     })?;
 
     // Update canary status and recommendation
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             pg_db.rollback_canary(&canary_id_str).await?;
             // Also update recommendation outcome
@@ -506,7 +512,7 @@ pub fn create_prompt_template_canary(
     candidate_version: i32,
     traffic_pct: f64,
 ) -> Result<String, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.create_template_canary(
             template_id,
             baseline_version,
@@ -521,7 +527,7 @@ pub fn get_prompt_template_canary(
     pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<PromptTemplateCanary, String> {
-    let result = tokio::task::block_in_place(|| {
+    let result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.get_template_canary(canary_id))
     })?;
     result.ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))
@@ -538,7 +544,7 @@ pub fn record_prompt_canary_run(
     tokens: i64,
 ) -> Result<(), String> {
     // PG-primary: load metrics, update, write back
-    let pg_result = tokio::task::block_in_place(|| {
+    let pg_result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             let canary = pg_db
                 .get_template_canary(canary_id)
@@ -605,10 +611,11 @@ pub fn resolve_prompt_with_canary(
     default_content: &str,
 ) -> CanaryResolvedPrompt {
     // Look up active canary from PG
-    let canary_opt: Option<PromptTemplateCanary> = tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.get_active_template_canary(template_id))
-    })
-    .unwrap_or(None);
+    let canary_opt: Option<PromptTemplateCanary> =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            Handle::current().block_on(pg_db.get_active_template_canary(template_id))
+        })
+        .unwrap_or(None);
 
     let Some(canary) = canary_opt else {
         return CanaryResolvedPrompt {

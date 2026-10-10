@@ -545,14 +545,14 @@ async fn resolve_one(
             owner: Err(Unresolved::NoMatchingSocket),
             pid: None,
         },
-        (Some(_), Ok(local)) => {
-            tokio::task::spawn_blocking(move || resolver.resolve(local, peer, accepted_at))
-                .await
-                .unwrap_or(Resolution {
-                    owner: Err(Unresolved::TableUnreadable),
-                    pid: None,
-                })
-        }
+        (Some(_), Ok(local)) => crate::wedge_diagnostics::spawn_blocking_tracked(move || {
+            resolver.resolve(local, peer, accepted_at)
+        })
+        .await
+        .unwrap_or(Resolution {
+            owner: Err(Unresolved::TableUnreadable),
+            pid: None,
+        }),
     };
     let verdict = decide(own.as_ref().as_ref(), &resolution);
     record(label, peer, &verdict, resolution.pid, mode);

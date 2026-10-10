@@ -497,7 +497,7 @@ impl PgDb {
         &self,
         checkpoint: &StepCheckpoint,
     ) -> Result<(), String> {
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current()
                 .block_on(self.save_workflow_step_checkpoint_async(checkpoint))
         })
@@ -565,7 +565,7 @@ impl PgDb {
         phase: &str,
         iteration: Option<u32>,
     ) -> Result<Vec<StepCheckpoint>, String> {
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current().block_on(self.get_workflow_step_checkpoints_by_phase(
                 execution_id,
                 phase,
@@ -740,7 +740,7 @@ impl PgDb {
         phase: Option<&str>,
         iteration: Option<u32>,
     ) -> Result<(), String> {
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current().block_on(self.delete_workflow_step_checkpoints_async(
                 execution_id,
                 phase,

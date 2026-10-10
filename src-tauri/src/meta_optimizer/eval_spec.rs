@@ -183,7 +183,7 @@ pub fn save_eval_spec(pg_db: &Arc<PgDb>, spec: &EvalSpec) -> Result<(), String> 
     let spec_json =
         serde_json::to_string(spec).map_err(|e| format!("Failed to serialize spec: {}", e))?;
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.save_eval_spec(
             &id,
             &name,
@@ -200,7 +200,7 @@ pub fn list_eval_specs(
     pg_db: &Arc<PgDb>,
     target_agent: Option<&str>,
 ) -> Result<Vec<EvalSpec>, String> {
-    let jsons = tokio::task::block_in_place(|| {
+    let jsons = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.list_eval_specs(target_agent))
     })?;
     let specs: Vec<EvalSpec> = jsons
@@ -212,8 +212,9 @@ pub fn list_eval_specs(
 
 /// Get a single eval spec by ID.
 pub fn get_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<Option<EvalSpec>, String> {
-    let result =
-        tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_eval_spec(spec_id)))?;
+    let result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.get_eval_spec(spec_id))
+    })?;
     match result {
         Some(json) => serde_json::from_str(&json)
             .map(Some)
@@ -224,7 +225,9 @@ pub fn get_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<Option<EvalSpec
 
 /// Delete an eval spec.
 pub fn delete_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.delete_eval_spec(spec_id)))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.delete_eval_spec(spec_id))
+    })
 }
 
 /// Save an eval result.
@@ -238,7 +241,7 @@ pub fn save_eval_result(pg_db: &Arc<PgDb>, result: &EvalResult) -> Result<(), St
     let p_value = result.comparison.as_ref().and_then(|c| c.p_value);
     let trials_run = result.trials_run as i64;
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.save_eval_result(
             &id,
             &spec_id,
@@ -259,7 +262,7 @@ pub fn list_eval_results(
     spec_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<EvalResult>, String> {
-    let jsons = tokio::task::block_in_place(|| {
+    let jsons = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.list_eval_results(spec_id, recommendation_id))
     })?;
     let results: Vec<EvalResult> = jsons
@@ -276,7 +279,7 @@ pub fn attach_eval_result(
     eval_result_id: &str,
     eval_status: &str,
 ) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.attach_eval_result(
             recommendation_id,
             eval_result_id,

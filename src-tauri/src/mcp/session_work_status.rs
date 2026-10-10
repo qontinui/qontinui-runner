@@ -504,7 +504,9 @@ async fn cached_credential() -> Result<(String, String), String> {
     }
     let parts = tokio::time::timeout(
         CREDENTIAL_TIMEOUT,
-        tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+            crate::mcp::continuation_verdict::coord_client_parts,
+        ),
     )
     .await;
     let (base, jwt) = match parts {

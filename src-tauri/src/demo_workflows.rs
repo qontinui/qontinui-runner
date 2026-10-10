@@ -23,7 +23,7 @@ pub fn seed_demo_workflows_if_needed(pg: &Arc<PgDb>) {
         Ok(rt) => {
             // Called from within an async context — use block_in_place to avoid
             // nesting block_on inside a running runtime.
-            tokio::task::block_in_place(|| {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 rt.block_on(seed_demo_workflows_pg(pg));
             });
         }
