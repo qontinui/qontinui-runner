@@ -174,12 +174,15 @@ export async function buildResumeCmd(
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
 ): Promise<string> {
-  const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
-  if (argv[0] !== "claude") return `${argv.join(" ")}\r`;
+  // Every provider is rendered by the backend (review N7): a provider that
+  // cannot route through a declared model gateway is refused there, and the
+  // session id is validated/quoted there — never assembled here.
+  const resumeProvider = provider ?? "claude";
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
   const resp = await invoke<CommandResponse>("build_ai_resume_command", {
     sessionId,
+    provider: resumeProvider,
     configDir: configDir ?? null,
     isWindows,
     fullResume: policy === "full",
