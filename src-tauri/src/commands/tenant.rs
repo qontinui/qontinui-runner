@@ -326,10 +326,7 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     PinSurface {
         surface: "session_outbox_tenant_backfill",
         timing: PinTiming::Live,
-        readers: &[
-            "session/coord_sync.rs::push_record",
-            "session/coord_sync.rs::rebuild_create_body",
-        ],
+        readers: &["session/coord_sync.rs::rebuild_create_body"],
         detail: "fills the tenant only for records that carry none, read per record",
     },
     PinSurface {
