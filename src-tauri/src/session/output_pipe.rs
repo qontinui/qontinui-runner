@@ -263,10 +263,7 @@ async fn flush(
     // owning session's tenant scope. A refused
     // chunk is dropped and counted, never held: the offset does not advance,
     // exactly like a quota drop, and nothing is released by a later flip.
-    if !crate::egress::permit_or_count_for(
-        crate::egress::Flow::TerminalStream,
-        tenant.declared_tenant(),
-    ) {
+    if !crate::egress::permit_or_count_session(crate::egress::Flow::TerminalStream, tenant.into()) {
         tracing::debug!(
             session = %session_id,
             bytes = buffer.len(),

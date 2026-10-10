@@ -662,20 +662,23 @@ impl SessionTranscriptTailer {
         }
     }
 
+    /// Transcript sync's gate for `session_key`, asked in the tenant the
+    /// registrar recorded for that session — the strictest bound tenant when
+    /// it recorded none (e.g. a session this process has not registered since
+    /// a restart): the tenant's `egress_transcript_sync` AND the user's own
+    /// toggle.
+    pub(crate) fn transcript_sync_open(&self, session_key: &str) -> bool {
+        crate::egress::transcript_sync_gate_session(crate::egress::SessionScope::from_lookup(
+            self.registrar.recorded_tenant(session_key),
+        ))
+        .is_open()
+    }
+
     /// Gate 1 and the binding, with the coverage bookkeeping. `true` = this
     /// batch should be emitted (then call [`Self::try_emit_batch`] or
     /// [`Self::emit_batch`]); `false` = drop it. Never blocks on a session
     /// lock.
     ///
-    /// Transcript sync's gate for `session_key`, asked in the tenant the
-    /// registrar recorded for that session (the device's default scope when it
-    /// recorded none): the tenant's `egress_transcript_sync` AND the user's
-    /// own toggle.
-    pub(crate) fn transcript_sync_open(&self, session_key: &str) -> bool {
-        crate::egress::transcript_sync_gate_for(self.registrar.recorded_tenant(session_key))
-            .is_open()
-    }
-
     /// The gate ([`crate::egress::transcript_sync_permitted`]: the user's
     /// `Settings.cloud_sync_enabled` AND the tenant's `egress_transcript_sync`)
     /// is resolved by the caller rather

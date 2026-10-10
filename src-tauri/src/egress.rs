@@ -63,7 +63,10 @@
 //! outranks a profile's `off`. A no-row answer with no `default_source` at all
 //! comes from a coord that predates the egress family
 //! ([`CoordAnswer::NotAnEgressAnswer`]): it marks the scope answered (no
-//! longer UNKNOWN) without overriding anything already held.
+//! longer UNKNOWN) without overriding anything already held. A FAILED fetch
+//! (no credential, 401, 404, network, 5xx) is no answer at all: nothing is
+//! recorded or persisted, the scope keeps whatever it held, and an unanswered
+//! tenant stays UNKNOWN.
 //!
 //! ## Scope: per coord deployment and per tenant; UNKNOWN fails closed
 //!
@@ -79,10 +82,19 @@
 //! default scope (re-pairing, a new coord) takes effect once coord has
 //! answered for the new scope; until then the stricter of the two applies.
 //!
-//! A scope that names a tenant but holds no answer — polled or persisted — is
-//! UNKNOWN ([`LevelSource::Unknown`]) and every flow fails closed there, never
-//! the product default. A device with no tenant at all has no tenant policy
-//! to wait for, and the profile, then the product default, answer.
+//! A scope that names a tenant but holds no answer from a SUCCESSFUL coord
+//! reply — this process's or a persisted one — is UNKNOWN
+//! ([`LevelSource::Unknown`]) and every flow fails closed there, never the
+//! product default; a failed poll does not change that. A device with no
+//! tenant at all has no tenant policy to wait for, and the profile, then the
+//! product default, answer.
+//!
+//! A session-keyed CONTENT send (terminal / AI output, transcripts, session
+//! state) whose tenant cannot be established ([`SessionScope::Unresolved`])
+//! is judged by the STRICTEST verdict across the default scope and every
+//! bound tenant ([`permit_session`]): any refusal refuses. The bound set is
+//! what the poller last enumerated, seeded at start from the tenants the store
+//! holds answers for under the current coord.
 //!
 //! Which paths know their session's tenant:
 //!
@@ -96,13 +108,17 @@
 //!   forwards) and the target side of remote terminal attach ask in the tenant
 //!   of the session the frame names — the open session on its terminal
 //!   ([`terminal_session_tenant`]) or the registrar's record for its task run
-//!   ([`task_run_session_tenant`]) — and in the default scope when the frame
-//!   names no session this runner knows;
-//! - what cannot be routed asks in the default scope: an `http_request` read
-//!   of `/processes/{id}/output` (a process id names no session), the SOURCE
-//!   side of remote attach (the terminal lives on another device, so there is
-//!   no local session to ask about), and the relay's `ui-error` /
-//!   `recent-crash` forwards (telemetry, device-wide);
+//!   ([`task_run_session_tenant`]); the content fields of task-run, findings
+//!   and pending-question reads over `http_request` are blanked per record
+//!   in that record's run's tenant;
+//! - what cannot be attributed is judged by the strictest bound tenant: a
+//!   frame or event naming no session or one this runner does not know, a
+//!   lifecycle stamp that is not a UUID, a run not registered since a restart,
+//!   an `http_request` read of `/processes/{id}/output` (a process id names no
+//!   session), and the SOURCE side of remote attach (the terminal lives on
+//!   another device);
+//! - the relay's `ui-error` / `recent-crash` forwards are telemetry,
+//!   device-wide, in the default scope;
 //! - telemetry, the update check and the skill mirror are device-wide and ask
 //!   in the default scope.
 //!
@@ -174,9 +190,11 @@ const DEFAULT_SOURCE_PRODUCT: &str = "product";
 
 /// What `/health` says about how scopes are polled and judged.
 const SCOPE_NOTE: &str = "every tenant this device holds a credential for is polled with that \
-     credential; a tenant with no polled or persisted answer is UNKNOWN and every flow fails \
-     closed for it; a device with no tenant at all uses the machine profile, else the product \
-     default";
+     credential; a failed poll records nothing, so a tenant with no answer from a successful \
+     coord reply (this process's or persisted) is UNKNOWN and every flow fails closed for it; a \
+     content send whose session tenant cannot be established takes the strictest verdict across \
+     all bound tenants; a device with no tenant at all uses the machine profile, else the \
+     product default";
 
 /// One outbound data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -352,6 +370,41 @@ impl LevelSource {
 pub(crate) struct EgressVerdict {
     pub(crate) allowed: bool,
     pub(crate) source: LevelSource,
+}
+
+/// Which tenant a SESSION-keyed send belongs to, as far as the call site could
+/// establish it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionScope {
+    /// The session's tenant is known.
+    Tenant(Uuid),
+    /// The session was positively established as the device default's (spawned
+    /// without a tenant choice, or a route with no tenant dimension).
+    DeviceDefault,
+    /// The tenant could not be established: no session record, an
+    /// unregistered run after a restart, a stamp that is not a UUID, a frame
+    /// naming no session. A CONTENT flow is then judged by the STRICTEST
+    /// verdict across every tenant this device is bound to — never the default
+    /// scope alone, which says nothing about whose content it is.
+    Unresolved,
+}
+
+impl From<crate::auth::TenantScope> for SessionScope {
+    fn from(scope: crate::auth::TenantScope) -> Self {
+        match scope {
+            crate::auth::TenantScope::Owned(t) => SessionScope::Tenant(t),
+            crate::auth::TenantScope::Device => SessionScope::DeviceDefault,
+            crate::auth::TenantScope::Unresolved => SessionScope::Unresolved,
+        }
+    }
+}
+
+impl SessionScope {
+    /// A lookup that answers `Some(tenant)` or nothing: nothing is
+    /// [`SessionScope::Unresolved`].
+    pub(crate) fn from_lookup(tenant: Option<Uuid>) -> Self {
+        tenant.map_or(SessionScope::Unresolved, SessionScope::Tenant)
+    }
 }
 
 /// The C6 ladder. PURE.
@@ -653,6 +706,12 @@ pub(crate) struct EgressState {
     /// yet. Until it has, a call that names no tenant gets the STRICTER of the
     /// old and new scope's verdicts.
     pending: RwLock<Option<ScopeKey>>,
+    /// Every tenant this device is bound to, as the poller last enumerated it
+    /// (seeded at construction with the tenants the store holds answers for
+    /// under the current coord, so an unresolved session is judged against
+    /// them from the first instant). [`SessionScope::Unresolved`] is judged by
+    /// the strictest verdict across these and the default scope.
+    bound: RwLock<Vec<Uuid>>,
     /// Rung 3 — the profile's `egress.default`, read once.
     profile: Option<Level>,
     /// Where rung 2 lives; `None` when the config dir does not resolve.
@@ -673,8 +732,16 @@ impl EgressState {
             .as_deref()
             .map(|p| load_store(p, &current))
             .unwrap_or_default();
+        let mut seeded: Vec<Uuid> = persisted
+            .keys()
+            .filter(|k| k.coord_base == current.coord_base)
+            .filter_map(|k| k.tenant_id)
+            .collect();
+        seeded.sort();
+        seeded.dedup();
         Self {
             coord: RwLock::new(ScopedAnswers::new()),
+            bound: RwLock::new(seeded),
             persisted: RwLock::new(persisted),
             current: RwLock::new(current),
             pending: RwLock::new(None),
@@ -752,6 +819,27 @@ impl EgressState {
     /// [`Self::permit_for`] in the default scope.
     pub(crate) fn permit(&self, flow: Flow) -> EgressVerdict {
         self.permit_for(flow, None)
+    }
+
+    /// Record the tenants this device is bound to (the poller, each tick).
+    pub(crate) fn set_bound_tenants(&self, tenants: Vec<Uuid>) {
+        *self.bound.write().unwrap_or_else(|p| p.into_inner()) = tenants;
+    }
+
+    pub(crate) fn bound_tenants(&self) -> Vec<Uuid> {
+        self.bound.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The verdict for a session-keyed send in `scope`. An unresolved tenant
+    /// gets the STRICTEST verdict across the default scope and every bound
+    /// tenant: the first refusal refuses.
+    pub(crate) fn permit_session(&self, flow: Flow, scope: SessionScope) -> EgressVerdict {
+        strictest_session_verdict(
+            flow,
+            scope,
+            |t| self.permit_for(flow, t),
+            || self.bound_tenants(),
+        )
     }
 
     /// Apply one classified coord answer for `flow` in scope `key`.
@@ -940,49 +1028,59 @@ pub(crate) fn install_session_tenant_lookup(app: tauri::AppHandle) {
     let _ = SESSION_TENANT_APP.set(app);
 }
 
-/// The tenant the open session on terminal `terminal_id` was spawned for (the
-/// lifecycle store's `tenant_id`), or `None` — no open session there, a
-/// session spawned for the device default, or the lookup not installed — in
-/// which case the caller asks in the default scope. A stamped tenant that is
-/// not a UUID reads as `None` too (and is logged): it names no scope coord
-/// could have answered for.
-pub(crate) fn terminal_session_tenant(terminal_id: &str) -> Option<Uuid> {
+/// The scope of the open session on terminal `terminal_id`: its spawn tenant
+/// (the lifecycle store's `tenant_id`), [`SessionScope::DeviceDefault`] for a
+/// session spawned without a tenant choice, and [`SessionScope::Unresolved`]
+/// when no open session is there, the stamp is not a UUID (logged — it names
+/// no scope coord could have answered for), or the lookup is not installed.
+pub(crate) fn terminal_session_tenant(terminal_id: &str) -> SessionScope {
     #[cfg(test)]
     if let Some(faked) = test_support::faked_session_tenant(terminal_id) {
         return faked;
     }
     use tauri::Manager;
-    let app = SESSION_TENANT_APP.get()?;
-    let store = app.try_state::<std::sync::Arc<
+    let Some(app) = SESSION_TENANT_APP.get() else {
+        return SessionScope::Unresolved;
+    };
+    let Some(store) = app.try_state::<std::sync::Arc<
         crate::session::session_lifecycle_store::SessionLifecycleStore,
-    >>()?;
-    let stamped = store.find_open_by_terminal(terminal_id)?.tenant_id?;
-    match Uuid::parse_str(&stamped) {
-        Ok(t) => Some(t),
-        Err(_) => {
-            warn!(
-                terminal_id,
-                stamped, "egress: session tenant is not a UUID — asking in the default scope"
-            );
-            None
-        }
+    >>() else {
+        return SessionScope::Unresolved;
+    };
+    let Some(record) = store.find_open_by_terminal(terminal_id) else {
+        return SessionScope::Unresolved;
+    };
+    match record.tenant_id {
+        None => SessionScope::DeviceDefault,
+        Some(stamped) => match Uuid::parse_str(&stamped) {
+            Ok(t) => SessionScope::Tenant(t),
+            Err(_) => {
+                warn!(
+                    terminal_id,
+                    stamped,
+                    "egress: session tenant is not a UUID — judged by the strictest bound tenant"
+                );
+                SessionScope::Unresolved
+            }
+        },
     }
 }
 
-/// The tenant the AI-session registrar recorded for the session behind
-/// `task_run_id` (its R4 key), or `None` — not registered by this process, no
-/// tenant resolved, or the lookup not installed — in which case the caller
-/// asks in the default scope.
-pub(crate) fn task_run_session_tenant(task_run_id: &str) -> Option<Uuid> {
+/// The scope of the session behind `task_run_id` (its R4 key): the tenant the
+/// AI-session registrar recorded, else [`SessionScope::Unresolved`] — not
+/// registered by this process (e.g. after a restart), no tenant resolved, or
+/// the lookup not installed.
+pub(crate) fn task_run_session_tenant(task_run_id: &str) -> SessionScope {
     #[cfg(test)]
     if let Some(faked) = test_support::faked_session_tenant(task_run_id) {
         return faked;
     }
     use tauri::Manager;
-    let app = SESSION_TENANT_APP.get()?;
-    let registrar =
-        app.try_state::<std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
-    registrar.recorded_tenant(task_run_id)
+    let tenant = SESSION_TENANT_APP.get().and_then(|app| {
+        app.try_state::<std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .and_then(|r| r.recorded_tenant(task_run_id))
+    });
+    SessionScope::from_lookup(tenant)
 }
 
 /// [`permit_for`] in the default scope.
@@ -1005,15 +1103,70 @@ pub(crate) fn permit_or_count(flow: Flow) -> bool {
     permit_or_count_for(flow, None)
 }
 
-/// Record coord's classified answer for `flow` in scope `key` (the poller's
-/// write door).
-pub(crate) fn apply_coord_answer(key: &ScopeKey, flow: Flow, answer: CoordAnswer) {
-    state().apply_coord_answer(key, flow, answer);
+/// The rule behind [`permit_session`], over an injected per-scope verdict and
+/// bound-tenant list (`verdict(None)` is the default scope). PURE.
+fn strictest_session_verdict(
+    flow: Flow,
+    scope: SessionScope,
+    verdict: impl Fn(Option<Uuid>) -> EgressVerdict,
+    bound: impl FnOnce() -> Vec<Uuid>,
+) -> EgressVerdict {
+    let _ = flow;
+    match scope {
+        SessionScope::Tenant(t) => verdict(Some(t)),
+        SessionScope::DeviceDefault => verdict(None),
+        SessionScope::Unresolved => {
+            let default = verdict(None);
+            if !default.allowed {
+                return default;
+            }
+            bound()
+                .into_iter()
+                .map(|t| verdict(Some(t)))
+                .find(|v| !v.allowed)
+                .unwrap_or(default)
+        }
+    }
 }
 
-/// Move the default scope (the poller's write door, each tick).
-pub(crate) fn set_current_scope(key: ScopeKey) {
-    state().set_current_scope(key);
+/// The tenants the poller last enumerated (the strictest rule's set).
+fn bound_tenants() -> Vec<Uuid> {
+    #[cfg(test)]
+    if let Some(faked) = test_support::faked_bound_tenants() {
+        return faked;
+    }
+    state().bound_tenants()
+}
+
+/// The verdict for a session-keyed send of a CONTENT flow in `scope` —
+/// [`SessionScope::Unresolved`] is judged by the strictest verdict across the
+/// default scope and every bound tenant.
+pub(crate) fn permit_session(flow: Flow, scope: SessionScope) -> EgressVerdict {
+    strictest_session_verdict(flow, scope, |t| permit_for(flow, t), bound_tenants)
+}
+
+/// [`permit_session`], counting a refusal.
+pub(crate) fn permit_or_count_session(flow: Flow, scope: SessionScope) -> bool {
+    let allowed = permit_session(flow, scope).allowed;
+    if !allowed {
+        state().count_refused(flow);
+    }
+    allowed
+}
+
+/// Transcript sync's gate for a session in `scope` ([`permit_session`] for the
+/// tenant half, AND the user's own toggle).
+pub(crate) fn transcript_sync_gate_session(scope: SessionScope) -> TranscriptGate {
+    transcript_gate_with(
+        permit_session(Flow::TranscriptSync, scope).allowed,
+        crate::settings::get_cloud_sync_enabled,
+    )
+}
+
+/// The process's switch state — the poller's write door (it applies answers,
+/// moves the default scope and records the bound tenants through it).
+pub(crate) fn global_state() -> &'static EgressState {
+    state()
 }
 
 /// Transcript sync's full consent, with the reason when it is closed.
@@ -1149,7 +1302,8 @@ pub(crate) mod test_support {
     thread_local! {
         static PINS: RefCell<[Option<Level>; 6]> = const { RefCell::new([None; 6]) };
         static TENANT_PINS: RefCell<Vec<(Flow, Uuid, Level)>> = const { RefCell::new(Vec::new()) };
-        static SESSION_TENANTS: RefCell<Vec<(String, Option<Uuid>)>> = const { RefCell::new(Vec::new()) };
+        static SESSION_TENANTS: RefCell<Vec<(String, super::SessionScope)>> = const { RefCell::new(Vec::new()) };
+        static BOUND: RefCell<Option<Vec<Uuid>>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn pinned(flow: Flow) -> Option<Level> {
@@ -1192,7 +1346,7 @@ pub(crate) mod test_support {
 
     /// `Some(answer)` when a test faked the tenant of session key `key` (a
     /// terminal id or a task-run id) on this thread.
-    pub(crate) fn faked_session_tenant(key: &str) -> Option<Option<Uuid>> {
+    pub(crate) fn faked_session_tenant(key: &str) -> Option<super::SessionScope> {
         SESSION_TENANTS.with(|m| {
             m.borrow()
                 .iter()
@@ -1213,9 +1367,27 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn fake_session_tenant(key: &str, tenant: Option<Uuid>) -> FakeSessionTenant {
-        SESSION_TENANTS.with(|m| m.borrow_mut().push((key.to_string(), tenant)));
+    pub(crate) fn fake_session_tenant(key: &str, scope: super::SessionScope) -> FakeSessionTenant {
+        SESSION_TENANTS.with(|m| m.borrow_mut().push((key.to_string(), scope)));
         FakeSessionTenant
+    }
+
+    pub(crate) fn faked_bound_tenants() -> Option<Vec<Uuid>> {
+        BOUND.with(|b| b.borrow().clone())
+    }
+
+    /// RAII fake of the bound-tenant set on this thread.
+    pub(crate) struct FakeBound(Option<Vec<Uuid>>);
+
+    impl Drop for FakeBound {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            BOUND.with(|b| *b.borrow_mut() = previous);
+        }
+    }
+
+    pub(crate) fn fake_bound_tenants(tenants: Vec<Uuid>) -> FakeBound {
+        FakeBound(BOUND.with(|b| b.borrow_mut().replace(tenants)))
     }
 
     /// RAII pin for one flow on this thread; restored on drop (including on a
@@ -2177,6 +2349,89 @@ mod tests {
         lines
     }
 
+    /// M3: a content send whose session tenant could not be resolved is
+    /// judged by the STRICTEST verdict across the default scope and every
+    /// bound tenant — never the default scope alone.
+    #[test]
+    fn an_unresolved_session_takes_the_strictest_bound_tenant() {
+        let base = "http://coord.example";
+        let a = Uuid::from_u128(0xa3);
+        let b = Uuid::from_u128(0xb3);
+        let state = EgressState::new(None, None, ScopeKey::new(base, Some(a)));
+        let decide = |t: Uuid, level: Level| {
+            state.apply_coord_answer(
+                &ScopeKey::new(base, Some(t)),
+                Flow::TerminalStream,
+                CoordAnswer::Authoritative(Decision {
+                    level,
+                    decided_by: CoordOrigin::TenantRow,
+                }),
+            )
+        };
+        decide(a, Level::On);
+        decide(b, Level::Off);
+        state.set_bound_tenants(vec![a, b]);
+        let flow = Flow::TerminalStream;
+        assert!(state.permit_session(flow, SessionScope::Tenant(a)).allowed);
+        assert!(
+            state
+                .permit_session(flow, SessionScope::DeviceDefault)
+                .allowed
+        );
+        let unresolved = state.permit_session(flow, SessionScope::Unresolved);
+        assert!(
+            !unresolved.allowed,
+            "B's off refuses an unattributable send"
+        );
+        // A bound tenant nobody has answered for is UNKNOWN, which refuses too.
+        let c = Uuid::from_u128(0xc3);
+        decide(b, Level::On);
+        state.set_bound_tenants(vec![a, b, c]);
+        assert!(!state.permit_session(flow, SessionScope::Unresolved).allowed);
+        state.set_bound_tenants(vec![a, b]);
+        assert!(state.permit_session(flow, SessionScope::Unresolved).allowed);
+    }
+
+    /// M3: the strictest rule's set is seeded from the store before the first
+    /// poll, so a restart does not open unattributable sends meanwhile.
+    #[test]
+    fn the_bound_set_is_seeded_from_the_store_before_the_first_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STORE_FILE);
+        let base = "http://coord.example";
+        let a = Uuid::from_u128(0xa4);
+        let b = Uuid::from_u128(0xb4);
+        let first = EgressState::new(Some(path.clone()), None, ScopeKey::new(base, Some(a)));
+        first.apply_coord_answer(
+            &ScopeKey::new(base, Some(b)),
+            Flow::TranscriptSync,
+            CoordAnswer::Authoritative(Decision {
+                level: Level::Off,
+                decided_by: CoordOrigin::TenantRow,
+            }),
+        );
+        let restarted = EgressState::new(Some(path), None, ScopeKey::new(base, Some(a)));
+        assert_eq!(restarted.bound_tenants(), vec![b]);
+        assert!(
+            !restarted
+                .permit_session(Flow::TranscriptSync, SessionScope::Unresolved)
+                .allowed
+        );
+    }
+
+    /// M3: the module-level door used by every content call site applies the
+    /// same rule over the faked bound set and pins.
+    #[test]
+    fn the_session_door_refuses_an_unresolved_send_when_any_bound_tenant_is_off() {
+        let t = Uuid::from_u128(0x7e7a_0006);
+        let _on = test_support::pin(Flow::TranscriptSync, Level::On);
+        let _off = test_support::pin_for(Flow::TranscriptSync, t, Level::Off);
+        let _bound = test_support::fake_bound_tenants(vec![t]);
+        assert!(!permit_session(Flow::TranscriptSync, SessionScope::Unresolved).allowed);
+        assert!(!transcript_sync_gate_session(SessionScope::from_lookup(None)).is_open());
+        assert!(permit_session(Flow::TranscriptSync, SessionScope::DeviceDefault).allowed);
+    }
+
     /// Re-review 9: the transcript and code-mirror paths that know their
     /// session ask in that session's tenant (the relay and remote-attach
     /// paths are covered behaviourally in their own modules' `egress_tests`).
@@ -2186,7 +2441,7 @@ mod tests {
         let tailer = squash(include_str!("session/session_transcript_tailer.rs"));
         assert!(
             tailer.contains(&squash(
-                "transcript_sync_gate_for(self.registrar.recorded_tenant(session_key))"
+                "transcript_sync_gate_session(crate::egress::SessionScope::from_lookup(self.registrar.recorded_tenant(session_key),))"
             )),
             "the tailer asks in the session's recorded tenant"
         );
@@ -2202,7 +2457,7 @@ mod tests {
         let emitter = squash(include_str!("session/transcript_emitter.rs"));
         assert!(
             emitter.contains(&squash(
-                "transcript_sync_gate_for(self.registrar.recorded_tenant(session_key))"
+                "transcript_sync_gate_session(crate::egress::SessionScope::from_lookup(self.registrar.recorded_tenant(session_key),))"
             )),
             "the emitter asks in the session's recorded tenant"
         );

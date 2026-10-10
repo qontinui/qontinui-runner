@@ -2145,7 +2145,7 @@ enum ControlsOutcome {
 /// ONE decision: a 401 resets, an error keeps, an absent JWT skips. The two
 /// caches are allowed to hold different values; they are not allowed to disagree
 /// about what a 404 means.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum FetchError {
     /// No device JWT yet — this runner is unpaired.
     NoJwt,
@@ -2684,28 +2684,32 @@ async fn poll_plan_capture_once() -> PlanCapturePoll {
 ///
 /// A 2xx is classified by [`crate::egress::classify_coord_answer`]: a tenant
 /// row or a self-hosted deployment's default is a decision, coord's product
-/// default is "no opinion" (clears the scope so the profile answers), and an
-/// answer from a coord that predates the egress family changes nothing. Any
-/// failure — unpaired, a 401/404, a network error — also changes nothing: it
-/// says nothing about the tenant's switch.
+/// default is "no opinion" (clears the scope so the profile answers), and a
+/// 2xx from a coord that predates the egress family (no `default_source`)
+/// marks the scope answered without overriding a held decision. A FAILED
+/// fetch — unpaired, a 401/404, a network error, a 5xx — is `None`: coord gave
+/// no answer, so nothing is recorded or persisted and an unanswered tenant
+/// stays UNKNOWN (refusing).
 fn egress_answer_for(
     result: &Result<FleetPolicyResponse, FetchError>,
-) -> crate::egress::CoordAnswer {
-    match result {
-        Ok(body) => crate::egress::classify_coord_answer(
-            body.effective_level.as_deref(),
-            body.resolved_scope.as_deref(),
-            body.default_source.as_deref(),
-        ),
-        Err(_) => crate::egress::CoordAnswer::NotAnEgressAnswer,
-    }
+) -> Option<crate::egress::CoordAnswer> {
+    let body = result.as_ref().ok()?;
+    Some(crate::egress::classify_coord_answer(
+        body.effective_level.as_deref(),
+        body.resolved_scope.as_deref(),
+        body.default_source.as_deref(),
+    ))
 }
 
 /// The scope a poll's answers are filed under: this coord, and the tenant the
 /// PRESENTED credential names (its `tenant_id` claim) — the tenant coord
-/// actually answered for. A claimless credential (a pre-claim pairing the
-/// bearer selector accepted for the requested tenant) files under that
-/// requested tenant.
+/// actually answered for. A claimless credential files under the requested
+/// tenant, which is sound ONLY because of the precondition
+/// `auth::legacy_token_serves_tenant` enforces before the bearer selector
+/// hands one out: the per-tenant slot store was read and holds no slot for
+/// that tenant, AND the device's binding count was MEASURED as exactly one. On
+/// a multi-binding device (or an unreadable `paired_user.json`) a claimless
+/// token is refused, so it never reaches this function for a second tenant.
 fn egress_poll_scope(
     base: &str,
     presented_bearer: Option<&str>,
@@ -2736,15 +2740,29 @@ fn egress_poll_tenants() -> Vec<uuid::Uuid> {
 /// flip logs and a steady state does not.
 fn egress_log_key(result: &Result<FleetPolicyResponse, FetchError>) -> String {
     use crate::egress::CoordAnswer;
-    match (result, egress_answer_for(result)) {
-        (Ok(_), CoordAnswer::Authoritative(d)) => {
-            format!("answer:{}:{}", d.level.as_str(), d.decided_by.as_str())
-        }
-        (Ok(_), CoordAnswer::NoOpinion) => "product-default".to_string(),
-        (Ok(_), CoordAnswer::NotAnEgressAnswer) => "coord-predates-egress".to_string(),
-        (Err(FetchError::NoJwt), _) => "unpaired".to_string(),
-        (Err(FetchError::AuthOrAbsent(status)), _) => format!("status:{status}"),
-        (Err(FetchError::Failed(_)), _) => "failed".to_string(),
+    match result {
+        Err(FetchError::NoJwt) => "unpaired".to_string(),
+        Err(FetchError::AuthOrAbsent(status)) => format!("status:{status}"),
+        Err(FetchError::Failed(_)) => "failed".to_string(),
+        Ok(_) => match egress_answer_for(result) {
+            Some(CoordAnswer::Authoritative(d)) => {
+                format!("answer:{}:{}", d.level.as_str(), d.decided_by.as_str())
+            }
+            Some(CoordAnswer::NoOpinion) => "product-default".to_string(),
+            Some(CoordAnswer::NotAnEgressAnswer) | None => "coord-predates-egress".to_string(),
+        },
+    }
+}
+
+/// Apply one egress poll result for `flow` in `scope` to `state`.
+fn apply_egress_result(
+    state: &crate::egress::EgressState,
+    scope: &crate::egress::ScopeKey,
+    flow: crate::egress::Flow,
+    result: &Result<FleetPolicyResponse, FetchError>,
+) {
+    if let Some(answer) = egress_answer_for(result) {
+        state.apply_coord_answer(scope, flow, answer);
     }
 }
 
@@ -2765,17 +2783,45 @@ async fn poll_egress_once(
         .await
         .ok()
         .flatten();
-    crate::egress::set_current_scope(crate::egress::ScopeKey::new(&base, default_tenant));
-    let tenants = tokio::task::spawn_blocking(egress_poll_tenants)
-        .await
-        .unwrap_or_default();
+    // Every bound tenant, each paired with ITS OWN slot credential (blocking
+    // secure-storage reads, so off the async runtime).
+    let targets = tokio::task::spawn_blocking(|| {
+        egress_poll_tenants()
+            .into_iter()
+            .map(|tenant| (tenant, crate::auth::device_bearer_for(Some(&tenant))))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    poll_egress_with(
+        crate::egress::global_state(),
+        &base,
+        default_tenant,
+        targets,
+        |domain, bearer| async move { fetch_fleet_policy_with(domain, &bearer).await },
+        last_logged,
+    )
+    .await;
+}
 
-    for tenant in tenants {
-        let bearer =
-            tokio::task::spawn_blocking(move || crate::auth::device_bearer_for(Some(&tenant)))
-                .await
-                .ok()
-                .flatten();
+/// The body of [`poll_egress_once`] over injected parts: the switch state,
+/// the coord base, the default tenant, every bound tenant with the credential
+/// to present for it (`None` = no usable credential), and the fetcher.
+async fn poll_egress_with<F, Fut>(
+    state: &crate::egress::EgressState,
+    base: &str,
+    default_tenant: Option<uuid::Uuid>,
+    targets: Vec<(uuid::Uuid, Option<String>)>,
+    fetch: F,
+    last_logged: &mut std::collections::HashMap<(Option<uuid::Uuid>, crate::egress::Flow), String>,
+) where
+    F: Fn(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<FleetPolicyResponse, FetchError>>,
+{
+    state.set_current_scope(crate::egress::ScopeKey::new(base, default_tenant));
+    state.set_bound_tenants(targets.iter().map(|(t, _)| *t).collect());
+
+    for (tenant, bearer) in targets {
         let Some(bearer) = bearer else {
             let key = (Some(tenant), crate::egress::Flow::TranscriptSync);
             if last_logged.get(&key).map(String::as_str) != Some("no-credential") {
@@ -2787,22 +2833,23 @@ async fn poll_egress_once(
             }
             continue;
         };
-        let scope = egress_poll_scope(&base, Some(&bearer), Some(tenant));
-        let bearer = bearer.as_str();
-        let results = futures::future::join_all(crate::egress::Flow::ALL.map(|flow| async move {
-            (flow, fetch_fleet_policy_with(flow.domain(), bearer).await)
+        let scope = egress_poll_scope(base, Some(&bearer), Some(tenant));
+        let fetch = &fetch;
+        let results = futures::future::join_all(crate::egress::Flow::ALL.map(|flow| {
+            let bearer = bearer.clone();
+            async move { (flow, fetch(flow.domain(), bearer).await) }
         }))
         .await;
 
         for (flow, result) in results {
-            crate::egress::apply_coord_answer(&scope, flow, egress_answer_for(&result));
+            apply_egress_result(state, &scope, flow, &result);
             let log_key = egress_log_key(&result);
             let slot = (scope.tenant_id, flow);
             if last_logged.get(&slot) == Some(&log_key) {
                 continue;
             }
-            let verdict = crate::egress::permit_for(flow, scope.tenant_id);
-            let state = if verdict.allowed { "on" } else { "off" };
+            let verdict = state.permit_for(flow, scope.tenant_id);
+            let level = if verdict.allowed { "on" } else { "off" };
             let who = scope
                 .tenant_id
                 .map_or_else(|| "no tenant".to_string(), |t| format!("tenant {t}"));
@@ -2815,20 +2862,20 @@ async fn poll_egress_once(
                 ),
                 Ok(_) if log_key == "product-default" => info!(
                     "fleet_policy_poller: coord has no row for {who} and applies its product \
-                     default for {} — not a tenant decision; {} stays {state} (source={})",
+                     default for {} — not a tenant decision; {} stays {level} (source={})",
                     flow.domain(),
                     flow.key(),
                     verdict.source.as_str()
                 ),
                 Ok(_) => info!(
                     "fleet_policy_poller: coord does not know {} yet (no default_source on its \
-                     no-row answer) — {} for {who} stays {state} (source={})",
+                     no-row answer) — {} for {who} stays {level} (source={})",
                     flow.domain(),
                     flow.key(),
                     verdict.source.as_str()
                 ),
                 Err(e) => warn!(
-                    "fleet_policy_poller: {} poll for {who} gave no answer ({}) — {} stays {state} \
+                    "fleet_policy_poller: {} poll for {who} gave no answer ({}) — {} stays {level} \
                      (source={})",
                     flow.domain(),
                     match e {
@@ -4345,13 +4392,13 @@ mod egress_poll_tests {
     fn an_egress_aware_no_row_answer_is_classified_by_its_default_source() {
         let r =
             body(r#"{"effective_level":"on","resolved_scope":"none","default_source":"product"}"#);
-        assert_eq!(egress_answer_for(&r), CoordAnswer::NoOpinion);
+        assert_eq!(egress_answer_for(&r).unwrap(), CoordAnswer::NoOpinion);
         assert_eq!(egress_log_key(&r), "product-default");
         let r = body(
             r#"{"effective_level":"off","resolved_scope":"none","default_source":"deployment_profile"}"#,
         );
         assert_eq!(
-            egress_answer_for(&r),
+            egress_answer_for(&r).unwrap(),
             CoordAnswer::Authoritative(Decision {
                 level: Level::Off,
                 decided_by: CoordOrigin::DeploymentProfile
@@ -4364,7 +4411,7 @@ mod egress_poll_tests {
     fn a_tenant_row_is_recorded_even_from_a_coord_without_default_source() {
         let r = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
         assert_eq!(
-            egress_answer_for(&r),
+            egress_answer_for(&r).unwrap(),
             CoordAnswer::Authoritative(Decision {
                 level: Level::Off,
                 decided_by: CoordOrigin::TenantRow
@@ -4377,7 +4424,10 @@ mod egress_poll_tests {
         // Today's coord answers every unknown domain `off` with no
         // default_source; recording it would switch all six flows off.
         let r = body(r#"{"effective_level":"off","resolved_scope":"none","default_source":null}"#);
-        assert_eq!(egress_answer_for(&r), CoordAnswer::NotAnEgressAnswer);
+        assert_eq!(
+            egress_answer_for(&r).unwrap(),
+            CoordAnswer::NotAnEgressAnswer
+        );
         assert_eq!(egress_log_key(&r), "coord-predates-egress");
     }
 
@@ -4396,7 +4446,7 @@ mod egress_poll_tests {
         let scope = crate::egress::ScopeKey::new("http://coord.example", None);
         let first =
             crate::egress::EgressState::new(Some(path.clone()), Some(Level::Off), scope.clone());
-        first.apply_coord_answer(&scope, flow, egress_answer_for(&r));
+        apply_egress_result(&first, &scope, flow, &r);
         assert!(
             !first.permit(flow).allowed,
             "first poll: the profile's off must hold"
@@ -4455,7 +4505,7 @@ mod egress_poll_tests {
         );
         let off = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
         let flow = crate::egress::Flow::TerminalStream;
-        state.apply_coord_answer(&poll_scope, flow, egress_answer_for(&off));
+        apply_egress_result(&state, &poll_scope, flow, &off);
 
         assert_eq!(poll_scope.tenant_id, stamped);
         assert_eq!(
@@ -4477,10 +4527,7 @@ mod egress_poll_tests {
         let src = include_str!("fleet_policy_poller.rs");
         let poll = src.split_once("async fn poll_egress_once(").unwrap().1;
         let poll = poll.split_once("\n}\n").unwrap().0;
-        assert!(
-            poll.contains("spawn_blocking(egress_poll_tenants)"),
-            "{poll}"
-        );
+        assert!(poll.contains("egress_poll_tenants()"), "{poll}");
         assert!(poll.contains("device_bearer_for(Some(&tenant))"), "{poll}");
     }
 
@@ -4488,20 +4535,229 @@ mod egress_poll_tests {
     #[test]
     fn the_six_egress_fetches_run_concurrently() {
         let src = include_str!("fleet_policy_poller.rs");
-        let poll = src.split_once("async fn poll_egress_once(").unwrap().1;
+        let poll = src.split_once("async fn poll_egress_with<").unwrap().1;
         let poll = poll.split_once("\n}\n").unwrap().0;
         assert!(poll.contains("join_all("), "{poll}");
     }
 
-    #[test]
-    fn a_failed_poll_records_nothing() {
-        for e in [
+    fn fetch_errors() -> Vec<FetchError> {
+        vec![
             FetchError::NoJwt,
             FetchError::AuthOrAbsent(401),
             FetchError::AuthOrAbsent(404),
-            FetchError::Failed("boom".into()),
-        ] {
-            assert_eq!(egress_answer_for(&Err(e)), CoordAnswer::NotAnEgressAnswer);
+            FetchError::Failed("network".into()),
+            FetchError::Failed("coord 503".into()),
+        ]
+    }
+
+    fn jwt_for(tenant: uuid::Uuid) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "tenant_id": tenant.to_string() }).to_string());
+        format!("e30.{payload}.sig")
+    }
+
+    /// C1: a failed poll (no credential, 401, 404, network, 5xx) records
+    /// NOTHING: a decision already held stays as it was — in memory and on
+    /// disk — and the store file is not rewritten.
+    #[test]
+    fn a_failed_poll_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress-levels.json");
+        let t = uuid::Uuid::from_u128(0xfa11);
+        let scope = crate::egress::ScopeKey::new("http://coord.example", Some(t));
+        let state = crate::egress::EgressState::new(Some(path.clone()), None, scope.clone());
+        let flow = crate::egress::Flow::TerminalStream;
+        let off = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
+        apply_egress_result(&state, &scope, flow, &off);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        for e in fetch_errors() {
+            apply_egress_result(&state, &scope, flow, &Err(e));
+            let v = state.permit(flow);
+            assert!(!v.allowed);
+            assert_eq!(v.source.as_str(), "coord", "the held decision is untouched");
+            assert_eq!(
+                v.source.decided_by(),
+                Some(CoordOrigin::TenantRow),
+                "and still a tenant row"
+            );
+        }
+        let after = std::fs::read_to_string(&path).unwrap();
+        let strip = |raw: &str| {
+            let mut v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            v.as_object_mut().unwrap().remove("written_at");
+            v
+        };
+        assert_eq!(strip(&after), strip(&stored), "nothing was persisted");
+    }
+
+    /// C1: an UNKNOWN tenant stays UNKNOWN (refusing) through an error tick,
+    /// and nothing is persisted, so a fresh process reading the store still
+    /// refuses.
+    #[test]
+    fn an_error_tick_leaves_an_unknown_tenant_refusing_also_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress-levels.json");
+        let t = uuid::Uuid::from_u128(0xfa12);
+        let scope = crate::egress::ScopeKey::new("http://coord.example", Some(t));
+        let state = crate::egress::EgressState::new(Some(path.clone()), None, scope.clone());
+        for e in fetch_errors() {
+            for flow in crate::egress::Flow::ALL {
+                apply_egress_result(&state, &scope, flow, &Err(e.clone()));
+            }
+        }
+        for flow in crate::egress::Flow::ALL {
+            let v = state.permit(flow);
+            assert!(!v.allowed, "{flow:?}: an unanswered tenant refuses");
+            assert_eq!(v.source.as_str(), "unknown", "{flow:?}");
+        }
+        assert!(!path.exists(), "an error tick persists nothing");
+        let reloaded = crate::egress::EgressState::new(Some(path), None, scope);
+        for flow in crate::egress::Flow::ALL {
+            let v = reloaded.permit(flow);
+            assert!(!v.allowed, "{flow:?}: still refusing after reload");
+            assert_eq!(v.source.as_str(), "unknown", "{flow:?}");
+        }
+    }
+
+    /// C1: only a SUCCESSFUL response lacking `default_source` marks the scope
+    /// answered (coord replied; it just predates the egress family).
+    #[test]
+    fn only_a_successful_answer_marks_an_unknown_scope_answered() {
+        let t = uuid::Uuid::from_u128(0xfa13);
+        let scope = crate::egress::ScopeKey::new("http://coord.example", Some(t));
+        let state = crate::egress::EgressState::new(None, None, scope.clone());
+        let flow = crate::egress::Flow::CodeMirror;
+        let pre = body(r#"{"effective_level":"off","resolved_scope":"none"}"#);
+        apply_egress_result(&state, &scope, flow, &pre);
+        assert_ne!(state.permit(flow).source.as_str(), "unknown");
+    }
+
+    /// Item 5 (behavioural): a poll whose fetches all FAIL does not move the
+    /// default scope to the new tenant — no answer for it was applied.
+    #[tokio::test]
+    async fn a_failed_poll_does_not_move_the_default_scope() {
+        let base = "http://coord.example";
+        let a = uuid::Uuid::from_u128(0xa);
+        let b = uuid::Uuid::from_u128(0xb);
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, Some(a)),
+        );
+        let mut logged = std::collections::HashMap::new();
+        poll_egress_with(
+            &state,
+            base,
+            Some(b),
+            vec![(b, Some(jwt_for(b)))],
+            |_domain, _bearer| async { Err(FetchError::Failed("down".into())) },
+            &mut logged,
+        )
+        .await;
+        assert_eq!(
+            state.current_scope().tenant_id,
+            Some(a),
+            "the move waits for an applied answer"
+        );
+    }
+
+    /// m5 (behavioural): every bound tenant is polled with ITS OWN credential,
+    /// each answer filed under that tenant; a tenant with no credential is not
+    /// asked and stays UNKNOWN; the bound set is recorded.
+    #[tokio::test]
+    async fn every_bound_tenant_is_polled_with_its_own_credential_behaviourally() {
+        let base = "http://coord.example";
+        let a = uuid::Uuid::from_u128(0xa1);
+        let b = uuid::Uuid::from_u128(0xb1);
+        let c = uuid::Uuid::from_u128(0xc1);
+        let (ja, jb) = (jwt_for(a), jwt_for(b));
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, Some(a)),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let mut logged = std::collections::HashMap::new();
+        let ja2 = ja.clone();
+        poll_egress_with(
+            &state,
+            base,
+            Some(a),
+            vec![(a, Some(ja.clone())), (b, Some(jb.clone())), (c, None)],
+            |domain, bearer| {
+                let seen = seen.clone();
+                let off = bearer == ja2;
+                async move {
+                    seen.lock().unwrap().push((domain.to_string(), bearer));
+                    let level = if off { "off" } else { "on" };
+                    Ok(serde_json::from_str(&format!(
+                        r#"{{"effective_level":"{level}","resolved_scope":"tenant"}}"#
+                    ))
+                    .unwrap())
+                }
+            },
+            &mut logged,
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            12,
+            "six domains for each tenant with a credential"
+        );
+        assert_eq!(seen.iter().filter(|(_, b)| *b == ja).count(), 6);
+        assert_eq!(seen.iter().filter(|(_, b)| *b == jb).count(), 6);
+        for flow in crate::egress::Flow::ALL {
+            let va = state.permit_for(flow, Some(a));
+            assert!(!va.allowed && va.source.as_str() == "coord", "{flow:?} A");
+            let vb = state.permit_for(flow, Some(b));
+            assert!(vb.allowed && vb.source.as_str() == "coord", "{flow:?} B");
+            let vc = state.permit_for(flow, Some(c));
+            assert!(!vc.allowed && vc.source.as_str() == "unknown", "{flow:?} C");
+        }
+        assert_eq!(state.bound_tenants(), vec![a, b, c]);
+    }
+
+    /// m5 (behavioural): the six fetches for a tenant run CONCURRENTLY — each
+    /// waits on a six-party barrier, which a sequential poll never releases.
+    #[tokio::test]
+    async fn the_six_egress_fetches_run_concurrently_behaviourally() {
+        let base = "http://coord.example";
+        let a = uuid::Uuid::from_u128(0xa2);
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, Some(a)),
+        );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(6));
+        let mut logged = std::collections::HashMap::new();
+        poll_egress_with(
+            &state,
+            base,
+            Some(a),
+            vec![(a, Some(jwt_for(a)))],
+            |_domain, _bearer| {
+                let barrier = barrier.clone();
+                async move {
+                    match tokio::time::timeout(Duration::from_secs(5), barrier.wait()).await {
+                        Ok(_) => Ok(serde_json::from_str(
+                            r#"{"effective_level":"off","resolved_scope":"tenant"}"#,
+                        )
+                        .unwrap()),
+                        Err(_) => Err(FetchError::Failed("sequential".into())),
+                    }
+                }
+            },
+            &mut logged,
+        )
+        .await;
+        for flow in crate::egress::Flow::ALL {
+            assert_eq!(
+                state.permit_for(flow, Some(a)).source.as_str(),
+                "coord",
+                "{flow:?}: every fetch completed together"
+            );
         }
     }
 
@@ -4518,12 +4774,13 @@ mod egress_poll_tests {
         assert!(loop_body.contains("poll_egress_once(&mut last_logged_egress).await"));
         let poll = src.split_once("async fn poll_egress_once(").unwrap().1;
         let poll = poll.split_once("\n}\n").unwrap().0;
-        assert!(poll.contains("crate::egress::Flow::ALL"));
-        assert!(poll.contains("fetch_fleet_policy_with(flow.domain(), bearer)"));
-        assert!(poll.contains("egress_poll_scope(&base, Some(&bearer), Some(tenant))"));
+        assert!(poll.contains("fetch_fleet_policy_with(domain, &bearer)"));
         assert!(poll.contains("spawn_blocking(crate::session::resolve_new_session_tenant)"));
-        assert!(poll.contains(
-            "crate::egress::apply_coord_answer(&scope, flow, egress_answer_for(&result))"
-        ));
+        assert!(poll.contains("poll_egress_with("));
+        let core = src.split_once("async fn poll_egress_with<").unwrap().1;
+        let core = core.split_once("\n}\n").unwrap().0;
+        assert!(core.contains("crate::egress::Flow::ALL"));
+        assert!(core.contains("egress_poll_scope(base, Some(&bearer), Some(tenant))"));
+        assert!(core.contains("apply_egress_result(state, &scope, flow, &result)"));
     }
 }

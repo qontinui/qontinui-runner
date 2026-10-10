@@ -1629,7 +1629,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // later flip to `on` does not release it either. Evaluated in the OWNING
     // session's tenant scope, the same tenant whose credential the push uses.
     if kind == "output_chunk" {
-        if let Some(flow) = output_chunk_egress_refusal(&rec.payload, scope.declared_tenant()) {
+        if let Some(flow) = output_chunk_egress_refusal(&rec.payload, scope.into()) {
             OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 session = %rec.session_id,
@@ -2806,7 +2806,7 @@ pub(crate) static OUTPUT_CHUNKS_DROPPED_EGRESS_OFF: AtomicU64 = AtomicU64::new(0
 /// transcript sync, whose verdict includes the user's own consent.
 fn output_chunk_egress_refusal(
     payload: &JsonValue,
-    tenant: Option<Uuid>,
+    scope: crate::egress::SessionScope,
 ) -> Option<crate::egress::Flow> {
     use crate::egress::Flow;
     let stream = payload
@@ -2816,15 +2816,15 @@ fn output_chunk_egress_refusal(
     let (flow, allowed) = if stream == PTY_STREAM {
         (
             Flow::TerminalStream,
-            crate::egress::permit_or_count_for(Flow::TerminalStream, tenant),
+            crate::egress::permit_or_count_session(Flow::TerminalStream, scope),
         )
     } else {
         // Counted as an egress refusal only when the TENANT switch refused; a
         // user who turned their own consent off is not the switch's doing.
-        crate::egress::permit_or_count_for(Flow::TranscriptSync, tenant);
+        crate::egress::permit_or_count_session(Flow::TranscriptSync, scope);
         (
             Flow::TranscriptSync,
-            crate::egress::transcript_sync_gate_for(tenant).is_open(),
+            crate::egress::transcript_sync_gate_session(scope).is_open(),
         )
     };
     (!allowed).then_some(flow)
@@ -8354,18 +8354,21 @@ pub(crate) mod egress_tests {
         let _t = pin(Flow::TranscriptSync, Level::Off);
         let _p = pin(Flow::TerminalStream, Level::Off);
         assert_eq!(
-            output_chunk_egress_refusal(&json!({"stream": "pty"}), None),
+            output_chunk_egress_refusal(
+                &json!({"stream": "pty"}),
+                crate::egress::SessionScope::DeviceDefault
+            ),
             Some(Flow::TerminalStream)
         );
         assert_eq!(
-            output_chunk_egress_refusal(&json!({}), None),
+            output_chunk_egress_refusal(&json!({}), crate::egress::SessionScope::DeviceDefault),
             Some(Flow::TranscriptSync),
             "an absent stream is a transcript chunk"
         );
         let src = include_str!("coord_sync.rs");
         let body = src.split_once("async fn push_record(").unwrap().1;
         let check = body
-            .find("output_chunk_egress_refusal(&rec.payload, scope.declared_tenant())")
+            .find("output_chunk_egress_refusal(&rec.payload, scope.into())")
             .unwrap();
         let scope = body
             .find("let scope = record_session_tenant(inner, rec);")
