@@ -2530,6 +2530,10 @@ pub(crate) enum SelfIdOutcome {
     /// `Some(task_run_id)` arm, and a runner-managed session with a task run
     /// registers before it can proxy. Kept because that is a property of the
     /// spawn ordering, not a guarantee.
+    ///
+    /// Also produced when the primary chain finds SEVERAL task runs on the
+    /// workdir (`WorkdirTaskRun::Ambiguous`): refused rather than handed to the
+    /// lifecycle fallback, which could name a sibling interactive terminal.
     NoSession,
 }
 
@@ -3028,16 +3032,21 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
-    // Ambiguity (two sessions on one workdir) deliberately reads as "no
-    // primary-chain hit" here: the lifecycle fallback below resolves only a
-    // workdir with exactly one admitted record, so it cannot guess between them.
-    let task_run_id = app
+    // Only `NoCandidate` may fall through to the lifecycle fallback below.
+    // `Ambiguous` means several task runs claim this workdir, and they own its
+    // calls: the lifecycle store holds interactive terminals, so a single
+    // admitted record there would name a SIBLING terminal, not the caller.
+    // No header beats a wrong one.
+    let task_run_id = match app
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .and_then(|sm| match sm.task_run_id_for_workdir(&workdir) {
-            crate::claude_session::WorkdirTaskRun::Found(id) => Some(id),
-            crate::claude_session::WorkdirTaskRun::NoCandidate
-            | crate::claude_session::WorkdirTaskRun::Ambiguous => None,
-        });
+        .map(|sm| sm.task_run_id_for_workdir(&workdir))
+    {
+        Some(crate::claude_session::WorkdirTaskRun::Found(id)) => Some(id),
+        Some(crate::claude_session::WorkdirTaskRun::Ambiguous) => {
+            return (None, SelfIdOutcome::NoSession);
+        }
+        Some(crate::claude_session::WorkdirTaskRun::NoCandidate) | None => None,
+    };
     match task_run_id {
         // Primary chain hit.
         Some(task_run_id) => {
