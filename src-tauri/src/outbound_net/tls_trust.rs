@@ -95,41 +95,47 @@ pub fn census_for(outcome: Option<&ProxyEnvOutcome>, windows: bool) -> Vec<Trust
         },
     ];
 
-    rows.push(match (windows, trust, outcome.and_then(|o| o.git_ssl_backend.as_deref())) {
-        (true, _, Some(backend)) => TrustRow {
-            stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-            source: format!("http.sslBackend={backend} (GIT_CONFIG_* exported at startup)"),
-            verdict: TrustVerdict::OsStore,
-            basis: "configured: Git for Windows' Schannel backend has the Windows store as \
+    rows.push(
+        match (
+            windows,
+            trust,
+            outcome.and_then(|o| o.git_ssl_backend.as_deref()),
+        ) {
+            (true, _, Some(backend)) => TrustRow {
+                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
+                source: format!("http.sslBackend={backend} (GIT_CONFIG_* exported at startup)"),
+                verdict: TrustVerdict::OsStore,
+                basis: "configured: Git for Windows' Schannel backend has the Windows store as \
                     its only trust source; not measured on CI"
-                .into(),
-        },
-        (true, Some(TrustMode::Bundled), None) => TrustRow {
-            stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-            source: "Git for Windows' OpenSSL bundle (network.trust = bundled)".into(),
-            verdict: TrustVerdict::Bundled,
-            basis: "configured: the profile opted out of Schannel".into(),
-        },
-        (true, _, None) => TrustRow {
-            stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-            source: "Git for Windows default backend (an operator GIT_CONFIG_* or an \
+                    .into(),
+            },
+            (true, Some(TrustMode::Bundled), None) => TrustRow {
+                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
+                source: "Git for Windows' OpenSSL bundle (network.trust = bundled)".into(),
+                verdict: TrustVerdict::Bundled,
+                basis: "configured: the profile opted out of Schannel".into(),
+            },
+            (true, _, None) => TrustRow {
+                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
+                source: "Git for Windows default backend (an operator GIT_CONFIG_* or an \
                      unreadable count left http.sslBackend unset by the runner)"
-                .into(),
-            verdict: TrustVerdict::Unknown,
-            basis: "the runner did not set the backend; whatever the machine's git config \
+                    .into(),
+                verdict: TrustVerdict::Unknown,
+                basis: "the runner did not set the backend; whatever the machine's git config \
                     says applies"
-                .into(),
-        },
-        (false, _, _) => TrustRow {
-            stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-            source: "the system git's libcurl TLS backend".into(),
-            verdict: TrustVerdict::Unknown,
-            basis: "not measured: depends on how the distribution built libcurl \
+                    .into(),
+            },
+            (false, _, _) => TrustRow {
+                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
+                source: "the system git's libcurl TLS backend".into(),
+                verdict: TrustVerdict::Unknown,
+                basis: "not measured: depends on how the distribution built libcurl \
                     (OpenSSL reads the system CA file; GnuTLS builds honour only \
                     GIT_SSL_CAINFO)"
-                .into(),
+                    .into(),
+            },
         },
-    });
+    );
 
     rows.push(TrustRow {
         stack: "claude CLI (Node)",
@@ -198,7 +204,14 @@ mod tests {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let out = Command::new(cargo)
-            .args(["metadata", "--format-version", "1", "--locked", "--offline", "--manifest-path"])
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--offline",
+                "--manifest-path",
+            ])
             .arg(&manifest)
             .output()
             .expect("run cargo metadata");
@@ -225,7 +238,9 @@ mod tests {
             .filter(|node| {
                 node["deps"].as_array().is_some_and(|deps| {
                     deps.iter().any(|d| {
-                        d["pkg"].as_str().is_some_and(|id| name_of(id) == "webpki-roots")
+                        d["pkg"]
+                            .as_str()
+                            .is_some_and(|id| name_of(id) == "webpki-roots")
                     })
                 })
             })
@@ -259,8 +274,14 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("sentry = "))
             .expect("a sentry dependency line");
-        assert!(line.contains("\"native-tls\""), "sentry must enable native-tls: {line}");
-        assert!(!line.contains("\"rustls\""), "sentry must not enable rustls: {line}");
+        assert!(
+            line.contains("\"native-tls\""),
+            "sentry must enable native-tls: {line}"
+        );
+        assert!(
+            !line.contains("\"rustls\""),
+            "sentry must not enable rustls: {line}"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -284,7 +305,9 @@ mod tests {
     }
 
     fn mint_pki() -> Pki {
-        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
+        };
         let ca = |cn: &str| {
             let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -329,9 +352,8 @@ mod tests {
     /// A TLS server on 127.0.0.1 presenting the leaf, answering each
     /// connection with a tiny HTTP 200 or a WebSocket upgrade.
     async fn spawn_tls_server(identity: native_tls::Identity, serve: Serve) -> u16 {
-        let acceptor = tokio_native_tls::TlsAcceptor::from(
-            native_tls::TlsAcceptor::new(identity).unwrap(),
-        );
+        let acceptor =
+            tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -414,7 +436,11 @@ mod tests {
         rt.block_on(async {
             match kind {
                 "reqwest" => {
-                    let resp = reqwest::Client::new().get(url).send().await.expect("TLS ok");
+                    let resp = reqwest::Client::new()
+                        .get(url)
+                        .send()
+                        .await
+                        .expect("TLS ok");
                     assert!(resp.status().is_success());
                 }
                 "ws" => {
@@ -448,12 +474,21 @@ mod tests {
         let empty = pki.dir.path().join("empty-cert-dir");
         let (root, other) = (pki.root.clone(), pki.other_root.clone());
         let (trusted, refused) = tokio::task::spawn_blocking(move || {
-            (probe_in_child(&probe, &root, &empty), probe_in_child(&probe, &other, &empty))
+            (
+                probe_in_child(&probe, &root, &empty),
+                probe_in_child(&probe, &other, &empty),
+            )
         })
         .await
         .unwrap();
-        assert!(trusted, "reqwest must trust a root placed in the system trust input");
-        assert!(!refused, "negative control: an unrelated root must not verify the leaf");
+        assert!(
+            trusted,
+            "reqwest must trust a root placed in the system trust input"
+        );
+        assert!(
+            !refused,
+            "negative control: an unrelated root must not verify the leaf"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -467,12 +502,21 @@ mod tests {
         let empty = pki.dir.path().join("empty-cert-dir");
         let (root, other) = (pki.root.clone(), pki.other_root.clone());
         let (trusted, refused) = tokio::task::spawn_blocking(move || {
-            (probe_in_child(&probe, &root, &empty), probe_in_child(&probe, &other, &empty))
+            (
+                probe_in_child(&probe, &root, &empty),
+                probe_in_child(&probe, &other, &empty),
+            )
         })
         .await
         .unwrap();
-        assert!(trusted, "the WebSocket TLS stack must trust a root in the system trust input");
-        assert!(!refused, "negative control: an unrelated root must not verify the leaf");
+        assert!(
+            trusted,
+            "the WebSocket TLS stack must trust a root in the system trust input"
+        );
+        assert!(
+            !refused,
+            "negative control: an unrelated root must not verify the leaf"
+        );
     }
 
     /// Node (the `claude` CLI) ignores the OS trust input and honours
@@ -516,8 +560,14 @@ mod tests {
             tokio::task::spawn_blocking(move || (run(None), run(Some(&root_for_extra))))
                 .await
                 .unwrap();
-        assert!(!os_only, "Node must NOT pick up a root from the system trust input (bundled)");
-        assert!(with_extra, "Node must trust a root supplied via NODE_EXTRA_CA_CERTS");
+        assert!(
+            !os_only,
+            "Node must NOT pick up a root from the system trust input (bundled)"
+        );
+        assert!(
+            with_extra,
+            "Node must trust a root supplied via NODE_EXTRA_CA_CERTS"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -539,22 +589,45 @@ mod tests {
 
     #[test]
     fn census_git_row_follows_the_exported_backend() {
-        let git = |rows: Vec<TrustRow>| rows.into_iter().find(|r| r.stack.starts_with("git")).unwrap();
-        let on = git(census_for(Some(&outcome(TrustMode::Os, Some("schannel"), None)), true));
+        let git = |rows: Vec<TrustRow>| {
+            rows.into_iter()
+                .find(|r| r.stack.starts_with("git"))
+                .unwrap()
+        };
+        let on = git(census_for(
+            Some(&outcome(TrustMode::Os, Some("schannel"), None)),
+            true,
+        ));
         assert_eq!(on.verdict, TrustVerdict::OsStore);
         assert!(on.source.contains("schannel"));
-        let off = git(census_for(Some(&outcome(TrustMode::Bundled, None, None)), true));
+        let off = git(census_for(
+            Some(&outcome(TrustMode::Bundled, None, None)),
+            true,
+        ));
         assert_eq!(off.verdict, TrustVerdict::Bundled);
         let linux = git(census_for(Some(&outcome(TrustMode::Os, None, None)), false));
-        assert_eq!(linux.verdict, TrustVerdict::Unknown, "unmeasured is never os-store");
+        assert_eq!(
+            linux.verdict,
+            TrustVerdict::Unknown,
+            "unmeasured is never os-store"
+        );
     }
 
     #[test]
     fn census_names_the_ca_bundle_for_node_and_python() {
-        let rows = census_for(Some(&outcome(TrustMode::Os, None, Some("/corp/root.pem"))), false);
-        let node = rows.iter().find(|r| r.stack.starts_with("claude CLI")).unwrap();
+        let rows = census_for(
+            Some(&outcome(TrustMode::Os, None, Some("/corp/root.pem"))),
+            false,
+        );
+        let node = rows
+            .iter()
+            .find(|r| r.stack.starts_with("claude CLI"))
+            .unwrap();
         assert!(node.source.contains("NODE_EXTRA_CA_CERTS=/corp/root.pem"));
-        let py = rows.iter().find(|r| r.stack.starts_with("python-bridge")).unwrap();
+        let py = rows
+            .iter()
+            .find(|r| r.stack.starts_with("python-bridge"))
+            .unwrap();
         assert!(py.source.contains("SSL_CERT_FILE=/corp/root.pem"));
         assert_eq!(py.verdict, TrustVerdict::Unknown);
         assert!(render_line(&rows).contains("sentry 0.35 (crash reports) = os-store"));
