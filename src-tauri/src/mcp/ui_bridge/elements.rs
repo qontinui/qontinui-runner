@@ -2304,6 +2304,8 @@ pub(crate) async fn try_ws_dispatch_for_app(
         dispatcher
             .dispatch(app_id, action, http_method, http_path, payload)
             .await
+            // WS-only by the guard above: the bare result, as before.
+            .map(crate::mcp::app_dispatch::Dispatched::into_raw)
             .map_err(|e| e.to_user_message()),
     )
 }
@@ -2334,6 +2336,7 @@ async fn ws_collect_components(
             .await
         {
             Ok(value) => {
+                let value = value.into_raw();
                 // Wrappers may either return a bare array or wrap it in
                 // `{success, data}` / `{components: [...]}`. Accept any of
                 // those shapes and append the contained items.
@@ -2357,6 +2360,18 @@ async fn ws_collect_components(
         }
     }
     out
+}
+
+/// The component handlers' answer for a WS outcome: wrapper `{success: false}` fails; dispatch error → 400.
+fn component_ws_answer(
+    outcome: Result<serde_json::Value, String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match outcome {
+        Ok(value) => Ok(Json(crate::mcp::app_dispatch::ws_result_api_response(
+            value,
+        ))),
+        Err(e) => Err(ws_dispatch_error_response(e)),
+    }
 }
 
 /// Build a flat 400 error response from a WS dispatch failure. Mirrors the
@@ -2494,10 +2509,7 @@ pub async fn ui_bridge_get_component_handler(
     )
     .await
     {
-        return match ws_outcome {
-            Ok(value) => Ok(Json(ApiResponse::success(value))),
-            Err(e) => Err(ws_dispatch_error_response(e)),
-        };
+        return component_ws_answer(ws_outcome);
     }
 
     let ipc_result = ui_bridge_request_sync(
@@ -2623,10 +2635,7 @@ async fn component_action_dispatch(
     )
     .await
     {
-        return match ws_outcome {
-            Ok(value) => Ok(Json(ApiResponse::success(value))),
-            Err(e) => Err(ws_dispatch_error_response(e)),
-        };
+        return component_ws_answer(ws_outcome);
     }
 
     // Iter-3 item 4 — detect "component not found" / "action not found"
@@ -7205,5 +7214,32 @@ mod read_value_tests {
             !validate_read_value_all(&json!({ "selector": "i", "all": false, "index": 2 }))
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod component_ws_answer_tests {
+    use super::*;
+
+    /// A WS outcome object that failed is a failed component response, with
+    /// its error and code — not success wrapped around a failure.
+    #[test]
+    fn a_failed_ws_outcome_is_a_failed_component_response() {
+        let Json(resp) = component_ws_answer(Ok(serde_json::json!({
+            "success": false, "error": "Action save not found", "code": "ACTION_NOT_FOUND"
+        })))
+        .expect("a WS answer is a 200 response");
+        assert!(!resp.success);
+        assert_eq!(resp.error.as_deref(), Some("Action save not found"));
+        assert_eq!(resp.code.as_deref(), Some("ACTION_NOT_FOUND"));
+
+        let Json(ok) = component_ws_answer(Ok(serde_json::json!({"id": "c1"})))
+            .expect("a WS answer is a 200 response");
+        assert!(ok.success);
+        assert_eq!(ok.data, Some(serde_json::json!({"id": "c1"})));
+
+        let (status, _) = component_ws_answer(Err("wrapper disconnected".into()))
+            .expect_err("a dispatch error is the handler's 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

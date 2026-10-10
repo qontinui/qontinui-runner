@@ -1399,8 +1399,9 @@ pixel shortfall; "the name is cut off" without those is not actionable.
 
 This phase needs **no runner window**: the geometric checks are pure snapshot
 work and the endpoints degrade rather than fail when frame capture is
-impossible. A `frameError` in the response is informational, not a reason to
-skip the phase.
+impossible. A `frame.status: "unknown"` in the response (no pixels, with
+`frame.unknown.code` saying why) is informational, not a reason to skip the
+phase.
 
 ## Phase 4: Cross-Feature Testing
 

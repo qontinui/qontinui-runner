@@ -31,7 +31,10 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::Deserialize;
+use qontinui_vision_core::{
+    Observation, ObservationCoverage, Producer, Provenance, UnknownCode, UnmeasuredDimension,
+};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -560,35 +563,42 @@ pub struct PageHealthRequest {
     pub options: Option<serde_json::Value>,
 }
 
-/// Analyse the current page by running discover internally and returning a
-/// structured `PageHealthReport` with spatial coverage, layout regions,
-/// element diversity, text signal scanning, interactive readiness, visual
-/// anomalies and an ASCII heatmap.
-pub async fn ui_bridge_page_health_handler(
-    State(state): State<Arc<ApiState>>,
-    body: Option<Json<PageHealthRequest>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page health analysis");
+/// Producer id of the runner's `/control/page-health` twin (wire contract).
+pub const PAGE_HEALTH_PRODUCER_ID: &str = "runner/page-health";
 
-    // --- Step 1: run discover to get all elements -------------------------
-    let _body = body.map(|b| b.0).unwrap_or_default();
+/// One page-health check's result. Same content the route has always
+/// reported; now typed rather than a free `serde_json::Value`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageHealthFinding {
+    pub check: String,
+    /// `"CRITICAL"` | `"WARNING"` | `"OK"`.
+    pub severity: String,
+    pub detail: String,
+    pub data: serde_json::Value,
+}
 
-    let discover_data =
-        match ui_bridge_request_sync(&state, "discover", discover_all_elements_payload()).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("UI Bridge API: page-health discover failed: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
-            }
-        };
+/// The measured value of `POST /ui-bridge/control/page-health`: today's
+/// report content, carried inside an [`Observation`] (plan
+/// `2026-09-20-ui-bridge-observations-distinguish-cannot-see-from-not-present-and-carry-provenance`,
+/// Phase 2). Present only under `status: "measured"`; an `unknown` answer
+/// carries no report at all, so no severity is ever computed over elements
+/// the runner never saw.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageHealthValue {
+    /// The worst finding severity.
+    pub summary: String,
+    pub findings: Vec<PageHealthFinding>,
+    /// 20x20 viewport coverage grid, `#` filled / `.` empty.
+    pub heatmap: Vec<String>,
+    pub element_count: usize,
+    /// Elements that are visible AND carry a `state.normalizedRect` — the
+    /// ones the grid could place.
+    pub visible_count: usize,
+}
 
-    // Elements live under "elements" key returned by discover.
-    let elements = discover_data
-        .get("elements")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
+/// Run the page-health checks over a discover element list. Pure; the
+/// analysis the route has always run, unchanged.
+fn page_health_report(elements: &[serde_json::Value]) -> PageHealthValue {
     let element_count = elements.len();
 
     // Visible elements: state.visible == true and state.normalizedRect present.
@@ -731,7 +741,7 @@ pub async fn ui_bridge_page_health_handler(
     let nav_types: &[&str] = &["button", "heading", "badge", "status-message"];
     let mut type_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for el in &elements {
+    for el in elements {
         let t = el.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
         *type_counts.entry(t.to_string()).or_insert(0) += 1;
     }
@@ -789,7 +799,7 @@ pub async fn ui_bridge_page_health_handler(
     let mut detected_empty: Vec<String> = Vec::new();
     let mut detected_css: Vec<String> = Vec::new();
 
-    for el in &elements {
+    for el in elements {
         let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let text = el
             .get("state")
@@ -873,7 +883,7 @@ pub async fn ui_bridge_page_health_handler(
     let mut interactive_total: usize = 0;
     let mut interactive_disabled: usize = 0;
 
-    for el in &elements {
+    for el in elements {
         let cat = el.get("category").and_then(|v| v.as_str()).unwrap_or("");
         if cat == "interactive" {
             interactive_total += 1;
@@ -974,15 +984,157 @@ pub async fn ui_bridge_page_health_handler(
         .max_by_key(|s| severity_rank(s))
         .unwrap_or("OK");
 
-    let report = serde_json::json!({
-        "summary": worst,
-        "findings": findings,
-        "heatmap": heatmap,
-        "element_count": element_count,
-        "visible_count": visible_count
-    });
+    PageHealthValue {
+        summary: worst.to_string(),
+        findings: findings
+            .into_iter()
+            .map(|f| PageHealthFinding {
+                check: f["check"].as_str().unwrap_or_default().to_string(),
+                severity: f["severity"].as_str().unwrap_or_default().to_string(),
+                detail: f["detail"].as_str().unwrap_or_default().to_string(),
+                data: f["data"].clone(),
+            })
+            .collect(),
+        heatmap,
+        element_count,
+        visible_count,
+    }
+}
 
-    Ok(Json(ApiResponse::success(report)))
+/// `true` when a discover element reports `state.visible == true`.
+fn element_is_visible(el: &serde_json::Value) -> bool {
+    el.get("state")
+        .and_then(|s| s.get("visible"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Judge a discover reply into a page-health observation, by fixed rules:
+///
+/// | discover reply | answer |
+/// |---|---|
+/// | IPC failed | `unknown{producer_failed}` (the error as detail) |
+/// | no `elements` array | `unknown{input_missing}`, `observedAt: null` (no sample) |
+/// | `elements: []` | `unknown{producer_not_run}` — nothing is registered to look at |
+/// | visible elements, none carrying `normalizedRect` | `unknown{input_missing}` — no geometry to place (mirrors the SDK's `page-health.ts`) |
+/// | otherwise | `measured`, the report as value |
+///
+/// Coverage: `considered` = visible elements, `measured` = those carrying a
+/// `normalizedRect`, and the difference is named as unmeasured `geometry` —
+/// an element the grid cannot place is not empty space. Before this, all
+/// three unknowns became zero elements, 0% coverage and a CRITICAL page.
+pub(crate) fn page_health_observation(
+    discover: Result<serde_json::Value, String>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> Observation<PageHealthValue> {
+    let producer = Producer::new(PAGE_HEALTH_PRODUCER_ID, env!("CARGO_PKG_VERSION"));
+    let mut source = serde_json::Map::new();
+    source.insert("transport".into(), serde_json::json!("runner-ipc"));
+    source.insert("discover".into(), discover_all_elements_payload());
+    let provenance = |coverage: ObservationCoverage| {
+        Provenance::new(producer.clone(), evaluated_at, coverage).with_source(source.clone())
+    };
+
+    let data = match discover {
+        Ok(d) => d,
+        Err(e) => {
+            return Observation::unknown(
+                UnknownCode::ProducerFailed,
+                format!("discover IPC failed: {e}"),
+                provenance(ObservationCoverage::default()),
+            );
+        }
+    };
+    let Some(elements) = data.get("elements").and_then(|v| v.as_array()) else {
+        // No element list = no sample of the page: `observedAt` stays null,
+        // as the SDK's implementation answers.
+        return Observation::unknown(
+            UnknownCode::InputMissing,
+            "the discover reply carried no `elements` array, so no element was seen",
+            provenance(ObservationCoverage::default()),
+        );
+    };
+    if elements.is_empty() {
+        return Observation::unknown(
+            UnknownCode::ProducerNotRun,
+            "the page has registered no elements yet (not hydrated, or not instrumented), \
+             so there was nothing to assess",
+            provenance(ObservationCoverage::default()).with_observed_at(observed_at),
+        );
+    }
+
+    let visible: Vec<&serde_json::Value> = elements
+        .iter()
+        .filter(|el| element_is_visible(el))
+        .collect();
+    let considered = visible.len() as u64;
+    let measured = visible
+        .iter()
+        .filter(|el| {
+            el.get("state")
+                .and_then(|s| s.get("normalizedRect"))
+                .is_some()
+        })
+        .count() as u64;
+    let missing = considered - measured;
+    let coverage = ObservationCoverage {
+        considered,
+        measured,
+        unmeasured: if missing > 0 {
+            vec![UnmeasuredDimension::new(
+                "geometry",
+                missing,
+                UnknownCode::InputMissing,
+            )]
+        } else {
+            Vec::new()
+        },
+    };
+    if considered > 0 && measured == 0 {
+        // Every visible element lacks geometry: the grid has nothing to place,
+        // so a spatial-coverage verdict would be a statement about missing
+        // DATA, not about the page.
+        return Observation::unknown(
+            UnknownCode::InputMissing,
+            format!(
+                "{considered} visible element(s) and none carries a normalizedRect, so the \
+                 layout could not be measured"
+            ),
+            provenance(coverage).with_observed_at(observed_at),
+        );
+    }
+    Observation::measured(
+        page_health_report(elements),
+        provenance(coverage).with_observed_at(observed_at),
+    )
+}
+
+/// Analyse the current page by running discover internally and answering an
+/// [`Observation<PageHealthValue>`] with spatial coverage, layout regions,
+/// element diversity, text signal scanning, interactive readiness, visual
+/// anomalies and an ASCII heatmap.
+///
+/// Always HTTP 200: a failed discover or an unusable reply is an `unknown`
+/// answer with a typed code (see [`page_health_observation`]), not a 500.
+pub async fn ui_bridge_page_health_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<PageHealthRequest>>,
+) -> Json<ApiResponse<Observation<PageHealthValue>>> {
+    info!("UI Bridge API: Page health analysis");
+    let _body = body.map(|b| b.0).unwrap_or_default();
+
+    let discover =
+        ui_bridge_request_sync(&state, "discover", discover_all_elements_payload()).await;
+    let observed_at = chrono::Utc::now();
+    if let Err(e) = &discover {
+        error!("UI Bridge API: page-health discover failed: {}", e);
+    }
+    Json(ApiResponse::success(page_health_observation(
+        discover,
+        observed_at,
+        chrono::Utc::now(),
+    )))
 }
 
 // ============================================================================
@@ -2258,5 +2410,233 @@ mod sweep_discover_tests {
     fn states_both_filters(text: &str) -> bool {
         let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         dense.contains("\"includeHidden\":true") && dense.contains("\"interactiveOnly\":false")
+    }
+}
+
+#[cfg(test)]
+mod page_health_observation_tests {
+    //! Plan 2026-09-20-ui-bridge-observations-distinguish-cannot-see-from-not-present-and-carry-provenance,
+    //! Phase 2 acceptance 5: "could not see the page" never renders as "the
+    //! page is broken", and elements the grid cannot place are counted.
+
+    use super::*;
+
+    fn at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .expect("fixed time")
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn wire(obs: Observation<PageHealthValue>) -> (serde_json::Value, String) {
+        let v = serde_json::to_value(ApiResponse::success(obs)).expect("serialize");
+        let text = serde_json::to_string(&v).expect("stringify");
+        (v, text)
+    }
+
+    fn element(visible: bool, rect: bool) -> serde_json::Value {
+        let mut state = serde_json::json!({ "visible": visible, "textContent": "Row" });
+        if rect {
+            state["normalizedRect"] =
+                serde_json::json!({"x": 0.3, "y": 0.2, "width": 0.5, "height": 0.1});
+        }
+        serde_json::json!({ "type": "text", "category": "content", "state": state })
+    }
+
+    /// A discover reply with no `elements` key is "no element was seen", not
+    /// "a blank page": before this it became 0% coverage and a CRITICAL
+    /// finding. Fails on the pre-change twin, whose reply had no `status` and
+    /// carried a `summary` computed over zero elements.
+    #[test]
+    fn missing_elements_key_is_unknown_input_missing_and_never_a_verdict() {
+        let (v, text) = wire(page_health_observation(
+            Ok(serde_json::json!({})),
+            at(),
+            at(),
+        ));
+        let data = &v["data"];
+        assert_eq!(data["status"], "unknown");
+        assert_eq!(data["unknown"]["code"], "input_missing");
+        assert!(
+            data.get("value").is_none(),
+            "an unknown carries no report: {v}"
+        );
+        assert!(
+            !text.contains("unhealthy") && !text.contains("CRITICAL"),
+            "no verdict may be rendered over elements that were never seen: {text}"
+        );
+        assert_eq!(
+            data["provenance"]["producer"]["id"],
+            PAGE_HEALTH_PRODUCER_ID
+        );
+        let p = data["provenance"].as_object().expect("provenance object");
+        for key in [
+            "producer",
+            "observedAt",
+            "evaluatedAt",
+            "coverage",
+            "confidence",
+            "cache",
+            "source",
+        ] {
+            assert!(
+                p.contains_key(key),
+                "provenance must always carry `{key}`: {v}"
+            );
+        }
+        assert!(data["provenance"]["confidence"].is_null());
+        assert!(data["provenance"]["cache"].is_null());
+        assert!(
+            data["provenance"]["observedAt"].is_null(),
+            "no element list means no sample was taken"
+        );
+    }
+
+    /// Visible elements exist but none carries geometry: `input_missing`, not
+    /// a CRITICAL empty page; the coverage names all of them as unmeasured.
+    #[test]
+    fn visible_elements_with_no_geometry_at_all_are_unknown_input_missing() {
+        let elements = vec![
+            element(true, false),
+            element(true, false),
+            element(true, false),
+        ];
+        let (v, text) = wire(page_health_observation(
+            Ok(serde_json::json!({ "elements": elements })),
+            at(),
+            at(),
+        ));
+        assert_eq!(v["data"]["status"], "unknown");
+        assert_eq!(v["data"]["unknown"]["code"], "input_missing");
+        assert!(!text.contains("CRITICAL") && !text.contains("unhealthy"));
+        let cov = &v["data"]["provenance"]["coverage"];
+        assert_eq!(cov["considered"], 3);
+        assert_eq!(cov["measured"], 0);
+        assert_eq!(cov["unmeasured"][0]["count"], 3);
+        assert_eq!(
+            v["data"]["provenance"]["observedAt"],
+            "2026-09-30T12:00:00Z"
+        );
+    }
+
+    /// Zero registered elements with the key present: nothing to look at yet,
+    /// which is `producer_not_run`, not a critical page.
+    #[test]
+    fn empty_registry_is_producer_not_run() {
+        let (v, text) = wire(page_health_observation(
+            Ok(serde_json::json!({ "elements": [] })),
+            at(),
+            at(),
+        ));
+        assert_eq!(v["data"]["status"], "unknown");
+        assert_eq!(v["data"]["unknown"]["code"], "producer_not_run");
+        assert!(!text.contains("unhealthy") && !text.contains("CRITICAL"));
+    }
+
+    /// A failed discover IPC is an answer (HTTP 200) with a typed code, not a
+    /// 500 carrying prose.
+    #[test]
+    fn discover_failure_is_unknown_producer_failed_with_no_sample_time() {
+        let (v, _) = wire(page_health_observation(
+            Err("bridge timed out".to_string()),
+            at(),
+            at(),
+        ));
+        assert_eq!(v["success"], true);
+        assert_eq!(v["data"]["status"], "unknown");
+        assert_eq!(v["data"]["unknown"]["code"], "producer_failed");
+        assert!(v["data"]["unknown"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("bridge timed out")));
+        assert!(
+            v["data"]["provenance"]["observedAt"].is_null(),
+            "no discover reply arrived, so no sample was taken"
+        );
+    }
+
+    /// 5 visible elements, 3 without a `normalizedRect`: the three are
+    /// counted as unmeasured geometry rather than read as empty viewport.
+    #[test]
+    fn visible_elements_without_geometry_are_counted_as_unmeasured() {
+        let elements = vec![
+            element(true, true),
+            element(true, true),
+            element(true, false),
+            element(true, false),
+            element(true, false),
+            element(false, false),
+        ];
+        let (v, _) = wire(page_health_observation(
+            Ok(serde_json::json!({ "elements": elements })),
+            at(),
+            at(),
+        ));
+        let data = &v["data"];
+        assert_eq!(data["status"], "measured");
+        let cov = &data["provenance"]["coverage"];
+        assert_eq!(cov["considered"], 5);
+        assert_eq!(cov["measured"], 2);
+        assert_eq!(cov["unmeasured"][0]["dimension"], "geometry");
+        assert_eq!(cov["unmeasured"][0]["count"], 3);
+        assert_eq!(cov["unmeasured"][0]["code"], "input_missing");
+        assert_eq!(
+            cov["measured"].as_u64().unwrap() + cov["unmeasured"][0]["count"].as_u64().unwrap(),
+            cov["considered"].as_u64().unwrap(),
+            "measured + unmeasured must equal considered"
+        );
+        assert_eq!(data["value"]["element_count"], 6);
+        assert_eq!(data["value"]["visible_count"], 2);
+        assert_eq!(data["provenance"]["observedAt"], "2026-09-30T12:00:00Z");
+    }
+
+    /// Anti-narrowing pin for the page-health value: an exhaustive
+    /// destructure (a field added breaks the build) plus the exact wire key
+    /// set (a field dropped or renamed breaks the test).
+    #[test]
+    fn page_health_value_reaches_the_wire_field_for_field() {
+        let obs = page_health_observation(
+            Ok(serde_json::json!({ "elements": [element(true, true)] })),
+            at(),
+            at(),
+        );
+        let value = obs.value().expect("measured").clone();
+        let PageHealthValue {
+            summary: _,
+            findings: _,
+            heatmap: _,
+            element_count: _,
+            visible_count: _,
+        } = &value;
+        let PageHealthFinding {
+            check: _,
+            severity: _,
+            detail: _,
+            data: _,
+        } = &value.findings[0];
+        let v = serde_json::to_value(&obs).expect("serialize");
+        let keys: std::collections::BTreeSet<&str> = v["value"]
+            .as_object()
+            .expect("value object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "element_count",
+                "findings",
+                "heatmap",
+                "summary",
+                "visible_count"
+            ]
+            .into_iter()
+            .collect()
+        );
+        let top: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("envelope object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(top, ["provenance", "status", "value"].into_iter().collect());
     }
 }
