@@ -4573,14 +4573,17 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// defense-in-depth, not the sole authority.
 ///
 /// DELIBERATELY EXCLUDED (add only with a security rationale): the onboarding
-/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`),
-/// privilege escalation (`coord_attest_escalate_override`), merge authority
-/// (`coord_request_merge`, `coord_cancel_merge`, `coord_pr_merge_verdict`,
-/// `coord_pr_merge_profile`), code publication (`coord_create_pr`,
-/// `coord_push_to_branch` — sessions open PRs via the dedicated
-/// `/vcs/pull-requests` loopback route, not this proxy), reservations
-/// (`coord_migration_reserve`, `coord_reserve_resource`), and policy/state
-/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
+/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`,
+/// `coord_enroll_repo`), privilege escalation (`coord_attest_escalate_override`,
+/// `coord_attest_advisory_ci_override`), merge authority (`coord_request_merge`,
+/// `coord_cancel_merge`, `coord_pr_merge_verdict`, `coord_pr_merge_profile`,
+/// `coord_set_pr_draft`), code publication (`coord_create_pr`,
+/// `coord_push_to_branch`, `coord_push_credential` — sessions open PRs via the
+/// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
+/// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
+/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
+/// and per-agent grants this device-only door never carries (`coord_fleet_drain`,
+/// `coord_fleet_undrain`, `coord_fleet_drain_host`, `coord_fleet_undrain_host`).
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -4935,6 +4938,32 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   same shape as `coord_post_finding`: it records what an overlord did, and
 ///   performs nothing.
 ///
+/// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
+/// reported eleven names that coord ADVERTISED to this door's principal, which
+/// this list neither allowed nor named as deliberate. Each was classified; the
+/// design-fork record is coord finding `73b15a9b` (which revises `e652d447`).
+/// None of the eleven is on coord's device floor at coord `origin/main`
+/// `1e720228b802`, so which coord build and principal advertised them is
+/// unestablished. That is why forwarding
+/// is limited to names whose call is harmless if coord refuses it, and safe if
+/// coord grants it. Three are IN:
+///
+/// * `coord_check_repo_name`: an availability probe.
+/// * `coord_create_repo`: creates an EMPTY repository under an owner bound to
+///   the caller's tenant. It publishes no code (its sibling
+///   `coord_push_credential` is excluded), but a repository it creates can be
+///   PUBLIC (`private: false`), which is visible outside the tenant. That side
+///   effect is accepted: the call is owner-bound and rate-limited per caller,
+///   and the repository is empty.
+/// * `coord_pin_worktree`: sets a worktree's retention. Pinning keeps reclaim
+///   off it. Unpinning (`retention: auto`) applies to any `agent_id` in the
+///   tenant and hands the worktree back to reclaim. Reclaim's own dirtiness
+///   guard still refuses to remove a tree with uncommitted work, so nothing is
+///   deleted by this call itself.
+///
+/// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
+/// reason in that list's note.
+///
 /// Forwarding a name coord does not yet serve is harmless — coord answers it as
 /// an unknown tool — so these entries may land ahead of the coord side.
 ///
@@ -4972,12 +5001,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_check_gate_predicate",
     "coord_check_install_safety",
     "coord_check_publish_safety",
+    "coord_check_repo_name",
     "coord_citations_reenrich",
     "coord_claim_acquire",
     "coord_claim_check",
     "coord_claim_heartbeat",
     "coord_claim_release",
     "coord_conflict_check",
+    "coord_create_repo",
     "coord_declare_intent",
     // The direct supersession-declaration door (qontinui-coord, operator
     // directive 2026-10-03, served policy `git-operations`
@@ -5042,6 +5073,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_overlord_interventions",
     "coord_overlord_record",
     "coord_pending_agent_questions",
+    "coord_pin_worktree",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
     // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
@@ -5166,19 +5198,63 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 /// "stale_binary"`, which is the refusal saying the same thing.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
+///
+/// Eight of them were added on the classification of finding `31a69d12` (record:
+/// coord finding `73b15a9b`, revising `e652d447`). None of them was forwarded
+/// before, so listing it here takes nothing away. Four join an existing family
+/// in the note above, and the fleet-drain writes start a new one (per-agent
+/// grants):
+///
+/// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
+///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`).
+///   This door only ever attaches a DEVICE token: agent-spawn sessions carry
+///   their own JWT and never route here. So no agent holding the grant ever
+///   reaches it through this proxy. Forwarding could only matter if coord
+///   advertised them to a device, and in that case it would hand a fleet-wide
+///   capacity lever to every session on the box. That is exactly what the
+///   decision withholds from an ordinary implementation agent.
+/// * `coord_push_credential`: code publication. It mints a `contents:write`
+///   token for ANY repository under a tenant-bound owner, including existing
+///   ones, which is a raw push that bypasses the PR path. That is a stronger
+///   form of what `coord_push_to_branch` is excluded for. Its HTTP twin admits
+///   a device, so whether devices should hold it at all is coord's decision to
+///   make in one place; this door does not pre-empt it.
+/// * `coord_enroll_repo`: the onboarding / enrollment family the allowlist note
+///   excludes. The `coord_onboard` prefix does not catch its name, so it is
+///   listed explicitly. Its HTTP twin is on coord's device/agent router, so a
+///   session that created a repository can still enroll it over HTTP.
+/// * `coord_attest_advisory_ci_override`: one of coord's four
+///   `require_strategy_admin` tools. No device or agent token carries
+///   `strategy_admin` today. That is a mint convention, not a structural
+///   guarantee, so this exclusion keeps the override in the operator family. Its
+///   twin `coord_attest_escalate_override` is excluded as privilege escalation
+///   (and is also `require_strategy_admin`).
+/// * `coord_set_pr_draft`: merge authority. A PR's draft state is the
+///   operator's release lever under the served `security-surface-implement-tier`
+///   setting `draft-required` ("the operator undrafts to release it to the
+///   train").
 const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
+    "coord_attest_advisory_ci_override",
     "coord_attest_escalate_override",
     "coord_cancel_merge",
     "coord_create_pr",
+    "coord_enroll_repo",
     "coord_flag_state",
     "coord_flag_states",
+    "coord_fleet_drain",
+    "coord_fleet_drain_host",
+    "coord_fleet_undrain",
+    "coord_fleet_undrain_host",
     "coord_migration_reserve",
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
+    "coord_push_credential",
     "coord_push_to_branch",
     "coord_request_merge",
     "coord_request_policy",
     "coord_reserve_resource",
+    "coord_set_pr_draft",
 ];
 
 /// Deliberately-excluded FAMILIES by prefix. `coord_onboard` is deliberately
@@ -17255,6 +17331,41 @@ mod coord_mcp_body_gate_tests {
                  whose predicate verifies, so the verb has nothing to do. coord's \
                  `approve_has_no_agent_tool_at_all` is the authority on its absence; this \
                  only pins that THIS door would not carry it."
+            );
+        }
+    }
+
+    /// Finding `31a69d12`: the eleven names coord advertised that this door had
+    /// left unclassified. A literal enumeration of the decision recorded in
+    /// coord finding `73b15a9b`. Moving any name between the two lists reds
+    /// this test by name, so the decision cannot change by drift.
+    #[test]
+    fn finding_31a69d12_drift_is_classified() {
+        for tool in [
+            "coord_check_repo_name",
+            "coord_create_repo",
+            "coord_pin_worktree",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not also read as a deliberate withholding"
+            );
+        }
+        for tool in [
+            "coord_fleet_drain",
+            "coord_fleet_undrain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain_host",
+            "coord_push_credential",
+            "coord_enroll_repo",
+            "coord_attest_advisory_ci_override",
+            "coord_set_pr_draft",
+        ] {
+            assert!(!coord_mcp_tool_is_allowed(tool), "{tool} must stay withheld");
+            assert!(
+                coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must be recorded as a deliberate exclusion, not drift"
             );
         }
     }
