@@ -1910,6 +1910,13 @@ fn model_confidence(c: f64) -> f64 {
 /// belowConfidence`, and a non-zero `belowConfidence` is named as unmeasured
 /// `text` — so `absent` is never claimed over text the model saw and was not
 /// sure of.
+///
+/// A reply of ZERO blocks is the one exception. The model did read the
+/// region — the call succeeded and answered "no text" — so the item it
+/// considered is that one region, read in full: `{considered: 1, measured: 1,
+/// unmeasured: []}`. Counting zero blocks as `considered: 0` would describe a
+/// producer that looked at nothing, which the canon refuses for `absent`
+/// (`AbsentOverNothingConsidered`) because it is what `unknown` is for.
 fn judge_extraction(
     result: Result<vision_ai::OcrExtraction, vision_ai::AiError>,
     model: &str,
@@ -1938,18 +1945,24 @@ fn judge_extraction(
 
     let below = x.dropped.below_confidence;
     let kept = x.blocks.len() as u64;
-    let coverage = ObservationCoverage {
-        considered: x.raw_count,
-        measured: x.raw_count.saturating_sub(below),
-        unmeasured: if below > 0 {
-            vec![UnmeasuredDimension::new(
-                "text",
-                below,
-                UnknownCode::BelowConfidenceFloor,
-            )]
-        } else {
-            Vec::new()
-        },
+    let coverage = if x.raw_count == 0 {
+        // No candidate blocks: the one region the model read is the item
+        // considered, and it was read in full (see the doc above).
+        ObservationCoverage::full(1)
+    } else {
+        ObservationCoverage {
+            considered: x.raw_count,
+            measured: x.raw_count.saturating_sub(below),
+            unmeasured: if below > 0 {
+                vec![UnmeasuredDimension::new(
+                    "text",
+                    below,
+                    UnknownCode::BelowConfidenceFloor,
+                )]
+            } else {
+                Vec::new()
+            },
+        }
     };
 
     if kept == 0 && below > 0 {
@@ -4813,7 +4826,8 @@ mod observation_tests {
         assert!(absent.get("unknown").is_none());
         assert_eq!(
             absent["provenance"]["coverage"],
-            serde_json::json!({"considered": 0, "measured": 0, "unmeasured": []})
+            serde_json::json!({"considered": 1, "measured": 1, "unmeasured": []}),
+            "zero blocks = the one region was read in full, not nothing considered"
         );
 
         let low = stub_model(
@@ -4860,6 +4874,43 @@ mod observation_tests {
         assert_eq!(lowered["status"], "measured");
         assert_eq!(lowered["value"]["dropped"]["belowConfidence"], 0);
         assert_eq!(lowered["value"]["blocks"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// A zero-block OCR reply is a VALID `absent`: the canon refuses `absent`
+    /// over `considered: 0` (`AbsentOverNothingConsidered`), so the region the
+    /// model read must be the item considered. Pinned both ways: the judged
+    /// observation is `absent` (not the `unknown{producer_failed}` that
+    /// `Observation::absent`'s refusal would degrade to), and its wire parses
+    /// back through the canon, which re-runs the absent checks.
+    #[test]
+    fn zero_block_extract_is_a_valid_absent_over_one_considered_region() {
+        let at = chrono::Utc::now();
+        let obs = judge_extraction(
+            Ok(vision_ai::OcrExtraction {
+                raw_count: 0,
+                blocks: Vec::new(),
+                aggregate_text: String::new(),
+                dropped: vision_ai::DroppedBlocks::default(),
+            }),
+            "stub-model",
+            0.5,
+            at,
+            Map::new(),
+            at,
+        );
+        assert_eq!(obs.status(), ObservationStatus::Absent, "{obs:?}");
+        let coverage = &obs.provenance().coverage;
+        assert!(coverage.considered >= 1, "absent needs considered >= 1: {coverage:?}");
+        assert_eq!(coverage.considered, 1);
+        assert_eq!(coverage.measured, 1);
+        assert!(coverage.unmeasured.is_empty());
+
+        let wire = serde_json::to_value(&obs).expect("serialize");
+        let back: Observation<ExtractValue> =
+            serde_json::from_value(wire.clone()).unwrap_or_else(|e| {
+                panic!("the canon refused the zero-block absent: {e}; wire = {wire}")
+            });
+        assert_eq!(back.status(), ObservationStatus::Absent);
     }
 
     /// Acceptance 3. A reply that is not the JSON the model was asked for is
