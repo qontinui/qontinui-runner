@@ -92,6 +92,7 @@ pub use qontinui_runner_lib::tenant_pin;
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;
+pub mod usage_totals; // Per-session, per-model token usage off live Claude Code transcripts -> `usage_totals` outbox rows (plan 2026-10-09-kpi-telemetry-and-dashboards, Phase 1)
 pub mod wind_down_executor; // The wind-down TICK — the only place a drain closes a session (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4)
 pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)
 pub mod workspace_tenant; // The workspace's own tenant declaration — tiers 1-3 of coord_mcp's authority order (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin, D1/Phase 1)
@@ -404,6 +405,27 @@ pub enum SessionEventKind {
     /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
     #[serde(rename = "operator_touch")]
     OperatorTouch,
+    /// CUMULATIVE token usage of one Claude Code session, per model (plan
+    /// `2026-10-09-kpi-telemetry-and-dashboards`, Phase 1). Producer:
+    /// [`session_transcript_tailer::SessionTranscriptTailer`], from the totals
+    /// [`usage_totals::UsageLedger`] keeps off the live transcript.
+    ///
+    /// Drained to `POST /coord/sessions/{claude_code_session_id}/usage` with
+    /// body `{models:[…]}` — an idempotent upsert of cumulative totals per
+    /// `(session, model)`. The PATH key is the Claude Code session id the
+    /// payload carries, NOT the outbox lane (the coord `sessions.id`).
+    ///
+    /// Its own delivery posture in `coord_sync`: an older row of a session is
+    /// SUPERSEDED (ACKed unsent) by a newer pending one, since the newer
+    /// carries everything the older did; a transient failure (a 503 while
+    /// coord's table is not migrated, a 5xx, a timeout, a 429) neither blocks
+    /// the session's chain nor drops the row — it is retried on its own
+    /// backoff; a 4xx is ACK-dropped, because the next row re-sends the
+    /// totals anyway.
+    ///
+    /// ⚠️ Like [`Self::OperatorTouch`], this kind HAS a `push_record` arm;
+    /// never remove one without the other.
+    UsageTotals,
 }
 
 impl SessionEventKind {
@@ -428,6 +450,7 @@ impl SessionEventKind {
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
+            SessionEventKind::UsageTotals => "usage_totals",
         }
     }
 }

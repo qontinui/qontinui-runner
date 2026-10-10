@@ -4066,6 +4066,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 );
                 session_transcript_tailer.start_coverage_reporter();
+                // Token usage per session x model (plan
+                // `2026-10-09-kpi-telemetry-and-dashboards` Phase 1): a
+                // periodic `usage_totals` flush, plus a final one queued from
+                // the registrar's close path ahead of the `Closed` row.
+                session_transcript_tailer.start_usage_flusher();
+                session_transcript_tailer.attach_usage_close_hook();
                 app.manage(session_transcript_tailer);
 
                 // R2 (session-lifecycle-cleanup) — pane → coord-session-id

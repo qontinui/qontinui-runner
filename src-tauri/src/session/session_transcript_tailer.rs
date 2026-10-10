@@ -154,6 +154,9 @@ use uuid::Uuid;
 use crate::claude_session::coord_register::{AiCoordRegistrar, TranscriptBindRefusal};
 
 use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
+use super::usage_totals::{
+    usage_totals_payload, UsageLedger, USAGE_FLUSH_INTERVAL, USAGE_IDLE_EVICT,
+};
 
 /// Upper bound on one replay emit. Each emit is one outbox append + fsync and
 /// one offset reservation, so a multi-megabyte prefix is replayed as a handful
@@ -202,6 +205,32 @@ pub struct SessionTranscriptTailer {
     identities: Mutex<HashMap<PathBuf, String>>,
     /// [`PREFIX_REPLAY_CAP_BYTES`]; a field so tests can shrink it.
     prefix_cap: u64,
+    /// Per-session, per-model token usage read off the same batches — plan
+    /// `2026-10-09-kpi-telemetry-and-dashboards` Phase 1. Independent of the
+    /// transcript emit (its own cursors, its own backfill read): usage is
+    /// counted for every tailed session, bound or not, and only SHIPPED for a
+    /// bound one. See [`Self::flush_usage_once`].
+    usage: UsageLedger,
+    /// Serialises every `usage_totals` write (periodic flush and close), so
+    /// the outbox order of a session's rows is the order their snapshots were
+    /// taken. Totals only grow, so the newest row (the one the drain keeps
+    /// when it supersedes by seq) always carries the largest totals — a
+    /// periodic row snapshotted before a close can never land after it.
+    usage_emit: Mutex<()>,
+}
+
+/// What one [`SessionTranscriptTailer::flush_usage_once`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct UsageFlush {
+    /// `usage_totals` rows queued.
+    pub queued: usize,
+    /// Changed sessions with no coord binding — UNCOVERED, not zero-cost. They
+    /// stay pending and ship once a binding appears.
+    pub uncovered: usize,
+    /// Outbox writes that failed; retried next pass.
+    pub failed: usize,
+    /// Idle sessions dropped from memory.
+    pub evicted: usize,
 }
 
 /// [`SessionTranscriptTailer::admit`]'s verdict on one batch.
@@ -604,7 +633,169 @@ impl SessionTranscriptTailer {
             marks,
             identities: Mutex::new(HashMap::new()),
             prefix_cap: PREFIX_REPLAY_CAP_BYTES,
+            usage: UsageLedger::new(),
+            usage_emit: Mutex::new(()),
         }
+    }
+
+    /// Fold one watcher batch into the usage ledger, reading any history of
+    /// the file this process has not counted yet. Synchronous file I/O —
+    /// see [`UsageLedger::observe`]; the watcher tries
+    /// [`Self::try_observe_usage`] first.
+    pub fn observe_usage(&self, session_key: &str, path: &Path, file_start: u64, appended: &str) {
+        self.usage.observe(session_key, path, file_start, appended);
+    }
+
+    /// Non-blocking [`Self::observe_usage`]: `false` = a file read is needed
+    /// and nothing was done; run [`Self::observe_usage`] on a blocking thread.
+    pub fn try_observe_usage(
+        &self,
+        session_key: &str,
+        path: &Path,
+        file_start: u64,
+        appended: &str,
+    ) -> bool {
+        self.usage
+            .try_observe(session_key, path, file_start, appended)
+    }
+
+    /// Queue a `usage_totals` row for every BOUND session whose totals changed
+    /// since its last row, then forget sessions idle past [`USAGE_IDLE_EVICT`].
+    ///
+    /// Gate 1 (`Settings.cloud_sync_enabled`) is honoured as for transcript
+    /// bytes: with consent off nothing is queued and the totals stay pending
+    /// (they are cumulative, so the first row after consent returns carries
+    /// everything). An unbound session produces no row — it is the KPI
+    /// layer's "uncovered", never a $0 session — and no binding is invented.
+    pub fn flush_usage_once(&self, cloud_sync_enabled: bool) -> UsageFlush {
+        let mut out = UsageFlush::default();
+        // Rows coord answered 404 for (it did not know the session yet) are
+        // owed again, on the ledger's capped backoff.
+        let now = std::time::Instant::now();
+        for csid in super::coord_sync::take_usage_resend_requests() {
+            self.usage.request_resend(&csid, now);
+        }
+        let _emit = self
+            .usage_emit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cloud_sync_enabled {
+            for d in self.usage.dirty() {
+                if Uuid::parse_str(&d.claude_session_id).is_err() {
+                    // coord keys usage on the Claude Code session UUID and
+                    // answers 400 `invalid_session_id` to anything else; a
+                    // non-UUID transcript stem can never be addressed.
+                    self.usage.mark_emitted(&d.claude_session_id, d.version);
+                    continue;
+                }
+                let payload = usage_totals_payload(&d.claude_session_id, &d.models);
+                match self
+                    .registrar
+                    .record_usage_totals(&d.claude_session_id, payload)
+                {
+                    Ok(Some(_)) => {
+                        self.usage.mark_emitted(&d.claude_session_id, d.version);
+                        out.queued += 1;
+                    }
+                    Ok(None) => out.uncovered += 1,
+                    Err(e) => {
+                        out.failed += 1;
+                        tracing::warn!(
+                            session = %d.claude_session_id,
+                            error = %e,
+                            "session_transcript_tailer: usage_totals outbox write failed — retried next pass"
+                        );
+                    }
+                }
+            }
+        }
+        out.evicted = self
+            .usage
+            .evict_idle(std::time::Instant::now(), USAGE_IDLE_EVICT);
+        out
+    }
+
+    /// The close hook: queue `session_key`'s final totals (whether or not they
+    /// changed since the last row — a close is the last chance) and forget it.
+    /// Runs from [`AiCoordRegistrar::close_session`] while the binding still
+    /// resolves, so the row is QUEUED ahead of the session's `Closed` row (a
+    /// lower outbox seq). Delivery order is the drain's: a `usage_totals` row
+    /// on its transient-failure backoff can reach coord after the `Closed`
+    /// row, which is harmless to an upsert of cumulative totals.
+    pub fn flush_usage_on_close(&self, session_key: &str, cloud_sync_enabled: bool) {
+        let _emit = self
+            .usage_emit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cloud_sync_enabled {
+            if let Some(d) = self.usage.snapshot(session_key) {
+                let payload = usage_totals_payload(&d.claude_session_id, &d.models);
+                if let Err(e) = self.registrar.record_usage_totals(session_key, payload) {
+                    tracing::warn!(
+                        session = %session_key,
+                        error = %e,
+                        "session_transcript_tailer: final usage_totals outbox write failed at \
+                         close — this session's last totals are lost"
+                    );
+                }
+            }
+        }
+        self.usage.remove(session_key);
+    }
+
+    /// Wire [`Self::flush_usage_on_close`] into the registrar's close path.
+    /// Holds the tailer weakly: the registrar outlives nothing it should keep
+    /// alive.
+    pub fn attach_usage_close_hook(self: &Arc<Self>) {
+        self.attach_usage_close_hook_gated(crate::settings::get_cloud_sync_enabled);
+    }
+
+    /// [`Self::attach_usage_close_hook`] with Gate 1 supplied, so tests never
+    /// read the machine's real `settings.json`.
+    pub(crate) fn attach_usage_close_hook_gated(self: &Arc<Self>, gate: fn() -> bool) {
+        let weak = Arc::downgrade(self);
+        self.registrar.attach_close_observer(move |session_key| {
+            if let Some(t) = weak.upgrade() {
+                t.flush_usage_on_close(session_key, gate());
+            }
+        });
+    }
+
+    /// Spawn the periodic usage flush. One task for the process lifetime.
+    pub fn start_usage_flusher(self: &Arc<Self>) {
+        let tailer = self.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(USAGE_FLUSH_INTERVAL).await;
+                // Outbox fsyncs and the settings read are blocking I/O — off
+                // the async runtime.
+                let t = tailer.clone();
+                let f = match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                    move || t.flush_usage_once(crate::settings::get_cloud_sync_enabled()),
+                )
+                .await
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "session_transcript_tailer: usage flush failed to run — retried next \
+                             interval"
+                        );
+                        continue;
+                    }
+                };
+                if f.queued + f.failed + f.evicted > 0 {
+                    tracing::debug!(
+                        queued = f.queued,
+                        uncovered = f.uncovered,
+                        failed = f.failed,
+                        evicted = f.evicted,
+                        "session_transcript_tailer: usage flush"
+                    );
+                }
+            }
+        });
     }
 
     /// Feed one batch of newly-appended transcript bytes for `session_key`
@@ -648,6 +839,7 @@ impl SessionTranscriptTailer {
         truncated: bool,
         cloud_sync_enabled: bool,
     ) {
+        self.observe_usage(session_key, path, file_start, appended);
         match self.admit(session_key, appended.len(), cloud_sync_enabled) {
             Admit::Emit => self.emit_batch(session_key, path, file_start, appended, truncated),
             Admit::Withheld => {
@@ -2577,6 +2769,190 @@ mod tests {
         assert!(
             t.report_coverage_once(),
             "a count moving between counters must be reported"
+        );
+    }
+
+    // ── Plan 2026-10-09-kpi-telemetry-and-dashboards Phase 1: usage_totals ──
+
+    fn usage_line(id: &str, model: &str, out: i64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-09T10:00:00Z",
+            "message": {"id": id, "model": model, "usage": {
+                "input_tokens": 1, "output_tokens": out,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn usage_rows(outbox: &OutboxWriter) -> Vec<crate::session::local_store::OutboxRecord> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::UsageTotals.as_str())
+            .collect()
+    }
+
+    /// A bound session's totals become ONE `usage_totals` row on its coord
+    /// lane, keyed on the Claude Code session id; an unbound session produces
+    /// no row (uncovered, not $0) until it binds; an unchanged session is not
+    /// re-sent; Gate 1 off queues nothing.
+    #[test]
+    fn usage_flush_ships_bound_sessions_only_and_only_on_change() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let path = jsonl(dir.path(), &csid, "");
+        let batch =
+            usage_line("m1", "claude-opus-5-5", 10) + &usage_line("m1", "claude-opus-5-5", 30);
+        append(&path, &batch);
+        t.on_appended_gated(&csid, &path, 0, &batch, false, false);
+
+        let f = t.flush_usage_once(true);
+        assert_eq!(
+            (f.queued, f.uncovered),
+            (0, 1),
+            "unbound = uncovered, no row"
+        );
+        assert!(usage_rows(&outbox).is_empty());
+
+        let coord_id = sniff_register(&registrar, &csid);
+        assert_eq!(
+            t.flush_usage_once(false).queued,
+            0,
+            "Gate 1 off queues nothing"
+        );
+        assert_eq!(t.flush_usage_once(true).queued, 1);
+        let rows = usage_rows(&outbox);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].session_id, coord_id,
+            "the lane is the coord session"
+        );
+        assert_eq!(
+            rows[0].payload["claude_code_session_id"],
+            serde_json::json!(csid)
+        );
+        let m = &rows[0].payload["models"][0];
+        assert_eq!(
+            m["output_tokens"],
+            serde_json::json!(30),
+            "deduped at the max"
+        );
+        assert_eq!(m["turn_count"], serde_json::json!(1));
+        assert!(
+            m["cost_usd"].is_null(),
+            "an unpriced model's cost is null, never 0"
+        );
+
+        assert_eq!(t.flush_usage_once(true).queued, 0, "unchanged: not re-sent");
+        let more = usage_line("m2", "claude-opus-5-5", 5);
+        append(&path, &more);
+        t.on_appended_gated(&csid, &path, batch.len() as u64, &more, false, true);
+        assert_eq!(t.flush_usage_once(true).queued, 1);
+        assert_eq!(usage_rows(&outbox).len(), 2);
+    }
+
+    /// Closing the session queues its final totals AHEAD of the `Closed` row,
+    /// through the binding the close then evicts.
+    #[test]
+    fn usage_close_hook_queues_final_totals_before_the_closed_row() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        t.attach_usage_close_hook_gated(|| true);
+        let csid = Uuid::new_v4().to_string();
+        let coord_id = sniff_register(&registrar, &csid);
+        let path = jsonl(dir.path(), &csid, "");
+        let batch = usage_line("m1", "claude-opus-5-5", 3);
+        append(&path, &batch);
+        t.on_appended_gated(&csid, &path, 0, &batch, false, false);
+        assert_eq!(t.flush_usage_once(true).queued, 1);
+
+        // The totals are clean (already shipped); the close re-sends them
+        // anyway, through the observer the registrar runs before evicting.
+        registrar.close_session(&csid);
+
+        let kinds: Vec<String> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == coord_id)
+            .map(|r| r.event_kind)
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "usage_totals").count(),
+            2,
+            "the flush row plus the close row: {kinds:?}"
+        );
+        let last_usage = kinds.iter().rposition(|k| k == "usage_totals").unwrap();
+        let closed = kinds.iter().position(|k| k == "closed").unwrap();
+        assert!(
+            last_usage < closed,
+            "usage rows precede the Closed row: {kinds:?}"
+        );
+        assert_eq!(t.usage.session_count(), 0, "a closed session is forgotten");
+    }
+
+    /// M3: periodic flushes racing appends and the close never put an older
+    /// snapshot after a newer one — the rows' totals never decrease with seq,
+    /// so the row the drain keeps (the newest) is always the largest.
+    #[test]
+    fn concurrent_flushes_and_close_queue_rows_in_snapshot_order() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        t.attach_usage_close_hook_gated(|| true);
+        let csid = Uuid::new_v4().to_string();
+        let coord_id = sniff_register(&registrar, &csid);
+        let path = jsonl(dir.path(), &csid, "");
+
+        let writer = {
+            let t = t.clone();
+            let path = path.clone();
+            let csid = csid.clone();
+            std::thread::spawn(move || {
+                let mut at = 0u64;
+                for i in 0..200 {
+                    let l = usage_line(&format!("m{i}"), "claude-opus-5-5", 1);
+                    append(&path, &l);
+                    t.observe_usage(&csid, &path, at, &l);
+                    at += l.len() as u64;
+                }
+            })
+        };
+        let flushers: Vec<_> = (0..3)
+            .map(|_| {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        t.flush_usage_once(true);
+                    }
+                })
+            })
+            .collect();
+        writer.join().unwrap();
+        for f in flushers {
+            f.join().unwrap();
+        }
+        registrar.close_session(&csid);
+
+        let rows: Vec<i64> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == coord_id && r.event_kind == "usage_totals")
+            .map(|r| r.payload["models"][0]["turn_count"].as_i64().unwrap())
+            .collect();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.windows(2).all(|w| w[0] <= w[1]),
+            "totals must never decrease with seq: {rows:?}"
+        );
+        assert_eq!(
+            *rows.last().unwrap(),
+            200,
+            "the close row carries the final totals"
         );
     }
 }

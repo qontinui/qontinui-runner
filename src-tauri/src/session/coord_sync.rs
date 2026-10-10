@@ -67,6 +67,14 @@
 //!   bootstrap — see [`gate_registration_outcome`].
 //! - `event_kind = "finding_posted"` → `POST /coord/agent-findings` with the
 //!   payload forwarded verbatim. Best-effort.
+//! - `event_kind = "usage_totals"` → `POST /coord/sessions/{claude_code_session_id}/usage`
+//!   with `{models:[…]}` ([`usage_totals_request`]) — CUMULATIVE token totals
+//!   per model (plan `2026-10-09-kpi-telemetry-and-dashboards` Phase 1). The
+//!   path key is the payload's Claude Code session id, not the outbox lane.
+//!   Its own posture ([`is_usage_totals_kind`]): superseded rows are ACKed
+//!   unsent, transient failures retry on a per-row backoff without blocking
+//!   the session's chain, and a 4xx is ACK-dropped because the next row
+//!   carries the same totals.
 //!
 //! ## Idempotency
 //!
@@ -959,6 +967,122 @@ fn append_quarantine(outbox: &OutboxWriter, rows: &[OutboxRecord]) -> std::io::R
 /// batch-breaking) and Ack-dropped once its budget is spent.
 const BEST_EFFORT_MAX_ATTEMPTS: u32 = 3;
 
+/// First retry delay of a `usage_totals` row after a transient failure;
+/// doubles per failure up to [`USAGE_TOTALS_RETRY_CAP`].
+const USAGE_TOTALS_RETRY_BASE: Duration = Duration::from_secs(15);
+
+/// Ceiling of the `usage_totals` per-row backoff. A coord answering 503
+/// because its usage table is not migrated yet is asked about once per this
+/// interval per pending row — never tight-looped, never given up on.
+const USAGE_TOTALS_RETRY_CAP: Duration = Duration::from_secs(10 * 60);
+
+/// `usage_totals` rows ACK-dropped on a 4xx — counted so the per-session
+/// warn line carries the running total.
+pub(crate) static USAGE_TOTALS_DROPPED_4XX: AtomicU64 = AtomicU64::new(0);
+
+/// Claude Code session ids a `usage_totals` drop has already been warned for:
+/// one `warn!` per session, not one per row. Capped; past the cap a drop is
+/// warned only every 1000th time, still carrying the running total.
+static USAGE_TOTALS_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+const USAGE_TOTALS_WARNED_CAP: usize = 4096;
+
+/// Whether this drop is the first for `csid` (or, past the cap, a sampled one).
+fn usage_drop_warn_due(csid: &str, dropped_total: u64) -> bool {
+    let mut g = USAGE_TOTALS_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let set = g.get_or_insert_with(HashSet::new);
+    if set.contains(csid) {
+        return false;
+    }
+    if set.len() >= USAGE_TOTALS_WARNED_CAP {
+        return dropped_total.is_multiple_of(1000);
+    }
+    set.insert(csid.to_string());
+    true
+}
+
+/// Claude Code session ids whose `usage_totals` row coord answered 404 — it
+/// does not know that session (yet: its row may still be on its way). The
+/// transcript tailer drains this on its next flush and re-sends any session it
+/// still holds, on the ledger's own capped backoff
+/// ([`crate::session::usage_totals::UsageLedger::request_resend`]). Every other
+/// 4xx is coord refusing the content and is never re-sent. Drained every flush
+/// interval.
+static USAGE_TOTALS_RESEND: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Take (and clear) the sessions whose last `usage_totals` row was dropped.
+pub(crate) fn take_usage_resend_requests() -> Vec<String> {
+    std::mem::take(
+        &mut *USAGE_TOTALS_RESEND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Record that `rec`'s session should be re-sent (its row was dropped).
+fn request_usage_resend(rec: &OutboxRecord) {
+    let Some(csid) = rec
+        .payload
+        .get("claude_code_session_id")
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    let mut q = USAGE_TOTALS_RESEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !q.iter().any(|s| s == csid) {
+        q.push(csid.to_string());
+    }
+}
+
+/// The `usage_totals` kind (plan `2026-10-09-kpi-telemetry-and-dashboards`
+/// Phase 1), which has its OWN delivery posture rather than the lifecycle or
+/// best-effort one:
+///
+/// - **Superseded, not queued.** Its payload is the session's CUMULATIVE
+///   totals, so a newer pending row of the same session carries everything an
+///   older one does: [`drain_tick`] ACKs the older rows unsent.
+/// - **A transient failure never blocks the chain and never drops the row.**
+///   A 5xx (coord answers 503 until its usage table is migrated), a timeout or
+///   a 429 leaves the row pending on its own per-row backoff
+///   ([`usage_totals_backoff`]) while the session's other rows keep draining.
+///   Blocking the chain instead would hold transcript chunks and `closed`
+///   hostage to a table migration, and eventually quarantine the session.
+/// - **A 4xx is ACK-dropped** (404/405 quietly — a coord without the route);
+///   the next row re-sends the same totals, so nothing is lost by it.
+fn is_usage_totals_kind(kind: &str) -> bool {
+    kind == SessionEventKind::UsageTotals.as_str()
+}
+
+/// Backoff after a `usage_totals` row's `failures`-th transient failure:
+/// 15 s, 30 s, 60 s … capped at [`USAGE_TOTALS_RETRY_CAP`].
+fn usage_totals_backoff(failures: u32) -> Duration {
+    let factor = 1u32 << failures.saturating_sub(1).min(10);
+    std::cmp::min(USAGE_TOTALS_RETRY_BASE * factor, USAGE_TOTALS_RETRY_CAP)
+}
+
+/// The `usage_totals` row's request: `(claude_code_session_id, body)`, or the
+/// reason the row cannot be addressed. The path key must be a UUID (coord
+/// keys Claude Code session ids as UUIDs); the body is `{models}` only — the
+/// payload's `tenant_id` stamp selects the credential slot and never reaches
+/// coord.
+fn usage_totals_request(payload: &JsonValue) -> Result<(Uuid, JsonValue), String> {
+    let csid = payload
+        .get("claude_code_session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "usage_totals row carries no claude_code_session_id".to_string())?;
+    let csid = Uuid::parse_str(csid)
+        .map_err(|_| format!("usage_totals claude_code_session_id {csid:?} is not a uuid"))?;
+    let models = payload
+        .get("models")
+        .filter(|m| m.is_array())
+        .cloned()
+        .ok_or_else(|| "usage_totals row carries no models array".to_string())?;
+    Ok((csid, json!({ "models": models })))
+}
+
 /// Map a non-2xx coord write response onto a [`PushOutcome`], through the ONE
 /// classifier both halves of plan
 /// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline` read
@@ -1080,6 +1204,9 @@ struct ChainOutcome {
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
+    /// `usage_totals` rows that failed transiently: left pending, skipped
+    /// (never blocking the chain), and put on their own backoff by the tick.
+    usage_failed: Vec<((Uuid, i64), String)>,
 }
 
 /// Push one session's records in seq order.
@@ -1108,6 +1235,7 @@ async fn push_chain(
         had_transport_error: false,
         blocked_on: None,
         aborted: false,
+        usage_failed: Vec::new(),
     };
 
     for rec in records {
@@ -1132,6 +1260,15 @@ async fn push_chain(
             PushOutcome::Transport(e) => {
                 let (fail_kind, fail_status) = classify_push_failure(&e, false);
                 note_outbox_failure(fail_kind, fail_status);
+                // `usage_totals`: neither block the chain nor drop the row —
+                // its own backoff retries it (see `is_usage_totals_kind`). It
+                // does not trip the abort flag either: a usage-table 503 is
+                // coord declining THIS kind, not coord being down.
+                if is_usage_totals_kind(&rec.event_kind) {
+                    out.usage_failed.push(((rec.session_id, rec.seq), e));
+                    out.had_transport_error = true;
+                    continue;
+                }
                 // A best-effort kind (helper tasks + the two closeout kinds)
                 // must never break the batch (session lifecycle events queued
                 // behind it would stall indefinitely). Skip it WITHOUT acking
@@ -1244,6 +1381,16 @@ struct DrainState {
     last_ack: Option<Instant>,
     /// Ticks in which coord took at least one row. Strictly increasing.
     ack_ticks: u64,
+    /// Per-row backoff of `usage_totals` rows that failed transiently, keyed
+    /// by (session_id, seq). Pruned every tick to the rows still pending.
+    usage_retry: HashMap<(Uuid, i64), UsageRetry>,
+}
+
+/// One `usage_totals` row's retry state ([`usage_totals_backoff`]).
+#[derive(Debug, Clone, Copy)]
+struct UsageRetry {
+    failures: u32,
+    next_attempt_at: Instant,
 }
 
 /// What one drain tick did, for the loop's sleep decision.
@@ -1366,11 +1513,68 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|r| ((r.session_id, r.seq), r.recorded_at))
         .collect();
 
+    // `usage_totals`: the newest pending row of each (lane, Claude Code
+    // session) supersedes the older ones, which are ACKed unsent; a row inside
+    // its own backoff sits this tick out.
+    let pending_keys: HashSet<(Uuid, i64)> =
+        pending.iter().map(|r| (r.session_id, r.seq)).collect();
+    state.usage_retry.retain(|k, _| pending_keys.contains(k));
+    let mut newest_usage: HashMap<(Uuid, String), i64> = HashMap::new();
+    for r in pending
+        .iter()
+        .filter(|r| is_usage_totals_kind(&r.event_kind))
+    {
+        let csid = r
+            .payload
+            .get("claude_code_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let e = newest_usage.entry((r.session_id, csid)).or_insert(r.seq);
+        *e = (*e).max(r.seq);
+    }
+    let mut superseded: Vec<(Uuid, i64)> = Vec::new();
+
     // Group into per-session chains. `pending()` returns records sorted by
     // (session_id, seq), so each chain is already in seq order.
     let mut chains: Vec<Vec<OutboxRecord>> = Vec::new();
     let mut to_quarantine: Vec<OutboxRecord> = Vec::new();
     for rec in pending {
+        if is_usage_totals_kind(&rec.event_kind) {
+            let csid = rec
+                .payload
+                .get("claude_code_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let newest = newest_usage
+                .get(&(rec.session_id, csid))
+                .copied()
+                .unwrap_or(rec.seq);
+            if newest > rec.seq {
+                // The superseded row's backoff carries over to the row that
+                // replaces it, so a fresh flush row during a long 503 does
+                // not buy an immediate retry: the outage is the route's, not
+                // the row's.
+                if let Some(r) = state.usage_retry.remove(&(rec.session_id, rec.seq)) {
+                    let heir = state
+                        .usage_retry
+                        .entry((rec.session_id, newest))
+                        .or_insert(r);
+                    heir.failures = heir.failures.max(r.failures);
+                    heir.next_attempt_at = heir.next_attempt_at.max(r.next_attempt_at);
+                }
+                superseded.push((rec.session_id, rec.seq));
+                continue;
+            }
+            if state
+                .usage_retry
+                .get(&(rec.session_id, rec.seq))
+                .is_some_and(|r| r.next_attempt_at > now)
+            {
+                continue;
+            }
+        }
         if held.contains(&rec.session_id) {
             continue;
         }
@@ -1386,6 +1590,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     // Quarantined sessions' rows land in the sidecar, then leave the outbox.
     let mut succeeded: Vec<(Uuid, i64)> = quarantine_rows(inner, state, to_quarantine);
+    succeeded.extend(superseded);
 
     // A session still inside its own backoff sits this tick out.
     chains.retain(|chain| {
@@ -1435,6 +1640,36 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // (or spent its budget) forgets its retry count, as before.
         for key in outcome.cleared {
             state.best_effort_attempts.remove(&key);
+        }
+        for (key, err) in outcome.usage_failed {
+            let entry = state.usage_retry.entry(key).or_insert(UsageRetry {
+                failures: 0,
+                next_attempt_at: now,
+            });
+            entry.failures += 1;
+            let wait = usage_totals_backoff(entry.failures);
+            entry.next_attempt_at = now + wait;
+            // First failure loud, repeats quiet: a coord whose usage table is
+            // not migrated answers 503 for as long as that lasts.
+            if entry.failures == 1 {
+                tracing::warn!(
+                    session = %key.0,
+                    seq = key.1,
+                    error = %snippet(&err),
+                    retry_in_secs = wait.as_secs(),
+                    "coord_sync: usage_totals push failed transiently — kept pending on its \
+                     own backoff (does not block the session's other rows)"
+                );
+            } else {
+                tracing::debug!(
+                    session = %key.0,
+                    seq = key.1,
+                    failures = entry.failures,
+                    error = %snippet(&err),
+                    retry_in_secs = wait.as_secs(),
+                    "coord_sync: usage_totals push failed again — retrying on backoff"
+                );
+            }
         }
         match outcome.blocked_on {
             Some(err) => blocked.push((outcome.session_id, err)),
@@ -1495,6 +1730,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             Ok(()) => {
                 for key in &succeeded {
                     state.in_sidecar.remove(key);
+                    state.usage_retry.remove(key);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "coord_sync: ack write failed"),
@@ -1881,6 +2117,35 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "usage_totals" => {
+            // CUMULATIVE token totals per model (plan
+            // 2026-10-09-kpi-telemetry-and-dashboards, Phase 1). POST
+            // /coord/sessions/{claude_code_session_id}/usage {models:[…]} —
+            // an idempotent upsert per (session, model), so a replay is a
+            // no-op. The path key is the Claude Code session id the payload
+            // carries, NOT `rec.session_id` (the coord `sessions.id` lane).
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING: without it the kind falls to the
+            // catch-all below, which ACKs and drops silently, and the usage
+            // KPI would read a clean zero. See
+            // `every_session_outbox_kind_has_a_dispatch_arm`.
+            let (csid, body) = match usage_totals_request(&rec.payload) {
+                Ok(req) => req,
+                Err(reason) => {
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        %reason,
+                        "coord_sync: usage_totals row cannot be addressed — dropping"
+                    );
+                    return PushOutcome::Acked;
+                }
+            };
+            let url = format!("{base}/coord/sessions/{csid}/usage");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
             // pushed yet. Quietly ACK so the file doesn't grow.
@@ -1925,6 +2190,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             }
             if status.is_success() {
                 return PushOutcome::Acked;
+            }
+            if is_usage_totals_kind(kind) {
+                return usage_totals_failure_outcome(rec, status, resp).await;
             }
             if is_lifecycle_kind(kind) && status == StatusCode::TOO_MANY_REQUESTS {
                 // A rate-limited lifecycle row is coord PACING this runner,
@@ -2055,6 +2323,47 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         // TLS / DNS / timeout reason lives in `.source()`.
         Err(e) => PushOutcome::Transport(transport_error(&e)),
     }
+}
+
+/// A non-2xx answer to a `usage_totals` push. 429 and 5xx (coord's 503
+/// while its usage table is not migrated) are TRANSIENT — the row stays
+/// pending on its own backoff. Every 4xx is ACK-dropped, warned ONCE per
+/// session (never an error per row): a 404 — coord does not know the session
+/// yet — asks the tailer to re-send it on a capped backoff; any other 4xx
+/// (400 `invalid_session_id`, 405 no route, 422) is coord refusing the content
+/// and is not re-sent. A later change to the totals still ships a new row.
+async fn usage_totals_failure_outcome(
+    rec: &OutboxRecord,
+    status: StatusCode,
+    resp: reqwest::Response,
+) -> PushOutcome {
+    let detail = resp.text().await.unwrap_or_default();
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return PushOutcome::Transport(format!("{status}: {detail}"));
+    }
+    let resend = status == StatusCode::NOT_FOUND;
+    if resend {
+        request_usage_resend(rec);
+    }
+    let n = USAGE_TOTALS_DROPPED_4XX.fetch_add(1, Ordering::Relaxed) + 1;
+    let csid = rec
+        .payload
+        .get("claude_code_session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if usage_drop_warn_due(csid, n) {
+        tracing::warn!(
+            dropped_total = n,
+            status = %status,
+            claude_code_session_id = %csid,
+            session = %rec.session_id,
+            body = %snippet(&detail),
+            resend,
+            "coord_sync: usage_totals row dropped by coord (4xx) — a 404 is re-sent on a \
+             capped backoff, any other refusal is not; warned once per session"
+        );
+    }
+    PushOutcome::Acked
 }
 
 /// A reqwest transport failure rendered with its FULL source chain
@@ -3494,6 +3803,7 @@ mod tests {
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
+            SessionEventKind::UsageTotals,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -3679,6 +3989,14 @@ mod tests {
         events_status: Option<u16>,
         /// Bodies accepted by `POST /coord/sessions/operator-touch`.
         operator_touches: Vec<JsonValue>,
+        /// `(claude_code_session_id, body)` per ACCEPTED
+        /// `POST /coord/sessions/:id/usage`.
+        usage_posts: Vec<(Uuid, JsonValue)>,
+        /// Every `POST /coord/sessions/:id/usage` attempt, accepted or not.
+        usage_attempts: usize,
+        /// When set, the usage route answers this status and records nothing
+        /// (503 = coord's usage table not migrated; 404 = no route).
+        usage_status: Option<u16>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -4066,6 +4384,26 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/sessions/{id}/usage",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     AxumPath(id): AxumPath<Uuid>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.usage_attempts += 1;
+                        if let Some(code) = g.usage_status {
+                            return (
+                                AxumStatus::from_u16(code).unwrap(),
+                                Json(json!({"error": "fake-usage-status"})),
+                            )
+                                .into_response();
+                        }
+                        g.usage_posts.push((id, body));
+                        (AxumStatus::OK, Json(json!({"upserted": true}))).into_response()
                     },
                 ),
             )
@@ -7342,6 +7680,253 @@ mod tests {
 
         // Nothing was stored coord-side, and nothing is left to retry.
         assert!(rec.lock().await.findings.is_empty());
+    }
+
+    // ========================================================================
+    // `usage_totals` — plan 2026-10-09-kpi-telemetry-and-dashboards, Phase 1.
+    // ========================================================================
+
+    fn usage_payload(csid: Uuid, output_tokens: i64) -> JsonValue {
+        json!({
+            "claude_code_session_id": csid.to_string(),
+            "tenant_id": Uuid::new_v4(),
+            "models": [{
+                "model": "claude-opus-5-5",
+                "input_tokens": 1,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3,
+                "cost_usd": null,
+                "cost_source": null,
+                "first_turn_at": "2026-10-09T10:00:00Z",
+                "last_turn_at": "2026-10-09T10:05:00Z",
+                "turn_count": 2
+            }]
+        })
+    }
+
+    #[test]
+    fn usage_totals_request_addresses_the_claude_session_and_sends_only_models() {
+        let csid = Uuid::new_v4();
+        let (path_id, body) = usage_totals_request(&usage_payload(csid, 7)).unwrap();
+        assert_eq!(path_id, csid);
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            1,
+            "tenant_id never reaches coord"
+        );
+        assert_eq!(body["models"][0]["output_tokens"], json!(7));
+        assert!(body["models"][0]["cost_usd"].is_null());
+
+        assert!(usage_totals_request(&json!({"models": []})).is_err());
+        assert!(
+            usage_totals_request(&json!({"claude_code_session_id": "agent-x", "models": []}))
+                .is_err()
+        );
+        assert!(
+            usage_totals_request(&json!({"claude_code_session_id": csid.to_string()})).is_err()
+        );
+    }
+
+    #[test]
+    fn usage_totals_backoff_doubles_and_caps() {
+        assert_eq!(usage_totals_backoff(1), Duration::from_secs(15));
+        assert_eq!(usage_totals_backoff(2), Duration::from_secs(30));
+        assert_eq!(usage_totals_backoff(5), Duration::from_secs(240));
+        assert_eq!(usage_totals_backoff(50), USAGE_TOTALS_RETRY_CAP);
+        assert!(!is_best_effort_kind(SessionEventKind::UsageTotals.as_str()));
+        assert!(!is_lifecycle_kind(SessionEventKind::UsageTotals.as_str()));
+    }
+
+    /// The wire mapping: the row reaches `POST /coord/sessions/{csid}/usage`
+    /// keyed on the CLAUDE CODE session id, not the outbox lane, and only the
+    /// newest pending row of a session is sent — older ones are superseded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_totals_posts_the_newest_row_to_the_claude_session_usage_route() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let lane = Uuid::new_v4();
+        let csid = Uuid::new_v4();
+        for out in [5, 9, 12] {
+            outbox
+                .record(
+                    machine,
+                    lane,
+                    SessionEventKind::UsageTotals,
+                    usage_payload(csid, out),
+                )
+                .unwrap();
+        }
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.usage_attempts, 1, "superseded rows are never sent");
+        assert_eq!(g.usage_posts.len(), 1);
+        let (path_id, body) = &g.usage_posts[0];
+        assert_eq!(*path_id, csid, "the path key is the Claude Code session id");
+        assert_ne!(*path_id, lane);
+        assert_eq!(body["models"][0]["output_tokens"], json!(12));
+        assert!(body.get("tenant_id").is_none());
+        drop(g);
+        assert!(outbox.pending().unwrap().is_empty(), "all three rows ACKed");
+    }
+
+    /// A 503 (coord's usage table not migrated) keeps the row pending on its
+    /// own backoff — not dropped, not retried every tick — and never blocks
+    /// the same session's other rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_totals_503_is_retried_on_backoff_without_blocking_the_session() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.usage_status = Some(503);
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let lane = Uuid::new_v4();
+        let csid = Uuid::new_v4();
+        outbox
+            .record(
+                machine,
+                lane,
+                SessionEventKind::UsageTotals,
+                usage_payload(csid, 1),
+            )
+            .unwrap();
+        outbox
+            .record(machine, lane, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        {
+            let g = rec.lock().await;
+            assert_eq!(g.usage_attempts, 1);
+            assert_eq!(g.patches.len(), 1, "the heartbeat behind it still went out");
+        }
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "the usage row is kept, not dropped");
+        assert_eq!(pending[0].event_kind, "usage_totals");
+        assert!(
+            !state.retry.contains_key(&lane),
+            "the session is not blocked"
+        );
+        assert!(state.quarantined.is_empty());
+
+        // Inside its backoff: the next tick does not ask again — not even for
+        // a newer row that supersedes it (it inherits the backoff).
+        drain_tick(&coord.inner, &mut state).await;
+        outbox
+            .record(
+                machine,
+                lane,
+                SessionEventKind::UsageTotals,
+                usage_payload(csid, 2),
+            )
+            .unwrap();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(rec.lock().await.usage_attempts, 1, "no tight loop");
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the older row was superseded"
+        );
+
+        // Backoff elapsed and coord migrated: delivered.
+        rec.lock().await.usage_status = None;
+        for r in state.usage_retry.values_mut() {
+            r.next_attempt_at = Instant::now();
+        }
+        drain_tick(&coord.inner, &mut state).await;
+        {
+            let g = rec.lock().await;
+            assert_eq!(g.usage_posts.len(), 1);
+            assert_eq!(g.usage_posts[0].1["models"][0]["output_tokens"], json!(2));
+        }
+        assert!(outbox.pending().unwrap().is_empty());
+        assert!(state.usage_retry.is_empty());
+    }
+
+    /// A coord without the usage route (404) ACK-drops the row quietly — the
+    /// next row re-sends the cumulative totals.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_totals_404_is_ack_dropped() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.usage_status = Some(404);
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::UsageTotals,
+                usage_payload(Uuid::new_v4(), 1),
+            )
+            .unwrap();
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(rec.lock().await.usage_attempts, 1);
+        assert!(outbox.pending().unwrap().is_empty());
+        assert!(state.usage_retry.is_empty());
+    }
+
+    /// N1: only a 404 (coord does not know the session yet) asks for a
+    /// re-send; a 400/405/422 refusal is dropped and never re-sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_totals_only_a_404_requests_a_resend() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let mut state = DrainState::default();
+        let mut by_status = Vec::new();
+        for code in [404u16, 400, 405, 422] {
+            rec.lock().await.usage_status = Some(code);
+            let csid = Uuid::new_v4();
+            outbox
+                .record(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    SessionEventKind::UsageTotals,
+                    usage_payload(csid, 1),
+                )
+                .unwrap();
+            drain_tick(&coord.inner, &mut state).await;
+            assert!(outbox.pending().unwrap().is_empty(), "{code}: ACK-dropped");
+            by_status.push((code, csid.to_string()));
+        }
+        // Other tests share the process-wide queue: assert on these ids only.
+        let queued = take_usage_resend_requests();
+        for (code, csid) in by_status {
+            assert_eq!(queued.contains(&csid), code == 404, "status {code}");
+        }
     }
 
     /// The best-effort posture covers the two closeout kinds as well as helper
