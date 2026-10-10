@@ -458,7 +458,20 @@ fn workdir_candidates<'a>(
 /// not a canonical checkout)? The same predicate `provision_session_cwd` uses
 /// to decide a cwd was freshly allocated.
 fn is_agent_allocation_root(path: &std::path::Path) -> bool {
-    crate::agent_worktree::canonical_paths::allocated_worktree_for_path(path)
+    is_allocation_root_with(
+        path,
+        crate::agent_worktree::canonical_paths::allocated_worktree_for_path,
+    )
+}
+
+/// Core of [`is_agent_allocation_root`] with the allocation lookup injected, so
+/// a test can point it at a temp worktree root
+/// (`allocated_worktree_for_path_in`) instead of the environment's.
+fn is_allocation_root_with(
+    path: &std::path::Path,
+    allocation_for: impl FnOnce(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> bool {
+    allocation_for(path)
         .is_some_and(|root| crate::agent_worktree::canonical_paths::paths_equal(&root, path))
 }
 
@@ -609,9 +622,10 @@ mod tests {
     }
 
     /// Real parked contexts through the real snapshot loop
-    /// (`workdir_candidates` over `ClaudeSession::isolated_worktree_paths`'
-    /// own projection) and the real allocation-root predicate
-    /// (`allocated_worktree_for_path_in`, the core of `is_agent_allocation_root`),
+    /// (`workdir_candidates` over `parked_worktree_paths`, the projection
+    /// `ClaudeSession::isolated_worktree_paths` applies) and the real
+    /// allocation-root predicate (`is_allocation_root_with`, the core of
+    /// `is_agent_allocation_root`, over `allocated_worktree_for_path_in`),
     /// on a temp worktree root: an agent allocation root identifies its worker;
     /// the canonical checkout named by a `shared_branch` row does not; and two
     /// sessions parked on the same allocation (the old first-match-wins case)
@@ -644,16 +658,14 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let canonical = tmp.path().join("repo-canonical");
         std::fs::create_dir_all(canonical.join(".git")).unwrap();
+        // The production predicate, pointed at the temp root.
         let is_root = |p: &std::path::Path| {
-            crate::agent_worktree::canonical_paths::allocated_worktree_for_path_in(&root, p)
-                .is_some_and(|r| crate::agent_worktree::canonical_paths::paths_equal(&r, p))
+            is_allocation_root_with(p, |q| {
+                crate::agent_worktree::canonical_paths::allocated_worktree_for_path_in(&root, q)
+            })
         };
-        let parked = |c: &IsolatedEditContext| -> Vec<std::path::PathBuf> {
-            c.worktrees
-                .iter()
-                .map(|w| w.worktree_path.clone())
-                .collect()
-        };
+        // The production projection `ClaudeSession::isolated_worktree_paths` applies.
+        let parked = crate::claude_session::session::parked_worktree_paths;
         let (worker, chat) = (ctx(&[&alloc]), ctx(&[&canonical, &sub]));
         let cands = workdir_candidates([
             ("worker", None, parked(&worker)),
