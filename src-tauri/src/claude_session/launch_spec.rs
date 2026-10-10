@@ -485,6 +485,17 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                          the append slot and Claude Code refuses both append flags together"
                     );
                 }
+                // Under an allow-list ONLY a known-harmless template flag
+                // survives (review N4): anything else — `--plugin-dir` (plugins
+                // carry PreToolUse allow hooks), `--add-dir`, a flag this
+                // runner does not know yet — could widen what runs.
+                n if allow_list_spec && !is_permitted_under_allow_list(n) => {
+                    tracing::warn!(
+                        flag = %n,
+                        "launch template flag dropped: not permitted under the allow-list \
+                         permission mode"
+                    );
+                }
                 // Any other operator flag is layered in, unless the caller's
                 // extra_required already provides that flag (spec wins).
                 _ => {
@@ -689,6 +700,36 @@ fn is_append_prompt_flag(token: &str) -> bool {
     APPEND_PROMPT_FLAG_GROUP.contains(&name)
 }
 
+/// Template flags permitted under an [`PermissionMode::AllowList`] spec
+/// (spaced or `=`-attached). An allow-list of flags, not a deny-list, so a CLI
+/// flag added later is dropped until someone decides it is harmless.
+fn is_permitted_under_allow_list(token: &str) -> bool {
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    matches!(
+        name,
+        "--model"
+            | "--fallback-model"
+            | "--effort"
+            | "--name"
+            | "-n"
+            | "--verbose"
+            | "--debug"
+            | "-d"
+            | "--debug-file"
+            | "--output-format"
+            | "--input-format"
+            | "--include-partial-messages"
+            | "--replay-user-messages"
+            | "--max-turns"
+            | "--append-system-prompt"
+            | "--append-system-prompt-file"
+            | "--system-prompt"
+            | "--system-prompt-file"
+            | "--exclude-dynamic-system-prompt-sections"
+            | "--ide"
+    )
+}
+
 /// Template flags an [`PermissionMode::AllowList`] spec owns, in either the
 /// spaced or the `=`-attached spelling.
 fn is_allow_list_owned_flag(token: &str) -> bool {
@@ -806,6 +847,36 @@ fn shell_tokenize(s: &str) -> Vec<String> {
 /// characters the shell would otherwise split or interpret. Uses literal
 /// single-quoting for both PowerShell and POSIX (differing only in the escape of
 /// an embedded quote).
+/// The one check for a path the runner interpolates inside double quotes in a
+/// typed shell command (`CLAUDE_CONFIG_DIR="<dir>"`), used by both the launch
+/// and the resume renderer (review N5). Refuses anything that could close the
+/// quote or expand inside it on POSIX shells or PowerShell: `"`, backtick,
+/// `$`, `!` (history expansion), the Unicode quotes PowerShell treats as
+/// quotes (U+2018–U+201E), control characters, and a trailing backslash
+/// (which would escape the closing quote).
+pub fn check_shell_safe_path(path: &str) -> Result<(), String> {
+    let bad = path.chars().find(|c| {
+        matches!(c, '"' | '`' | '$' | '!')
+            || ('\u{2018}'..='\u{201E}').contains(c)
+            || c.is_control()
+    });
+    if let Some(c) = bad {
+        return Err(format!(
+            "refusing to type a command with an unsafe character ({c:?}) in the path {path:?}"
+        ));
+    }
+    if path.ends_with('\\') {
+        return Err(format!(
+            "refusing to type a command with a trailing backslash in the path {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Characters PowerShell reads as a single quote inside a single-quoted
+/// literal: ASCII `'` and U+2018–U+201B. Each is escaped by doubling it.
+const POWERSHELL_SINGLE_QUOTES: &[char] = &['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
 fn shell_quote(tok: &str, is_windows: bool) -> String {
     let safe = !tok.is_empty()
         && tok
@@ -815,8 +886,18 @@ fn shell_quote(tok: &str, is_windows: bool) -> String {
         return tok.to_string();
     }
     if is_windows {
-        // PowerShell single-quote literal: embedded ' is doubled.
-        format!("'{}'", tok.replace('\'', "''"))
+        // PowerShell single-quote literal: every character PowerShell reads as
+        // a single quote — ASCII and the Unicode ones — is doubled (review N5).
+        let mut out = String::with_capacity(tok.len() + 2);
+        out.push('\'');
+        for c in tok.chars() {
+            if POWERSHELL_SINGLE_QUOTES.contains(&c) {
+                out.push(c);
+            }
+            out.push(c);
+        }
+        out.push('\'');
+        out
     } else {
         // POSIX single-quote literal: embedded ' is closed, escaped, reopened.
         format!("'{}'", tok.replace('\'', "'\\''"))
@@ -960,6 +1041,74 @@ mod tests {
             assert!(!argv.iter().any(|a| a == gone), "{gone} leaked: {argv:?}");
         }
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
+    }
+
+    /// Review N4: under an allow-list only a known-harmless set of template
+    /// flags survives — `--plugin-dir` (plugins carry PreToolUse allow hooks)
+    /// and any flag the runner does not know are dropped.
+    #[test]
+    fn allow_list_keeps_only_permitted_template_flags() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        let argv = render_argv(
+            &s,
+            &tmpl(
+                "claude --plugin-dir /p --brand-new-flag x --model opus --verbose \
+                 --add-dir /elsewhere",
+            ),
+            "claude",
+        );
+        for gone in [
+            "--plugin-dir",
+            "/p",
+            "--brand-new-flag",
+            "x",
+            "--add-dir",
+            "/elsewhere",
+        ] {
+            assert!(!argv.iter().any(|a| a == gone), "{gone} leaked: {argv:?}");
+        }
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+        assert!(argv.iter().any(|a| a == "--verbose"));
+        // Outside an allow-list the same template flags still layer in.
+        let argv = render_argv(&spec(), &tmpl("claude --plugin-dir /p"), "claude");
+        assert_eq!(value_after(&argv, "--plugin-dir"), Some("/p"));
+    }
+
+    /// Review N5: one shared refusal for paths interpolated into a typed
+    /// command — smart quotes, `!`, a trailing backslash and the existing set.
+    #[test]
+    fn shell_safe_path_check_refuses_quote_breakers() {
+        for bad in [
+            "/x\u{2018}y",
+            "/x\u{2019}y",
+            "/x\u{201C}y",
+            "/x\u{201D}y",
+            "/x\u{201E}y",
+            "/x!y",
+            "C:\\claude\\",
+            "/x\"y",
+            "/x$y",
+            "/x`y",
+            "/x\ny",
+        ] {
+            assert!(check_shell_safe_path(bad).is_err(), "{bad:?} accepted");
+        }
+        for good in [
+            "/home/u/.claude",
+            "C:\\Users\\a b\\.claude-x",
+            "C:/claude/acct (2)",
+        ] {
+            assert!(check_shell_safe_path(good).is_ok(), "{good:?} refused");
+        }
+    }
+
+    /// Review N5: PowerShell treats U+2018-201B as single quotes too, so the
+    /// single-quoted literal doubles them like `'`.
+    #[test]
+    fn powershell_quote_doubles_unicode_single_quotes() {
+        assert_eq!(shell_quote("a\u{2019}b", true), "'a\u{2019}\u{2019}b'");
+        assert_eq!(shell_quote("a\u{2018}b'c", true), "'a\u{2018}\u{2018}b''c'");
     }
 
     /// Review M1: an opaque account alias cannot be introspected, so under an

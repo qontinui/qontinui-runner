@@ -584,6 +584,7 @@ pub fn get_model_gateway() -> Result<CommandResponse, String> {
         data: Some(serde_json::json!({
             "gateway": gateway,
             "state": state,
+            "marker": crate::model_gateway::marker_info(),
             "declared": state != "not_declared",
             "valid": problem.is_none(),
         })),
@@ -670,8 +671,18 @@ pub fn build_ai_launch_command(
 
     // A declared model gateway owns the session's account: the typed
     // `CLAUDE_CONFIG_DIR` prefix names the gateway config dir, never the
-    // subscription account the UI picked (`crate::model_gateway`).
-    let config_dir = crate::model_gateway::session_config_dir_override().unwrap_or(config_dir);
+    // subscription account the UI picked (`crate::model_gateway`). A gateway
+    // whose dir could not be prepared, or is unresolved, refuses (review N1).
+    let gateway_declared = crate::model_gateway::gateway_declared();
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        return Err(refusal);
+    }
+    let config_dir = gateway_launch_dir(
+        gateway_declared,
+        crate::model_gateway::session_config_dir_override(),
+        config_dir,
+    )?;
+    crate::claude_session::launch_spec::check_shell_safe_path(&config_dir)?;
     let cfg = LaunchConfig::from_settings(Some(&config_dir));
     let spec = LaunchSpec {
         config_dir: Some(config_dir),
@@ -679,7 +690,14 @@ pub fn build_ai_launch_command(
         session_id: session_id.clone(),
         ..Default::default()
     };
-    let command = render_pty_command(&spec, &cfg, is_windows);
+    let mut command = render_pty_command(&spec, &cfg, is_windows);
+    if gateway_declared {
+        // Clear vendor env the pane's shell may hold (review N2).
+        command = format!(
+            "{}{command}",
+            crate::model_gateway::env_scrub_prefix(is_windows)
+        );
+    }
 
     let pinned_session_id = match &session_id {
         Some(id) if command.contains(id.as_str()) => Some(id.clone()),
@@ -693,6 +711,24 @@ pub fn build_ai_launch_command(
             "command": command,
             "pinnedSessionId": pinned_session_id,
         })),
+    })
+}
+
+/// The config dir a typed launch/resume uses: the gateway dir when a gateway is
+/// declared (refusing when it could not be prepared — never the account dir),
+/// else the caller's.
+fn gateway_launch_dir(
+    gateway_declared: bool,
+    gateway_dir: Option<String>,
+    account_dir: String,
+) -> Result<String, String> {
+    if !gateway_declared {
+        return Ok(account_dir);
+    }
+    gateway_dir.ok_or_else(|| {
+        "refusing to type a claude command: a model gateway is declared but its session \
+         config dir could not be prepared"
+            .to_string()
     })
 }
 
@@ -715,6 +751,7 @@ pub fn build_ai_launch_command(
 #[tauri::command]
 pub fn build_ai_resume_command(
     session_id: String,
+    provider: Option<String>,
     config_dir: Option<String>,
     is_windows: bool,
     full_resume: bool,
@@ -725,7 +762,9 @@ pub fn build_ai_resume_command(
     let gateway_dir = crate::model_gateway::session_config_dir_override();
     let command = render_ai_resume_command(
         &session_id,
+        provider.as_deref().unwrap_or("claude"),
         config_dir.as_deref(),
+        crate::model_gateway::gateway_declared(),
         gateway_dir.as_deref(),
         is_windows,
         full_resume,
@@ -739,9 +778,12 @@ pub fn build_ai_resume_command(
 }
 
 /// Pure core of [`build_ai_resume_command`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_ai_resume_command(
     session_id: &str,
+    provider: &str,
     recorded_config_dir: Option<&str>,
+    gateway_declared: bool,
     gateway_config_dir: Option<&str>,
     is_windows: bool,
     full_resume: bool,
@@ -759,17 +801,32 @@ pub(crate) fn render_ai_resume_command(
             "refusing to resume: invalid session id '{session_id}'"
         ));
     }
-    // The gateway dir wins over whatever account the tab recorded.
-    let config_dir = gateway_config_dir
-        .or(recorded_config_dir)
-        .map(str::trim)
-        .filter(|d| !d.is_empty());
+    // Only Claude speaks the gateway's protocol (review N7): another
+    // provider's resume is refused while a gateway is declared. With no
+    // gateway, every provider currently resumes through the Claude adapter
+    // (`session::provider_adapter::adapter_for`), as the frontend did.
+    let provider = provider.trim();
+    if gateway_declared && !provider.is_empty() && provider != "claude" {
+        return Err(format!(
+            "refusing to resume a {provider} session: a model gateway is configured and only \
+             Claude sessions can route through it"
+        ));
+    }
+    // The gateway dir wins over whatever account the tab recorded, and a
+    // declared gateway without a prepared dir refuses (review N1).
+    let config_dir = if gateway_declared {
+        Some(gateway_config_dir.ok_or_else(|| {
+            "refusing to resume: a model gateway is declared but its session config dir could \
+             not be prepared"
+                .to_string()
+        })?)
+    } else {
+        recorded_config_dir
+    }
+    .map(str::trim)
+    .filter(|d| !d.is_empty());
     if let Some(dir) = config_dir {
-        // The dir is interpolated inside double quotes on both shells; refuse
-        // anything that could close the quote or expand inside it.
-        if dir.contains(['"', '`', '$', '\n', '\r']) {
-            return Err(format!("refusing to resume: unsafe config dir '{dir}'"));
-        }
+        crate::claude_session::launch_spec::check_shell_safe_path(dir)?;
     }
     let spec = LaunchSpec {
         config_dir: config_dir.map(str::to_string),
@@ -783,7 +840,12 @@ pub(crate) fn render_ai_resume_command(
         session_permission: posture.clone(),
     };
     let body = render_pty_command(&spec, &cfg, is_windows);
-    let mut prefix = String::new();
+    let mut prefix = if gateway_declared {
+        // Clear vendor env the pane's shell may hold (review N2).
+        crate::model_gateway::env_scrub_prefix(is_windows)
+    } else {
+        String::new()
+    };
     if full_resume {
         for var in [
             "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD",
@@ -841,7 +903,9 @@ mod resume_render_tests {
     fn default_resume_matches_the_historical_typed_command() {
         let cmd = render_ai_resume_command(
             SID,
+            "claude",
             Some("/home/user/.claude"),
+            false,
             None,
             false,
             true,
@@ -857,8 +921,17 @@ mod resume_render_tests {
                  bypassPermissions --resume {SID}"
             )
         );
-        let summary =
-            render_ai_resume_command(SID, None, None, false, false, &Default::default()).unwrap();
+        let summary = render_ai_resume_command(
+            SID,
+            "claude",
+            None,
+            false,
+            None,
+            false,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             format!("claude --permission-mode bypassPermissions --resume {SID}")
@@ -871,15 +944,18 @@ mod resume_render_tests {
     fn gateway_dir_replaces_the_recorded_subscription_dir() {
         let cmd = render_ai_resume_command(
             SID,
+            "claude",
             Some("/home/user/.claude-subscription"),
+            true,
             Some("/cfg/model-gateway/claude-config"),
             false,
             false,
             &Default::default(),
         )
         .unwrap();
+        // After the vendor-env scrub prefix (review N2), the gateway dir.
         assert!(
-            cmd.starts_with("CLAUDE_CONFIG_DIR=\"/cfg/model-gateway/claude-config\" "),
+            cmd.contains(" CLAUDE_CONFIG_DIR=\"/cfg/model-gateway/claude-config\" claude "),
             "{cmd}"
         );
         assert!(!cmd.contains("claude-subscription"), "{cmd}");
@@ -891,7 +967,8 @@ mod resume_render_tests {
         let posture = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string()],
         };
-        let cmd = render_ai_resume_command(SID, None, None, true, true, &posture).unwrap();
+        let cmd = render_ai_resume_command(SID, "claude", None, false, None, true, true, &posture)
+            .unwrap();
         assert!(
             cmd.starts_with("$env:CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=\"999999999\"; "),
             "{cmd}"
@@ -905,14 +982,118 @@ mod resume_render_tests {
         assert!(!cmd.contains("bypassPermissions"));
     }
 
+    /// Review N1: a declared gateway whose session dir could not be prepared
+    /// refuses — it never falls back to the recorded subscription dir.
+    #[test]
+    fn declared_gateway_without_a_dir_refuses() {
+        let err = render_ai_resume_command(
+            SID,
+            "claude",
+            Some("/home/user/.claude-subscription"),
+            true,
+            None,
+            false,
+            true,
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("gateway"), "{err}");
+    }
+
+    /// Review N2: under a gateway the typed command clears inherited vendor
+    /// env in the shell first, on both shells.
+    #[test]
+    fn gateway_resume_clears_inherited_vendor_env() {
+        let posix = render_ai_resume_command(
+            SID,
+            "claude",
+            None,
+            true,
+            Some("/cfg/gw"),
+            false,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(posix.starts_with("env -u ANTHROPIC_API_KEY "), "{posix}");
+        assert!(posix.contains("-u CLAUDE_CODE_OAUTH_TOKEN "), "{posix}");
+        let ps = render_ai_resume_command(
+            SID,
+            "claude",
+            None,
+            true,
+            Some("C:/cfg/gw"),
+            true,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            ps.starts_with("Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue; "),
+            "{ps}"
+        );
+        // No gateway: no scrub prefix (the historical command).
+        let plain = render_ai_resume_command(
+            SID,
+            "claude",
+            None,
+            false,
+            None,
+            false,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!plain.contains("env -u"));
+    }
+
+    /// Review N7: a non-Claude provider's resume is rendered here too, and is
+    /// refused while a gateway is declared.
+    #[test]
+    fn non_claude_resume_is_refused_under_a_gateway() {
+        let err = render_ai_resume_command(
+            SID,
+            "gemini",
+            None,
+            true,
+            Some("/cfg/gw"),
+            false,
+            false,
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("gemini"), "{err}");
+    }
+
     #[test]
     fn unsafe_ids_and_dirs_are_refused() {
         let p = SessionPermissionSetting::SiteDefault;
-        assert!(render_ai_resume_command("a; rm -rf /", None, None, false, true, &p).is_err());
-        assert!(render_ai_resume_command("", None, None, false, true, &p).is_err());
-        for dir in ["/x\"; evil", "/x$(evil)", "/x`evil`", "C:/$env:Y"] {
+        assert!(render_ai_resume_command(
+            "a; rm -rf /",
+            "claude",
+            None,
+            false,
+            None,
+            false,
+            true,
+            &p
+        )
+        .is_err());
+        assert!(
+            render_ai_resume_command("", "claude", None, false, None, false, true, &p).is_err()
+        );
+        for dir in [
+            "/x\"; evil",
+            "/x$(evil)",
+            "/x`evil`",
+            "C:/$env:Y",
+            "/x\u{2019}y",
+            "/x!y",
+            "C:\\claude\\",
+        ] {
             assert!(
-                render_ai_resume_command(SID, Some(dir), None, false, true, &p).is_err(),
+                render_ai_resume_command(SID, "claude", Some(dir), false, None, false, true, &p)
+                    .is_err(),
                 "{dir}"
             );
         }

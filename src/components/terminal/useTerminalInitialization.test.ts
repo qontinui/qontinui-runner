@@ -625,6 +625,7 @@ describe("buildResumeCmd (backend-rendered resume)", () => {
     expect(cmd).toBe("RENDERED\r");
     expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
       sessionId: "sess-1",
+      provider: "claude",
       configDir: "C:/claude/.claude-hotmail",
       isWindows: false,
       fullResume: true,
@@ -636,6 +637,21 @@ describe("buildResumeCmd (backend-rendered resume)", () => {
     await buildResumeCmd("sess-1", undefined, "summary");
     expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
       sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+    });
+  });
+
+  // Review N7: a non-Claude provider's resume is rendered by the backend too
+  // (so a provider refusal under a gateway applies), never assembled here.
+  it("routes a non-Claude provider through the backend as well", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "G" } });
+    expect(await buildResumeCmd("sess-1", undefined, "summary", "gemini")).toBe("G\r");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "gemini",
       configDir: null,
       isWindows: false,
       fullResume: false,

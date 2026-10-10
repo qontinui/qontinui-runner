@@ -17278,3 +17278,38 @@ mod launch_hold_tests {
         assert_eq!(out, LaunchHold::Refused(refusal));
     }
 }
+
+/// Review N1/H2 wiring: `spawn_claude_child` refuses while the model gateway is
+/// unresolved (a reset settings file with the sticky marker present). Goes red
+/// if the `spawn_refusal` check is removed from the spawn path.
+#[cfg(test)]
+mod gateway_spawn_refusal_tests {
+    #[tokio::test]
+    async fn spawn_claude_child_refuses_an_unresolved_gateway() {
+        let _amb = crate::test_env::isolated_ambient();
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://wiring-gw.example.com".to_string()),
+            api_key_helper: Some("echo wiring-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        let workdir = std::env::temp_dir();
+        let outcome = super::spawn_claude_child(
+            &workdir.to_string_lossy(),
+            "hi",
+            None,
+            crate::coord_mcp::CoordMcpDelivery::Provisioned,
+            &[],
+            false,
+        )
+        .await;
+        match outcome {
+            Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
+            Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
+        }
+    }
+}
