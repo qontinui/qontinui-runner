@@ -57,6 +57,18 @@ fn mark_current_account_rate_limited(headers: &reqwest::header::HeaderMap) {
 /// constrained generation. This avoids client-side retries entirely for supported
 /// models. Until then, the retry-with-validation-feedback path (Phase 3) handles
 /// schema compliance via the `StructuredOutputMiddleware`.
+/// The call route for this module's direct API calls: the vendor host with the
+/// keychain key, or the declared model gateway with its helper key.
+fn resolve_call() -> Result<crate::model_gateway::ModelCall, String> {
+    crate::model_gateway::ModelCall::resolve(|| match ai_keychain().get("claude_api") {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => {
+            Err("No Claude API key configured. Please set your API key in Settings.".to_string())
+        }
+        Err(e) => Err(format!("Failed to retrieve API key: {}", e)),
+    })
+}
+
 pub(super) fn run_claude_api(
     prompt: &str,
     settings: &settings::ClaudeApiSettings,
@@ -70,15 +82,11 @@ pub(super) fn run_claude_api(
         model_override.is_some()
     );
 
-    // Get API key from keychain using KeychainHelper
-    let api_key = match ai_keychain().get("claude_api") {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return AiResponse::error(
-                "No Claude API key configured. Please set your API key in Settings.".to_string(),
-            )
-        }
-        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
+    // Vendor host + keychain key, or the declared model gateway
+    // (`crate::model_gateway`).
+    let call = match resolve_call() {
+        Ok(c) => c,
+        Err(e) => return AiResponse::error(e),
     };
 
     // Use blocking reqwest client for synchronous HTTP request.
@@ -96,14 +104,12 @@ pub(super) fn run_claude_api(
     });
 
     retry_with_backoff("Claude API", || {
-        let response = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            &api_key,
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send();
+        let response = call
+            .post_blocking(&client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send();
 
         match response {
             Ok(resp) => {
@@ -177,14 +183,11 @@ pub(super) fn run_claude_api_with_overrides(
         model, temperature_override, max_tokens
     );
 
-    let api_key = match ai_keychain().get("claude_api") {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return AiResponse::error(
-                "No Claude API key configured. Please set your API key in Settings.".to_string(),
-            )
-        }
-        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
+    // Vendor host + keychain key, or the declared model gateway
+    // (`crate::model_gateway`).
+    let call = match resolve_call() {
+        Ok(c) => c,
+        Err(e) => return AiResponse::error(e),
     };
 
     let client = match reqwest::blocking::Client::builder().build() {
@@ -203,14 +206,12 @@ pub(super) fn run_claude_api_with_overrides(
     }
 
     retry_with_backoff("Claude API (overrides)", || {
-        let response = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            &api_key,
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send();
+        let response = call
+            .post_blocking(&client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send();
 
         match response {
             Ok(resp) => {
@@ -286,14 +287,11 @@ pub(super) fn run_claude_api_multimodal(
         prompt.content.len()
     );
 
-    let api_key = match ai_keychain().get("claude_api") {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return AiResponse::error(
-                "No Claude API key configured. Please set your API key in Settings.".to_string(),
-            )
-        }
-        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
+    // Vendor host + keychain key, or the declared model gateway
+    // (`crate::model_gateway`).
+    let call = match resolve_call() {
+        Ok(c) => c,
+        Err(e) => return AiResponse::error(e),
     };
 
     let client = match reqwest::blocking::Client::builder().build() {
@@ -319,14 +317,12 @@ pub(super) fn run_claude_api_multimodal(
     }
 
     retry_with_backoff("Claude API (multimodal)", || {
-        let response = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            &api_key,
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send();
+        let response = call
+            .post_blocking(&client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send();
 
         match response {
             Ok(resp) => {
@@ -403,14 +399,11 @@ pub(super) fn run_claude_api_cached(
         prompt.user_message.len(),
     );
 
-    let api_key = match ai_keychain().get("claude_api") {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return AiResponse::error(
-                "No Claude API key configured. Please set your API key in Settings.".to_string(),
-            )
-        }
-        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
+    // Vendor host + keychain key, or the declared model gateway
+    // (`crate::model_gateway`).
+    let call = match resolve_call() {
+        Ok(c) => c,
+        Err(e) => return AiResponse::error(e),
     };
 
     let client = match reqwest::blocking::Client::builder().build() {
@@ -425,14 +418,12 @@ pub(super) fn run_claude_api_cached(
     let request_body = builder.build(&prompt.user_message);
 
     retry_with_backoff("Claude API (cached)", || {
-        let request = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            &api_key,
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
-        .header("content-type", "application/json")
-        .json(&request_body);
+        let request = call
+            .post_blocking(&client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
+            .header("content-type", "application/json")
+            .json(&request_body);
         let response = request.send();
 
         match response {
@@ -525,14 +516,11 @@ pub(super) fn run_claude_api_with_structured_output(
         model, schema_name
     );
 
-    let api_key = match ai_keychain().get("claude_api") {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return AiResponse::error(
-                "No Claude API key configured. Please set your API key in Settings.".to_string(),
-            )
-        }
-        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
+    // Vendor host + keychain key, or the declared model gateway
+    // (`crate::model_gateway`).
+    let call = match resolve_call() {
+        Ok(c) => c,
+        Err(e) => return AiResponse::error(e),
     };
 
     let client = match reqwest::blocking::Client::builder().build() {
@@ -572,14 +560,12 @@ pub(super) fn run_claude_api_with_structured_output(
     }
 
     retry_with_backoff("Claude API (structured output)", || {
-        let response = super::anthropic_auth::apply_blocking(
-            client.post("https://api.anthropic.com/v1/messages"),
-            &api_key,
-        )
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send();
+        let response = call
+            .post_blocking(&client, crate::model_gateway::MESSAGES_PATH)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send();
 
         match response {
             Ok(resp) => {
