@@ -3945,20 +3945,15 @@ mod tests {
     #[test]
     fn flush_batch_reports_transport_failure_and_requeues() {
         // `attach_device_auth_blocking` walks the real credential seam; keep it
-        // off the host's secure storage and keychain like the other
-        // env-touching tests in this module.
+        // off the host's secure storage like the other env-touching tests in
+        // this module. (The OS keychain is out of reach of any test binary —
+        // `auth::deny_os_keychain_for_this_test_process`.)
         let _env = env_lock();
-        // Restore both on exit (value or absence): CI runs the whole binary
-        // with QONTINUI_DISABLE_KEYCHAIN=1, so a bare remove_var would unset
-        // CI's default for every later test, and a storage dir left pointing
-        // at this tempdir would outlive it.
-        let _restore = crate::test_env::EnvVarRestore::capture(&[
-            "QONTINUI_SECURE_STORAGE_DIR",
-            "QONTINUI_DISABLE_KEYCHAIN",
-        ]);
+        // Restore on exit (value or absence): a storage dir left pointing at
+        // this tempdir would outlive it.
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SECURE_STORAGE_DIR"]);
         let storage = tempfile::tempdir().expect("tempdir");
         std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", storage.path());
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         // The port was bound and released a moment ago; a sibling test binding
         // 127.0.0.1:0 could in principle land on it before the connect, which
         // would answer instead of refusing. One in the ephemeral range per

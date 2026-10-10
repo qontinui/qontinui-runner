@@ -20,6 +20,64 @@ use uuid::Uuid;
 /// Service name used for keychain entries (legacy)
 const SERVICE_NAME: &str = "com.qontinui.runner";
 
+/// Prefix of the per-instance keychain service name every test-only
+/// constructor uses. [`TestKeychainEntries`] refuses to delete anything else.
+#[cfg(test)]
+pub(crate) const TEST_KEYCHAIN_SERVICE_PREFIX: &str = "com.qontinui.runner.test.";
+
+/// Removes, on drop, every OS-keychain entry a
+/// [`AuthManager::with_storage_force_keychain`] instance can write
+/// (`access_token`, `refresh_token`, `device_id` under its test service name),
+/// so the one test path that reaches the real keychain leaves nothing behind —
+/// including when the test panics. Holds a clone of the manager; `AuthManager`
+/// is `Clone` and the clone shares the service name.
+///
+/// Refuses (panics) on a service name outside [`TEST_KEYCHAIN_SERVICE_PREFIX`],
+/// so it can never be pointed at the production `com.qontinui.runner` entries.
+/// Each delete is bounded by [`keyring_call_bounded`]; if the keychain hung
+/// earlier in the run, the circuit breaker makes the deletes no-ops and the
+/// entries stay — a hung backend cannot be cleaned through, only reported.
+#[cfg(test)]
+pub(crate) struct TestKeychainEntries {
+    manager: AuthManager,
+}
+
+#[cfg(test)]
+impl TestKeychainEntries {
+    pub(crate) fn new(manager: &AuthManager) -> Self {
+        assert!(
+            manager
+                .service_name
+                .starts_with(TEST_KEYCHAIN_SERVICE_PREFIX),
+            "TestKeychainEntries only deletes test entries, not {:?}",
+            manager.service_name
+        );
+        Self {
+            manager: manager.clone(),
+        }
+    }
+
+    /// Deletes the three entries now. Missing entries are not an error.
+    pub(crate) fn delete(&self) {
+        let service_name = self.manager.service_name.clone();
+        let _ = keyring_call_bounded("delete_test_entries", move || {
+            for key in ["access_token", "refresh_token", "device_id"] {
+                if let Ok(entry) = Entry::new(&service_name, key) {
+                    let _ = entry.delete_credential();
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestKeychainEntries {
+    fn drop(&mut self) {
+        self.delete();
+    }
+}
+
 /// The minted token's own `tenant_id` claim (decoded, unverified — see
 /// [`jwt_tenant_claim`]) disagreed with the tenant a caller asked coord to
 /// mint for. Returned (wrapped in `anyhow::Error`) by
@@ -282,13 +340,55 @@ impl SlotDescriptor {
 /// in CI bypasses the dialog cleanly.
 ///
 /// This is the pure env-var check. [`AuthManager::keychain_enabled`] is the
-/// call site every method actually uses — it additionally consults a
-/// test-only per-instance override (see
-/// [`AuthManager::with_storage_force_keychain`]) so a regression test can
-/// exercise the real keychain path even when the whole test binary runs
-/// under `QONTINUI_DISABLE_KEYCHAIN=1` (CI's default — `ci_node/manifest.rs`).
+/// call site every method actually uses. Ahead of this check it consults the
+/// test-process marker ([`deny_os_keychain_for_this_test_process`]), so a
+/// test binary never reaches the OS keychain whatever this variable says. The
+/// one way past the marker is the test-only per-instance override
+/// ([`AuthManager::with_storage_force_keychain`]).
 fn keychain_enabled_env() -> bool {
     std::env::var_os("QONTINUI_DISABLE_KEYCHAIN").is_none()
+}
+
+/// Set once, at load time, in the runner's two unit-test binaries (the lib's
+/// and the runner bin's — each crate root carries the hook, and the bin's
+/// marks the linked lib's copy too); never set in a shipped runner.
+/// Integration tests (`tests/*.rs`) and the auxiliary `src/bin/*` test binaries
+/// carry no hook; none of them reaches the keychain today, and
+/// `tests/keychain_call_sites_are_enumerated.rs` keeps new keychain call sites
+/// from appearing unnoticed. While it is set, [`AuthManager::keychain_enabled`]
+/// answers `false` for every instance not built by
+/// [`AuthManager::with_storage_force_keychain`].
+///
+/// Why a process marker and not `#[cfg(test)]` or `QONTINUI_DISABLE_KEYCHAIN`:
+/// - The env var protected only the runs that set it. CI sets it; a local
+///   `cargo test` did not, and the test-only constructors below then wrote a
+///   fresh `com.qontinui.runner.test.<uuid>` entry into the developer's real
+///   credential store on every run (745 of them on one box, 2026-10-05), while
+///   tests built with [`AuthManager::new`] read — and could overwrite — the
+///   operator's live `com.qontinui.runner` token.
+/// - `#[cfg(test)]` reaches only the crate under test. The runner bin's unit
+///   tests link this module through the lib once the bin stops compiling its
+///   own copy (`main.rs` `mod auth;`), and that lib is built without
+///   `cfg(test)`. A marker set from each crate root's `#[cfg(test)]` ctor
+///   works either way.
+///
+/// Plan `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
+static OS_KEYCHAIN_DENIED_FOR_TEST_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Marks this process as a test binary, so [`AuthManager`] never reaches the
+/// OS keychain from it. Called only from the `#[cfg(test)]` load-time hooks in
+/// `lib.rs` and `main.rs`; a shipped runner never calls it.
+#[doc(hidden)]
+pub fn deny_os_keychain_for_this_test_process() {
+    OS_KEYCHAIN_DENIED_FOR_TEST_PROCESS.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`deny_os_keychain_for_this_test_process`] has run in this process.
+/// Each crate root asserts it in a unit test, so a load-time hook the linker
+/// dropped fails loudly instead of silently re-opening the keychain.
+#[doc(hidden)]
+pub fn os_keychain_denied_for_this_test_process() -> bool {
+    OS_KEYCHAIN_DENIED_FOR_TEST_PROCESS.load(Ordering::SeqCst)
 }
 
 /// How long a synchronous `keyring::Entry` call may run before we give up on
@@ -413,8 +513,9 @@ pub struct AuthManager {
     /// (and, in tests, to exercise the no-machine.json fallback).
     machine_file: Option<std::path::PathBuf>,
     /// Test-only override that forces [`Self::keychain_enabled`] to `true`
-    /// regardless of `QONTINUI_DISABLE_KEYCHAIN`. Compiled only under
-    /// `#[cfg(test)]` so it cannot affect a release binary. See
+    /// regardless of `QONTINUI_DISABLE_KEYCHAIN` and of the test-process
+    /// marker. It is the ONLY way a test reaches the OS keychain. Compiled only
+    /// under `#[cfg(test)]` so it cannot affect a release binary. See
     /// [`Self::with_storage_force_keychain`] for why this exists.
     #[cfg(test)]
     force_keychain_enabled: bool,
@@ -438,14 +539,24 @@ impl AuthManager {
     }
 
     /// Instance-level "is the keychain enabled?" check consulted by every
-    /// keychain call site in this module. Delegates to
-    /// [`keychain_enabled_env`] except under test, where
-    /// [`Self::force_keychain_enabled`] can override it — see
-    /// [`Self::with_storage_force_keychain`].
+    /// keychain call site in this module. In order:
+    /// 1. a [`Self::with_storage_force_keychain`] instance (tests only) is
+    ///    enabled — the one explicit opt-in;
+    /// 2. in a test binary ([`os_keychain_denied_for_this_test_process`]) every
+    ///    other instance is disabled, whatever the environment says;
+    /// 3. otherwise [`keychain_enabled_env`] decides.
     fn keychain_enabled(&self) -> bool {
         #[cfg(test)]
         if self.force_keychain_enabled {
+            debug_assert!(
+                self.service_name.starts_with(TEST_KEYCHAIN_SERVICE_PREFIX),
+                "a force-keychain AuthManager must use a test service name, never {:?}",
+                self.service_name
+            );
             return true;
+        }
+        if os_keychain_denied_for_this_test_process() {
+            return false;
         }
         keychain_enabled_env()
     }
@@ -472,7 +583,7 @@ impl AuthManager {
     pub fn with_storage(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
-            service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
+            service_name: format!("{TEST_KEYCHAIN_SERVICE_PREFIX}{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: false,
         }
@@ -480,7 +591,9 @@ impl AuthManager {
 
     /// As [`Self::with_storage`], but [`Self::keychain_enabled`] always
     /// returns `true` for this instance, regardless of
-    /// `QONTINUI_DISABLE_KEYCHAIN`.
+    /// `QONTINUI_DISABLE_KEYCHAIN` and of the test-process marker — the only
+    /// constructor that reaches the real OS keychain from a test. A caller must
+    /// remove what it writes ([`TestKeychainEntries`]); nothing else ever will.
     ///
     /// Exists for exactly one caller: the pair-code hang regression test
     /// (`pair::pair_code_hang_regression_tests`, plan
@@ -497,7 +610,7 @@ impl AuthManager {
     pub fn with_storage_force_keychain(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
-            service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
+            service_name: format!("{TEST_KEYCHAIN_SERVICE_PREFIX}{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: true,
         }
@@ -513,7 +626,7 @@ impl AuthManager {
     ) -> Self {
         Self {
             secure_storage,
-            service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
+            service_name: format!("{TEST_KEYCHAIN_SERVICE_PREFIX}{}", uuid::Uuid::now_v7()),
             machine_file: Some(machine_file),
             force_keychain_enabled: false,
         }
@@ -654,7 +767,9 @@ impl AuthManager {
     /// blocking frame that hung `qontinui_profile device pair` forever).
     fn store_tokens_in_keychain(&self, access_token: &str, refresh_token: &str) -> Result<()> {
         if !self.keychain_enabled() {
-            debug!("keychain disabled via QONTINUI_DISABLE_KEYCHAIN, skipping store");
+            debug!(
+                "keychain disabled (QONTINUI_DISABLE_KEYCHAIN, or a test process), skipping store"
+            );
             return Ok(());
         }
         let service_name = self.service_name.clone();
@@ -781,7 +896,7 @@ impl AuthManager {
     fn get_access_token_from_keychain(&self) -> Result<String> {
         if !self.keychain_enabled() {
             return Err(anyhow::anyhow!(
-                "keychain disabled via QONTINUI_DISABLE_KEYCHAIN"
+                "keychain disabled (QONTINUI_DISABLE_KEYCHAIN, or a test process)"
             ));
         }
         let service_name = self.service_name.clone();
@@ -832,7 +947,7 @@ impl AuthManager {
     fn get_refresh_token_from_keychain(&self) -> Result<String> {
         if !self.keychain_enabled() {
             return Err(anyhow::anyhow!(
-                "keychain disabled via QONTINUI_DISABLE_KEYCHAIN"
+                "keychain disabled (QONTINUI_DISABLE_KEYCHAIN, or a test process)"
             ));
         }
         let service_name = self.service_name.clone();
@@ -3250,6 +3365,56 @@ mod tests {
         AuthManager::with_storage(storage)
     }
 
+    /// The structural guard: in a test binary, no `AuthManager` reaches the OS
+    /// keychain unless it was built by `with_storage_force_keychain` — even
+    /// with `QONTINUI_DISABLE_KEYCHAIN` UNSET, which is the state of every
+    /// local `cargo test` run. On a tree without the guard the first
+    /// `keychain_enabled()` assertion is true and this fails; that is the
+    /// leak of 745 `com.qontinui.runner.test.*` entries measured 2026-10-05.
+    /// Plan `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
+    #[test]
+    fn a_test_build_never_reaches_the_keychain_without_the_force_constructor() {
+        // Holds the env lock and restores QONTINUI_DISABLE_KEYCHAIN on drop;
+        // also points the secure-storage dir at a tempdir for `new()`.
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::remove_var("QONTINUI_DISABLE_KEYCHAIN");
+        assert!(
+            keychain_enabled_env(),
+            "precondition: with the variable unset the environment alone would enable the keychain"
+        );
+        assert!(os_keychain_denied_for_this_test_process());
+
+        let plain = create_test_auth_manager("never_reaches_keychain_plain");
+        assert!(
+            !plain.keychain_enabled(),
+            "with_storage must not reach the keychain"
+        );
+        assert!(
+            !AuthManager::new().keychain_enabled(),
+            "new() must not reach the keychain from a test binary"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let forced = AuthManager::with_storage_force_keychain(
+            SecureStorage::with_path(dir.path().join("forced.enc")).unwrap(),
+        );
+        assert!(
+            forced.keychain_enabled(),
+            "the explicit opt-in still reaches it"
+        );
+
+        // Behaviour, not only the predicate: the file store still round-trips
+        // and the keychain read refuses instead of calling keyring.
+        plain
+            .store_tokens("access-never-in-keychain", "refresh-never-in-keychain")
+            .unwrap();
+        assert_eq!(
+            plain.get_access_token().unwrap(),
+            "access-never-in-keychain"
+        );
+        let err = plain.get_access_token_from_keychain().unwrap_err();
+        assert!(err.to_string().contains("keychain disabled"), "{err}");
+    }
+
     /// As [`create_test_auth_manager`], but with an explicit `machine.json`
     /// path so the canonical-identity branch is exercised WITHOUT touching the
     /// real `~/.qontinui/machine.json`.
@@ -3860,7 +4025,6 @@ mod bearer_selection_tests {
     #[test]
     fn credential_state_agrees_with_select_device_bearer_on_every_slot_state() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
         let slot_cases: Vec<(&str, Option<String>)> = vec![
             ("usable", Some(live_jwt("slot"))),
@@ -4393,8 +4557,6 @@ mod bearer_selection_tests {
     #[test]
     fn select_device_bearer_refuses_a_claimless_token_on_an_unmeasurable_binding_file() {
         let amb = crate::test_env::isolated_ambient();
-        // See the note in the W1 test above: never the real OS keychain.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = tenant(0xC6);
         let mgr = AuthManager::new();
         let claimless = live_jwt("claimless");
@@ -4453,14 +4615,6 @@ mod bearer_selection_tests {
     #[test]
     fn device_bearer_scoped_degrades_on_a_devices_own_two_binding_file() {
         let amb = crate::test_env::isolated_ambient();
-        // NEVER the real OS credential store. AuthManager::new() keys the
-        // keychain on the fixed real SERVICE_NAME, and store_tokens writes it
-        // unless this is set; isolated_ambient captures the variable but does
-        // not set it, so on a paired Windows box this test would overwrite the
-        // runner's own keychain backup — the documented recovery when the .enc
-        // store will not decrypt. Safe here: the fixture holds env_lock and has
-        // already captured this key for restore.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = tenant(0xC5);
         let am = AuthManager::new();
         let jwt = live_jwt("default-binding");
@@ -5066,10 +5220,6 @@ mod bearer_selection_tests {
         // ambient pins it to a device stating ONE binding, the shape where the
         // legacy fallback is admissible at all.
         let amb = crate::test_env::isolated_ambient();
-        // NEVER the real OS credential store: `store_tokens` writes the
-        // keychain unless this is set, and `isolated_ambient` captures the key
-        // for restore without setting it.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
         let slot_cases: Vec<(&str, Option<String>)> = vec![
             ("usable", Some(live_jwt("slot"))),

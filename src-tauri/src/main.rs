@@ -723,6 +723,39 @@ pub(crate) mod test_env {
     }
 }
 
+/// Marks this test binary as a test process at load time, before any test
+/// runs, so `auth::AuthManager` never reaches the developer's real OS keychain
+/// (Windows Credential Manager, macOS Keychain, Secret Service) from a unit
+/// test — whether or not the run set `QONTINUI_DISABLE_KEYCHAIN`. The test
+/// below fails if the hook did not run, so a linker that dropped it cannot
+/// silently re-open the keychain. Plan
+/// `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
+#[cfg(test)]
+mod keychain_test_guard {
+    // While this bin compiles its own `mod auth;`, the test binary holds TWO
+    // copies of the marker: this crate's and the linked lib's, which bin code
+    // reaches through `qontinui_runner_lib::auth` (e.g. `credential_helper`,
+    // `coord_http`). Mark both. Once the bin re-exports the lib's module the
+    // two paths name one static and the second call is a no-op.
+    #[ctor::ctor]
+    unsafe fn deny_os_keychain_in_tests() {
+        crate::auth::deny_os_keychain_for_this_test_process();
+        qontinui_runner_lib::auth::deny_os_keychain_for_this_test_process();
+    }
+
+    #[test]
+    fn this_test_binary_is_marked_before_any_test_runs() {
+        assert!(
+            crate::auth::os_keychain_denied_for_this_test_process(),
+            "the load-time hook did not run: AuthManager could reach the real OS keychain"
+        );
+        assert!(
+            qontinui_runner_lib::auth::os_keychain_denied_for_this_test_process(),
+            "the linked lib's AuthManager is not marked: bin code reaching it could hit the keychain"
+        );
+    }
+}
+
 use commands::AppState;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;

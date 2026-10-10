@@ -6909,7 +6909,6 @@ mod load_persist_tests {
         "QONTINUI_WEB_BACKEND_URL",
         "QONTINUI_RUNNER_TOKEN",
         "QONTINUI_RESTATE_INGRESS_PORT",
-        "QONTINUI_DISABLE_KEYCHAIN",
         // `claude_accounts` resolves the machine-global roster from
         // `dirs::config_dir()`, deliberately ignoring `QONTINUI_CONFIG_DIR`.
         // On Linux that honours `XDG_CONFIG_HOME`, which is what makes the
@@ -6988,8 +6987,9 @@ mod load_persist_tests {
         std::env::remove_var("QONTINUI_INSTANCE_NAME");
         std::env::remove_var("QONTINUI_SERVER_MODE");
         // The Tier-2 post-upgrade probe at the end of `load_settings_full`
-        // reads the credential store; keep it off the OS keychain.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        // reads the credential store; a test binary never reaches the OS
+        // keychain (`auth::deny_os_keychain_for_this_test_process`), so the
+        // pinned secure-storage dir above is the whole store it sees.
         // The headless launch, verbatim.
         std::env::set_var("QONTINUI_WEB_BACKEND_URL", "https://env-only.example");
         std::env::set_var("QONTINUI_RUNNER_TOKEN", "env-only-runner-token");

@@ -475,6 +475,11 @@ mut_range_bound = { level = "allow", priority = 2 }
 
 [dev-dependencies]
 tempfile = "3"
+# Load-time hook that marks every runner test binary as a test process, so
+# `auth::AuthManager` never reaches the developer's real OS keychain from a
+# unit test (lib.rs / main.rs `deny_os_keychain_in_tests`). Already in the lock
+# via tauri-utils. Plan 2026-10-05-runner-unit-tests-write-to-the-real-os-keychain.
+ctor = "0.8"
 tower = { version = "0.5", features = ["util"] }
 # Deterministic mtime control for tests (e.g. transcript::get_latest_session_id
 # `since` filter coverage). Cross-platform; on Windows wraps SetFileTime.

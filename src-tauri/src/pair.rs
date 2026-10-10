@@ -5057,6 +5057,11 @@ mod pair_code_hang_regression_tests {
                 // keychain write entirely and make this test pass
                 // vacuously on BOTH the fixed and the unfixed tree.
                 let mgr = crate::auth::AuthManager::with_storage_force_keychain(storage);
+                // This is the one test that reaches the real OS keychain, so
+                // it removes what it writes. The guard drops when this closure
+                // returns or panics; if the keychain call hung, the thread is
+                // abandoned and cleanup cannot run (the timeout arm below).
+                let _keychain_cleanup = crate::auth::TestKeychainEntries::new(&mgr);
                 let tenant = uuid::Uuid::parse_str(TEST_TENANT_ID).map_err(|e| e.to_string())?;
                 let paired_path = dir.path().join("paired_user.json");
                 persist_pairing_with(&mgr, &paired_path, &resp, tenant)?;
@@ -5071,7 +5076,15 @@ mod pair_code_hang_regression_tests {
         match rx.recv_timeout(WALL_CLOCK_BOUND) {
             Ok(Ok(())) => {} // pass: redeem + persist completed within bound
             Ok(Err(e)) => panic!("pair-code redeem + persist failed: {e}"),
-            Err(_) => panic!(
+            // The worker panicked before sending (an assert or unwrap inside
+            // the closure). This is a failure, not the hang the arm below
+            // describes; its cleanup guard attempted to remove any keychain
+            // entries it wrote during the unwind (best-effort).
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "pair-code redeem + persist worker thread panicked (see its panic above); its \
+                 cleanup guard attempted to remove any keychain entries it wrote during the unwind"
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
                 "pair-code redeem + persist did not complete within {WALL_CLOCK_BOUND:?} — this \
                  reproduces the `qontinui_profile device pair` hang from plan \
                  2026-08-29-qontinui-profile-device-pair-never-exits (Phase 1's named blocking \

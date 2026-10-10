@@ -310,6 +310,29 @@ pub(crate) mod test_env {
     pub(crate) use crate::ambient::test_support::*;
 }
 
+/// Marks this test binary as a test process at load time, before any test
+/// runs, so `auth::AuthManager` never reaches the developer's real OS keychain
+/// (Windows Credential Manager, macOS Keychain, Secret Service) from a unit
+/// test — whether or not the run set `QONTINUI_DISABLE_KEYCHAIN`. The test
+/// below fails if the hook did not run, so a linker that dropped it cannot
+/// silently re-open the keychain. Plan
+/// `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
+#[cfg(test)]
+mod keychain_test_guard {
+    #[ctor::ctor]
+    unsafe fn deny_os_keychain_in_tests() {
+        crate::auth::deny_os_keychain_for_this_test_process();
+    }
+
+    #[test]
+    fn this_test_binary_is_marked_before_any_test_runs() {
+        assert!(
+            crate::auth::os_keychain_denied_for_this_test_process(),
+            "the load-time hook did not run: AuthManager could reach the real OS keychain"
+        );
+    }
+}
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================

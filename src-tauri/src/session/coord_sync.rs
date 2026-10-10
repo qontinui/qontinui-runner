@@ -5684,7 +5684,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unpinned_multi_bound_device_registers_under_its_default_binding() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
         let storage = std::path::PathBuf::from(
             std::env::var("QONTINUI_SECURE_STORAGE_DIR")
@@ -7458,12 +7457,10 @@ mod tests {
     /// which is the cross-tenant presentation coord answers `403` to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_poll_presents_the_queried_tenants_credential() {
-        let _amb = crate::test_env::isolated_ambient();
         // The fixture pins QONTINUI_SECURE_STORAGE_DIR into its own tempdir
-        // and restores every ambient key on drop; the keychain is not one of
-        // the keys it steers, and a real one would put this test's tokens on
-        // the developer's box.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        // and restores every ambient key on drop; the OS keychain is out of
+        // reach of any test binary (`auth::deny_os_keychain_for_this_test_process`).
+        let _amb = crate::test_env::isolated_ambient();
 
         let queried = Uuid::now_v7();
         let default_tenant = Uuid::now_v7();
@@ -7521,7 +7518,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slot_miss_goes_out_unauthenticated_rather_than_borrowing_the_default() {
         let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
 
         let slotless = Uuid::now_v7();
         let default_jwt = device_jwt_for(&Uuid::now_v7());
@@ -7565,7 +7561,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refusal_carries_coords_own_stated_cause() {
         let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
 
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -7605,7 +7600,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_large_refusal_body_is_read_only_up_to_the_cap() {
         let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
 
         let huge = "A".repeat(512 * 1024);
         let dir = tempfile::tempdir().unwrap();
