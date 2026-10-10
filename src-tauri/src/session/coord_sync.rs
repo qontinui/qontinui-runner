@@ -1802,8 +1802,10 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
-            // Body is the payload verbatim ({repo, branch, shas}); coord
-            // resolves the session server-side from (repo, branch). Tenant
+            // Body is the payload verbatim ({repo, branch, shas}, plus the
+            // pushing session's top-level `tenant_id` when the registrar
+            // resolved one — which is also what made `scope` Owned above);
+            // coord resolves the session server-side from (repo, branch). Tenant
             // comes from the X-Qontinui-Tenant-Id header (post_device_register
             // posture) — Phase 8b: the OWNING SESSION's binding wins; the
             // machine.json default only backfills tenant-less legacy rows.
@@ -2081,7 +2083,10 @@ fn transport_error(e: &reqwest::Error) -> String {
 ///    intent (whose `tenant_id` the registry stamped at creation), and a
 ///    top-level `tenant_id` is the carrier for sessions OUTSIDE the registry:
 ///    `AiCoordRegistrar` stamps one on every row of its sessions (create and
-///    thin rows alike) and on their transcript `output_chunk` rows.
+///    thin rows alike), on their transcript `output_chunk` rows, and on every
+///    `commit_report` row whose pushing session's tenant it can resolve
+///    (those rows' `session_id` is a synthetic per-branch lane id, so this is
+///    their ONLY route to a tenant).
 /// 2. The live [`SessionRegistry`] record for `rec.session_id` — thin
 ///    payloads (heartbeat / state_change / closed) carry no intent, but the
 ///    registry still holds the session's stamped tenant while it's alive.
@@ -4798,6 +4803,109 @@ mod tests {
         let rec4 = mk(Uuid::new_v4(), json!({}));
         assert_eq!(
             record_session_tenant(&coord.inner, &rec4),
+            TenantScope::Unresolved
+        );
+    }
+
+    /// Plan `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`
+    /// Phase 0 (a): a `commit_report` row written by the REAL registrar for a
+    /// push in a registered session resolves `TenantScope::Owned(t)` — its
+    /// outbox `session_id` is a synthetic UUIDv5 the registry never holds, so
+    /// the payload stamp is the only way there — and on a MULTI-bound device
+    /// that scope presents `t`'s own slot instead of degrading to no bearer.
+    #[test]
+    fn commit_report_row_resolves_its_owning_tenant_and_presents_its_slot() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        const OWNING: Uuid = Uuid::from_u128(0x0c0c_0000_0000_4000_8000_0000_0000_000a);
+        const DEFAULT: Uuid = Uuid::from_u128(0x0d0d_0000_0000_4000_8000_0000_0000_000b);
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let reg = crate::claude_session::coord_register::AiCoordRegistrar::with_tenant_resolver(
+            outbox.clone(),
+            Uuid::new_v4(),
+            || Some(OWNING),
+        );
+        let harness = Uuid::new_v4().to_string();
+        reg.register_session(&harness, "push work", None).unwrap();
+        reg.report_commits(&harness, "o/r", "feat/x", vec!["sha1".into()]);
+
+        let row = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event_kind == "commit_report")
+            .expect("a commit_report row");
+        let scope = record_session_tenant(&coord.inner, &row);
+        assert_eq!(scope, TenantScope::Owned(OWNING));
+
+        // Multi-bound device: default binding + two tenant slots.
+        let jwt = |tag: &str| {
+            use base64::Engine as _;
+            let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let exp = chrono::Utc::now().timestamp() + 3 * 60 * 60;
+            format!(
+                "{}.{}.sig",
+                enc(br#"{"alg":"none","typ":"JWT"}"#),
+                enc(format!(r#"{{"sub":"{tag}","exp":{exp}}}"#).as_bytes())
+            )
+        };
+        let mgr = crate::auth::AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(dir.path().join("auth.enc")).unwrap(),
+        );
+        let default_jwt = jwt("default");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        mgr.store_tenant_device_jwt(&DEFAULT, &jwt("slot.default"))
+            .unwrap();
+        let owning_jwt = jwt("slot.owning");
+        mgr.store_tenant_device_jwt(&OWNING, &owning_jwt).unwrap();
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&mgr, scope, Some(DEFAULT), 2).as_deref(),
+            Some(owning_jwt.as_str()),
+            "a stamped commit report must present its owning tenant's slot on a multi-bound device"
+        );
+    }
+
+    /// Phase 0 (b): a push whose session the registrar cannot resolve leaves
+    /// the row unstamped — NOT stamped with the device default the resolver
+    /// would answer — so it stays `Unresolved` (today's behaviour, and the D2
+    /// degrade still decides).
+    #[test]
+    fn commit_report_row_without_a_resolvable_tenant_stays_unresolved() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        const DEFAULT: Uuid = Uuid::from_u128(0x0d0d_0000_0000_4000_8000_0000_0000_000c);
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let reg = crate::claude_session::coord_register::AiCoordRegistrar::with_tenant_resolver(
+            outbox.clone(),
+            Uuid::new_v4(),
+            || Some(DEFAULT),
+        );
+        reg.report_commits("never-registered", "o/r", "feat/x", vec!["sha1".into()]);
+
+        let row = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event_kind == "commit_report")
+            .expect("a commit_report row");
+        assert!(row.payload.get("tenant_id").is_none());
+        assert_eq!(
+            record_session_tenant(&coord.inner, &row),
             TenantScope::Unresolved
         );
     }

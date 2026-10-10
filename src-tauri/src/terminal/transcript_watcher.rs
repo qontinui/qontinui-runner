@@ -1479,7 +1479,11 @@ async fn tail_session(
             if let Some(reg) = registrar.as_ref() {
                 let pushes = super::commit_report::parse_line_for_pushes(line);
                 for obs in pushes {
-                    super::commit_report::dispatch_push_observation(obs, reg.clone());
+                    super::commit_report::dispatch_push_observation(
+                        obs,
+                        session_id.clone(),
+                        reg.clone(),
+                    );
                 }
 
                 // Sensitive agent actions (Phase 9): a `tool_use` line parks

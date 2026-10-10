@@ -23,9 +23,14 @@
 //! [`crate::session::local_store::OutboxWriter`] (via
 //! [`crate::claude_session::coord_register::AiCoordRegistrar::report_commits`]).
 //! The existing `CoordSync` drain loop POSTs it to
-//! `POST /coord/commits/report {repo, branch, shas[]}`. Coord resolves the
-//! session **server-side** from `(repo, branch)`; the body carries NO session
-//! id (plan §Population path 2).
+//! `POST /coord/commits/report {repo, branch, shas[], tenant_id?}`. Coord
+//! resolves the session **server-side** from `(repo, branch)`; the body carries
+//! NO session id (plan §Population path 2). It does carry the pushing session's
+//! owning `tenant_id` whenever the registrar can resolve one from the
+//! transcript's session id — the field the drain reads to pick that tenant's
+//! credential slot (plan
+//! `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`,
+//! Phase 0).
 //!
 //! ## Dedup
 //!
@@ -422,8 +427,12 @@ pub fn reset_dedup_for_test() {
 /// Full pipeline for one push observation: resolve git facts, apply dedup, and
 /// (when warranted) report via the registrar. Best-effort — logs and returns on
 /// any miss. Synchronous git calls are cheap and run on the tail task's thread.
+///
+/// `session_key` is the harness id of the transcript the push was seen in; the
+/// registrar resolves the report's owning tenant from it.
 pub fn handle_push_observation(
     obs: &PushObservation,
+    session_key: &str,
     registrar: &crate::claude_session::coord_register::AiCoordRegistrar,
 ) {
     if !report_enabled() {
@@ -444,7 +453,7 @@ pub fn handle_push_observation(
         );
         return;
     }
-    registrar.report_commits(&resolved.repo, &resolved.branch, resolved.shas);
+    registrar.report_commits(session_key, &resolved.repo, &resolved.branch, resolved.shas);
 }
 
 // ── Bounded fan-out ──────────────────────────────────────────────────────────
@@ -552,12 +561,16 @@ static PUSH_DISPATCHER: Lazy<PushDispatcher> =
 ///
 /// This is what the transcript tail loop calls, in place of an unbounded
 /// `spawn_blocking` per line. Returns whether the observation was queued.
+/// `session_key` is the transcript's harness session id (see
+/// [`handle_push_observation`]); the tenant is resolved on the worker, at
+/// report time, so a registration that lands just after the push still counts.
 pub fn dispatch_push_observation(
     obs: PushObservation,
+    session_key: String,
     registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
 ) -> bool {
     let accepted = PUSH_DISPATCHER.try_dispatch(move || {
-        handle_push_observation(&obs, &registrar);
+        handle_push_observation(&obs, &session_key, &registrar);
     });
     if !accepted {
         warn!(
