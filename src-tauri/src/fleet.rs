@@ -1486,7 +1486,8 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 // read it, and `ci:node` would break all of them for zero capability gain.
 //
 // The memory tiers `mem_ge_<N>` (N in `MEMORY_TIERS_GIB`: 8..256 GiB,
-// cumulative) are the second exception to that grammar, after bare `ci_node`, deliberately: plan
+// cumulative) are the second exception to that grammar, after bare `ci_node`,
+// and deliberately so: plan
 // `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6 fixes the
 // spelling as the wire contract `canonical_repos.ci_node_required_capabilities`
 // seeds name, and coord's `@>` containment needs no grammar. Total memory is
