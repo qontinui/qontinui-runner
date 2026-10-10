@@ -135,7 +135,11 @@
 //!   `terminal_*` / `chat_get_output` handlers and its `terminal-output` /
 //!   `ai-output` / `session-state` forwards,
 //!   `mcp::remote_terminal::gate_remote_frame` and `RemoteAttachClient`;
-//! - code mirror: `agent_pusher::push_one`;
+//! - code mirror: `agent_pusher::push_one`, and the relay's `http_request`
+//!   reads of repo / worktree content (`/files/read`, `/files/browse`,
+//!   `/worktrees/diff`) in the tenant of the session working in that path's
+//!   closest enclosing directory ([`path_session_tenant`]), else the
+//!   strictest bound tenant;
 //! - telemetry: the `sentry::init` block in `main`, `otel::init_otel`, and the
 //!   relay's `ui-error` / `recent-crash` forwards;
 //! - update check: `check_for_updates` / `install_update`;
@@ -1081,6 +1085,77 @@ pub(crate) fn task_run_session_tenant(task_run_id: &str) -> SessionScope {
             .and_then(|r| r.recorded_tenant(task_run_id))
     });
     SessionScope::from_lookup(tenant)
+}
+
+/// The scope that owns the repository / worktree content at `path`: the open
+/// session whose working directory is the CLOSEST ancestor of `path`
+/// (component-wise). Several sessions at that closest directory must agree —
+/// sessions of different tenants sharing one checkout make it
+/// [`SessionScope::Unresolved`], as does a path no open session works under,
+/// a non-UUID stamp, or the lookup not installed. A session spawned without a
+/// tenant choice is [`SessionScope::DeviceDefault`].
+pub(crate) fn path_session_tenant(path: &str) -> SessionScope {
+    #[cfg(test)]
+    if let Some(faked) = test_support::faked_session_tenant(path) {
+        return faked;
+    }
+    use tauri::Manager;
+    let Some(app) = SESSION_TENANT_APP.get() else {
+        return SessionScope::Unresolved;
+    };
+    let Some(store) = app.try_state::<std::sync::Arc<
+        crate::session::session_lifecycle_store::SessionLifecycleStore,
+    >>() else {
+        return SessionScope::Unresolved;
+    };
+    let records = store.open_records();
+    scope_for_path(
+        path,
+        records
+            .iter()
+            .filter_map(|r| Some((r.working_dir.as_deref()?, r.tenant_id.as_deref()))),
+    )
+}
+
+/// The rule behind [`path_session_tenant`] over `(working_dir, tenant stamp)`
+/// pairs. PURE.
+pub(crate) fn scope_for_path<'a>(
+    path: &str,
+    sessions: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> SessionScope {
+    let target = Path::new(path);
+    if !target.is_absolute() {
+        return SessionScope::Unresolved;
+    }
+    let mut best: Option<(usize, Vec<Option<&'a str>>)> = None;
+    for (dir, stamp) in sessions {
+        let dir = Path::new(dir);
+        if !dir.is_absolute() || !target.starts_with(dir) {
+            continue;
+        }
+        let depth = dir.components().count();
+        match &mut best {
+            Some((d, stamps)) if *d == depth => stamps.push(stamp),
+            Some((d, _)) if *d > depth => {}
+            _ => best = Some((depth, vec![stamp])),
+        }
+    }
+    let Some((_, stamps)) = best else {
+        return SessionScope::Unresolved;
+    };
+    let scopes: Vec<SessionScope> = stamps
+        .into_iter()
+        .map(|stamp| match stamp {
+            None => SessionScope::DeviceDefault,
+            Some(s) => Uuid::parse_str(s)
+                .map(SessionScope::Tenant)
+                .unwrap_or(SessionScope::Unresolved),
+        })
+        .collect();
+    match scopes.first() {
+        Some(first) if scopes.iter().all(|s| s == first) => *first,
+        _ => SessionScope::Unresolved,
+    }
 }
 
 /// [`permit_for`] in the default scope.
@@ -2430,6 +2505,41 @@ mod tests {
         assert!(!permit_session(Flow::TranscriptSync, SessionScope::Unresolved).allowed);
         assert!(!transcript_sync_gate_session(SessionScope::from_lookup(None)).is_open());
         assert!(permit_session(Flow::TranscriptSync, SessionScope::DeviceDefault).allowed);
+    }
+
+    /// Code-mirror relay reads: a path belongs to the session working in its
+    /// closest enclosing directory; disagreement or no session is unresolved.
+    #[test]
+    fn a_path_is_owned_by_the_session_working_closest_above_it() {
+        let a = Uuid::from_u128(0xa5).to_string();
+        let b = Uuid::from_u128(0xb5).to_string();
+        let sessions = [
+            ("/work/root", Some(b.as_str())),
+            ("/work/root/wt-a", Some(a.as_str())),
+            ("/work/shared", Some(a.as_str())),
+            ("/work/shared", Some(b.as_str())),
+            ("/work/plain", None),
+            ("/work/bad", Some("not-a-uuid")),
+        ];
+        let scope = |p: &str| scope_for_path(p, sessions.iter().copied());
+        assert_eq!(
+            scope("/work/root/wt-a/src/lib.rs"),
+            SessionScope::Tenant(Uuid::from_u128(0xa5))
+        );
+        assert_eq!(
+            scope("/work/root/other/x"),
+            SessionScope::Tenant(Uuid::from_u128(0xb5))
+        );
+        assert_eq!(
+            scope("/work/root/wt-ab/x"),
+            SessionScope::Tenant(Uuid::from_u128(0xb5)),
+            "component-wise"
+        );
+        assert_eq!(scope("/work/shared/x"), SessionScope::Unresolved);
+        assert_eq!(scope("/work/plain/x"), SessionScope::DeviceDefault);
+        assert_eq!(scope("/work/bad/x"), SessionScope::Unresolved);
+        assert_eq!(scope("/elsewhere/x"), SessionScope::Unresolved);
+        assert_eq!(scope("relative/x"), SessionScope::Unresolved);
     }
 
     /// Re-review 9: the transcript and code-mirror paths that know their
