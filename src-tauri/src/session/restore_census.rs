@@ -673,6 +673,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             confirmed_at: confirmed.then_some(3),

@@ -9,8 +9,14 @@
 //! - User messages: responds with an assistant message + result
 //! - Interrupt: responds with a result immediately
 //! - Control requests from runner: not applicable (this mock is the "CLI" side)
+//!
+//! **`--replay <fixture.ndjson> [--exit-code N]`** replays a recorded CLI
+//! stdout (plan `2026-09-20-ai-session-handling-is-claude-shaped-…` Phase 8;
+//! the fixtures are Phase 2's `tests/fixtures/cli_protocol/claude/<ver>/`),
+//! honoring the order the real CLI answered in — see [`replay`].
 
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,8 +70,33 @@ struct UserMessagePayload {
 struct IncomingControlResponse {
     #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    response: Option<Value>,
     #[serde(flatten)]
     _data: serde_json::Map<String, Value>,
+}
+
+/// The `can_use_tool` answer a control response carries, judged the way Claude
+/// Code 2.1.285 judges it (plan 2026-09-20-ai-session-handling-is-claude-shaped,
+/// Phase 2 probe Q1): only the SDK's nested shape —
+/// `{"response":{"subtype":"success","request_id":<id>,"response":{"behavior":…}}}`
+/// — answers the request; anything else (the runner's former top-level
+/// `request_id` + `{"allowed": true}`) is ignored and the turn waits.
+fn tool_answer(resp: &IncomingControlResponse, request_id: &str) -> Option<(String, String)> {
+    let body = resp.response.as_ref()?;
+    if body.get("subtype")?.as_str()? != "success"
+        || body.get("request_id")?.as_str()? != request_id
+    {
+        return None;
+    }
+    let answer = body.get("response")?;
+    let behavior = answer.get("behavior")?.as_str()?.to_string();
+    let message = answer
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((behavior, message))
 }
 
 // ============================================================================
@@ -178,9 +209,206 @@ fn send_assistant_and_result(text: &str, session_id: &str) {
 // Main loop
 // ============================================================================
 
+// ============================================================================
+// --replay: a recorded CLI session, frame for frame
+// ============================================================================
+
+/// The value after `flag` in `args`, if present.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// The scenario the fixture's sibling `manifest.json` records for it (the
+/// entry whose `stdout` names the fixture file), if there is one.
+fn manifest_scenario(fixture: &Path) -> Option<Value> {
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.parent()?.join("manifest.json")).ok()?,
+    )
+    .ok()?;
+    let name = fixture.file_name()?.to_str()?;
+    manifest
+        .get("scenarios")?
+        .as_object()?
+        .values()
+        .find(|sc| sc.get("stdout").and_then(Value::as_str) == Some(name))
+        .cloned()
+}
+
+/// A process exit status as an exit code: a recorded signal death (`-9`)
+/// becomes the shell convention `128 + signal`.
+fn as_exit_code(recorded: i64) -> i32 {
+    if recorded < 0 {
+        128 + (-recorded).min(127) as i32
+    } else {
+        recorded.min(255) as i32
+    }
+}
+
+/// Next non-empty stdin frame parsed as JSON; `None` at EOF. A line that is
+/// not JSON is reported on stderr and skipped.
+fn next_stdin_frame(lines: &mut impl Iterator<Item = io::Result<String>>) -> Option<Value> {
+    for line in lines {
+        let line = line.ok()?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str(trimmed) {
+            Ok(v) => return Some(v),
+            Err(e) => eprintln!("mock_claude_cli --replay: unparseable stdin line: {e}"),
+        }
+    }
+    None
+}
+
+/// Read stdin until a frame `pred` accepts; `None` at EOF. Frames it does not
+/// accept are reported on stderr — the recorded CLI did not see them.
+fn await_stdin_frame(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    what: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Option<Value> {
+    loop {
+        let frame = next_stdin_frame(lines)?;
+        if pred(&frame) {
+            return Some(frame);
+        }
+        eprintln!(
+            "mock_claude_cli --replay: ignoring stdin frame of type {:?} while awaiting {what}",
+            frame.get("type").and_then(Value::as_str).unwrap_or("?")
+        );
+    }
+}
+
+fn frame_type(v: &Value) -> Option<&str> {
+    v.get("type").and_then(Value::as_str)
+}
+
+fn write_raw_line(line: &str) {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    writeln!(handle, "{line}").expect("Failed to write to stdout");
+    handle.flush().expect("Failed to flush stdout");
+}
+
+/// Replay `fixture` (a recorded CLI stdout) the way the CLI produced it,
+/// returning the process exit code:
+///
+/// 1. await the runner's `initialize` control request, then write the fixture
+///    through its first `control_response` (the handshake answer), with the
+///    recorded `request_id` rewritten to the one the runner sent;
+/// 2. await the runner's `user` message, then write the rest of the turn —
+///    after each `control_request` the CLI sent (a `can_use_tool`), await the
+///    runner's `control_response` before writing on, because the CLI waits;
+/// 3. like the CLI, exit at stdin EOF, with the recorded exit code
+///    (`--exit-code N` overrides the fixture's `manifest.json`). A scenario
+///    the probe had to kill (`killed_by_probe_watchdog`) hangs as the CLI did,
+///    bounded, then exits `128 + signal`.
+fn replay(fixture: &Path, exit_override: Option<i64>) -> i32 {
+    let text = match std::fs::read_to_string(fixture) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "mock_claude_cli --replay: cannot read {}: {e}",
+                fixture.display()
+            );
+            return 2;
+        }
+    };
+    let scenario = manifest_scenario(fixture);
+    let recorded_exit = exit_override
+        .or_else(|| scenario.as_ref()?.get("exit_code")?.as_i64())
+        .unwrap_or(0);
+    let killed = scenario
+        .as_ref()
+        .and_then(|sc| sc.get("killed_by_probe_watchdog")?.as_bool())
+        .unwrap_or(false);
+    let exit_code = as_exit_code(recorded_exit);
+
+    let frames: Vec<(&str, Value)> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok().map(|v| (l, v)))
+        .collect();
+    let handshake_end = frames
+        .iter()
+        .position(|(_, v)| frame_type(v) == Some("control_response"))
+        .map_or(0, |i| i + 1);
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    // 1. The init handshake.
+    let Some(init) = await_stdin_frame(&mut lines, "initialize", |v| {
+        frame_type(v) == Some("control_request")
+            && v.pointer("/request/subtype").and_then(Value::as_str) == Some("initialize")
+    }) else {
+        return exit_code;
+    };
+    let runner_request_id = init
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for (line, v) in &frames[..handshake_end] {
+        let recorded_id = v.pointer("/response/request_id").and_then(Value::as_str);
+        match recorded_id {
+            Some(rid) if frame_type(v) == Some("control_response") && rid != runner_request_id => {
+                write_raw_line(&line.replacen(
+                    &format!("\"request_id\":\"{rid}\""),
+                    &format!("\"request_id\":\"{runner_request_id}\""),
+                    1,
+                ));
+            }
+            _ => write_raw_line(line),
+        }
+    }
+
+    // 2. The turn.
+    if await_stdin_frame(&mut lines, "a user message", |v| {
+        frame_type(v) == Some("user")
+    })
+    .is_none()
+    {
+        return exit_code;
+    }
+    for (line, v) in &frames[handshake_end..] {
+        write_raw_line(line);
+        if frame_type(v) == Some("control_request") {
+            let awaited = await_stdin_frame(&mut lines, "a control_response", |r| {
+                frame_type(r) == Some("control_response")
+            });
+            if awaited.is_none() {
+                return exit_code;
+            }
+        }
+    }
+
+    // 3. Exit as the CLI did.
+    while next_stdin_frame(&mut lines).is_some() {}
+    if killed {
+        // The CLI never exited on its own; the probe killed it.
+        std::thread::sleep(std::time::Duration::from_secs(600));
+    }
+    exit_code
+}
+
 fn main() {
     // Check for special modes via command-line args
     let args: Vec<String> = std::env::args().collect();
+    if let Some(fixture) = flag_value(&args, "--replay") {
+        let exit_override = match flag_value(&args, "--exit-code").map(str::parse::<i64>) {
+            Some(Ok(code)) => Some(code),
+            Some(Err(e)) => {
+                eprintln!("mock_claude_cli: --exit-code: {e}");
+                std::process::exit(2);
+            }
+            None => None,
+        };
+        std::process::exit(replay(Path::new(fixture), exit_override));
+    }
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("normal");
 
     let stdin = io::stdin();
@@ -280,11 +508,25 @@ fn main() {
                     }
                 }
             }
-            IncomingMessage::ControlResponse(_resp) => {
-                // This is the runner approving a tool use request.
-                // In tool_use mode, now send the actual response.
+            IncomingMessage::ControlResponse(resp) => {
+                // The runner answering the tool-use request. In tool_use mode,
+                // finish the turn — but only for an answer the real CLI would
+                // accept (see `tool_answer`).
                 if mode == "tool_use" {
-                    send_assistant_and_result("Tool approved, executed successfully.", "default");
+                    match tool_answer(&resp, "mock_tool_req_1") {
+                        Some((behavior, _)) if behavior == "allow" => send_assistant_and_result(
+                            "Tool approved, executed successfully.",
+                            "default",
+                        ),
+                        Some((behavior, message)) if behavior == "deny" => send_assistant_and_result(
+                            &format!("Tool denied: {message}"),
+                            "default",
+                        ),
+                        _ => eprintln!(
+                            "mock_claude_cli: ignoring a control_response the CLI would not accept: {:?}",
+                            resp.response
+                        ),
+                    }
                 }
             }
         }

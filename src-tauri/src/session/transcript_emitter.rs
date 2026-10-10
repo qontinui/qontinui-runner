@@ -61,7 +61,7 @@
 //! `LoopController::run` at run start and closed at run end, so the
 //! executor's emit hooks resolve. Interactive panes are registered by
 //! `AiCoordRegistrar::register_sniffed_session` from
-//! `terminal::claude_resume_sniff`, so
+//! `terminal::typed_resume_sniff`, so
 //! [`super::session_transcript_tailer`]'s emits resolve. A session with no
 //! resolvable coord session (registration gated off via
 //! `QONTINUI_SESSION_AUTOMATION_REGISTER`, a run kind that never registers,

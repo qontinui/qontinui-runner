@@ -3530,6 +3530,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::task_sync::sync_deferred_questions,
             commands::terminal::terminal_ack,
             commands::terminal::terminal_cleanup_scrollback,
+            commands::terminal::terminal_cli_profiles,
+            commands::cli_availability::cli_profile_availability,
+            commands::session_failure::terminal_failures,
+            commands::session_failure::terminal_report_resume_failure,
+            commands::session_failure::terminal_report_resume_verified,
+            commands::session_failure::terminal_failure_dismiss,
+            commands::structured_session::create_structured_session,
+            commands::structured_session::respond_session_permission,
+            commands::structured_session::session_pending_permissions,
             commands::terminal::terminal_close,
             commands::terminal::terminal_collect_session_metadata,
             commands::terminal::terminal_create,
@@ -4679,7 +4688,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 match session::claude_session_registry::live_pids_from_snapshot(&snap) {
                                     Ok(live_pids) => session::claude_session_registry::read_live_sessions(
-                                        &terminal::transcript::find_claude_config_dirs(),
+                                        &terminal::transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE),
                                         &live_pids,
                                     )
                                     .into_iter()

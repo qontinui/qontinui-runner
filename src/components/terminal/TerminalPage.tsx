@@ -1,10 +1,12 @@
 import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { PastSession } from "./usePastSessions";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
@@ -57,7 +59,10 @@ import { callRegistry, textArg, useTerminalCommands } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
-import { ResumeFailedBanner } from "./ResumeFailedBanner";
+import { SessionFailureBanner } from "./SessionFailureBanner";
+import { RestoreTerminalOnlyNote } from "./RestoreTerminalOnlyNote";
+import { dismissSessionFailure, useSessionFailures } from "./useSessionFailures";
+import { structuredLaunchCwd } from "./providerLaunchMenu";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
@@ -76,6 +81,7 @@ import {
   type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
+import { loadCliProfiles, providerDescriptorFor } from "./providerAdapter";
 import {
   getActiveProjectHint,
   subscribeActiveProject,
@@ -99,6 +105,14 @@ import { useZoneProfileRestore } from "./useZoneProfileRestore";
 import { useHotField } from "./useTerminalHotStore";
 
 const logger = createLogger("TerminalPage");
+
+/**
+ * The CLI profile id of Claude Code. The page's account roster
+ * (`claude_config_dirs`, `/spawn-ai <account>`, the per-account launch
+ * commands) is a roster of CLAUDE accounts, so those surfaces launch this
+ * profile; every other CLI is launched through the provider launch menu.
+ */
+const CLAUDE_PROVIDER = "claude";
 
 /**
  * `paramSchema`s hoisted so the REGISTRATION and its guarded HANDLER read the
@@ -690,6 +704,9 @@ function TerminalPageInner({
     assignmentsRef.current = zoneLayout.assignments;
   }, [zoneLayout.assignments]);
   const tabsRef = useRef(tabs);
+  // Active AI-session failures per tab, as the runner classifies them (plan
+  // 2026-09-20-ai-session-handling-is-claude-shaped, Phase 7).
+  const sessionFailures = useSessionFailures(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
@@ -719,11 +736,13 @@ function TerminalPageInner({
       claudeSessionId: string,
       configDir?: string,
       origin: SessionOrigin = "reconciled",
+      provider?: string,
     ) => {
       const args = buildSessionOpenArgs({
         assignments: assignmentsRef.current,
         tabs: tabsRef.current,
         tabId,
+        provider,
         claudeSessionId,
         configDir,
         pageId,
@@ -998,6 +1017,7 @@ function TerminalPageInner({
         tabId,
         claudeSessionId: tab.claudeSessionId,
         configDir: tab.claudeConfigDir,
+        provider: tab.sessionProvider,
         updateTab,
         // Re-assert payload for the verified branch — no origin, so the
         // backend preserves the record's existing origin.
@@ -1020,6 +1040,14 @@ function TerminalPageInner({
   // was restored but the provider can't bring the conversation back by id — so
   // the only affordance is acknowledging the note; clearing the flag drops the
   // tab from the banner's terminal-only list.
+  // Acknowledge one session failure. The runner removes it and announces the
+  // clear, which is what drops the row.
+  const handleDismissFailure = useCallback((tabId: string, failureId: string) => {
+    dismissSessionFailure(tabId, failureId).catch((err) => {
+      logger.warn(`terminal_failure_dismiss failed for ${tabId}/${failureId}: ${err}`);
+    });
+  }, []);
+
   const handleDismissTerminalOnly = useCallback(
     (tabId: string) => {
       updateTab(tabId, { restoreTerminalOnly: false });
@@ -1162,9 +1190,40 @@ function TerminalPageInner({
     return createdTabIds;
   };
 
-  const handleLaunchAiSession = async (
+  /**
+   * A launched tab's title. A Claude tab is named for its account (the
+   * per-account launch command, else the `.claude-<name>` dir suffix); any
+   * other CLI for itself.
+   */
+  const launchTabLabel = (
+    provider: string,
+    configDir: string | null,
+    displayName: string | undefined,
+  ): string => {
+    if (provider !== CLAUDE_PROVIDER) return displayName ?? provider;
+    if (configDir === null) return CLAUDE_PROVIDER;
+    const customCmd = sessionManager.launchCommands?.[configDir];
+    const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+    return customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? CLAUDE_PROVIDER;
+  };
+
+  /**
+   * Open `count` terminals and type a new session of the served CLI profile
+   * `provider` into each. `configDir` is the account dir for the profile's
+   * account variable; `null` launches under the CLI's default account.
+   *
+   * What happens to the session id depends on the profile. A pinning CLI
+   * (Claude) runs under the fresh id the builder pins, recorded here at once.
+   * A CLI that mints its own (Codex) reports no pin: the tab is stamped with
+   * its provider, and the runner's read-back capture records the session and
+   * stamps the id (`session-bound`) once it appears. Only a Claude launch whose
+   * per-account alias dropped the pin falls back to the Claude transcript
+   * capture.
+   */
+  const launchAiSessions = async (
     count: number,
-    configDir: string,
+    provider: string,
+    configDir: string | null,
     context?: string,
     tenantId?: string,
   ): Promise<string[]> => {
@@ -1174,9 +1233,11 @@ function TerminalPageInner({
     const spawnTenant = resolveTenantForSpawn(tenantId);
 
     const isWindows = navigator.platform.startsWith("Win");
-    const customCmd = sessionManager.launchCommands?.[configDir];
-    const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-    const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
+    // Profiles are served by the runner; make sure the cache is primed before
+    // reading the descriptor (a no-op once it is).
+    await loadCliProfiles();
+    const descriptor = providerDescriptorFor(provider);
+    const label = launchTabLabel(provider, configDir, descriptor?.displayName);
     const createdTabIds: string[] = [];
     for (let i = 0; i < count; i++) {
       const tabId = await createAndAssignTerminal(label, undefined, spawnTenant);
@@ -1191,9 +1252,10 @@ function TerminalPageInner({
       for (const tabId of createdTabIds) {
         // Fresh uuid per tab/retype (a reused --session-id fails loudly) —
         // the registry records synchronously, no transcript mtime guess. The
-        // Rust launch-spec builder reads the operator's per-account override +
-        // global template from settings itself; the frontend only supplies the
-        // fresh id it needs synchronously for updateTab/recordSessionOpen.
+        // Rust launch-spec builder reads the profile, and for Claude the
+        // operator's per-account override + global template, itself; the
+        // frontend only supplies the fresh id it needs synchronously for
+        // updateTab/recordSessionOpen.
         //
         // The PTY already exists at this point, so a throw here (a Tauri fault,
         // a data-less response) would strand a bare shell with no toast and no
@@ -1201,7 +1263,7 @@ function TerminalPageInner({
         // answers null — we skip the tab rather than type into a dead one.
         const launch = await buildAiLaunchCommandForTab(
           tabId,
-          { configDir, isWindows, sessionId: crypto.randomUUID() },
+          { provider, configDir, isWindows, sessionId: crypto.randomUUID() },
           {
             disposeTab: closeTerminal,
             notify: (message) => workflowGen.setNotification({ message, type: "error" }),
@@ -1211,10 +1273,19 @@ function TerminalPageInner({
         const { command, pinnedSessionId } = launch;
         launchedTabIds.push(tabId);
         writeWhenReady(tabId, `${command}\r`);
+        const accountDir = configDir ?? undefined;
         if (pinnedSessionId) {
-          updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
-          rememberSessionId(tabId, pinnedSessionId, configDir);
-          recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
+          updateTab(tabId, {
+            claudeSessionId: pinnedSessionId,
+            claudeConfigDir: accountDir,
+            sessionProvider: provider,
+          });
+          rememberSessionId(tabId, pinnedSessionId, accountDir);
+          recordSessionOpen(tabId, pinnedSessionId, accountDir, "authoritative", provider);
+        } else if (descriptor?.readsIdBack) {
+          // The CLI mints its own id; the runner's read-back capture records it
+          // and stamps the tab. Nothing to guess here.
+          updateTab(tabId, { sessionProvider: provider });
         } else {
           // Custom launch command (an alias that may drop the runner's
           // `--session-id` pin) — the id is unknown up front, so fall back to
@@ -1222,8 +1293,9 @@ function TerminalPageInner({
           // of `startSessionIdCapture`; it binds origin "reconciled" (a
           // freshest-mtime guess), so restore treats it as terminal-only rather
           // than auto-resuming. Every pinned path above records authoritatively.
+          updateTab(tabId, { sessionProvider: provider });
           const tab = tabs.find((t) => t.id === tabId);
-          startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
+          startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, accountDir);
         }
       }
       if (context && launchedTabIds.length > 0) {
@@ -1236,6 +1308,84 @@ function TerminalPageInner({
       }
     }
     return launchedTabIds;
+  };
+
+  /**
+   * `/spawn-ai` and every account-picking surface: a Claude session under the
+   * Claude account `configDir` (the account roster, `claude_config_dirs`, is
+   * Claude's).
+   */
+  const handleLaunchAiSession = (
+    count: number,
+    configDir: string,
+    context?: string,
+    tenantId?: string,
+  ): Promise<string[]> => launchAiSessions(count, CLAUDE_PROVIDER, configDir, context, tenantId);
+
+  /**
+   * The provider launch menu (`ProviderLaunchMenu`): one session of
+   * `provider`. Claude takes the configured account with the most spare
+   * capacity, as `/spawn-ai best` does; with no account configured, or for any
+   * other CLI, the CLI's own default account.
+   */
+  const handleLaunchProvider = (provider: string): void => {
+    const configDir =
+      provider === CLAUDE_PROVIDER
+        ? ([...spawnAccounts].sort(compareByUsageHeadroom)[0]?.config_dir ?? null)
+        : null;
+    void launchAiSessions(1, provider, configDir);
+  };
+
+  /**
+   * The launch menu's explicit "structured" choice (plan
+   * `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+   * Phase 9): a stream-json session in `Prompt` mode, whose tool calls arrive
+   * as permission cards in its `StructuredSessionCell`. The runner opens it
+   * and records it (`create_structured_session`); the page adopts the record
+   * through the same door a Conductor worker uses, into the first empty zone.
+   */
+  const handleLaunchStructured = async (provider: string): Promise<void> => {
+    const emptyZone = zoneLayout.layout.zones.findIndex((_, idx) => !zoneLayout.assignments[idx]);
+    let resp: CommandResponse;
+    try {
+      resp = await invoke<CommandResponse>("create_structured_session", {
+        provider,
+        pageId,
+        zoneIndex: Math.max(emptyZone, 0),
+        // The focused terminal's cwd; with none, the runner uses the home dir.
+        workingDir: structuredLaunchCwd(tabs, zoneLayout.assignments, zoneLayout.focusedZone),
+        title: null,
+      });
+    } catch (e) {
+      workflowGen.setNotification({
+        message: `Structured session failed to start: ${describeThrown(e, "no detail")}`,
+        type: "error",
+      });
+      return;
+    }
+    const record = (resp.data as { record?: TerminalSessionRecord } | undefined)?.record;
+    if (!resp.success || !record) {
+      workflowGen.setNotification({
+        message: resp.message ?? "Structured session failed to start",
+        type: "error",
+      });
+      return;
+    }
+    const tabId = adoptWorkerTab(record);
+    if (!tabId) {
+      // No cell ⇒ nobody can answer its permission requests: close it rather
+      // than leave a prompting session stalling unseen.
+      void invoke("close_ai_session", { taskRunId: record.taskRunId }).catch(() => {});
+      workflowGen.setNotification({
+        message: "Structured session started but could not be shown, so it was closed",
+        type: "error",
+      });
+      return;
+    }
+    if (emptyZone >= 0) {
+      zoneLayout.assignTabToZone(emptyZone, tabId);
+      zoneLayout.setFocusedZone(emptyZone);
+    }
   };
 
   // Phase 1b — register the Terminal-page command set. Sources the spawn
@@ -1523,6 +1673,8 @@ function TerminalPageInner({
               sessionConflictCounts={fileConflicts.sessionConflictCounts}
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
+              onLaunchProvider={handleLaunchProvider}
+              onLaunchStructured={(provider) => void handleLaunchStructured(provider)}
             />
           )}
 
@@ -1697,17 +1849,24 @@ function TerminalPageInner({
                 every terminal is already at the root. */}
             <ProjectFolderChip />
 
-            {/* Honest restore-status banner (Phase 5 + #548): restored tabs
-                whose `--resume` failed (operator retry), reconciled best-effort
-                matches (one-click confirm), and terminal-only / fresh-
-                conversation restores (informational, dismissible) — instead of
-                any of these silently posing as a fully resumed conversation.
-                Same top-right advisory column. */}
-            <ResumeFailedBanner
+            {/* The one AI-session failure surface (plan
+                2026-09-20-ai-session-handling-is-claude-shaped, Phase 7): every
+                failure the runner classified for a tab here — a resume whose
+                handshake never appeared (operator retry), an exhausted quota,
+                a rate limit, an exited CLI, … — rendered from its payload, a
+                hint worded "may have …" until confirmed. */}
+            <SessionFailureBanner
               tabs={tabs}
+              failures={sessionFailures}
               onRetryResume={handleRetryResume}
-              onDismissTerminalOnly={handleDismissTerminalOnly}
+              onDismiss={handleDismissFailure}
             />
+
+            {/* Honest restore tier (Phase 5): terminal-only / fresh-
+                conversation restores (informational, dismissible) — never
+                silently posing as a fully resumed conversation. Not a failure.
+                Same top-right advisory column. */}
+            <RestoreTerminalOnlyNote tabs={tabs} onDismiss={handleDismissTerminalOnly} />
 
             {/* Remote tabs from before a restart (remote-session-tabs plan,
                 Phase 4): placeholders with a Reattach action, never a

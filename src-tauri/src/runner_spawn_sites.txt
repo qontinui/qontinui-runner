@@ -47,9 +47,11 @@ agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuatio
 claude_session/runner.rs | run_claude_session_interactive | helper | run_claude_session_interactive(
 claude_session/runner.rs | run_claude_session_interactive_with_retry | helper | run_claude_session_interactive_with_retry(
 commands/ai_session.rs | create_ai_session | operator | -
+commands/ai_session.rs | open_ai_session | helper | open_ai_session(
 commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing
 commands/session.rs | session_start | operator | -
+commands/structured_session.rs | create_structured_session | operator | -
 commands/terminal.rs | create_terminal_session_backend | helper | create_terminal_session_backend(
 commands/terminal.rs | create_tracked_terminal_session_backend | helper | create_tracked_terminal_session_backend(
 commands/terminal.rs | terminal_create | operator | -
@@ -85,6 +87,7 @@ orchestration_loop/fix_agent.rs | run_fix_agent | exempt | the fix step of an or
 reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection
 reflection/trigger.rs | launch_reflection | autonomous | launch_reflection
 reflection/trigger.rs | launch_ui_bridge_reflection | autonomous | launch_ui_bridge_reflection
+session/failure_recovery.rs | resume_in_place | exempt | the resume_same_id recovery of a PTY session that was already running under the same id — refused while draining and bounded by the migration cap
 session/handoff.rs | materialize | autonomous | materialize
 session/mod.rs | start | helper | .start(intent)
 session/mod.rs | start_inner | helper | .start_inner(

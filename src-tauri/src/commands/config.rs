@@ -565,48 +565,57 @@ pub fn save_claude_default_launch_command(
     })
 }
 
-/// Build the PTY launch command for a new AI (`/spawn-ai`) session, routed
-/// through the shared launch-spec builder ([`crate::claude_session::launch_spec`]).
+/// Build the PTY launch command for a new AI session of `provider`, routed
+/// through the shared launch-spec builder ([`crate::session::launch_spec`]).
 ///
 /// This is the single source of truth for the #779 frontend `aiLaunchCommand.ts`
-/// (now a thin wrapper): the operator's per-account override and machine-global
-/// `claude_default_launch_command` flags layer in here, so the PTY-typed spawn
-/// and the argv spawn sites can never drift.
+/// (now a thin wrapper): every CLI spelling comes from `provider`'s CLI profile,
+/// and for a Claude launch the operator's per-account override and
+/// machine-global `claude_default_launch_command` flags layer in here, so the
+/// PTY-typed spawn and the argv spawn sites can never drift.
 ///
 /// # Arguments
-/// * `config_dir` - The account's `CLAUDE_CONFIG_DIR` (env-prefixed onto the
-///   command; also selects the per-account override template).
+/// * `provider` - The CLI profile id to launch (`"claude"`, `"codex"`). An
+///   unknown id is refused rather than launched as another CLI.
+/// * `config_dir` - The account dir, env-prefixed through the profile's account
+///   variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`); for Claude it also selects
+///   the per-account override template. `None` launches under the CLI's own
+///   default account.
 /// * `session_id` - Fresh UUIDv4 minted by the frontend (it needs the id
-///   synchronously to record the tab), pinned as `--session-id`/`{sessionId}`.
+///   synchronously to record the tab), pinned as `--session-id`/`{sessionId}`
+///   when the profile pins.
 /// * `is_windows` - PowerShell (`$env:…`) vs POSIX (`VAR=…`) env-prefix + quoting.
 ///
 /// Returns `{ command, pinnedSessionId }` matching the `AiLaunchCommand` TS
-/// contract. `pinnedSessionId` is the passed `session_id` when a real `claude`
-/// command was built; `null` when the per-account override was an opaque alias
-/// returned verbatim (no pin — the mtime-capture fallback then applies). The
-/// alias case is detected the same way the frontend did: a pinned command
-/// contains the id; a verbatim alias does not.
+/// contract. `pinnedSessionId` is the passed `session_id` only when the command
+/// actually pins it. It is `null` for a profile that reads its id back (Codex
+/// mints its own; the runner records it once its identity shim signals the
+/// start) and when a Claude per-account override was an opaque alias returned
+/// verbatim (no pin). The alias case is detected the way the frontend did: a
+/// pinned command contains the id; a verbatim alias does not.
 #[tauri::command]
 pub fn build_ai_launch_command(
-    config_dir: String,
+    provider: String,
+    config_dir: Option<String>,
     session_id: Option<String>,
     is_windows: bool,
 ) -> Result<CommandResponse, String> {
-    use crate::claude_session::launch_spec::{
-        render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
-    };
+    use crate::session::launch_spec::{render_pty_command, LaunchConfig, LaunchSpec};
 
-    let cfg = LaunchConfig::from_settings(Some(&config_dir));
+    let profile = qontinui_runner_lib::cli_profile::profile_for(&provider)
+        .ok_or_else(|| format!("no CLI profile for provider {provider:?}; nothing launched"))?;
+    let config_dir = config_dir.filter(|d| !d.trim().is_empty());
+    let cfg = LaunchConfig::from_settings(config_dir.as_deref());
     let spec = LaunchSpec {
-        config_dir: Some(config_dir),
-        permission: PermissionMode::BypassPermissions,
+        provider: profile,
+        config_dir,
         session_id: session_id.clone(),
         ..Default::default()
     };
     let command = render_pty_command(&spec, &cfg, is_windows);
 
     let pinned_session_id = match &session_id {
-        Some(id) if command.contains(id.as_str()) => Some(id.clone()),
+        Some(id) if spec.pins_session_id() && command.contains(id.as_str()) => Some(id.clone()),
         _ => None,
     };
 

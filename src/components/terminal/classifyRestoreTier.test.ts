@@ -7,30 +7,33 @@
  * the same confirmed-authoritative record restores TERMINAL-ONLY — never a
  * resume typed against an id the provider can't resume.
  *
- * No shipped provider declares `terminal-only` yet (Claude + Gemini are both
- * `full`), so this branch is exercised by STUBBING the descriptor registry — a
- * dedicated test file keeps the module mock isolated from the other
- * `useTerminalInitialization` suites (which assert the real Claude full-tier
- * behavior).
+ * No shipped provider declares `terminal-only` yet, so this suite primes the
+ * served-profile registry with two fixture profiles — one per tier — through
+ * the same `setCliProfiles` door the real `terminal_cli_profiles` load uses.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { afterAll, describe, it, expect, vi } from "vitest";
 
-// Stub the provider registry so we can drive both tiers deterministically.
-vi.mock("./providerAdapter", () => {
-  const make = (tier: "full" | "terminal-only") => ({
-    provider: tier === "full" ? "full-provider" : "terminal-only-provider",
-    resumeCommand: (id: string) => ["x", "--resume", id],
-    handshakePatterns: () => ({ success: [], failure: [] }),
-    restoreTier: () => tier,
-  });
-  return {
-    providerDescriptorFor: (p: string | undefined) =>
-      p === "terminal-only-provider" ? make("terminal-only") : make("full"),
-  };
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
+
+import { resetCliProfiles, setCliProfiles, type ServedCliProfile } from "./providerAdapter";
+import { classifyRestoreAction } from "./useTerminalInitialization";
+
+const fixtureProfile = (id: string, tier: "full" | "terminal_only"): ServedCliProfile => ({
+  id,
+  displayName: id,
+  programs: ["x"],
+  resume: { kind: "by_id_argv", template: ["x", "--resume", "{id}"] },
+  restoreTier: tier,
 });
 
-import { classifyRestoreAction } from "./useTerminalInitialization";
+setCliProfiles([
+  fixtureProfile("full-provider", "full"),
+  fixtureProfile("terminal-only-provider", "terminal_only"),
+]);
+afterAll(() => resetCliProfiles());
 
 describe("classifyRestoreAction — restore-tier gate (Phase 5)", () => {
   it("CONFIRMED authoritative + FULL-tier provider ⇒ auto-resume", () => {
@@ -95,6 +98,19 @@ describe("classifyRestoreAction — restore-tier gate (Phase 5)", () => {
         provider: "full-provider",
       }),
     ).toBe("terminal-only");
+  });
+
+  it("CONFIRMED authoritative + a provider with NO served profile ⇒ terminal-only (never Claude)", () => {
+    for (const provider of ["gemini", "claude-unprimed-here", undefined]) {
+      expect(
+        classifyRestoreAction({
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          confirmedAt: 1,
+          provider,
+        }),
+      ).toBe("terminal-only");
+    }
   });
 
   it("reconciled origin restores terminal-only regardless of provider tier", () => {

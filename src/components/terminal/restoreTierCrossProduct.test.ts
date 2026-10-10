@@ -32,9 +32,10 @@
  *
  * The terminal-only provider: no shipped provider declares `terminal-only`
  * yet, so both suites register a fixture provider named
- * `fixture-terminal-only` through their own seam (a module mock here, an
- * explicit adapter in Rust). `claude` rows go through the REAL registry on
- * both sides.
+ * `fixture-terminal-only` — the Claude profile under another id with a
+ * terminal-only tier (primed into the registry here, passed as an explicit
+ * profile in Rust). `claude` rows go through the REAL served profile on both
+ * sides.
  *
  * Ids: the fixture deliberately avoids a trailing-newline id. JavaScript's `$`
  * matches before a final `\n`, so `isValidSessionId("abc\n")` is true here
@@ -49,22 +50,29 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("./providerAdapter", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./providerAdapter")>();
-  const terminalOnly = {
-    ...actual.claudeDescriptor,
-    provider: "fixture-terminal-only",
-    restoreTier: () => "terminal-only" as const,
-  };
-  return {
-    ...actual,
-    providerDescriptorFor: (p: string | undefined) =>
-      p === "fixture-terminal-only" ? terminalOnly : actual.providerDescriptorFor(p),
-  };
-});
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
 
-import { providerDescriptorFor, type RestoreTier } from "./providerAdapter";
+import served from "../../../src-tauri/tests/fixtures/cli_screens/served_profiles.json";
+import {
+  providerDescriptorFor,
+  setCliProfiles,
+  type RestoreTier,
+  type ServedCliProfile,
+} from "./providerAdapter";
 import { classifyRestoreAction, type RestoreAction } from "./useTerminalInitialization";
+
+// The served profiles, plus the fixture's terminal-only provider: the real
+// Claude profile under another id with a terminal-only tier (the Rust half
+// builds the same one). `claude` rows go through the REAL served profile.
+const servedProfiles = served as ServedCliProfile[];
+const claudeProfile = servedProfiles.find((p) => p.id === "claude");
+if (!claudeProfile) throw new Error("served_profiles.json has no claude profile");
+setCliProfiles([
+  ...servedProfiles,
+  { ...claudeProfile, id: "fixture-terminal-only", restoreTier: "terminal_only" },
+]);
 
 const FIXTURE_PATH = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -163,9 +171,9 @@ describe("restore-tier cross product — classifyRestoreAction pins the shared f
     writeFileSync(FIXTURE_PATH, renderFixture(rows));
   }
 
-  it("the mocked registry resolves both provider tiers (claude through the REAL descriptor)", () => {
-    expect(providerDescriptorFor("claude").restoreTier()).toBe("full");
-    expect(providerDescriptorFor("fixture-terminal-only").restoreTier()).toBe("terminal-only");
+  it("the registry resolves both provider tiers (claude through the REAL served profile)", () => {
+    expect(providerDescriptorFor("claude")?.restoreTier()).toBe("full");
+    expect(providerDescriptorFor("fixture-terminal-only")?.restoreTier()).toBe("terminal-only");
   });
 
   it("covers the full 2×3×2×3×2 cross product", () => {

@@ -478,6 +478,20 @@ impl SessionIdentityUpdate {
     }
 }
 
+/// Which lane hosts a session (plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 6). Wire spelling `"pty"` / `"structured"`, mirrored by the frontend
+/// `SessionLane` union in `src/components/terminal/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLane {
+    /// The CLI's TUI in a PTY, driven by keystrokes.
+    #[default]
+    Pty,
+    /// The CLI's machine protocol (Claude's stream-json) — no PTY.
+    Structured,
+}
+
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +529,11 @@ pub struct TerminalSessionRecord {
     /// [`default_provider`]); they are all Claude today.
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// Which lane hosts the session: a PTY-hosted TUI, or the structured
+    /// (stream-json) lane. `#[serde(default)]`: every record written before the
+    /// field existed was a PTY session's, and reads back as `pty`.
+    #[serde(default)]
+    pub lane: SessionLane,
     /// How `claude_session_id` was bound:
     ///
     /// - `"authoritative"` — the runner KNOWS the id exactly (it pre-pinned
@@ -1501,6 +1520,9 @@ impl SessionLifecycleStore {
                 entry.terminal_id = rec.terminal_id;
             }
             entry.provider = rec.provider;
+            // The lane of the latest write: one session id can move between
+            // lanes, and the writer knows which one it runs in.
+            entry.lane = rec.lane;
             // Unasserted origin (zone-move backstop / boot re-assert) must not
             // degrade an authoritative binding to reconciled — preserve on
             // None. The incoming value is normalized so a legacy caller still
@@ -4555,6 +4577,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         closed_at: None,
         close_reason: None,
         provider: DEFAULT_PROVIDER.to_string(),
+        lane: SessionLane::Pty,
         origin: None,
         restore_pending_at: None,
         confirmed_at: None,
@@ -4778,6 +4801,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,
@@ -8625,6 +8649,7 @@ mod tests {
             closed_at,
             close_reason: close_reason.map(str::to_string),
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,

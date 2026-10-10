@@ -15103,6 +15103,7 @@ mod self_id_chain_tests {
             closed_at: None,
             close_reason: None,
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: None,

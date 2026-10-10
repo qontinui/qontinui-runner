@@ -1,5 +1,7 @@
 /**
- * `WorkerSessionCell` — the honesty contract of the Conductor worker cell.
+ * `StructuredSessionCell` — the honesty contract of the structured-session cell
+ * (a Conductor worker, or an operator's structured launch with its permission
+ * card, plan 2026-09-20-ai-session-handling-is-claude-shaped Phase 9).
  *
  * The runner's vitest config is `environment: "node"` with no React Testing
  * Library, so (as `StreamingMessageView.test.tsx` does) the pure presentational
@@ -27,8 +29,19 @@ import {
   reconcileDirectSendArm,
   settleQueuedOnTransition,
   shouldFetchChanges,
+  PermissionCard,
+  addPermissionRequest,
+  formatToolInput,
+  interruptFailureText,
+  kindCopy,
+  removePermissionRequest,
+  resolvedLabel,
+  respondArgs,
+  PERMISSION_INPUT_MAX_CHARS,
+  type PermissionRequest,
   type SteeringEntry,
-} from "./WorkerSessionCell";
+} from "./StructuredSessionCell";
+import { isOperatorOwnedStructuredTab, workerTabFromRecord } from "./useTerminalManager";
 import type { FileChangesRead, SessionFileChangesResponse } from "./workerFileChanges";
 
 describe("describeWorkerState", () => {
@@ -664,6 +677,18 @@ describe("ConversationView", () => {
       <ConversationView {...base} messages={[]} readStatus="ok" lastReadError={null} />,
     );
     expect(ok).toContain("No transcript yet");
+    expect(ok).toContain("worker");
+    const structured = renderToStaticMarkup(
+      <ConversationView
+        {...base}
+        messages={[]}
+        readStatus="ok"
+        lastReadError={null}
+        kind="structured"
+      />,
+    );
+    expect(structured).toContain("No transcript yet");
+    expect(structured).not.toContain("worker");
   });
 
   it("renders the in-flight tail through StreamingMessageView while processing", () => {
@@ -686,23 +711,23 @@ describe("ConversationView", () => {
 describe("ZoneGrid wiring", () => {
   const source = readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8");
 
-  it("mounts WorkerSessionCell at both TerminalInstance sites (maximized + zoned)", () => {
-    expect(source.match(/<WorkerSessionCell\s/g)?.length).toBe(2);
+  it("mounts StructuredSessionCell at both TerminalInstance sites (maximized + zoned)", () => {
+    expect(source.match(/<StructuredSessionCell\s/g)?.length).toBe(2);
   });
 
   it("never gives a worker tab the hidden TerminalInstance mount", () => {
     expect(source).toContain("!t.sessionBacked");
   });
 
-  it("passes the zone's visibility through to every WorkerSessionCell mount", () => {
+  it("passes the zone's visibility through to every StructuredSessionCell mount", () => {
     // The cell's file-changes read is gated on `visible`; a mount that hard-
     // coded `visible` would defeat that silently.
-    expect(source.match(/<WorkerSessionCell[^>]*visible=\{/g)?.length).toBe(2);
+    expect(source.match(/<StructuredSessionCell[^>]*visible=\{/g)?.length).toBe(2);
   });
 });
 
-describe("WorkerSessionCell wiring", () => {
-  const source = readFileSync(resolve(__dirname, "./WorkerSessionCell.tsx"), "utf8");
+describe("StructuredSessionCell wiring", () => {
+  const source = readFileSync(resolve(__dirname, "./StructuredSessionCell.tsx"), "utf8");
 
   it("hands the cell's visibility to the file-changes hook", () => {
     // Pins the fix: `visible` must reach `useSessionReview` (formerly `useWorkerFileChanges`), not just the
@@ -710,5 +735,152 @@ describe("WorkerSessionCell wiring", () => {
     expect(source).toMatch(
       /useSessionReview\(taskRunId,\s*\{\s*visible,\s*sessionState:\s*session\.sessionState\s*\}\)/,
     );
+  });
+});
+
+describe("permission card (Phase 9)", () => {
+  // The request Claude Code 2.1.285 sent in the Phase 2 probe
+  // (`can_use_tool_sdk_allow_with_session_state_events`), as the runner
+  // re-emits it on `session-permission-request`.
+  const request: PermissionRequest = {
+    sessionId: "trid-1",
+    requestId: "00000000-0000-4000-8000-000000000011",
+    toolName: "Write",
+    displayName: "Write",
+    description: "probe.txt",
+    toolUseId: "toolu_redacted_01",
+    input: { file_path: "/redacted/cwd/probe.txt", content: "hello" },
+    suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+    requestedAt: "2026-10-03T10:00:00+00:00",
+    expiresAt: "2026-10-03T10:10:00+00:00",
+    timeoutSecs: 600,
+  };
+
+  it("renders the tool, its arguments and the three answers", () => {
+    const html = renderToStaticMarkup(
+      <PermissionCard request={request} onAnswer={() => {}} busy={false} error={null} />,
+    );
+    expect(html).toContain("Permission requested: Write");
+    expect(html).toContain("probe.txt");
+    expect(html).toContain("&quot;file_path&quot;: &quot;/redacted/cwd/probe.txt&quot;");
+    expect(html).toContain('data-permission-answer="allow"');
+    expect(html).toContain('data-permission-answer="deny"');
+    expect(html).toContain('data-permission-answer="deny_interrupt"');
+    expect(html).toContain("Deny &amp; interrupt");
+    expect(html).toContain("denied automatically at");
+    expect(html).not.toContain('disabled=""');
+  });
+
+  it("disables the answers while one is in flight and shows a failed answer", () => {
+    const html = renderToStaticMarkup(
+      <PermissionCard request={request} onAnswer={() => {}} busy error="no live session trid-1" />,
+    );
+    expect(html.match(/disabled=""/g)?.length).toBe(3);
+    expect(html).toContain("The answer was not delivered: no live session trid-1");
+  });
+
+  it("bounds the arguments it renders and says how much it held back", () => {
+    const big = { content: "x".repeat(PERMISSION_INPUT_MAX_CHARS * 2) };
+    const { text, truncatedChars } = formatToolInput(big);
+    expect(text.length).toBe(PERMISSION_INPUT_MAX_CHARS);
+    expect(truncatedChars).toBeGreaterThan(0);
+    const html = renderToStaticMarkup(
+      <PermissionCard request={{ ...request, input: big }} onAnswer={() => {}} busy={false} error={null} />,
+    );
+    expect(html).toContain(`${truncatedChars} more characters not shown`);
+    expect(formatToolInput({ a: 1 })).toEqual({ text: '{\n  "a": 1\n}', truncatedChars: 0 });
+  });
+
+  it("maps each answer onto respond_session_permission's arguments", () => {
+    expect(respondArgs("s", "r", "allow")).toEqual({
+      sessionId: "s",
+      requestId: "r",
+      decision: "allow",
+      interrupt: false,
+    });
+    expect(respondArgs("s", "r", "deny")).toMatchObject({ decision: "deny", interrupt: false });
+    expect(respondArgs("s", "r", "deny_interrupt")).toMatchObject({
+      decision: "deny",
+      interrupt: true,
+    });
+  });
+
+  it("keeps one card per request, oldest first, and drops it when resolved", () => {
+    const later = { ...request, requestId: "r2", requestedAt: "2026-10-03T10:05:00+00:00" };
+    let list = addPermissionRequest([], later);
+    list = addPermissionRequest(list, request);
+    expect(list.map((r) => r.requestId)).toEqual([request.requestId, "r2"]);
+    expect(addPermissionRequest(list, request)).toBe(list); // the mount read + the event
+    const after = removePermissionRequest(list, request.requestId);
+    expect(after.map((r) => r.requestId)).toEqual(["r2"]);
+    expect(removePermissionRequest(after, "unknown")).toBe(after);
+  });
+
+  it("says a timeout was a fail-closed deny, never a silent disappearance", () => {
+    const base = { sessionId: "s", requestId: "r", toolName: "Bash", interrupt: false };
+    expect(resolvedLabel({ ...base, outcome: "timed_out" })).toContain("denied Bash (fail closed)");
+    expect(resolvedLabel({ ...base, outcome: "denied", interrupt: true })).toContain("interrupted");
+    expect(resolvedLabel({ ...base, outcome: "allowed" })).toBe("Allowed Bash.");
+    expect(resolvedLabel({ ...base, outcome: "session_ended" })).toContain("ended");
+    expect(resolvedLabel({ ...base, outcome: "superseded" })).toContain("replaced");
+  });
+
+  it("labels the cell by what it hosts", () => {
+    expect(kindCopy("worker").label).toBe("Worker");
+    expect(kindCopy("structured").label).toBe("Structured");
+    expect(kindCopy("structured").steerNow).not.toContain("worker");
+    expect(kindCopy("structured").emptyTranscript).not.toContain("worker");
+  });
+
+  it("surfaces an interrupt that could not be sent after a deny", () => {
+    const resolved = {
+      sessionId: "s",
+      requestId: "r",
+      toolName: "Bash",
+      outcome: "denied" as const,
+      interrupt: true,
+    };
+    expect(interruptFailureText({ resolved, interruptError: "stdin closed" })).toContain(
+      "stdin closed",
+    );
+    expect(interruptFailureText({ resolved, interruptError: null })).toBeNull();
+    expect(interruptFailureText(null)).toBeNull();
+    const source = readFileSync(resolve(__dirname, "./StructuredSessionCell.tsx"), "utf8");
+    expect(source).toContain("setInterruptWarning(interruptFailureText(outcome))");
+    expect(source).toContain("data-permission-interrupt-failed");
+  });
+
+  it("marks a structured launch's record as prompting, and a worker's as not", () => {
+    const rec = {
+      claudeSessionId: "t",
+      terminalId: "t",
+      taskRunId: "t",
+      title: "Claude Code (structured)",
+      openedAt: 1,
+    };
+    expect(
+      workerTabFromRecord({ ...rec, lane: "structured", bypassPermissions: false })
+        ?.promptsForPermission,
+    ).toBe(true);
+    // A Conductor worker's record carries no bypass flag: never "asks".
+    expect(workerTabFromRecord({ ...rec, lane: "structured" })?.promptsForPermission).toBeUndefined();
+  });
+
+  it("closing a structured launch's tab ends it; closing a worker's only hides it", () => {
+    const rec = { claudeSessionId: "t", terminalId: "t", taskRunId: "t", openedAt: 1 };
+    const launched = workerTabFromRecord({ ...rec, lane: "structured", bypassPermissions: false });
+    const worker = workerTabFromRecord({ ...rec, lane: "structured" });
+    expect(isOperatorOwnedStructuredTab(launched ?? undefined)).toBe(true);
+    expect(isOperatorOwnedStructuredTab(worker ?? undefined)).toBe(false);
+    expect(isOperatorOwnedStructuredTab(undefined)).toBe(false);
+  });
+
+  it("mounts the card and the permission channels in the cell", () => {
+    const source = readFileSync(resolve(__dirname, "./StructuredSessionCell.tsx"), "utf8");
+    expect(source).toContain('"session-permission-request"');
+    expect(source).toContain('"session-permission-resolved"');
+    expect(source).toContain('"session_pending_permissions"');
+    expect(source).toContain('"respond_session_permission"');
+    expect(source).toMatch(/<PermissionCard\s/);
   });
 });

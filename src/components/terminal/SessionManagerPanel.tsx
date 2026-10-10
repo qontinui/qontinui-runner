@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { TerminalSquare, X, CheckSquare, History, Radio, Server } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { StewardControl } from "./StewardControl";
+import { ProviderLaunchMenu } from "./ProviderLaunchMenu";
 import { SessionCard } from "./SessionCard";
 import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import { PastSessionsView } from "./PastSessionsView";
@@ -35,6 +36,13 @@ interface SessionManagerPanelProps {
    * copying the command.
    */
   onResumePastSession?: (session: PastSession) => void;
+  /**
+   * Launch a new PTY session of the served CLI profile `provider`, from the
+   * provider launch menu. Wired in `TerminalPage`; undefined ⇒ no menu.
+   */
+  onLaunchProvider?: (provider: string) => void;
+  /** Launch a structured (permission-prompting) session of `provider` (plan Phase 9). */
+  onLaunchStructured?: (provider: string) => void;
 }
 
 /** Human-readable status group labels. */
@@ -109,6 +117,8 @@ export function SessionManagerPanel({
   sessionConflictCounts,
   sessionLockStates,
   onResumePastSession,
+  onLaunchProvider,
+  onLaunchStructured,
 }: SessionManagerPanelProps) {
   const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
@@ -221,6 +231,9 @@ export function SessionManagerPanel({
         <PastSessionsView onResumePastSession={onResumePastSession} />
       ) : (
         <>
+      {onLaunchProvider && (
+        <ProviderLaunchMenu onLaunch={onLaunchProvider} onLaunchStructured={onLaunchStructured} />
+      )}
       <StewardControl />
       <SessionManagerHeader
         loading={loading}

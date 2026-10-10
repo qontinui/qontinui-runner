@@ -381,6 +381,8 @@ async fn spawn_session(
             None, // tool_policy
             None, // cli_session_ctx
             None, // agent_log_emitter — mcp session path, no coord agent_logs
+            // Autonomous / chat spawn: never prompts (plan 2026-09-20 Phase 9).
+            crate::session::launch_spec::PermissionMode::BypassPermissions,
         ) {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -650,7 +652,8 @@ async fn get_transcript(
         .map(|(root, _, _)| root.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config_dirs = transcript::find_claude_config_dirs();
+    let config_dirs =
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
     for dir in &config_dirs {
         if let Ok(messages) = transcript::read_session(dir, &project, &id) {
             let json_messages: Vec<serde_json::Value> = messages
@@ -2444,6 +2447,35 @@ mod tests {
     }
 }
 
+/// `GET /sessions/{id}/permission-requests` — the permission requests the
+/// structured session `id` (its task run id) is waiting on, oldest first (plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 9), so a headless reader sees a stalled prompt without having been
+/// subscribed to `session-permission-request`. Read-only: answering stays on
+/// the interactive surface. 404 when no such session is live, so absence is
+/// never an empty list.
+async fn get_permission_requests(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_manager: Arc<crate::claude_session::SessionManager> = state
+        .app_handle
+        .state::<Arc<crate::claude_session::SessionManager>>()
+        .inner()
+        .clone();
+    let session = session_manager.get(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No active session found for task_run_id: {}", id),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "prompts": session.permission_mode().prompts(),
+        "pending": session.pending_permissions(),
+    })))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/sessions/spawn", post(spawn_session))
@@ -2453,6 +2485,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/tree-resets", get(list_tree_resets))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
         .route("/sessions/{id}/transcript", get(get_transcript))
+        .route(
+            "/sessions/{id}/permission-requests",
+            get(get_permission_requests),
+        )
         .route(
             "/sessions/{id}/continuation-verdict",
             post(continuation_verdict),

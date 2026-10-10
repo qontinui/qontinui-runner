@@ -1101,9 +1101,8 @@ async fn spawn_looping_agent_terminal(
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
-    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
     // The briefing, composed with the tenant's cached policy body into one
     // `--append-system-prompt-file` when that cache exists, inline otherwise
     // (plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`).
@@ -1119,7 +1118,7 @@ async fn spawn_looping_agent_terminal(
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
     // One string for `--name`, the tab title and the trailer file.
     let spawn_name =
-        crate::claude_session::launch_spec::sanitize_session_name(&format!("loop-{}", def.name));
+        crate::session::launch_spec::sanitize_session_name(&format!("loop-{}", def.name));
     let tab_title = spawn_name.clone().unwrap_or_else(|| def.name.clone());
     let argv = crate::agent_runtime::build_continuation_claude_command(
         claude_bin,

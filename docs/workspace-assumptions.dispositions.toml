@@ -23,7 +23,8 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
-unreviewed_ceiling = 238
+# 238 -> 237 (rebase onto main a45075f81): program_stem reviewed (os_bound_tooling).
+unreviewed_ceiling = 237
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -581,4 +582,28 @@ disposition = "fallback_correct"
 note = "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
+]
+
+# os_bound_tooling — reviewed individually as they are added (plan
+# 2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy
+# Phase 6 split the identity shim's templates per CLI profile).
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/install_effects_producer/intercept/shim_materializer.rs"
+symbol = "identity_cmd_template"
+disposition = "fallback_correct"
+note = "The Windows `.cmd` flavour of the identity shim, called only from the cfg(windows) block of write_identity_shims_for. Every OS gets the extensionless bash shim from identity_bash_template, so a non-Windows sibling would have nothing to render."
+reviewed = [
+    "cfg(windows)-only fn `identity_cmd_template` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/cli_profile/mod.rs"
+symbol = "program_stem"
+disposition = "fallback_correct"
+note = "Strips a Windows launcher suffix (.exe/.cmd/.bat/.ps1) off a program name so `claude.cmd` and `claude` match the same CLI profile. On every other OS the names carry no suffix, the loop matches nothing and the bare basename is returned; no Windows tool is invoked."
+reviewed = [
+    "for suffix in [\".exe\", \".cmd\", \".bat\", \".ps1\"] {",
 ]

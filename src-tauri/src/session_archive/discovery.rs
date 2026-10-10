@@ -12,7 +12,7 @@
 //!
 //! ## Why this lives in the lib crate
 //!
-//! `terminal::transcript::find_claude_config_dirs` and
+//! `terminal::transcript::find_transcript_config_dirs` and
 //! `session::past_sessions::account_from_config_dir` already implemented these
 //! two rules — but both live in the **binary** crate, and `qontinui-pr` is a
 //! separate crate root that can only reach `qontinui_runner_lib`. Rather than
@@ -48,6 +48,22 @@ pub struct AccountHome {
 /// it has one, which is what distinguishes a real config dir from any other
 /// dot-directory under `C:/claude`.
 const PROJECTS_SUBDIR: &str = "projects";
+
+/// The environment variable that names an account home — what
+/// [`discover_account_homes_from_env`] reads first.
+const ACCOUNT_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
+
+/// Whether `profile`'s sessions live in the layout this module sweeps: an
+/// account selected by [`ACCOUNT_ENV_VAR`] and transcripts as JSONL under the
+/// config dir's [`PROJECTS_SUBDIR`]. Only such a profile HAS account homes to
+/// discover; for any other (a CLI that keeps its state under `$HOME`, or one
+/// whose layout is unknown) the sweep would return another CLI's directories,
+/// so callers get none.
+pub fn sweeps_profile(profile: &qontinui_types::cli_session::CliProfile) -> bool {
+    use qontinui_types::cli_session::{AccountIsolation, TranscriptSpec};
+    matches!(&profile.account_isolation, AccountIsolation::EnvVar { name } if name == ACCOUNT_ENV_VAR)
+        && matches!(&profile.transcript, TranscriptSpec::JsonlUnderConfigDir { subdir } if subdir == PROJECTS_SUBDIR)
+}
 
 /// Map a config dir to its account label + CLI wrapper.
 ///
@@ -157,7 +173,7 @@ pub fn discover_account_homes(
 /// a `cfg` here would make the scan untestable on the machine that runs CI.
 pub fn discover_account_homes_from_env(configured: &[String]) -> Vec<AccountHome> {
     discover_account_homes(
-        std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        std::env::var(ACCOUNT_ENV_VAR).ok(),
         configured,
         // `USERPROFILE` on Windows, `HOME` elsewhere — `dirs` already resolves
         // both, and the runner's own device-identity code uses the same door.
@@ -296,6 +312,22 @@ pub fn by_label(homes: &[AccountHome]) -> HashMap<String, &AccountHome> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_claude_layout_is_swept() {
+        let claude = claude_profile();
+        assert!(super::sweeps_profile(&claude));
+        let mut home_dir = claude.clone();
+        home_dir.account_isolation = qontinui_types::cli_session::AccountIsolation::HomeDir;
+        assert!(!super::sweeps_profile(&home_dir));
+        let mut unknown = claude;
+        unknown.transcript = qontinui_types::cli_session::TranscriptSpec::Unknown;
+        assert!(!super::sweeps_profile(&unknown));
+    }
+
+    fn claude_profile() -> qontinui_types::cli_session::CliProfile {
+        crate::cli_profile::profile_for("claude").unwrap().clone()
+    }
+
     use super::*;
 
     fn make_home(root: &Path, name: &str) -> PathBuf {

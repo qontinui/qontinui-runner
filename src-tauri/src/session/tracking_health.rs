@@ -64,7 +64,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::process_capture::process_tree::{
-    claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree, ProcessSnapshot,
+    ai_cli_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree, ProcessSnapshot,
 };
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use crate::terminal::TerminalManager;
@@ -596,7 +596,7 @@ pub fn evaluate(
     primary_boot_unix_millis: i64,
     now_ms: i64,
 ) -> TrackingHealthReport {
-    let live_claude: Vec<u32> = claude_pids_in_inclusive_subtree(runner_pid, snapshot);
+    let live_claude: Vec<u32> = ai_cli_pids_in_inclusive_subtree(runner_pid, snapshot);
     let live_set: HashSet<u32> = live_claude.iter().copied().collect();
 
     // Child -> parent, inverted once from the snapshot's parent -> children
@@ -610,11 +610,11 @@ pub fn evaluate(
 
     let mut ai_claimed: HashSet<u32> = HashSet::new();
     for &root in ai_plane_root_pids {
-        ai_claimed.extend(claude_pids_in_inclusive_subtree(root, snapshot));
+        ai_claimed.extend(ai_cli_pids_in_inclusive_subtree(root, snapshot));
     }
     let mut agent_runtime_claimed: HashSet<u32> = HashSet::new();
     for &root in agent_runtime_root_pids {
-        agent_runtime_claimed.extend(claude_pids_in_inclusive_subtree(root, snapshot));
+        agent_runtime_claimed.extend(ai_cli_pids_in_inclusive_subtree(root, snapshot));
     }
 
     let mut terminal_claimed: HashSet<u32> = HashSet::new();
@@ -644,7 +644,7 @@ pub fn evaluate(
                 // different session would be silently discounted. Registering
                 // the claim unconditionally makes the pid AMBIGUOUS instead,
                 // which blocks. Fail-closed beats tidy.
-                for claimed in claude_pids_in_inclusive_subtree(pid, snapshot) {
+                for claimed in ai_cli_pids_in_inclusive_subtree(pid, snapshot) {
                     if present {
                         terminal_claimed.insert(claimed);
                     }
@@ -853,11 +853,11 @@ pub async fn compute(
     // has. TARGETED (≤ tens of pids), fail-open, no subprocess.
     //
     // D1: this is NOT a second census. It is the SAME pure function
-    // (`claude_pids_in_inclusive_subtree`) over the SAME `snap` that
+    // (`ai_cli_pids_in_inclusive_subtree`) over the SAME `snap` that
     // `evaluate` is handed one line later, so the two walks cannot disagree —
     // they are the same computation, evaluated twice over one snapshot.
     let live_pids =
-        crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(runner_pid, &snap);
+        crate::process_capture::process_tree::ai_cli_pids_in_inclusive_subtree(runner_pid, &snap);
     let cwd_by_pid =
         crate::process_capture::process_tree::working_directories_for_pids(&live_pids).await;
 
@@ -1008,6 +1008,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,
@@ -1713,10 +1714,10 @@ mod tests {
         // Recompute the PRE-SPLIT expression by hand from the same snapshot.
         let mut exempt_union: HashSet<u32> = HashSet::new();
         for root in agent_runtime.iter().chain(ai_roots.iter()) {
-            exempt_union.extend(claude_pids_in_inclusive_subtree(*root, &snap));
+            exempt_union.extend(ai_cli_pids_in_inclusive_subtree(*root, &snap));
         }
-        exempt_union.extend(claude_pids_in_inclusive_subtree(5, &snap));
-        let expected_untracked: Vec<u32> = claude_pids_in_inclusive_subtree(1, &snap)
+        exempt_union.extend(ai_cli_pids_in_inclusive_subtree(5, &snap));
+        let expected_untracked: Vec<u32> = ai_cli_pids_in_inclusive_subtree(1, &snap)
             .into_iter()
             .filter(|p| !exempt_union.contains(p))
             .collect();

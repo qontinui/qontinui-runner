@@ -669,6 +669,8 @@ pub async fn dispatch_subtask(
             None, // tool_policy
             Some(&cli_session_ctx),
             None, // agent_log_emitter — orchestration path, no coord agent_logs
+            // Autonomous / chat spawn: never prompts (plan 2026-09-20 Phase 9).
+            crate::session::launch_spec::PermissionMode::BypassPermissions,
         )?;
         let session = Arc::new(session);
 
@@ -736,6 +738,7 @@ pub async fn dispatch_subtask(
                 closed_at: None,
                 close_reason: None,
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                lane: crate::session::session_lifecycle_store::SessionLane::Structured,
                 // Authoritative: the CLI session id was pre-pinned to
                 // task_run_id via `CliSessionContext { is_resume: false }` above
                 // (`--session-id`).

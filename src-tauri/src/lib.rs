@@ -180,6 +180,12 @@ pub mod cognito;
 // `coord doctor` check can never disagree on the spelling.
 pub mod claude_env;
 
+// The per-CLI profile manifest (plan
+// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+// Phase 4): one `CliProfile` per AI CLI, served to the frontend. In the lib so
+// the shim bin and `qontinui-pr` can read the same data as the runner.
+pub mod cli_profile;
+
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command
 // (`crate::coord_doctor` in the runner binary) share one driver + formatter +

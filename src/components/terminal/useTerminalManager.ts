@@ -46,10 +46,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -93,7 +90,8 @@ export interface TerminalTab {
    * True when a boot-restore typed `claude --resume` into this tab but the
    * Claude UI handshake never appeared (after one retry) — the pane is most
    * likely still a bare shell. Surfaced as an explicit operator-clickable
-   * "resume failed — retry" affordance (`ResumeFailedBanner`); cleared when a
+   * "resume failed — retry" affordance (reported to the runner as a
+   * `resume_failed` session failure, rendered by `SessionFailureBanner`); cleared when a
    * retry verifies. While set, the durable record keeps its backend
    * restore-pending marker so the liveness poll can't flip it `poll-dead`.
    */
@@ -109,7 +107,7 @@ export interface TerminalTab {
    * (backstop-guessed) origin — the guess isn't strong enough to act on, so it
    * is treated the same as no match found: do nothing beyond an honest
    * restore. No resume is typed and NO confirm banner is shown; instead the
-   * `ResumeFailedBanner`'s informational "fresh conversation" note surfaces it
+   * `RestoreTerminalOnlyNote`'s informational "fresh conversation" note surfaces it
    * so the user is never misled into thinking the conversation came back.
    * Cleared once the user dismisses the note or the tab is otherwise used.
    */
@@ -129,13 +127,20 @@ export interface TerminalTab {
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
   /**
+   * Provider (CLI profile id) that owns `claudeSessionId`, copied from the
+   * durable record on restore. The operator's "Retry resume" reads it: without
+   * it the retry would have no provider, and a provider-less resume is never
+   * typed.
+   */
+  sessionProvider?: string;
+  /**
    * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
    * Conductor worker (`dispatch_subtask` in
    * `orchestration_loop/ai_session_executor.rs`). `workerTabFromRecord` is
    * its only writer and always sets {@link sessionBacked} beside it, so a tab
    * carrying this is a worker view and never a pty tab.
    *
-   * It is an identity, not a behaviour switch: `WorkerSessionCell` keys the
+   * It is an identity, not a behaviour switch: `StructuredSessionCell` keys the
    * conversation and steering channels on it, and `closeTerminal` records it
    * so a hidden worker can be found again. The `Worker N` title pin is NOT
    * enforced from here — see `ZoneGrid::onTitleChange`, which no longer tests
@@ -149,13 +154,21 @@ export interface TerminalTab {
    * worker (`dispatch_subtask`) — and NOT by a PTY. `id === taskRunId`, `pid`
    * is null, and there is no terminal process to attach to: `terminal_list`
    * never lists it, `terminal_close` cannot kill it, and `terminal-output`
-   * never carries its text. The grid renders it through `WorkerSessionCell`
+   * never carries its text. The grid renders it through `StructuredSessionCell`
    * (conversation via `ai-output` / `claude-session-state`, steering via
    * `send_user_message`) instead of `TerminalInstance`; `reconcileTabsWithBackend`
    * keeps it across `terminal_list` re-syncs; `closeTerminal` drops the tab
    * without touching the worker, whose lifetime the Conductor owns.
    */
   sessionBacked?: boolean;
+  /**
+   * True for a structured session the operator launched from the Terminal
+   * page (`create_structured_session`): it runs in `Prompt` mode, so the CLI
+   * asks before each tool call and the cell shows a permission card. Set by
+   * `workerTabFromRecord` from the record (`lane: "structured"` with
+   * `bypassPermissions: false`); absent on a Conductor worker, which bypasses.
+   */
+  promptsForPermission?: boolean;
   /**
    * True when the PTY child runs Claude with tool permissions bypassed
    * (`--dangerously-skip-permissions` or `--permission-mode bypassPermissions`).
@@ -365,7 +378,15 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 export function workerTabFromRecord(
   rec: Pick<
     TerminalSessionRecord,
-    "claudeSessionId" | "terminalId" | "taskRunId" | "title" | "workingDir" | "openedAt"
+    | "claudeSessionId"
+    | "terminalId"
+    | "taskRunId"
+    | "title"
+    | "workingDir"
+    | "openedAt"
+    | "lane"
+    | "bypassPermissions"
+    | "provider"
   >,
   now: number = Date.now(),
 ): TerminalTab | null {
@@ -381,7 +402,24 @@ export function workerTabFromRecord(
     claudeSessionId: rec.claudeSessionId,
     taskRunId: rec.taskRunId,
     sessionBacked: true,
+    // The record's provider — the badge and every provider-keyed affordance
+    // (failure retry, resume) read it off the tab.
+    ...(rec.provider ? { sessionProvider: rec.provider } : {}),
+    ...(rec.lane === "structured" && rec.bypassPermissions === false
+      ? { promptsForPermission: true }
+      : {}),
   };
+}
+
+/**
+ * Whether closing `tab` should END its session rather than hide a view of it:
+ * an operator's structured launch (`promptsForPermission`), which no Conductor
+ * owns. Pure.
+ */
+export function isOperatorOwnedStructuredTab(
+  tab: Pick<TerminalTab, "sessionBacked" | "promptsForPermission" | "taskRunId"> | undefined,
+): boolean {
+  return tab?.sessionBacked === true && tab.promptsForPermission === true && !!tab.taskRunId;
 }
 
 /**
@@ -533,7 +571,7 @@ export function reconcileTabsWithBackend(
     if (t.type === "plan" || t.id.startsWith("plan-")) return true;
     if (t.__synthetic) return true;
     // A Conductor worker has no PTY; `terminal_list` is the wrong census for
-    // it (its liveness is the SessionManager's, read by `WorkerSessionCell`).
+    // it (its liveness is the SessionManager's, read by `StructuredSessionCell`).
     if (t.sessionBacked) return true;
     // The runner has already announced this terminal's exit, so its absence
     // from the list is a real teardown, not a create the snapshot predates.
@@ -1504,7 +1542,14 @@ export function useTerminalManager(
       // inside the updater, which React may run later than this handler.
       const closingTab = tabsRef.current.find((t) => t.id === id);
       const sessionBacked = closingTab?.sessionBacked === true;
-      if (sessionBacked) {
+      // An operator's structured launch (plan 2026-09-20 Phase 9) is NOT a view
+      // onto someone else's session: nothing else owns its lifetime, so closing
+      // its tab ends it — the session is closed and its record closed, exactly
+      // as closing a PTY tab ends that terminal. Hiding it instead would leave a
+      // prompting session running with no cell to answer it.
+      const operatorOwned = isOperatorOwnedStructuredTab(closingTab);
+      const viewOnly = sessionBacked && !operatorOwned;
+      if (viewOnly) {
         // Record the dismissal AND the chip row together, so the close is
         // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
         // keeps running either way.
@@ -1520,7 +1565,7 @@ export function useTerminalManager(
       // Update React state immediately so the UI is responsive.
       // The Rust-side close (process kill + thread join) runs in the background.
       setTabs((prev) => {
-        closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
+        closeRecord = viewOnly ? null : buildSessionCloseRecord(prev, id);
         const next = prev.filter((t) => t.id !== id);
         setActiveId((currentActive) => {
           if (currentActive !== id) return currentActive;
@@ -1535,6 +1580,13 @@ export function useTerminalManager(
       if (closeRecord) {
         invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
           // Best-effort — the live close still proceeds below.
+        });
+      }
+
+      if (operatorOwned && closingTab?.taskRunId) {
+        const taskRunId = closingTab.taskRunId;
+        invoke<CommandResponse>("close_ai_session", { taskRunId }).catch((err) => {
+          logger.warn(`closing structured session ${taskRunId} failed: ${err}`);
         });
       }
 
@@ -1608,6 +1660,7 @@ export function useTerminalManager(
           | "workingDir"
           | "claudeSessionId"
           | "claudeConfigDir"
+          | "sessionProvider"
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"

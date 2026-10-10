@@ -1,5 +1,12 @@
 //! Phase 2 of `plans/2026-06-12-runner-session-registry-and-restore-hardening.md`
-//! — typed `claude --resume <id>` / `claude --session-id <id>` sniff (issue #548).
+//! — typed `<cli> --resume <id>` / `<cli> --session-id <id>` sniff (issue #548).
+//!
+//! Provider-neutral since plan
+//! `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`
+//! Phase 5 (it was `claude_resume_sniff`): the program, the id flags and the
+//! bypass spellings all come from the CLI's profile
+//! ([`qontinui_runner_lib::cli_profile`]), and the recognized line carries the
+//! provider it was typed for.
 //!
 //! Every restore surface TYPES such a line into a plain shell, so a backend
 //! observer on completed typed input lines can register the session in the
@@ -18,31 +25,41 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
+use qontinui_runner_lib::cli_profile;
+
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 
-/// A typed input line recognized as a `claude` invocation carrying an
-/// explicit session id.
+/// A typed input line recognized as an AI-CLI invocation carrying an explicit
+/// session id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypedClaudeResume {
-    /// The session id extracted from `--resume <id>` / `--session-id <id>`.
-    pub claude_session_id: String,
-    /// Whether the line also implies bypassed tool permissions (per
-    /// [`crate::terminal::manager::command_implies_bypass_permissions`]).
+pub struct TypedResume {
+    /// The CLI profile id the line invokes (`"claude"`) — the provider the
+    /// session is recorded under.
+    pub provider: String,
+    /// The session id extracted from one of the profile's id flags
+    /// (`--resume <id>` / `--session-id <id>` for Claude Code).
+    pub session_id: String,
+    /// Whether the line also implies bypassed tool permissions: one of the
+    /// profile's auto-approve spellings
+    /// ([`cli_profile::implies_auto_approve`]).
     pub bypass_permissions: bool,
 }
 
-/// Parse a completed typed input line as `claude … (--resume <id> |
-/// --session-id <id>)`.
+/// Parse a completed typed input line as `<cli> … <id flag> <id>`, where
+/// `<cli>` is a program some CLI profile claims and `<id flag>` one of that
+/// profile's long id flags ([`cli_profile::id_flags`]).
 ///
 /// Heuristic, mirroring the L3 git-warn matcher's posture (soft, never a
 /// shell parser): the line is split into command segments on `;`, `&`, `|`
 /// (so `cd x && claude --resume …` and `$env:FOO="y"; claude …` both work);
 /// within a segment, leading env-assignment tokens (containing `=`) are
-/// skipped and the first real token must be the `claude` program. The id
-/// must be a strict UUID (what every restore surface types), so prose
-/// containing "claude" can't false-positive. A bare `claude --resume`
-/// (interactive picker form) has no id and does NOT match.
-pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
+/// skipped and the first real token must be the CLI program. The id must be a
+/// strict UUID (what every restore surface types), so prose naming the CLI
+/// can't false-positive. A bare `claude --resume` (interactive picker form)
+/// has no id and does NOT match. Short aliases (`-r`) are not read here: a
+/// typed line is untrusted prose, and a short flag is too easily something
+/// else.
+pub fn parse_typed_resume(line: &str) -> Option<TypedResume> {
     for segment in line.split([';', '&', '|']) {
         let mut tokens = segment.split_whitespace();
         // Skip leading env-assignment prefixes (`FOO=bar`, `$env:FOO="bar"`).
@@ -50,39 +67,36 @@ pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
         let Some(program) = tokens.by_ref().find(|t| !t.contains('=')) else {
             continue;
         };
-        if !is_claude_program(program) {
+        let Some(profile) = cli_profile::profile_for_program(program) else {
             continue;
-        }
+        };
+        let flags: Vec<&str> = cli_profile::id_flags(profile)
+            .into_iter()
+            .map(|(flag, _)| flag)
+            .filter(|flag| flag.starts_with("--"))
+            .collect();
         let rest: Vec<&str> = tokens.collect();
         for (i, t) in rest.iter().enumerate() {
-            let candidate = if *t == "--resume" || *t == "--session-id" {
+            let candidate = if flags.contains(t) {
                 rest.get(i + 1).copied()
             } else {
-                t.strip_prefix("--resume=")
-                    .or_else(|| t.strip_prefix("--session-id="))
+                flags.iter().find_map(|flag| {
+                    t.strip_prefix(flag)
+                        .and_then(|after| after.strip_prefix('='))
+                })
             };
             let Some(cand) = candidate else { continue };
             let cand = cand.trim_matches(|c| c == '"' || c == '\'');
             if is_session_uuid(cand) {
-                return Some(TypedClaudeResume {
-                    claude_session_id: cand.to_ascii_lowercase(),
-                    bypass_permissions:
-                        crate::terminal::manager::command_implies_bypass_permissions(&[
-                            line.to_string()
-                        ]),
+                return Some(TypedResume {
+                    provider: profile.id.clone(),
+                    session_id: cand.to_ascii_lowercase(),
+                    bypass_permissions: cli_profile::implies_auto_approve(profile, line),
                 });
             }
         }
     }
     None
-}
-
-/// Whether `token` names the `claude` CLI — bare, extensioned, or
-/// path-qualified (`/usr/local/bin/claude`, `C:\…\claude.exe`).
-fn is_claude_program(token: &str) -> bool {
-    let t = token.trim_matches(|c| c == '"' || c == '\'');
-    let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
-    matches!(base, "claude" | "claude.exe" | "claude.cmd" | "claude.ps1")
 }
 
 /// Strict 8-4-4-4-12 hex UUID check — the only id shape `claude --resume` /
@@ -113,7 +127,7 @@ fn is_session_uuid(s: &str) -> bool {
 /// without a Tauri app.
 pub(crate) fn apply_typed_resume_effects(
     store: Option<&SessionLifecycleStore>,
-    parsed: &TypedClaudeResume,
+    parsed: &TypedResume,
     terminal_id: &str,
     working_dir: &str,
     page_id: &str,
@@ -124,7 +138,7 @@ pub(crate) fn apply_typed_resume_effects(
     match store {
         Some(store) => {
             store.record_open(TerminalSessionRecord {
-                claude_session_id: parsed.claude_session_id.clone(),
+                claude_session_id: parsed.session_id.clone(),
                 // config_dir None → restore scans every known config dir.
                 // Zone unknown backend-side → 0 (wrong zone beats a lost
                 // session). Timestamps are placeholders record_open seeds.
@@ -139,7 +153,8 @@ pub(crate) fn apply_typed_resume_effects(
                 state: "open".to_string(),
                 closed_at: None,
                 close_reason: None,
-                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                provider: parsed.provider.clone(),
+                lane: crate::session::session_lifecycle_store::SessionLane::Pty,
                 // Exact id lifted from the typed `--resume`/`--session-id`
                 // flag — authoritative, same as the spawn-argv pre-pin path.
                 origin: Some(
@@ -170,16 +185,16 @@ pub(crate) fn apply_typed_resume_effects(
             });
             info!(
                 terminal_id = %terminal_id,
-                claude_session = %parsed.claude_session_id,
+                claude_session = %parsed.session_id,
                 bypass = parsed.bypass_permissions,
-                "typed claude resume sniff: session durably recorded"
+                "typed resume sniff: session durably recorded"
             );
             register_coord();
         }
         None => warn!(
             terminal_id = %terminal_id,
-            claude_session = %parsed.claude_session_id,
-            "typed claude resume sniff: lifecycle store not managed — session not recorded"
+            claude_session = %parsed.session_id,
+            "typed resume sniff: lifecycle store not managed — session not recorded"
         ),
     }
     if parsed.bypass_permissions {
@@ -198,7 +213,7 @@ pub fn spawn_register_typed_resume(
     working_dir: String,
     page_id: String,
     title: String,
-    parsed: TypedClaudeResume,
+    parsed: TypedResume,
 ) {
     tauri::async_runtime::spawn(async move {
         let store = app_handle
@@ -212,7 +227,7 @@ pub fn spawn_register_typed_resume(
         // hook then mints/rebinds the fsh_ handle with task_run_id: None).
         // Best-effort: an unmanaged registrar (tests, early boot) is a no-op.
         let register_handle = app_handle.clone();
-        let register_csid = parsed.claude_session_id.clone();
+        let register_csid = parsed.session_id.clone();
         let register_title = title.clone();
         let register_coord = move || {
             let Some(registrar) = register_handle
@@ -220,7 +235,7 @@ pub fn spawn_register_typed_resume(
             else {
                 debug!(
                     claude_session = %register_csid,
-                    "typed claude resume sniff: AiCoordRegistrar not managed — skipping coord registration"
+                    "typed resume sniff: AiCoordRegistrar not managed — skipping coord registration"
                 );
                 return;
             };
@@ -242,7 +257,7 @@ pub fn spawn_register_typed_resume(
                     debug!(
                         terminal_id = %emit_terminal_id,
                         error = %e,
-                        "typed claude resume sniff: bypass event emit failed"
+                        "typed resume sniff: bypass event emit failed"
                     );
                 }
             },
@@ -258,8 +273,8 @@ mod tests {
 
     const UUID: &str = "0d5e9a8c-1111-2222-3333-444455556666";
 
-    fn parse(line: &str) -> Option<TypedClaudeResume> {
-        parse_typed_claude_resume(line)
+    fn parse(line: &str) -> Option<TypedResume> {
+        parse_typed_resume(line)
     }
 
     #[test]
@@ -271,7 +286,8 @@ mod tests {
             format!("claude --session-id={UUID}"),
         ] {
             let parsed = parse(&line).unwrap_or_else(|| panic!("must parse: {line}"));
-            assert_eq!(parsed.claude_session_id, UUID, "id from: {line}");
+            assert_eq!(parsed.session_id, UUID, "id from: {line}");
+            assert_eq!(parsed.provider, "claude", "provider from: {line}");
             assert!(!parsed.bypass_permissions, "no bypass in: {line}");
         }
     }
@@ -282,7 +298,7 @@ mod tests {
             "claude --resume {UUID} --permission-mode bypassPermissions"
         ))
         .expect("bypass form must parse");
-        assert_eq!(p.claude_session_id, UUID);
+        assert_eq!(p.session_id, UUID);
         assert!(p.bypass_permissions);
         let p = parse(&format!(
             "claude --dangerously-skip-permissions --resume {UUID}"
@@ -313,6 +329,8 @@ mod tests {
             "claude --resume".to_string(),          // bare picker form, no id
             "claude --resume --permission-mode bypassPermissions".to_string(),
             "claude --resume not-a-uuid".to_string(),
+            format!("claude -r {UUID}"), // short alias: not read from typed prose
+            format!("gemini --resume {UUID}"), // no profile claims the program
             String::new(),
         ] {
             assert!(parse(&line).is_none(), "must NOT parse: {line:?}");
@@ -346,6 +364,7 @@ mod tests {
         let open = store.open_records();
         assert_eq!(open.len(), 1, "record_open effect must land");
         assert_eq!(open[0].claude_session_id, UUID);
+        assert_eq!(open[0].provider, "claude", "the provider the line invoked");
         assert_eq!(open[0].terminal_id, "term-1");
         assert_eq!(open[0].working_dir.as_deref(), Some("C:/repo"));
         assert_eq!(open[0].page_id, "default");

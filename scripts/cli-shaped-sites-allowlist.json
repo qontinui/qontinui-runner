@@ -1,0 +1,725 @@
+{
+  "format": 1,
+  "entries": [
+    {
+      "file": "src-tauri/src/bin/qontinui_cli.rs",
+      "item": "session_archive_backfill",
+      "pattern": ".claude/",
+      "count": 1,
+      "class": "M",
+      "reason": "backfill help names the default ~/.claude home; profile.transcript"
+    },
+    {
+      "file": "src-tauri/src/bin/qontinui_cli.rs",
+      "item": "session_archive_backfill",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "backfill help names the Claude config-dir env var; profile.account_isolation / transcript"
+    },
+    {
+      "file": "src-tauri/src/claude_session/dispatcher.rs",
+      "item": "dispatch_line",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "provider label on Claude stream-json lane output; the structured lane stays Claude-only until follow-up A"
+    },
+    {
+      "file": "src-tauri/src/claude_session/runner.rs",
+      "item": "run_claude_session_inline",
+      "pattern": "lit:claude",
+      "count": 3,
+      "class": "K",
+      "reason": "provider label on Claude stream-json lane output (stdout/stderr); structured lane stays Claude-only until follow-up A"
+    },
+    {
+      "file": "src-tauri/src/claude_session/session.rs",
+      "item": "ClaudeSession::finalize_child_env",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 2,
+      "class": "K",
+      "reason": "ClaudeSession stream-json child env (account pin) - Claude-only structured lane; generalised with follow-up A, not Phase 5"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_session.rs",
+      "item": "resume_ai_sessions",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "K",
+      "reason": "log line of the Claude stream-json chat lane's lossless resume; structured lane stays Claude-only"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "find_claude_credentials_path",
+      "pattern": ".claude/",
+      "count": 1,
+      "class": "M",
+      "reason": "default ~/.claude credentials location; profile.auth / transcript home"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "find_claude_credentials_path",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "account isolation env var name: profile.account_isolation EnvVar{name}"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "find_claude_credentials_path",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "M",
+      "reason": "Claude credentials-file locator; profile.auth / account_isolation"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "get_cli_auth_status",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "M",
+      "reason": "auth status reads the Claude credentials path; profile.auth"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "refresh_claude_cli_auth",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "account isolation env var name: profile.account_isolation EnvVar{name}"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "refresh_claude_cli_auth",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "login program default; profile.auth CliLogin{args}"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "test_claude_cli_connection",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "availability probe program default; profile.programs (Phase 6 availability probe)"
+    },
+    {
+      "file": "src-tauri/src/commands/ai_settings.rs",
+      "item": "test_gemini_cli_connection",
+      "pattern": "lit:gemini",
+      "count": 1,
+      "class": "M",
+      "reason": "sunset gemini availability probe program; profile.programs (Phase 6)"
+    },
+    {
+      "file": "src-tauri/src/commands/command_interpreter.rs",
+      "item": "build_interpret_command",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "one-shot `claude -p --output-format json` interpreter call, outside the session lifecycle this plan's manifest governs"
+    },
+    {
+      "file": "src-tauri/src/commands/recap/utils.rs",
+      "item": "is_ai_step_type",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "workflow step-type vocabulary (\"claude\" step), not a CLI program or session site"
+    },
+    {
+      "file": "src-tauri/src/commands/setup_wizard.rs",
+      "item": "discover_claude_config_dirs",
+      "pattern": ".claude/",
+      "count": 2,
+      "class": "M",
+      "reason": "default ~/.claude config home; profile.transcript / account_isolation"
+    },
+    {
+      "file": "src-tauri/src/commands/setup_wizard.rs",
+      "item": "discover_claude_config_dirs",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 2,
+      "class": "M",
+      "reason": "account isolation env var name: profile.account_isolation EnvVar{name}"
+    },
+    {
+      "file": "src-tauri/src/commands/setup_wizard.rs",
+      "item": "discover_claude_config_dirs",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "%LOCALAPPDATA%/claude config home; profile.transcript / account_isolation"
+    },
+    {
+      "file": "src-tauri/src/commands/terminal.rs",
+      "item": "create_terminal_session_backend",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "account isolation env var name: profile.account_isolation EnvVar{name}"
+    },
+    {
+      "file": "src-tauri/src/commands/terminal.rs",
+      "item": "poll_and_verify_pinned_session",
+      "pattern": "--session-id",
+      "count": 1,
+      "class": "F",
+      "reason": "pinned-session-never-appeared detection (\"claude likely failed to start\"); spawn_failed/resume evidence for the Phase 7 classifier"
+    },
+    {
+      "file": "src-tauri/src/commands/terminal.rs",
+      "item": "terminal_probe_claude",
+      "pattern": "ident:is_claude",
+      "count": 3,
+      "class": "B",
+      "reason": "live-claude probe before a resume write (main f950aaad8): the pane's claude pid census on the wire (claudePids); stays code behind the behaviour trait with the graceful-exit census, keyed by the pane's profile when the resume path is"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_materializer.rs",
+      "item": "IDENTITY_TOOLS",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "identity-shim tool roster; profile.programs of profiles with an identity capture"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/intercept/shim_materializer.rs",
+      "item": "PERSISTENT_IDENTITY_TOOL",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "persistent identity shim program; profile.programs"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/mod.rs",
+      "item": "post_session_open",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 2,
+      "class": "M",
+      "reason": "stamps DEFAULT_PROVIDER whatever was launched; takes the provider from the launch / profile_for_program (Phase 5-6)"
+    },
+    {
+      "file": "src-tauri/src/install_effects_producer/mod.rs",
+      "item": "spawn_phantom_turn_watch",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 2,
+      "class": "M",
+      "reason": "gates the transcript-driven phantom-turn watch to provider==claude; a profile.transcript capability check"
+    },
+    {
+      "file": "src-tauri/src/session/claude_session_registry.rs",
+      "item": "parse_registry_file",
+      "pattern": "--resume",
+      "count": 2,
+      "class": "M",
+      "reason": "resume command template (program + --resume + id): profile.resume ByIdArgv"
+    },
+    {
+      "file": "src-tauri/src/session/handoff.rs",
+      "item": "<module>",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "M",
+      "reason": "imports DEFAULT_PROVIDER for a provider stamp/compare in this file; goes with those sites"
+    },
+    {
+      "file": "src-tauri/src/session/handoff.rs",
+      "item": "registry_record_from_restore_payload",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "M",
+      "reason": "restore payload missing a provider defaults to claude; the payload's provider or profile_for_program"
+    },
+    {
+      "file": "src-tauri/src/session/launch_spec.rs",
+      "item": "render_program_and_argv",
+      "pattern": "ident:is_claude",
+      "count": 3,
+      "class": "K",
+      "reason": "the direct (non-PTY) spawn serves the structured lane, which the runner implements for Claude alone; only a Claude spec uses Claude's binary resolvers (QONTINUI_CLAUDE_BIN, the shim-skipping PATH walk)"
+    },
+    {
+      "file": "src-tauri/src/session/past_sessions.rs",
+      "item": "build_enriched",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "resume command template (program + --resume + id): profile.resume ByIdArgv"
+    },
+    {
+      "file": "src-tauri/src/session/reconcile.rs",
+      "item": "<module>",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "M",
+      "reason": "imports DEFAULT_PROVIDER for a provider stamp/compare in this file; goes with those sites"
+    },
+    {
+      "file": "src-tauri/src/session/reconcile.rs",
+      "item": "bind_record",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "M",
+      "reason": "stamps DEFAULT_PROVIDER whatever was launched; takes the provider from the launch / profile_for_program (Phase 5-6)"
+    },
+    {
+      "file": "src-tauri/src/session/reconcile.rs",
+      "item": "run_reconcile",
+      "pattern": "--session-id",
+      "count": 1,
+      "class": "M",
+      "reason": "binder log names the pin flag it read off the cmdline; profile.identity Pinned{flag}"
+    },
+    {
+      "file": "src-tauri/src/session/respawn.rs",
+      "item": "resolve_target_config_dir",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "respawn log names the per-PTY account env var; profile.account_isolation"
+    },
+    {
+      "file": "src-tauri/src/session/session_ledger.rs",
+      "item": "diff",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "shutdown-diff note explains resume under the wrong account; wording from profile.resume"
+    },
+    {
+      "file": "src-tauri/src/session/session_ledger.rs",
+      "item": "diff",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "shutdown-diff note names the account env var; profile.account_isolation"
+    },
+    {
+      "file": "src-tauri/src/session/session_ledger.rs",
+      "item": "resume_command_for",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "resume command template (program + --resume + id): profile.resume ByIdArgv"
+    },
+    {
+      "file": "src-tauri/src/session/session_ledger.rs",
+      "item": "resume_command_for",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "resume line env-prefix; profile.account_isolation"
+    },
+    {
+      "file": "src-tauri/src/session/session_lifecycle_store.rs",
+      "item": "<module>",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "K",
+      "reason": "DEFAULT_PROVIDER definition: survives only as the serde default for pre-provider records (plan Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/session/session_lifecycle_store.rs",
+      "item": "DEFAULT_PROVIDER",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "value of the legacy serde default: records written before the provider field were all claude"
+    },
+    {
+      "file": "src-tauri/src/session/session_lifecycle_store.rs",
+      "item": "default_provider",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "K",
+      "reason": "serde default fn for pre-provider records; survives per plan Phase 5"
+    },
+    {
+      "file": "src-tauri/src/session/session_transcript_tailer.rs",
+      "item": "SessionTranscriptTailer::report_coverage_once",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "coverage report names the claude --resume sniffer; generalises with typed_resume_sniff (Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/session/tracking_health.rs",
+      "item": "compute",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "M",
+      "reason": "Claude process census (claude_pids_in_inclusive_subtree) -> profile-driven ai_cli_pids_in_inclusive_subtree (Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/session/tracking_health.rs",
+      "item": "headless_claude_pids",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "M",
+      "reason": "Claude process census (claude_pids_in_inclusive_subtree) -> profile-driven ai_cli_pids_in_inclusive_subtree (Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/session/wind_down_executor.rs",
+      "item": "<LiveCloseEffects<'_> as CloseEffects>::wind_down_one",
+      "pattern": "/exit",
+      "count": 1,
+      "class": "B",
+      "reason": "wind-down executor log of the graceful-exit behaviour; the typed text itself is profile.graceful_exit"
+    },
+    {
+      "file": "src-tauri/src/session/wind_down_executor.rs",
+      "item": "claude_was_observed",
+      "pattern": "ident:is_claude",
+      "count": 6,
+      "class": "B",
+      "reason": "graceful-exit driver plumbing: the outcome's Claude pid census; the drive loop stays code behind the behaviour trait (only EXIT_TEXT is a manifest fact)"
+    },
+    {
+      "file": "src-tauri/src/session/wind_down_observer.rs",
+      "item": "fresh_pass",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "unknown-plane reason names live `claude` processes; the census is profile-driven (Phase 5)"
+    },
+    {
+      "file": "src-tauri/src/terminal/graceful_exit.rs",
+      "item": "GracefulExitOutcome",
+      "pattern": "ident:is_claude",
+      "count": 6,
+      "class": "B",
+      "reason": "graceful-exit driver plumbing: the outcome's Claude pid census; the drive loop stays code behind the behaviour trait (only EXIT_TEXT is a manifest fact)"
+    },
+    {
+      "file": "src-tauri/src/terminal/graceful_exit.rs",
+      "item": "drive",
+      "pattern": "ident:is_claude",
+      "count": 13,
+      "class": "B",
+      "reason": "graceful-exit driver plumbing: the outcome's Claude pid census; the drive loop stays code behind the behaviour trait (only EXIT_TEXT is a manifest fact)"
+    },
+    {
+      "file": "src-tauri/src/terminal/session.rs",
+      "item": "TerminalSession::close_inner",
+      "pattern": "/exit",
+      "count": 1,
+      "class": "B",
+      "reason": "close path log of the graceful-exit behaviour; typed text is profile.graceful_exit"
+    },
+    {
+      "file": "src-tauri/src/terminal/session.rs",
+      "item": "TerminalSession::graceful_exit_driven",
+      "pattern": "ident:is_claude",
+      "count": 2,
+      "class": "B",
+      "reason": "graceful-exit driver plumbing: the outcome's Claude pid census; the drive loop stays code behind the behaviour trait (only EXIT_TEXT is a manifest fact)"
+    },
+    {
+      "file": "src/components/terminal/SessionCard.tsx",
+      "item": "SessionCardInner",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "resume tooltip text; profile.resume"
+    },
+    {
+      "file": "src/components/terminal/SessionCard.tsx",
+      "item": "isWorktreePath",
+      "pattern": ".claude/",
+      "count": 1,
+      "class": "K",
+      "reason": "recognises Claude Code's own .claude/worktrees/ agent-worktree layout as a worktree path; not session launch/lifecycle"
+    },
+    {
+      "file": "src/components/terminal/TerminalPage.tsx",
+      "item": "CLAUDE_PROVIDER",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "the page's account roster (claude_config_dirs, /spawn-ai <account>, per-account launch commands) is a roster of Claude accounts; other CLIs launch through the provider launch menu"
+    },
+    {
+      "file": "src/components/terminal/TranscriptContentPanel.tsx",
+      "item": "TranscriptContentPanel",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "resume-in-terminal text; profile.resume"
+    },
+    {
+      "file": "src/components/terminal/commands/useTerminalCommands.ts",
+      "item": "SCHEMA",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "command schema text names the claude program; profile.display_name"
+    },
+    {
+      "file": "src/components/terminal/commands/useTerminalCommands.ts",
+      "item": "useTerminalCommands",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "command description names the resume line; profile.resume"
+    },
+    {
+      "file": "src/components/terminal/commands/useTerminalCommands.ts",
+      "item": "useTerminalCommands",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "command description names the claude program; profile.display_name"
+    },
+    {
+      "file": "src/components/terminal/contexts/TerminalSessionContext.tsx",
+      "item": "PageSessionScope",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "B",
+      "reason": "cold-resume guard (decideColdResume) skip message; the guard is behaviour, only the flag name is profile data"
+    },
+    {
+      "file": "src/components/terminal/sessionStateDetector.ts",
+      "item": "detectSessionState",
+      "pattern": "bypassPermissions",
+      "count": 2,
+      "class": "S",
+      "reason": "screen-scraped needs-input detector option - sibling plan terminal-session-state-comes-from-events"
+    },
+    {
+      "file": "src/components/terminal/terminalLaunchMenuActions.ts",
+      "item": "buildTerminalLaunchMenuActions",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "launch-menu text names the account env var; profile.account_isolation"
+    },
+    {
+      "file": "src/components/terminal/terminalLaunchMenuActions.ts",
+      "item": "buildTerminalLaunchMenuActions",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "launch-menu action text names claude; menu lists served profiles (Phase 6)"
+    },
+    {
+      "file": "src/components/terminal/types.ts",
+      "item": "TerminalSessionRecord",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "B",
+      "reason": "mirror of the lifecycle record's provider-neutral permission posture (Rust bypass_permissions), not a CLI flag spelling; false marks a Phase 9 prompting structured launch"
+    },
+    {
+      "file": "src/components/terminal/useSessionInfo.ts",
+      "item": "SessionLifecycleInfo",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "M",
+      "reason": "lifecycle-info field carrying the auto-approve detection (manager.rs -> profile.auto_approve.detect)"
+    },
+    {
+      "file": "src/components/terminal/useSessionManager.ts",
+      "item": "TRANSCRIPT_SCAN_PROVIDER",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "K",
+      "reason": "the session list is built from the transcript scan, which reads Claude Code transcripts only; a row open in a tab takes the tab's launch provider instead"
+    },
+    {
+      "file": "src/components/terminal/useSessionManager.ts",
+      "item": "extractAccountLabel",
+      "pattern": ".claude/",
+      "count": 1,
+      "class": "M",
+      "reason": "account label from a .claude-<name> config dir; profile.account_isolation"
+    },
+    {
+      "file": "src/components/terminal/useSessionPersistence.ts",
+      "item": "SavedSessionConfig",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "M",
+      "reason": "saved-layout isClaudeSession flag; becomes the tab's provider id (profile id)"
+    },
+    {
+      "file": "src/components/terminal/useSessionPersistence.ts",
+      "item": "useSessionPersistence::saveSessionLayout",
+      "pattern": "ident:is_claude",
+      "count": 2,
+      "class": "M",
+      "reason": "saved-layout isClaudeSession flag; becomes the tab's provider id (profile id)"
+    },
+    {
+      "file": "src/components/terminal/useSessionStateTracking.ts",
+      "item": "UseSessionStateTrackingParams",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "S",
+      "reason": "feeds the tab bypass mark into detectSessionState - sibling plan's screen-scraped state"
+    },
+    {
+      "file": "src/components/terminal/useSessionStateTracking.ts",
+      "item": "useSessionStateTracking::handleActivityDigest",
+      "pattern": "bypassPermissions",
+      "count": 2,
+      "class": "S",
+      "reason": "feeds the tab bypass mark into detectSessionState - sibling plan's screen-scraped state"
+    },
+    {
+      "file": "src/components/terminal/useSessionStateTracking.ts",
+      "item": "useSessionStateTracking::handleActivityDigest::detected",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "S",
+      "reason": "feeds the tab bypass mark into detectSessionState - sibling plan's screen-scraped state"
+    },
+    {
+      "file": "src/components/terminal/useSessionStateTracking.ts",
+      "item": "useSessionStateTracking::handleOutput",
+      "pattern": "bypassPermissions",
+      "count": 2,
+      "class": "S",
+      "reason": "feeds the tab bypass mark into detectSessionState - sibling plan's screen-scraped state"
+    },
+    {
+      "file": "src/components/terminal/useSessionStateTracking.ts",
+      "item": "useSessionStateTracking::handleOutput::detected",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "S",
+      "reason": "feeds the tab bypass mark into detectSessionState - sibling plan's screen-scraped state"
+    },
+    {
+      "file": "src/components/terminal/useShellIntegration.ts",
+      "item": "useShellIntegration::handleResumeSession",
+      "pattern": "--resume",
+      "count": 3,
+      "class": "M",
+      "reason": "resume command template (program + --resume + id): profile.resume ByIdArgv"
+    },
+    {
+      "file": "src/components/terminal/useShellIntegration.ts",
+      "item": "useShellIntegration::handleResumeSession",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 2,
+      "class": "M",
+      "reason": "resume env-prefix; profile.account_isolation"
+    },
+    {
+      "file": "src/components/terminal/useShellIntegration.ts",
+      "item": "useShellIntegration::handleResumeSession",
+      "pattern": "bypassPermissions",
+      "count": 3,
+      "class": "M",
+      "reason": "autonomous resume flags; profile.auto_approve"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "UseTerminalInitializationParams::getSavedLayout",
+      "pattern": "ident:is_claude",
+      "count": 1,
+      "class": "M",
+      "reason": "saved-layout isClaudeSession flag type; becomes the provider id"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "buildResumeCmd",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "M",
+      "reason": "resume command template (program + --resume + id): profile.resume ByIdArgv"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "buildResumeCmd",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "resume env pair; profile.account_isolation"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "buildResumeCmd",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "M",
+      "reason": "autonomous resume flags; profile.auto_approve"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "buildResumeCmd",
+      "pattern": "ident:is_claude",
+      "count": 4,
+      "class": "M",
+      "reason": "isClaude branch of the resume builder; profile lookup"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "buildResumeCmd",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "program compare picks the claude resume shape; profile_for_program"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "useTerminalInitialization",
+      "pattern": "--resume",
+      "count": 1,
+      "class": "B",
+      "reason": "cold-resume drain-time guard skip message; the guard is behaviour, only the flag name is profile data"
+    },
+    {
+      "file": "src/components/terminal/useTerminalInitialization.ts",
+      "item": "useTerminalInitialization",
+      "pattern": "ident:is_claude",
+      "count": 3,
+      "class": "M",
+      "reason": "restore isClaudeSession flag; becomes the provider id"
+    },
+    {
+      "file": "src/components/terminal/useTerminalManager.ts",
+      "item": "TerminalTab",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "S",
+      "reason": "per-tab auto-approve mark whose only consumer is the screen-scraped needs-input detector (sessionStateDetector) - sibling plan's state"
+    },
+    {
+      "file": "src/components/terminal/useTerminalManager.ts",
+      "item": "applyBypassMark",
+      "pattern": "bypassPermissions",
+      "count": 2,
+      "class": "S",
+      "reason": "per-tab auto-approve mark whose only consumer is the screen-scraped needs-input detector (sessionStateDetector) - sibling plan's state"
+    },
+    {
+      "file": "src/components/terminal/useTerminalManager.ts",
+      "item": "reduceCreatedTerminal",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "S",
+      "reason": "per-tab auto-approve mark whose only consumer is the screen-scraped needs-input detector (sessionStateDetector) - sibling plan's state"
+    },
+    {
+      "file": "src/components/terminal/useTerminalManager.ts",
+      "item": "workerTabFromRecord",
+      "pattern": "bypassPermissions",
+      "count": 2,
+      "class": "B",
+      "reason": "reads the record's provider-neutral permission posture to label a Phase 9 prompting structured session; no CLI flag spelling"
+    },
+    {
+      "file": "src/components/terminal/zoneProfileStorage.ts",
+      "item": "ZONE_SESSION_PROVIDER",
+      "pattern": "lit:claude",
+      "count": 1,
+      "class": "M",
+      "reason": "zone-profile sessions predate providers (claudeSessionId): the provider their resume line is looked up under; becomes a per-session provider field when the zone-profile format gains one (moved from TerminalSessionContext buildResumeCmd, Phase 5)"
+    }
+  ]
+}

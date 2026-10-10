@@ -1,0 +1,3 @@
+user@host:~/repo$ codex resume 01a0ef49-1234-7abc-8def-0123456789ab --dangerously-bypass-approvals-and-sandbox
+bash: codex: command not found
+user@host:~/repo$

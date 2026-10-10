@@ -1,0 +1,15 @@
+╭───────────────────────────────────────────────────╮
+│ ✻ Welcome back to Claude Code!                    │
+│                                                   │
+│   /help for help, /status for your current setup  │
+│                                                   │
+│   cwd: /home/user/repo                            │
+╰───────────────────────────────────────────────────╯
+
+ ※ Tip: Use /memory to view and manage Claude memory
+
+╭───────────────────────────────────────────────────╮
+│ >                                                 │
+╰───────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+  ? for shortcuts

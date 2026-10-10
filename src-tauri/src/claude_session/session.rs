@@ -54,6 +54,56 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+/// The structured lane's [`crate::session::failure_recovery::StructuredRestart`]:
+/// everything [`ClaudeSession::restart_in_place`] needs, captured by the
+/// waiter thread when the child exits.
+struct StructuredLaneRestart {
+    app: tauri::AppHandle,
+    session_id: String,
+    session_ctx: Option<AiSessionContext>,
+    working_dir: String,
+    /// The dead session's posture: a restart never changes it (a prompted
+    /// session restarted in bypass would silently stop asking).
+    permission: crate::session::launch_spec::PermissionMode,
+    /// The dead instance's state tracker — its identity. A restart replaces
+    /// only THIS instance: if the `SessionManager` no longer holds it under
+    /// `session_id` (closed, or already replaced), the restart is abandoned.
+    dead_instance: SessionStateTracker,
+}
+
+impl crate::session::failure_recovery::StructuredRestart for StructuredLaneRestart {
+    fn still_wanted(&self) -> Result<(), String> {
+        use tauri::Manager;
+        let sm = self
+            .app
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .ok_or("SessionManager not available")?;
+        ClaudeSession::restart_still_wanted(&sm, &self.session_id, &self.dead_instance)
+    }
+
+    fn restart(&self, rotate_account: bool) -> Result<(), String> {
+        ClaudeSession::restart_in_place(
+            &self.app,
+            &self.session_id,
+            self.session_ctx.as_ref(),
+            &self.working_dir,
+            rotate_account,
+            self.permission,
+            &self.dead_instance,
+        )
+    }
+}
+
+/// A deliberate close: force the state to Closed FIRST, then close the CLI's
+/// stdin. Closing stdin makes the CLI exit, and the waiter reads this state the
+/// moment it sees the exit to tell a deliberate close from a failure; the
+/// other order let a fast exit read "not closed" and report the operator's own
+/// close as a failure to recover from.
+fn mark_closed_then_close_input(state: &SessionStateTracker, close_input: impl FnOnce()) {
+    state.force_close();
+    close_input();
+}
+
 /// Internal error type for `build_replay_from_history`.
 ///
 /// Distinguishes "no history found" (`Ok(None)`) from "PG isn't available"
@@ -107,6 +157,15 @@ impl TurnPersistSender {
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
     }
+}
+
+/// What [`ClaudeSession::respond_permission`] did.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionResponseOutcome {
+    pub resolved: super::permission::PermissionResolvedNotice,
+    /// Set when a deny asked to interrupt and the interrupt could not be sent.
+    pub interrupt_error: Option<String>,
 }
 
 /// An interactive Claude CLI session.
@@ -193,6 +252,11 @@ pub struct ClaudeSession {
     /// default is ON) or the coord session id / device id couldn't be
     /// resolved — a strict no-op.
     agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+    /// Answers the CLI's control requests by subtype and holds this session's
+    /// parked permission requests (plan
+    /// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+    /// Phase 9). Shared with the stdout reader.
+    permissions: Arc<super::permission::PermissionBroker>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -224,10 +288,15 @@ impl ClaudeSession {
         tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
         cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
         agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+        // Caller-authoritative permission posture. Every autonomous site
+        // passes `PermissionMode::BypassPermissions`; only an operator's
+        // structured launch from an interactive surface passes `Prompt`
+        // (pinned by `permission::tests::every_spawn_site_*`).
+        permission: crate::session::launch_spec::PermissionMode,
     ) -> Result<Self, String> {
         info!(
-            "Spawning interactive Claude session: {} in {}",
-            session_id, working_dir
+            "Spawning interactive Claude session: {} in {} (permission: {:?})",
+            session_id, working_dir, permission
         );
 
         // Spawn CLI with stream-json input AND output. The Command itself is
@@ -342,19 +411,19 @@ impl ClaudeSession {
         // The operator's global template + per-account command layer in here;
         // with no operator config the composed tail is byte-identical to the
         // historical hand-built argv.
-        let spec = crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+        let spec = crate::session::launch_spec::LaunchSpec {
+            permission,
             session_id: session_id_pin,
             resume_id: resume_id_pin,
             model: model_override.map(|m| m.to_string()),
             extra_required,
             ..Default::default()
         };
-        let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+        let launch_cfg = crate::session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
         let (program, cli_args) =
-            crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
+            crate::session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
         let mut cmd = crate::process_helpers::no_window(&program);
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
@@ -553,6 +622,16 @@ impl ClaudeSession {
         // Create shared state
         let state_tracker = SessionStateTracker::new();
         let stdin_writer = Arc::new(StdinWriter::new(stdin));
+        let permissions = super::permission::PermissionBroker::new(
+            session_id,
+            permission,
+            super::permission::decision_timeout(None),
+            stdin_writer.clone(),
+            Arc::new(super::permission::TauriPermissionSink::new(
+                app_handle.clone(),
+                session_ctx.clone(),
+            )),
+        );
         let pending_messages: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let accumulated_output = Arc::new(Mutex::new(String::new()));
         let user_has_interacted = Arc::new(AtomicBool::new(false));
@@ -726,10 +805,17 @@ impl ClaudeSession {
         // stdout reader so each line streams to coord. `None` when the gate is
         // OFF (the common case); the reader then never touches it.
         let agent_log_emitter_for_stdout = agent_log_emitter.clone();
+        // The dispatcher's per-process frame ledger is keyed by the session id
+        // the waiter's exit report uses, so an errored turn and the exit that
+        // follows it are one failure (plan 2026-09-20-ai-session-handling-is-
+        // claude-shaped, Phase 8).
+        let frame_ledger_key = session_id.to_string();
+        let permissions_for_stdout = permissions.clone();
 
         let stdout_handle = thread::spawn(move || {
             let mut all_text = String::new();
             let mut line_buffer = String::new();
+            let mut frame_ledger = dispatcher::FrameLedger::new(frame_ledger_key);
 
             let mut finding_parser = if finding_ctx_for_stdout.is_some() {
                 Some(FindingParser::new())
@@ -750,7 +836,9 @@ impl ClaudeSession {
                     match result {
                         Ok(line) => {
                             line_count += 1;
-                            let preview = crate::str_utils::truncate_str(&line, 150);
+                            // Never the raw control/system frames: the
+                            // init response carries account identity.
+                            let preview = dispatcher::stdout_log_preview(&line);
                             info!("[STDOUT_READER] Line #{}: {}", line_count, preview);
 
                             // Update activity
@@ -785,6 +873,8 @@ impl ClaudeSession {
                                 &persisted_len_for_stdout,
                                 fallback_id_for_stdout.as_deref(),
                                 worktree_id_for_stdout.as_deref(),
+                                &mut frame_ledger,
+                                &permissions_for_stdout,
                             ) {
                                 has_output_stdout.store(true, Ordering::Relaxed);
                                 all_text.push_str(&text);
@@ -818,6 +908,10 @@ impl ClaudeSession {
             } else {
                 warn!("[STDOUT_READER] No stdout handle available!");
             }
+
+            // The CLI's stdout is closed: no parked permission request can be
+            // answered any more, so none may keep offering buttons.
+            permissions_for_stdout.end_session("the session's CLI stopped");
 
             // Flush remaining line buffer
             dispatcher::flush_line_buffer(
@@ -1190,6 +1284,10 @@ impl ClaudeSession {
         thread::spawn(move || {
             // Wait for the child process to exit
             Self::wait_for_child(child, &session_id_for_waiter);
+            // A deliberate `close()` (or a worktree promotion) force-closes the
+            // state before the child goes; an exit nobody asked for leaves it
+            // open. Only the latter is a failure to recover from.
+            let closed_deliberately = state_for_waiter.get() == SessionState::Closed;
 
             // Remove PID from tracker
             if let Some(ref tracker) = pid_tracker_for_waiter {
@@ -1223,48 +1321,17 @@ impl ClaudeSession {
                 }
             }
 
-            // Check if the exit was due to rate-limiting
             let stderr_output = shared_stderr_for_waiter
                 .lock()
                 .ok()
                 .map(|s| s.clone())
                 .unwrap_or_default();
 
-            let is_rate_limited = crate::ai_provider::retry::is_rate_limit_error(&stderr_output);
-
-            if is_rate_limited {
-                warn!(
-                    "Session {} exited due to rate-limit, attempting auto-restart on another account",
-                    session_id_for_waiter
-                );
-
-                // Emit a user-visible notification
-                if let Some(ref ctx) = session_ctx_for_waiter {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(
-                            &app_handle_for_waiter,
-                            "Rate limit reached. Switching account and restarting session...",
-                            "status",
-                            None,
-                            Some(ctx),
-                        );
-                    }));
-                }
-
-                // Attempt auto-restart on another account
-                Self::auto_restart_on_rate_limit(
-                    &app_handle_for_waiter,
-                    &session_id_for_waiter,
-                    session_ctx_for_waiter.as_ref(),
-                    &working_dir_for_waiter,
-                );
-            }
-
             // Transition to Closed
             state_for_waiter.force_close();
             info!(
-                "Session {} process exited, state -> Closed (rate_limited={})",
-                session_id_for_waiter, is_rate_limited
+                "Session {} process exited, state -> Closed (deliberate={})",
+                session_id_for_waiter, closed_deliberately
             );
 
             // Review notes sent into this worker are never confirmed from a
@@ -1278,10 +1345,71 @@ impl ClaudeSession {
             );
 
             // Phase 1b — terminal coord agent_logs milestone + final flush.
-            // No-op unless the emitter was built (gate ON). Done last so the
-            // `session_closed` row reflects the real process-exit moment.
+            // No-op unless the emitter was built (gate ON). Done before any
+            // recovery so the `session_closed` row reflects the real
+            // process-exit moment.
             if let Some(emitter) = agent_log_emitter_for_waiter.as_ref() {
                 emitter.close();
+            }
+
+            // The exit's stderr is a failure SIGNAL, not a decision: the
+            // classifier names the kind and the one recovery table acts on it
+            // (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 7).
+            // A quota or budget exhaustion migrates the account through
+            // `restart_in_place(rotate = true)` — this lane's arm of the
+            // `migrate_account` policy; a rate limit or an overload restarts
+            // on the SAME account after a bounded backoff. Runs on this
+            // dedicated waiter thread, which is free to wait out that backoff.
+            if !closed_deliberately {
+                let restart = Arc::new(StructuredLaneRestart {
+                    app: app_handle_for_waiter.clone(),
+                    session_id: session_id_for_waiter.clone(),
+                    session_ctx: session_ctx_for_waiter.clone(),
+                    working_dir: working_dir_for_waiter.clone(),
+                    permission,
+                    dead_instance: state_for_waiter.clone(),
+                });
+                // Say what is happening in the session's own output, as the
+                // pre-taxonomy path did, before any recovery runs — from the
+                // failure `report_then` recorded and decided, so the line
+                // states exactly what the runner then does.
+                let announce = |f: &qontinui_types::cli_session::SessionFailure| {
+                    if let Some(ref ctx) = session_ctx_for_waiter {
+                        let text = match &f.details {
+                            Some(d) => format!("{}. {}", f.title, d),
+                            None => f.title.clone(),
+                        };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            emit_ai_output(
+                                &app_handle_for_waiter,
+                                &text,
+                                "status",
+                                None,
+                                Some(ctx),
+                            );
+                        }));
+                    }
+                };
+                let signal = crate::session::failure::FailureSignal::Stderr(stderr_output);
+                let provider = qontinui_runner_lib::cli_profile::claude::ID;
+                crate::session::failure_recovery::report_then(
+                    crate::session::failure_recovery::RecoveryTarget::Structured {
+                        session_id: session_id_for_waiter.clone(),
+                        restart,
+                    },
+                    provider,
+                    None,
+                    signal,
+                    |failure| {
+                        warn!(
+                            session_id = %session_id_for_waiter,
+                            kind = ?failure.kind,
+                            policy = ?failure.recovery_policy,
+                            "stream-json session exited with a classified failure"
+                        );
+                        announce(failure);
+                    },
+                );
             }
         });
 
@@ -1367,6 +1495,7 @@ impl ClaudeSession {
             federation_ctx,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             agent_log_emitter,
+            permissions,
         })
     }
 
@@ -1502,6 +1631,44 @@ impl ClaudeSession {
             );
             Ok(false)
         }
+    }
+
+    /// This session's permission posture.
+    pub fn permission_mode(&self) -> crate::session::launch_spec::PermissionMode {
+        self.permissions.mode()
+    }
+
+    /// The permission requests waiting on the operator, oldest first. Empty
+    /// for a bypass session, which never parks one.
+    pub fn pending_permissions(&self) -> Vec<super::permission::PermissionRequestNotice> {
+        self.permissions.pending()
+    }
+
+    /// Answer parked permission request `request_id`. A deny that asks for it
+    /// is followed by the session's ordinary interrupt; the answer stands even
+    /// when that interrupt cannot be sent (the turn may already be ending), and
+    /// the returned notice says whether it was.
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        decision: super::permission::PermissionDecision,
+    ) -> Result<PermissionResponseOutcome, String> {
+        let resolved = self.permissions.respond(request_id, decision)?;
+        let interrupt_error = if resolved.interrupt {
+            self.interrupt().err()
+        } else {
+            None
+        };
+        if let Some(e) = &interrupt_error {
+            warn!(
+                "Permission deny on session {} asked to interrupt, and the interrupt was not sent: {}",
+                self.session_id, e
+            );
+        }
+        Ok(PermissionResponseOutcome {
+            resolved,
+            interrupt_error,
+        })
     }
 
     /// Send an interrupt request.
@@ -1706,6 +1873,9 @@ impl ClaudeSession {
     pub fn close(&self) -> Result<(), String> {
         info!("Closing session {}", self.session_id);
 
+        // Nothing parked can be answered once the CLI is gone.
+        self.permissions.end_session("the session was closed");
+
         // Worktree-isolation Phase 3 — drop the re-acquired isolated edit
         // context first so the claim-release fire-and-forget posts ahead of
         // the rest of teardown (release uses tokio::spawn; running it before
@@ -1738,11 +1908,8 @@ impl ClaudeSession {
             // which terminates the persister thread after it processes pending messages.
         }
 
-        // Close stdin (sends EOF to CLI)
-        self.stdin_writer.close();
-
-        // Force state to Closed
-        self.state_tracker.force_close();
+        // Closed, then EOF to the CLI — see `mark_closed_then_close_input`.
+        mark_closed_then_close_input(&self.state_tracker, || self.stdin_writer.close());
 
         // Close stdout pipe on Windows to unblock reader thread
         #[cfg(target_os = "windows")]
@@ -1760,7 +1927,7 @@ impl ClaudeSession {
 
     /// Read this session's task output log from PG and build a replay prompt.
     ///
-    /// Shared by `auto_restart_on_rate_limit` (account rotation) and
+    /// Shared by `restart_in_place` (failure recovery) and
     /// `promote_to_worktree` (worktree promotion) — both kill-and-respawn the
     /// CLI process and need to give the new instance the prior conversation.
     ///
@@ -1939,6 +2106,8 @@ impl ClaudeSession {
             // respawn so promotion is continuous on the dashboard. The handle is
             // a cheap clone over the same emitter service; `None` stays a no-op.
             self.agent_log_emitter.clone(),
+            // Promotion moves the process, never its permission posture.
+            self.permissions.mode(),
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
 
@@ -1966,146 +2135,179 @@ impl ClaudeSession {
         Ok(info)
     }
 
-    /// Auto-restart the session on another account after a rate-limit exit.
+    /// Restart an exited session in place, under the same id, replaying its
+    /// conversation from the DB output log — the structured lane's recovery
+    /// mechanism, driven by `session::failure_recovery`'s table.
     ///
-    /// Reads conversation history from the DB output_log, rotates the account,
-    /// spawns a new ClaudeSession with a replay prompt, and re-registers it
-    /// in the SessionManager.
-    fn auto_restart_on_rate_limit(
+    /// With `rotate_account` it first moves the runner to another account:
+    /// that is the `migrate_account` policy's structured-lane arm (quota or
+    /// budget exhausted). Without it the account stays: the
+    /// `backoff_then_retry` and `resume_same_id` arms, because no account
+    /// switch fixes a rate limit, an overload or a lost process.
+    ///
+    /// Reads conversation history from the DB output_log, spawns a new
+    /// ClaudeSession with a replay prompt, and re-registers it in the
+    /// SessionManager.
+    fn restart_in_place(
         app_handle: &tauri::AppHandle,
         session_id: &str,
         session_ctx: Option<&AiSessionContext>,
         working_dir: &str,
-    ) {
+        rotate_account: bool,
+        permission: crate::session::launch_spec::PermissionMode,
+        dead_instance: &SessionStateTracker,
+    ) -> Result<(), String> {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
-        // 1. Rotate to another account
-        if !rotate_account_on_rate_limit() {
-            warn!(
-                "Session {}: no alternative account available for restart",
-                session_id
-            );
-            return;
-        }
+        let sm = app_handle
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .ok_or("SessionManager not available for restart")?
+            .inner()
+            .clone();
+
+        // 1. Rotate to another account, when the failure is the account's —
+        //    but never for a restart nobody wants any more: rotation moves the
+        //    whole runner's account, so an abandoned restart must not do it.
+        rotate_if_still_wanted(
+            rotate_account,
+            || Self::restart_still_wanted(&sm, session_id, dead_instance),
+            rotate_account_on_rate_limit,
+        )?;
 
         let (resolved_config_dir, _config_dir_source) =
             get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli);
-        let new_config_dir = resolved_config_dir.unwrap_or_else(|| "unknown".to_string());
-        let label = std::path::Path::new(&new_config_dir)
+        let config_dir = resolved_config_dir.unwrap_or_else(|| "unknown".to_string());
+        let label = std::path::Path::new(&config_dir)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(&new_config_dir);
+            .unwrap_or(&config_dir)
+            .to_string();
         info!(
-            "Session {}: restarting on account '{}' after rate-limit",
-            session_id, label
+            "Session {}: restarting in place on account '{}' (rotated={})",
+            session_id, label, rotate_account
         );
 
         // 2. Read conversation history from DB
         let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
             Ok(replay) => replay,
             Err(BuildReplayErr::NoPg) => {
-                warn!("No PG connection for reading conversation history");
-                return;
+                return Err("no PG connection for reading conversation history".to_string());
             }
         };
 
         // 3. Spawn new session
-        let sm = match app_handle.try_state::<Arc<crate::claude_session::manager::SessionManager>>()
-        {
-            Some(sm) => sm.inner().clone(),
-            None => {
-                warn!("SessionManager not available for auto-restart");
-                return;
-            }
-        };
-
-        // Clone session_ctx for the new session
-        let new_session_ctx = session_ctx.cloned();
-
-        match Self::spawn(
+        let new_session = match Self::spawn(
             working_dir,
             session_id,
             app_handle,
-            new_session_ctx,
+            session_ctx.cloned(),
             None, // finding_ctx
             None, // progress_ctx
             None, // pid_tracker
             None, // model_override
-            None, // worktree (rate-limit restart preserves the original cwd)
-            None, // tool_policy (rate-limit restart preserves the original policy-less spawn)
+            None, // worktree (an in-place restart preserves the original cwd)
+            None, // tool_policy (an in-place restart preserves the original policy-less spawn)
             None, // cli_session_ctx — in-process restart does its own replay; no --resume
             // agent_log_emitter — this associated fn has no `self` handle to the
-            // emitter; a rate-limit restart is a fresh process and the prior
-            // waiter already emitted `session_closed`. No-op here.
+            // emitter; a restart is a fresh process and the prior waiter
+            // already emitted `session_closed`. No-op here.
             None,
+            // The restarted process keeps the dead one's posture.
+            permission,
         ) {
-            Ok(new_session) => {
-                let new_session = Arc::new(new_session);
-
-                // Send replay prompt if we have conversation context
-                if let Some(ref replay_prompt) = conversation_context {
-                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
-                        warn!("Failed to send replay prompt: {}", e);
-                    }
-                }
-
-                // Remove old session and re-register under the same ID
-                sm.remove(session_id);
-                if let Err(e) = sm.register(session_id, new_session.clone()) {
-                    warn!("Failed to re-register session after restart: {}", e);
-                    return;
-                }
-
-                // Emit state event so frontend knows the session is back
-                crate::commands::ai_session::emit_session_state_ex(
-                    app_handle,
-                    session_id,
-                    session_id,
-                    new_session.state(),
-                    true, // resumed flag
-                );
-
-                // Notify user
-                if let Some(ctx) = session_ctx {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(
-                            app_handle,
-                            &format!(
-                                "Session restarted on account '{}'. Conversation context restored.",
-                                label
-                            ),
-                            "status",
-                            None,
-                            Some(ctx),
-                        );
-                    }));
-                }
-
-                info!(
-                    "Session {} successfully restarted on account '{}'",
-                    session_id, label
-                );
-            }
+            Ok(s) => Arc::new(s),
             Err(e) => {
-                warn!(
-                    "Failed to restart session {} on new account: {}",
-                    session_id, e
-                );
-                // Notify user of failure
                 if let Some(ctx) = session_ctx {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         emit_ai_output(
                             app_handle,
-                            &format!("Failed to restart session on new account: {}", e),
+                            &format!("Failed to restart session: {}", e),
                             "error",
                             None,
                             Some(ctx),
                         );
                     }));
                 }
+                return Err(format!("restart spawn failed: {e}"));
             }
+        };
+
+        // Swap the dead instance for the new one under the same id — only if
+        // the dead instance is STILL what is registered — and only THEN send
+        // the replay. The spawn above waits up to a minute for `initialize`;
+        // an operator who closed the session in that time must neither find
+        // it resurrected nor have it run one more turn.
+        commit_restart(
+            || {
+                sm.replace_if(session_id, new_session.clone(), |current| {
+                    current.is_instance(dead_instance)
+                })
+            },
+            || {
+                if let Some(ref replay_prompt) = conversation_context {
+                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
+                        warn!("Failed to send replay prompt: {}", e);
+                    }
+                }
+            },
+            || {
+                let _ = new_session.close();
+            },
+        )?;
+
+        // Emit state event so frontend knows the session is back
+        crate::commands::ai_session::emit_session_state_ex(
+            app_handle,
+            session_id,
+            session_id,
+            new_session.state(),
+            true, // resumed flag
+        );
+
+        // Notify user
+        if let Some(ctx) = session_ctx {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(
+                    app_handle,
+                    &format!(
+                        "Session restarted on account '{}'. Conversation context restored.",
+                        label
+                    ),
+                    "status",
+                    None,
+                    Some(ctx),
+                );
+            }));
         }
+
+        info!(
+            "Session {} successfully restarted on account '{}'",
+            session_id, label
+        );
+        Ok(())
+    }
+
+    /// Whether a restart of `session_id` is still wanted: the runner is not
+    /// draining, and `sm` still holds the instance whose state tracker is
+    /// `dead_instance` (the one that failed) under that id. `Err(why)` when the
+    /// operator closed the session or something already replaced it.
+    fn restart_still_wanted(
+        sm: &crate::claude_session::manager::SessionManager,
+        session_id: &str,
+        dead_instance: &SessionStateTracker,
+    ) -> Result<(), String> {
+        let registered = sm.get(session_id);
+        restart_verdict(
+            crate::drain::is_draining(),
+            registered.as_ref().map(|s| &s.state_tracker),
+            dead_instance,
+        )
+    }
+
+    /// Whether this session is the instance `tracker` belongs to.
+    pub(crate) fn is_instance(&self, tracker: &SessionStateTracker) -> bool {
+        self.state_tracker.same_instance(tracker)
     }
 
     /// The final env mutations applied to the bidirectional stream-json child
@@ -2140,6 +2342,14 @@ impl ClaudeSession {
             );
             cmd.env("CLAUDE_CONFIG_DIR", config_dir);
         }
+
+        // Ask the CLI to report its own turn state. Without this env var
+        // Claude Code (2.1.285, Phase 2 probe Q2) sends no
+        // `system:session_state_changed` frame, and the dispatcher falls back
+        // to ending the turn on `result`; with it, `idle` (sent after
+        // `result`) ends the turn and `requires_action` marks a pending
+        // decision.
+        cmd.env(crate::claude_protocol::SESSION_STATE_EVENTS_ENV, "1");
 
         // Full non-interactive git credential posture — this seam spawns a
         // `claude` that can run `git push`, so without it a credential prompt
@@ -2200,10 +2410,140 @@ impl std::fmt::Debug for ClaudeSession {
     }
 }
 
+/// The decision inside [`ClaudeSession::restart_still_wanted`]: `registered`
+/// is the state tracker of whatever `SessionManager` holds under the id now.
+fn restart_verdict(
+    draining: bool,
+    registered: Option<&SessionStateTracker>,
+    dead_instance: &SessionStateTracker,
+) -> Result<(), String> {
+    if draining {
+        return Err("the runner is draining".into());
+    }
+    match registered {
+        None => Err("the session was closed".into()),
+        Some(current) if !current.same_instance(dead_instance) => {
+            Err("the session was already replaced".into())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Rotate the account (when asked) only while the restart is still wanted.
+fn rotate_if_still_wanted(
+    rotate_account: bool,
+    still_wanted: impl FnOnce() -> Result<(), String>,
+    rotate: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    if !rotate_account {
+        return Ok(());
+    }
+    still_wanted()?;
+    if !rotate() {
+        return Err("no alternative account available for restart".to_string());
+    }
+    Ok(())
+}
+
+/// The ordering of a restart's commit: `register` (the CAS) first; `replay`
+/// runs only when it succeeded, `abandon` (close the replacement) when it did
+/// not. Replaying before the CAS let a session closed during the restart
+/// spawn run one more turn (review round 2, M2-residual).
+fn commit_restart(
+    register: impl FnOnce() -> Result<(), String>,
+    replay: impl FnOnce(),
+    abandon: impl FnOnce(),
+) -> Result<(), String> {
+    match register() {
+        Ok(()) => {
+            replay();
+            Ok(())
+        }
+        Err(why) => {
+            abandon();
+            Err(why)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A deliberate close is Closed BEFORE the CLI's stdin closes, so a CLI
+    /// that exits on the EOF finds the waiter reading a deliberate close —
+    /// never a failure to recover from.
+    #[test]
+    fn close_marks_the_state_closed_before_the_cli_sees_eof() {
+        use super::super::state::{SessionState, SessionStateTracker};
+        let state = SessionStateTracker::new();
+        let seen = Mutex::new(None);
+        super::mark_closed_then_close_input(&state, || {
+            *seen.lock().unwrap() = Some(state.get());
+        });
+        assert_eq!(*seen.lock().unwrap(), Some(SessionState::Closed));
+    }
+
+    #[test]
+    fn commit_restart_replays_only_after_the_cas_succeeds() {
+        use std::cell::RefCell;
+        let log = RefCell::new(Vec::new());
+        let r = super::commit_restart(
+            || {
+                log.borrow_mut().push("cas");
+                Err("closed".into())
+            },
+            || log.borrow_mut().push("replay"),
+            || log.borrow_mut().push("abandon"),
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            *log.borrow(),
+            vec!["cas", "abandon"],
+            "no turn for a closed session"
+        );
+
+        log.borrow_mut().clear();
+        super::commit_restart(
+            || {
+                log.borrow_mut().push("cas");
+                Ok(())
+            },
+            || log.borrow_mut().push("replay"),
+            || log.borrow_mut().push("abandon"),
+        )
+        .unwrap();
+        assert_eq!(*log.borrow(), vec!["cas", "replay"]);
+    }
+
+    #[test]
+    fn restart_still_wanted_refuses_closed_replaced_and_draining() {
+        use super::super::state::SessionStateTracker;
+        let dead = SessionStateTracker::new();
+        let other = SessionStateTracker::new();
+        assert!(super::restart_verdict(false, None, &dead).is_err());
+        assert!(super::restart_verdict(false, Some(&other), &dead).is_err());
+        assert!(super::restart_verdict(true, Some(&dead.clone()), &dead).is_err());
+        assert!(super::restart_verdict(false, Some(&dead.clone()), &dead).is_ok());
+    }
+
+    #[test]
+    fn an_abandoned_restart_does_not_rotate_the_account() {
+        let rotated = std::cell::Cell::new(false);
+        let r = super::rotate_if_still_wanted(
+            true,
+            || Err("the session was closed".into()),
+            || {
+                rotated.set(true);
+                true
+            },
+        );
+        assert!(r.is_err());
+        assert!(!rotated.get(), "an abandoned restart must not rotate");
+        assert!(super::rotate_if_still_wanted(true, || Ok(()), || true).is_ok());
+        assert!(super::rotate_if_still_wanted(true, || Ok(()), || false).is_err());
+    }
 
     // =======================================================================
     // Bidirectional stream-json spawn seam — production call-site coverage for
@@ -2246,6 +2586,16 @@ mod tests {
                 |(k, v)| k == "CLAUDE_CONFIG_DIR" && v.as_deref() == Some("/tmp/claude-config")
             ),
             "the resolved account pin must still be applied"
+        );
+        // Plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 8: the
+        // CLI reports its own turn state only when asked (probe Q2), and the
+        // credential scrub that runs after must not strip the request.
+        assert!(
+            envs.iter().any(
+                |(k, v)| k == crate::claude_protocol::SESSION_STATE_EVENTS_ENV
+                    && v.as_deref() == Some("1")
+            ),
+            "the structured lane must ask the CLI for session_state_changed frames"
         );
     }
 

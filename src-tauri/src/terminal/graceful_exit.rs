@@ -1,6 +1,15 @@
-//! Graceful exit of a terminal-hosted `claude` — type `/exit` at an empty
-//! prompt, wait for the process to leave, only then close the tab (plan
+//! Graceful exit of a terminal-hosted AI CLI — type its profile's exit command
+//! (`/exit` for Claude Code) at an empty prompt, wait for the process to
+//! leave, only then close the tab (plan
 //! `2026-09-13-drained-runner-never-reaches-idle`, design decision D5).
+//!
+//! The command comes from the CLI's profile
+//! ([`qontinui_runner_lib::cli_profile::graceful_exit_text`]), chosen by the
+//! image of the AI CLI the probe finds in the pane. A CLI whose profile
+//! declares no typed exit — `Unknown`, or a signal — or a process no profile
+//! claims gets NOTHING typed: the outcome is `Refused`, naming why. The screen
+//! checks below are Claude Code's TUI (the `❯` prompt, its placeholder), so
+//! they refuse any other TUI too.
 //!
 //! ## Why not `close`
 //!
@@ -63,12 +72,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
+use crate::process_capture::process_tree::{ai_cli_pids_in_inclusive_subtree, ProcessSnapshot};
 use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
-
-/// The command typed at the prompt. Submitted separately ([`SUBMIT`]) once it
-/// has echoed on the input line.
-pub const EXIT_TEXT: &[u8] = b"/exit";
 
 /// Enter.
 pub const SUBMIT: &[u8] = b"\r";
@@ -280,17 +285,17 @@ fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(),
     Ok(())
 }
 
-/// Has typed `/exit` echoed? The input line reads exactly `/exit` and the
-/// cursor sits right after it.
-pub fn exit_echoed(screen: &ScreenText) -> bool {
+/// Has the typed exit command (`typed`, e.g. `/exit`) echoed? The input line
+/// reads exactly `typed` and the cursor sits right after it.
+pub fn exit_echoed(screen: &ScreenText, typed: &str) -> bool {
     let Some(line) = prompt_line(screen) else {
         return false;
     };
-    let typed = std::str::from_utf8(EXIT_TEXT).unwrap_or_default();
     line.input == typed && usize::from(screen.cursor_col) == input_start(&line) + typed.len()
 }
 
-/// Does the input line hold ONLY (a prefix of) the `/exit` we just wrote?
+/// Does the input line hold ONLY (a prefix of) the exit command (`typed`) we
+/// just wrote?
 ///
 /// This gates the Ctrl-U recovery. Ctrl-U clears the WHOLE input line, not
 /// just our bytes, so firing it blindly when the echo failed to arrive can
@@ -302,11 +307,10 @@ pub fn exit_echoed(screen: &ScreenText) -> bool {
 /// our text with theirs appended — is NOT ours to clear, and the caller leaves
 /// the line alone and says so instead. An empty line has nothing to clear, so
 /// it is false too: the recovery is pointless there.
-pub fn input_is_only_our_exit_text(screen: &ScreenText) -> bool {
+pub fn input_is_only_our_exit_text(screen: &ScreenText, typed: &str) -> bool {
     let Some(line) = prompt_line(screen) else {
         return false;
     };
-    let typed = std::str::from_utf8(EXIT_TEXT).unwrap_or_default();
     !line.input.is_empty() && typed.starts_with(line.input.as_str())
 }
 
@@ -326,8 +330,13 @@ pub struct ProcIdentity {
 /// One readable look at the pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneProcesses {
-    /// `claude` processes in the pane's subtree, top-level first.
+    /// AI-CLI processes in the pane's subtree, top-level first (any profile's
+    /// program — the name predates profiles).
     pub subtree_claude: Vec<ProcIdentity>,
+    /// The CLI profile id of the top-level AI CLI's image (`"claude"`), or
+    /// `None` when there is none or no profile claims its image. Chooses the
+    /// exit command.
+    pub provider: Option<String>,
     /// Child processes of the top-level `claude` (0 when there is none).
     pub top_level_children: usize,
     /// Of the identities asked about, those alive ANYWHERE in the table.
@@ -367,7 +376,7 @@ pub fn probe_from_snapshot(
             "the process table is unreadable (empty parent map)".to_string(),
         );
     }
-    let pids = claude_pids_in_inclusive_subtree(root_pid, snapshot);
+    let pids = ai_cli_pids_in_inclusive_subtree(root_pid, snapshot);
     let subtree_claude: Vec<ProcIdentity> = pids
         .iter()
         .map(|&pid| ProcIdentity {
@@ -376,11 +385,16 @@ pub fn probe_from_snapshot(
         })
         .collect();
     // Inclusive-subtree order is root first, then breadth-first, so the first
-    // `claude` has no `claude` ancestor inside the pane.
+    // AI CLI has no AI-CLI ancestor inside the pane.
     let top_level_children = pids
         .first()
         .and_then(|pid| snapshot.parent_map.get(pid))
         .map_or(0, Vec::len);
+    let provider = pids
+        .first()
+        .and_then(|pid| snapshot.names.get(pid))
+        .and_then(|image| qontinui_runner_lib::cli_profile::profile_for_program(image))
+        .map(|profile| profile.id.clone());
     let tracked_alive = tracked
         .iter()
         .copied()
@@ -388,6 +402,7 @@ pub fn probe_from_snapshot(
         .collect();
     ClaudeProbe::Readable(PaneProcesses {
         subtree_claude,
+        provider,
         top_level_children,
         tracked_alive,
     })
@@ -503,6 +518,20 @@ pub enum CloseTabResult {
     Unknown { detail: String },
 }
 
+/// The command to type to exit the AI CLI whose profile id is `provider`, or
+/// why nothing may be typed: no profile claims the process, or its profile
+/// declares no typed exit
+/// ([`qontinui_runner_lib::cli_profile::graceful_exit_text`]).
+pub fn exit_text_for(provider: Option<&str>) -> Result<&'static str, String> {
+    use qontinui_runner_lib::cli_profile;
+    let Some(id) = provider else {
+        return Err("no CLI profile claims the AI CLI process in the pane".to_string());
+    };
+    let profile = cli_profile::profile_for(id)
+        .ok_or_else(|| format!("no CLI profile for provider {id:?}"))?;
+    cli_profile::graceful_exit_text(profile)
+}
+
 fn pids_of(ids: &[ProcIdentity]) -> Vec<u32> {
     ids.iter().map(|id| id.pid).collect()
 }
@@ -542,8 +571,8 @@ where
         n => {
             return GracefulExitOutcome::Refused {
                 reason: format!(
-                    "{n} claude processes in the pane — a nested claude does not leave with /exit"
-                ),
+                "{n} AI CLI processes in the pane — a nested one does not leave with a typed exit"
+            ),
                 claude_pids,
             }
         }
@@ -558,7 +587,18 @@ where
         };
     }
 
-    // (2) The screen.
+    // (2) The exit command, from the CLI's profile. Unknown → type nothing.
+    let exit_text = match exit_text_for(initial.provider.as_deref()) {
+        Ok(text) => text,
+        Err(why) => {
+            return GracefulExitOutcome::Refused {
+                reason: format!("{why} — nothing was typed"),
+                claude_pids,
+            }
+        }
+    };
+
+    // (3) The screen.
     if let Err(why) = exit_prompt_ready(&screen()) {
         return GracefulExitOutcome::Refused {
             reason: format!("not at an empty prompt: {why}"),
@@ -566,31 +606,32 @@ where
         };
     }
 
-    // (3) Type, confirm the echo, submit.
-    if let Err(error) = write(EXIT_TEXT) {
+    // (4) Type, confirm the echo, submit.
+    if let Err(error) = write(exit_text.as_bytes()) {
         return GracefulExitOutcome::WriteFailed { error, claude_pids };
     }
     let echo_started = tokio::time::Instant::now();
-    while !exit_echoed(&screen()) {
+    while !exit_echoed(&screen(), exit_text) {
         if echo_started.elapsed() >= timing.echo_timeout {
             // Ctrl-U clears the WHOLE line. Only do it when the line still
             // holds nothing but our own (possibly partial) `/exit` — never
             // when the operator has typed into the pane during the echo
             // window, where clearing would destroy their text.
-            let cleared = if input_is_only_our_exit_text(&screen()) {
+            let cleared = if input_is_only_our_exit_text(&screen(), exit_text) {
                 match write(CLEAR_INPUT_LINE) {
-                    Ok(()) => "the partially-typed /exit was cleared".to_string(),
+                    Ok(()) => format!("the partially-typed {exit_text} was cleared"),
                     Err(e) => format!("clearing the line failed: {e}"),
                 }
             } else {
-                "the line was LEFT AS IS — it no longer holds only our /exit, so \
-                 clearing it could have destroyed text typed in the pane; any \
-                 leftover /exit characters are still on the input line"
-                    .to_string()
+                format!(
+                    "the line was LEFT AS IS — it no longer holds only our {exit_text}, so \
+                     clearing it could have destroyed text typed in the pane; any \
+                     leftover {exit_text} characters are still on the input line"
+                )
             };
             return GracefulExitOutcome::Refused {
                 reason: format!(
-                    "typed /exit did not echo on the input line within {} ms; {cleared}",
+                    "typed {exit_text} did not echo on the input line within {} ms; {cleared}",
                     millis(timing.echo_timeout)
                 ),
                 claude_pids,
@@ -602,7 +643,7 @@ where
         return GracefulExitOutcome::WriteFailed { error, claude_pids };
     }
 
-    // (4) Wait for every claude ever seen to be gone from the whole table.
+    // (5) Wait for every AI CLI ever seen to be gone from the whole table.
     let mut tracked: BTreeSet<ProcIdentity> = initial.subtree_claude.iter().copied().collect();
     let mut last_alive = claude_pids.clone();
     let mut last_probe_unreadable = false;
@@ -624,7 +665,7 @@ where
                 if view.subtree_claude.is_empty() && view.tracked_alive.is_empty() {
                     gone_streak += 1;
                     if gone_streak >= GONE_PROBES_REQUIRED {
-                        // (5) Gone. The closer re-proves the pane clear at the
+                        // (6) Gone. The closer re-proves the pane clear at the
                         // moment of the close and may refuse — see
                         // [`CloseTabResult`].
                         return match close_tab().await {
@@ -856,22 +897,22 @@ mod tests {
     #[test]
     fn only_our_own_exit_text_may_be_cleared() {
         // Fully echoed, and partially echoed — both ours.
-        assert!(input_is_only_our_exit_text(&echoed_prompt()));
+        assert!(input_is_only_our_exit_text(&echoed_prompt(), "/exit"));
         let mut partial = echoed_prompt();
         partial.lines[3] = "❯\u{a0}/exi".to_string();
-        assert!(input_is_only_our_exit_text(&partial));
+        assert!(input_is_only_our_exit_text(&partial, "/exit"));
 
         // The operator's own draft is NOT ours to clear.
-        assert!(!input_is_only_our_exit_text(&draft_prompt()));
+        assert!(!input_is_only_our_exit_text(&draft_prompt(), "/exit"));
 
         // Our text with theirs appended is not ours either — Ctrl-U would take
         // both.
         let mut mixed = echoed_prompt();
         mixed.lines[3] = "❯\u{a0}/exit and then some".to_string();
-        assert!(!input_is_only_our_exit_text(&mixed));
+        assert!(!input_is_only_our_exit_text(&mixed, "/exit"));
 
         // An empty prompt has nothing of ours to clear.
-        assert!(!input_is_only_our_exit_text(&empty_prompt()));
+        assert!(!input_is_only_our_exit_text(&empty_prompt(), "/exit"));
     }
 
     #[test]
@@ -887,16 +928,16 @@ mod tests {
 
     #[test]
     fn echo_detection() {
-        assert!(exit_echoed(&echoed_prompt()));
-        assert!(!exit_echoed(&empty_prompt()));
-        assert!(!exit_echoed(&draft_prompt()));
+        assert!(exit_echoed(&echoed_prompt(), "/exit"));
+        assert!(!exit_echoed(&empty_prompt(), "/exit"));
+        assert!(!exit_echoed(&draft_prompt(), "/exit"));
         let mut early = echoed_prompt();
         early.cursor_col = 5;
-        assert!(!exit_echoed(&early), "cursor not after the echo");
+        assert!(!exit_echoed(&early, "/exit"), "cursor not after the echo");
         let mut prefixed = echoed_prompt();
         prefixed.lines[3] = "❯\u{a0}draft/exit".to_string();
         prefixed.cursor_col = 12;
-        assert!(!exit_echoed(&prefixed));
+        assert!(!exit_echoed(&prefixed, "/exit"));
     }
 
     // ---- process probe ------------------------------------------------------
@@ -984,9 +1025,13 @@ mod tests {
         }
     }
 
+    /// What the Claude profile types to exit.
+    const EXIT: &str = "/exit";
+
     fn readable(subtree: &[ProcIdentity], children: usize, alive: &[ProcIdentity]) -> ClaudeProbe {
         ClaudeProbe::Readable(PaneProcesses {
             subtree_claude: subtree.to_vec(),
+            provider: (!subtree.is_empty()).then(|| "claude".to_string()),
             top_level_children: children,
             tracked_alive: alive.to_vec(),
         })
@@ -1045,7 +1090,7 @@ mod tests {
             let echoes = self.echoes;
             let initial = self.initial.clone();
             move || {
-                if echoes && typed.lock().unwrap().starts_with(EXIT_TEXT) {
+                if echoes && typed.lock().unwrap().starts_with(EXIT.as_bytes()) {
                     echoed_prompt()
                 } else {
                     initial.clone()
@@ -1243,7 +1288,7 @@ mod tests {
             (
                 readable(&[CLAUDE, id(43, 1_001)], 0, &[]),
                 empty_prompt(),
-                "2 claude processes",
+                "2 AI CLI processes",
             ),
             (
                 readable(&[CLAUDE], 3, &[]),
@@ -1439,6 +1484,49 @@ mod tests {
         } else {
             assert_eq!(POLL_INTERVAL, Duration::from_millis(500));
         }
+    }
+
+    /// The exit command is the probed CLI's profile's: Claude Code's for a
+    /// `claude` image, and nothing at all for a process no profile claims.
+    #[test]
+    fn the_exit_command_comes_from_the_probed_cli_profile() {
+        let snap = snapshot(&[(100, 1, "bash", 10), (200, 100, "claude.exe", 20)]);
+        let ClaudeProbe::Readable(view) = probe_from_snapshot(100, &snap, &[]) else {
+            panic!("readable");
+        };
+        assert_eq!(view.provider.as_deref(), Some("claude"));
+        assert_eq!(exit_text_for(view.provider.as_deref()), Ok(EXIT));
+        assert!(exit_text_for(None).is_err());
+        assert!(exit_text_for(Some("not-a-known-cli")).is_err());
+    }
+
+    /// No profile for the AI CLI → type NOTHING and say why (the module's
+    /// refusal posture), never a guessed command.
+    #[tokio::test(start_paused = true)]
+    async fn an_unprofiled_cli_gets_nothing_typed() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
+        let mut view = readable(&[CLAUDE], 0, &[]);
+        if let ClaudeProbe::Readable(v) = &mut view {
+            v.provider = None;
+        }
+        let outcome = drive(
+            pane.write(Arc::clone(&log)),
+            pane.screen(),
+            scripted_probe(vec![view], Arc::clone(&log)),
+            recording_close(Arc::clone(&log)),
+            timing(),
+        )
+        .await;
+        let GracefulExitOutcome::Refused { reason, .. } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert!(reason.contains("nothing was typed"), "{reason}");
+        assert!(
+            pane.typed.lock().unwrap().is_empty(),
+            "nothing may be typed"
+        );
+        assert!(!log.lock().unwrap().iter().any(|l| l == "close"));
     }
 
     /// Structural pin on the invariant: this module's code never names a kill

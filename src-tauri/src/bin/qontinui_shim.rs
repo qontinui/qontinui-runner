@@ -60,9 +60,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use qontinui_runner_lib::cli_profile;
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
+use qontinui_types::cli_session::CliProfile;
 
 const GUARD_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_GUARD";
 const PORT_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_PORT";
@@ -240,54 +242,63 @@ pub fn detect_tool(argv0: Option<&str>) -> Option<ShimTool> {
 // fail-open invariants as the install straddle.
 // ===========================================================================
 
-/// The identity provider this exe impersonates (from `argv[0]`).
+/// The identity provider this exe impersonates (from `argv[0]`): the CLI
+/// profile ([`cli_profile`]) whose program it was invoked as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityTool {
-    Claude,
-    Gemini,
-}
+pub struct IdentityTool(&'static CliProfile);
 
 impl IdentityTool {
-    /// The provider program name (also the wire `provider` string).
+    /// Claude Code — the one CLI whose extra launch plumbing (the
+    /// SessionStart-hook `--settings`, the coord-mcp `--mcp-config`, the
+    /// delivered-policy marker) this shim knows how to deliver.
+    pub fn claude() -> Self {
+        Self(&cli_profile::claude::PROFILE)
+    }
+
+    /// The program name the real CLI is resolved and exec'd by: the profile's
+    /// first program stem (`claude`).
     pub fn program(self) -> &'static str {
-        match self {
-            IdentityTool::Claude => "claude",
-            IdentityTool::Gemini => "gemini",
-        }
+        self.0.programs.first().unwrap_or(&self.0.id).as_str()
+    }
+
+    /// The wire `provider` string: the profile id.
+    pub fn provider(self) -> &'static str {
+        self.0.id.as_str()
+    }
+
+    /// The CLI's profile.
+    pub fn profile(self) -> &'static CliProfile {
+        self.0
     }
 }
 
-/// Detect an identity provider from `argv[0]` (stem, case-insensitive).
-/// `None` ⇒ not an identity invocation (fall through to the install path).
+/// Detect an identity provider from `argv[0]`: the CLI profile claiming its
+/// program ([`cli_profile::profile_for_program`] — path, case and a Windows
+/// launcher suffix tolerated) AND pinning its session id by a flag, since
+/// pinning is the whole straddle. `None` ⇒ not an identity invocation (fall
+/// through to the install path).
 pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
-    match argv0_stem(argv0?).as_str() {
-        "claude" => Some(IdentityTool::Claude),
-        "gemini" => Some(IdentityTool::Gemini),
-        _ => None,
-    }
+    let profile = cli_profile::profile_for_program(argv0?)?;
+    cli_profile::pin_flag(profile)?;
+    Some(IdentityTool(profile))
 }
 
 /// Did the user's argv already choose a session? Then the shim must NOT
-/// double-pin. Exact token match, case-insensitive, mirroring
-/// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
-/// bash identity shim also honors. A merely-prefixed token
+/// double-pin. The tokens are the profile's
+/// ([`cli_profile::user_chose_session`]: the id flags, their aliases and the
+/// continue/picker spellings), matched as whole argv entries,
+/// case-insensitively, plus the `--flag=…` inline forms — mirroring
+/// `identity_shim.cmd` / `identity_shim.bash`. A merely-prefixed token
 /// (`--session-id-ish`) does NOT match.
-pub fn user_chose_session(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        let t = a.to_ascii_lowercase();
-        matches!(
-            t.as_str(),
-            "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
-        ) || t.starts_with("--session-id=")
-            || t.starts_with("--resume=")
-    })
+pub fn user_chose_session(tool: IdentityTool, args: &[String]) -> bool {
+    cli_profile::user_chose_session(tool.profile(), args)
 }
 
 /// The claude SessionStart-hook `--settings` args: tool==claude AND the env
 /// path is non-empty AND that file exists ⇒ `["--settings", <path>]` (two argv
 /// entries — native args, no quoting games). Otherwise empty (fail-open).
 pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -> Vec<String> {
-    if tool != IdentityTool::Claude {
+    if tool != IdentityTool::claude() {
         return Vec::new();
     }
     match settings_path {
@@ -333,7 +344,7 @@ pub fn keeps_policy_delivered_sha(
         .take_while(|a| a.as_str() != "--")
         .map(|a| a.split_once('=').map_or(a.as_str(), |(name, _)| name))
         .any(|name| name == "--system-prompt" || name == "--system-prompt-file");
-    tool == IdentityTool::Claude
+    tool == IdentityTool::claude()
         && !replacement
         && args.iter().enumerate().any(|(i, a)| {
             (a == FLAG && args.get(i + 1).is_some_and(|v| v == file))
@@ -350,7 +361,7 @@ pub fn keeps_policy_delivered_sha(
 /// pair BEFORE the `--session-id` flag (which terminates the variadic) — never as
 /// the trailing argv token.
 pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str>) -> Vec<String> {
-    if tool != IdentityTool::Claude {
+    if tool != IdentityTool::claude() {
         return Vec::new();
     }
     match mcp_config_path {
@@ -455,7 +466,7 @@ fn read_loopback_handshake_key(path: &std::path::Path) -> Option<String> {
 /// that would block headless `claude -p`). The caller holds the `TempPath` for
 /// exactly the lifetime of the `claude` child and it is deleted on drop.
 fn self_provision_mcp_config(tool: IdentityTool) -> Option<tempfile::TempPath> {
-    if tool != IdentityTool::Claude {
+    if tool != IdentityTool::claude() {
         return None; // only claude has a --mcp-config flag
     }
     // Dark-posture short-circuit (plan §6): the mint route's gate requires the
@@ -527,8 +538,9 @@ fn write_temp_mcp_config(document: &str) -> Option<tempfile::TempPath> {
 
 /// Compose the final identity argv (everything after the program): the
 /// ORIGINAL args byte-exact, then the `--settings` pair (claude hook), then the
-/// `--mcp-config` pair (coord-mcp delivery), then `--session-id <pinned>` ONLY
-/// when the user did not choose a session and a pinned id exists. `--mcp-config`
+/// `--mcp-config` pair (coord-mcp delivery), then `<pin_flag> <pinned>` (the
+/// profile's pin flag, `--session-id` for Claude Code) ONLY when the user did
+/// not choose a session and a pinned id exists. `--mcp-config`
 /// sits BEFORE `--session-id` on purpose: it is variadic, so a following
 /// `--`-flag must terminate it. Pure, so passthrough purity (incl. multi-line
 /// args) is unit-testable.
@@ -536,6 +548,7 @@ pub fn identity_argv(
     original: &[String],
     settings_args: &[String],
     mcp_config_args: &[String],
+    pin_flag: &str,
     pinned: Option<&str>,
     user_chose: bool,
 ) -> Vec<String> {
@@ -545,7 +558,7 @@ pub fn identity_argv(
     if !user_chose {
         if let Some(p) = pinned {
             if !p.is_empty() {
-                out.push("--session-id".to_string());
+                out.push(pin_flag.to_string());
                 out.push(p.to_string());
             }
         }
@@ -569,7 +582,7 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let pinned = env::var(PINNED_SESSION_ENV)
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let user_chose = user_chose_session(args);
+    let user_chose = user_chose_session(tool, args);
     let settings = identity_settings_args(tool, env::var(CLAUDE_HOOK_SETTINGS_ENV).ok().as_deref());
     let mut mcp_config = identity_mcp_config_args(tool, env::var(MCP_CONFIG_ENV).ok().as_deref());
 
@@ -612,7 +625,7 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
             port,
             "/control/shim-beacon",
             &shim_beacon_body(
-                tool.program(),
+                tool.provider(),
                 user_chose,
                 !settings.is_empty(),
                 !mcp_config.is_empty(),
@@ -634,15 +647,20 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
                 .ok()
                 .and_then(|p| p.trim().parse::<u16>().ok()),
         ) {
-            let _ = http_post(
-                port,
-                "/control/session-open",
-                &session_open_body(pin, tool.program()),
-            );
+            let _ = http_post(port, "/control/session-open", &session_open_body(pin, tool));
         }
     }
 
-    let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
+    // `detect_identity_tool` admits only a profile with a pin flag.
+    let pin_flag = cli_profile::pin_flag(tool.profile()).unwrap_or_default();
+    let final_args = identity_argv(
+        args,
+        &settings,
+        &mcp_config,
+        pin_flag,
+        pinned.as_deref(),
+        user_chose,
+    );
     let delivered_file = std::env::var(POLICY_DELIVERED_FILE_ENV).ok();
     let env_remove: &[&str] = if keeps_policy_delivered_sha(tool, args, delivered_file.as_deref()) {
         &[]
@@ -684,19 +702,21 @@ fn shim_beacon_body(
 
 /// JSON body for the identity confirmation POST. Every value is
 /// [`json_escape`]d. Reads the effective account config dir the runner set on
-/// this PTY child (`CLAUDE_CONFIG_DIR`) so the record binds the CORRECT Claude
-/// account for an autonomous boot-resume. Env read only; the shape is built by
-/// the pure [`session_open_body_fields`] so it stays deterministically testable.
-fn session_open_body(session_id: &str, provider: &str) -> String {
+/// this PTY child (the profile's account env var, `CLAUDE_CONFIG_DIR` for
+/// Claude Code) so the record binds the CORRECT account for an autonomous
+/// boot-resume. Env read only; the shape is built by the pure
+/// [`session_open_body_fields`] so it stays deterministically testable.
+fn session_open_body(session_id: &str, tool: IdentityTool) -> String {
     let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let config_dir = env::var("CLAUDE_CONFIG_DIR").ok();
+    let config_dir =
+        cli_profile::account_env_var(tool.profile()).and_then(|var| env::var(var).ok());
     session_open_body_fields(
         &terminal_id,
         session_id,
-        provider,
+        tool.provider(),
         &cwd,
         config_dir.as_deref(),
     )
@@ -1613,34 +1633,44 @@ mod tests {
 
     // ---- IDENTITY mode -----------------------------------------------------
 
+    /// An identity tool that is not Claude Code, for the Claude-only plumbing's
+    /// negative cases (the role the sunset gemini arm used to play here).
+    fn other_tool() -> IdentityTool {
+        let mut profile = IdentityTool::claude().profile().clone();
+        profile.id = "other-cli".to_string();
+        profile.programs = vec!["other-cli".to_string()];
+        IdentityTool(Box::leak(Box::new(profile)))
+    }
+
     #[test]
     fn detect_identity_tool_from_argv0_variants() {
         // Plain names.
         assert_eq!(
             detect_identity_tool(Some("claude")),
-            Some(IdentityTool::Claude)
+            Some(IdentityTool::claude())
         );
-        assert_eq!(
-            detect_identity_tool(Some("gemini")),
-            Some(IdentityTool::Gemini)
-        );
+        // The sunset gemini arm is gone: no CLI profile claims it.
+        assert_eq!(detect_identity_tool(Some("gemini")), None);
+        // Codex has a profile, but it reads its id back — nothing to pin, so
+        // the stub is never materialized for it and does not claim it.
+        assert_eq!(detect_identity_tool(Some("codex.exe")), None);
         // Extension + case variants (Windows materialized names).
         assert_eq!(
             detect_identity_tool(Some("claude.exe")),
-            Some(IdentityTool::Claude)
+            Some(IdentityTool::claude())
         );
         assert_eq!(
             detect_identity_tool(Some("CLAUDE.EXE")),
-            Some(IdentityTool::Claude)
+            Some(IdentityTool::claude())
         );
         // Full paths, both separators.
         assert_eq!(
             detect_identity_tool(Some("C:\\Temp\\qontinui-identity-x\\Claude.EXE")),
-            Some(IdentityTool::Claude)
+            Some(IdentityTool::claude())
         );
         assert_eq!(
-            detect_identity_tool(Some("/tmp/qontinui-identity-x/gemini")),
-            Some(IdentityTool::Gemini)
+            detect_identity_tool(Some("/tmp/qontinui-identity-x/claude")),
+            Some(IdentityTool::claude())
         );
         // Unknown stems fall through to the install path (or exit-0).
         assert_eq!(detect_identity_tool(Some("cargo.exe")), None);
@@ -1672,26 +1702,44 @@ mod tests {
             "-C",
         ] {
             assert!(
-                user_chose_session(&strs(&["-p", "hi", tok])),
+                user_chose_session(IdentityTool::claude(), &strs(&["-p", "hi", tok])),
                 "{tok} must mark user-chose"
             );
         }
         // Inline `=` forms (bash-shim parity).
-        assert!(user_chose_session(&strs(&["--session-id=abc"])));
-        assert!(user_chose_session(&strs(&["--resume=abc"])));
+        assert!(user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--session-id=abc"])
+        ));
+        assert!(user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--resume=abc"])
+        ));
         // Negative: token-exact — prefixes/lookalikes must NOT match.
-        assert!(!user_chose_session(&strs(&["--session-id-ish"])));
-        assert!(!user_chose_session(&strs(&["--session-identifier"])));
-        assert!(!user_chose_session(&strs(&["--continued"])));
-        assert!(!user_chose_session(&strs(&["-cc"])));
-        assert!(!user_chose_session(&strs(&["--print", "resume the work"])));
-        assert!(!user_chose_session(&strs(&[])));
+        assert!(!user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--session-id-ish"])
+        ));
+        assert!(!user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--session-identifier"])
+        ));
+        assert!(!user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--continued"])
+        ));
+        assert!(!user_chose_session(IdentityTool::claude(), &strs(&["-cc"])));
+        assert!(!user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--print", "resume the work"])
+        ));
+        assert!(!user_chose_session(IdentityTool::claude(), &strs(&[])));
         // A VALUE that merely contains a token string is a separate argv entry
         // in native-args land and DOES match only if it IS the token.
-        assert!(!user_chose_session(&strs(&[
-            "--append-system-prompt",
-            "use --resume-like flows"
-        ])));
+        assert!(!user_chose_session(
+            IdentityTool::claude(),
+            &strs(&["--append-system-prompt", "use --resume-like flows"])
+        ));
     }
 
     #[test]
@@ -1703,17 +1751,17 @@ mod tests {
 
         // claude + existing file ⇒ the two-entry pair.
         assert_eq!(
-            identity_settings_args(IdentityTool::Claude, Some(&path)),
+            identity_settings_args(IdentityTool::claude(), Some(&path)),
             vec!["--settings".to_string(), path.clone()]
         );
         // gemini never gets --settings.
-        assert!(identity_settings_args(IdentityTool::Gemini, Some(&path)).is_empty());
+        assert!(identity_settings_args(other_tool(), Some(&path)).is_empty());
         // Missing file / empty / unset ⇒ nothing (fail-open).
         let missing = tmp.path().join("nope.json").to_string_lossy().into_owned();
-        assert!(identity_settings_args(IdentityTool::Claude, Some(&missing)).is_empty());
-        assert!(identity_settings_args(IdentityTool::Claude, Some("")).is_empty());
-        assert!(identity_settings_args(IdentityTool::Claude, Some("  ")).is_empty());
-        assert!(identity_settings_args(IdentityTool::Claude, None).is_empty());
+        assert!(identity_settings_args(IdentityTool::claude(), Some(&missing)).is_empty());
+        assert!(identity_settings_args(IdentityTool::claude(), Some("")).is_empty());
+        assert!(identity_settings_args(IdentityTool::claude(), Some("  ")).is_empty());
+        assert!(identity_settings_args(IdentityTool::claude(), None).is_empty());
     }
 
     /// The policy marker survives ONLY on a claude launch that passes the
@@ -1728,12 +1776,12 @@ mod tests {
         let with_file = strs(&["--append-system-prompt-file", "/x/spawn-1.md", "-p", "hi"]);
         let attached = strs(&["--append-system-prompt-file=/x/spawn-1.md"]);
         assert!(keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &with_file,
             composed
         ));
         assert!(keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &attached,
             composed
         ));
@@ -1742,25 +1790,25 @@ mod tests {
         let own = strs(&["-p", "--append-system-prompt-file", "./eval.md"]);
         let own_attached = strs(&["--append-system-prompt-file=./eval.md"]);
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &own,
             composed
         ));
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &own_attached,
             composed
         ));
         // The composed path as a VALUE of some other flag, or dangling: dropped.
         let elsewhere = strs(&["--append-system-prompt-file", "./eval.md", "/x/spawn-1.md"]);
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &elsewhere,
             composed
         ));
         let dangling = strs(&["--append-system-prompt-file"]);
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &dangling,
             composed
         ));
@@ -1768,23 +1816,23 @@ mod tests {
         let inline = strs(&["--append-system-prompt", "briefing"]);
         let bare = strs(&["-p", "hi"]);
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &inline,
             composed
         ));
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &bare,
             composed
         ));
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &[],
             composed
         ));
         // A near-miss token is not the flag.
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &strs(&["--append-system-prompt-files=/x/spawn-1.md"]),
             composed
         ));
@@ -1803,7 +1851,7 @@ mod tests {
             ]),
         ] {
             assert!(
-                !keeps_policy_delivered_sha(IdentityTool::Claude, &replacement, composed),
+                !keeps_policy_delivered_sha(IdentityTool::claude(), &replacement, composed),
                 "{replacement:?}"
             );
         }
@@ -1814,23 +1862,23 @@ mod tests {
             "--system-prompt",
         ]);
         assert!(keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &after_terminator,
             composed
         ));
         // No inherited file (or an empty one): nothing to match, never kept.
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &with_file,
             None
         ));
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Claude,
+            IdentityTool::claude(),
             &with_file,
             Some("")
         ));
         assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Gemini,
+            other_tool(),
             &with_file,
             composed
         ));
@@ -1847,17 +1895,17 @@ mod tests {
 
         // claude + existing file ⇒ the two-entry pair.
         assert_eq!(
-            identity_mcp_config_args(IdentityTool::Claude, Some(&path)),
+            identity_mcp_config_args(IdentityTool::claude(), Some(&path)),
             vec!["--mcp-config".to_string(), path.clone()]
         );
         // gemini never gets --mcp-config (no such flag).
-        assert!(identity_mcp_config_args(IdentityTool::Gemini, Some(&path)).is_empty());
+        assert!(identity_mcp_config_args(other_tool(), Some(&path)).is_empty());
         // Missing file / empty / unset ⇒ nothing (fail-open — no broken server).
         let missing = tmp.path().join("nope.json").to_string_lossy().into_owned();
-        assert!(identity_mcp_config_args(IdentityTool::Claude, Some(&missing)).is_empty());
-        assert!(identity_mcp_config_args(IdentityTool::Claude, Some("")).is_empty());
-        assert!(identity_mcp_config_args(IdentityTool::Claude, Some("  ")).is_empty());
-        assert!(identity_mcp_config_args(IdentityTool::Claude, None).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::claude(), Some(&missing)).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::claude(), Some("")).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::claude(), Some("  ")).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::claude(), None).is_empty());
     }
 
     /// §5 fail-open: gemini has no `--mcp-config` flag, so the fallback must
@@ -1865,7 +1913,7 @@ mod tests {
     /// also proves gemini pays zero cost (no breadcrumb read, no HTTP).
     #[test]
     fn self_provision_never_fires_for_gemini() {
-        assert!(self_provision_mcp_config(IdentityTool::Gemini).is_none());
+        assert!(self_provision_mcp_config(other_tool()).is_none());
     }
 
     /// §5 fail-open, the whole-chain assertion: with NOTHING listening on the
@@ -1881,7 +1929,7 @@ mod tests {
     fn self_provision_fails_open_without_a_reachable_minting_runner() {
         // Must not panic on any path; a machine with a live runner in the
         // default (flag-off) posture 403s, which is also None.
-        let _ = self_provision_mcp_config(IdentityTool::Claude);
+        let _ = self_provision_mcp_config(IdentityTool::claude());
     }
 
     /// §6 dark-posture short-circuit: when the opt-in marker is ABSENT,
@@ -1895,7 +1943,7 @@ mod tests {
     fn self_provision_short_circuits_when_not_opted_in() {
         if !session_identity_marker_exists() {
             assert!(
-                self_provision_mcp_config(IdentityTool::Claude).is_none(),
+                self_provision_mcp_config(IdentityTool::claude()).is_none(),
                 "marker absent ⇒ no mint attempt, fail-open to None"
             );
         }
@@ -1976,7 +2024,7 @@ mod tests {
         // The existing arg builder accepts it (is_file passes) — one code path
         // for the env config and the minted one.
         assert_eq!(
-            identity_mcp_config_args(IdentityTool::Claude, Some(&as_str)),
+            identity_mcp_config_args(IdentityTool::claude(), Some(&as_str)),
             vec!["--mcp-config".to_string(), as_str.clone()]
         );
         // On Unix the live credential is owner-only.
@@ -2091,7 +2139,14 @@ mod tests {
         // Pinned + not user-chose ⇒ original (byte-exact) + settings + mcp-config
         // + pin, with `--mcp-config` BEFORE `--session-id` (the variadic must be
         // terminated by a following `--`-flag, never trail the argv).
-        let got = identity_argv(&orig, &settings, &mcp, Some("pin-123"), false);
+        let got = identity_argv(
+            &orig,
+            &settings,
+            &mcp,
+            "--session-id",
+            Some("pin-123"),
+            false,
+        );
         assert_eq!(
             got,
             strs(&[
@@ -2116,26 +2171,33 @@ mod tests {
 
         // User chose ⇒ no pin appended, settings + mcp-config still delivered.
         assert_eq!(
-            identity_argv(&orig, &settings, &mcp, Some("pin-123"), true),
+            identity_argv(
+                &orig,
+                &settings,
+                &mcp,
+                "--session-id",
+                Some("pin-123"),
+                true
+            ),
             [orig.clone(), settings.clone(), mcp.clone()].concat()
         );
         // No pinned id ⇒ no pin appended (settings + mcp-config still delivered).
         assert_eq!(
-            identity_argv(&orig, &settings, &mcp, None, false),
+            identity_argv(&orig, &settings, &mcp, "--session-id", None, false),
             [orig.clone(), settings.clone(), mcp.clone()].concat()
         );
         assert_eq!(
-            identity_argv(&orig, &settings, &mcp, Some(""), false),
+            identity_argv(&orig, &settings, &mcp, "--session-id", Some(""), false),
             [orig.clone(), settings.clone(), mcp.clone()].concat()
         );
         // No settings, no mcp-config ⇒ original + pin only.
         assert_eq!(
-            identity_argv(&orig, &[], &[], Some("p"), false),
+            identity_argv(&orig, &[], &[], "--session-id", Some("p"), false),
             [orig.clone(), strs(&["--session-id", "p"])].concat()
         );
         // mcp-config without settings ⇒ original + mcp-config + pin.
         assert_eq!(
-            identity_argv(&orig, &[], &mcp, Some("p"), false),
+            identity_argv(&orig, &[], &mcp, "--session-id", Some("p"), false),
             [orig.clone(), mcp.clone(), strs(&["--session-id", "p"])].concat()
         );
     }
@@ -2166,7 +2228,7 @@ mod tests {
 
     #[test]
     fn session_open_body_is_valid_json_shape() {
-        let body = session_open_body("sid-1", "claude");
+        let body = session_open_body("sid-1", IdentityTool::claude());
         assert!(body.starts_with('{') && body.ends_with('}'));
         assert!(body.contains("\"session_id\":\"sid-1\""));
         assert!(body.contains("\"source\":\"startup\""));

@@ -1306,6 +1306,7 @@ pub fn terminal_session_record_open(
     // guard the seed-lifecycle fixture door applies. See the helper for why,
     // and for why `config_dir` is deliberately not among them.
     validate_record_open_identity(&claude_session_id, &terminal_id)?;
+    let provider = record_open_provider(provider, store.get(&claude_session_id));
     let record = TerminalSessionRecord {
         claude_session_id,
         config_dir,
@@ -1320,13 +1321,8 @@ pub fn terminal_session_record_open(
         state: "open".to_string(),
         closed_at: None,
         close_reason: None,
-        // Origin-unaware callers omit `provider`; default to claude (the only
-        // provider today). record_open never downgrades an existing provider
-        // via a re-record because it always refreshes it from the incoming
-        // record — callers that re-assert must pass the right provider.
-        provider: provider.unwrap_or_else(|| {
-            crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string()
-        }),
+        provider,
+        lane: crate::session::session_lifecycle_store::SessionLane::Pty,
         // `None` (origin-unaware callers) preserves any existing origin;
         // record_open normalizes any legacy value passed in.
         origin,
@@ -1357,6 +1353,23 @@ pub fn terminal_session_record_open(
         message: None,
         data: Some(record_open_confirmation_report(&store, &session_id)),
     })
+}
+
+/// The provider [`terminal_session_record_open`] writes. `record_open`
+/// refreshes the provider from the incoming record, so the answer must never
+/// downgrade a known one:
+///
+/// - the provider the caller names (the tab's launch provider);
+/// - else the existing record's — an unnamed re-record (a zone re-resolve, a
+///   post-resume re-assert) is about the session the store already holds;
+/// - else Claude. A frontend that names no provider for a NEW record bound the
+///   id through a Claude-specific channel: the Claude transcript mtime capture,
+///   Claude Code's live session registry, or the Claude `--session-id` pin.
+fn record_open_provider(named: Option<String>, existing: Option<TerminalSessionRecord>) -> String {
+    named
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| existing.map(|r| r.provider))
+        .unwrap_or_else(|| qontinui_runner_lib::cli_profile::claude::ID.to_string())
 }
 
 /// Refuse a blank `claudeSessionId` / `terminalId` before either reaches the
@@ -1614,6 +1627,16 @@ pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
 ///
+/// Every AI-CLI profile the runner knows — the frontend's only source for
+/// per-CLI session facts (resume argv, resume handshake markers, restore
+/// tier). Plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 4; `GET /terminals/cli-profiles` serves the same data over HTTP.
+#[tauri::command]
+pub fn terminal_cli_profiles() -> Vec<qontinui_types::cli_session::CliProfile> {
+    qontinui_runner_lib::cli_profile::all().to_vec()
+}
+
 /// Returns the restorable set (see `restorable_records`): `open` records
 /// whose `last_seen_at` is recent relative to the registry's cohort ANCHOR
 /// (the newest instant of the densest death cohort — see `restorable_records`;
@@ -1919,7 +1942,9 @@ pub fn terminal_report_bridge_registration_failure(
 /// the caller's decision.
 #[tauri::command]
 pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let config_dirs = crate::terminal::transcript::find_transcript_config_dirs(
+        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+    );
     // Re-check liveness: a crashed process cannot remove its own registry file,
     // so PID presence is the guard against reporting a dead session as open.
     //
@@ -2346,6 +2371,17 @@ pub(crate) fn create_terminal_session_backend(
     // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
     let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
     let app_handle_for_spawn_name = app_handle.clone();
+    // The provider a hint's spawn-time record is stamped with: the CLI the
+    // command launches. A hint's id verification and mtime capture read
+    // Claude's transcript layout, so a hint spawn whose head names no known
+    // CLI (a shell wrapper) is a Claude spawn by construction.
+    let launch_provider: &'static str = command
+        .as_deref()
+        .and_then(<[String]>::first)
+        .and_then(|head| qontinui_runner_lib::cli_profile::profile_for_program(head))
+        .map_or(qontinui_runner_lib::cli_profile::claude::ID, |p| {
+            p.id.as_str()
+        });
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -2541,12 +2577,14 @@ pub(crate) fn create_terminal_session_backend(
                     title,
                     record_page_id,
                     record_zone_index,
-                    crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                    launch_provider.to_string(),
                 );
                 let verify_dirs: Vec<std::path::PathBuf> = config_dir
                     .iter()
                     .map(std::path::PathBuf::from)
-                    .chain(crate::terminal::transcript::find_claude_config_dirs())
+                    .chain(crate::terminal::transcript::find_transcript_config_dirs(
+                        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+                    ))
                     .collect();
                 let verify_pinned = pinned.clone();
                 let verify = move || {
@@ -2613,7 +2651,9 @@ fn resolve_latest_claude_session_id(
     project_path: &str,
     since: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
-    for dir in crate::terminal::transcript::find_claude_config_dirs() {
+    for dir in crate::terminal::transcript::find_transcript_config_dirs(
+        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+    ) {
         if let Some(session) =
             crate::terminal::transcript::get_latest_session_id(&dir, project_path, Some(since))
         {
@@ -2677,7 +2717,11 @@ async fn poll_and_record_session<F>(
                 state: "open".to_string(),
                 closed_at: None,
                 close_reason: None,
-                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                // `resolve` reads Claude's transcript layout (the freshest
+                // `<config>/projects/<cwd>/*.jsonl`), so what it finds is a
+                // Claude session.
+                provider: qontinui_runner_lib::cli_profile::claude::ID.to_string(),
+                lane: crate::session::session_lifecycle_store::SessionLane::Pty,
                 // Freshest-transcript mtime guess — may be a foreign session.
                 origin: Some(
                     crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string(),
@@ -2771,6 +2815,7 @@ pub(crate) fn record_pinned_session_open(
         closed_at: None,
         close_reason: None,
         provider,
+        lane: crate::session::session_lifecycle_store::SessionLane::Pty,
         // The runner KNOWS this id — it pre-pinned `--session-id` (or lifted a
         // typed flag / a hook POSTed it). Authoritative ⇒ auto-resume safe.
         origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
@@ -2956,6 +3001,25 @@ mod tests {
         }
     }
 
+    /// A named provider wins; an unnamed re-record keeps the stored one (a
+    /// Codex session re-asserted by a zone move stays Codex); only an unnamed
+    /// NEW record falls to Claude.
+    #[test]
+    fn record_open_provider_never_downgrades_a_known_provider() {
+        let mut codex_row = restore_candidate_record("s");
+        codex_row.provider = "codex".to_string();
+        assert_eq!(
+            record_open_provider(Some("codex".to_string()), None),
+            "codex"
+        );
+        assert_eq!(record_open_provider(None, Some(codex_row.clone())), "codex");
+        assert_eq!(
+            record_open_provider(Some("  ".to_string()), Some(codex_row)),
+            "codex"
+        );
+        assert_eq!(record_open_provider(None, None), "claude");
+    }
+
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
@@ -2971,6 +3035,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: Some(3),
@@ -3048,7 +3113,7 @@ mod tests {
     /// loop turned each one into a bare shell pane on every restore.
     ///
     /// Non-vacuous by construction: the transcript lives under
-    /// `CLAUDE_CONFIG_DIR`, which `find_claude_config_dirs` returns (asserted
+    /// `CLAUDE_CONFIG_DIR`, which `find_transcript_config_dirs` returns (asserted
     /// below), the file is seconds old, and the instance-identity env is
     /// cleared so this process reads as the PRIMARY. A re-added net that scans
     /// the config dirs from [`restore_candidates`] would therefore offer
@@ -3075,7 +3140,10 @@ mod tests {
         .expect("transcript");
         std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
         assert!(
-            crate::terminal::transcript::find_claude_config_dirs().contains(&cfg),
+            crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE
+            )
+            .contains(&cfg),
             "fixture must be discoverable, or this test proves nothing about a disk scan"
         );
 

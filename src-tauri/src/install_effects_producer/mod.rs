@@ -194,15 +194,20 @@ pub struct SessionOpenRequest {
     /// The per-PTY terminal id the runner injected as `QONTINUI_TERMINAL_ID`.
     pub terminal_id: String,
     /// The provider session id (the runner-pinned `QONTINUI_PINNED_SESSION_ID`,
-    /// echoed back by the hook for confirmation).
+    /// echoed back by the hook for confirmation). EMPTY from the identity shim
+    /// of a CLI whose profile reads its id back (Codex mints its own): that
+    /// post is a start signal, and the route begins the provider's read-back
+    /// capture instead of recording ([`read_back_signal`]).
+    #[serde(default)]
     pub session_id: String,
     /// The hook's `SessionStart` source: `"startup"` | `"resume"` | `"clear"`
     /// | `"compact"`. `"clear"` ([`HOOK_SOURCE_CLEAR`]) marks the id as ADOPTED
     /// onto this terminal; every other value is liveness only.
     #[serde(default)]
     pub source: Option<String>,
-    /// Which provider owns the session (`"claude"`, `"gemini"`). Defaults to
-    /// claude when the hook omits it (back-compat / Claude-only deployments).
+    /// Which provider owns the session — a CLI profile id (`"claude"`,
+    /// `"codex"`). Defaults to claude when the hook omits it (the Claude
+    /// SessionStart hook predates the field).
     #[serde(default)]
     pub provider: Option<String>,
     /// The provider config dir, if the hook reports it.
@@ -211,6 +216,11 @@ pub struct SessionOpenRequest {
     /// The session working dir, if the hook reports it.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The id a `codex resume <id>` launch named in argv, as the read-back
+    /// shim reports it with `source: "resume"`. UNVALIDATED here — the
+    /// capture validates it against the strict id charset before use.
+    #[serde(default)]
+    pub resume_id: Option<String>,
 }
 
 /// Why a `POST /control/session-open` body must be refused, or `None` to accept.
@@ -252,6 +262,96 @@ fn session_open_rejection(req: &SessionOpenRequest) -> Option<String> {
     None
 }
 
+/// The read-back adapter a `/control/session-open` body asks for, or `None`
+/// for an ordinary (session-id-carrying) open.
+///
+/// A body is a read-back START SIGNAL when it names a terminal, carries no
+/// session id, and names a provider whose profile reads its id back with a
+/// mechanism the runner implements
+/// ([`crate::session::provider_adapter::read_back_adapter`]) — the Codex
+/// identity shim's post. Every other id-less body falls through to
+/// [`session_open_rejection`] and is refused as before. Pure.
+fn read_back_signal(
+    req: &SessionOpenRequest,
+) -> Option<&'static dyn crate::session::provider_adapter::SessionProviderAdapter> {
+    if req.terminal_id.trim().is_empty() || !req.session_id.trim().is_empty() {
+        return None;
+    }
+    let provider = req.provider.as_deref()?.trim();
+    let profile = qontinui_runner_lib::cli_profile::profile_for(provider)?;
+    crate::session::provider_adapter::read_back_adapter(profile)
+}
+
+/// Begin `adapter`'s read-back capture for the session a start signal
+/// reports, and stamp the frontend tab with the id once it is recorded — the
+/// same `session-bound` event an id-carrying open emits. The id came from the
+/// provider's own session file, so it is provider-reported, not a runner
+/// prediction. Without the lifecycle store in Tauri state nothing can be
+/// recorded, so nothing starts.
+fn start_read_back(
+    state: &ApiState,
+    req: &SessionOpenRequest,
+    adapter: &'static dyn crate::session::provider_adapter::SessionProviderAdapter,
+) {
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use tauri::Manager;
+
+    let Some(store) = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+    else {
+        warn!(
+            terminal_id = %req.terminal_id,
+            provider = adapter.provider(),
+            "control/session-open: read-back start signal, but the lifecycle store is not in \
+             Tauri state — nothing captured"
+        );
+        return;
+    };
+    let start = crate::session::codex_capture::CaptureStart {
+        terminal_id: req.terminal_id.clone(),
+        cwd: req.cwd.clone().unwrap_or_default(),
+        codex_home: req.config_dir.clone().filter(|d| !d.trim().is_empty()),
+        started_ms: chrono::Utc::now().timestamp_millis(),
+        resume: (req.source.as_deref() == Some("resume")).then(|| req.resume_id.clone()),
+    };
+    let app_handle = state.app_handle.clone();
+    let terminal_id = req.terminal_id.clone();
+    adapter.spawn_read_back(
+        store,
+        start,
+        Box::new(move |session_id: &str, config_dir: &str| {
+            use crate::session::reconcile::{SessionBoundPayload, SESSION_BOUND_EVENT};
+            use crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE;
+            use tauri::Emitter;
+
+            let payload = SessionBoundPayload {
+                terminal_id: terminal_id.clone(),
+                session_id: session_id.to_string(),
+                config_dir: config_dir.to_string(),
+                origin: ORIGIN_AUTHORITATIVE.to_string(),
+                confirmed: true,
+                provider_reported: true,
+            };
+            if let Err(e) = app_handle.emit(SESSION_BOUND_EVENT, payload) {
+                warn!(
+                    terminal_id = %terminal_id,
+                    session_id = %session_id,
+                    error = %e,
+                    "control/session-open: session-bound emit after read-back failed \
+                     (tab stamp skipped; registry already durable)"
+                );
+            }
+        }),
+    );
+    info!(
+        terminal_id = %req.terminal_id,
+        provider = adapter.provider(),
+        "control/session-open: read-back start signal — capture started"
+    );
+}
+
 /// `POST /control/session-open`. Synchronously records the session
 /// AUTHORITATIVELY in the durable lifecycle store via the same writer the spawn
 /// path uses ([`crate::commands::terminal::record_pinned_session_open`]), then
@@ -270,6 +370,12 @@ async fn post_session_open(
     use crate::session::session_lifecycle_store::{SessionLifecycleStore, DEFAULT_PROVIDER};
     use tauri::Manager;
 
+    if let Some(adapter) = read_back_signal(&req) {
+        start_read_back(&state, &req, adapter);
+        // 200 whatever happened: a start signal is best-effort and must never
+        // delay the CLI the shim is about to exec.
+        return Ok(Json(ApiResponse::success(())));
+    }
     if let Some(msg) = session_open_rejection(&req) {
         return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
     }
@@ -937,7 +1043,9 @@ async fn get_sessions_info(
         )));
     };
     // Discovered ONCE for the whole listing, not per session.
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let config_dirs = crate::terminal::transcript::find_transcript_config_dirs(
+        &qontinui_runner_lib::cli_profile::claude::PROFILE,
+    );
     let probe = DiskTranscriptIndex::discover();
     let mut records = store.open_records();
     records.sort_by(|a, b| {
@@ -1367,6 +1475,11 @@ fn record_session_open_into(
         }
     }
 
+    // The same proof ends the failures a REPLACEMENT pane took over: when the
+    // runner respawned a failed session into this terminal, its session
+    // starting here is the evidence the replacement works — never the spawn.
+    crate::session::failure_recovery::on_pty_session_confirmed(&req.terminal_id);
+
     // D1 name stamp at confirmation. The account is already durable (the
     // `record_pinned_session_open` above derives it from `config_dir`), but the
     // NAME the operator sees lives only in Claude Code's per-process registry,
@@ -1383,7 +1496,9 @@ fn record_session_open_into(
     // tick. Never invent a name here.
     let dirs: Vec<std::path::PathBuf> = match req.config_dir.as_deref() {
         Some(d) if !d.trim().is_empty() => vec![std::path::PathBuf::from(d)],
-        _ => crate::terminal::transcript::find_claude_config_dirs(),
+        _ => crate::terminal::transcript::find_transcript_config_dirs(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        ),
     };
     if let Some(live) =
         crate::session::claude_session_registry::find_live_session_by_id(&dirs, &req.session_id)
@@ -2317,6 +2432,7 @@ mod tests {
             provider: None,
             config_dir: None,
             cwd: None,
+            resume_id: None,
         }
     }
 
@@ -2336,6 +2452,39 @@ mod tests {
             session_open_rejection(&session_open_req("term-1", "plain_id-9")),
             None
         );
+    }
+
+    /// Only an id-less post from a read-back provider is a start signal; an
+    /// id-less post from any other provider (or none) still reaches the
+    /// empty-id refusal, and an id-carrying Codex post is an ordinary open.
+    #[test]
+    fn read_back_signal_is_an_id_less_post_from_a_read_back_provider() {
+        let with_provider =
+            |terminal: &str, sid: &str, provider: Option<&str>| SessionOpenRequest {
+                provider: provider.map(str::to_string),
+                cwd: Some("/work".to_string()),
+                ..session_open_req(terminal, sid)
+            };
+        let adapter = read_back_signal(&with_provider("term-1", "", Some("codex")))
+            .expect("codex start signal");
+        assert_eq!(adapter.provider(), "codex");
+        assert!(read_back_signal(&with_provider("term-1", "  ", Some(" codex "))).is_some());
+
+        for req in [
+            with_provider("term-1", "", Some("claude")),
+            with_provider("term-1", "", None),
+            with_provider("term-1", "", Some("gemini")),
+            with_provider("", "", Some("codex")),
+            with_provider(
+                "term-1",
+                "01a0ef49-1234-7abc-8def-0123456789ab",
+                Some("codex"),
+            ),
+        ] {
+            assert!(read_back_signal(&req).is_none(), "{req:?}");
+        }
+        // …and the id-less non-signals are refused exactly as before.
+        assert!(session_open_rejection(&with_provider("term-1", "", Some("claude"))).is_some());
     }
 
     #[test]
@@ -2450,6 +2599,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
             confirmed_at: confirmed.then_some(3),
@@ -2903,6 +3053,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: Some("C:/cfg".to_string()),
             cwd: Some("C:/repos/widget".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -2968,6 +3119,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_OBSERVED.to_string()),
             restore_pending_at: None,
             confirmed_at: None,
@@ -2998,6 +3150,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: None, // hook may omit — must not erase the known one
             cwd: Some("/d/qontinui-root".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3043,6 +3196,7 @@ mod tests {
                 provider: Some("claude".to_string()),
                 config_dir: Some(config.clone()),
                 cwd: None,
+                resume_id: None,
             };
             record_session_open_into(&store, &req, "claude");
         };
@@ -3102,6 +3256,7 @@ mod tests {
                     provider: Some("claude".to_string()),
                     config_dir: Some(config.clone()),
                     cwd: None,
+                    resume_id: None,
                 };
                 record_session_open_into(&store, &req, "claude");
             };
@@ -3170,6 +3325,7 @@ mod tests {
                     closed_at: None,
                     close_reason: None,
                     provider: "claude".to_string(),
+                    lane: crate::session::session_lifecycle_store::SessionLane::Pty,
                     origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
                     restore_pending_at: None,
                     confirmed_at: Some(confirmed_at),
@@ -3200,6 +3356,7 @@ mod tests {
                     provider: Some("claude".to_string()),
                     config_dir: Some(config.clone()),
                     cwd: None,
+                    resume_id: None,
                 };
                 record_session_open_into(&store, &req, "claude");
             };
@@ -3265,6 +3422,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: None,
@@ -3295,6 +3453,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3351,6 +3510,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: None,
@@ -3380,6 +3540,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3428,6 +3589,7 @@ mod tests {
             provider: None,
             config_dir: None,
             cwd: None,
+            resume_id: None,
         };
         // The handler computes `provider`; mirror its default here.
         record_session_open_into(&store, &req, "claude");
