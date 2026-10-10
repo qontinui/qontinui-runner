@@ -637,13 +637,14 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   loop lives but the ledger holds no rows, so nothing is renewed (an `add` was
   refused or never ran); `MAX_RUNTIME` (9) — the loop itself ended on its own
   `--max-runtime` ceiling, not a coord verdict (these grants may still be live
-  at coord for up to their remaining ttl). A row the loop records
-  as `stolen`, `lapsed` or `max_runtime` is terminal and never beaten again,
+  at coord for up to their remaining ttl); `OWNER_GONE` (11) — the loop saw its
+  owning session die, released every row and ended. A row the loop records
+  as `stolen`, `lapsed`, `max_runtime` or `owner_gone` is terminal and never beaten again,
   while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
   `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if the ceiling
-  ended it, otherwise `DEAD`.
-  **Only `LIVE` means the claims are held.** The other six mean the claim is
+  ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
+  **Only `LIVE` means the claims are held.** The other seven mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
   dead loop and a healthy one look identical to anything that never asks. After
@@ -692,11 +693,12 @@ write the first line.
 - **Cite the plan path in every commit body and PR body** (e.g.
   `Plan: plans/<plan-slug>.md`) so the work is reliably indexable by the
   merged-branch search in step 4 and the durable plan→PR edge. Indexability is
-  all the marker claims — it is not a delivery claim: once plan
+  all the marker claims — it is not a delivery claim: now that plan
   `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
-  (authored 2026-09-04, not deployed as of that date), coord classifies a
-  citation whose PR changed only plan documents as a *document citation*, which
-  neither derives nor blocks `shipped`.
+  (qontinui-coord#1924, `483659578` on `origin/main`; the plan is stamped
+  SHIPPED 2026-09-07), coord classifies a citation whose PR changed only plan
+  documents as a *document citation*, which neither derives nor blocks
+  `shipped`.
 
 ## Applies to "post-merge follow-up" and other non-plan-slug dispatches too
 
