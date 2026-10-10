@@ -121,6 +121,12 @@ pub struct Profile {
     /// own `HTTPS_PROXY` / `HTTP_PROXY` always wins over this.
     #[serde(default)]
     pub network: Option<NetworkProfile>,
+    /// This machine's default for the six outbound data flows (plan
+    /// `2026-10-10-spec-front-end-phase-9-generic-boundary` C6 rung 3, C7).
+    /// Absent: no opinion — the product default `on` applies until coord
+    /// answers. Skipped when absent so existing files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressProfile>,
 }
 
 /// The `network` block of a profile (plan
@@ -180,6 +186,17 @@ pub enum TrustMode {
     /// Leave each stack on its own bundle (Git for Windows keeps its OpenSSL
     /// bundle).
     Bundled,
+}
+
+/// The profile's `egress` block. `default` is `"on"` | `"off"`; the runner's
+/// `egress` module reads it as the third rung of its resolution, below coord's
+/// live answer and the answer persisted from a previous process. Kept as a raw
+/// string so a typo cannot fail the whole profiles.json parse — the reader
+/// treats any value other than `on` as `off`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 /// S3-compatible blob storage settings. `kind` distinguishes MinIO from
@@ -265,7 +282,16 @@ pub fn load_strict() -> Result<ResolvedProfile> {
     load_inner()
 }
 
-fn load_inner() -> Result<ResolvedProfile> {
+/// The active profile's `egress` block, or `None` when it sets none. Errors
+/// exactly when [`load_strict`] would (no file, unparseable, active profile
+/// missing).
+pub fn active_egress_profile() -> Result<Option<EgressProfile>> {
+    read_active_profile().map(|(_, profile, _)| profile.egress)
+}
+
+/// Read profiles.json and pick the active profile: `QONTINUI_ENV`, else the
+/// file's `active`, else `dev`. Returns `(name, profile, path)`.
+fn read_active_profile() -> Result<(String, Profile, PathBuf)> {
     let path = profiles_path().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
     if !path.exists() {
         return Err(anyhow!("profiles.json not found at {}", path.display()));
@@ -288,6 +314,11 @@ fn load_inner() -> Result<ResolvedProfile> {
             path.display()
         )
     })?;
+    Ok((active, profile, path))
+}
+
+fn load_inner() -> Result<ResolvedProfile> {
+    let (active, profile, path) = read_active_profile()?;
 
     debug!("Loaded profile '{}' from {}", active, path.display());
 

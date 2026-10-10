@@ -404,7 +404,7 @@ impl TenantMemorySync {
         Self::with_probes(
             outbox,
             machine_id,
-            Box::new(crate::settings::get_cloud_sync_enabled),
+            Box::new(crate::egress::transcript_sync_permitted),
             Box::new(crate::auth::device_bearer),
         )
     }
@@ -728,7 +728,7 @@ static GLOBAL: OnceLock<Option<Arc<TenantMemorySync>>> = OnceLock::new();
 ///   production writers run inside the Tauri tokio runtime).
 /// - Never fails or panics; every failure mode collapses to a log line.
 pub fn enqueue_memory_record(record: TenantMemoryRecord) {
-    if !crate::settings::get_cloud_sync_enabled() {
+    if !crate::egress::transcript_sync_permitted() {
         return;
     }
     if let Some(sync) = global() {
