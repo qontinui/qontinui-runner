@@ -62,10 +62,105 @@ pub enum EarsCategory {
     Optional,
     /// Combined conditions: "While [state], when [event], the system shall [action]"
     Complex,
+    /// Unwanted behaviour: "If [trigger], then the system shall [response]" —
+    /// how the system must respond to an undesired situation (a failure, an
+    /// invalid input, a lost connection). Serialized `unwanted_behavior`; the
+    /// British spelling EARS itself uses is accepted on input.
+    #[serde(alias = "unwanted_behaviour")]
+    UnwantedBehavior,
     /// Not applicable (legacy criteria without EARS classification)
     #[default]
     #[serde(other)]
     NotApplicable,
+}
+
+impl EarsCategory {
+    /// Every classified category, in the order the prompts list them.
+    /// `NotApplicable` is the absence of a classification, not a category.
+    pub const CLASSIFIED: [EarsCategory; 6] = [
+        EarsCategory::Ubiquitous,
+        EarsCategory::EventDriven,
+        EarsCategory::StateDriven,
+        EarsCategory::Optional,
+        EarsCategory::Complex,
+        EarsCategory::UnwantedBehavior,
+    ];
+
+    /// The wire name — identical to the serde serialization — or `"n/a"` for
+    /// an unclassified criterion.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EarsCategory::Ubiquitous => "ubiquitous",
+            EarsCategory::EventDriven => "event_driven",
+            EarsCategory::StateDriven => "state_driven",
+            EarsCategory::Optional => "optional",
+            EarsCategory::Complex => "complex",
+            EarsCategory::UnwantedBehavior => "unwanted_behavior",
+            EarsCategory::NotApplicable => "n/a",
+        }
+    }
+
+    /// Whether a criterion of this category names a trigger (an event, a
+    /// state, a feature or an unwanted condition) that verification has to
+    /// set up before it can assert anything.
+    pub fn requires_trigger(&self) -> bool {
+        !matches!(self, EarsCategory::Ubiquitous | EarsCategory::NotApplicable)
+    }
+
+    /// Render a criterion as its EARS sentence:
+    /// `If <trigger>, then the <system> shall <action>` and so on.
+    ///
+    /// A missing trigger on a category that needs one renders as
+    /// `(trigger not specified)` rather than collapsing into the ubiquitous
+    /// form, so an incomplete criterion reads as incomplete. `Complex` takes
+    /// its trigger verbatim — it already carries its own "While …, when …".
+    /// `NotApplicable` renders the action alone.
+    pub fn render(&self, system: &str, trigger: Option<&str>, action: &str) -> String {
+        let trigger = trigger
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("(trigger not specified)");
+        match self {
+            EarsCategory::Ubiquitous => format!("The {system} shall {action}"),
+            EarsCategory::EventDriven => format!("When {trigger}, the {system} shall {action}"),
+            EarsCategory::StateDriven => format!("While {trigger}, the {system} shall {action}"),
+            EarsCategory::Optional => format!("Where {trigger}, the {system} shall {action}"),
+            EarsCategory::Complex => format!("{trigger}, the {system} shall {action}"),
+            EarsCategory::UnwantedBehavior => {
+                format!("If {trigger}, then the {system} shall {action}")
+            }
+            EarsCategory::NotApplicable => action.to_string(),
+        }
+    }
+
+    /// Classify a requirement sentence by its EARS keyword, ignoring case and
+    /// leading whitespace:
+    ///
+    /// * `If … then …` → [`EarsCategory::UnwantedBehavior`] (the `then` is
+    ///   what makes it EARS: a bare "If" with no "then" is not classified);
+    /// * `While … when …` → [`EarsCategory::Complex`];
+    /// * `When …` → [`EarsCategory::EventDriven`];
+    /// * `While …` → [`EarsCategory::StateDriven`];
+    /// * `Where …` → [`EarsCategory::Optional`];
+    /// * `The … shall …` → [`EarsCategory::Ubiquitous`];
+    /// * anything else → [`EarsCategory::NotApplicable`].
+    pub fn classify(sentence: &str) -> EarsCategory {
+        let lower = sentence.trim_start().to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let has = |word: &str| words.iter().skip(1).any(|w| *w == word);
+        match words.first().copied() {
+            Some("if") if has("then") => EarsCategory::UnwantedBehavior,
+            Some("while") if has("when") => EarsCategory::Complex,
+            Some("when") => EarsCategory::EventDriven,
+            Some("while") => EarsCategory::StateDriven,
+            Some("where") => EarsCategory::Optional,
+            Some("the") if has("shall") => EarsCategory::Ubiquitous,
+            _ => EarsCategory::NotApplicable,
+        }
+    }
 }
 
 /// A single acceptance criterion describing an observable success condition.
@@ -392,10 +487,13 @@ Classify each criterion using EARS categories:
   Example: { "ears_category": "optional", "trigger": "dark mode is enabled", "action": "render with dark color scheme" }
 - **complex**: Combined state + event
   Example: { "ears_category": "complex", "trigger": "While authenticated, when clicking logout", "action": "clear session and redirect to login" }
+- **unwanted_behavior**: Response to an undesired situation — "If [trigger], then the system shall [action]"
+  Example: { "ears_category": "unwanted_behavior", "trigger": "the API returns a 500 error", "action": "show an error banner and keep the form contents" }
+  Use it for failure handling, invalid input and lost connections — anything the system must survive rather than do.
 
 Each criterion in the JSON output must include:
-- "ears_category": one of "ubiquitous", "event_driven", "state_driven", "optional", "complex"
-- "trigger": the event or state condition (required for event_driven, state_driven, complex; null for ubiquitous)
+- "ears_category": one of "ubiquitous", "event_driven", "state_driven", "optional", "complex", "unwanted_behavior"
+- "trigger": the event, state or unwanted condition (required for event_driven, state_driven, complex, unwanted_behavior; null for ubiquitous)
 - "action": the expected system behavior (required for all)
 
 ## Bugfix Detection
@@ -479,14 +577,7 @@ pub fn format_criteria_for_builder(criteria: &AcceptanceCriteria) -> String {
             CriterionPriority::Important => "important",
             CriterionPriority::Optional => "optional",
         };
-        let ears_str = match c.ears_category {
-            EarsCategory::Ubiquitous => "ubiquitous",
-            EarsCategory::EventDriven => "event_driven",
-            EarsCategory::StateDriven => "state_driven",
-            EarsCategory::Optional => "optional",
-            EarsCategory::Complex => "complex",
-            EarsCategory::NotApplicable => "n/a",
-        };
+        let ears_str = c.ears_category.as_str();
         section.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
             c.id, priority_str, method_str, ears_str, c.description, c.verification_hint
@@ -513,15 +604,22 @@ pub fn format_criteria_for_builder(criteria: &AcceptanceCriteria) -> String {
     section.push_str(
         "- **complex** criteria: Generate a **multi-step sequence**: (1) establish state, (2) trigger event, (3) verify the expected action.\n",
     );
+    section.push_str(
+        "- **unwanted_behavior** criteria: Generate a **fault-injection step** that induces the unwanted condition (a failing dependency, an invalid input, a dropped connection), then a **check step** that verifies the system's specified response — and that it did not crash or corrupt state.\n",
+    );
 
-    // Emit structured EARS detail for event_driven/state_driven/complex criteria
+    // Emit structured EARS detail for every category that names a trigger
+    // except `optional` (its check is a single non-required step).
     let ears_criteria: Vec<&AcceptanceCriterion> = criteria
         .criteria
         .iter()
         .filter(|c| {
             matches!(
                 c.ears_category,
-                EarsCategory::EventDriven | EarsCategory::StateDriven | EarsCategory::Complex
+                EarsCategory::EventDriven
+                    | EarsCategory::StateDriven
+                    | EarsCategory::Complex
+                    | EarsCategory::UnwantedBehavior
             )
         })
         .collect();
@@ -546,6 +644,12 @@ pub fn format_criteria_for_builder(criteria: &AcceptanceCriteria) -> String {
                 EarsCategory::Complex => {
                     format!(
                         "- `{}`: **While/When** {} **then** {} -- generate state-setup+trigger+assert steps\n",
+                        c.id, trigger_str, action_str
+                    )
+                }
+                EarsCategory::UnwantedBehavior => {
+                    format!(
+                        "- `{}`: **If** {} **then** {} -- generate fault-injection+assert steps\n",
                         c.id, trigger_str, action_str
                     )
                 }
@@ -663,8 +767,11 @@ pub fn format_criteria_for_verifier(criteria: &AcceptanceCriteria) -> String {
     let has_complex = automatable
         .iter()
         .any(|c| matches!(c.ears_category, EarsCategory::Complex));
+    let has_unwanted = automatable
+        .iter()
+        .any(|c| matches!(c.ears_category, EarsCategory::UnwantedBehavior));
 
-    if has_event_driven || has_state_driven || has_complex {
+    if has_event_driven || has_state_driven || has_complex || has_unwanted {
         section.push_str("\n### EARS Structure Checks:\n");
         if has_event_driven {
             section.push_str(
@@ -679,6 +786,11 @@ pub fn format_criteria_for_verifier(criteria: &AcceptanceCriteria) -> String {
         if has_complex {
             section.push_str(
                 "- Flag if a **complex** criterion lacks the full sequence: state-setup, event-trigger, assertion.\n",
+            );
+        }
+        if has_unwanted {
+            section.push_str(
+                "- Flag if an **unwanted_behavior** criterion has no step that induces the unwanted condition before asserting the response (a happy-path check does not verify failure handling).\n",
             );
         }
     }
@@ -903,5 +1015,241 @@ mod tests {
     fn test_ears_category_default() {
         let criterion = AcceptanceCriterion::default();
         assert_eq!(criterion.ears_category, EarsCategory::NotApplicable);
+    }
+
+    fn unwanted_criterion() -> AcceptanceCriterion {
+        AcceptanceCriterion {
+            id: "save-survives-500".to_string(),
+            description: "A failed save keeps the form contents".to_string(),
+            method: VerificationMethod::UiBridge,
+            priority: CriterionPriority::Critical,
+            verification_hint: "Stub the save endpoint to 500, submit, assert banner".to_string(),
+            category: "behavior".to_string(),
+            ears_category: EarsCategory::UnwantedBehavior,
+            trigger: Some("the save request returns a 500 error".to_string()),
+            action: Some("show an error banner and keep the form contents".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_unwanted_behavior_serde_name_and_alias() {
+        let json = serde_json::to_string(&EarsCategory::UnwantedBehavior).unwrap();
+        assert_eq!(json, "\"unwanted_behavior\"");
+        for spelling in ["\"unwanted_behavior\"", "\"unwanted_behaviour\""] {
+            let parsed: EarsCategory = serde_json::from_str(spelling).unwrap();
+            assert_eq!(parsed, EarsCategory::UnwantedBehavior, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn test_as_str_matches_serde_for_every_classified_category() {
+        for category in EarsCategory::CLASSIFIED {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{}\"", category.as_str()));
+            let back: EarsCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, category, "{json} must round-trip");
+        }
+        assert_eq!(EarsCategory::NotApplicable.as_str(), "n/a");
+    }
+
+    #[test]
+    fn test_unwanted_behavior_parses_inside_a_criterion() {
+        let json = r#"{
+            "goal_summary": "Saves fail safely",
+            "criteria": [{
+                "id": "save-survives-500",
+                "description": "A failed save keeps the form contents",
+                "method": "ui_bridge",
+                "priority": "critical",
+                "verification_hint": "",
+                "category": "behavior",
+                "ears_category": "unwanted_behavior",
+                "trigger": "the save request returns a 500 error",
+                "action": "show an error banner"
+            }],
+            "assumptions": []
+        }"#;
+        let parsed: AcceptanceCriteria = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.criteria[0].ears_category,
+            EarsCategory::UnwantedBehavior
+        );
+    }
+
+    #[test]
+    fn test_render_every_category() {
+        let sys = "system";
+        let cases = [
+            (EarsCategory::Ubiquitous, None, "The system shall log out"),
+            (
+                EarsCategory::EventDriven,
+                Some("the user clicks logout"),
+                "When the user clicks logout, the system shall log out",
+            ),
+            (
+                EarsCategory::StateDriven,
+                Some("the session is active"),
+                "While the session is active, the system shall log out",
+            ),
+            (
+                EarsCategory::Optional,
+                Some("single sign-on is enabled"),
+                "Where single sign-on is enabled, the system shall log out",
+            ),
+            (
+                EarsCategory::Complex,
+                Some("While authenticated, when the token expires"),
+                "While authenticated, when the token expires, the system shall log out",
+            ),
+            (
+                EarsCategory::UnwantedBehavior,
+                Some("the identity provider is unreachable"),
+                "If the identity provider is unreachable, then the system shall log out",
+            ),
+            (EarsCategory::NotApplicable, None, "log out"),
+        ];
+        for (category, trigger, expected) in cases {
+            assert_eq!(category.render(sys, trigger, "log out"), expected);
+        }
+    }
+
+    #[test]
+    fn test_render_marks_a_missing_trigger_instead_of_dropping_it() {
+        for trigger in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                EarsCategory::UnwantedBehavior.render("service", trigger, "retry"),
+                "If (trigger not specified), then the service shall retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_every_pattern() {
+        let cases = [
+            (
+                "If the payment gateway times out, then the system shall queue the order",
+                EarsCategory::UnwantedBehavior,
+            ),
+            (
+                "  IF a duplicate id is submitted THEN the API shall return 409",
+                EarsCategory::UnwantedBehavior,
+            ),
+            (
+                "While logged in, when the token expires, the app shall refresh it",
+                EarsCategory::Complex,
+            ),
+            (
+                "When the user submits, the system shall save",
+                EarsCategory::EventDriven,
+            ),
+            (
+                "While offline, the app shall queue writes",
+                EarsCategory::StateDriven,
+            ),
+            (
+                "Where dark mode is enabled, the UI shall use the dark palette",
+                EarsCategory::Optional,
+            ),
+            (
+                "The system shall encrypt data at rest",
+                EarsCategory::Ubiquitous,
+            ),
+            // A bare "If" with no "then" is not EARS.
+            ("If possible, make it fast", EarsCategory::NotApplicable),
+            // "then" must follow the opening word, not be it.
+            ("Then the system shall stop", EarsCategory::NotApplicable),
+            // Prefix of a longer word is not the keyword.
+            ("Whenever it rains, carry on", EarsCategory::NotApplicable),
+            ("", EarsCategory::NotApplicable),
+        ];
+        for (sentence, expected) in cases {
+            assert_eq!(EarsCategory::classify(sentence), expected, "{sentence:?}");
+        }
+    }
+
+    #[test]
+    fn test_classify_inverts_render() {
+        for category in EarsCategory::CLASSIFIED {
+            let trigger = match category {
+                EarsCategory::Complex => Some("While idle, when a job arrives"),
+                _ => Some("a job arrives"),
+            };
+            let sentence = category.render("scheduler", trigger, "start it");
+            assert_eq!(EarsCategory::classify(&sentence), category, "{sentence}");
+        }
+    }
+
+    #[test]
+    fn test_requires_trigger() {
+        assert!(!EarsCategory::Ubiquitous.requires_trigger());
+        assert!(!EarsCategory::NotApplicable.requires_trigger());
+        for category in [
+            EarsCategory::EventDriven,
+            EarsCategory::StateDriven,
+            EarsCategory::Optional,
+            EarsCategory::Complex,
+            EarsCategory::UnwantedBehavior,
+        ] {
+            assert!(category.requires_trigger(), "{}", category.as_str());
+        }
+    }
+
+    #[test]
+    fn test_builder_renders_unwanted_behavior() {
+        let mut criteria = sample_criteria();
+        criteria.criteria.push(unwanted_criterion());
+        let output = format_criteria_for_builder(&criteria);
+
+        assert!(output.contains("| save-survives-500 | CRITICAL | ui_bridge | unwanted_behavior |"));
+        assert!(
+            output.contains("**unwanted_behavior** criteria: Generate a **fault-injection step**")
+        );
+        assert!(output.contains(
+            "- `save-survives-500`: **If** the save request returns a 500 error **then** show an error banner and keep the form contents -- generate fault-injection+assert steps"
+        ));
+    }
+
+    #[test]
+    fn test_verifier_checks_unwanted_behavior_only_when_present() {
+        let mut criteria = sample_criteria();
+        let without = format_criteria_for_verifier(&criteria);
+        assert!(!without.contains("unwanted_behavior"));
+
+        criteria.criteria.push(unwanted_criterion());
+        let with = format_criteria_for_verifier(&criteria);
+        assert!(with.contains(
+            "Flag if an **unwanted_behavior** criterion has no step that induces the unwanted condition"
+        ));
+    }
+
+    #[test]
+    fn test_verifier_emits_ears_checks_for_unwanted_behavior_alone() {
+        let criteria = AcceptanceCriteria {
+            goal_summary: "Fails safely".to_string(),
+            criteria: vec![unwanted_criterion()],
+            assumptions: vec![],
+            bugfix_context: None,
+        };
+        let output = format_criteria_for_verifier(&criteria);
+        assert!(output.contains("EARS Structure Checks"));
+        assert!(!output.contains("event_driven"));
+    }
+
+    #[test]
+    fn test_prompt_lists_unwanted_behavior() {
+        let prompt = build_specification_prompt(
+            "Add retry to the uploader",
+            "",
+            "",
+            None,
+            "standard",
+            &[],
+            None,
+        );
+        assert!(prompt.contains("**unwanted_behavior**"));
+        assert!(prompt.contains("If [trigger], then the system shall [action]"));
+        assert!(prompt.contains(
+            "one of \"ubiquitous\", \"event_driven\", \"state_driven\", \"optional\", \"complex\", \"unwanted_behavior\""
+        ));
     }
 }
