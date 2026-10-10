@@ -802,25 +802,41 @@ impl ExplorationTask {
         }
     }
 
-    /// Execute a transition via Python bridge
+    /// Execute a transition via the Python bridge's `sm_execute_transition` handler.
+    ///
+    /// Waits for the executor's response so a failed transition is reported as a
+    /// failure. The previous fire-and-forget `execute_transition` send had no Python
+    /// handler at all, so every transition read as passed while doing nothing.
     async fn execute_transition(&self, transition_id: &str) -> Result<(), String> {
         let params = serde_json::json!({
             "transition_id": transition_id
         });
 
         let app_state = self.app_state.clone();
-        spawn_blocking_tracked(move || {
+        let response = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
                 }
                 bridge
-                    .send_command("execute_transition", Some(params))
+                    .send_command_and_wait(
+                        "sm_execute_transition",
+                        Some(params),
+                        Duration::from_secs(30),
+                    )
                     .map_err(|e| format!("Failed to execute transition: {}", e))
             })?
         })
         .await
-        .map_err(|e| format!("spawn_blocking error: {}", e))?
+        .map_err(|e| format!("spawn_blocking error: {}", e))??;
+
+        if response.success {
+            Ok(())
+        } else {
+            Err(response
+                .error
+                .unwrap_or_else(|| "Transition failed with no error message".to_string()))
+        }
     }
 
     /// Send an event if event sender is configured

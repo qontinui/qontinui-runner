@@ -1159,13 +1159,15 @@ class QontinuiExecutor(
     def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Handle command from Rust bridge."""
         cmd_type = command.get("command")
-        params = command.get("params", {})
+        # Rust serializes ``params: None`` as JSON null; handlers expect a dict.
+        params = command.get("params") or {}
 
         # Don't log high-frequency commands to avoid flooding the logs
         if cmd_type not in ("ping", "status"):
             self.event_manager.emit_log("info", f"handle_command: received '{cmd_type}'")
 
-        # ``params`` is decoded JSON, so the ``_cmd_*`` methods type it ``Any``.
+        # ``params`` is decoded JSON; handlers that read required keys type it
+        # ``dict[str, Any]`` and validate those keys themselves.
         entry = _COMMAND_TABLE.get(cmd_type) if isinstance(cmd_type, str) else None
         if entry is None:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
@@ -1174,15 +1176,19 @@ class QontinuiExecutor(
             return handler(params)  # type: ignore[no-any-return]
         return handler()  # type: ignore[no-any-return]
 
-    def _cmd_load(self, params: Any) -> dict[str, Any]:
+    def _cmd_load(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle the ``load`` command."""
         config_path = params.get("config_path")
+        if not config_path:
+            return {"success": False, "error": "config_path is required"}
         success = self.load_configuration(config_path)
         return {"success": success}
 
-    def _cmd_start(self, params: Any) -> dict[str, Any]:
+    def _cmd_start(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle the ``start`` command."""
         workflow_id = params.get("workflow_id") or params.get("workflow")
+        if not workflow_id:
+            return {"success": False, "error": "workflow_id is required"}
         # Support both "monitor" and "monitor_index" parameter names
         # Use explicit None check to handle monitor_index=0 correctly (0 is falsy in Python)
         monitor = params.get("monitor_index")
@@ -1383,10 +1389,12 @@ class QontinuiExecutor(
         print(json.dumps(pong_message), flush=True)
         return {"success": True}
 
-    def _cmd_navigate_to_state(self, params: Any) -> dict[str, Any]:
+    def _cmd_navigate_to_state(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle the ``navigate_to_state`` command."""
         # Support both "target_state_id" (from Rust action_service) and "state_id" (legacy)
         state_id = params.get("target_state_id") or params.get("state_id")
+        if not state_id:
+            return {"success": False, "error": "target_state_id is required"}
         return self.navigate_to_state(state_id)
 
     def _start_async_loop(self):

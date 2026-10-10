@@ -40,24 +40,13 @@ METHODS_SNAPSHOT = Path(__file__).resolve().parent / "executor-methods.snapshot.
 PACKAGE_DIR = BRIDGE_DIR / "executor_commands"
 RUST_SRC = BRIDGE_DIR.parent / "src-tauri" / "src"
 
-_FOLLOW_UP = (
-    "follow-up: delete or route "
-    "(plan 2026-10-04-runner-python-executor-routes-118-commands-through-one-if-chain)"
-)
-
-# Command names the Rust side sends that no Python dispatcher handles; each returns
-# ``Unknown command`` today. Remove an entry when its sender is deleted or routed.
-KNOWN_UNHANDLED: dict[str, str] = {
-    # src-tauri/src/commands/state_machine.rs
-    "execute_transition": _FOLLOW_UP,
-    "navigate_to_multiple_states": _FOLLOW_UP,
-    "get_active_states": _FOLLOW_UP,
-    "get_available_transitions": _FOLLOW_UP,
-    # src-tauri/src/mcp/ai_generation.rs
-    "generate_macro_with_ai": _FOLLOW_UP,
-    "generate_prompt_snippet_with_ai": _FOLLOW_UP,
-    "suggest_check_groups_with_ai": _FOLLOW_UP,
-}
+# Command names the Rust side sends that no Python dispatcher handles; each would return
+# ``Unknown command``. Empty since plan
+# 2026-10-06-runner-python-bridge-guards-run-nowhere-and-seven-rust-commands-have-no-handler
+# deleted the last seven senders. ``test_every_rust_sent_command_is_handled`` fails on any
+# new unhandled sender; add an entry here only for a known gap, with a pointer to the plan
+# that will delete or route it.
+KNOWN_UNHANDLED: dict[str, str] = {}
 
 # Newline-tolerant: ``\s*`` spans the line break when the literal sits on the next line.
 _SEND_RE = re.compile(r'send_command(?:_and_wait|_async)?\(\s*"([^"]+)"')

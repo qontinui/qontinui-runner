@@ -494,7 +494,6 @@ pub const FOREIGN_ROUTES: &[(&str, &str)] = &[
 pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ai/generate-api-request"),
     ("POST", "/ai/generate-context"),
-    ("POST", "/ai/generate-macro"),
     ("POST", "/ai/generate-prompt"),
     ("POST", "/ai/generate-shell-command"),
     ("POST", "/ai/generate-test"),
