@@ -208,8 +208,8 @@ use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
-pub(crate) use qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureVerdict;
 use crate::settings::AccountSelectionMode;
+pub(crate) use qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureVerdict;
 
 /// How often the loop refreshes the cached effective level. 45s sits in the
 /// 30–60s window the plan specifies — long enough to not hammer coord, short
