@@ -397,8 +397,9 @@ impl std::fmt::Debug for TenantMemorySync {
 }
 
 impl TenantMemorySync {
-    /// Production constructor: gate reads the real
-    /// `Settings.cloud_sync_enabled`, bearer reads the default device-JWT
+    /// Production constructor: gate reads [`crate::egress::transcript_sync_permitted`]
+    /// (the user's `Settings.cloud_sync_enabled` AND the tenant's
+    /// `egress_transcript_sync`), bearer reads the default device-JWT
     /// slot.
     pub fn new(outbox: Arc<OutboxWriter>, machine_id: Uuid) -> Self {
         Self::with_probes(
@@ -721,7 +722,8 @@ static GLOBAL: OnceLock<Option<Arc<TenantMemorySync>>> = OnceLock::new();
 
 /// Enqueue a tenant-memory record via the process-global emitter.
 ///
-/// - Consent gate 1 (hard): with `cloud_sync_enabled` off this returns
+/// - Consent gate (hard): with the user's `cloud_sync_enabled` or the tenant's
+///   `egress_transcript_sync` off this returns
 ///   immediately — the sync is never even initialized, no file is created,
 ///   nothing egresses.
 /// - First consented call lazy-initializes the outbox + drain loop (all

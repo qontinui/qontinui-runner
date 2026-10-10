@@ -1608,24 +1608,6 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     let base = inner.coord_url.trim_end_matches('/');
     let kind = rec.event_kind.as_str();
 
-    // The last line of the per-tenant egress switches for BOTH session-output
-    // streams (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
-    // Phase 7): a chunk queued before a flip to `off` is ACKed and DROPPED —
-    // counted, never held — so the backlog does not leave afterwards and a
-    // later flip to `on` does not release it either.
-    if kind == "output_chunk" {
-        if let Some(flow) = output_chunk_egress_refusal(&rec.payload) {
-            OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                session = %rec.session_id,
-                seq = rec.seq,
-                flow = flow.key(),
-                "coord_sync: output chunk refused by the egress switch — ACK-and-drop"
-            );
-            return PushOutcome::Acked;
-        }
-    }
-
     // Phase 8b (plan 2026-07-02-session-scoped-multi-tenant-device-binding
     // §D4) — per-session credential selection: every push presents the
     // OWNING SESSION's device-JWT slot.
@@ -1639,6 +1621,25 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // behaviour, and degrades to unauthenticated on a multi-bound one instead
     // of filing another tenant's session row.
     let scope = record_session_tenant(inner, rec);
+
+    // The last line of the per-tenant egress switches for BOTH session-output
+    // streams (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
+    // Phase 7): a chunk queued before a flip to `off` is ACKed and DROPPED —
+    // counted, never held — so the backlog does not leave afterwards and a
+    // later flip to `on` does not release it either. Evaluated in the OWNING
+    // session's tenant scope, the same tenant whose credential the push uses.
+    if kind == "output_chunk" {
+        if let Some(flow) = output_chunk_egress_refusal(&rec.payload, scope.declared_tenant()) {
+            OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                flow = flow.key(),
+                "coord_sync: output chunk refused by the egress switch — ACK-and-drop"
+            );
+            return PushOutcome::Acked;
+        }
+    }
 
     let result = match kind {
         "started" => {
@@ -2803,7 +2804,10 @@ pub(crate) static OUTPUT_CHUNKS_DROPPED_EGRESS_OFF: AtomicU64 = AtomicU64::new(0
 /// Stream `pty` is terminal streaming; every other stream — `transcript`, and
 /// an absent stream, which [`output_chunk_body`] defaults to `transcript` — is
 /// transcript sync, whose verdict includes the user's own consent.
-fn output_chunk_egress_refusal(payload: &JsonValue) -> Option<crate::egress::Flow> {
+fn output_chunk_egress_refusal(
+    payload: &JsonValue,
+    tenant: Option<Uuid>,
+) -> Option<crate::egress::Flow> {
     use crate::egress::Flow;
     let stream = payload
         .get("stream")
@@ -2812,15 +2816,15 @@ fn output_chunk_egress_refusal(payload: &JsonValue) -> Option<crate::egress::Flo
     let (flow, allowed) = if stream == PTY_STREAM {
         (
             Flow::TerminalStream,
-            crate::egress::permit_or_count(Flow::TerminalStream),
+            crate::egress::permit_or_count_for(Flow::TerminalStream, tenant),
         )
     } else {
         // Counted as an egress refusal only when the TENANT switch refused; a
         // user who turned their own consent off is not the switch's doing.
-        crate::egress::permit_or_count(Flow::TranscriptSync);
+        crate::egress::permit_or_count_for(Flow::TranscriptSync, tenant);
         (
             Flow::TranscriptSync,
-            crate::egress::transcript_sync_permitted(),
+            crate::egress::transcript_sync_gate_for(tenant).is_open(),
         )
     };
     (!allowed).then_some(flow)
@@ -8350,19 +8354,26 @@ pub(crate) mod egress_tests {
         let _t = pin(Flow::TranscriptSync, Level::Off);
         let _p = pin(Flow::TerminalStream, Level::Off);
         assert_eq!(
-            output_chunk_egress_refusal(&json!({"stream": "pty"})),
+            output_chunk_egress_refusal(&json!({"stream": "pty"}), None),
             Some(Flow::TerminalStream)
         );
         assert_eq!(
-            output_chunk_egress_refusal(&json!({})),
+            output_chunk_egress_refusal(&json!({}), None),
             Some(Flow::TranscriptSync),
             "an absent stream is a transcript chunk"
         );
         let src = include_str!("coord_sync.rs");
         let body = src.split_once("async fn push_record(").unwrap().1;
         let check = body
-            .find("output_chunk_egress_refusal(&rec.payload)")
+            .find("output_chunk_egress_refusal(&rec.payload, scope.declared_tenant())")
             .unwrap();
+        let scope = body
+            .find("let scope = record_session_tenant(inner, rec);")
+            .unwrap();
+        assert!(
+            scope < check,
+            "the owning session's tenant is resolved before the check"
+        );
         let dispatch = body.find("let result = match kind").unwrap();
         assert!(
             check < dispatch,

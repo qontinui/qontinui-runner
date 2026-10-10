@@ -259,10 +259,14 @@ async fn flush(
     }
     // The tenant's `egress_terminal_stream` switch, checked on EVERY flush so a
     // flip takes effect on the next coalesced chunk (plan
-    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). A refused
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), in the
+    // owning session's tenant scope. A refused
     // chunk is dropped and counted, never held: the offset does not advance,
     // exactly like a quota drop, and nothing is released by a later flip.
-    if !crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) {
+    if !crate::egress::permit_or_count_for(
+        crate::egress::Flow::TerminalStream,
+        tenant.declared_tenant(),
+    ) {
         tracing::debug!(
             session = %session_id,
             bytes = buffer.len(),

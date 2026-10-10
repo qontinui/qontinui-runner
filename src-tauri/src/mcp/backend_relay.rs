@@ -2864,43 +2864,55 @@ pub(crate) fn route_relay_frame(msg_type: &str, data: &Value) -> RelayRoute {
     RelayRoute::Refuse(remote_type_refusal(&msg_type, &data))
 }
 
-/// The relay `terminal_*` frames that stream a terminal (or open one to
-/// stream) and so stop at the tenant's `egress_terminal_stream` switch (plan
-/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). Tear-down and
-/// flow-control frames (`terminal_detach`, `terminal_flow`, `terminal_subscribe`
-/// / `_unsubscribe`, which are fire-and-forget and expect no reply) pass: none
-/// of them sends terminal bytes, and the outbound forwarder withholds the
-/// output frames themselves.
-const EGRESS_GATED_TERMINAL_FRAMES: &[&str] = &[
-    "terminal_list",
-    "terminal_create",
-    "terminal_input",
-    "terminal_resize",
-    "terminal_close",
-    "terminal_buffer",
-    "terminal_attach",
+/// The relay frames that stream a terminal (or open one to stream), or read a
+/// session's output back out, and so stop at the tenant's
+/// `egress_terminal_stream` switch (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), each with the
+/// reply type its caller is waiting for. AI-session content relayed to the
+/// console (`chat_get_output`) rides the same switch as terminal output — it
+/// is the same live view, over the same relay (see the `egress` module doc).
+/// Tear-down and flow-control frames (`terminal_detach`, `terminal_flow`,
+/// `terminal_subscribe` / `_unsubscribe`, which are fire-and-forget and expect
+/// no reply) pass: none of them sends session bytes, and the outbound
+/// forwarder withholds the output frames themselves.
+const EGRESS_GATED_RELAY_FRAMES: &[(&str, &str)] = &[
+    ("terminal_list", "terminal_response"),
+    ("terminal_create", "terminal_response"),
+    ("terminal_input", "terminal_response"),
+    ("terminal_resize", "terminal_response"),
+    ("terminal_close", "terminal_response"),
+    ("terminal_buffer", "terminal_response"),
+    ("terminal_attach", "terminal_response"),
+    ("chat_get_output", "chat_output"),
 ];
 
-/// `Some(refusal frame)` when `msg_type` is a gated terminal frame and the
-/// switch is off. Checked live on every frame.
+/// `Some(refusal frame)` when `msg_type` is a gated relay frame and the
+/// terminal-stream switch is off. Checked live on every frame.
 fn terminal_egress_refusal(msg_type: &str, data: &Value) -> Option<Value> {
-    if !EGRESS_GATED_TERMINAL_FRAMES.contains(&msg_type) {
-        return None;
-    }
+    let (_, reply_type) = EGRESS_GATED_RELAY_FRAMES
+        .iter()
+        .find(|(frame, _)| *frame == msg_type)?;
     if crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) {
         return None;
     }
-    Some(crate::egress::terminal_refusal_frame(data))
+    Some(crate::egress::egress_refusal_frame(
+        reply_type,
+        crate::egress::Flow::TerminalStream,
+        data,
+    ))
 }
 
 /// Whether the outbound forwarder may send an event on `channel` right now:
-/// `terminal-output` / `terminal-exit` follow `egress_terminal_stream`, and
+/// `terminal-output` / `terminal-exit` and the AI-session content channels
+/// (`ai-output`, `session-state`) follow `egress_terminal_stream`, and
 /// `ui-error` / `recent-crash` follow `egress_telemetry` (checked live, unlike
 /// the boot-time crash reporter). Every other channel is not an egress flow.
 fn outbound_egress_permitted(channel: &str) -> bool {
     use crate::egress::Flow;
     match channel {
-        "terminal-output" | "terminal-exit" => crate::egress::permit_or_count(Flow::TerminalStream),
+        "terminal-output" | "terminal-exit" | "ai-output" | "session-state" => {
+            crate::egress::permit_or_count(Flow::TerminalStream)
+        }
         "ui-error" | "recent-crash" => crate::egress::permit_or_count(Flow::Telemetry),
         _ => true,
     }
@@ -8904,9 +8916,9 @@ mod egress_tests {
     fn gated_terminal_frames_answer_egress_off_while_the_switch_is_off() {
         let data = serde_json::json!({"request_id": "r-1", "terminal_id": "t-1"});
         let _pin = pin(Flow::TerminalStream, Level::Off);
-        for frame in EGRESS_GATED_TERMINAL_FRAMES {
+        for (frame, reply) in EGRESS_GATED_RELAY_FRAMES {
             let refusal = terminal_egress_refusal(frame, &data).expect(frame);
-            assert_eq!(refusal["type"], "terminal_response");
+            assert_eq!(refusal["type"], *reply);
             assert_eq!(refusal["error"], "egress_off");
             assert_eq!(refusal["flow"], "terminal_stream");
             assert_eq!(refusal["request_id"], "r-1");
@@ -8925,7 +8937,7 @@ mod egress_tests {
     #[test]
     fn gated_terminal_frames_pass_while_the_switch_is_on() {
         let _pin = pin(Flow::TerminalStream, Level::On);
-        for frame in EGRESS_GATED_TERMINAL_FRAMES {
+        for (frame, _) in EGRESS_GATED_RELAY_FRAMES {
             assert!(terminal_egress_refusal(frame, &serde_json::json!({})).is_none());
         }
     }
@@ -8945,6 +8957,25 @@ mod egress_tests {
         assert!(!outbound_egress_permitted("ui-error"));
         assert!(!outbound_egress_permitted("recent-crash"));
         assert!(outbound_egress_permitted("terminal-output"));
+    }
+
+    /// M4: relay channels carrying AI session content ride the terminal
+    /// streaming switch — the `ai-output` / `session-state` forwards and the
+    /// `chat_get_output` read.
+    #[test]
+    fn ai_session_content_follows_the_terminal_stream_switch() {
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        assert!(!outbound_egress_permitted("ai-output"));
+        assert!(!outbound_egress_permitted("session-state"));
+        let data = serde_json::json!({"request_id": "r-9", "session_id": "s-1"});
+        let refusal = terminal_egress_refusal("chat_get_output", &data).expect("refused");
+        assert_eq!(refusal["error"], "egress_off");
+        assert_eq!(refusal["type"], "chat_output");
+        assert_eq!(refusal["request_id"], "r-9");
+        drop(_t);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        assert!(outbound_egress_permitted("ai-output"));
+        assert!(terminal_egress_refusal("chat_get_output", &data).is_none());
     }
 
     /// Both checks are wired where they act: before dispatch, and before the

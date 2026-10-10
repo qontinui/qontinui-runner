@@ -323,10 +323,16 @@ fn cmd_show() -> ExitCode {
                 "auth":         auth_view,
                 // The machine's default for the six outbound data flows
                 // (`on` | `off`); `null` is no profile opinion.
-                "egress_default": qontinui_runner_lib::profiles::active_egress_profile()
-                    .ok()
-                    .flatten()
-                    .and_then(|e| e.default),
+                "egress_default": match qontinui_runner_lib::profiles::active_egress_profile() {
+                    qontinui_runner_lib::profiles::ActiveEgress::Profile(e) => {
+                        json!(e.and_then(|e| e.default))
+                    }
+                    qontinui_runner_lib::profiles::ActiveEgress::FileAbsent => json!(null),
+                    // The runner reads an unusable file as `off`; say so.
+                    qontinui_runner_lib::profiles::ActiveEgress::Unreadable(why) => {
+                        json!(format!("off (profiles.json unusable: {why})"))
+                    }
+                },
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             ExitCode::SUCCESS
