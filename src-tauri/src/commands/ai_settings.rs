@@ -1648,20 +1648,116 @@ mod usage_twin_report {
         // coord-tenant-scope(device): the payload is this machine's whole Claude-account roster (:1540-1561) -- a device property, with no session and no artifact in scope.
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
         match req.json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(
-                    accounts = results.len(),
-                    prepaid = prepaid.len(),
-                    "account usage mirrored to coord twin"
-                );
-            }
             Ok(resp) => {
-                warn!(status = %resp.status(), "coord account-usage ingest non-2xx (older coord?) — skipped");
+                let status = resp.status().as_u16();
+                let success = resp.status().is_success();
+                let bytes = resp.bytes().await.unwrap_or_default();
+                // coord's FleetPrincipal verifies the bearer on this route, so
+                // a 2xx is a real Accepted (resets the dark streak); coord's
+                // codeless 403 classifies Indeterminate and records nothing.
+                crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(
+                    None, true, status, &bytes,
+                );
+                if success {
+                    *last_refusal().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    debug!(
+                        accounts = results.len(),
+                        prepaid = prepaid.len(),
+                        "account usage mirrored to coord twin"
+                    );
+                } else {
+                    let body = String::from_utf8_lossy(&bytes);
+                    let posture = crate::mcp::device_jwt_refresher::coord_credential_posture()
+                        .map(|s| s.posture);
+                    if let Some(line) = refusal_warning(last_refusal(), status, &body, posture) {
+                        warn!("{line}");
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, "coord account-usage report failed — skipped");
             }
         }
+    }
+
+    /// The (status, refusal token, posture) of the last refusal WARNed. The report runs on
+    /// every usage refresh, so an unchanged refusal must not re-WARN each tick
+    /// (147 identical lines in one day on 2026-10-07). Cleared on a 2xx so the
+    /// next refusal after a recovery is announced again.
+    type RefusalKey = (u16, String, String);
+
+    fn last_refusal() -> &'static std::sync::Mutex<Option<RefusalKey>> {
+        static LAST: std::sync::Mutex<Option<RefusalKey>> = std::sync::Mutex::new(None);
+        &LAST
+    }
+
+    /// The WARN line for a non-2xx ingest answer, or `None` when it repeats
+    /// the last one.
+    ///
+    /// 401/403 is a CREDENTIAL refusal, not route-absence: coord's ingest
+    /// answers every device-verification failure with a uniform
+    /// `403 {"error":"auth_required"}` and no typed code
+    /// (qontinui-coord `fleet_principal.rs`), so the cause cannot be read off
+    /// the response — it is named from the runner's own credential posture.
+    /// Every other status keeps the older-coord wording.
+    fn refusal_warning(
+        last: &std::sync::Mutex<Option<RefusalKey>>,
+        status: u16,
+        body: &str,
+        posture: Option<crate::mcp::device_jwt_refresher::CoordCredentialPosture>,
+    ) -> Option<String> {
+        use crate::mcp::device_jwt_refresher::upstream_refusal_code;
+        let credential = matches!(status, 401 | 403);
+        let posture_label = match posture {
+            Some(p) => match p.cause() {
+                Some(cause) => format!("{} ({cause})", p.as_str()),
+                None => p.as_str().to_string(),
+            },
+            None => "unknown (no refresher pass yet)".to_string(),
+        };
+        let code = if credential {
+            upstream_refusal_code(body)
+                .or_else(|| {
+                    serde_json::from_str::<serde_json::Value>(body)
+                        .ok()?
+                        .get("error")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "none".to_string())
+        } else {
+            String::new()
+        };
+        let key = (
+            status,
+            code.clone(),
+            if credential {
+                posture_label.clone()
+            } else {
+                String::new()
+            },
+        );
+        {
+            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref() == Some(&key) {
+                return None;
+            }
+            *guard = Some(key);
+        }
+        if !credential {
+            return Some(format!(
+                "coord account-usage ingest non-2xx ({status}) (older coord?) — skipped"
+            ));
+        }
+        let action = if posture.is_some_and(|p| p.can_answer()) {
+            "credential looks live locally; coord does not say why"
+        } else {
+            "re-pair"
+        };
+        Some(format!(
+            "coord account-usage ingest refused ({status} {code}) — credential rejected; \
+             runner coord credential posture: {posture_label} — device feed not updating; {action}"
+        ))
     }
 
     #[cfg(test)]
@@ -1705,6 +1801,47 @@ mod usage_twin_report {
                 acct.get("config_dir").is_none(),
                 "the wire must never carry a local path"
             );
+        }
+
+        /// An expired credential against coord's uniform
+        /// `403 {"error":"auth_required"}` yields ONE credential-rejected WARN
+        /// across repeated reports — not one per refresh — and a recovery
+        /// re-arms it.
+        #[test]
+        fn expired_credential_refusal_warns_once_per_state_change() {
+            use crate::mcp::device_jwt_refresher::CoordCredentialPosture;
+            let last = std::sync::Mutex::new(None);
+            let body = r#"{"error":"auth_required"}"#;
+            let expired = Some(CoordCredentialPosture::Expired);
+            let lines: Vec<String> = (0..5)
+                .filter_map(|_| refusal_warning(&last, 403, body, expired))
+                .collect();
+            assert_eq!(lines.len(), 1, "one WARN, not one per tick: {lines:?}");
+            let line = &lines[0];
+            assert!(line.contains("refused (403 auth_required)"), "{line}");
+            assert!(line.contains("credential rejected"), "{line}");
+            assert!(line.contains("posture: expired"), "{line}");
+            assert!(line.ends_with("re-pair"), "{line}");
+            assert!(!line.contains("older coord"), "{line}");
+
+            // A posture change is new information and WARNs again.
+            let absent = refusal_warning(&last, 403, body, Some(CoordCredentialPosture::Absent));
+            assert!(absent.is_some_and(|l| l.contains("posture: absent")));
+
+            // A 2xx clears the state (what `report_to_coord` does), so the
+            // next refusal is announced again.
+            *last.lock().unwrap() = None;
+            assert!(refusal_warning(&last, 403, body, expired).is_some());
+        }
+
+        /// A 404 is route-absence and keeps the older-coord wording.
+        #[test]
+        fn not_found_keeps_older_coord_wording() {
+            let last = std::sync::Mutex::new(None);
+            let line = refusal_warning(&last, 404, "", None).expect("first warns");
+            assert!(line.contains("older coord?"), "{line}");
+            assert!(!line.contains("credential"), "{line}");
+            assert!(refusal_warning(&last, 404, "", None).is_none());
         }
 
         /// `is_active` is a per-account flag; a report where nothing has been
