@@ -56,13 +56,11 @@ use qontinui_types::runner::RunnerInstanceRole;
 use serde_json::Value;
 use tauri::Manager;
 use tokio::sync::{broadcast, watch, Mutex};
-use tokio_tungstenite::{
-    tungstenite::{
-        client::IntoClientRequest,
-        handshake::client::Request as HttpRequest,
-        http::{header, HeaderValue},
-        Message,
-    },
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    handshake::client::Request as HttpRequest,
+    http::{header, HeaderValue},
+    Message,
 };
 use tracing::{info, warn};
 use uuid::Uuid;

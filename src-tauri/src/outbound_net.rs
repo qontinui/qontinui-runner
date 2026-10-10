@@ -61,8 +61,8 @@ use tokio_tungstenite::tungstenite::{
 use tracing::{debug, info, warn};
 
 use crate::coord_ws::CoordWs;
-pub use crate::profiles::TrustMode;
 use crate::profiles::NetworkProfile;
+pub use crate::profiles::TrustMode;
 
 /// Corporate CA trust: the per-stack census and its measurements (Phase 5).
 pub mod tls_trust;
@@ -98,7 +98,10 @@ impl std::fmt::Debug for ProxyRoute {
             .field("proxy_scheme", &self.proxy_scheme)
             .field("proxy_host", &self.proxy_host)
             .field("proxy_port", &self.proxy_port)
-            .field("authorization", &self.authorization.as_ref().map(|_| "<withheld>"))
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<withheld>"),
+            )
             .field("target_host", &self.target_host)
             .field("target_port", &self.target_port)
             .finish()
@@ -129,11 +132,15 @@ impl ProxyRoute {
             .ok()?;
         let intercept = matcher.intercept(&probe)?;
         let proxy_uri = intercept.uri();
-        let proxy_scheme = proxy_uri.scheme_str().unwrap_or("http").to_ascii_lowercase();
+        let proxy_scheme = proxy_uri
+            .scheme_str()
+            .unwrap_or("http")
+            .to_ascii_lowercase();
         let proxy_host = strip_brackets(proxy_uri.host()?).to_string();
-        let proxy_port = proxy_uri
-            .port_u16()
-            .unwrap_or(if proxy_scheme == "https" { 443 } else { 80 });
+        let proxy_port =
+            proxy_uri
+                .port_u16()
+                .unwrap_or(if proxy_scheme == "https" { 443 } else { 80 });
         Some(ProxyRoute {
             proxy_scheme,
             proxy_host,
@@ -170,7 +177,10 @@ impl ProxyRoute {
             .map_err(|e| {
                 WsConnectError::Ws(tungstenite::Error::Io(std::io::Error::new(
                     e.kind(),
-                    format!("could not reach the HTTP proxy {}: {e}", self.proxy_authority()),
+                    format!(
+                        "could not reach the HTTP proxy {}: {e}",
+                        self.proxy_authority()
+                    ),
                 )))
             })?;
 
@@ -344,13 +354,15 @@ pub async fn connect_ws_with(
 ) -> Result<CoordWs, WsConnectError> {
     match tokio::time::timeout(timeout, attempt(request, matcher)).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(WsConnectError::Ws(tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "WebSocket connect exceeded {}s with no handshake response",
-                timeout.as_secs()
+        Err(_elapsed) => Err(WsConnectError::Ws(tungstenite::Error::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "WebSocket connect exceeded {}s with no handshake response",
+                    timeout.as_secs()
+                ),
             ),
-        )))),
+        ))),
     }
 }
 
@@ -488,9 +500,7 @@ pub fn apply_profile_environment_for(
 ) -> ProxyEnvOutcome {
     let mut exported = Vec::new();
 
-    let operator = OPERATOR_PROXY_VARS
-        .iter()
-        .find_map(|k| non_empty(env, k));
+    let operator = OPERATOR_PROXY_VARS.iter().find_map(|k| non_empty(env, k));
     let profile_proxy = network
         .and_then(|n| n.proxy_url.as_deref())
         .map(str::trim)
@@ -888,7 +898,11 @@ mod tests {
         .expect("connect through the proxy");
         echo_round_trip(ws).await;
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "exactly one CONNECT reached the proxy: {seen:?}");
+        assert_eq!(
+            seen.len(),
+            1,
+            "exactly one CONNECT reached the proxy: {seen:?}"
+        );
         assert!(
             seen[0].starts_with(&format!("CONNECT 127.0.0.2:{echo} HTTP/1.1\r\n")),
             "the proxy saw a CONNECT for the origin: {:?}",
@@ -910,7 +924,10 @@ mod tests {
             matches!(err, WsConnectError::ProxyAuthRequired),
             "407 must surface as ProxyAuthRequired, got {err:?}"
         );
-        assert!(!err.is_unauthorized(), "a proxy 407 must never kick the JWT refresher");
+        assert!(
+            !err.is_unauthorized(),
+            "a proxy 407 must never kick the JWT refresher"
+        );
     }
 
     #[tokio::test]
@@ -924,7 +941,9 @@ mod tests {
         )
         .await
         .expect_err("the origin refused");
-        let inner = err.as_tungstenite().expect("an origin refusal is tungstenite's");
+        let inner = err
+            .as_tungstenite()
+            .expect("an origin refusal is tungstenite's");
         assert!(
             crate::coord_ws::upgrade_refusal_is_unauthorized(inner),
             "a 401 through the tunnel must still read as unauthorized, got {err:?}"
@@ -946,7 +965,10 @@ mod tests {
         .await
         .expect("direct to loopback");
         echo_round_trip(ws).await;
-        assert!(seen.lock().unwrap().is_empty(), "loopback must never reach the proxy");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "loopback must never reach the proxy"
+        );
 
         // Routing decisions, without sockets.
         let m = Matcher::builder()
@@ -967,16 +989,22 @@ mod tests {
         let plain = route("ws://127.0.0.2:4000/ws").expect("ws:// uses the http proxy");
         assert_eq!(plain.proxy_authority(), format!("127.0.0.1:{proxy}"));
         assert_eq!(plain.target_authority(), "127.0.0.2:4000");
-        let secure = route("wss://coord.example.test/ws?token=x").expect("wss:// uses the https proxy");
+        let secure =
+            route("wss://coord.example.test/ws?token=x").expect("wss:// uses the https proxy");
         assert_eq!(secure.proxy_authority(), "secure-proxy.example.test:3128");
         assert_eq!(secure.target_authority(), "coord.example.test:443");
     }
 
     #[test]
     fn a_tunnel_route_needs_a_proxy_for_its_scheme() {
-        let m = Matcher::builder().https("http://p.example.test:8080").build();
+        let m = Matcher::builder()
+            .https("http://p.example.test:8080")
+            .build();
         let route = |u: &str| ProxyRoute::for_url(&u.parse::<Uri>().unwrap(), &m);
-        assert!(route("ws://origin.example.test/ws").is_none(), "no http proxy configured");
+        assert!(
+            route("ws://origin.example.test/ws").is_none(),
+            "no http proxy configured"
+        );
         assert!(route("wss://origin.example.test/ws").is_some());
     }
 
@@ -1017,11 +1045,25 @@ mod tests {
             logs.contains(&format!("through HTTP proxy 127.0.0.1:{proxy}")),
             "the capture must see the tunnel line, or this test proves nothing: {logs:?}"
         );
-        for secret in ["s3cret-pw", "YWxpY2U6czNjcmV0LXB3", "device-jwt-SECRET", "alice"] {
-            assert!(!logs.contains(secret), "{secret:?} leaked into the logs: {logs:?}");
+        for secret in [
+            "s3cret-pw",
+            "YWxpY2U6czNjcmV0LXB3",
+            "device-jwt-SECRET",
+            "alice",
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "{secret:?} leaked into the logs: {logs:?}"
+            );
         }
-        let debug = format!("{:?}", ProxyRoute::for_url(&"ws://127.0.0.2:1/".parse().unwrap(), &matcher));
-        assert!(!debug.contains("YWxp"), "Debug must withhold the credential: {debug}");
+        let debug = format!(
+            "{:?}",
+            ProxyRoute::for_url(&"ws://127.0.0.2:1/".parse().unwrap(), &matcher)
+        );
+        assert!(
+            !debug.contains("YWxp"),
+            "Debug must withhold the credential: {debug}"
+        );
     }
 
     #[tokio::test]
@@ -1076,7 +1118,10 @@ mod tests {
     #[test]
     fn the_profile_proxy_is_exported_when_the_operator_set_none() {
         let mut env = MapEnv::default();
-        let n = net(Some("http://bob:pw@proxy.example.test:3128"), Some(".corp.example.test"));
+        let n = net(
+            Some("http://bob:pw@proxy.example.test:3128"),
+            Some(".corp.example.test"),
+        );
         let out = apply_profile_environment(Some(&n), Some("dev"), &mut env);
         assert_eq!(out.arm, ProxyEnvArm::Profile);
         assert_eq!(out.profile.as_deref(), Some("dev"));
@@ -1102,8 +1147,15 @@ mod tests {
         let n = net(Some("http://profile.example.test:3128"), None);
         let out = apply_profile_environment(Some(&n), Some("dev"), &mut env);
         assert_eq!(out.arm, ProxyEnvArm::OperatorEnv);
-        assert_eq!(out.proxy.as_deref(), Some("http://operator.example.test:8080"));
-        assert_eq!(env.get("HTTPS_PROXY"), None, "the profile proxy must not be exported");
+        assert_eq!(
+            out.proxy.as_deref(),
+            Some("http://operator.example.test:8080")
+        );
+        assert_eq!(
+            env.get("HTTPS_PROXY"),
+            None,
+            "the profile proxy must not be exported"
+        );
         assert_eq!(env.get("HTTP_PROXY"), None);
         // Existing entries kept, loopback appended once (localhost deduped).
         assert_eq!(out.no_proxy, "a.example.test,localhost,127.0.0.1,::1");
@@ -1116,7 +1168,10 @@ mod tests {
         assert_eq!(out.arm, ProxyEnvArm::None);
         assert_eq!(out.proxy, None);
         assert_eq!(out.profile, None);
-        assert_eq!(env.get("NO_PROXY").as_deref(), Some("127.0.0.1,::1,localhost"));
+        assert_eq!(
+            env.get("NO_PROXY").as_deref(),
+            Some("127.0.0.1,::1,localhost")
+        );
         assert_eq!(env.get("HTTPS_PROXY"), None);
     }
 
@@ -1129,8 +1184,14 @@ mod tests {
             ..NetworkProfile::default()
         };
         let out = apply_profile_environment_for(Some(&n), Some("dev"), &mut env, false);
-        assert_eq!(env.get("NODE_EXTRA_CA_CERTS").as_deref(), Some("/corp/root.pem"));
-        assert_eq!(env.get("SSL_CERT_FILE").as_deref(), Some("/operator/chosen.pem"));
+        assert_eq!(
+            env.get("NODE_EXTRA_CA_CERTS").as_deref(),
+            Some("/corp/root.pem")
+        );
+        assert_eq!(
+            env.get("SSL_CERT_FILE").as_deref(),
+            Some("/operator/chosen.pem")
+        );
         assert_eq!(out.ca_bundle.as_deref(), Some("/corp/root.pem"));
         assert!(out.exported.contains(&"NODE_EXTRA_CA_CERTS".to_string()));
         assert!(!out.exported.contains(&"SSL_CERT_FILE".to_string()));
@@ -1145,8 +1206,14 @@ mod tests {
         let out = apply_profile_environment_for(None, None, &mut env, true);
         assert_eq!(out.git_ssl_backend.as_deref(), Some("schannel"));
         assert_eq!(env.get("GIT_CONFIG_COUNT").as_deref(), Some("2"));
-        assert_eq!(env.get("GIT_CONFIG_KEY_0").as_deref(), Some("core.autocrlf"));
-        assert_eq!(env.get("GIT_CONFIG_KEY_1").as_deref(), Some("http.sslBackend"));
+        assert_eq!(
+            env.get("GIT_CONFIG_KEY_0").as_deref(),
+            Some("core.autocrlf")
+        );
+        assert_eq!(
+            env.get("GIT_CONFIG_KEY_1").as_deref(),
+            Some("http.sslBackend")
+        );
         assert_eq!(env.get("GIT_CONFIG_VALUE_1").as_deref(), Some("schannel"));
         assert_eq!(out.trust, TrustMode::Os);
     }
@@ -1154,7 +1221,10 @@ mod tests {
     #[test]
     fn git_is_left_alone_off_windows_when_bundled_or_when_the_operator_chose() {
         let mut env = MapEnv::default();
-        assert_eq!(apply_profile_environment_for(None, None, &mut env, false).git_ssl_backend, None);
+        assert_eq!(
+            apply_profile_environment_for(None, None, &mut env, false).git_ssl_backend,
+            None
+        );
         assert_eq!(env.get("GIT_CONFIG_COUNT"), None, "never off Windows");
 
         let bundled = NetworkProfile {
@@ -1165,26 +1235,53 @@ mod tests {
         let out = apply_profile_environment_for(Some(&bundled), Some("dev"), &mut env, true);
         assert_eq!(out.git_ssl_backend, None);
         assert_eq!(out.trust, TrustMode::Bundled);
-        assert_eq!(env.get("GIT_CONFIG_COUNT"), None, "network.trust=bundled opts out");
+        assert_eq!(
+            env.get("GIT_CONFIG_COUNT"),
+            None,
+            "network.trust=bundled opts out"
+        );
 
         let mut env = MapEnv::default();
         env.set("GIT_CONFIG_COUNT", "1");
         env.set("GIT_CONFIG_KEY_0", "http.sslbackend");
         env.set("GIT_CONFIG_VALUE_0", "openssl");
-        assert_eq!(apply_profile_environment_for(None, None, &mut env, true).git_ssl_backend, None);
-        assert_eq!(env.get("GIT_CONFIG_COUNT").as_deref(), Some("1"), "the operator's backend stands");
+        assert_eq!(
+            apply_profile_environment_for(None, None, &mut env, true).git_ssl_backend,
+            None
+        );
+        assert_eq!(
+            env.get("GIT_CONFIG_COUNT").as_deref(),
+            Some("1"),
+            "the operator's backend stands"
+        );
 
         let mut env = MapEnv::default();
         env.set("GIT_CONFIG_COUNT", "two");
-        assert_eq!(apply_profile_environment_for(None, None, &mut env, true).git_ssl_backend, None);
-        assert_eq!(env.get("GIT_CONFIG_KEY_0"), None, "an unreadable count is not appended to");
+        assert_eq!(
+            apply_profile_environment_for(None, None, &mut env, true).git_ssl_backend,
+            None
+        );
+        assert_eq!(
+            env.get("GIT_CONFIG_KEY_0"),
+            None,
+            "an unreadable count is not appended to"
+        );
     }
 
     #[test]
     fn redaction_never_prints_userinfo() {
-        assert_eq!(redact_proxy_url("http://u:p@h.example.test:1"), "http://h.example.test:1 (credentials withheld)");
-        assert_eq!(redact_proxy_url("h.example.test:3128"), "http://h.example.test:3128");
-        assert_eq!(redact_proxy_url("http://u@h.example.test"), "http://h.example.test (credentials withheld)");
+        assert_eq!(
+            redact_proxy_url("http://u:p@h.example.test:1"),
+            "http://h.example.test:1 (credentials withheld)"
+        );
+        assert_eq!(
+            redact_proxy_url("h.example.test:3128"),
+            "http://h.example.test:3128"
+        );
+        assert_eq!(
+            redact_proxy_url("http://u@h.example.test"),
+            "http://h.example.test (credentials withheld)"
+        );
         assert!(!redact_proxy_url("http://[bad").contains("bad"));
     }
 
@@ -1223,10 +1320,14 @@ mod tests {
         let prev_enable: Option<u32> = key.get_value("ProxyEnable").ok();
         let prev_server: Option<String> = key.get_value("ProxyServer").ok();
         key.set_value("ProxyEnable", &1u32).unwrap();
-        key.set_value("ProxyServer", &"registry-proxy.example.test:8123").unwrap();
+        key.set_value("ProxyServer", &"registry-proxy.example.test:8123")
+            .unwrap();
 
-        let seen = ProxyRoute::for_url(&"wss://coord.example.test/ws".parse().unwrap(), &Matcher::from_system())
-            .map(|r| r.proxy_authority());
+        let seen = ProxyRoute::for_url(
+            &"wss://coord.example.test/ws".parse().unwrap(),
+            &Matcher::from_system(),
+        )
+        .map(|r| r.proxy_authority());
 
         match prev_enable {
             Some(v) => key.set_value("ProxyEnable", &v).unwrap(),
@@ -1258,10 +1359,15 @@ mod tests {
             let after = attr + "#[cfg(test)]".len();
             from = after;
             let rest = src[after..].trim_start();
-            if !(rest.starts_with("mod ") || rest.starts_with("pub mod ") || rest.starts_with("pub(crate) mod ")) {
+            if !(rest.starts_with("mod ")
+                || rest.starts_with("pub mod ")
+                || rest.starts_with("pub(crate) mod "))
+            {
                 continue;
             }
-            let Some(brace_rel) = src[after..].find(['{', ';']) else { continue };
+            let Some(brace_rel) = src[after..].find(['{', ';']) else {
+                continue;
+            };
             let brace = after + brace_rel;
             if src.as_bytes()[brace] == b';' {
                 continue;
@@ -1336,7 +1442,10 @@ mod tests {
                 }
             }
         }
-        assert!(scanned > 100, "the scan must actually walk src/ (saw {scanned} files)");
+        assert!(
+            scanned > 100,
+            "the scan must actually walk src/ (saw {scanned} files)"
+        );
         assert!(
             offenders.is_empty(),
             "every WebSocket connect goes through outbound_net::connect_ws (proxy-aware); \

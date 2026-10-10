@@ -619,21 +619,35 @@ mod tests {
 
         let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
         assert!(
-            logs.contains(&format!("Connecting to relay 127.0.0.1:{port} for device device-under-test")),
+            logs.contains(&format!(
+                "Connecting to relay 127.0.0.1:{port} for device device-under-test"
+            )),
             "the capture must see the connect line, or this test proves nothing: {logs:?}"
         );
-        assert!(!logs.contains("TOKEN-must-not-be-logged"), "token leaked: {logs:?}");
+        assert!(
+            !logs.contains("TOKEN-must-not-be-logged"),
+            "token leaked: {logs:?}"
+        );
         assert!(!logs.contains("token="), "a token query leaked: {logs:?}");
     }
 
     #[test]
     fn relay_host_for_log_strips_everything_but_the_host() {
-        assert_eq!(relay_host_for_log("https://api.example.test/"), "api.example.test");
-        assert_eq!(relay_host_for_log("http://127.0.0.1:8000"), "127.0.0.1:8000");
+        assert_eq!(
+            relay_host_for_log("https://api.example.test/"),
+            "api.example.test"
+        );
+        assert_eq!(
+            relay_host_for_log("http://127.0.0.1:8000"),
+            "127.0.0.1:8000"
+        );
         assert_eq!(
             relay_host_for_log("https://api.example.test/x?token=abc"),
             "api.example.test"
         );
-        assert_eq!(relay_host_for_log("not a url"), "<unparseable relay base withheld>");
+        assert_eq!(
+            relay_host_for_log("not a url"),
+            "<unparseable relay base withheld>"
+        );
     }
 }
