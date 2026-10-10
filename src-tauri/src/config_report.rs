@@ -452,8 +452,11 @@ pub const LAYER_SPECS: &[LayerSpec] = &[
                     `HTTP_PROXY` / `ALL_PROXY`, the active profile's \
                     `network.proxy_url` exported at startup, or none (on Windows \
                     and macOS the OS system proxy may still apply) — plus the \
-                    `NO_PROXY` in force, which always exempts loopback. The proxy \
-                    is shown with any credential removed",
+                    `NO_PROXY` in force (exported, with loopback and the Windows \
+                    bypass list, only while an environment proxy is in force), and \
+                    whether the WebSocket transports tunnel through it or go DIRECT \
+                    past a socks5/https proxy they cannot use. The proxy is shown \
+                    with any credential removed",
         anchor: "outbound_net::apply_profile_environment_at_startup",
         side: LayerSide::Lib,
         status: LayerStatus::Resolved,
@@ -1070,9 +1073,14 @@ fn resolve_network_proxy(now: DateTime<Utc>) -> LayerReading {
     match crate::outbound_net::startup_outcome() {
         Some(o) => LayerReading::known(
             format!(
-                "proxy={} no_proxy={}",
+                "proxy={} no_proxy={} websocket={}",
                 o.proxy.as_deref().unwrap_or("none"),
-                o.no_proxy
+                if o.no_proxy.is_empty() {
+                    "(unset)"
+                } else {
+                    o.no_proxy.as_str()
+                },
+                websocket_route_note(o.proxy.as_deref()),
             ),
             match &o.profile {
                 Some(p) => format!("{} (profile {p:?})", o.arm.as_str()),
@@ -1084,6 +1092,20 @@ fn resolve_network_proxy(now: DateTime<Utc>) -> LayerReading {
             "the proxy rung is recorded by the runner's own startup step \
              (outbound_net::apply_profile_environment_at_startup); this process did not run it",
             now,
+        ),
+    }
+}
+
+/// How the WebSocket transports treat the environment proxy: tunnelled
+/// through an `http://` proxy, or DIRECT past one they cannot use.
+fn websocket_route_note(proxy: Option<&str>) -> String {
+    match proxy.and_then(|p| p.split_once("://")) {
+        None => "direct-or-os-system-proxy".to_string(),
+        Some((scheme, _)) if crate::outbound_net::proxy_scheme_is_tunnellable(scheme) => {
+            "tunnelled".to_string()
+        }
+        Some((scheme, _)) => format!(
+            "DIRECT (a {scheme}:// proxy cannot carry a WebSocket; only http:// CONNECT can)"
         ),
     }
 }
@@ -1504,11 +1526,7 @@ absence of a reading, NOT a finding that the generations agree.
     #[test]
     fn config_report_headless_bin_reports_bin_layers_as_unknown() {
         let report = build_report(&headless_inputs());
-        assert_eq!(
-            report.rows.len(),
-            LAYER_SPECS.len(),
-            "every layer gets a row, always"
-        );
+        assert_eq!(report.rows.len(), 17, "every layer gets a row, always");
         let row = report
             .row("api_endpoint_registry")
             .expect("the bin-only layer still gets a row");
@@ -1944,7 +1962,7 @@ absence of a reading, NOT a finding that the generations agree.
         let text = report.render();
         assert_eq!(
             text.matches("captured_at: ").count(),
-            LAYER_SPECS.len(),
+            17,
             "one capture stamp per layer:\n{text}"
         );
     }

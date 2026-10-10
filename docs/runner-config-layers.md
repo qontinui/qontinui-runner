@@ -126,7 +126,7 @@ the credential store itself (OS keychain or the encrypted on-disk slot under `QO
 
 ## 16. Outbound proxy rung (HTTP and WebSocket) (`network_proxy`)
 
-whether outbound traffic goes through an HTTP proxy and which rung decided it — the operator's own `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, the active profile's `network.proxy_url` exported at startup, or none (on Windows and macOS the OS system proxy may still apply) — plus the `NO_PROXY` in force, which always exempts loopback. The proxy is shown with any credential removed
+whether outbound traffic goes through an HTTP proxy and which rung decided it — the operator's own `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, the active profile's `network.proxy_url` exported at startup, or none (on Windows and macOS the OS system proxy may still apply) — plus the `NO_PROXY` in force (exported, with loopback and the Windows bypass list, only while an environment proxy is in force), and whether the WebSocket transports tunnel through it or go DIRECT past a socks5/https proxy they cannot use. The proxy is shown with any credential removed
 
 - Resolved by: `outbound_net::apply_profile_environment_at_startup`
 - Owned by: lib

@@ -125,7 +125,10 @@ pub struct Profile {
 
 /// The `network` block of a profile (plan
 /// `2026-10-10-spec-front-end-phase-9-generic-boundary`, decision C2).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written: `proxy_url` may carry `user:password@`, and a
+/// profile is `Debug`-printed in diagnostics.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkProfile {
     /// The HTTP proxy every outbound connection goes through
     /// (`http://[user:password@]host:port`). Exported as `HTTPS_PROXY` and
@@ -137,14 +140,32 @@ pub struct NetworkProfile {
     #[serde(default)]
     pub no_proxy: Option<String>,
     /// A PEM bundle holding the corporate root, for the stacks that cannot
-    /// read the OS trust store (Node, Python). Exported as
-    /// `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE`.
+    /// read the OS trust store. Exported as `NODE_EXTRA_CA_CERTS`, which is
+    /// additive; never as `SSL_CERT_FILE`, which on Linux would REPLACE the OS
+    /// store for the runner and its children.
     #[serde(default)]
     pub ca_bundle: Option<PathBuf>,
     /// Which trust source the runner points the stacks it CAN steer at.
-    /// Absent means [`TrustMode::Os`].
+    /// Absent means "leave each stack as the machine configured it".
     #[serde(default)]
     pub trust: Option<TrustMode>,
+}
+
+impl std::fmt::Debug for NetworkProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkProfile")
+            .field(
+                "proxy_url",
+                &self
+                    .proxy_url
+                    .as_deref()
+                    .map(crate::outbound_net::redact_proxy_url),
+            )
+            .field("no_proxy", &self.no_proxy)
+            .field("ca_bundle", &self.ca_bundle)
+            .field("trust", &self.trust)
+            .finish()
+    }
 }
 
 /// `network.trust` (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`
@@ -152,12 +173,13 @@ pub struct NetworkProfile {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustMode {
-    /// The OS trust store everywhere — on Windows the runner's `git` is pointed
-    /// at Schannel (`http.sslBackend=schannel`) so it reads the Windows store.
+    /// The OS trust store — on Windows the runner's `git` is pointed at
+    /// Schannel (`http.sslBackend=schannel`), unless the machine's git config
+    /// already chose a backend or CA file.
     #[default]
     Os,
-    /// Leave each stack on its own bundle (opt-out; Git for Windows keeps its
-    /// OpenSSL bundle).
+    /// Leave each stack on its own bundle (Git for Windows keeps its OpenSSL
+    /// bundle).
     Bundled,
 }
 
