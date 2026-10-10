@@ -36,6 +36,20 @@ const PS1_INTEGRATION: &str = include_str!("../../resources/shell-integration.ps
 const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
 const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
 
+/// The account the spawn-time lifecycle record binds: the PTY's pinned
+/// account when it has one, else the `ambient` default the unpinned child
+/// actually reads. Never `None` while an ambient dir resolves — "no account
+/// recorded" was resumed as "inherit the restore PTY's account", which is the
+/// spawn picker's, not the transcript's. Pure, for its unit test.
+pub(crate) fn resolve_record_config_dir(
+    pinned: Option<String>,
+    ambient: Option<std::path::PathBuf>,
+) -> Option<String> {
+    pinned
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| ambient.map(|p| p.to_string_lossy().into_owned()))
+}
+
 /// Write a shell integration script to a temp file, returning the path on success.
 fn write_integration_script(content: &str, name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::temp_dir().join(name);
@@ -3370,7 +3384,18 @@ impl TerminalSession {
                 // The effective account dir placed into the PTY env — stamped
                 // authoritatively at spawn so restore is account-correct without
                 // waiting on the hook echo. The store normalizes empty→None.
-                config_dir,
+                //
+                // No pinned account means the child reads the AMBIENT one, so
+                // that is what gets recorded — never `None`. A `None` record
+                // was resumed as "inherit whatever the restore PTY got", which
+                // is the picker's account, not the one this session's
+                // transcript is under (2026-10-08, 22/22 resumes failed). A
+                // later hook confirm that carries a real account still
+                // overwrites this (`record_open`'s sticky-on-Some rule).
+                resolve_record_config_dir(
+                    config_dir,
+                    crate::terminal::transcript::ambient_claude_config_dir(),
+                ),
                 cwd.to_string(),
                 title.to_string(),
                 page_id.to_string(),
@@ -4951,6 +4976,27 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A spawn with no pinned account records the AMBIENT dir the child
+    /// reads, never `None` (the 2026-10-08 restore failure); a pin wins.
+    #[test]
+    fn spawn_record_binds_the_ambient_account_when_nothing_is_pinned() {
+        let ambient = Some(std::path::PathBuf::from("/home/u/.claude"));
+        assert_eq!(
+            resolve_record_config_dir(None, ambient.clone()).as_deref(),
+            Some("/home/u/.claude")
+        );
+        assert_eq!(
+            resolve_record_config_dir(Some("  ".into()), ambient.clone()).as_deref(),
+            Some("/home/u/.claude"),
+            "a blank pin is no pin"
+        );
+        assert_eq!(
+            resolve_record_config_dir(Some("/home/u/.claude-iris".into()), ambient).as_deref(),
+            Some("/home/u/.claude-iris")
+        );
+        assert_eq!(resolve_record_config_dir(None, None), None);
+    }
 
     #[test]
     fn a_runner_initiated_close_hands_the_hook_no_exit_code() {

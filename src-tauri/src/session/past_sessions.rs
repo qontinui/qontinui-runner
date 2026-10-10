@@ -197,20 +197,96 @@ pub(crate) fn resolve_transcript_path(
     working_dir: Option<&str>,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let wd = working_dir?;
-    if let Some(cd) = config_dir {
-        let p = transcript::session_transcript_path(Path::new(cd), wd, session_id);
-        if p.exists() {
-            return Some(p);
+    locate_transcript_in(
+        config_dir,
+        working_dir,
+        session_id,
+        &transcript_search_dirs(),
+    )
+    .map(|(_, path)| path)
+}
+
+/// Every config dir a transcript may live under, in search order after the
+/// record's own: every discovered account home (env, roster, `C:\claude`
+/// sweep, `~/.claude` when it has a `projects/`), then the ambient default
+/// explicitly — so the platform default is searched even when discovery did
+/// not list it. Duplicates are harmless (a second `exists()` on the same path).
+pub(crate) fn transcript_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = transcript::find_claude_config_dirs();
+    if let Some(ambient) = transcript::ambient_claude_config_dir() {
+        if !dirs.contains(&ambient) {
+            dirs.push(ambient);
         }
     }
-    for dir in transcript::find_claude_config_dirs() {
-        let p = transcript::session_transcript_path(&dir, wd, session_id);
-        if p.exists() {
-            return Some(p);
+    dirs
+}
+
+/// Where a session's transcript actually lives, as `(config_dir, path)`:
+/// the record's own `config_dir` first, then each of `candidates` in order.
+/// `None` when `working_dir` is absent/blank (the project path cannot be
+/// derived) or no candidate holds the file. Pure over `candidates` so the
+/// search order is unit-testable without the ambient machine.
+pub(crate) fn locate_transcript_in(
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    session_id: &str,
+    candidates: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    let wd = working_dir.filter(|s| !s.trim().is_empty())?;
+    let recorded = config_dir
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+    recorded
+        .into_iter()
+        .chain(candidates.iter().cloned())
+        .find_map(|dir| {
+            let p = transcript::session_transcript_path(&dir, wd, session_id);
+            p.exists().then_some((dir, p))
+        })
+}
+
+/// The account a `claude --resume <id>` for this record must run under —
+/// ALWAYS an explicit dir when one can be named, never "inherit whatever the
+/// PTY got".
+///
+/// 1. The config dir the transcript was FOUND under ([`locate_transcript_in`]:
+///    the record's own dir, then every candidate). Where the conversation is
+///    is the only thing `--resume` reads, so this outranks the record.
+/// 2. Else the record's own `config_dir` (no transcript found — e.g. the
+///    process cwd diverged from the recorded one — so trust the record).
+/// 3. Else `ambient`: a record with no account was launched with no
+///    `CLAUDE_CONFIG_DIR` and therefore ran under the ambient default.
+///
+/// Returns the dir plus whether a transcript was found, so the caller can
+/// report `transcriptExists` from the same search.
+pub(crate) fn resolve_resume_config_dir_in(
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    session_id: &str,
+    candidates: &[PathBuf],
+    ambient: Option<&Path>,
+) -> (Option<String>, bool) {
+    // A record with NO account ran under the ambient one by definition, so
+    // the ambient dir is searched first for it — a copy of the same id under
+    // another account (a migrated transcript) must not outrank it.
+    let ambient_first: Vec<PathBuf>;
+    let search: &[PathBuf] = match (config_dir.filter(|s| !s.trim().is_empty()), ambient) {
+        (None, Some(a)) => {
+            ambient_first = std::iter::once(a.to_path_buf())
+                .chain(candidates.iter().filter(|c| c.as_path() != a).cloned())
+                .collect();
+            &ambient_first
         }
+        _ => candidates,
+    };
+    if let Some((dir, _)) = locate_transcript_in(config_dir, working_dir, session_id, search) {
+        return (Some(dir.to_string_lossy().into_owned()), true);
     }
-    None
+    let recorded = config_dir
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let dir = recorded.or_else(|| ambient.map(|p| p.to_string_lossy().into_owned()));
+    (dir, false)
 }
 
 /// Format a unix-millis timestamp into a short human date for the `"Session
@@ -587,5 +663,122 @@ mod tests {
         // Exactly two distinct cohorts.
         let distinct: std::collections::HashSet<_> = sessions.iter().map(|s| s.cohort_id).collect();
         assert_eq!(distinct.len(), 2);
+    }
+
+    /// Lay down `<config_dir>/projects/<encoded wd>/<sid>.jsonl`.
+    fn plant_transcript(config_dir: &Path, wd: &str, sid: &str) {
+        let p = transcript::session_transcript_path(config_dir, wd, sid);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{\"type\":\"user\"}\n").unwrap();
+    }
+
+    /// The 2026-10-08 shape: the record says `configDir: null`, the transcript
+    /// lives ONLY under the default `~/.claude`, and another account home (the
+    /// one the spawn picker chose) is searched first and holds nothing. The
+    /// resume must be pinned to the default dir — explicitly — never left
+    /// `None` for the PTY's account to fill in.
+    #[test]
+    fn null_config_dir_resumes_under_the_dir_holding_the_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let picker = tmp.path().join(".claude-iris");
+        let default = tmp.path().join(".claude");
+        std::fs::create_dir_all(picker.join("projects")).unwrap();
+        let wd = "/home/u/Projects/qontinui-root";
+        plant_transcript(&default, wd, "sess-default");
+
+        let (dir, found) = resolve_resume_config_dir_in(
+            None,
+            Some(wd),
+            "sess-default",
+            &[picker.clone(), default.clone()],
+            Some(&picker),
+        );
+        assert!(found, "the transcript under the default dir must be found");
+        assert_eq!(
+            dir.as_deref(),
+            Some(default.to_string_lossy().as_ref()),
+            "resume must name the transcript's account, not the picker's"
+        );
+    }
+
+    /// Where the transcript IS outranks what the record says: a record whose
+    /// `config_dir` names an account that does not hold the conversation would
+    /// otherwise type a resume guaranteed to answer "No conversation found".
+    #[test]
+    fn the_transcripts_account_outranks_a_wrong_recorded_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorded = tmp.path().join(".claude-a");
+        let actual = tmp.path().join(".claude-b");
+        let wd = "/w";
+        plant_transcript(&actual, wd, "s1");
+        let (dir, found) = resolve_resume_config_dir_in(
+            Some(recorded.to_str().unwrap()),
+            Some(wd),
+            "s1",
+            &[actual.clone()],
+            None,
+        );
+        assert!(found);
+        assert_eq!(dir.as_deref(), Some(actual.to_string_lossy().as_ref()));
+    }
+
+    /// No transcript anywhere: the record's own account stands, and a record
+    /// with none falls back to the AMBIENT default — still explicit.
+    #[test]
+    fn no_transcript_falls_back_to_record_then_ambient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ambient = tmp.path().join(".claude");
+        let (dir, found) =
+            resolve_resume_config_dir_in(Some("/acct/x"), Some("/w"), "gone", &[], Some(&ambient));
+        assert!(!found);
+        assert_eq!(dir.as_deref(), Some("/acct/x"));
+
+        let (dir, found) =
+            resolve_resume_config_dir_in(None, Some("/w"), "gone", &[], Some(&ambient));
+        assert!(!found);
+        assert_eq!(dir.as_deref(), Some(ambient.to_string_lossy().as_ref()));
+
+        // A blank recorded dir is no dir.
+        let (dir, _) = resolve_resume_config_dir_in(Some("  "), None, "gone", &[], Some(&ambient));
+        assert_eq!(dir.as_deref(), Some(ambient.to_string_lossy().as_ref()));
+    }
+
+    /// A null-account record ran under the ambient account, so the ambient
+    /// copy wins over a same-id copy under another account.
+    #[test]
+    fn null_config_dir_prefers_the_ambient_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join(".claude-o");
+        let ambient = tmp.path().join(".claude");
+        plant_transcript(&other, "/w", "dup");
+        plant_transcript(&ambient, "/w", "dup");
+        let (dir, found) = resolve_resume_config_dir_in(
+            None,
+            Some("/w"),
+            "dup",
+            &[other, ambient.clone()],
+            Some(&ambient),
+        );
+        assert!(found);
+        assert_eq!(dir.as_deref(), Some(ambient.to_string_lossy().as_ref()));
+    }
+
+    /// The record's own dir is searched FIRST, ahead of every candidate.
+    #[test]
+    fn locate_searches_the_recorded_dir_before_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorded = tmp.path().join(".claude-r");
+        let other = tmp.path().join(".claude-o");
+        plant_transcript(&recorded, "/w", "dup");
+        plant_transcript(&other, "/w", "dup");
+        let (dir, _) = locate_transcript_in(
+            Some(recorded.to_str().unwrap()),
+            Some("/w"),
+            "dup",
+            &[other],
+        )
+        .expect("found");
+        assert_eq!(dir, recorded);
+        assert!(locate_transcript_in(None, Some(" "), "dup", &[recorded]).is_none());
     }
 }

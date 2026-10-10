@@ -745,6 +745,35 @@ function sanitizeConfigDir(dir: string | undefined): string | undefined {
   return SAFE_PATH_RE.test(dir) ? dir : undefined;
 }
 
+/**
+ * The account a restored record's pane and resume run under: the backend's
+ * resolved `resumeConfigDir` (where the transcript actually is, else the
+ * record's dir, else the ambient default), falling back to the raw
+ * `configDir` only when the resolved one is absent or unsafe. Never prefers
+ * the raw `configDir` — a `null` there means "default account", and treating
+ * it as "no account" let the restore PTY's picker-chosen account win.
+ * Pure + exported for unit tests.
+ */
+export function resolveRestoreConfigDir(
+  rec: Pick<TerminalSessionRecord, "configDir" | "resumeConfigDir">,
+): string | undefined {
+  return sanitizeConfigDir(rec.resumeConfigDir) ?? sanitizeConfigDir(rec.configDir);
+}
+
+/**
+ * The account a cold-restored pane's PTY is pinned to: the session's resolved
+ * account for an `auto-resume` row (the resume typed into it must find the
+ * transcript), and NONE for every other row — a terminal-only pane types no
+ * resume, and pinning it would bypass the spawn-time picker's credential /
+ * rate-limit choice for whatever is launched in it later. Pure + exported.
+ */
+export function restorePanePin(
+  restoreAction: ReturnType<typeof classifyRestoreAction>,
+  configDir: string | undefined,
+): string | undefined {
+  return restoreAction === "auto-resume" ? configDir : undefined;
+}
+
 interface UseTerminalInitializationParams {
   /** Which terminal page this restore runs for ("default" when unset). */
   pageId: string;
@@ -767,6 +796,7 @@ interface UseTerminalInitializationParams {
     workingDir?: string,
     tenantId?: string,
     spawnSource?: ResourceGuardSource,
+    claudeConfigDir?: string,
   ) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
   /**
@@ -1132,7 +1162,7 @@ export function useTerminalInitialization({
             adoptWorkerTab(rec);
             continue;
           }
-          const safeConfigDir = sanitizeConfigDir(rec.configDir);
+          const safeConfigDir = resolveRestoreConfigDir(rec);
           const restoreAction = classifyRestoreAction(rec);
 
           // a) A live reconnected PTY is already running this session (React
@@ -1195,10 +1225,22 @@ export function useTerminalInitialization({
           // The source names this restore in the resource-guard dialog. `queued`
           // counts the records still ahead, this one included — an upper bound,
           // since reconnected and live records ahead will be skipped.
-          const tabId = await createTerminal(rec.title, rec.workingDir, undefined, {
-            label: "session restore",
-            queued: openRecords.length - recIndex,
-          });
+          // An auto-resume pane is PINNED to the session's account
+          // (`claudeConfigDir`), not left to the spawn-time account picker:
+          // the resume typed into it names a conversation stored under that
+          // account, and a pane on another account cannot find it. A
+          // terminal-only pane types no resume, so it stays unpinned and the
+          // picker decides for anything launched in it later.
+          const tabId = await createTerminal(
+            rec.title,
+            rec.workingDir,
+            undefined,
+            {
+              label: "session restore",
+              queued: openRecords.length - recIndex,
+            },
+            restorePanePin(restoreAction, safeConfigDir),
+          );
           if (!tabId) continue;
           // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
           // here, and is deliberately not clamped to zone 0: zone 0 belongs to
@@ -1315,7 +1357,10 @@ export function useTerminalInitialization({
                 restoreAction === "auto-resume"
                   ? {
                       claudeSessionId: rec.claudeSessionId,
-                      configDir: rec.configDir,
+                      // The RESOLVED account — re-recording it heals a
+                      // `configDir: null` row so the next restore needs no
+                      // search to find its account.
+                      configDir: safeConfigDir,
                       workingDir: rec.workingDir,
                       pageId,
                       zoneIndex: rec.zoneIndex,

@@ -59,6 +59,26 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
     Ok(tenant)
 }
 
+/// Append a caller-chosen `CLAUDE_CONFIG_DIR` pin to a PTY's extra env. A
+/// blank or absent dir adds nothing (the spawn-time picker then decides); a
+/// present one REPLACES any pin already in `env`, so the PTY carries exactly
+/// one account. Pure, for the unit test that pins the restore pane's account.
+fn with_caller_config_dir(
+    env: Option<Vec<(String, String)>>,
+    config_dir: Option<&str>,
+) -> Option<Vec<(String, String)>> {
+    let Some(dir) = config_dir.map(str::trim).filter(|d| !d.is_empty()) else {
+        return env;
+    };
+    let mut pairs: Vec<(String, String)> = env
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| k != "CLAUDE_CONFIG_DIR")
+        .collect();
+    pairs.push(("CLAUDE_CONFIG_DIR".to_string(), dir.to_string()));
+    Some(pairs)
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -113,6 +133,15 @@ pub async fn terminal_create(
     // that omit the argument keep working — Tauri/serde pass a missing arg as
     // `None`, which resolves to "no override", the safe answer.
     resource_override: Option<bool>,
+    // The Claude account this pane must run under, when the CALLER already
+    // knows it — the boot restore passes the account its session's transcript
+    // lives under (`terminal_session_list_open`'s `resumeConfigDir`). Pinned
+    // onto the PTY env as `CLAUDE_CONFIG_DIR`, which outranks the spawn-time
+    // account picker (`TerminalSession::caller_pinned_config_dir`): a restored
+    // pane otherwise came up on the picker's account while the resume typed
+    // into it named a conversation stored under another. Absent/blank → the
+    // picker decides, exactly as before.
+    claude_config_dir: Option<String>,
 ) -> Result<CommandResponse, String> {
     // Spawn-time resource gate, EARLY-OUT arm (§Part D). The authority is still
     // the gate inside `TerminalSession::spawn` — every unattended seam reaches
@@ -212,9 +241,12 @@ pub async fn terminal_create(
     // selects a stored path and nothing more — attribution of anything the
     // session captures comes from the credential, never from this.
     let spawn_tenant_key = spawn_tenant_id.map(|t| t.to_string());
-    let extra_env = crate::agent_worktree::session_env::session_extra_env(
-        isolated_ctx.as_ref(),
-        spawn_tenant_key.as_deref(),
+    let extra_env = with_caller_config_dir(
+        crate::agent_worktree::session_env::session_extra_env(
+            isolated_ctx.as_ref(),
+            spawn_tenant_key.as_deref(),
+        ),
+        claude_config_dir.as_deref(),
     );
     // Phase 6 (B4): the whole blocking spawn (PTY open, identity seam, child
     // exec) runs on a BLOCKING thread, matching the AI path
@@ -242,7 +274,11 @@ pub async fn terminal_create(
             extra_env,
             create_resource_override,
             // Operator-opened terminal (the Tauri `terminal_create` command):
-            // the account is chosen after this point.
+            // the account is chosen after this point — EXCEPT a boot-restore
+            // pane, which arrives with `claude_config_dir` already pinned. That
+            // pane deliberately stays on this non-fatal every-account arm (the
+            // mint covers the pinned account too) rather than `Pinned`, so a
+            // trust-gate refusal can never drop a session restore.
             crate::terminal::TrustArm::AccountChosenLater,
             spawn_tenant_id,
         )
@@ -1722,6 +1758,17 @@ struct RestoreCandidate {
     /// rather than "no transcript".
     #[serde(rename = "transcriptExists", skip_serializing_if = "Option::is_none")]
     transcript_exists: Option<bool>,
+    /// The account the resume MUST run under — see
+    /// [`crate::session::past_sessions::resolve_resume_config_dir_in`]: the
+    /// config dir the transcript was found under, else the record's own, else
+    /// the ambient default. Explicit even for a default-account session whose
+    /// record says `configDir: null`, because "no dir" made the frontend type
+    /// a bare `claude --resume` that inherited the PTY's picker-chosen account
+    /// and found no conversation (2026-10-08). The frontend pins the restore
+    /// pane AND prefixes the typed resume with this value. Absent only when no
+    /// dir can be named at all (no record dir, no transcript, no home).
+    #[serde(rename = "resumeConfigDir", skip_serializing_if = "Option::is_none")]
+    resume_config_dir: Option<String>,
 }
 
 /// The boot-restore set [`terminal_session_list_open`] returns: exactly the
@@ -1748,15 +1795,68 @@ fn restore_candidates(
     boot_was_clean: bool,
     boot_at_ms: Option<i64>,
 ) -> Vec<RestoreCandidate> {
+    restore_candidates_in(
+        store,
+        now_ms,
+        prior_marker_at,
+        boot_was_clean,
+        &crate::session::past_sessions::transcript_search_dirs(),
+        crate::terminal::transcript::ambient_claude_config_dir().as_deref(),
+    )
+}
+
+/// [`restore_candidates`] over an explicit account search set — `candidates`
+/// (searched after each record's own `config_dir`) and the `ambient` default —
+/// so the resume-account resolution is testable without the machine's real
+/// account homes. The search set is computed ONCE per list, not per record.
+///
+/// `transcriptExists` is `Some(true)` whenever the account search found the
+/// transcript, whatever the attached probe says: the probe looks only under
+/// the config dirs it snapshotted at boot and ignores the record's own, so it
+/// can miss a transcript this search just stat'ed. Otherwise the probe's
+/// answer stands, `None` (not probed) included.
+fn restore_candidates_in(
+    store: &SessionLifecycleStore,
+    now_ms: i64,
+    prior_marker_at: Option<i64>,
+    boot_was_clean: bool,
+    candidates: &[std::path::PathBuf],
+    ambient: Option<&std::path::Path>,
+) -> Vec<RestoreCandidate> {
     store
         .restorable_records(now_ms, prior_marker_at, boot_was_clean, boot_at_ms)
         .into_iter()
         .map(|rec| {
-            let transcript_exists =
-                store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+            let (resume_config_dir, found) =
+                crate::session::past_sessions::resolve_resume_config_dir_in(
+                    rec.config_dir.as_deref(),
+                    rec.working_dir.as_deref(),
+                    &rec.claude_session_id,
+                    candidates,
+                    ambient,
+                );
+            let transcript_exists = if found {
+                Some(true)
+            } else {
+                let probed = store
+                    .probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+                if probed == Some(true) {
+                    // The boot probe saw a transcript under a dir the account
+                    // search no longer lists, so the resume runs under the
+                    // FALLBACK account, which is not known to hold it.
+                    warn!(
+                        claude_session_id = %rec.claude_session_id,
+                        resume_config_dir = ?resume_config_dir,
+                        "restore: transcript probe says present but the account search \
+                         missed it — resuming under the fallback account"
+                    );
+                }
+                probed
+            };
             RestoreCandidate {
                 record: rec,
                 transcript_exists,
+                resume_config_dir,
             }
         })
         .collect()
@@ -2956,6 +3056,93 @@ mod tests {
         }
     }
 
+    /// Defect 2026-10-08 end-to-end at the restore-set boundary: an open
+    /// record with `config_dir: None` whose transcript lives ONLY under the
+    /// default account dir must come back from the restore set with that dir as
+    /// an explicit `resumeConfigDir` — even though a picker-chosen account home
+    /// is searched first. Before the fix the row carried no account at all and
+    /// the frontend typed a bare `claude --resume` into a PTY on the picker's
+    /// account ("No conversation found", 22 of 22 panes).
+    #[test]
+    fn restore_set_names_the_transcripts_account_for_a_null_config_dir_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let picker = tmp.path().join(".claude-iris");
+        let default = tmp.path().join(".claude");
+        std::fs::create_dir_all(picker.join("projects")).unwrap();
+        let rec = restore_candidate_record("sess-null-cfg");
+        let wd = rec.working_dir.clone().unwrap();
+        let tpath =
+            crate::terminal::transcript::session_transcript_path(&default, &wd, "sess-null-cfg");
+        std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+        std::fs::write(&tpath, "{}\n").unwrap();
+
+        let store = SessionLifecycleStore::open(tmp.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        assert!(
+            rec.config_dir.is_none(),
+            "fixture is the null-configDir shape"
+        );
+        store.record_open(rec);
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let rows = restore_candidates_in(
+            &store,
+            now,
+            None,
+            false,
+            &[picker.clone(), default.clone()],
+            Some(&picker),
+        );
+        assert_eq!(rows.len(), 1);
+        let wire = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(
+            wire["resumeConfigDir"],
+            serde_json::Value::String(default.to_string_lossy().into_owned()),
+            "the restore set must name the transcript's account explicitly: {wire}"
+        );
+        assert_eq!(
+            wire["transcriptExists"],
+            serde_json::Value::Bool(true),
+            "found by the account search ⇒ exists, whatever the (unattached) probe says"
+        );
+    }
+
+    /// The restore pane's PTY account: a caller-supplied dir replaces any pin
+    /// already present and becomes THE pin `TerminalSession::spawn` honors
+    /// over the spawn-time picker; absent/blank leaves the env untouched.
+    #[test]
+    fn caller_config_dir_pins_the_pty_over_any_prior_pin() {
+        let env = Some(vec![
+            ("QONTINUI_SESSION_WORKTREES".to_string(), "x".to_string()),
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/u/.claude-iris".to_string(),
+            ),
+        ]);
+        let pinned = with_caller_config_dir(env.clone(), Some("/home/u/.claude"));
+        assert_eq!(
+            crate::terminal::session::TerminalSession::caller_pinned_config_dir(pinned.as_deref()),
+            Some("/home/u/.claude"),
+            "the restore's account must be the PTY's pin, not the picker's"
+        );
+        assert_eq!(
+            pinned
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .count(),
+            1,
+            "exactly one account on the PTY"
+        );
+        assert_eq!(with_caller_config_dir(env.clone(), None), env);
+        assert_eq!(with_caller_config_dir(env.clone(), Some("  ")), env);
+        assert_eq!(
+            with_caller_config_dir(None, Some("/c")),
+            Some(vec![("CLAUDE_CONFIG_DIR".to_string(), "/c".to_string())])
+        );
+    }
+
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
@@ -3006,6 +3193,7 @@ mod tests {
         let probed_absent = serde_json::to_value(RestoreCandidate {
             record: restore_candidate_record("sess-absent"),
             transcript_exists: Some(false),
+            resume_config_dir: None,
         })
         .expect("probed-absent candidate serializes");
         assert_eq!(probed_absent["claudeSessionId"], "sess-absent");
@@ -3018,6 +3206,7 @@ mod tests {
         let probed_present = serde_json::to_value(RestoreCandidate {
             record: restore_candidate_record("sess-present"),
             transcript_exists: Some(true),
+            resume_config_dir: None,
         })
         .expect("probed-present candidate serializes");
         assert_eq!(
@@ -3028,6 +3217,7 @@ mod tests {
         let unprobed = serde_json::to_value(RestoreCandidate {
             record: restore_candidate_record("sess-unprobed"),
             transcript_exists: None,
+            resume_config_dir: None,
         })
         .expect("unprobed candidate serializes");
         assert_eq!(
