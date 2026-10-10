@@ -193,6 +193,12 @@ fn env_var_name_for_credential(name: &str) -> String {
 fn resolve_credential(source: &CredentialSource) -> Option<String> {
     match source {
         CredentialSource::Keychain { service, key } => {
+            // The keychain gate (`instance_env::os_keychain_allowed`): a gated
+            // read resolves nothing, exactly like a missing entry.
+            if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+                debug!("Credential proxy: OS keychain disabled for this runner");
+                return None;
+            }
             // Use the keyring crate to retrieve from OS keychain
             match keyring::Entry::new(service, key) {
                 Ok(entry) => match entry.get_password() {

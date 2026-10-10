@@ -221,6 +221,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
     "QONTINUI_INSTALL_OVERRIDE",
     "QONTINUI_INSTANCE_NAME",
+    "QONTINUI_INSTANCE_ROOT",
     "QONTINUI_LOOPING_AGENT_TICK_MS",
     "QONTINUI_MACHINE_ID",
     "QONTINUI_MAINTENANCE_INTERVAL_SECS",
@@ -772,6 +773,9 @@ pub mod test_support {
     /// configured developer box exports and a clean CI runner does not.
     pub const KEYS_REMOVED: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
+        // A subject runner's root: a test that inherited one would run as a
+        // secondary with the keychain gated off.
+        "QONTINUI_INSTANCE_ROOT",
         "COORD_HTTP_URL",
         "QONTINUI_WORKSPACE_ROOT",
         "QONTINUI_SERVER_MODE",
@@ -2171,5 +2175,200 @@ mod tests {
             "env keys read but not declared in ambient::AMBIENT_ENV_KEYS (add them, sorted):\n  {}",
             violations.into_iter().collect::<Vec<_>>().join("\n  ")
         );
+    }
+    /// The gate every `keyring::Entry::new*` must name, in the same fn and
+    /// before the entry is built.
+    const KEYCHAIN_GATE: &str = "os_keychain_allowed";
+
+    /// Files whose keychain access goes through a DIFFERENT per-fn gate, with
+    /// the gate identifier each such fn must name and the reason.
+    const KEYCHAIN_GATE_EXCEPTIONS: &[(&str, &str, &str)] = &[(
+        "auth.rs",
+        "keychain_enabled",
+        "`AuthManager::keychain_enabled` reads `QONTINUI_DISABLE_KEYCHAIN`, which every \
+         binary's startup exports as `1` under an instance root \
+         (`instance_env::instance_root_defaults`); auth's switch is kept so a primary's \
+         behaviour is unchanged",
+    )];
+
+    fn leaf_ident(leaf: &Leaf) -> Option<&str> {
+        match &leaf.tok {
+            Tok::Ident(i) => Some(i.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The index of the `fn` keyword whose body (its first top-level `{…}`
+    /// after the signature) contains leaf `at`, innermost first; `None` when
+    /// `at` is inside no fn body at all.
+    fn enclosing_fn(leaves: &[Leaf], at: usize) -> Option<usize> {
+        (0..at)
+            .rev()
+            .filter(|&j| leaves[j].is_ident("fn"))
+            .find(|&j| {
+                // Find the body's opening brace: the first `{` at paren/bracket
+                // depth 0 before any `;` at that depth (a bodiless `fn x();`).
+                let mut depth = 0i32;
+                let mut open = None;
+                for (k, leaf) in leaves.iter().enumerate().skip(j + 1) {
+                    if leaf.is_open(Delimiter::Parenthesis) || leaf.is_open(Delimiter::Bracket) {
+                        depth += 1;
+                    } else if leaf.is_close(Delimiter::Parenthesis)
+                        || leaf.is_close(Delimiter::Bracket)
+                    {
+                        depth -= 1;
+                    } else if depth == 0 && leaf.is_punct(';') {
+                        return false;
+                    } else if depth == 0 && leaf.is_open(Delimiter::Brace) {
+                        open = Some(k);
+                        break;
+                    }
+                }
+                let Some(open) = open else { return false };
+                if open > at {
+                    return false;
+                }
+                let mut braces = 0i32;
+                for (k, leaf) in leaves.iter().enumerate().skip(open) {
+                    if leaf.is_open(Delimiter::Brace) {
+                        braces += 1;
+                    } else if leaf.is_close(Delimiter::Brace) {
+                        braces -= 1;
+                        if braces == 0 {
+                            return k > at;
+                        }
+                    }
+                }
+                false
+            })
+    }
+
+    /// Drift guard (c), plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D2: keychain service names are machine-wide, so an ungated entry lets a
+    /// subject runner read or overwrite the harness's secrets. In PRODUCTION
+    /// code:
+    ///
+    /// - every `Entry::new*` (`new`, `new_with_target`, `new_with_credential`, …)
+    ///   sits inside a fn body (never a `static` / `Lazy` initialiser) and names
+    ///   [`KEYCHAIN_GATE`] — or its file's [`KEYCHAIN_GATE_EXCEPTIONS`] gate — in
+    ///   that fn, BEFORE the entry is built;
+    /// - nothing swaps the credential builder (`set_default_credential_builder`
+    ///   / `default_credential_builder`), which would re-route every entry;
+    /// - nothing aliases the crate or its items with `use keyring… as …`, which
+    ///   would hide an entry from this scan.
+    ///
+    /// A stale exception fails too.
+    #[test]
+    fn every_keyring_entry_is_behind_the_keychain_gate() {
+        let mut violations = Vec::new();
+        let mut entries_seen = 0usize;
+        let mut exceptions_used: BTreeSet<&str> = BTreeSet::new();
+        for (rel, leaves) in production_sources() {
+            let exception = KEYCHAIN_GATE_EXCEPTIONS.iter().find(|(f, _, _)| *f == rel);
+            let gate = exception.map_or(KEYCHAIN_GATE, |(_, g, _)| *g);
+            for i in 0..leaves.len() {
+                if let Some(id) = leaf_ident(&leaves[i]) {
+                    if id.ends_with("default_credential_builder") {
+                        violations.push(format!(
+                            "{rel}:{} swaps the credential builder",
+                            leaves[i].line
+                        ));
+                    }
+                    if id == "use" {
+                        let stmt_end = (i..leaves.len())
+                            .find(|&j| leaves[j].is_punct(';'))
+                            .unwrap_or(leaves.len());
+                        let stmt = &leaves[i..stmt_end];
+                        if stmt.iter().any(|l| l.is_ident("keyring"))
+                            && stmt.iter().any(|l| l.is_ident("as"))
+                        {
+                            violations.push(format!(
+                                "{rel}:{} aliases keyring with `as`",
+                                leaves[i].line
+                            ));
+                        }
+                    }
+                }
+                let is_entry_new = leaves[i].is_ident("Entry")
+                    && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+                    && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+                    && leaves
+                        .get(i + 3)
+                        .and_then(leaf_ident)
+                        .is_some_and(|id| id.starts_with("new"));
+                if !is_entry_new {
+                    continue;
+                }
+                entries_seen += 1;
+                if let Some((f, _, _)) = exception {
+                    exceptions_used.insert(f);
+                }
+                // The enclosing fn: the nearest preceding `fn` whose BODY
+                // contains this call. None (a `static` / `Lazy` initialiser, a
+                // `const`) is a violation in itself: there is no fn to gate in.
+                let Some(fn_start) = enclosing_fn(&leaves, i) else {
+                    violations.push(format!(
+                        "{rel}:{} Entry::new* outside any fn (a static initialiser cannot be gated)",
+                        leaves[i].line
+                    ));
+                    continue;
+                };
+                if !leaves[fn_start..i].iter().any(|l| l.is_ident(gate)) {
+                    violations.push(format!(
+                        "{rel}:{} Entry::new* without `{gate}`",
+                        leaves[i].line
+                    ));
+                }
+            }
+        }
+        // Measured when written: 10 gated sites outside auth.rs plus 8 in
+        // auth.rs. A scan that sees fewer has stopped recognising the call.
+        assert!(
+            entries_seen >= 18,
+            "only {entries_seen} `Entry::new*` found"
+        );
+        assert!(
+            violations.is_empty(),
+            "keychain access not behind its gate (instance_env::os_keychain_allowed(), or the \
+             file's KEYCHAIN_GATE_EXCEPTIONS gate):\n  {}",
+            violations.join("\n  ")
+        );
+        let stale: Vec<&str> = KEYCHAIN_GATE_EXCEPTIONS
+            .iter()
+            .map(|(f, _, _)| *f)
+            .filter(|f| !exceptions_used.contains(f))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stale KEYCHAIN_GATE_EXCEPTIONS entries: {stale:?}"
+        );
+    }
+
+    /// The scope finder behind the keychain guard: an `Entry::new` in a
+    /// `static` initialiser has NO enclosing fn (so the guard refuses it), and
+    /// one in a fn body is attributed to that fn, not to an earlier one.
+    #[test]
+    fn enclosing_fn_sees_fn_bodies_and_not_static_initialisers() {
+        let src = r#"
+            fn earlier() { let _ = 1; }
+            static E: Lazy<Entry> = Lazy::new(|| Entry::new("s", "k").unwrap());
+            trait T { fn bodiless(&self); }
+            fn later(x: u8) -> u8 { if os_keychain_allowed() { Entry::new("s", "k"); } x }
+        "#;
+        let leaves = prod_tokens(src, "synthetic.rs").leaves;
+        let entries: Vec<usize> = (0..leaves.len())
+            .filter(|&i| {
+                leaves[i].is_ident("Entry") && leaves.get(i + 3).is_some_and(|l| l.is_ident("new"))
+            })
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            enclosing_fn(&leaves, entries[0]),
+            None,
+            "a static initialiser"
+        );
+        let in_later = enclosing_fn(&leaves, entries[1]).expect("inside `later`");
+        assert!(leaves[in_later + 1].is_ident("later"));
     }
 }

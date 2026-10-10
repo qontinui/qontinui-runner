@@ -57,6 +57,9 @@ use qontinui_runner_lib::config_report::{
 };
 
 fn main() -> ExitCode {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     // Doc-emit mode: print the layer inventory generated from LAYER_SPECS and
     // exit WITHOUT resolving anything live.
     if std::env::args().any(|a| a == "--layer-doc") {

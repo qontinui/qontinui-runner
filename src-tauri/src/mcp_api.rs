@@ -13918,7 +13918,7 @@ pub async fn start_server(
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets
-    let ports_to_try = [port, port + 1, port + 2];
+    let ports_to_try = crate::instance::api_ports_to_try(port);
     let mut last_error = None;
 
     for try_port in ports_to_try {

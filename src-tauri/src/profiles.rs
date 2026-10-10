@@ -1453,7 +1453,8 @@ pub fn promote_tier_to_account() -> Result<(TierWrite, PathBuf)> {
     let (path, source) = settings_json_path();
     let path =
         path.ok_or_else(|| anyhow!("cannot resolve settings.json path (source: {source})"))?;
-    let outcome = promote_tier_to_account_at(&path, crate::instance_env::is_secondary())?;
+    let outcome =
+        promote_tier_to_account_at(&path, crate::instance_env::shares_primary_settings())?;
     Ok((outcome, path))
 }
 
