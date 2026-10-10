@@ -77,6 +77,51 @@ export type GenericRunnerEvent = {
   eventType: Scalars["String"]["output"];
 };
 
+/**
+ * The wire discriminant of a bounded read's bound — GraphQL mirror of
+ * `qontinui_types::page::BoundKind`.
+ */
+export const GqlBoundKind = {
+  /** A probe fired; more rows exist, `total` is null. */
+  AtLeast: "AT_LEAST",
+  /** The page holds everything from its start position. */
+  Complete: "COMPLETE",
+  /** A count ran; `total` is a number. */
+  Exact: "EXACT",
+  /** Did not resolve; `truncated` and `total` are null. */
+  Unknown: "UNKNOWN",
+} as const;
+
+export type GqlBoundKind = (typeof GqlBoundKind)[keyof typeof GqlBoundKind];
+/**
+ * The shared bounded-read envelope (plan
+ * `2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus` §3
+ * Layer 2) — GraphQL mirror of `qontinui_types::page::BoundedReadMeta`, key
+ * for key. GraphQL cannot flatten, so a bounded query nests it as `page`.
+ */
+export type GqlBoundedReadMeta = {
+  /** False only when the store is unprovisioned. */
+  available: Scalars["Boolean"]["output"];
+  /** Which kind of bound produced `total` / `truncated`. */
+  boundKind: GqlBoundKind;
+  /** Items in this page (the legacy spelling of `shown`). */
+  count: Scalars["Int"]["output"];
+  /** For a ranked read that cannot page: the door that walks the corpus. */
+  enumerateVia?: Maybe<Scalars["String"]["output"]>;
+  /** A filter narrowed before the read ran, or null. */
+  filterNarrowed?: Maybe<GqlFilterNarrowing>;
+  /** The cap actually applied to this page. */
+  limit: Scalars["Int"]["output"];
+  /** The opaque token for the next page — pass it back verbatim as `cursor`. */
+  nextCursor?: Maybe<Scalars["String"]["output"]>;
+  /** Items in this page. */
+  shown: Scalars["Int"]["output"];
+  /** The exact count from this page's start position, when one ran. */
+  total?: Maybe<Scalars["Int"]["output"]>;
+  /** Whether more exists beyond this page; null when unknown. */
+  truncated?: Maybe<Scalars["Boolean"]["output"]>;
+};
+
 /** Budget warning when consumption exceeds a threshold. */
 export type GqlBudgetWarningEvent = {
   budgetLimitUsd: Scalars["Float"]["output"];
@@ -152,6 +197,19 @@ export type GqlErrorSummary = {
   totalCount: Scalars["Int"]["output"];
   unresolvedCount: Scalars["Int"]["output"];
   warningCount: Scalars["Int"]["output"];
+};
+
+/**
+ * A filter the surface narrowed before the read ran — GraphQL mirror of
+ * `qontinui_types::page::FilterNarrowing`.
+ */
+export type GqlFilterNarrowing = {
+  /** How many of its values the read applied. */
+  applied: Scalars["Int"]["output"];
+  /** The cap that dropped the rest. */
+  cap: Scalars["Int"]["output"];
+  /** The query parameter that was narrowed. */
+  parameter: Scalars["String"]["output"];
 };
 
 /** A finding detected by AI analysis. */
@@ -327,17 +385,24 @@ export type GqlTaskRun = {
   workspaceId?: Maybe<Scalars["String"]["output"]>;
 };
 
-/** Paginated task run output. */
+/**
+ * One byte-cursor page of a task run's output (see
+ * `graphql::output_page`).
+ */
 export type GqlTaskRunOutput = {
-  /** Output text (may be truncated by offset/limit). */
+  /**
+   * This page's text: at most `page.limit` bytes, never splitting a
+   * character.
+   */
   content: Scalars["String"]["output"];
-  /** Whether there is more content after this chunk. */
-  hasMore: Scalars["Boolean"]["output"];
-  /** Character offset of this content within the full output. */
-  offset: Scalars["Int"]["output"];
+  /**
+   * The bounded-read envelope: pass `page.nextCursor` back as `cursor` for
+   * the following page; `null` means this page reaches the end.
+   */
+  page: GqlBoundedReadMeta;
   /** The task run ID. */
   taskRunId: Scalars["String"]["output"];
-  /** Total length of the full output in characters. */
+  /** Length of the WHOLE output in bytes, whatever page this is. */
   totalLength: Scalars["Int"]["output"];
 };
 
@@ -552,8 +617,12 @@ export type QueryRoot = {
   /** Get a single task run by ID. */
   taskRun?: Maybe<GqlTaskRun>;
   /**
-   * Get task run output with optional offset/limit for pagination.
-   * Defaults to last 10000 characters (tail) if no offset specified.
+   * One page of a task run's output, walked from the start by an opaque
+   * byte cursor: omit `cursor` for the first page and pass the previous
+   * response's `page.nextCursor` for the next. `limit` is in bytes,
+   * clamped to `1..=1048576`; a page never splits a character. A cursor
+   * that this read did not mint for this run is refused with extension
+   * `code: "cursor_malformed"`, `parameter: "cursor"`.
    */
   taskRunOutput: GqlTaskRunOutput;
   /** List recent task runs with optional filters. */
@@ -635,9 +704,9 @@ export type QueryRootTaskRunArgs = {
 };
 
 export type QueryRootTaskRunOutputArgs = {
+  cursor?: InputMaybe<Scalars["String"]["input"]>;
   id: Scalars["String"]["input"];
   limit?: Scalars["Int"]["input"];
-  offset?: Scalars["Int"]["input"];
 };
 
 export type QueryRootTaskRunsArgs = {
@@ -1216,7 +1285,7 @@ export type FindingSummaryQuery = {
 
 export type TaskRunOutputQueryVariables = Exact<{
   id: Scalars["String"]["input"];
-  offset?: InputMaybe<Scalars["Int"]["input"]>;
+  cursor?: InputMaybe<Scalars["String"]["input"]>;
   limit?: InputMaybe<Scalars["Int"]["input"]>;
 }>;
 
@@ -1225,8 +1294,17 @@ export type TaskRunOutputQuery = {
     taskRunId: string;
     content: string;
     totalLength: number;
-    offset: number;
-    hasMore: boolean;
+    page: {
+      count: number;
+      limit: number;
+      shown: number;
+      total?: number | null;
+      truncated?: boolean | null;
+      boundKind: GqlBoundKind;
+      nextCursor?: string | null;
+      available: boolean;
+      enumerateVia?: string | null;
+    };
   };
 };
 

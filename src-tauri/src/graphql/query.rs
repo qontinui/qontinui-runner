@@ -278,19 +278,23 @@ impl QueryRoot {
         Ok(run.map(super::types::GqlTaskRun::from_db))
     }
 
-    /// Get task run output with optional offset/limit for pagination.
-    /// Defaults to last 10000 characters (tail) if no offset specified.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
+    /// One page of a task run's output, walked from the start by an opaque
+    /// byte cursor: omit `cursor` for the first page and pass the previous
+    /// response's `page.nextCursor` for the next. `limit` is in bytes,
+    /// clamped to `1..=1048576`; a page never splits a character. A cursor
+    /// that this read did not mint for this run is refused with extension
+    /// `code: "cursor_malformed"`, `parameter: "cursor"`.
     async fn task_run_output(
         &self,
         ctx: &Context<'_>,
         id: String,
-        #[graphql(default = 0)] offset: i32,
+        cursor: Option<String>,
         #[graphql(default = 10000)] limit: i32,
     ) -> Result<super::types::GqlTaskRunOutput> {
+        use super::output_page::{
+            decode_output_cursor, output_page, output_scope, OutputCursorError,
+        };
+
         let state = ctx.data::<Arc<ApiState>>()?;
 
         let full_output = state
@@ -300,25 +304,23 @@ impl QueryRoot {
             .await
             .map_err(|e| Error::new(format!("Failed to get task output: {}", e)))?;
 
-        let total_length = full_output.len() as i32;
-        let offset = offset.max(0) as usize;
-        let limit = limit.max(0) as usize;
-
-        let content = if offset < full_output.len() {
-            let end = (offset + limit).min(full_output.len());
-            full_output[offset..end].to_string()
-        } else {
-            String::new()
+        let scope = output_scope(&id);
+        let start = match cursor.as_deref() {
+            None => 0,
+            Some(token) => decode_output_cursor(&scope, token, &full_output).map_err(|e| {
+                Error::new(e.refusal()).extend_with(|_, ext| {
+                    ext.set("code", OutputCursorError::CODE);
+                    ext.set("parameter", "cursor");
+                })
+            })?,
         };
-
-        let has_more = (offset + limit) < full_output.len();
+        let page = output_page(&full_output, start, limit, &scope);
 
         Ok(super::types::GqlTaskRunOutput {
             task_run_id: id,
-            content,
-            total_length,
-            offset: offset as i32,
-            has_more,
+            content: page.content,
+            total_length: full_output.len() as i64,
+            page: page.meta.into(),
         })
     }
 

@@ -41,8 +41,8 @@ export interface TaskRunLiveState {
   loading: boolean;
   /** Any error from queries or subscriptions. */
   error: string | null;
-  /** Fetch the next page of output. */
-  fetchMoreOutput: (offset: number) => void;
+  /** Fetch the output page a previous page's `page.nextCursor` addresses. */
+  fetchMoreOutput: (cursor: string) => void;
 }
 
 /**
@@ -67,7 +67,7 @@ export function useTaskRunLive(
 
   // Accumulated events
   const [events, setEvents] = useState<RunnerEventData[]>([]);
-  const [outputOffset, setOutputOffset] = useState(0);
+  const [outputCursor, setOutputCursor] = useState<string | null>(null);
   const prevTaskIdRef = useRef(taskRunId);
 
   // Reset state when task ID changes
@@ -75,7 +75,7 @@ export function useTaskRunLive(
     if (taskRunId !== prevTaskIdRef.current) {
       prevTaskIdRef.current = taskRunId;
       setEvents([]);
-      setOutputOffset(0);
+      setOutputCursor(null);
     }
   }, [taskRunId]);
 
@@ -91,7 +91,7 @@ export function useTaskRunLive(
   const isTerminal =
     taskRun?.status === "complete" || taskRun?.status === "failed" || taskRun?.status === "stopped";
 
-  const { data: outputData } = useTaskRunOutputGql(taskRunId, outputOffset, outputLimit, !active);
+  const { data: outputData } = useTaskRunOutputGql(taskRunId, outputCursor, outputLimit, !active);
 
   const { data: summaryData } = useFindingSummaryGql(taskRunId, !active);
 
@@ -130,6 +130,6 @@ export function useTaskRunLive(
     isTerminal,
     loading: taskRunLoading,
     error,
-    fetchMoreOutput: setOutputOffset,
+    fetchMoreOutput: setOutputCursor,
   };
 }

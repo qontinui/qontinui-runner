@@ -109,7 +109,14 @@ FROM task_run_playwright_results
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
---! get_task_run_playwright_results_limited
+-- No window count rides on a page statement: `COUNT(*) OVER ()` forces the
+-- executor to read every remaining row (including the big text columns) on
+-- EVERY page, which makes a walk O(n^2). A page is `LIMIT :max_results` with
+-- the caller binding limit + 1 (the extra row is the has-more probe). The exact
+-- population counts are the separate `*_counts` statements below, run on the
+-- first page only (plan 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, Section 6).
+
+--! get_task_run_playwright_results_page
 SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status,
        COALESCE(duration_ms, 0) as duration_ms,
        COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr,
@@ -118,8 +125,16 @@ SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status,
        assertions_passed, assertions_failed, created_at
 FROM task_run_playwright_results
 WHERE task_run_id = :task_run_id
-ORDER BY created_at ASC
-LIMIT :max_results OFFSET :skip_results;
+  AND (created_at, id) > (:after_created_at, :after_id)
+ORDER BY created_at ASC, id ASC
+LIMIT :max_results;
+
+--! get_task_run_playwright_results_counts
+SELECT COUNT(*)::bigint as total,
+       (COUNT(*) FILTER (WHERE status = 'passed'))::bigint as passed,
+       (COUNT(*) FILTER (WHERE status = 'failed'))::bigint as failed
+FROM task_run_playwright_results
+WHERE task_run_id = :task_run_id;
 
 --! create_task_run_api_request (step_name?, request_headers?, request_body?, status_text?, response_headers?, response_body?, response_size_bytes?, extractions?, assertions?, error_message?)
 INSERT INTO task_run_api_requests
@@ -148,7 +163,7 @@ FROM task_run_api_requests
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
---! get_task_run_api_requests_limited
+--! get_task_run_api_requests_page
 SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name,
        method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers,
        COALESCE(request_body, '') as request_body,
@@ -160,8 +175,17 @@ SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name,
        success, COALESCE(error_message, '') as error_message, created_at
 FROM task_run_api_requests
 WHERE task_run_id = :task_run_id
-ORDER BY created_at ASC
-LIMIT :max_results OFFSET :skip_results;
+  AND (NOT :filter_by_success OR success = :success)
+  AND (created_at, id) > (:after_created_at, :after_id)
+ORDER BY created_at ASC, id ASC
+LIMIT :max_results;
+
+--! get_task_run_api_requests_counts
+SELECT COUNT(*)::bigint as total,
+       (COUNT(*) FILTER (WHERE success))::bigint as succeeded
+FROM task_run_api_requests
+WHERE task_run_id = :task_run_id
+  AND (NOT :filter_by_success OR success = :success);
 
 --! create_task_run_awas_step (step_id?, step_name?, url?, action_id?, parameters?, response_data?, error_message?, duration_ms?)
 INSERT INTO task_run_awas_steps
@@ -181,12 +205,21 @@ FROM task_run_awas_steps
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
---! get_task_run_awas_steps_limited
+--! get_task_run_awas_steps_page
 SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type,
        COALESCE(url, '') as url, COALESCE(action_id, '') as action_id,
        COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data,
        success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at
 FROM task_run_awas_steps
 WHERE task_run_id = :task_run_id
-ORDER BY created_at ASC
-LIMIT :max_results OFFSET :skip_results;
+  AND (NOT :filter_by_step_type OR step_type = :step_type)
+  AND (created_at, id) > (:after_created_at, :after_id)
+ORDER BY created_at ASC, id ASC
+LIMIT :max_results;
+
+--! get_task_run_awas_steps_counts
+SELECT COUNT(*)::bigint as total,
+       (COUNT(*) FILTER (WHERE success))::bigint as succeeded
+FROM task_run_awas_steps
+WHERE task_run_id = :task_run_id
+  AND (NOT :filter_by_step_type OR step_type = :step_type);

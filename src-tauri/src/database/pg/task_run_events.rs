@@ -470,90 +470,6 @@ impl PgDb {
             .collect())
     }
 
-    /// Get Playwright results for a task run with SQL-level LIMIT/OFFSET.
-    pub async fn get_task_run_playwright_results_paginated(
-        &self,
-        task_run_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<TaskRunPlaywrightResult>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let rows = qontinui_db::queries::task_run_events::get_task_run_playwright_results_limited()
-            .bind(&conn, &task_run_id, &limit, &offset)
-            .all()
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG query task_run_playwright_results", &e))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let spec_file = if r.spec_file.is_empty() {
-                    None
-                } else {
-                    Some(r.spec_file)
-                };
-                let duration_ms = if r.duration_ms == 0 {
-                    None
-                } else {
-                    Some(r.duration_ms)
-                };
-                let stdout = if r.stdout.is_empty() {
-                    None
-                } else {
-                    Some(r.stdout)
-                };
-                let stderr = if r.stderr.is_empty() {
-                    None
-                } else {
-                    Some(r.stderr)
-                };
-                let console_output = if r.console_output.is_empty() {
-                    None
-                } else {
-                    Some(r.console_output)
-                };
-                let page_snapshot = if r.page_snapshot.is_empty() {
-                    None
-                } else {
-                    Some(r.page_snapshot)
-                };
-                let error_message = if r.error_message.is_empty() {
-                    None
-                } else {
-                    Some(r.error_message)
-                };
-                let failure_screenshot_path = if r.failure_screenshot_path.is_empty() {
-                    None
-                } else {
-                    Some(r.failure_screenshot_path)
-                };
-
-                TaskRunPlaywrightResult {
-                    id: r.id,
-                    task_run_id: r.task_run_id,
-                    test_name: r.test_name,
-                    spec_file,
-                    status: r.status,
-                    duration_ms,
-                    stdout,
-                    stderr,
-                    console_output,
-                    page_snapshot,
-                    error_message,
-                    failure_screenshot_path,
-                    assertions_passed: r.assertions_passed,
-                    assertions_failed: r.assertions_failed,
-                    created_at: r.created_at.to_rfc3339(),
-                }
-            })
-            .collect())
-    }
-
     /// Create a task run API request record.
     pub async fn create_task_run_api_request(
         &self,
@@ -628,106 +544,6 @@ impl PgDb {
             .into_iter()
             .map(|r| {
                 // Clorinde returns non-optional (COALESCE'd) — convert empty to None
-                let step_name = if r.step_name.is_empty() {
-                    None
-                } else {
-                    Some(r.step_name)
-                };
-                let request_headers = if r.request_headers.is_empty() {
-                    None
-                } else {
-                    Some(r.request_headers)
-                };
-                let request_body = if r.request_body.is_empty() {
-                    None
-                } else {
-                    Some(r.request_body)
-                };
-                let status_text = if r.status_text.is_empty() {
-                    None
-                } else {
-                    Some(r.status_text)
-                };
-                let response_headers = if r.response_headers.is_empty() {
-                    None
-                } else {
-                    Some(r.response_headers)
-                };
-                let response_body = if r.response_body.is_empty() {
-                    None
-                } else {
-                    Some(r.response_body)
-                };
-                let response_size_bytes = if r.response_size_bytes == 0 {
-                    None
-                } else {
-                    Some(r.response_size_bytes)
-                };
-                let extractions = if r.extractions.is_empty() {
-                    None
-                } else {
-                    Some(r.extractions)
-                };
-                let assertions = if r.assertions.is_empty() {
-                    None
-                } else {
-                    Some(r.assertions)
-                };
-                let error_message = if r.error_message.is_empty() {
-                    None
-                } else {
-                    Some(r.error_message)
-                };
-
-                TaskRunApiRequest {
-                    id: r.id,
-                    task_run_id: r.task_run_id,
-                    step_id: r.step_id,
-                    step_name,
-                    method: r.method,
-                    url: r.url,
-                    resolved_url: r.resolved_url,
-                    request_headers,
-                    request_body,
-                    status_code: r.status_code,
-                    status_text,
-                    response_headers,
-                    response_time_ms: r.response_time_ms,
-                    response_body_type: r.response_body_type,
-                    response_body,
-                    response_size_bytes,
-                    extractions,
-                    assertions,
-                    success: r.success,
-                    error_message,
-                    created_at: r.created_at.to_rfc3339(),
-                }
-            })
-            .collect())
-    }
-
-    /// Get API requests for a task run with SQL-level LIMIT/OFFSET.
-    pub async fn get_task_run_api_requests_paginated(
-        &self,
-        task_run_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<TaskRunApiRequest>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let rows = qontinui_db::queries::task_run_events::get_task_run_api_requests_limited()
-            .bind(&conn, &task_run_id, &limit, &offset)
-            .all()
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG query task_run_api_requests", &e))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| {
                 let step_name = if r.step_name.is_empty() {
                     None
                 } else {
@@ -924,108 +740,321 @@ impl PgDb {
             })
             .collect())
     }
+}
 
-    /// Get AWAS steps for a task run with SQL-level LIMIT/OFFSET.
-    pub async fn get_task_run_awas_steps_paginated(
+// =============================================================================
+// Keyset pages over the per-run log tables
+// =============================================================================
+
+/// One page of a per-run log table (`task_run_playwright_results`,
+/// `task_run_api_requests`, `task_run_awas_steps`), walked by keyset on the
+/// immutable `(created_at, id)` in `created_at ASC, id ASC` order (plan
+/// `2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus`, Phase 5b
+/// and D8).
+///
+/// `created_at` is written once, by the INSERT's `NOW()`, and no statement
+/// updates it or `id` — `commands::ai_data`'s pinning test greps for one. The
+/// walk is ascending (chronological, the order a run's log is read in) rather
+/// than the codec's usual descending, so rows a still-running task appends
+/// land AHEAD of the cursor and are reached, never skipped.
+///
+/// **A page statement carries no window count.** `COUNT(*) OVER ()` would make
+/// the executor read every remaining row — the big text columns included — on
+/// every page, turning a walk into O(n^2). The page is `LIMIT limit + 1` (the
+/// extra row is the has-more probe), and the exact population counts are a
+/// separate statement over the small columns, run ONLY on the first page
+/// (plan Section 6: the exact total is opt-in at a cost the caller can see,
+/// `at_least` is the default). Later pages report `at_least`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskRunLogPage<T> {
+    /// The rows in walk order, each with its exact `created_at` (the keyset
+    /// value the next cursor is minted from): up to `limit + 1` of them. The
+    /// last one, when present, is the probe — NOT part of the page.
+    pub rows: Vec<(T, chrono::DateTime<chrono::Utc>)>,
+    /// The population counts, from the first page's separate statement; `None`
+    /// on every later page (never computed, not zero).
+    pub counts: Option<TaskRunLogCounts>,
+}
+
+/// Rows matching the walk's filters over the WHOLE run — what the first page's
+/// counts statement measured (a first page starts before every row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRunLogCounts {
+    /// Every matching row.
+    pub total: i64,
+    /// Of those, rows that passed (Playwright) or succeeded.
+    pub succeeded: i64,
+    /// Of those, rows that failed.
+    pub failed: i64,
+}
+
+/// `0001-01-01T00:00:00Z` — an instant both chrono and PostgreSQL's
+/// `timestamptz` represent, before every `NOW()` a row was inserted at.
+const WALK_START_UNIX_SECONDS: i64 = -62_135_596_800;
+
+/// The `(created_at, id)` a walk resumes strictly after. The first page binds
+/// a position before every row the table can hold (`created_at` is always an
+/// INSERT's `NOW()`, and the empty id sorts before every id), so ONE statement
+/// serves the first and every later page.
+fn keyset_after(
+    after: Option<qontinui_types::page::KeysetPosition>,
+) -> (chrono::DateTime<chrono::FixedOffset>, String) {
+    match after {
+        Some(pos) => (pos.at.fixed_offset(), pos.id.to_string()),
+        None => (
+            chrono::DateTime::<chrono::Utc>::from_timestamp(WALK_START_UNIX_SECONDS, 0)
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .fixed_offset(),
+            String::new(),
+        ),
+    }
+}
+
+fn non_empty(s: String) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn non_zero(v: i64) -> Option<i64> {
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+impl PgDb {
+    /// One keyset page of a run's Playwright results. `limit` is the page size (the statement
+    /// fetches `limit + 1`); see [`TaskRunLogPage`] for the walk and the counts.
+    pub async fn get_task_run_playwright_results_page(
         &self,
         task_run_id: &str,
+        after: Option<qontinui_types::page::KeysetPosition>,
         limit: i64,
-        offset: i64,
-    ) -> Result<Vec<TaskRunAwasStep>, String> {
+    ) -> Result<TaskRunLogPage<TaskRunPlaywrightResult>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let first_page = after.is_none();
+        let (after_created_at, after_id) = keyset_after(after);
+        // `limit + 1`: the extra row is the has-more probe.
+        let probe_limit = limit.saturating_add(1);
 
-        let rows = qontinui_db::queries::task_run_events::get_task_run_awas_steps_limited()
-            .bind(&conn, &task_run_id, &limit, &offset)
+        let rows = qontinui_db::queries::task_run_events::get_task_run_playwright_results_page()
+            .bind(
+                &conn,
+                &task_run_id,
+                &after_created_at,
+                &after_id.as_str(),
+                &probe_limit,
+            )
+            .all()
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_playwright_results", &e))?;
+
+        let counts = if first_page {
+            let c = qontinui_db::queries::task_run_events::get_task_run_playwright_results_counts()
+                .bind(&conn, &task_run_id)
+                .one()
+                .await
+                .map_err(|e| {
+                    crate::database::pg::pg_err("PG count task_run_playwright_results", &e)
+                })?;
+            Some(TaskRunLogCounts {
+                total: c.total,
+                succeeded: c.passed,
+                failed: c.failed,
+            })
+        } else {
+            None
+        };
+        let rows = rows
+            .into_iter()
+            .map(|r| {
+                let created_at = r.created_at.with_timezone(&chrono::Utc);
+                let row = TaskRunPlaywrightResult {
+                    id: r.id,
+                    task_run_id: r.task_run_id,
+                    test_name: r.test_name,
+                    spec_file: non_empty(r.spec_file),
+                    status: r.status,
+                    duration_ms: non_zero(r.duration_ms),
+                    stdout: non_empty(r.stdout),
+                    stderr: non_empty(r.stderr),
+                    console_output: non_empty(r.console_output),
+                    page_snapshot: non_empty(r.page_snapshot),
+                    error_message: non_empty(r.error_message),
+                    failure_screenshot_path: non_empty(r.failure_screenshot_path),
+                    assertions_passed: r.assertions_passed,
+                    assertions_failed: r.assertions_failed,
+                    created_at: r.created_at.to_rfc3339(),
+                };
+                (row, created_at)
+            })
+            .collect::<Vec<_>>();
+        Ok(TaskRunLogPage { rows, counts })
+    }
+
+    /// One keyset page of a run's API requests, optionally only the
+    /// succeeded (`Some(true)`) or failed (`Some(false)`) ones — filtered in
+    /// the statement, so the counts and the page agree.
+    pub async fn get_task_run_api_requests_page(
+        &self,
+        task_run_id: &str,
+        success_filter: Option<bool>,
+        after: Option<qontinui_types::page::KeysetPosition>,
+        limit: i64,
+    ) -> Result<TaskRunLogPage<TaskRunApiRequest>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let first_page = after.is_none();
+        let (after_created_at, after_id) = keyset_after(after);
+        // `limit + 1`: the extra row is the has-more probe.
+        let probe_limit = limit.saturating_add(1);
+        let filter_by_success = success_filter.is_some();
+        let success = success_filter.unwrap_or(false);
+
+        let rows = qontinui_db::queries::task_run_events::get_task_run_api_requests_page()
+            .bind(
+                &conn,
+                &task_run_id,
+                &filter_by_success,
+                &success,
+                &after_created_at,
+                &after_id.as_str(),
+                &probe_limit,
+            )
+            .all()
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_api_requests", &e))?;
+
+        let counts = if first_page {
+            let c = qontinui_db::queries::task_run_events::get_task_run_api_requests_counts()
+                .bind(&conn, &task_run_id, &filter_by_success, &success)
+                .one()
+                .await
+                .map_err(|e| crate::database::pg::pg_err("PG count task_run_api_requests", &e))?;
+            Some(TaskRunLogCounts {
+                total: c.total,
+                succeeded: c.succeeded,
+                failed: c.total - c.succeeded,
+            })
+        } else {
+            None
+        };
+        let rows = rows
+            .into_iter()
+            .map(|r| {
+                let created_at = r.created_at.with_timezone(&chrono::Utc);
+                let row = TaskRunApiRequest {
+                    id: r.id,
+                    task_run_id: r.task_run_id,
+                    step_id: r.step_id,
+                    step_name: non_empty(r.step_name),
+                    method: r.method,
+                    url: r.url,
+                    resolved_url: r.resolved_url,
+                    request_headers: non_empty(r.request_headers),
+                    request_body: non_empty(r.request_body),
+                    status_code: r.status_code,
+                    status_text: non_empty(r.status_text),
+                    response_headers: non_empty(r.response_headers),
+                    response_time_ms: r.response_time_ms,
+                    response_body_type: r.response_body_type,
+                    response_body: non_empty(r.response_body),
+                    response_size_bytes: non_zero(r.response_size_bytes),
+                    extractions: non_empty(r.extractions),
+                    assertions: non_empty(r.assertions),
+                    success: r.success,
+                    error_message: non_empty(r.error_message),
+                    created_at: r.created_at.to_rfc3339(),
+                };
+                (row, created_at)
+            })
+            .collect::<Vec<_>>();
+        Ok(TaskRunLogPage { rows, counts })
+    }
+
+    /// One keyset page of a run's AWAS steps, optionally only one
+    /// `step_type` — filtered in the statement, so the counts and the
+    /// page agree.
+    pub async fn get_task_run_awas_steps_page(
+        &self,
+        task_run_id: &str,
+        step_type: Option<&str>,
+        after: Option<qontinui_types::page::KeysetPosition>,
+        limit: i64,
+    ) -> Result<TaskRunLogPage<TaskRunAwasStep>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let first_page = after.is_none();
+        let (after_created_at, after_id) = keyset_after(after);
+        // `limit + 1`: the extra row is the has-more probe.
+        let probe_limit = limit.saturating_add(1);
+        let filter_by_step_type = step_type.is_some();
+        let step_type = step_type.unwrap_or("");
+
+        let rows = qontinui_db::queries::task_run_events::get_task_run_awas_steps_page()
+            .bind(
+                &conn,
+                &task_run_id,
+                &filter_by_step_type,
+                &step_type,
+                &after_created_at,
+                &after_id.as_str(),
+                &probe_limit,
+            )
             .all()
             .await
             .map_err(|e| crate::database::pg::pg_err("PG query task_run_awas_steps", &e))?;
 
-        Ok(rows
+        let counts = if first_page {
+            let c = qontinui_db::queries::task_run_events::get_task_run_awas_steps_counts()
+                .bind(&conn, &task_run_id, &filter_by_step_type, &step_type)
+                .one()
+                .await
+                .map_err(|e| crate::database::pg::pg_err("PG count task_run_awas_steps", &e))?;
+            Some(TaskRunLogCounts {
+                total: c.total,
+                succeeded: c.succeeded,
+                failed: c.total - c.succeeded,
+            })
+        } else {
+            None
+        };
+        let rows = rows
             .into_iter()
             .map(|r| {
-                let step_id = if r.step_id.is_empty() {
-                    None
-                } else {
-                    Some(r.step_id)
-                };
-                let step_name = if r.step_name.is_empty() {
-                    None
-                } else {
-                    Some(r.step_name)
-                };
-                let url = if r.url.is_empty() { None } else { Some(r.url) };
-                let action_id = if r.action_id.is_empty() {
-                    None
-                } else {
-                    Some(r.action_id)
-                };
-                let parameters = if r.parameters.is_empty() {
-                    None
-                } else {
-                    Some(r.parameters)
-                };
-                let response_data = if r.response_data.is_empty() {
-                    None
-                } else {
-                    Some(r.response_data)
-                };
-                let error_message = if r.error_message.is_empty() {
-                    None
-                } else {
-                    Some(r.error_message)
-                };
-                let duration_ms = if r.duration_ms == 0 {
-                    None
-                } else {
-                    Some(r.duration_ms)
-                };
-
-                TaskRunAwasStep {
+                let created_at = r.created_at.with_timezone(&chrono::Utc);
+                let row = TaskRunAwasStep {
                     id: r.id,
                     task_run_id: r.task_run_id,
-                    step_id,
-                    step_name,
+                    step_id: non_empty(r.step_id),
+                    step_name: non_empty(r.step_name),
                     step_type: r.step_type,
-                    url,
-                    action_id,
-                    parameters,
-                    response_data,
+                    url: non_empty(r.url),
+                    action_id: non_empty(r.action_id),
+                    parameters: non_empty(r.parameters),
+                    response_data: non_empty(r.response_data),
                     success: r.success,
-                    error_message,
-                    duration_ms,
+                    error_message: non_empty(r.error_message),
+                    duration_ms: non_zero(r.duration_ms),
                     created_at: r.created_at.to_rfc3339(),
-                }
+                };
+                (row, created_at)
             })
-            .collect())
-    }
-
-    /// Count rows in a table for a task run (for pagination total_count).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn count_task_run_table(
-        &self,
-        table: &str,
-        task_run_id: &str,
-    ) -> Result<i64, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        let query = format!(
-            "SELECT COUNT(*)::bigint FROM {} WHERE task_run_id = $1",
-            table
-        );
-        let row = conn
-            .query_one(&query, &[&task_run_id])
-            .await
-            .map_err(|e| format!("PG count {}: {}", table, e))?;
-        Ok(row.get(0))
+            .collect::<Vec<_>>();
+        Ok(TaskRunLogPage { rows, counts })
     }
 }

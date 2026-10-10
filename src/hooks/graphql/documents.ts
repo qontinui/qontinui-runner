@@ -179,13 +179,22 @@ export const FINDING_SUMMARY_QUERY = gql`
 `;
 
 export const TASK_RUN_OUTPUT_QUERY = gql`
-  query TaskRunOutput($id: String!, $offset: Int = 0, $limit: Int = 10000) {
-    taskRunOutput(id: $id, offset: $offset, limit: $limit) {
+  query TaskRunOutput($id: String!, $cursor: String, $limit: Int = 10000) {
+    taskRunOutput(id: $id, cursor: $cursor, limit: $limit) {
       taskRunId
       content
       totalLength
-      offset
-      hasMore
+      page {
+        count
+        limit
+        shown
+        total
+        truncated
+        boundKind
+        nextCursor
+        available
+        enumerateVia
+      }
     }
   }
 `;
