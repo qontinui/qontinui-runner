@@ -414,20 +414,31 @@ impl PendingEdge {
     /// Past the TTL, or a held edge past its hold window: either way the
     /// next close is `to_node_unobserved`.
     fn is_stale(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.opened_at) >= PENDING_TTL
-            || self.hold.is_some_and(|h| now >= h.deadline)
+        self.ttl_expired(now) || self.hold.is_some_and(|h| now >= h.deadline)
     }
 
-    /// May this snapshot close the edge? Always, for an unheld edge.
+    fn ttl_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.opened_at) >= PENDING_TTL
+    }
+
+    /// May this snapshot close the edge? Always, for an unheld edge. A held
+    /// edge needs a snapshot TAKEN inside its window — at or after the hold
+    /// began and before its deadline — that satisfies the rule. The window is
+    /// judged by when the snapshot was taken, not when the worker got to it, so
+    /// a queue backlog never turns an observed change into `to_node_unobserved`.
     fn closes_on(&self, observed: &Observed, taken_at: Instant) -> bool {
         let Some(hold) = self.hold else {
             return true;
         };
-        if taken_at < hold.began {
+        if taken_at < hold.began || taken_at >= hold.deadline {
             return false;
         }
         match hold.rule {
             HoldRule::UntilNextSnapshot => true,
+            // With no snapshot before the action, `from_digest` is `None` and
+            // `outcome_of` never answers `no_change`: the first snapshot taken
+            // after the hold began closes it as `changed`. Nothing is known of
+            // the page the navigation left, so any page seen after it counts.
             HoldRule::UntilChanged => {
                 outcome_of(
                     &self.from_node,
@@ -549,8 +560,9 @@ impl Cursors {
         let cursor = self.map.entry(key.clone()).or_default();
         let closed = match cursor.pending.take() {
             None => None,
-            Some(p) if p.is_stale(now) => Some(p.close(key, None)),
+            Some(p) if p.ttl_expired(now) => Some(p.close(key, None)),
             Some(p) if p.closes_on(&observed, taken_at) => Some(p.close(key, Some(&observed))),
+            Some(p) if p.is_stale(now) => Some(p.close(key, None)),
             Some(held) => {
                 cursor.pending = Some(held);
                 None
@@ -1037,6 +1049,91 @@ mod tests {
             .expect("the expired hold closes");
         assert_eq!(edge.outcome, EdgeOutcome::ToNodeUnobserved);
         assert!(edge.to_node.is_none());
+    }
+
+    /// Warning 1 of the review: a snapshot TAKEN inside the window that shows
+    /// the change closes the edge as `changed`, even when the worker reaches it
+    /// after the deadline.
+    #[test]
+    fn a_change_taken_inside_the_window_closes_even_if_processed_late() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        let edge = c
+            .observe_taken(
+                &key(),
+                seen("detail", &["open"], "d2"),
+                AffordanceIndex::default(),
+                now + Duration::from_secs(4),
+                now + HOLD_WINDOW + Duration::from_secs(3),
+            )
+            .expect("closes");
+        assert_eq!(edge.outcome, EdgeOutcome::Changed);
+        // ...while a change TAKEN after the deadline does not count.
+        let mut c = Cursors::default();
+        c.observe(
+            &key(),
+            seen("home", &["idle"], "d1"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        let late = now + HOLD_WINDOW + Duration::from_secs(1);
+        let edge = c
+            .observe_taken(
+                &key(),
+                seen("detail", &["open"], "d2"),
+                AffordanceIndex::default(),
+                late,
+                late,
+            )
+            .expect("closes");
+        assert_eq!(edge.outcome, EdgeOutcome::ToNodeUnobserved);
+    }
+
+    #[test]
+    fn a_held_navigate_with_no_prior_snapshot_closes_on_the_first_snapshot_after_it() {
+        let now = t0();
+        let mut c = Cursors::default();
+        c.open_held(
+            &key(),
+            &navigate(),
+            Provenance::default(),
+            None,
+            now,
+            Some(HoldRule::UntilChanged),
+        );
+        let t = now + Duration::from_millis(100);
+        let edge = c
+            .observe_taken(
+                &key(),
+                seen("a", &["1"], "d"),
+                AffordanceIndex::default(),
+                t,
+                t,
+            )
+            .expect("no from-digest: nothing can read as no_change");
+        assert_eq!(edge.outcome, EdgeOutcome::Changed);
     }
 
     #[test]

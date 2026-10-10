@@ -550,7 +550,7 @@ fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::
     Some(serde_json::json!({
         "success": false,
         "error": format!(
-            "{code}: {route}: {what} ({detail}); the action was NOT retried on \
+            "{code}: {route}: {what} ({detail}); the request was NOT retried on \
              the runner's own UI"
         ),
         "code": code,
