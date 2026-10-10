@@ -1486,7 +1486,7 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 // read it, and `ci:node` would break all of them for zero capability gain.
 //
 // The memory tiers `mem_ge_<N>` (N in `MEMORY_TIERS_GIB`: 8..256 GiB,
-// cumulative) are the one family outside that grammar, deliberately: plan
+// cumulative) are the second exception to that grammar, after bare `ci_node`, deliberately: plan
 // `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6 fixes the
 // spelling as the wire contract `canonical_repos.ci_node_required_capabilities`
 // seeds name, and coord's `@>` containment needs no grammar. Total memory is
@@ -7867,19 +7867,15 @@ mod tests {",
         assert_eq!(MEMORY_TIERS_GIB, [8, 16, 32, 64, 128, 256]);
     }
 
-    /// The live probe path: this process can read its own memory, so the
-    /// assembled host set carries exactly the tiers its `MemTotal` meets
-    /// (agreeing with the shared resource-guard probe), and at least
-    /// `mem_ge_8` — every dev and CI host is above the 7.2 GiB line.
+    /// The live probe path: this process can read its own memory, and the
+    /// assembled host set carries exactly the tiers its `MemTotal` meets,
+    /// agreeing with the shared resource-guard probe. No particular tier is
+    /// asserted, so the test does not depend on the host's size.
     #[test]
     fn live_host_capabilities_carry_the_probed_memory_tiers() {
         let mem = crate::resource_guard::host_capacity().mem_bytes;
         assert!(mem.is_some(), "a test host must be able to read its memory");
         let expected = memory_tier_capabilities(mem);
-        assert!(
-            expected.iter().any(|c| c == "mem_ge_8"),
-            "a test host meets at least mem_ge_8, got {expected:?}"
-        );
         let caps = host_capabilities();
         let got: Vec<&String> = caps
             .iter()
