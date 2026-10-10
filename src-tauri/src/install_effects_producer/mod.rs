@@ -3212,6 +3212,7 @@ mod tests {
                 provider: Some("claude".to_string()),
                 config_dir: Some(config.clone()),
                 cwd: None,
+                resume_id: None,
             };
             record_session_open_into(&store, &req, "claude");
         };
@@ -3271,6 +3272,7 @@ mod tests {
                     provider: Some("claude".to_string()),
                     config_dir: Some(config.clone()),
                     cwd: None,
+                    resume_id: None,
                 };
                 record_session_open_into(&store, &req, "claude");
             };
@@ -3339,6 +3341,7 @@ mod tests {
                     closed_at: None,
                     close_reason: None,
                     provider: "claude".to_string(),
+                    lane: crate::session::session_lifecycle_store::SessionLane::Pty,
                     origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
                     restore_pending_at: None,
                     confirmed_at: Some(confirmed_at),
@@ -3369,6 +3372,7 @@ mod tests {
                     provider: Some("claude".to_string()),
                     config_dir: Some(config.clone()),
                     cwd: None,
+                    resume_id: None,
                 };
                 record_session_open_into(&store, &req, "claude");
             };
