@@ -6108,13 +6108,13 @@ mod tests {
         };
         // A floor guard, deliberately not claimed as more: the extraction is
         // textual, so a literal that survives elsewhere in the scanned window
-        // (an `unwrap_or("remote_terminal_error")`, say) keeps the count at 6
+        // (an `unwrap_or("remote_terminal_error")`, say) keeps the count at 8
         // even if its match arm is gone. It catches wholesale extraction
         // failure, which is what it is for.
         assert_eq!(
             known.len(),
-            7,
-            "expected 7 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
+            8,
+            "expected 8 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
              type was genuinely added or removed, update this count deliberately"
         );
 
