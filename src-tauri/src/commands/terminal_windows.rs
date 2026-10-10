@@ -742,17 +742,19 @@ pub async fn open_elevated_terminal() -> Result<(), String> {
             return Err("an elevation prompt is already open".to_string());
         }
         let output = tauri::async_runtime::spawn_blocking(|| {
-            std::process::Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    // Message to stderr as plain text: an uncaught error under
-                    // -NonInteractive is emitted as CLIXML, not a readable line.
-                    "try { Start-Process -FilePath powershell.exe -Verb RunAs -ErrorAction Stop }                      catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                // Message to stderr as plain text: an uncaught error under
+                // -NonInteractive is emitted as CLIXML, not a readable line.
+                "try { Start-Process -FilePath powershell.exe -Verb RunAs -ErrorAction Stop }                  catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }",
+            ])
+            .creation_flags(CREATE_NO_WINDOW);
+            // The wait is human-paced (the UAC prompt), so the bound is generous;
+            // it exists so an unanswered prompt cannot park this thread forever.
+            crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(300))
         })
         .await;
         IN_FLIGHT.store(false, Ordering::Release);
