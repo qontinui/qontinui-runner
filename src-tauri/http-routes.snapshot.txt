@@ -42,6 +42,7 @@ DELETE /render-log clear_render_log_handler
 DELETE /saved-api-requests/{id} delete_saved_api_request
 DELETE /scheduler/tasks/{id} delete_scheduled_task
 DELETE /security/audit/cleanup cleanup_audit_events
+DELETE /sessions/{session_id}/review/notes/{note_id} discard_note_handler
 DELETE /settings/ai/api-key/{provider} delete_ai_api_key
 DELETE /settings/playwright/password delete_playwright_password
 DELETE /settings/self-healing/api-key/{provider} delete_self_healing_api_key
@@ -427,6 +428,7 @@ GET /sessions/{id}/policy-context policy_context
 GET /sessions/{id}/touched-files get_touched_files
 GET /sessions/{id}/transcript get_transcript
 GET /sessions/{session_id}/file-changes file_changes_handler
+GET /sessions/{session_id}/review get_review_handler
 GET /sessions/{session_id}/snapshots get_snapshots_handler
 GET /settings/accessibility get_accessibility_settings
 GET /settings/agentic get_agentic_settings
@@ -968,6 +970,7 @@ MERGE security_audit::routes
 MERGE session_briefing::routes
 MERGE session_recap::routes
 MERGE session_repository::routes
+MERGE session_review::routes
 MERGE sessions::routes
 MERGE settings::routes
 MERGE shell_commands::routes
@@ -1010,6 +1013,7 @@ MERGE worktrees::routes
 MERGE ws_relay::routes
 PATCH /apps/{app_id} handle_update_app
 PATCH /canvas/panels/{panel_id} patch_panel_data
+PATCH /sessions/{session_id}/review/notes/{note_id} patch_note_handler
 POST /__debug/terminals/{id}/graceful-exit graceful_exit_handler
 POST /__debug/wedge-ui-thread wedge_ui_thread_handler
 POST /a11y/ai_context handle_ai_context
@@ -1054,6 +1058,7 @@ POST /backup/info get_backup_info_handler
 POST /bridges create_bridge
 POST /bridges/{bridge_id}/workflow run_bridge_workflow
 POST /canvas/panels create_or_update_panel
+POST /capability-manifest/provision-probe capability_manifest_provision_probe
 POST /capture-screenshot capture_screenshot_step
 POST /check-groups create_check_group_handler
 POST /check-groups/{id}/run run_check_group_handler
@@ -1261,6 +1266,9 @@ POST /sessions/{id}/message send_message
 POST /sessions/{id}/notification operator_touch_notification
 POST /sessions/{session_id}/commit-progress commit_session_progress_handler
 POST /sessions/{session_id}/promote-to-worktree promote_session_to_worktree_handler
+POST /sessions/{session_id}/review/insert insert_handler
+POST /sessions/{session_id}/review/notes create_note_handler
+POST /sessions/{session_id}/review/send send_handler
 POST /sessions/{session_id}/rewind rewind_session_handler
 POST /settings/ai/api-key save_ai_api_key
 POST /settings/ai/path-prediction save_ai_path_prediction_enabled
@@ -1769,6 +1777,7 @@ PUT /reflection/settings update_reflection_settings_handler
 PUT /saved-api-requests/{id} update_saved_api_request
 PUT /scheduler/settings update_scheduler_settings
 PUT /scheduler/tasks/{id} update_scheduled_task
+PUT /sessions/{session_id}/review/hunks mark_hunks_handler
 PUT /settings/agentic save_agentic_settings
 PUT /settings/ai save_ai_settings
 PUT /settings/api/allowed-origins save_allowed_origins_setting
