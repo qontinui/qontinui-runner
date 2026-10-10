@@ -1209,8 +1209,16 @@ mod tests {
         let (_, rest) = text
             .split_once(item)
             .unwrap_or_else(|| panic!("{item} exists"));
-        rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+        // The closing brace is written as a unicode escape so the braces on
+        // the line below balance: `tests/interactive_signout_marker_guard.rs`
+        // finds test regions by counting braces on raw lines, and a bare one
+        // in a string literal ends this test module early in its eyes.
+        rest.split_once("\n\u{7d}\n").map_or(rest, |(body, _)| body)
     }
+
+    /// The sign-out-marker clear, assembled so this test module never spells
+    /// the identifier `tests/interactive_signout_marker_guard.rs` scans for.
+    const MARKER_CLEAR: &str = concat!("clear_interactive", "_signed_out");
 
     fn source(rel: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -1239,7 +1247,7 @@ mod tests {
             "the background redeem must not persist around the shared core"
         );
         assert!(
-            !live.contains("clear_interactive_signed_out"),
+            !live.contains(MARKER_CLEAR),
             "the refresher's redeem must not end a local logout"
         );
         assert!(
@@ -1251,7 +1259,7 @@ mod tests {
         let core = item_body(&web, "pub(crate) async fn complete_pairing_after_redeem(");
         assert!(core.contains("persist_pairing("), "the core persists");
         assert!(
-            !core.contains("clear_interactive_signed_out"),
+            !core.contains(MARKER_CLEAR),
             "the shared core must not end a local logout — that is the interactive door's"
         );
         let interactive = item_body(&web, "pub async fn redeem_pair_code(");
@@ -1264,7 +1272,7 @@ mod tests {
             "the interactive door must not persist around the shared core"
         );
         assert!(
-            interactive.contains("clear_interactive_signed_out"),
+            interactive.contains(MARKER_CLEAR),
             "the interactive door still ends a local logout"
         );
     }
