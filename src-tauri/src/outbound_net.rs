@@ -46,6 +46,15 @@
 //! is not folded in; the operator's entries are kept and the profile's entries
 //! and loopback are appended. An operator `NO_PROXY=*` is left untouched.
 //!
+//! The fold-in is a STARTUP SNAPSHOT. `ProxyOverride` is read once, when the
+//! runner starts, and folded in even while `ProxyEnable` is 0 — so a VPN that
+//! turns the system proxy on later still finds the user's exemptions. An edit
+//! to `ProxyOverride` after that reaches the runner (and its children) only on
+//! the runner's next start, because the exported `NO_PROXY` is what every
+//! client reads from then on. [`convert_proxy_override`] reproduces
+//! hyper-util's own conversion at [`CONVERTER_MIRRORS_HYPER_UTIL`]; a test pins
+//! that version against Cargo.lock.
+//!
 //! # Proxies the WebSocket path cannot use
 //!
 //! Only an `http://` proxy that accepts `CONNECT` can carry a WebSocket here.
@@ -534,8 +543,10 @@ fn non_empty(env: &impl EnvAccess, key: &str) -> Option<String> {
 ///   the operator set no proxy variable of their own — an explicit operator
 ///   value always wins.
 /// - `NO_PROXY` (and its lowercase twin, which curl and so `git` read first)
-///   becomes the union of what was there, the profile's `no_proxy`, and the
-///   three loopback spellings.
+///   becomes the union of what was there — or, when the operator set none, the
+///   Windows registry bypass list (`ProxyOverride`, a startup snapshot) — the
+///   profile's `no_proxy`, and the three loopback spellings. An operator
+///   `NO_PROXY=*` is left untouched.
 pub fn apply_profile_environment(
     network: Option<&NetworkProfile>,
     profile: Option<&str>,
@@ -550,8 +561,8 @@ pub struct SystemInputs<'a> {
     /// The runner is on Windows (git's Schannel step applies only there).
     pub windows: bool,
     /// The Windows registry bypass list (`ProxyOverride`), already converted
-    /// the way `hyper-util` converts it, and only while `ProxyEnable` is on —
-    /// exactly when `hyper-util` itself would consult it.
+    /// the way `hyper-util` converts it, read once at startup whether or not
+    /// `ProxyEnable` is on (see [`registry_bypass`]).
     pub system_bypass: Option<String>,
     /// Does the machine's git config already choose `http.sslBackend` or
     /// `http.sslCAInfo`? `None` when that could not be established. Called
@@ -655,8 +666,11 @@ pub fn apply_profile_environment_with(
                 entries.push(entry.to_string());
             }
         };
-        // The registry list stands in for an operator NO_PROXY only when there
-        // is none: that is exactly when hyper-util would have read it.
+        // With no operator NO_PROXY, the registry list (a startup snapshot,
+        // read whether or not ProxyEnable is on) becomes the base, so the
+        // user's exemptions survive a system proxy switched on later. An
+        // operator NO_PROXY already overrides the registry for hyper-util, so
+        // it stays the base instead.
         let base = existing.as_deref().or(system.system_bypass.as_deref());
         for source in [base, network.and_then(|n| n.no_proxy.as_deref())] {
             for e in source.unwrap_or_default().split(',') {
@@ -723,6 +737,11 @@ pub fn apply_profile_environment_with(
     }
 }
 
+/// The hyper-util version whose WinINet `ProxyOverride` conversion
+/// [`convert_proxy_override`] reproduces; pinned against Cargo.lock by
+/// `tests::hyper_util_is_the_version_convert_proxy_override_mirrors`.
+pub const CONVERTER_MIRRORS_HYPER_UTIL: &str = "0.1.20";
+
 /// Convert a WinINet `ProxyOverride` value the way `hyper-util` does:
 /// `;`-separated → `,`-separated, every `*.` removed.
 pub fn convert_proxy_override(raw: &str) -> String {
@@ -733,9 +752,21 @@ pub fn convert_proxy_override(raw: &str) -> String {
         .replace("*.", "")
 }
 
-/// The Windows per-user registry bypass list, converted, while the system
-/// proxy is enabled (`ProxyEnable` non-zero) — the only state in which
-/// `hyper-util` consults it. `None` elsewhere.
+/// The bypass list a registry `ProxyEnable` / `ProxyOverride` pair yields,
+/// converted; `None` when there is nothing to fold in.
+///
+/// `proxy_enable` is deliberately ignored: the export is a STARTUP SNAPSHOT,
+/// and a VPN that switches the system proxy on after the runner started must
+/// still find the user's exemptions in the `NO_PROXY` it inherited (with
+/// `NO_PROXY` set, hyper-util no longer reads `ProxyOverride` itself).
+pub fn registry_bypass(_proxy_enable: u32, proxy_override: Option<&str>) -> Option<String> {
+    let converted = convert_proxy_override(proxy_override?);
+    (!converted.trim().is_empty()).then_some(converted)
+}
+
+/// The Windows per-user registry bypass list (`ProxyOverride`), converted,
+/// whether or not the system proxy is enabled right now (see
+/// [`registry_bypass`]). `None` off Windows or when the value is absent.
 pub fn windows_system_bypass() -> Option<String> {
     #[cfg(windows)]
     {
@@ -744,12 +775,8 @@ pub fn windows_system_bypass() -> Option<String> {
             .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
             .ok()?;
         let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
-        if enabled == 0 {
-            return None;
-        }
-        let raw: String = key.get_value("ProxyOverride").ok()?;
-        let converted = convert_proxy_override(&raw);
-        (!converted.trim().is_empty()).then_some(converted)
+        let raw: Option<String> = key.get_value("ProxyOverride").ok();
+        registry_bypass(enabled, raw.as_deref())
     }
     #[cfg(not(windows))]
     {
@@ -1787,6 +1814,53 @@ mod tests {
         }
     }
 
+    /// W1: the registry bypass list is folded in even while `ProxyEnable` is
+    /// 0 — the export is a startup snapshot, and a VPN that switches the
+    /// system proxy on later must still find the user's exemptions in it.
+    #[test]
+    fn the_registry_bypass_is_folded_in_even_while_the_system_proxy_is_off() {
+        assert_eq!(
+            registry_bypass(0, Some("*.intranet.example.test;<local>")).as_deref(),
+            Some("intranet.example.test,<local>")
+        );
+        assert_eq!(
+            registry_bypass(1, Some("*.intranet.example.test")).as_deref(),
+            Some("intranet.example.test")
+        );
+        assert_eq!(registry_bypass(1, None), None);
+        assert_eq!(registry_bypass(0, Some(" ")), None);
+    }
+
+    /// W2: [`convert_proxy_override`] mirrors hyper-util's WinINet conversion
+    /// AT A SPECIFIC VERSION. hyper-util 0.1.21 normalises IPv4 wildcards
+    /// (`10.*`) to CIDR, which this converter does not, so after a bump the
+    /// exported list and hyper-util's own reading of the registry would
+    /// disagree and such hosts would silently go through the proxy.
+    #[test]
+    fn hyper_util_is_the_version_convert_proxy_override_mirrors() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock"),
+        )
+        .expect("read the workspace Cargo.lock");
+        let mut versions: Vec<&str> = Vec::new();
+        let mut lines = lock.lines();
+        while let Some(line) = lines.next() {
+            if line == "name = \"hyper-util\"" {
+                if let Some(v) = lines.next().and_then(|l| l.strip_prefix("version = \"")) {
+                    versions.push(v.trim_end_matches('"'));
+                }
+            }
+        }
+        assert_eq!(
+            versions,
+            vec![CONVERTER_MIRRORS_HYPER_UTIL],
+            "hyper-util in Cargo.lock is not the version convert_proxy_override mirrors. \
+             Re-read hyper-util's client/proxy/matcher.rs `win::with_system` at the new \
+             version, update convert_proxy_override to match it exactly (0.1.21+ turns \
+             IPv4 wildcards like `10.*` into CIDR), then update CONVERTER_MIRRORS_HYPER_UTIL"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // The Windows system-proxy arm (Phase 4 step 4).
     // ---------------------------------------------------------------------
@@ -1798,6 +1872,10 @@ mod tests {
     /// It WRITES `HKCU\...\Internet Settings` (restoring it afterwards), so it
     /// runs only on a GitHub Actions runner, never on a developer's box where
     /// it would flip the user's live system proxy for its duration.
+    ///
+    /// Its parity claim (the exported list routes hosts exactly as hyper-util's
+    /// own registry reading does) covers `ProxyEnable=1` only — the one state in
+    /// which hyper-util reads the registry at all.
     #[cfg(windows)]
     #[test]
     fn windows_registry_only_proxy_is_seen_by_the_system_matcher() {
@@ -1854,53 +1932,76 @@ mod tests {
         key.set_value("ProxyEnable", &1u32).unwrap();
         key.set_value("ProxyServer", &"registry-proxy.example.test:8123")
             .unwrap();
-        key.set_value("ProxyOverride", &"*.intranet.example.test;<local>")
+        key.set_value("ProxyOverride", &"*.intranet.example.test;10.*;<local>")
             .unwrap();
 
+        // hyper-util's OWN reading of the registry (no NO_PROXY in this env).
         let system = Matcher::from_system();
         let seen = ProxyRoute::for_url(&"wss://coord.example.test/ws".parse().unwrap(), &system)
             .map(|r| r.proxy_authority());
-        let intranet_direct_system = ProxyRoute::for_url(
-            &"wss://wiki.intranet.example.test/ws".parse().unwrap(),
-            &system,
-        )
-        .is_none();
         let bypass = windows_system_bypass();
-        // H1: with an env proxy in force, the exported NO_PROXY keeps the
-        // registry bypass list, so the intranet host stays direct.
-        let mut env = MapEnv::default();
-        let n = net(Some("http://env-proxy.example.test:3128"), None);
-        let out = apply(
-            Some(&n),
-            &mut env,
-            &SystemInputs {
-                windows: true,
-                system_bypass: bypass.clone(),
-                git_tls_configured: &|| Some(true),
-            },
-        );
-        let union = Matcher::builder()
-            .https("http://env-proxy.example.test:3128")
-            .no(out.no_proxy.as_str())
-            .build();
-        let intranet_direct_union = ProxyRoute::for_url(
-            &"wss://wiki.intranet.example.test/ws".parse().unwrap(),
-            &union,
-        )
-        .is_none();
+        let hosts = [
+            "https://wiki.intranet.example.test/",
+            "https://10.1.2.3/",
+            "https://coord.example.test/",
+        ];
+        let direct = |m: &Matcher| -> Vec<bool> {
+            hosts
+                .iter()
+                .map(|h| m.intercept(&h.parse().unwrap()).is_none())
+                .collect()
+        };
+        let system_decision = direct(&system);
+
+        // The exported list must reproduce hyper-util's own decision, in both
+        // arms: env proxy in force, and system proxy only.
+        let mut arms = Vec::new();
+        for (label, proxy) in [
+            ("env proxy", Some("http://env-proxy.example.test:3128")),
+            ("system proxy only", None),
+        ] {
+            let mut env = MapEnv::default();
+            let n = net(proxy, None);
+            let out = apply(
+                Some(&n),
+                &mut env,
+                &SystemInputs {
+                    windows: true,
+                    system_bypass: bypass.clone(),
+                    git_tls_configured: &|| Some(true),
+                },
+            );
+            let via = proxy.unwrap_or("http://registry-proxy.example.test:8123");
+            let exported = Matcher::builder()
+                .http(via)
+                .https(via)
+                .no(out.no_proxy.as_str())
+                .build();
+            arms.push((label, out.no_proxy.clone(), direct(&exported)));
+        }
 
         drop(guard);
         assert_eq!(seen.as_deref(), Some("registry-proxy.example.test:8123"));
+        assert_eq!(
+            bypass.as_deref(),
+            Some("intranet.example.test,10.*,<local>")
+        );
         assert!(
-            intranet_direct_system,
+            system_decision[0],
             "the registry bypass list exempts the intranet"
         );
-        assert_eq!(bypass.as_deref(), Some("intranet.example.test,<local>"));
         assert!(
-            intranet_direct_union,
-            "an env proxy must not lose the registry bypass list: {}",
-            out.no_proxy
+            !system_decision[2],
+            "a non-exempt host goes through the system proxy"
         );
+        for (label, no_proxy, decision) in arms {
+            assert_eq!(
+                decision, system_decision,
+                "{label}: the exported NO_PROXY ({no_proxy}) must route {hosts:?} exactly as \
+                 hyper-util's own registry reading does — if they differ after a hyper-util \
+                 bump, convert_proxy_override no longer mirrors it"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
