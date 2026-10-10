@@ -124,6 +124,14 @@ the credential store itself (OS keychain or the encrypted on-disk slot under `QO
 - Owned by: lib
 - Status: reported
 
+## 16. Outbound proxy rung (HTTP and WebSocket) (`network_proxy`)
+
+whether outbound traffic goes through an HTTP proxy and which rung decided it — the operator's own `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, the active profile's `network.proxy_url` exported at startup, or none (on Windows and macOS the OS system proxy may still apply) — plus the `NO_PROXY` in force, which always exempts loopback. The proxy is shown with any credential removed
+
+- Resolved by: `outbound_net::apply_profile_environment_at_startup`
+- Owned by: lib
+- Status: reported
+
 ---
 
 A layer marked `UNKNOWN` in the report could **not be read** at the point the report was taken. It is never a default value. A layer marked `WITHHELD` holds credentials and is never printed.
