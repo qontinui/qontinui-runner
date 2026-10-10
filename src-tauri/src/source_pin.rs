@@ -33,7 +33,7 @@ use std::ops::{Deref, Range};
 /// `split_once`, indexing) works on it directly; pass `&src` where a function
 /// takes `&str`.
 #[derive(Debug, Clone)]
-pub(crate) struct ProdSource<'a> {
+pub struct ProdSource<'a> {
     text: Cow<'a, str>,
 }
 
@@ -73,7 +73,7 @@ impl<'a> ProdSource<'a> {
     /// at all. A silent fallback to the whole file is how a reformatted marker
     /// used to turn the cut into a no-op; this makes it loud instead.
     #[track_caller]
-    pub(crate) fn of(src: &'a str) -> Self {
+    pub fn of(src: &'a str) -> Self {
         match Self::try_of(src) {
             Ok(prod) => prod,
             Err(why) => panic!("ProdSource::of: {why}"),
@@ -83,7 +83,7 @@ impl<'a> ProdSource<'a> {
     /// [`ProdSource::of`] without the panic, for a caller walking files it did
     /// not choose (a directory scan meets whole-file test modules such as
     /// `foo/tests.rs`, which legitimately have no production half to cut to).
-    pub(crate) fn try_of(src: &'a str) -> Result<Self, String> {
+    pub fn try_of(src: &'a str) -> Result<Self, String> {
         let normalized = normalize(src);
         let stripped = strip_test_modules(&normalized)?;
         if let Some(line) = first_code_test_attr(stripped.as_deref().unwrap_or(&normalized)) {
@@ -107,7 +107,7 @@ impl<'a> ProdSource<'a> {
     /// `reason` must say why this pin has to read test code (e.g. a lint over
     /// every string literal in the file, tests included). CRLF is still
     /// normalized.
-    pub(crate) fn whole(src: &'a str, reason: &'static str) -> Self {
+    pub fn whole(src: &'a str, reason: &'static str) -> Self {
         assert!(
             !reason.trim().is_empty(),
             "ProdSource::whole needs a reason: say why this pin must read the test half"
@@ -123,7 +123,7 @@ impl<'a> ProdSource<'a> {
     /// This is the only spelling of a manifest-rooted self-read the meta-pin
     /// accepts. `rel` uses `/` separators (`"mcp/device_jwt_refresher.rs"`).
     #[track_caller]
-    pub(crate) fn read_own(rel: &str) -> ProdSource<'static> {
+    pub fn read_own(rel: &str) -> ProdSource<'static> {
         let text = read_src(rel);
         ProdSource::of(&text).into_owned()
     }
@@ -131,7 +131,7 @@ impl<'a> ProdSource<'a> {
     /// [`ProdSource::read_own`] of the WHOLE file — the greppable opt-out, with
     /// a reason, exactly as [`ProdSource::whole`].
     #[track_caller]
-    pub(crate) fn read_own_whole(rel: &str, reason: &'static str) -> ProdSource<'static> {
+    pub fn read_own_whole(rel: &str, reason: &'static str) -> ProdSource<'static> {
         let text = read_src(rel);
         ProdSource::whole(&text, reason).into_owned()
     }
@@ -143,7 +143,7 @@ impl<'a> ProdSource<'a> {
     }
 
     /// The text as a plain `&str`.
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.text
     }
 
@@ -154,7 +154,7 @@ impl<'a> ProdSource<'a> {
     /// warned about), and a pin that cannot tell a warning from a call site fails
     /// on the documentation that explains it. Whitespace then goes so a pin
     /// matches regardless of how `rustfmt` wrapped a call.
-    pub(crate) fn squeezed(&self) -> String {
+    pub fn squeezed(&self) -> String {
         squeeze(&self.text)
     }
 
@@ -171,7 +171,7 @@ impl<'a> ProdSource<'a> {
     ///   TWO-SIDED on purpose: occurrence 17's failure was a RUNAWAY — a
     ///   22,879-char slice — which a lower bound alone cannot see.
     #[track_caller]
-    pub(crate) fn body_of(&self, signature: &str, len: Range<usize>) -> &str {
+    pub fn body_of(&self, signature: &str, len: Range<usize>) -> &str {
         let (_, open, close) = self.locate(signature);
         let body = self
             .text
@@ -190,7 +190,7 @@ impl<'a> ProdSource<'a> {
     /// the first code `{` after it. Same exactly-once and two-sided-bound rules
     /// as [`ProdSource::body_of`], with the bound applied to the whole item.
     #[track_caller]
-    pub(crate) fn item_of(&self, signature: &str, len: Range<usize>) -> &str {
+    pub fn item_of(&self, signature: &str, len: Range<usize>) -> &str {
         let (start, _, close) = self.locate(signature);
         let item = self
             .text
@@ -251,7 +251,7 @@ impl std::fmt::Display for ProdSource<'_> {
 
 /// [`ProdSource::squeezed`] for a slice already cut from a production half
 /// (typically a [`ProdSource::body_of`] result).
-pub(crate) fn squeeze(text: &str) -> String {
+pub fn squeeze(text: &str) -> String {
     text.lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .flat_map(str::chars)
