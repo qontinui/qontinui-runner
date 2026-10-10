@@ -3409,6 +3409,16 @@ fn collect_claude_accounts_from(
 // on every compliant box (`qontinui-dev-notes/plans`), so two machines with
 // different roots compare `in_sync` on it. The absolute value stays readable
 // locally through the Phase 2 doctor and the Paths settings page.
+//
+// Its full value set, so a reader of the wire does not have to infer it:
+// a root-relative forward-slash path (`qontinui-dev-notes/plans` on a
+// compliant box); `.` when the plans dir IS the workspace root, which would
+// otherwise render as the empty string and read as `unset`; `unset` when the
+// setting is absent or blank (the markdown-plan tier is OFF); `unread` when
+// this process has no door to the setting (the one-shot CLI); and
+// `outside-workspace` when it resolves somewhere else. A setting spelled
+// relative is published normalized and verbatim — defensive only, since the
+// setting is documented as absolute.
 
 /// The bin crate's `paths.plans_dir` door, published as a FUNCTION for the
 /// same reason [`WorkspaceRootFn`] is: the setting is operator-editable and
@@ -3544,6 +3554,56 @@ fn normalize_lexical(p: &Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");
     let s = s.strip_prefix("//?/").unwrap_or(&s).to_string();
     s.trim_end_matches('/').to_string()
+}
+
+/// Fold `.` and `..` components out of a forward-slash rendering, so that a
+/// prefix test can mean "descendant". **Pure — unit-tested.**
+///
+/// [`normalize_lexical`] deliberately does no folding and `render_under` is a
+/// pure prefix test, so without this `<root>/../evil/plans` passes the prefix
+/// test and publishes as `../evil/plans`: a path OUTSIDE the workspace root
+/// wearing a root-relative spelling. Folding first answers the question the
+/// prefix test is actually being asked. It also makes `<root>/./x` and
+/// `<root>/x` ONE reading rather than two, which is what stops a `.` in one
+/// operator's setting reading as drift against a peer box that spelled the
+/// same directory plainly.
+///
+/// Purely lexical on purpose: it has to work on a path that does not exist
+/// yet, which is the ordinary new-machine shape. A LEADING run of empty
+/// components is preserved, so a UNC `//server/share` survives; an empty
+/// component anywhere else (`<root>//x`, a doubled separator) is dropped, so
+/// it folds to `<root>/x` instead of publishing as `/x` — a value that looks
+/// absolute and reads as drift against a peer that spelled it plainly.
+///
+/// `..` is folded WITHOUT consulting the filesystem, so `<root>/link/../x`
+/// reads as `<root>/x` even where the OS would resolve `..` after following
+/// `link`. That is the declared-spelling reading this section publishes, by
+/// the same choice (and with the same caveat) as [`plans_dir_relative`].
+fn fold_lexical(p: &str) -> String {
+    let mut it = p.split('/');
+    let head = it.next().unwrap_or_default();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut leading = true;
+    for c in it {
+        match c {
+            "" if leading && head.is_empty() => parts.push(""),
+            "" => {}
+            "." => leading = false,
+            ".." => {
+                leading = false;
+                parts.pop();
+            }
+            other => {
+                leading = false;
+                parts.push(other);
+            }
+        }
+    }
+    if parts.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}/{}", parts.join("/"))
+    }
 }
 
 /// Classify one harness link. **Pure over [`PathShape`] — unit-tested.**
@@ -3708,45 +3768,68 @@ fn plans_dir_relative(root: &Path, reading: &PlansDirReading) -> String {
             None
         }
     };
-    let root_lex = normalize_lexical(root);
+    let root_lex = fold_lexical(&normalize_lexical(root));
     let root_canon = std::fs::canonicalize(root)
         .ok()
         .map(|r| normalize_lexical(&r));
+
+    // THE DECLARED SPELLING FIRST, against both spellings of the root. This
+    // ordering is the whole correctness of this function, and it is the same
+    // lesson the Phase 2 doctor learned the hard way (plan §4 Phase 2
+    // "Post-land" defect 2): compare what the operator WROTE before resolving
+    // anything, because resolution answers a different question.
+    //
+    // Canonical-first published a value that MOVED while the setting stood
+    // still. `canonicalize` follows every component, so wherever any
+    // intermediate component is a link — `<root>/qontinui-dev-notes` a
+    // junction, inside the root or out of it — the reading flipped the moment
+    // somebody created the leaf directory: `qontinui-dev-notes/plans` while it
+    // did not exist (no canonical form, so the lexical arm answered), and
+    // `notes-checkout/plans` or `outside-workspace` once it did. Two boxes
+    // then differ on a key neither operator touched, which is the "drift
+    // signal rots" failure this section is built to avoid.
+    let declared = fold_lexical(&normalize_lexical(configured));
+    let by_declared = render_under(&root_lex, &declared).or_else(|| {
+        root_canon
+            .as_deref()
+            .and_then(|rc| render_under(rc, &declared))
+    });
+
     match std::fs::canonicalize(configured) {
-        // Both sides canonical: `D:` vs `C:` subst aliases and case
-        // differences cannot fake an `outside-workspace`. (When the ROOT does
-        // not canonicalise but the configured path does, the lexical root is
-        // the only spelling there is; the canonical configured path is still
-        // the right side to compare, since a lexical configured path would be
-        // the operator's own spelling of a place the root may spell otherwise.)
+        // The declared spelling did not land under the root, but the path
+        // exists — so resolve it and try again. This is the arm that stops a
+        // `subst` alias or a case difference from faking an `outside-workspace`
+        // for a path the operator spelled through a THIRD alias of the root,
+        // one that is neither the configured root nor its canonical form.
+        //
+        // When the declared and canonical renderings differ ONLY by ASCII case
+        // (a Windows setting typed `D:/Root/Qontinui-Dev-Notes/plans`), the
+        // canonical one — the case on disk — is published, so two boxes
+        // pointing at the same directory do not read as drift over how an
+        // operator capitalised it. A link, which renders a different NAME,
+        // still publishes the declared spelling. Windows only: on a
+        // case-sensitive filesystem a case-only difference is a different
+        // NAME (a link `Notes` -> `notes`), which declared-first keeps.
         Ok(c) => {
             let cfg_n = normalize_lexical(&c);
-            render_under(root_canon.as_deref().unwrap_or(&root_lex), &cfg_n)
-                .unwrap_or_else(|| PLANS_DIR_OUTSIDE.to_string())
+            let by_canonical = render_under(root_canon.as_deref().unwrap_or(&root_lex), &cfg_n);
+            match (by_declared, by_canonical) {
+                (Some(d), Some(canon)) if cfg!(windows) && d.eq_ignore_ascii_case(&canon) => canon,
+                (Some(d), _) => d,
+                (None, Some(canon)) => canon,
+                (None, None) => PLANS_DIR_OUTSIDE.to_string(),
+            }
         }
         // The configured directory does not exist (yet), so it has no
-        // canonical form. Compare it lexically against BOTH spellings of the
-        // root — the one `workspace_root()` resolved (which is what a typed
-        // setting usually copies) and the canonical one — and render it
-        // inside if either matches. The honest caveat: a not-yet-existing path spelled
-        // through a THIRD alias of the root (a `subst` drive neither the
-        // configured root nor its canonical form uses) reads
-        // `outside-workspace` here although it would resolve inside once
-        // created. Chosen over publishing `unknown` because a plans dir that
-        // does not exist is, for the scan, a dir with no plans in it either
-        // way — the reading a peer box compares against is where the operator
-        // POINTED it, and two spellings cover every way this fleet's boxes
-        // actually spell their roots.
-        Err(_) => {
-            let cfg_n = normalize_lexical(configured);
-            render_under(&root_lex, &cfg_n)
-                .or_else(|| {
-                    root_canon
-                        .as_deref()
-                        .and_then(|rc| render_under(rc, &cfg_n))
-                })
-                .unwrap_or_else(|| PLANS_DIR_OUTSIDE.to_string())
-        }
+        // canonical form and the declared spelling is all there is. The honest
+        // caveat: a not-yet-existing path spelled through a third alias of the
+        // root reads `outside-workspace` here although it would resolve inside
+        // once created. Chosen over publishing `unknown` because a plans dir
+        // that does not exist is, for the scan, a dir with no plans in it
+        // either way — the reading a peer box compares against is where the
+        // operator POINTED it, and two spellings cover every way this fleet's
+        // boxes actually spell their roots.
+        Err(_) => by_declared.unwrap_or_else(|| PLANS_DIR_OUTSIDE.to_string()),
     }
 }
 
@@ -3884,6 +3967,14 @@ fn agent_skills_installed(config_repo: &Path, home: Option<&Path>) -> bool {
 ///
 /// `None` when `<repo>/.git` is neither a dir nor a parseable gitdir file.
 fn git_hooks_dir(repo: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let (git_dir, common_dir) = git_dir_and_common_dir(repo)?;
+    git_hooks_dir_from(repo, &git_dir, &common_dir, home)
+}
+
+/// `<repo>`'s git dir and git COMMON dir, read from disk the way git does:
+/// `.git` as a directory, or a `gitdir:` file (a linked worktree) whose git
+/// dir may carry a `commondir` pointer. `None` when `<repo>/.git` is neither.
+fn git_dir_and_common_dir(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = repo.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git
@@ -3916,7 +4007,16 @@ fn git_hooks_dir(repo: &Path, home: Option<&Path>) -> Option<PathBuf> {
         }
         Err(_) => git_dir.clone(),
     };
+    Some((git_dir, common_dir))
+}
 
+/// The body of [`git_hooks_dir`] once the two git dirs are known.
+fn git_hooks_dir_from(
+    repo: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     // core.hooksPath, most specific source first.
     let mut hooks_path: Option<String> = None;
     let local_cfg = std::fs::read_to_string(common_dir.join("config")).unwrap_or_default();
@@ -4011,9 +4111,18 @@ fn git_config_bool(text: &str, section: &str, key: &str) -> bool {
 }
 
 /// The accounts installer's render: the runner's machine-global roster
-/// (`<config dir>/com.qontinui.runner/claude-accounts.json` — the same file
-/// [`collect_claude_accounts_from`] reads, through the same probe) naming at
-/// least one per-account config dir that exists on disk. The `.claude-<id>`
+/// (`<config dir>/com.qontinui.runner/claude-accounts.json` — the PRIMARY
+/// source [`collect_claude_accounts_from`] reads, through the same probe)
+/// naming at least one per-account config dir that exists on disk.
+///
+/// **Only the primary source, and that is the intended reading.** That
+/// collector also has a `settings.json` FALLBACK (accounts nested under
+/// `ai.claude_cli`); this key does not, because the roster file IS the
+/// installer's render and a box configured only through the fallback has not
+/// run the installer. So `installer_claude_accounts: absent` beside a
+/// populated `claude_accounts` section is a true reading of two different
+/// questions, not a contradiction — stated here because the two sections sit
+/// in one envelope and the disagreement is otherwise unexplained. The `.claude-<id>`
 /// dirs themselves live under the installer's accounts root (not under the
 /// runner's config dir), which is why the roster is the anchor rather than a
 /// directory enumeration.
@@ -4034,6 +4143,159 @@ fn claude_accounts_installed(config_root: Option<&Path>) -> bool {
         .claude_config_dirs
         .iter()
         .any(|d| !d.trim().is_empty() && Path::new(d).is_dir())
+}
+
+/// On-disk probe of `scripts/repo-git-hooks.json` — only the fields this
+/// collector needs. The roster is the installer's own DATA file: its control
+/// flow names no repo, so "which repos should be armed here" is this file and
+/// nothing else, and reading it keeps the capture from carrying a second copy
+/// of the list that could drift from the installer's.
+#[derive(serde::Deserialize, Default)]
+struct RepoGitHooksProbe {
+    #[serde(default)]
+    hooks: Vec<RepoGitHookRow>,
+}
+
+/// One `(repo, hook_type)` row of the roster. `repo` is a directory name
+/// under the workspace root; `hook_type` is the git hook the installer arms
+/// (`pre-push` today).
+#[derive(serde::Deserialize)]
+struct RepoGitHookRow {
+    repo: String,
+    hook_type: String,
+}
+
+/// `install-repo-git-hooks.sh`'s render: for every `(repo, hook_type)` the
+/// roster declares, a hook file at the place git would actually run it from.
+///
+/// The fourth installer with a per-machine render, and the one whose absence
+/// is least visible: the component's own manifest records that
+/// `qontinui-runner`'s pre-push cargo gate — a 60–90 s local mirror of CI's
+/// Rust gate — was, measured 2026-08-26, *"installed NOWHERE … A capability
+/// available to nobody"*. That is exactly the fleet-wide invisibility this
+/// section exists to end, and the capability doctor already carries the same
+/// question as its `installer_repo_git_hooks` row (Phase 2), so publishing it
+/// keeps the local and central readings of the harness the same shape.
+///
+/// A row is armed only on the installer's OWN reading of the file, applied
+/// here as plain file reads (section header: never shells out):
+///
+/// - the hook file carries one of the two marks the installer's classifier
+///   accepts — its shim mark ([`REPO_HOOKS_SHIM_MARK`]) or pre-commit's
+///   generated header (`generated by pre-commit` / `hook-impl`, ASCII case-
+///   insensitive). Any other file at that path is the installer's
+///   `UNMANAGED`, which its `--check` fails, so it must not read `present`;
+/// - the hooks dir sits inside the repo's git COMMON dir. A `core.hooksPath`
+///   pointing elsewhere (a global hooks dir, a tracked `.githooks`) is the
+///   installer's `SKIPPED`, also a failure;
+/// - on Unix, the file is executable — git silently ignores a hook that is not.
+///
+/// Whether an armed stage has DRIFTED from the pre-commit config stays the
+/// doctor's `--check` question and deliberately not this loop's.
+///
+/// `present` only when the roster is non-empty AND every row is armed: a
+/// partially armed roster is not armed, and an empty or unreadable roster is
+/// `absent` rather than a vacuous green — the same fail-closed rule
+/// [`agent_skills_installed`] applies to its own source enumeration.
+fn repo_git_hooks_installed(root: &Path, config_repo: &Path, home: Option<&Path>) -> bool {
+    let roster = config_repo.join("scripts").join("repo-git-hooks.json");
+    let Ok(text) = std::fs::read_to_string(&roster) else {
+        return false;
+    };
+    let probe = match serde_json::from_str::<RepoGitHooksProbe>(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            // Fail closed, but SAY so. Serde rejects the whole document when
+            // any row is malformed, so one bad row makes this key `absent`
+            // fleet-wide even where every other row is armed — and without a
+            // line here that is indistinguishable from "this box has no config
+            // repo", which is the ordinary benign reading.
+            warn!(
+                "env_agent: harness capture — {} is unparseable ({e}); reporting installer_repo_git_hooks=absent",
+                roster.display()
+            );
+            return false;
+        }
+    };
+    if probe.hooks.is_empty() {
+        return false;
+    }
+    probe.hooks.iter().all(|row| {
+        let name = row.repo.trim();
+        let hook = row.hook_type.trim();
+        // The roster declares a checkout DIRECTORY NAME under the workspace
+        // root and a git hook name. Anything with a separator, a `.`/`..`
+        // component, or an absolute spelling is not that, and joining it would
+        // silently probe somewhere else entirely — so the row fails closed
+        // instead of making the doc comment above a wish.
+        let plain = |v: &str| {
+            !v.is_empty()
+                && !v.contains('/')
+                && !v.contains('\\')
+                && !v.contains(':')
+                && v != "."
+                && v != ".."
+                && !is_absolute_any_platform(Path::new(v))
+        };
+        if !plain(name) || !plain(hook) {
+            warn!(
+                "env_agent: harness capture — {} declares a row this collector will not probe (repo={:?} hook_type={:?}); reporting installer_repo_git_hooks=absent",
+                roster.display(),
+                row.repo,
+                row.hook_type
+            );
+            return false;
+        }
+        // A repo this box has not cloned resolves no hooks dir, which reads
+        // `absent` — a stated observation, not an error.
+        repo_hook_is_armed(&root.join(name), hook, home)
+    })
+}
+
+/// `install-repo-git-hooks.sh`'s `SHIM_MARK`: the line its generated shim
+/// carries, and the first of the two marks its classifier treats as managed.
+const REPO_HOOKS_SHIM_MARK: &str = "# qontinui-repo-git-hooks managed shim";
+
+/// One roster row's verdict — see [`repo_git_hooks_installed`].
+fn repo_hook_is_armed(repo: &Path, hook: &str, home: Option<&Path>) -> bool {
+    let Some((git_dir, common_dir)) = git_dir_and_common_dir(repo) else {
+        return false;
+    };
+    let Some(hooks_dir) = git_hooks_dir_from(repo, &git_dir, &common_dir, home) else {
+        return false;
+    };
+    // Containment, compared lexically on the folded forward-slash spelling the
+    // rest of this section uses, so a `..` in a `commondir` pointer or a
+    // hooksPath cannot fake (or hide) a descendant.
+    let common = fold_lexical(&normalize_lexical(&common_dir));
+    let hooks = fold_lexical(&normalize_lexical(&hooks_dir));
+    if !hooks.starts_with(&format!("{common}/")) {
+        return false;
+    }
+    let file = hooks_dir.join(hook);
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    let managed = text.contains(REPO_HOOKS_SHIM_MARK)
+        || lower.contains("generated by pre-commit")
+        || lower.contains("hook-impl");
+    managed && hook_file_is_executable(&file)
+}
+
+/// Git runs a hook only when it is executable. Windows has no execute bit, and
+/// Git for Windows runs any file at the path, so there it is always `true`.
+#[cfg(unix)]
+fn hook_file_is_executable(file: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(file)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn hook_file_is_executable(_file: &Path) -> bool {
+    true
 }
 
 /// One workspace-root link to judge: the section key, the entry name under
@@ -4155,7 +4417,10 @@ fn collect_harness_under(
     );
     // The `_git_hooks` half of install-guard-hooks.sh: the trailer hook in the
     // hooks dir git would actually run it from (`core.hooksPath`, linked
-    // worktrees), resolved by `git_hooks_dir` without shelling out.
+    // worktrees), resolved by `git_hooks_dir` without shelling out. Scoped to
+    // the CONFIG REPO's hooks dir: that installer reaches more than one
+    // checkout, and this key answers "is the trailer hook armed where the
+    // harness lives", not "is it armed everywhere".
     put(
         &mut section,
         "installer_git_hooks",
@@ -4164,6 +4429,16 @@ fn collect_harness_under(
                 .map(|d| d.join("prepare-commit-msg").is_file())
                 .unwrap_or(false),
         ),
+    );
+
+    // `install-repo-git-hooks.sh`'s render: every `(repo, hook_type)` its
+    // roster declares, armed at the path git runs hooks from. Resolved with
+    // the same `git_hooks_dir` the key above uses, so `core.hooksPath` and a
+    // linked worktree are honoured here too.
+    put(
+        &mut section,
+        "installer_repo_git_hooks",
+        presence(repo_git_hooks_installed(root, &config_repo, home)),
     );
 
     // The runner's plans dir, root-relative.
@@ -6644,6 +6919,34 @@ dependencies = [
         }
     }
 
+    /// Restores `XDG_CONFIG_HOME` on DROP, so a failed assert cannot leave the
+    /// variable pointing at a deleted temp dir for every later test in this
+    /// process. The manual restore this replaced ran only on the happy path,
+    /// so one panic among the ~15 asserts below it leaked the override and
+    /// turned one real failure into a cascade of unrelated ones that hides it.
+    ///
+    /// The LEAK is the whole mechanism. `env_lock()` itself recovers from
+    /// poisoning (`ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())`), so a
+    /// poisoned mutex was never what propagated the failure.
+    struct XdgConfigHomeGuard(Option<std::ffi::OsString>);
+
+    impl XdgConfigHomeGuard {
+        fn set(value: &Path) -> Self {
+            let saved = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", value);
+            Self(saved)
+        }
+    }
+
+    impl Drop for XdgConfigHomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
     /// The fake home dir the harness tests hand in as `home`: under `root` so
     /// one `remove_dir_all` cleans it, named so a leaked one is findable.
     fn harness_home(root: &Path) -> PathBuf {
@@ -6672,6 +6975,16 @@ dependencies = [
         std::fs::write(cfg.join("CLAUDE.md"), "# guidelines\n").unwrap();
         std::fs::create_dir_all(cfg.join("scripts")).unwrap();
         std::fs::write(cfg.join("scripts").join("dev-start.ps1"), "param()\n").unwrap();
+        // install-repo-git-hooks.sh: the roster it reads, and the hook it
+        // arms for the one repo that roster declares today.
+        std::fs::write(
+            cfg.join("scripts").join("repo-git-hooks.json"),
+            r#"{"hooks":[{"repo":"qontinui-runner","hook_type":"pre-push"}]}"#,
+        )
+        .unwrap();
+        let runner_hooks = root.join("qontinui-runner").join(".git").join("hooks");
+        std::fs::create_dir_all(&runner_hooks).unwrap();
+        write_managed_hook(&runner_hooks.join("pre-push"));
         let skill_src = cfg.join(".agents").join("skills").join("coord");
         std::fs::create_dir_all(&skill_src).unwrap();
         std::fs::create_dir_all(root.join(HARNESS_PLANS_REPO_DIR).join("plans")).unwrap();
@@ -6701,7 +7014,14 @@ dependencies = [
     /// agree on. Every value is a string (envelope contract).
     #[test]
     fn harness_compliant_root_reads_present_and_root_relative() {
+        // This is the one harness test that hands in a `home`, so both
+        // git-hook keys reach `git_hooks_dir`'s global-config rung and read
+        // `$XDG_CONFIG_HOME`. Pin it, or a `core.hooksPath` in the HOST's
+        // global git config -- or a sibling test's override racing this one
+        // -- decides an assertion about the fake tree.
+        let _env_lock = env_lock();
         let root = harness_root("compliant");
+        let _xdg_guard = XdgConfigHomeGuard::set(&root.join("_xdg"));
         if !compliant_harness(&root) {
             eprintln!("skipping: this box cannot create symlinks or junctions");
             let _ = std::fs::remove_dir_all(&root);
@@ -6734,6 +7054,10 @@ dependencies = [
         assert_eq!(harness_value(&section, "root_settings_hooks"), "present");
         assert_eq!(harness_value(&section, "installer_agent_skills"), "present");
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
+        assert_eq!(
+            harness_value(&section, "installer_repo_git_hooks"),
+            "present"
+        );
         // No config root handed in → the roster cannot be read → absent.
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),
@@ -6766,6 +7090,10 @@ dependencies = [
         ] {
             assert_eq!(harness_value(&section, key), "absent", "{key}");
         }
+        assert_eq!(
+            harness_value(&section, "installer_repo_git_hooks"),
+            "absent"
+        );
         assert_eq!(harness_value(&section, "plans_dir_relative"), "unset");
         assert_eq!(harness_value(&section, "invariant_class"), "(a)");
         let _ = std::fs::remove_dir_all(&root);
@@ -7050,6 +7378,18 @@ dependencies = [
             "the absolute root must never be published: {rendered}"
         );
 
+        // A doubled separator in the setting reads the same as the plain
+        // spelling — never `/qontinui-dev-notes/plans`.
+        let doubled = format!(
+            "{}//{}/plans",
+            normalize_lexical(&root),
+            HARNESS_PLANS_REPO_DIR
+        );
+        assert_eq!(
+            plans_dir_relative(&root, &PlansDirReading::Read(Some(doubled))),
+            "qontinui-dev-notes/plans"
+        );
+
         // Inside, NOT existing yet: lexical comparison still renders it.
         let planned = root.join("qontinui-dev-notes").join("plans-next");
         assert_eq!(
@@ -7232,13 +7572,12 @@ dependencies = [
         // The global-config arm reads `$XDG_CONFIG_HOME/git/config`; pin it
         // under the fake home so a real one on this box cannot answer.
         let _env_lock = env_lock();
-        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let root = harness_root("hooksdir");
         let home = harness_home(&root);
         std::fs::create_dir_all(&home).unwrap();
         let xdg = home.join("xdg");
         std::fs::create_dir_all(xdg.join("git")).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let _xdg_guard = XdgConfigHomeGuard::set(&xdg);
 
         // No `.git` at all.
         let bare = root.join("not-a-repo");
@@ -7368,10 +7707,6 @@ dependencies = [
             git_hooks_dir(&linked, Some(&home)),
             Some(linked.join(".wt-hooks"))
         );
-        match saved_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7488,6 +7823,34 @@ dependencies = [
             ),
             "qontinui-dev-notes/plans-later"
         );
+        // A prefix match is NOT a descendant. `normalize_lexical` folds no
+        // `.`/`..`, so without `fold_lexical` the declared arm renders
+        // `<root>/../evil/plans` as the root-relative-looking `../evil/plans`
+        // -- a path outside the root, published as though it were inside.
+        let escaping = root.join("..").join("evil").join("plans");
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(escaping.display().to_string()))
+            ),
+            "outside-workspace",
+            "a `..` component escapes the root however it is spelled"
+        );
+        // A `.` component is the same class, but folds INSIDE rather than
+        // out: it must not survive into a published rendering, where it would
+        // read as a difference against a box whose operator spelled the same
+        // directory plainly. Note this path does not exist, so it is the
+        // declared arm answering -- folding has to work without the filesystem.
+        let dotted = root.join(".").join("qontinui-dev-notes").join("plans");
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(dotted.display().to_string()))
+            ),
+            "qontinui-dev-notes/plans",
+            "a `.` component is folded, not published"
+        );
+
         // The root itself, existing.
         assert_eq!(
             plans_dir_relative(
@@ -7496,6 +7859,387 @@ dependencies = [
             ),
             "."
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REGRESSION. The published value must not move when the SETTING did not.
+    ///
+    /// With `<root>/qontinui-dev-notes` a link onto another tree, resolving
+    /// the configured path physically leaves the workspace root, so the
+    /// canonical-only comparison called it `outside-workspace` — but only
+    /// once `plans` existed, because an absent directory has no canonical
+    /// form and fell through to the lexical arm. The same unchanged setting
+    /// therefore published `qontinui-dev-notes/plans` before someone created
+    /// the directory and `outside-workspace` after: drift with no change
+    /// behind it. Both readings must be the declared, comparable one.
+    #[test]
+    fn harness_plans_dir_relative_is_stable_across_a_linked_component() {
+        let root = harness_root("plansdir-linked");
+        let external = harness_root("plansdir-linked-ext");
+        let real_notes = external.join("real-dev-notes");
+        std::fs::create_dir_all(&real_notes).unwrap();
+
+        if !make_link(&root.join(HARNESS_PLANS_REPO_DIR), &real_notes, true) {
+            eprintln!("skipping: this box cannot create symlinks or junctions");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&external);
+            return;
+        }
+
+        // The operator's spelling — through the link, under the root.
+        let configured = root
+            .join(HARNESS_PLANS_REPO_DIR)
+            .join("plans")
+            .display()
+            .to_string();
+        let reading = PlansDirReading::Read(Some(configured));
+
+        // Before the directory exists.
+        assert_eq!(
+            plans_dir_relative(&root, &reading),
+            "qontinui-dev-notes/plans",
+            "an absent plans dir renders from the declared spelling"
+        );
+
+        // Create it THROUGH the link, so it now canonicalises outside the root.
+        std::fs::create_dir_all(real_notes.join("plans")).unwrap();
+        assert_eq!(
+            plans_dir_relative(&root, &reading),
+            "qontinui-dev-notes/plans",
+            "creating the directory must not change the published value"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&external);
+    }
+
+    /// Windows: a setting typed in a different letter case than the directory
+    /// on disk publishes the on-disk case once it exists, so two boxes pointing
+    /// at one directory do not drift over capitalisation. A not-yet-existing
+    /// path has no on-disk case, so it publishes the declared spelling.
+    #[cfg(windows)]
+    #[test]
+    fn harness_plans_dir_relative_publishes_the_on_disk_case() {
+        let root = harness_root("plansdir-case");
+        let configured = format!(
+            "{}/Qontinui-Dev-Notes/Plans",
+            normalize_lexical(&root).to_uppercase()
+        );
+        assert_eq!(
+            plans_dir_relative(&root, &PlansDirReading::Read(Some(configured.clone()))),
+            "Qontinui-Dev-Notes/Plans",
+            "not created yet: the declared spelling is all there is"
+        );
+        std::fs::create_dir_all(root.join(HARNESS_PLANS_REPO_DIR).join("plans")).unwrap();
+        assert_eq!(
+            plans_dir_relative(&root, &PlansDirReading::Read(Some(configured))),
+            "qontinui-dev-notes/plans"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fold_lexical`: `.` dropped, `..` pops, a LEADING run of empty
+    /// components preserved so a UNC path survives (any other empty component
+    /// is a doubled separator and dropped), and a pop past the root cannot
+    /// underflow.
+    #[test]
+    fn harness_fold_lexical_folds_dot_and_dotdot_only() {
+        assert_eq!(fold_lexical("C:/root/./a/b"), "C:/root/a/b");
+        assert_eq!(fold_lexical("C:/root/../evil/plans"), "C:/evil/plans");
+        assert_eq!(fold_lexical("C:/root/a/../b"), "C:/root/b");
+        assert_eq!(fold_lexical("C:/root"), "C:/root");
+        // POSIX absolute: the head is the empty string before the leading `/`.
+        assert_eq!(fold_lexical("/home/x/../y"), "/home/y");
+        // UNC: the leading empty run is preserved, or the path silently
+        // becomes a different (single-slash) one.
+        assert_eq!(fold_lexical("//server/share/a/./b"), "//server/share/a/b");
+        // Popping past the root must not underflow or panic.
+        assert_eq!(fold_lexical("C:/../../x"), "C:/x");
+        // A name that merely CONTAINS dots is not a dot component.
+        assert_eq!(fold_lexical("C:/root/..hidden/a"), "C:/root/..hidden/a");
+        assert_eq!(fold_lexical("C:/root/a.b/c"), "C:/root/a.b/c");
+        // A doubled separator is ONE separator past the leading run, so a
+        // stray `//` cannot publish a root-relative value starting with `/`.
+        assert_eq!(fold_lexical("C:/root//a"), "C:/root/a");
+        assert_eq!(fold_lexical("/home//x///y"), "/home/x/y");
+        assert_eq!(fold_lexical("//server/share//a"), "//server/share/a");
+        // After a drive letter, a doubled separator is not a UNC prefix.
+        assert_eq!(fold_lexical("C://root/x"), "C:/root/x");
+    }
+
+    /// REGRESSION, the same defect with the link target INSIDE the root.
+    ///
+    /// The external-target case above is caught by the canonical compare
+    /// failing outright. This one is not: the resolved path is still under the
+    /// root, so a canonical-first reading happily renders it -- as the link
+    /// TARGET's name. The setting still never changed, so the published value
+    /// still must not, and the answer must stay the name the operator wrote.
+    #[test]
+    fn harness_plans_dir_relative_is_stable_across_an_intra_root_link() {
+        let root = harness_root("plansdir-intralink");
+        let real_notes = root.join("notes-checkout");
+        std::fs::create_dir_all(&real_notes).unwrap();
+
+        if !make_link(&root.join(HARNESS_PLANS_REPO_DIR), &real_notes, true) {
+            eprintln!("skipping: this box cannot create symlinks or junctions");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        let configured = root
+            .join(HARNESS_PLANS_REPO_DIR)
+            .join("plans")
+            .display()
+            .to_string();
+        let reading = PlansDirReading::Read(Some(configured));
+
+        assert_eq!(
+            plans_dir_relative(&root, &reading),
+            "qontinui-dev-notes/plans",
+            "an absent plans dir renders from the declared spelling"
+        );
+
+        std::fs::create_dir_all(real_notes.join("plans")).unwrap();
+        assert_eq!(
+            plans_dir_relative(&root, &reading),
+            "qontinui-dev-notes/plans",
+            "resolving THROUGH the link must not republish the target's name"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hook file exactly as `install-repo-git-hooks.sh`'s shim arm leaves
+    /// it: carrying the shim mark, and executable.
+    fn write_managed_hook(path: &Path) {
+        std::fs::write(
+            path,
+            format!("#!/usr/bin/env bash\n{REPO_HOOKS_SHIM_MARK}\n"),
+        )
+        .unwrap();
+        set_executable(path);
+    }
+
+    fn set_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    /// `installer_repo_git_hooks`: every `(repo, hook_type)` the roster
+    /// declares must be armed — a partially armed roster is not armed, and an
+    /// empty or unreadable roster is `absent`, never a vacuous green.
+    #[test]
+    fn harness_repo_git_hooks_reads_every_roster_row() {
+        // `git_hooks_dir` consults `$XDG_CONFIG_HOME` for a global
+        // `core.hooksPath`, and a sibling test in this module points that
+        // variable at a tree that declares one. Serialise against it, or this
+        // test's "no hooksPath anywhere" premise is whatever ran last.
+        let _env_lock = env_lock();
+        let root = harness_root("repohooks");
+        let _xdg_guard = XdgConfigHomeGuard::set(&root.join("_xdg"));
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        let scripts = cfg.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let roster = scripts.join("repo-git-hooks.json");
+
+        let arm = |repo: &str, hook: &str| {
+            let hooks = root.join(repo).join(".git").join("hooks");
+            std::fs::create_dir_all(&hooks).unwrap();
+            write_managed_hook(&hooks.join(hook));
+        };
+        let home = harness_home(&root);
+        let probe = || repo_git_hooks_installed(&root, &cfg, Some(&home));
+
+        // No roster at all — nothing declared, so nothing is proven armed.
+        assert!(!probe(), "a missing roster is absent, not vacuously green");
+
+        // An empty roster is the same fail-closed reading.
+        std::fs::write(&roster, r#"{"hooks":[]}"#).unwrap();
+        assert!(!probe(), "an empty roster is absent");
+
+        // One declared row, not armed.
+        std::fs::write(
+            &roster,
+            r#"{"hooks":[{"repo":"qontinui-runner","hook_type":"pre-push","config":".pre-commit-config.yaml"}]}"#,
+        )
+        .unwrap();
+        assert!(!probe(), "a declared row with no hook file is absent");
+
+        // The repo exists but the hook does not — still absent.
+        std::fs::create_dir_all(root.join("qontinui-runner").join(".git").join("hooks")).unwrap();
+        assert!(!probe(), "a cloned repo with no hook file is absent");
+
+        // A hook file the installer did not write (hand-rolled, husky, …) is
+        // its UNMANAGED, which its --check fails — so it is not `present`.
+        let runner_hook = root
+            .join("qontinui-runner")
+            .join(".git")
+            .join("hooks")
+            .join("pre-push");
+        std::fs::write(&runner_hook, "#!/bin/sh\nexit 0\n").unwrap();
+        set_executable(&runner_hook);
+        assert!(!probe(), "an unmanaged hook file is not armed");
+
+        // pre-commit's generated hook is the installer's other managed mark.
+        std::fs::write(
+            &runner_hook,
+            "#!/usr/bin/env bash\n# File generated by pre-commit: https://pre-commit.com\n",
+        )
+        .unwrap();
+        set_executable(&runner_hook);
+        assert!(probe(), "a pre-commit-generated hook is armed");
+
+        // Armed by the shim.
+        arm("qontinui-runner", "pre-push");
+        assert!(probe(), "the one declared row is armed");
+
+        // Git ignores a hook that is not executable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runner_hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!probe(), "a non-executable hook is not armed");
+            set_executable(&runner_hook);
+        }
+
+        // A core.hooksPath pointing OUTSIDE the repo's git dir is the
+        // installer's SKIPPED, even when a managed hook sits there.
+        let outside = root.join("_shared_hooks");
+        std::fs::create_dir_all(&outside).unwrap();
+        write_managed_hook(&outside.join("pre-push"));
+        let local_cfg = root.join("qontinui-runner").join(".git").join("config");
+        std::fs::write(
+            &local_cfg,
+            format!("[core]\n\thooksPath = {}\n", normalize_lexical(&outside)),
+        )
+        .unwrap();
+        assert!(
+            !probe(),
+            "a hooks dir outside the git common dir is not armed"
+        );
+        std::fs::remove_file(&local_cfg).unwrap();
+        assert!(probe(), "back to the armed reading once hooksPath is gone");
+
+        // Rows this collector refuses to join — each one fails closed.
+        for bad in [
+            r#"{"hooks":[{"repo":"../x","hook_type":"pre-push"}]}"#,
+            r#"{"hooks":[{"repo":"/abs","hook_type":"pre-push"}]}"#,
+            r#"{"hooks":[{"repo":"a/b","hook_type":"pre-push"}]}"#,
+            r#"{"hooks":[{"repo":"","hook_type":"pre-push"}]}"#,
+            r#"{"hooks":[{"repo":"C:foo","hook_type":"pre-push"}]}"#,
+            r#"{"hooks":[{"repo":"qontinui-runner","hook_type":".."}]}"#,
+            r#"{"hooks":[{"repo":"qontinui-runner"}]}"#,
+        ] {
+            std::fs::write(&roster, bad).unwrap();
+            assert!(!probe(), "a refused or malformed row is absent: {bad}");
+        }
+        std::fs::write(
+            &roster,
+            r#"{"hooks":[{"repo":"qontinui-runner","hook_type":"pre-push"}]}"#,
+        )
+        .unwrap();
+        assert!(probe(), "the valid roster reads armed again");
+
+        // A roster row whose checkout is a LINKED WORKTREE: its hook lives in
+        // the primary's common dir, reached through `gitdir:` + `commondir`.
+        let main_git = root.join("_primary").join(".git");
+        let wt_git = main_git.join("worktrees").join("x");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(main_git.join("hooks")).unwrap();
+        let linked = root.join("qontinui-linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", normalize_lexical(&wt_git)),
+        )
+        .unwrap();
+        std::fs::write(
+            &roster,
+            r#"{"hooks":[{"repo":"qontinui-linked","hook_type":"pre-push"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !probe(),
+            "a linked worktree with no hook in the common dir is absent"
+        );
+        write_managed_hook(&main_git.join("hooks").join("pre-push"));
+        assert!(probe(), "a linked worktree is armed through the common dir");
+
+        // A SECOND declared row that is not armed takes the whole key down:
+        // "armed" must mean the roster, not the first row of it.
+        std::fs::write(
+            &roster,
+            r#"{"hooks":[{"repo":"qontinui-runner","hook_type":"pre-push"},{"repo":"qontinui-coord","hook_type":"pre-push"}]}"#,
+        )
+        .unwrap();
+        assert!(!probe(), "one armed row of two is not armed");
+
+        arm("qontinui-coord", "pre-push");
+        assert!(probe(), "both rows armed");
+
+        // Corrupt roster: fail closed rather than guessing.
+        std::fs::write(&roster, "{not json").unwrap();
+        assert!(!probe(), "an unparseable roster is absent");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `config_root` parameter is WIRED: `installer_claude_accounts`
+    /// reads `present` through the collector when the roster is really there.
+    /// Every other harness test hands in `None`, so without this one that
+    /// argument's path through `collect_harness_under` is never exercised.
+    #[test]
+    fn harness_installer_claude_accounts_present_through_the_collector() {
+        let root = harness_root("accounts-wired");
+        let config_root = root.join("_config");
+        let runner_dir = config_root.join("com.qontinui.runner");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let account_dir = root.join(".claude-work");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(
+            runner_dir.join("claude-accounts.json"),
+            serde_json::json!({
+                "claude_config_dirs": [account_dir.display().to_string()],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            Some(&config_root),
+            None,
+        );
+        assert_eq!(
+            harness_value(&section, "installer_claude_accounts"),
+            "present"
+        );
+
+        // And it is the ROSTER that decides: a roster naming only a directory
+        // that does not exist reads `absent` through the same wiring.
+        std::fs::write(
+            runner_dir.join("claude-accounts.json"),
+            r#"{"claude_config_dirs":["/nope/does-not-exist"]}"#,
+        )
+        .unwrap();
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            Some(&config_root),
+            None,
+        );
+        assert_eq!(
+            harness_value(&section, "installer_claude_accounts"),
+            "absent"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
