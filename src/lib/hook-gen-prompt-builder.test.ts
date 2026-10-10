@@ -203,6 +203,7 @@ describe("buildHookGenPrompt — route patterns never come from the pathname", (
     expect(prompt).toContain("<RouteUnmatchedContext.Provider value={unmatched}>");
     expect(prompt).toContain("{ unmatched },");
     expect(prompt).toContain("app/not-found.tsx");
+    expect(prompt).toMatch(/\/\/ app\/RouteAwareness\.tsx[^\n]*\n'use client';\n/);
     expect(prompt).toContain("useMarkRouteUnmatched();");
   });
 

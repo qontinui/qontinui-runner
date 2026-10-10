@@ -38,7 +38,7 @@
 //!   `budget_exhausted`, …) are kept.
 //!
 //! The MARKER is a row in the database itself (`project.settings`, key
-//! [`TEMPLATE_SCRUB_VERSION`], value = the cutoff), claimed in the SAME
+//! [`TEMPLATE_SCRUB_VERSION`], value = the cutoff as a JSON string), claimed in the SAME
 //! transaction as the scrub, so it can never exist without its scrub and needs
 //! no database identity. Only the owning instance scrubs and claims it: a temp
 //! runner on this build must not mark a shared database while a pre-D1
@@ -46,6 +46,13 @@
 //! start on this build is what scrubs. The marker is what keeps a later start
 //! from withdrawing rows a router-asserting build wrote legitimately; the
 //! cutoff bounds the one run to rows older than the scrubbing process.
+//!
+//! The remaining limit, stated: once the owner has claimed the marker, a
+//! pre-D1 writer still sharing the database — an older-build secondary, or a
+//! last-known-good binary the supervisor falls back to — can still write
+//! leaked rows, and nothing scrubs them; the marker says the scrub ran, not
+//! that no old build is left. Rebuilding every runner that shares the
+//! database is what closes it.
 //! It runs on whatever database the runner's `PgDb` is — the embedded cluster
 //! or `DATABASE_URL` alike.
 
@@ -90,7 +97,9 @@ pub(crate) const TEMPLATE_SCRUB_REASON: &str = "pathnameTemplate was stored with
      redacted; plan 2026-10-09-journey-ledger-stores-a-concrete-url-path-as-a-route-pattern";
 
 /// Claim the marker row INSIDE the scrub's transaction: `$1` the version key,
-/// `$2` the cutoff (stored as the value, so the record says what was covered).
+/// `$2` the cutoff, stored as a JSON string ([`scrub_marker_value`]): every
+/// `project.settings` value is JSON, and `get_all_settings` skips (and the
+/// settings export nulls) a row that is not.
 /// `ON CONFLICT DO NOTHING ... RETURNING`: zero rows back means another process
 /// already claimed it, and the scrub rolls back without touching a row.
 /// `project.settings` is the runner's existing key/value table
@@ -100,6 +109,17 @@ pub(crate) const SCRUB_CLAIM_MARKER_SQL: &str = r#"INSERT INTO project.settings 
 VALUES ($1, $2, now())
 ON CONFLICT (key) DO NOTHING
 RETURNING key"#;
+
+/// The marker's `project.settings` value: the cutoff as a JSON string.
+pub(crate) fn scrub_marker_value(cutoff: &str) -> String {
+    serde_json::Value::String(cutoff.to_string()).to_string()
+}
+
+/// The cutoff a marker value records: its JSON string, or the raw text when
+/// the value is not one (never treated as "no marker").
+pub(crate) fn scrub_marker_cutoff(value: &str) -> String {
+    serde_json::from_str::<String>(value).unwrap_or_else(|_| value.to_string())
+}
 
 /// Is the marker store present, and is the marker already in it?
 pub(crate) const SCRUB_MARKER_STORE_SQL: &str =
@@ -162,7 +182,10 @@ pub(crate) async fn run_scrub_statements(
     let err = |e: tokio_postgres::Error| crate::database::pg::pg_err("journey template scrub", &e);
     let tx = conn.transaction().await.map_err(err)?;
     let claimed = tx
-        .query(SCRUB_CLAIM_MARKER_SQL, &[&TEMPLATE_SCRUB_VERSION, &cutoff])
+        .query(
+            SCRUB_CLAIM_MARKER_SQL,
+            &[&TEMPLATE_SCRUB_VERSION, &scrub_marker_value(cutoff)],
+        )
         .await
         .map_err(err)?;
     if claimed.is_empty() {
@@ -320,7 +343,10 @@ async fn observe_for_scrub(conn: &deadpool_postgres::Object, owns: bool) -> Scru
     obs.marker = Some(
         conn.query_opt(SCRUB_MARKER_READ_SQL, &[&TEMPLATE_SCRUB_VERSION])
             .await
-            .map(|row| row.and_then(|r| r.try_get::<_, String>(0).ok()))
+            .map(|row| {
+                row.and_then(|r| r.try_get::<_, String>(0).ok())
+                    .map(|v| scrub_marker_cutoff(&v))
+            })
             .map_err(|e| crate::database::pg::pg_err("scrub marker", &e)),
     );
     obs
@@ -598,6 +624,15 @@ mod tests {
     }
 
     #[test]
+    fn the_marker_value_is_json_like_every_settings_value() {
+        let v = scrub_marker_value("2026-10-10T00:00:00.000000Z");
+        assert_eq!(v, "\"2026-10-10T00:00:00.000000Z\"");
+        assert!(serde_json::from_str::<serde_json::Value>(&v).is_ok());
+        assert_eq!(scrub_marker_cutoff(&v), "2026-10-10T00:00:00.000000Z");
+        assert_eq!(scrub_marker_cutoff("not-json"), "not-json");
+    }
+
+    #[test]
     fn the_marker_is_claimed_in_the_database_without_overwriting() {
         assert!(SCRUB_CLAIM_MARKER_SQL.starts_with("INSERT INTO project.settings"));
         assert!(SCRUB_CLAIM_MARKER_SQL.contains("ON CONFLICT (key) DO NOTHING"));
@@ -851,9 +886,11 @@ mod tests {
             .unwrap()
             .map(|r| r.get(0));
         assert_eq!(
-            marker.as_deref(),
-            Some(cutoff.as_str()),
-            "the marker is claimed"
+            marker
+                .as_deref()
+                .map(|v| serde_json::from_str::<String>(v).unwrap()),
+            Some(cutoff.clone()),
+            "the marker is claimed, its value a JSON string"
         );
         let second = run_scrub_statements(&mut conn, &cutoff)
             .await

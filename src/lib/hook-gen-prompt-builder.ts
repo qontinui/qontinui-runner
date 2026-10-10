@@ -246,7 +246,8 @@ const NEXTJS_GUIDANCE = `
 For route awareness, mount ONE component in the root layout, and mark the
 not-found page:
 \`\`\`tsx
-// app/RouteAwareness.tsx — 'use client', mounted once, in the root layout
+// app/RouteAwareness.tsx — mounted once, in the root layout
+'use client';
 import { usePathname, useParams, useSearchParams } from 'next/navigation';
 import {
   RouteUnmatchedContext,
@@ -419,7 +420,7 @@ is user input, not a pattern. Do NOT import \`@qontinui/ui-bridge/react\` in a
 React Native app: it is the DOM barrel, and \`@qontinui/ui-bridge\` is only an
 optional peer of \`@qontinui/ui-bridge-native\`. Before generating this call,
 check that the installed \`@qontinui/ui-bridge-native\` actually exports
-\`useRouteAwareness\` (0.6.12 does not); if it does not, skip route awareness
+\`useRouteAwareness\` (the current ui-bridge-native, 0.6.15, does not); if it does not, skip route awareness
 and say so rather than importing it from elsewhere.
 
 For page context, map Expo Router file-based routes to semantic names:
@@ -644,7 +645,7 @@ is user input, not a pattern. Do NOT import \`@qontinui/ui-bridge/react\` in a
 React Native app: it is the DOM barrel, and \`@qontinui/ui-bridge\` is only an
 optional peer of \`@qontinui/ui-bridge-native\`. Before generating this call,
 check that the installed \`@qontinui/ui-bridge-native\` actually exports
-\`useRouteAwareness\` (0.6.12 does not); if it does not, skip route awareness
+\`useRouteAwareness\` (the current ui-bridge-native, 0.6.15, does not); if it does not, skip route awareness
 and say so rather than importing it from elsewhere.
 
 **Do NOT use** \`useLocation()\` (that's react-router-dom) or

@@ -52,6 +52,15 @@ pub(crate) const PENDING_TTL: Duration = Duration::from_secs(120);
 /// `to_node_unobserved` (D4).
 pub(crate) const HOLD_WINDOW: Duration = Duration::from_secs(5);
 
+/// How long after a hold's deadline the worker's TIMER waits before it closes
+/// the edge as `to_node_unobserved`. A snapshot requested inside the window can
+/// answer after the deadline — at most the SDK dispatch timeout later (the
+/// relay's `DEFAULT_COMMAND_TIMEOUT`, and the HTTP dispatch's own 30 s
+/// `HTTP_DISPATCH_TIMEOUT` in `mcp/app_dispatch.rs`) — so the timer must not
+/// close the edge before such a snapshot can still arrive. Inside the grace a
+/// snapshot decides by when it was TAKEN ([`Cursors::observe_taken`]).
+pub(crate) const HOLD_GRACE: Duration = crate::mcp::command_relay::DEFAULT_COMMAND_TIMEOUT;
+
 /// How a held edge decides which snapshot closes it (D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HoldRule {
@@ -417,6 +426,13 @@ impl PendingEdge {
         self.ttl_expired(now) || self.hold.is_some_and(|h| now >= h.deadline)
     }
 
+    /// May the TIMER close it? Past the TTL, or a hold past its deadline PLUS
+    /// [`HOLD_GRACE`] — a snapshot taken inside the window may still be in
+    /// flight until then.
+    fn sweepable(&self, now: Instant) -> bool {
+        self.ttl_expired(now) || self.hold.is_some_and(|h| now >= h.deadline + HOLD_GRACE)
+    }
+
     fn ttl_expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.opened_at) >= PENDING_TTL
     }
@@ -573,22 +589,23 @@ impl Cursors {
         closed
     }
 
-    /// The earliest hold deadline among open edges, so the worker can close
-    /// an expired hold on time rather than at the next hourly sweep.
+    /// When the worker's timer should next wake: the earliest hold deadline
+    /// plus [`HOLD_GRACE`], so an expired hold closes without waiting for the
+    /// hourly sweep, but never before an in-window snapshot could land.
     pub(crate) fn next_hold_deadline(&self) -> Option<Instant> {
         self.map
             .values()
             .filter_map(|c| c.pending.as_ref().and_then(|p| p.hold))
-            .map(|h| h.deadline)
+            .map(|h| h.deadline + HOLD_GRACE)
             .min()
     }
 
-    /// Close every pending edge older than [`PENDING_TTL`] (or past its hold
-    /// window) as unobserved.
+    /// Close every pending edge older than [`PENDING_TTL`], or held past its
+    /// deadline plus [`HOLD_GRACE`], as unobserved.
     pub(crate) fn sweep(&mut self, now: Instant) -> Vec<EdgeDraft> {
         let mut drafts = Vec::new();
         for (key, cursor) in &mut self.map {
-            if cursor.pending.as_ref().is_some_and(|p| p.is_stale(now)) {
+            if cursor.pending.as_ref().is_some_and(|p| p.sweepable(now)) {
                 if let Some(p) = cursor.pending.take() {
                     drafts.push(p.close(key, None));
                 }
@@ -1036,7 +1053,7 @@ mod tests {
             "an unchanged snapshot inside the window does not close a held navigate"
         );
         assert_eq!(c.pending_count(), 1);
-        assert_eq!(c.next_hold_deadline(), Some(now + HOLD_WINDOW));
+        assert_eq!(c.next_hold_deadline(), Some(now + HOLD_WINDOW + HOLD_GRACE));
         let late = now + HOLD_WINDOW;
         let edge = c
             .observe_taken(
@@ -1137,6 +1154,11 @@ mod tests {
     }
 
     #[test]
+    fn the_grace_covers_the_sdk_snapshot_timeout() {
+        assert!(HOLD_GRACE >= Duration::from_secs(30));
+    }
+
+    #[test]
     fn an_expired_hold_is_swept_as_unobserved() {
         let now = t0();
         let mut c = Cursors::default();
@@ -1149,7 +1171,11 @@ mod tests {
             Some(HoldRule::UntilChanged),
         );
         assert!(c.sweep(now + Duration::from_secs(1)).is_empty());
-        let swept = c.sweep(now + HOLD_WINDOW);
+        assert!(
+            c.sweep(now + HOLD_WINDOW).is_empty(),
+            "the timer waits out the grace: an in-window snapshot may still be in flight"
+        );
+        let swept = c.sweep(now + HOLD_WINDOW + HOLD_GRACE);
         assert_eq!(swept.len(), 1);
         assert_eq!(swept[0].outcome, EdgeOutcome::ToNodeUnobserved);
         assert_eq!(c.next_hold_deadline(), None);
