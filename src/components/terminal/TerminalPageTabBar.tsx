@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
+import { Plus, X, Shuffle, SquareArrowOutUpRight, BrushCleaning } from "lucide-react";
 import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
 
 /**
@@ -23,6 +23,8 @@ interface TerminalPageTabBarProps {
    */
   onReorderPage?: (sourceId: string, targetId: string | null) => void;
   onReorganize?: () => void;
+  /** Close every page that hosts no terminals. Resolves to how many were closed. */
+  onCloseEmptyPages?: () => Promise<number>;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
   /** Detach an entire page (all its terminals + layout) into its own window. */
@@ -43,6 +45,7 @@ export function TerminalPageTabBar({
   onRenamePage,
   onReorderPage,
   onReorganize,
+  onCloseEmptyPages,
   onPopOut,
   onPopOutPage,
   isPinned,
@@ -50,6 +53,22 @@ export function TerminalPageTabBar({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const [closingEmpty, setClosingEmpty] = useState(false);
+  const [closeEmptyNote, setCloseEmptyNote] = useState<string | null>(null);
+
+  const handleCloseEmpty = async () => {
+    if (!onCloseEmptyPages || closingEmpty) return;
+    setClosingEmpty(true);
+    try {
+      const n = await onCloseEmptyPages();
+      setCloseEmptyNote(n > 0 ? `Closed ${n} empty` : "No empty tabs");
+    } catch {
+      setCloseEmptyNote("Couldn't close empty tabs");
+    } finally {
+      setClosingEmpty(false);
+      setTimeout(() => setCloseEmptyNote(null), 3000);
+    }
+  };
 
   // Drag-to-reorder state: the tab currently being dragged, and the tab it's
   // currently hovering over (drop target). Both are cleared on drop/dragend
@@ -279,6 +298,22 @@ export function TerminalPageTabBar({
         >
           <Shuffle className="w-3 h-3" />
         </button>
+      )}
+      {pages.length >= 2 && onCloseEmptyPages && (
+        <button
+          onClick={() => void handleCloseEmpty()}
+          disabled={closingEmpty}
+          aria-label="Close empty tabs"
+          className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50"
+          title="Close empty tabs (tabs that have no terminals open)"
+        >
+          <BrushCleaning className="w-3 h-3" />
+        </button>
+      )}
+      {closeEmptyNote && (
+        <span role="status" className="text-[10px] text-[#565f89] px-1">
+          {closeEmptyNote}
+        </span>
       )}
       {onPopOut && (
         <button
