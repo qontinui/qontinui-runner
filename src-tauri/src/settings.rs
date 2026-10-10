@@ -3687,10 +3687,14 @@ pub struct Settings {
     /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D7). The
     /// default keeps each spawn site's bypass flag. `allow_list` replaces it
     /// with a pre-approved tool list, for machines whose IT-managed Claude Code
-    /// settings disable bypass mode. Read per spawn into
-    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`], so
-    /// every `LaunchSpec` spawn site honours it, and by the scheduler's
-    /// RemoteAgent launch.
+    /// settings disable bypass mode. Read per spawn: into
+    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`] (every
+    /// `LaunchSpec` spawn site, the typed resume renderer
+    /// `commands::config::build_ai_resume_command`, and the provider-adapter
+    /// launch spec), by the scheduler's RemoteAgent launch (intersected with the
+    /// task's tools), and by the orchestration fix agent. Settings layers the
+    /// runner does not own (a repository's `.claude/settings.json`, managed
+    /// settings) can still pre-approve more tools.
     #[serde(default)]
     pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
 }
@@ -6338,6 +6342,10 @@ pub fn save_model_gateway(
     normalized.validate()?;
     let stored = normalized.clone();
     update_settings(move |settings| settings.model_gateway = normalized)?;
+    // The sticky marker (written for a gateway, deleted for an explicit clear)
+    // is what lets a later settings reset read as UNKNOWN rather than "no
+    // gateway" — see `model_gateway` "Fail closed".
+    crate::model_gateway::record_saved_declaration(&stored)?;
     Ok(stored)
 }
 

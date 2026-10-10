@@ -407,7 +407,10 @@ async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
 
     let ai_settings = settings::get_ai_settings();
 
+    let refusal = crate::model_gateway::provider_refusal(&ai_settings.provider);
     let result = match ai_settings.provider {
+        // Review M5: refused while a model gateway is declared.
+        _ if refusal.is_some() => Err(refusal.unwrap_or_default()),
         AiProvider::ClaudeCli => test_claude_cli_connection(&ai_settings.claude_cli).await,
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
         AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,

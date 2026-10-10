@@ -31,7 +31,6 @@ import {
   probeClaudeInPane,
 } from "./resumeVerification";
 import { claudeDescriptor } from "./providerAdapter";
-import { buildResumeCmd } from "./useTerminalInitialization";
 import { TERMINAL_EXITED, TERMINAL_WRITE_FAILED } from "./terminalWriteResult";
 
 const CLAUDE_UI =
@@ -99,7 +98,11 @@ describe("lastOscTitle", () => {
 const V2_SESSION_ID = "230feb99-2dd7-42d7-92bc-6d36c1883089";
 // The exact line the restore types (env thresholds included), echoed by the
 // shell and repeated in the shell-integration OSC 633;E mark.
-const V2_TYPED = buildResumeCmd(V2_SESSION_ID, "/home/user/.claude", "full").replace(/\r$/, "");
+// What the backend renderer (`render_ai_resume_command`) types under the
+// default full-resume policy for a non-gateway install.
+const V2_TYPED =
+  'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999" CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999" ' +
+  `CLAUDE_CONFIG_DIR="/home/user/.claude" claude --permission-mode bypassPermissions --resume ${V2_SESSION_ID}`;
 const V2_SHELL_ECHO =
   "\x1b]633;A\x07\x1b]0;user@host: ~/repo\x07\x1b[01;32muser@host\x1b[00m:\x1b[01;34m~/repo\x1b[00m$ \x1b]633;B\x07" +
   `${V2_TYPED}\r\n` +

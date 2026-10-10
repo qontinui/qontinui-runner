@@ -363,11 +363,19 @@ describe("runVerifiedResume", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     // The pane probe reads a plain shell (no claude), so the typing paths run.
-    mockInvoke.mockImplementation(async (cmd: string) =>
-      cmd === "terminal_probe_claude"
-        ? { success: true, message: null, data: { state: "absent", sessionIds: [] } }
-        : { success: true, message: null, data: null },
-    );
+    mockInvoke.mockImplementation(async (cmd: string, args?: { sessionId?: string }) => {
+      if (cmd === "terminal_probe_claude")
+        return { success: true, message: null, data: { state: "absent", sessionIds: [] } };
+      if (cmd === "build_ai_resume_command")
+        return {
+          success: true,
+          message: null,
+          data: {
+            command: `claude --permission-mode bypassPermissions --resume ${args?.sessionId}`,
+          },
+        };
+      return { success: true, message: null, data: null };
+    });
   });
 
   it("a claude that is NOT provably this session → types nothing, parks resumeFailed, no re-assert, marker kept", async () => {
@@ -599,54 +607,71 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
   });
 });
 
-// #548 item 3 — the typed resume must suppress the CLI's "Resume from
-// summary?" picker under the default full-resume policy (env thresholds; no
-// CLI flag / settings key short of the global "Don't ask again" exists), and
-// must leave it answerable under the opt-in summary policy.
-describe("buildResumeCmd (resume-size picker policy)", () => {
-  it("default 'full' policy raises both resume thresholds so the picker never shows", () => {
-    const cmd = buildResumeCmd("sess-1", undefined, "full");
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999"');
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999"');
-    expect(cmd).toContain("--resume sess-1\r");
+// The Claude resume is RENDERED BY THE BACKEND (review H1): the config dir and
+// permission posture are its decisions. The CLI-shape assertions (#548 item 3
+// thresholds, the bypass/allow-list flag, the gateway dir) live with the Rust
+// renderer `commands::config::render_ai_resume_command`; these pin the
+// frontend half — what is asked for, and that nothing is typed on a refusal.
+describe("buildResumeCmd (backend-rendered resume)", () => {
+  beforeEach(() => mockInvoke.mockReset());
+
+  it("asks the backend with the recorded dir and the full-resume policy, then appends Enter", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { command: "RENDERED" },
+    });
+    const cmd = await buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
+    expect(cmd).toBe("RENDERED\r");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      configDir: "C:/claude/.claude-hotmail",
+      isWindows: false,
+      fullResume: true,
+    });
   });
 
-  it("'summary' policy leaves the thresholds alone (picker shows; the loop answers it)", () => {
-    const cmd = buildResumeCmd("sess-1", undefined, "summary");
-    expect(cmd).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
-    expect(cmd).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  it("'summary' policy asks for no threshold env; an unbound dir is sent as null", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "X" } });
+    await buildResumeCmd("sess-1", undefined, "summary");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+    });
   });
 
-  it("keeps the CLAUDE_CONFIG_DIR prefix alongside the threshold vars", () => {
-    const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
-    expect(cmd).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-hotmail"');
-    expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
-    expect(cmd).toContain("--resume sess-1\r");
+  it("a backend refusal rejects — the caller types nothing", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: false,
+      message: "model gateway unresolved",
+      data: null,
+    });
+    await expect(buildResumeCmd("sess-1", undefined, "full")).rejects.toThrow(
+      "model gateway unresolved",
+    );
   });
 
-  it("resumes autonomously — bypassPermissions so an unattended restore never stalls on a permission prompt (#547 union)", () => {
-    for (const policy of ["full", "summary"] as const) {
-      expect(buildResumeCmd("abc-123", undefined, policy)).toContain(
-        "claude --permission-mode bypassPermissions --resume abc-123",
-      );
-    }
-  });
-
-  // G2 (Phase 1 configDir capture): now that every capture path persists a
-  // non-null configDir, the resume must emit the CLAUDE_CONFIG_DIR prefix
-  // whenever an account is bound, and NONE when it isn't — isolated here from
-  // the threshold vars via the 'summary' policy so the config-dir branch alone
-  // is asserted.
-  it("emits the CLAUDE_CONFIG_DIR prefix iff an account dir is bound (config-dir branch, no thresholds)", () => {
-    const bound = buildResumeCmd("sess-1", "C:/claude/.claude-qontinui", "summary");
-    expect(bound).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-qontinui"');
-    expect(bound).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
-    expect(bound).toContain("--resume sess-1\r");
-
-    // No account bound ⇒ no prefix at all (bare command).
-    const unbound = buildResumeCmd("sess-1", undefined, "summary");
-    expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  it("runVerifiedResume types nothing and parks the tab when the backend refuses to render", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "build_ai_resume_command"
+        ? { success: false, message: "refused", data: null }
+        : { success: true, message: null, data: null },
+    );
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: new Map([
+        ["tab-1", { current: { writeToTerminal: (t: string) => void writes.push(t) } }],
+      ]) as never,
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", { isReconnecting: false, resumeFailed: true });
   });
 });
 

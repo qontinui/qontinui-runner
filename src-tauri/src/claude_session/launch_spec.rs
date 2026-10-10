@@ -55,10 +55,15 @@ pub enum PermissionMode {
     /// machines whose IT-managed Claude Code settings disable bypass mode.
     ///
     /// `dontAsk` is Claude Code's no-prompt mode at the same privilege level as
-    /// `default`: a pre-approved tool runs, anything else is denied instead of
-    /// raising a prompt nobody is there to answer. So an autonomous session never
-    /// stalls, and it can do only what the list allows. An empty list renders no
-    /// `--allowedTools`, which leaves the session read-only in effect.
+    /// `default`: a tool something has pre-approved runs, anything else is
+    /// refused instead of raising a prompt nobody is there to answer. What THIS
+    /// renderer guarantees is narrower than "only these tools": the runner never
+    /// widens the list — a template's own tool list, settings file, prompt tool
+    /// and MCP config are dropped, and a caller's `--allowedTools` is
+    /// intersected with it. Settings layers the runner does not control (a
+    /// repository's `.claude/settings.json`, managed settings) can still
+    /// pre-approve more tools; govern those to bound a session fully. An empty
+    /// list renders no `--allowedTools`, so the runner pre-approves nothing.
     AllowList { tools: Vec<String> },
 }
 
@@ -359,8 +364,21 @@ pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String
 /// flags are joined onto a bare `claude` head and prefixed with the
 /// `CLAUDE_CONFIG_DIR` assignment (omitted when `config_dir` is `None`).
 pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: bool) -> String {
+    // An opaque alias applies no permission flag the runner can see, so under
+    // an allow-list posture it is refused (review M1): the composed command,
+    // which carries the allow-list, is typed instead.
+    let allow_list = matches!(
+        cfg.session_permission.apply(spec.permission.clone()),
+        PermissionMode::AllowList { .. }
+    );
     if let Some(alias) = pty_verbatim_alias(cfg) {
-        return alias;
+        if !allow_list {
+            return alias;
+        }
+        tracing::warn!(
+            "account launch alias ignored: an allow-list permission posture cannot be applied \
+             through an opaque alias"
+        );
     }
 
     let flags = compose_flags(spec, cfg);
@@ -390,7 +408,18 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     // 1. Permission — caller-authoritative, always applied. The operator's
     //    explicit session posture may replace the site default; a template
     //    never can.
-    let permission = cfg.session_permission.apply(spec.permission.clone());
+    //    Under an allow-list, a caller-supplied `--allowedTools` (a workflow
+    //    node's tool policy) NARROWS the list — it is intersected and removed
+    //    from the trailing args, never appended (review M1).
+    let mut permission = cfg.session_permission.apply(spec.permission.clone());
+    let mut extra_required = spec.extra_required.clone();
+    if let PermissionMode::AllowList { tools } = &permission {
+        if let Some(caller_tools) = take_caller_allowed_tools(&mut extra_required) {
+            permission = PermissionMode::AllowList {
+                tools: intersect_tool_lists(tools, &caller_tools),
+            };
+        }
+    }
     out.extend(permission.render());
     let allow_list_spec = matches!(permission, PermissionMode::AllowList { .. });
 
@@ -399,8 +428,8 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     // global default for the argv/compose path).
     let template = claude_template(cfg);
     let pin = spec.resume_id.as_deref().or(spec.session_id.as_deref());
-    let provided = provided_flag_names(&spec.extra_required);
-    let caller_owns_append_prompt = provides_append_prompt_flag(&spec.extra_required);
+    let provided = provided_flag_names(&extra_required);
+    let caller_owns_append_prompt = provides_append_prompt_flag(&extra_required);
     let name = spec.name.as_deref().and_then(sanitize_session_name);
 
     let mut template_model: Option<String> = None;
@@ -508,9 +537,91 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
 
     // 5. Caller's required trailing args, verbatim and in order (carries the
     //    `-- <prompt>` positional). Never reordered or deduped.
-    out.extend(spec.extra_required.iter().cloned());
+    out.extend(extra_required);
 
     out
+}
+
+/// Remove every `--allowedTools` / `--allowed-tools` unit (spaced or
+/// `=`-attached) ahead of the `--` terminator from `extra`, returning the tools
+/// they named, or `None` when the caller supplied no such flag.
+fn take_caller_allowed_tools(extra: &mut Vec<String>) -> Option<Vec<String>> {
+    let mut found: Option<Vec<String>> = None;
+    let mut kept = Vec::with_capacity(extra.len());
+    let mut i = 0;
+    while i < extra.len() {
+        let tok = &extra[i];
+        if tok == "--" {
+            kept.extend(extra[i..].iter().cloned());
+            break;
+        }
+        let (name, attached) = match tok.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (tok.as_str(), None),
+        };
+        if matches!(name, "--allowedTools" | "--allowed-tools") {
+            let list = found.get_or_insert_with(Vec::new);
+            if let Some(v) = attached {
+                list.extend(split_tool_specs(v));
+            }
+            i += 1;
+            while i < extra.len() && !extra[i].starts_with('-') {
+                list.extend(split_tool_specs(&extra[i]));
+                i += 1;
+            }
+            continue;
+        }
+        kept.push(tok.clone());
+        i += 1;
+    }
+    *extra = kept;
+    found
+}
+
+/// Split one `--allowedTools` value the way Claude Code reads it: comma or
+/// whitespace separated, except inside a specifier's parentheses
+/// (`Bash(git log, status)` is one tool).
+fn split_tool_specs(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for ch in value.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && (ch == ',' || ch.is_whitespace()) {
+            if !cur.trim().is_empty() {
+                out.push(cur.trim().to_string());
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// The tools in `allow` that `narrower` also names, in `allow`'s order. Never
+/// adds a tool `allow` lacks — the allow-list can be narrowed, never widened.
+pub fn intersect_tool_lists<A: AsRef<str>, B: AsRef<str>>(
+    allow: &[A],
+    narrower: &[B],
+) -> Vec<String> {
+    let wanted: HashSet<String> = narrower
+        .iter()
+        .flat_map(|t| split_tool_specs(t.as_ref()))
+        .collect();
+    let mut seen = HashSet::new();
+    allow
+        .iter()
+        .flat_map(|t| split_tool_specs(t.as_ref()))
+        .filter(|t| wanted.contains(t) && seen.insert(t.clone()))
+        .collect()
 }
 
 /// The claude template to parse for flag composition, honoring precedence:
@@ -584,7 +695,16 @@ fn is_allow_list_owned_flag(token: &str) -> bool {
     let name = token.split_once('=').map_or(token, |(name, _)| name);
     matches!(
         name,
-        "--allowedTools" | "--allowed-tools" | "--allow-dangerously-skip-permissions"
+        "--allowedTools"
+            | "--allowed-tools"
+            | "--allow-dangerously-skip-permissions"
+            // Each of these can pre-approve or proxy tools past the list: a
+            // settings layer's `permissions.allow`, a prompt tool that answers
+            // "allow", an MCP config that adds tools.
+            | "--settings"
+            | "--permission-prompt-tool"
+            | "--mcp-config"
+            | "--strict-mcp-config"
     )
 }
 
@@ -776,6 +896,89 @@ mod tests {
         assert!(!argv
             .iter()
             .any(|a| a.contains("bypass") || a.contains("dangerously")));
+    }
+
+    /// Review M1: a caller-supplied `--allowedTools` (a workflow node's tool
+    /// policy) is INTERSECTED with the allow-list, never appended to it.
+    #[test]
+    fn allow_list_intersects_caller_allowed_tools() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read", "Edit"]);
+        s.extra_required = vec![
+            "--allowedTools".to_string(),
+            "Read".to_string(),
+            "Bash".to_string(),
+            "--".to_string(),
+            "go".to_string(),
+        ];
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--allowedTools").count(),
+            1,
+            "{argv:?}"
+        );
+        assert_eq!(value_after(&argv, "--allowedTools"), Some("Read"));
+        assert!(!argv.iter().any(|a| a == "Bash" || a == "Edit"), "{argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["--", "go"]);
+    }
+
+    /// Review M1: a caller tool list disjoint from the allow-list leaves the
+    /// session with NO pre-approved tools rather than the caller's.
+    #[test]
+    fn allow_list_disjoint_caller_tools_pre_approve_nothing() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        s.extra_required = vec!["--allowedTools".to_string(), "Bash".to_string()];
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(argv, vec!["claude", "--permission-mode", "dontAsk"]);
+    }
+
+    /// Review M1: under an allow-list, a template may not carry its own
+    /// settings layer, permission-prompt tool or MCP config — each could
+    /// pre-approve or proxy tools past the list.
+    #[test]
+    fn allow_list_drops_template_settings_prompt_tool_and_mcp_config() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        let argv = render_argv(
+            &s,
+            &tmpl(
+                "claude --settings /t/s.json --permission-prompt-tool mcp__x__y \
+                 --mcp-config /t/m.json --settings=/t/b.json --model opus",
+            ),
+            "claude",
+        );
+        for gone in [
+            "--settings",
+            "/t/s.json",
+            "--permission-prompt-tool",
+            "mcp__x__y",
+            "--mcp-config",
+            "/t/m.json",
+            "--settings=/t/b.json",
+        ] {
+            assert!(!argv.iter().any(|a| a == gone), "{gone} leaked: {argv:?}");
+        }
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+    }
+
+    /// Review M1: an opaque account alias cannot be introspected, so under an
+    /// allow-list it is never typed; the composed command is used instead.
+    #[test]
+    fn allow_list_refuses_an_opaque_account_alias() {
+        let cfg = LaunchConfig {
+            account_command: Some("clg".to_string()),
+            session_permission: SessionPermissionSetting::AllowList {
+                tools: vec!["Read".to_string()],
+            },
+            ..Default::default()
+        };
+        let cmd = render_pty_command(&spec(), &cfg, false);
+        assert_ne!(cmd, "clg");
+        assert!(
+            cmd.starts_with("claude --permission-mode dontAsk --allowedTools Read"),
+            "{cmd}"
+        );
     }
 
     #[test]

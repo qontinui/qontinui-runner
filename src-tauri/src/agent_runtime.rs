@@ -9554,6 +9554,12 @@ pub(crate) async fn spawn_claude_child(
     // signal delivery.
     own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
+    // A model gateway that cannot be resolved (invalid, or its state unknown)
+    // refuses the spawn outright rather than starting a session that can only
+    // fail — or worse, reach a vendor (`crate::model_gateway`, review H2).
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        anyhow::bail!(refusal);
+    }
     // Resolved to an absolute path through the same PATH walk the PTY seams
     // use, so a failure names the real file. Falls back to the bare name when
     // nothing resolves; the spawn below retries either way (plan

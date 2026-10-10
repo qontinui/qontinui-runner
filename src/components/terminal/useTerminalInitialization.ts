@@ -156,46 +156,39 @@ export function recordBelongsToRestore(
  * picker appears and the verification loop answers it
  * (`buildPickerAnswer`). Exported for unit tests.
  *
- * Autonomous resume (`--permission-mode bypassPermissions`, matching the
- * zone-profile + shell-integration resume builders): a boot-restored session
- * is unattended, so a bare `claude --resume` would stall forever on its first
- * permission prompt. Aligned with PR #547 — whichever lands second resolves
- * the textual conflict by keeping this union form.
+ * Claude resumes are RENDERED BY THE BACKEND (`build_ai_resume_command`), never
+ * assembled here. The backend owns the two decisions a typed resume must not
+ * get wrong: which `CLAUDE_CONFIG_DIR` the session runs under (a declared model
+ * gateway replaces the recorded subscription dir, so a subscription token can
+ * never ride a gateway-routed session) and the permission posture (bypass, or
+ * the operator's allow-list). The resume-summary env thresholds ride along
+ * under the default `"full"` policy.
  *
  * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
- * sourced from the provider descriptor's `resumeCommand` (so a future Gemini
- * record resumes via `gemini --resume <id>`, not a hardcoded `claude`); the
- * Claude-specific autonomous flag (`--permission-mode bypassPermissions`) and
- * the resume-summary env thresholds are applied ONLY when the resolved program
- * is Claude — they are CLI-specific and harmless to omit for other providers.
+ * sourced from the provider descriptor's `resumeCommand`; a non-Claude
+ * provider is rendered from that descriptor here.
  */
-export function buildResumeCmd(
+export async function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
-): string {
-  // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
-  // ["gemini","--resume",id]. The descriptor owns the program + flags so the
-  // boot restore is not Claude-hardcoded.
+): Promise<string> {
   const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
-  const program = argv[0];
-  const isClaude = program === "claude";
-  const base = isClaude
-    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
-    : argv.join(" ");
-  const env: Array<[string, string]> = [];
-  if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
-  if (isClaude && policy === "full") {
-    env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
-    env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
-  }
-  if (env.length === 0) return `${base}\r`;
+  if (argv[0] !== "claude") return `${argv.join(" ")}\r`;
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
-  return isWindows
-    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
-    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
+  const resp = await invoke<CommandResponse>("build_ai_resume_command", {
+    sessionId,
+    configDir: configDir ?? null,
+    isWindows,
+    fullResume: policy === "full",
+  });
+  const command = (resp?.data as { command?: string } | null | undefined)?.command;
+  if (!resp?.success || !command) {
+    throw new Error(resp?.message ?? "build_ai_resume_command returned no command");
+  }
+  return `${command}\r`;
 }
 
 /**
@@ -246,7 +239,17 @@ export async function runVerifiedResume(params: {
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  let resumeCmd: string;
+  try {
+    resumeCmd = await buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  } catch (err) {
+    // The backend refused to render a resume (e.g. an unresolved model
+    // gateway). Type nothing; park the tab for an explicit retry and keep the
+    // restore-pending marker, exactly like an unverified resume.
+    console.warn(`[TerminalPage] resume not rendered for ${claudeSessionId}:`, err);
+    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+    return "failed";
+  }
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's

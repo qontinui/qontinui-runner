@@ -24,6 +24,16 @@ pub enum CredentialSource {
     Keychain { service: String, key: String },
     /// Retrieve from an environment variable.
     Environment { var_name: String },
+    /// The declared model gateway's api-key-helper (cached for `ttl_secs`).
+    ModelGatewayHelper { command: String, ttl_secs: u64 },
+}
+
+/// A placeholder's source, and the one host it may be injected for (`None` =
+/// any host the network policy allows, the historical behaviour).
+#[derive(Debug, Clone)]
+struct ScopedSource {
+    source: CredentialSource,
+    host: Option<String>,
 }
 
 // ============================================================================
@@ -38,12 +48,14 @@ pub enum CredentialSource {
 /// outbound request headers.
 #[derive(Debug, Clone)]
 pub struct CredentialProxy {
-    /// Maps placeholder token → credential source.
-    placeholder_map: HashMap<String, CredentialSource>,
+    /// Maps placeholder token → credential source (and its host scope).
+    placeholder_map: HashMap<String, ScopedSource>,
     /// Maps env var name → placeholder token (for container env injection).
     env_var_map: HashMap<String, String>,
     /// HTTP header names to scan for placeholders.
     header_patterns: Vec<String>,
+    /// Plain (non-secret) env entries for the container, `KEY=VALUE`.
+    plain_env: Vec<String>,
 }
 
 /// Result of credential injection (used by future per-request reporting).
@@ -77,9 +89,12 @@ impl CredentialProxy {
             let (service, key) = credential_source_for_name(name);
             placeholder_map.insert(
                 token.clone(),
-                CredentialSource::Keychain {
-                    service: service.to_string(),
-                    key: key.to_string(),
+                ScopedSource {
+                    source: CredentialSource::Keychain {
+                        service: service.to_string(),
+                        key: key.to_string(),
+                    },
+                    host: None,
                 },
             );
 
@@ -96,6 +111,36 @@ impl CredentialProxy {
                 "x-api-key".to_string(),
                 "api-key".to_string(),
             ],
+            plain_env: Vec::new(),
+        }
+    }
+
+    /// Route the container's Anthropic calls through the declared model
+    /// gateway (review M3): `ANTHROPIC_BASE_URL` points at the gateway, and —
+    /// when a key helper is configured — `ANTHROPIC_API_KEY` is a placeholder
+    /// that resolves to the helper's key ONLY for requests to the gateway host.
+    /// The vendor `claude_api` credential must not be in the proxy's name list
+    /// (see [`without_vendor_credentials`]).
+    pub fn add_model_gateway(&mut self, gateway: &crate::model_gateway::ModelGateway) {
+        self.plain_env.push(format!(
+            "{}={}",
+            crate::model_gateway::BASE_URL_ENV,
+            gateway.base_url()
+        ));
+        if let Some(command) = gateway.api_key_helper() {
+            let token = format!("QCRED_MODEL_GATEWAY_{:016x}", rand::rng().random::<u64>());
+            self.placeholder_map.insert(
+                token.clone(),
+                ScopedSource {
+                    source: CredentialSource::ModelGatewayHelper {
+                        command: command.to_string(),
+                        ttl_secs: gateway.helper_ttl().as_secs(),
+                    },
+                    host: Some(gateway.host().to_string()),
+                },
+            );
+            self.env_var_map
+                .insert("ANTHROPIC_API_KEY".to_string(), token);
         }
     }
 
@@ -107,6 +152,7 @@ impl CredentialProxy {
         self.env_var_map
             .iter()
             .map(|(name, placeholder)| format!("{}={}", name, placeholder))
+            .chain(self.plain_env.iter().cloned())
             .collect()
     }
 
@@ -118,9 +164,25 @@ impl CredentialProxy {
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    pub fn resolve_placeholder(&self, header_value: &str) -> Option<(String, String)> {
-        for (placeholder, source) in &self.placeholder_map {
+    pub fn resolve_placeholder(
+        &self,
+        header_value: &str,
+        domain: &str,
+    ) -> Option<(String, String)> {
+        for (placeholder, scoped) in &self.placeholder_map {
             if header_value.contains(placeholder.as_str()) {
+                // A host-scoped credential (the model gateway's key) is never
+                // injected into a request for any other host.
+                if let Some(host) = &scoped.host {
+                    if !host.eq_ignore_ascii_case(domain) {
+                        warn!(
+                            "Credential proxy: placeholder scoped to {} not injected for {}",
+                            host, domain
+                        );
+                        return None;
+                    }
+                }
+                let source = &scoped.source;
                 // Retrieve the real credential
                 match resolve_credential(source) {
                     Some(real_value) => {
@@ -215,12 +277,92 @@ fn resolve_credential(source: &CredentialSource) -> Option<String> {
             }
         }
         CredentialSource::Environment { var_name } => std::env::var(var_name).ok(),
+        CredentialSource::ModelGatewayHelper { command, ttl_secs } => {
+            crate::model_gateway::cached_helper_key(
+                command,
+                std::time::Duration::from_secs(*ttl_secs),
+                || {
+                    crate::model_gateway::run_api_key_helper(
+                        command,
+                        std::time::Duration::from_secs(30),
+                    )
+                },
+            )
+            .map_err(|e| warn!("Credential proxy: model gateway key helper failed: {e}"))
+            .ok()
+        }
     }
+}
+
+/// `names` minus the vendor Anthropic credential (`claude_api` and its
+/// aliases). While a model gateway is declared a container must never hold —
+/// even as a placeholder — the vendor key (review M3).
+pub fn without_vendor_credentials<'a>(names: &[&'a str]) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|n| !matches!(*n, "claude_api" | "claude" | "anthropic"))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gateway(helper: Option<&str>) -> crate::model_gateway::ModelGateway {
+        crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://llm-gw.example.com/anthropic".to_string()),
+            api_key_helper: helper.map(str::to_string),
+            network_auth: helper.is_none(),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Review M3: under a gateway the vendor credential is not offered at all.
+    #[test]
+    fn vendor_credential_is_dropped_under_a_gateway() {
+        assert_eq!(
+            without_vendor_credentials(&["claude_api", "openai", "anthropic", "gemini"]),
+            vec!["openai", "gemini"]
+        );
+        let mut proxy = CredentialProxy::new(&without_vendor_credentials(&["claude_api"]));
+        proxy.add_model_gateway(&gateway(None));
+        let env = proxy.placeholder_env_vars();
+        assert_eq!(
+            env,
+            vec!["ANTHROPIC_BASE_URL=https://llm-gw.example.com/anthropic".to_string()]
+        );
+    }
+
+    /// Review M3: the gateway key placeholder resolves for the gateway host
+    /// only — never for another host the container talks to.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn gateway_key_is_injected_for_the_gateway_host_only() {
+        let mut proxy = CredentialProxy::new(&[]);
+        proxy.add_model_gateway(&gateway(Some("echo proxy-gw-key-unique")));
+        let env = proxy.placeholder_env_vars();
+        let placeholder = env
+            .iter()
+            .find_map(|e| e.strip_prefix("ANTHROPIC_API_KEY="))
+            .expect("api key placeholder")
+            .to_string();
+        assert!(!placeholder.contains("proxy-gw-key"));
+        let header = format!("Bearer {placeholder}");
+        assert!(proxy
+            .resolve_placeholder(&header, "api.anthropic.com")
+            .is_none());
+        assert!(proxy
+            .resolve_placeholder(&header, "evil.example.com")
+            .is_none());
+        let (replaced, _) = proxy
+            .resolve_placeholder(&header, "llm-gw.example.com")
+            .expect("injected for the gateway host");
+        assert_eq!(replaced, "Bearer proxy-gw-key-unique");
+    }
 
     #[test]
     fn test_placeholder_generation() {
