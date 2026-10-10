@@ -199,7 +199,12 @@ pub(crate) async fn scrub_templates_once(pg: &PgDb, cutoff: &str) {
     }
     let identity = match conn.query_one(DB_IDENTITY_SQL, &[]).await {
         Ok(row) => (0..4)
-            .map(|i| row.try_get::<_, Option<String>>(i).ok().flatten().unwrap_or_default())
+            .map(|i| {
+                row.try_get::<_, Option<String>>(i)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            })
             .collect::<Vec<_>>()
             .join("|"),
         Err(e) => {
@@ -213,9 +218,7 @@ pub(crate) async fn scrub_templates_once(pg: &PgDb, cutoff: &str) {
     let Some(marker_dir) = scrub_marker_dir() else {
         // No place to remember it ran: running anyway would re-run on every
         // start and withdraw rows a router-asserting build wrote.
-        health::record_template_scrub(
-            "not run: no runner data dir to hold its marker".to_string(),
-        );
+        health::record_template_scrub("not run: no runner data dir to hold its marker".to_string());
         TEMPLATE_SCRUB_SETTLED.store(true, Ordering::Release);
         return;
     };
@@ -368,8 +371,7 @@ pub async fn run_journey_edge_retention_loop(pg: Arc<PgDb>) {
         RETENTION_DAYS
     );
     // No edge this process writes can be older than this.
-    let scrub_cutoff =
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let scrub_cutoff = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     tokio::time::sleep(STARTUP_DELAY).await;
     loop {
         scrub_templates_once(&pg, &scrub_cutoff).await;
@@ -450,7 +452,10 @@ mod tests {
     fn the_scrub_invalidates_template_carrying_edges_before_the_cutoff_only() {
         let sql = SCRUB_INVALIDATE_EDGES_SQL;
         assert!(sql.starts_with("UPDATE project.journey_edge_observations"));
-        assert!(!sql.contains("DELETE"), "edges are withdrawn, never deleted");
+        assert!(
+            !sql.contains("DELETE"),
+            "edges are withdrawn, never deleted"
+        );
         for needle in [
             "invalidated_at = now()",
             "invalidated_reason = $1",
@@ -543,7 +548,9 @@ mod tests {
         }
         let cutoff = (chrono::Utc::now() + chrono::Duration::seconds(5))
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        let first = run_scrub_statements(&mut conn, &cutoff).await.expect("scrub");
+        let first = run_scrub_statements(&mut conn, &cutoff)
+            .await
+            .expect("scrub");
         assert!(first.edges_invalidated >= 1 && first.frontier_deleted >= 1);
         let left: i64 = conn
             .query_one(
@@ -565,7 +572,9 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(live, 1, "only the clean edge stays live");
-        let second = run_scrub_statements(&mut conn, &cutoff).await.expect("re-run");
+        let second = run_scrub_statements(&mut conn, &cutoff)
+            .await
+            .expect("re-run");
         assert_eq!(second.edges_invalidated, 0, "idempotent");
         conn.execute(
             "DELETE FROM project.journey_edge_observations WHERE app_id = $1",
