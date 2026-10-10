@@ -12050,6 +12050,7 @@ mod tests {
                 &crate::claude_session::launch_spec::LaunchConfig {
                     default_template: template.map(str::to_string),
                     account_command: None,
+                    ..Default::default()
                 },
             )
         };

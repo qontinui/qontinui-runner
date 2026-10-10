@@ -603,6 +603,33 @@ pub fn save_model_gateway(
     })
 }
 
+/// Get the session permission posture (`settings.claude_session_permission`).
+#[tauri::command]
+pub fn get_claude_session_permission() -> Result<CommandResponse, String> {
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "permission": settings::get_claude_session_permission(),
+        })),
+    })
+}
+
+/// Save the session permission posture: `{"mode":"site_default"}` or
+/// `{"mode":"allow_list","tools":[…]}`.
+#[tauri::command]
+pub fn save_claude_session_permission(
+    permission: crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<CommandResponse, String> {
+    let stored = settings::save_claude_session_permission(permission)?;
+    info!("Saved session permission posture: {:?}", stored);
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Saved session permission posture".to_string()),
+        data: Some(serde_json::json!({ "permission": stored })),
+    })
+}
+
 /// Build the PTY launch command for a new AI (`/spawn-ai`) session, routed
 /// through the shared launch-spec builder ([`crate::claude_session::launch_spec`]).
 ///
@@ -684,6 +711,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_claude_default_launch_command,
             get_model_gateway,
             save_model_gateway,
+            get_claude_session_permission,
+            save_claude_session_permission,
             build_ai_launch_command,
         ])
         .build()
