@@ -2,7 +2,7 @@
 //!
 //! The guards that walk `src-tauri/src` and tell production code from test code
 //! (`runner_spawn_sites`, `process_helpers`, `wedge_diagnostics`,
-//! `commands::tenant`'s pin-reader scan, and the
+//! `commands::tenant`'s pin-reader scan, `env_test_lock_hierarchy_guard`, and the
 //! `tests/coord_auth_pin.rs`, `tests/coord_schema_authorship.rs` and
 //! `tests/interactive_signout_marker_guard.rs` integration gates) find test code
 //! by an IN-FILE `#[cfg(test)]` span. A test module moved out of line by
@@ -19,9 +19,11 @@
 //! `#[cfg(test)] mod x;` line is the other half; the brace-tracking guards end a
 //! pending `#[cfg(test)]` at such a `;` so it cannot swallow the next item.
 //!
-//! Compiled into the lib and bin test builds (`#[cfg(test)] mod source_lex;` in
-//! both crate roots) and into the integration gates through `#[path]`, so there
-//! is ONE predicate rather than a copy per guard.
+//! Owned by the lib (`pub mod source_lex;`, unconditional so the bin's test build
+//! can reach it), re-exported by the bin (`pub(crate) use qontinui_runner_lib::source_lex;`
+//! — `crate_roots_ratchet` forbids declaring it in both roots), and compiled into
+//! the integration gates through `#[path]`, so there is ONE predicate rather than
+//! a copy per guard.
 //!
 //! Not adopted by `ambient.rs` or `tests/workspace_assumptions_are_enumerated.rs`:
 //! both already classify a file-level `#![cfg(test)]` with their own token/lexer
@@ -38,7 +40,7 @@ const TEST_ONLY_FILE_HEADER: &str = "#![cfg(test)]";
 /// File-local by design: a guard needs no parent lookup and no path convention.
 /// Line (`//`, `///`, `//!`) and block (`/* … */`) comments and blank lines are
 /// skipped; anything else decides. A leading byte-order mark is ignored.
-pub(crate) fn is_test_only_file(text: &str) -> bool {
+pub fn is_test_only_file(text: &str) -> bool {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut in_block = false;
     for line in text.lines() {
