@@ -1444,7 +1444,12 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
                         // `dispatch_condition_check` spawns detached. Outcome
                         // counts matter only on the poll path, which still awaits.
                         tokio::spawn(async move {
-                            let _ = dispatch_gate_continuation(payload, device_id).await;
+                            let _ = dispatch_gate_continuation(
+                                payload,
+                                device_id,
+                                ContinuationDelivery::Payload,
+                            )
+                            .await;
                         });
                     }
                     None => warn!(
@@ -1961,6 +1966,54 @@ struct PendingContinuation {
     #[serde(default)]
     #[allow(dead_code)]
     dispatched_at: Option<String>,
+    /// Coord's `coord.gates.continuation_spawn_attempts` for this row: the
+    /// counter coord's re-drive CAS (`continuation_spawn_retry::REDRIVE_SQL`)
+    /// bumps in the SAME statement that re-arms the row. It is the re-delivery
+    /// episode key the poll path dispatches under
+    /// ([`PendingContinuation::dispatch_attempt`]), because coord re-drives a
+    /// row without rewriting its persisted payload — so the payload's `retry`
+    /// block alone reads attempt 0 on every re-listing (plan
+    /// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock` D1).
+    ///
+    /// Absent (an older coord), `null`, negative or unreadable all read 0 —
+    /// never a parse failure, because one bad row must not drop the whole
+    /// pending list.
+    #[serde(default, deserialize_with = "deserialize_lenient_spawn_attempts")]
+    continuation_spawn_attempts: u32,
+}
+
+impl PendingContinuation {
+    /// The re-delivery attempt this poll row is dispatched under:
+    /// `max(payload.retry.attempt, continuation_spawn_attempts)`.
+    ///
+    /// Either source can only RAISE the attempt, and coord raises
+    /// `continuation_spawn_attempts` only inside the CAS that re-arms the row,
+    /// so the runner never sees a "new" episode coord did not create. If
+    /// coord's `retry` block and this counter ever number episodes
+    /// differently, `max()` can over-advance by one (one extra claim, which
+    /// coord's consume arbiter backstops) but never under-advance (a dropped
+    /// re-delivery — the defect this exists to close).
+    fn dispatch_attempt(&self) -> u32 {
+        self.payload
+            .retry_attempt()
+            .max(self.continuation_spawn_attempts)
+    }
+}
+
+/// Lenient reader for [`PendingContinuation::continuation_spawn_attempts`]:
+/// a non-negative integer (or a numeric string) is taken; anything else —
+/// `null`, a negative, a float, garbage — reads 0 with no error.
+fn deserialize_lenient_spawn_attempts<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    let parsed = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    Ok(parsed.map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)))
 }
 
 /// The envelope of coord's `GET /coord/agents/pending-continuations` response.
@@ -2365,17 +2418,176 @@ fn dispatched_gate_ids(
 /// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
 /// older attempt never claims again, released or not.
 fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
+    try_claim_gate_dispatch_attempt(gate_id, attempt) == GateClaimAttempt::Won
+}
+
+/// The result of one [`try_claim_gate_dispatch_attempt`]: whether this call
+/// won the claim, and — when it lost — what was held, so the dispatcher can
+/// tell a plain duplicate from a contradiction with coord (see
+/// [`ContinuationDelivery::GatePollRow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClaimAttempt {
+    /// This call claimed the attempt; the caller dispatches.
+    Won,
+    /// Dropped: the gate already holds `held_attempt` in `held_state`.
+    Lost {
+        held_attempt: u32,
+        held_state: GateClaimState,
+    },
+}
+
+/// [`claim_gate_dispatch_attempt`], reporting what blocked a losing claim.
+/// The single place the claim rule lives; the `bool` form delegates here.
+fn try_claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> GateClaimAttempt {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
-    let wins = match held.get(&gate_id) {
-        None => true,
+    let verdict = match held.get(&gate_id) {
+        None => GateClaimAttempt::Won,
         Some(&(prev, state)) => {
-            attempt > prev || (attempt == prev && state == GateClaimState::Released)
+            if attempt > prev || (attempt == prev && state == GateClaimState::Released) {
+                GateClaimAttempt::Won
+            } else {
+                GateClaimAttempt::Lost {
+                    held_attempt: prev,
+                    held_state: state,
+                }
+            }
         }
     };
-    if wins {
+    if verdict == GateClaimAttempt::Won {
         held.insert(gate_id, (attempt, GateClaimState::Held));
     }
-    wins
+    verdict
+}
+
+/// How a gate continuation reached [`dispatch_gate_continuation`] — which
+/// decides the re-delivery attempt it claims under and how a lost claim is
+/// classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationDelivery {
+    /// The live WS frame (or a work-unit dispatch replay, which carries no
+    /// gate-level counter): the attempt is `payload.retry_attempt()` alone.
+    /// A lost claim is a plain duplicate — the frame is a second copy of an
+    /// episode this process already claimed, which is exactly the WS/poll
+    /// double-spawn the dedupe guards.
+    Payload,
+    /// A row of coord's `pending-continuations` list: the attempt is
+    /// [`PendingContinuation::dispatch_attempt`] (the max of the payload's
+    /// `retry` and coord's `continuation_spawn_attempts`). A row coord still
+    /// lists UN-consumed whose attempt this process holds `Sealed` (coord
+    /// accepted that attempt's consume claim) is a contradiction, not a
+    /// duplicate — see [`gate_claim_verdict`].
+    GatePollRow { attempt: u32 },
+}
+
+impl ContinuationDelivery {
+    /// The attempt this delivery claims under.
+    fn attempt(self, payload: &GateContinuationPayload) -> u32 {
+        match self {
+            ContinuationDelivery::Payload => payload.retry_attempt(),
+            ContinuationDelivery::GatePollRow { attempt } => attempt,
+        }
+    }
+}
+
+/// Make the payload's `retry.attempt` agree with the attempt the dispatcher
+/// CLAIMED, when the claim came from a poll row's
+/// `continuation_spawn_attempts` rather than from the payload itself. Returns
+/// `true` when it raised the attempt.
+///
+/// Everything downstream of the claim reads the episode off the payload —
+/// most importantly [`continuation_session_id`], which gives a re-delivery its
+/// own `:retry{n}` worktree-claim discriminator so the earlier attempt's
+/// still-open tab cannot release a claim out from under the new session.
+/// Without this stamp a re-driven poll row would claim attempt `n` in the
+/// dedupe map yet run under attempt 0's discriminator. The stamped value is
+/// the same one a coord `retry` block for that attempt would carry, so a
+/// frame and a poll row for one episode derive the same id. Only `attempt` is
+/// set; the descriptive fields (`class`, `family`, …) keep whatever coord
+/// sent, empty when it sent no block, rather than inventing a cause.
+fn stamp_dispatch_attempt(payload: &mut GateContinuationPayload, attempt: u32) -> bool {
+    if attempt <= payload.retry_attempt() {
+        return false;
+    }
+    payload
+        .retry
+        .get_or_insert_with(ContinuationRetry::default)
+        .attempt = attempt;
+    true
+}
+
+/// The dispatcher's in-process verdict on one gate delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClaimVerdict {
+    /// Claimed: dispatch it.
+    Claim,
+    /// A duplicate of an in-flight or earlier-consumed episode: drop it.
+    Duplicate,
+    /// A poll row coord lists un-consumed, at an attempt this process has
+    /// `Sealed` (plan
+    /// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock`
+    /// D2). Coord says the row is pending; this process says coord consumed
+    /// it. Still dropped — re-spawning it would be the double spawn the seal
+    /// exists to stop — but loudly: `warn!` (rate-limited per gate) and its
+    /// own poll-report reason, because each one is a re-delivery that will
+    /// never run in this process.
+    SealedButRelisted,
+}
+
+/// Claim `gate_id` for `delivery` and classify the result. Pure apart from the
+/// process-wide claim map, so the dedupe contract is testable without the
+/// async dispatcher's I/O.
+fn gate_claim_verdict(
+    gate_id: uuid::Uuid,
+    delivery: ContinuationDelivery,
+    attempt: u32,
+) -> GateClaimVerdict {
+    match try_claim_gate_dispatch_attempt(gate_id, attempt) {
+        GateClaimAttempt::Won => GateClaimVerdict::Claim,
+        GateClaimAttempt::Lost {
+            held_attempt,
+            held_state: GateClaimState::Sealed,
+        } if held_attempt == attempt
+            && matches!(delivery, ContinuationDelivery::GatePollRow { .. }) =>
+        {
+            GateClaimVerdict::SealedButRelisted
+        }
+        GateClaimAttempt::Lost { .. } => GateClaimVerdict::Duplicate,
+    }
+}
+
+/// Minimum interval between `sealed_but_relisted` warnings for the SAME gate.
+/// The backstop re-lists the row every ~300 s, so an un-throttled warning is
+/// ~12 lines an hour per stuck gate; one an hour keeps it loud and readable.
+const SEALED_BUT_RELISTED_WARN_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Per-gate last-warned times for the `sealed_but_relisted` warning.
+fn sealed_but_relisted_last_warn(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Decide-and-record: should the `sealed_but_relisted` warning fire for
+/// `gate_id` at `now`? `true` at most once per
+/// [`SEALED_BUT_RELISTED_WARN_INTERVAL`] per gate. Takes `now` so the window
+/// is unit-testable (the shape of [`should_post_deferred_stamp`]).
+fn should_warn_sealed_but_relisted(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
+    let mut map = lock_recover(
+        sealed_but_relisted_last_warn(),
+        "sealed_but_relisted_last_warn",
+    );
+    if let Some(last) = map.get(&gate_id) {
+        if now.saturating_duration_since(*last) < SEALED_BUT_RELISTED_WARN_INTERVAL {
+            return false;
+        }
+    }
+    if map.len() > 1024 {
+        map.retain(|_, t| now.saturating_duration_since(*t) < SEALED_BUT_RELISTED_WARN_INTERVAL);
+    }
+    map.insert(gate_id, now);
+    true
 }
 
 /// Test shim: [`claim_gate_dispatch_attempt`] at attempt 0 (a first delivery).
@@ -4438,6 +4650,7 @@ enum ConsumeTarget {
 async fn dispatch_gate_continuation(
     payload: GateContinuationPayload,
     device_id: uuid::Uuid,
+    delivery: ContinuationDelivery,
 ) -> DispatchOutcome {
     // Instance-targeting self-gate (primary-only by default). A continuation
     // spawns on EXACTLY the instance it is addressed to; an absent
@@ -4528,32 +4741,67 @@ async fn dispatch_gate_continuation(
         // Fast-path dedupe: drop an in-process duplicate before any claim.
         // (The agent-registry check above is the one I/O that precedes it — it
         // must, so a refused dispatch never claims anything.)
-        let attempt = payload.retry_attempt();
-        if payload.retry.is_some() && attempt == 0 {
+        //
+        // The attempt is the payload's `retry` on a WS frame, and on a poll row
+        // the max of that and coord's `continuation_spawn_attempts` — the
+        // counter coord's re-drive bumps without rewriting the payload, so a
+        // re-driven row is a NEW episode here rather than a duplicate of the
+        // sealed one (plan 2026-10-09-a-re-listed-gate-continuation… D1).
+        let attempt = delivery.attempt(&payload);
+        if payload.retry.is_some() && payload.retry_attempt() == 0 {
             warn!(
                 "agent_runtime: gate-continuation gate_id={gate_id} carries a coord `retry` \
-                 annotation with no readable attempt — treated as attempt 0; on a device that \
-                 already ran this gate the re-delivery will be dropped as a duplicate"
+                 annotation with no readable attempt — treated as attempt 0 (dispatching \
+                 under attempt {attempt}); on a device that already ran this gate at that \
+                 attempt the re-delivery will be dropped as a duplicate"
             );
         }
-        if !claim_gate_dispatch_attempt(gate_id, attempt) {
-            if attempt > 0 {
-                info!(
-                    "agent_runtime: gate-continuation gate_id={gate_id} re-delivery attempt \
-                     {attempt} already dispatched in this process; skipping duplicate"
+        match gate_claim_verdict(gate_id, delivery, attempt) {
+            GateClaimVerdict::Claim => {}
+            GateClaimVerdict::Duplicate => {
+                // A poll row of an in-flight re-drive is re-listed every
+                // backstop tick until it settles, so only a WS frame earns
+                // the `info!`; poll duplicates stay at `debug!`.
+                if attempt > 0 && delivery == ContinuationDelivery::Payload {
+                    info!(
+                        "agent_runtime: gate-continuation gate_id={gate_id} re-delivery attempt \
+                         {attempt} already dispatched in this process; skipping duplicate"
+                    );
+                }
+                debug!(
+                    "agent_runtime: gate-continuation gate_id={gate_id} attempt={attempt} \
+                     already dispatched; skipping duplicate"
                 );
+                return DispatchOutcome::AlreadyDispatched;
             }
-            debug!(
-                "agent_runtime: gate-continuation gate_id={gate_id} attempt={attempt} already \
-                 dispatched; skipping duplicate"
-            );
-            return DispatchOutcome::AlreadyDispatched;
+            GateClaimVerdict::SealedButRelisted => {
+                if should_warn_sealed_but_relisted(gate_id, std::time::Instant::now()) {
+                    warn!(
+                        "agent_runtime: gate-continuation gate_id={gate_id} is re-listed by \
+                         coord as PENDING at attempt {attempt}, but this process holds that \
+                         attempt in held state Sealed (coord accepted its consume claim) — \
+                         dropping it to avoid a double spawn; it will not run in this process \
+                         until coord re-drives it as a newer attempt \
+                         (continuation_spawn_attempts > {attempt}). Counted as \
+                         skip_reasons.sealed_but_relisted (warned once per gate per hour)"
+                    );
+                }
+                return DispatchOutcome::SealedButRelisted(gate_id);
+            }
         }
         if let Some(retry) = payload.retry.as_ref() {
             info!(
                 "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DELIVERY attempt \
                  {}/{} ({} family, class {}); prior outcome {:?}",
                 retry.attempt, retry.max_attempts, retry.family, retry.class, retry.prior_outcome
+            );
+        }
+        let mut payload = payload;
+        if stamp_dispatch_attempt(&mut payload, attempt) {
+            info!(
+                "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DRIVE attempt \
+                 {attempt} (continuation_spawn_attempts on the pending row; the payload carried \
+                 no newer `retry`) — dispatching as a new episode"
             );
         }
         // One task owns the whole claim → spawn → outcome handshake. The #469
@@ -4637,6 +4885,11 @@ enum DispatchOutcome {
     Dispatched,
     /// Dropped at the in-process dedupe — this id is in-flight or consumed.
     AlreadyDispatched,
+    /// A poll row coord lists un-consumed at an attempt this process holds
+    /// `Sealed` ([`GateClaimVerdict::SealedButRelisted`]). Dropped like a
+    /// duplicate, but counted and named separately in the poll report,
+    /// because coord and this process contradict each other about the row.
+    SealedButRelisted(uuid::Uuid),
     /// Not addressed to this instance (the addressed instance spawns it).
     NotAddressedToSelf,
     /// Refused by the agent registry (`agent-spawn-authorization`): the
@@ -4718,16 +4971,16 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         ..Default::default()
     };
     for row in body.pending {
+        // The poll row's episode key: max(payload retry, coord's
+        // continuation_spawn_attempts). Read before the payload is moved.
+        let delivery = ContinuationDelivery::GatePollRow {
+            attempt: row.dispatch_attempt(),
+        };
         // The row's gate_id is authoritative; stamp it onto the payload so the
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
-        match dispatch_gate_continuation(payload, device_id).await {
-            DispatchOutcome::Dispatched => counts.dispatched_n += 1,
-            DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
-            DispatchOutcome::NotAddressedToSelf => counts.not_addressed_to_self += 1,
-            DispatchOutcome::Denied => counts.spawn_authorization_denied += 1,
-        }
+        counts.record(dispatch_gate_continuation(payload, device_id, delivery).await);
     }
     post_continuation_poll_report(device_id, counts).await;
 }
@@ -4740,7 +4993,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
 /// build / GET / non-2xx / parse) — reported so coord can tell "poll loop
 /// alive but the pull route failing" apart from "poll loop dead" (the exact
 /// ambiguity the self-report exists to kill).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct PollRunCounts {
     listed_n: usize,
     dispatched_n: usize,
@@ -4751,8 +5004,21 @@ struct PollRunCounts {
     /// standing continuations" apart from a dedupe drop or a dead poll loop —
     /// the two look identical in `skipped_n` alone.
     spawn_authorization_denied: usize,
+    /// Poll rows coord lists un-consumed at an attempt this process holds
+    /// `Sealed` ([`DispatchOutcome::SealedButRelisted`]). A partition of the
+    /// skips, NOT a subset of `already_dispatched`: each such row is counted
+    /// here only.
+    sealed_but_relisted: usize,
+    /// The first [`SEALED_BUT_RELISTED_GATE_IDS_CAP`] gate ids behind
+    /// `sealed_but_relisted`, in poll order. Bounded so a pathological list
+    /// cannot grow the report body; the count above stays exact.
+    sealed_but_relisted_gate_ids: Vec<uuid::Uuid>,
     fetch_failed: bool,
 }
+
+/// Upper bound on `sealed_but_relisted_gate_ids` in one poll report (plan
+/// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock` D2).
+const SEALED_BUT_RELISTED_GATE_IDS_CAP: usize = 20;
 
 impl PollRunCounts {
     /// The counts for a run whose pending-list pull failed before any row was
@@ -4761,6 +5027,23 @@ impl PollRunCounts {
         Self {
             fetch_failed: true,
             ..Default::default()
+        }
+    }
+
+    /// Fold one row's [`DispatchOutcome`] into the counts — the single place
+    /// the poll loop's per-row accounting lives.
+    fn record(&mut self, outcome: DispatchOutcome) {
+        match outcome {
+            DispatchOutcome::Dispatched => self.dispatched_n += 1,
+            DispatchOutcome::AlreadyDispatched => self.already_dispatched += 1,
+            DispatchOutcome::SealedButRelisted(gate_id) => {
+                self.sealed_but_relisted += 1;
+                if self.sealed_but_relisted_gate_ids.len() < SEALED_BUT_RELISTED_GATE_IDS_CAP {
+                    self.sealed_but_relisted_gate_ids.push(gate_id);
+                }
+            }
+            DispatchOutcome::NotAddressedToSelf => self.not_addressed_to_self += 1,
+            DispatchOutcome::Denied => self.spawn_authorization_denied += 1,
         }
     }
 }
@@ -4772,7 +5055,15 @@ struct ContinuationPollReportBody {
     listed_n: usize,
     dispatched_n: usize,
     skipped_n: usize,
+    /// Count-only histogram: coord's `sanitize_skip_reasons` coerces every
+    /// value to an integer, so ids can never ride here.
     skip_reasons: std::collections::BTreeMap<&'static str, usize>,
+    /// The gate ids behind `skip_reasons.sealed_but_relisted`, at most
+    /// [`SEALED_BUT_RELISTED_GATE_IDS_CAP`]. Omitted when empty, so a report
+    /// with no such row keeps its pre-existing wire shape; coord's request
+    /// type does not deny unknown fields, so an older coord ignores it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sealed_but_relisted_gate_ids: Vec<uuid::Uuid>,
 }
 
 impl ContinuationPollReportBody {
@@ -4783,6 +5074,9 @@ impl ContinuationPollReportBody {
         }
         if counts.not_addressed_to_self > 0 {
             skip_reasons.insert("not_addressed_to_self", counts.not_addressed_to_self);
+        }
+        if counts.sealed_but_relisted > 0 {
+            skip_reasons.insert("sealed_but_relisted", counts.sealed_but_relisted);
         }
         if counts.spawn_authorization_denied > 0 {
             skip_reasons.insert(
@@ -4799,6 +5093,7 @@ impl ContinuationPollReportBody {
             dispatched_n: counts.dispatched_n,
             skipped_n: counts.listed_n.saturating_sub(counts.dispatched_n),
             skip_reasons,
+            sealed_but_relisted_gate_ids: counts.sealed_but_relisted_gate_ids,
         }
     }
 }
@@ -4951,7 +5246,9 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         let mut payload = row.payload;
         payload.dispatch_id = Some(row.dispatch_id);
         // Outcome counts are aggregated only on the gate-continuations poll.
-        let _ = dispatch_gate_continuation(payload, device_id).await;
+        // A unit dispatch has no gate-level re-delivery counter, so it is
+        // keyed on its payload exactly like a WS frame.
+        let _ = dispatch_gate_continuation(payload, device_id, ContinuationDelivery::Payload).await;
     }
 }
 
@@ -5409,17 +5706,21 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
 /// coord an honest, queryable "a runner saw this and deferred it" signal.
 /// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
-/// **Best-effort**: the route may 404 until coord's parallel phase deploys —
-/// ANY non-2xx or transport error is `debug!` and we move on.
+/// **Best-effort, but loud on loss**: a non-2xx or transport error is one
+/// `warn!` and we move on. A lost stamp is not cosmetic — coord's deferral
+/// escalation reads these stamps, so a silently failing post makes a stuck row
+/// look like one that was deferred once and is quietly waiting (plan
+/// `2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-deferral-streak-has-no-clock`
+/// Phase 2). The success path stays `debug!`.
 async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
     let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
     let Some(client) = crate::coord_http::coord_client() else {
-        debug!(
+        warn!(
             "agent_runtime: continuation-deferred: no shared coord client \
-             gate_id={gate_id} (continuing)"
+             gate_id={gate_id} — the deferral stamp did NOT land (continuing)"
         );
         return;
     };
@@ -5438,15 +5739,17 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
             );
         }
         Ok(resp) => {
-            debug!(
-                "agent_runtime: continuation-deferred POST gate_id={gate_id} returned {} \
-                 (route may not be deployed yet; continuing)",
-                resp.status()
+            warn!(
+                "agent_runtime: continuation-deferred POST gate_id={gate_id} returned {} — \
+                 the deferral stamp did NOT land (reason={}; continuing)",
+                resp.status(),
+                body.reason
             );
         }
-        Err(e) => debug!(
-            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
-             (continuing): {e:#}"
+        Err(e) => warn!(
+            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed — the \
+             deferral stamp did NOT land (reason={}; continuing): {e:#}",
+            body.reason
         ),
     }
 }
@@ -13922,6 +14225,422 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Plan 2026-10-09-a-re-listed-gate-continuation-is-silently-dropped-and-a-
+    // deferral-streak-has-no-clock, Phase 2 (runner): the poll path keys on
+    // max(payload retry, coord's continuation_spawn_attempts), and a poll row
+    // dropped against a Sealed attempt is loud and counted.
+    // =========================================================================
+
+    /// A `pending-continuations` row for `gate`, with
+    /// `continuation_spawn_attempts` set to `spawn_attempts` (absent on `None`)
+    /// and the payload carrying NO `retry` block — coord's re-drive leaves the
+    /// persisted payload unchanged, which is the shape of the incident.
+    fn pending_row(
+        gate: uuid::Uuid,
+        spawn_attempts: Option<serde_json::Value>,
+    ) -> PendingContinuation {
+        let mut row = serde_json::json!({
+            "gate_id": gate,
+            "dispatched_at": "2026-10-08T22:00:53Z",
+            "payload": {
+                "target_device_id": "11111111-1111-1111-1111-111111111111",
+                "initial_prompt": "/implement-plan x",
+                "repos": [],
+                "source": "gate_continuation",
+            },
+        });
+        if let Some(v) = spawn_attempts {
+            row["continuation_spawn_attempts"] = v;
+        }
+        serde_json::from_value(row).expect("pending row parses")
+    }
+
+    /// Coord accepted attempt `attempt`'s consume claim: claim it as a first
+    /// WS delivery and seal it exactly as the dispatcher's settle does.
+    fn claim_and_seal(gate: uuid::Uuid, attempt: u32) {
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, attempt),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            settle_claim_decision(
+                &SpawnDecision::Spawn,
+                ConsumeTarget::Gate(gate, attempt),
+                gate
+            ),
+            ClaimOutcome::Spawn
+        );
+    }
+
+    /// `continuation_spawn_attempts` is read leniently (one bad row must never
+    /// drop the whole pending list), and the poll row's attempt is the MAX of
+    /// it and the payload's `retry.attempt`.
+    #[test]
+    fn a_poll_row_attempt_is_the_max_of_retry_and_spawn_attempts() {
+        let gate = uuid::Uuid::now_v7();
+        for (raw, want) in [
+            (None, 0),
+            (Some(serde_json::Value::Null), 0),
+            (Some(serde_json::json!(-1)), 0),
+            (Some(serde_json::json!(1.5)), 0),
+            (Some(serde_json::json!("garbage")), 0),
+            (Some(serde_json::json!({"n": 2})), 0),
+            (Some(serde_json::json!("2")), 2),
+            (Some(serde_json::json!(3)), 3),
+        ] {
+            let row = pending_row(gate, raw.clone());
+            assert_eq!(
+                row.continuation_spawn_attempts, want,
+                "continuation_spawn_attempts={raw:?}"
+            );
+            assert_eq!(row.dispatch_attempt(), want);
+        }
+
+        // A whole response with one garbled counter still yields every row.
+        let body: PendingContinuationsResponse = serde_json::from_value(serde_json::json!({
+            "pending": [
+                {
+                    "gate_id": gate, "continuation_spawn_attempts": "x",
+                    "payload": {"target_device_id": "11111111-1111-1111-1111-111111111111",
+                                "initial_prompt": "p", "source": "gate_continuation"}
+                },
+                {
+                    "gate_id": gate, "continuation_spawn_attempts": 4,
+                    "payload": {"target_device_id": "11111111-1111-1111-1111-111111111111",
+                                "initial_prompt": "p", "source": "gate_continuation"}
+                },
+            ],
+            "total": 2,
+        }))
+        .expect("a garbled counter never fails the list");
+        assert_eq!(body.pending.len(), 2);
+        assert_eq!(body.pending[0].dispatch_attempt(), 0);
+        assert_eq!(body.pending[1].dispatch_attempt(), 4);
+
+        // max(): a payload retry above the counter wins, and vice versa.
+        let mut row = pending_row(gate, Some(serde_json::json!(1)));
+        row.payload.retry = Some(
+            serde_json::from_value(serde_json::json!({"attempt": 3, "family": "spawn"}))
+                .expect("retry parses"),
+        );
+        assert_eq!(
+            row.dispatch_attempt(),
+            3,
+            "retry.attempt above the counter wins"
+        );
+        row.continuation_spawn_attempts = 5;
+        assert_eq!(
+            row.dispatch_attempt(),
+            5,
+            "the counter above retry.attempt wins"
+        );
+    }
+
+    /// Test (a): attempt 0 sealed (coord accepted it, the run then failed and
+    /// coord re-drove the row, bumping `continuation_spawn_attempts` to 1 but
+    /// leaving the payload alone). The re-listed poll row claims and
+    /// dispatches — before this phase it was dropped for the process's life.
+    #[test]
+    fn a_redriven_poll_row_claims_past_a_sealed_attempt() {
+        let gate = uuid::Uuid::now_v7();
+        claim_and_seal(gate, 0);
+        // The error-path release after the failed run is a no-op on a seal.
+        release_gate_dispatch_attempt(gate, 0);
+
+        let row = pending_row(gate, Some(serde_json::json!(1)));
+        assert_eq!(row.payload.retry_attempt(), 0, "coord sent no retry block");
+        let delivery = ContinuationDelivery::GatePollRow {
+            attempt: row.dispatch_attempt(),
+        };
+        assert_eq!(delivery.attempt(&row.payload), 1);
+        assert_eq!(
+            gate_claim_verdict(gate, delivery, delivery.attempt(&row.payload)),
+            GateClaimVerdict::Claim,
+            "the re-driven episode claims and dispatches"
+        );
+
+        let mut counts = PollRunCounts {
+            listed_n: 1,
+            ..Default::default()
+        };
+        counts.record(DispatchOutcome::Dispatched);
+        let v = serde_json::to_value(ContinuationPollReportBody::new(row.gate_id, counts)).unwrap();
+        assert_eq!(v["dispatched_n"], 1);
+        assert_eq!(v["skipped_n"], 0);
+        assert!(v.get("sealed_but_relisted_gate_ids").is_none());
+
+        // …and the next re-listing of the SAME episode is a plain duplicate,
+        // not a second spawn.
+        assert_eq!(
+            gate_claim_verdict(gate, delivery, 1),
+            GateClaimVerdict::Duplicate,
+            "attempt 1 is held in flight, so its re-listing is an ordinary duplicate"
+        );
+    }
+
+    /// Test (b): the same re-listed row WITHOUT a bumped counter (an older
+    /// coord, or a row coord lists without re-driving) is still dropped — the
+    /// seal holds — but now as `sealed_but_relisted`: counted under its own
+    /// skip reason (not `already_dispatched`) and named in the id list.
+    #[test]
+    fn a_relisted_row_against_a_sealed_attempt_is_counted_and_named() {
+        for raw in [Some(serde_json::json!(0)), None] {
+            let gate = uuid::Uuid::now_v7();
+            claim_and_seal(gate, 0);
+
+            let row = pending_row(gate, raw.clone());
+            let delivery = ContinuationDelivery::GatePollRow {
+                attempt: row.dispatch_attempt(),
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, delivery, delivery.attempt(&row.payload)),
+                GateClaimVerdict::SealedButRelisted,
+                "spawn_attempts={raw:?}: dropped, and classified as the contradiction"
+            );
+
+            let mut counts = PollRunCounts {
+                listed_n: 1,
+                ..Default::default()
+            };
+            counts.record(DispatchOutcome::SealedButRelisted(gate));
+            assert_eq!(counts.already_dispatched, 0, "a partition, not a subset");
+            let v = serde_json::to_value(ContinuationPollReportBody::new(gate, counts)).unwrap();
+            assert_eq!(v["skipped_n"], 1);
+            assert_eq!(
+                v["skip_reasons"],
+                serde_json::json!({ "sealed_but_relisted": 1 }),
+                "skip_reasons stays count-only"
+            );
+            assert_eq!(
+                v["sealed_but_relisted_gate_ids"],
+                serde_json::json!([gate.to_string()])
+            );
+        }
+
+        // The seal is never re-opened by a re-listing: the next one is
+        // classified the same way, not claimed.
+        let gate = uuid::Uuid::now_v7();
+        claim_and_seal(gate, 0);
+        let poll = ContinuationDelivery::GatePollRow { attempt: 0 };
+        assert_eq!(
+            gate_claim_verdict(gate, poll, 0),
+            GateClaimVerdict::SealedButRelisted
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, poll, 0),
+            GateClaimVerdict::SealedButRelisted
+        );
+
+        // A poll row at an attempt only HELD (in flight, coord has not
+        // accepted it yet) is an ordinary duplicate, not a contradiction.
+        let held = uuid::Uuid::now_v7();
+        assert_eq!(
+            gate_claim_verdict(held, ContinuationDelivery::Payload, 0),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            gate_claim_verdict(held, poll, 0),
+            GateClaimVerdict::Duplicate
+        );
+    }
+
+    /// The `sealed_but_relisted` warning fires at most once per gate per hour.
+    #[test]
+    fn sealed_but_relisted_warning_is_rate_limited_per_gate() {
+        let gate_a = uuid::Uuid::now_v7();
+        let gate_b = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        assert!(
+            should_warn_sealed_but_relisted(gate_a, t0),
+            "first sighting warns"
+        );
+        assert!(
+            !should_warn_sealed_but_relisted(gate_a, t0 + Duration::from_secs(300)),
+            "the next backstop poll's sighting is suppressed"
+        );
+        assert!(
+            !should_warn_sealed_but_relisted(
+                gate_a,
+                t0 + SEALED_BUT_RELISTED_WARN_INTERVAL - Duration::from_secs(1)
+            ),
+            "still suppressed just inside the window"
+        );
+        assert!(
+            should_warn_sealed_but_relisted(gate_a, t0 + SEALED_BUT_RELISTED_WARN_INTERVAL),
+            "warns again once the hour has elapsed"
+        );
+        assert!(
+            should_warn_sealed_but_relisted(gate_b, t0),
+            "a different gate is independent"
+        );
+    }
+
+    /// Test (c): the double-spawn guard is untouched on the WS path. A frame
+    /// at attempt 0 after attempt 0 was sealed is dropped as a plain duplicate
+    /// — the WS path keys on the payload's `retry` alone, and it is never
+    /// classified as `sealed_but_relisted` (a WS frame is a second copy of an
+    /// episode, not coord re-listing a pending row).
+    #[test]
+    fn a_ws_frame_at_a_sealed_attempt_is_still_dropped() {
+        let gate = uuid::Uuid::now_v7();
+        claim_and_seal(gate, 0);
+        let frame: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "11111111-1111-1111-1111-111111111111",
+            "initial_prompt": "/implement-plan x",
+            "source": "gate_continuation",
+            "gate_id": gate,
+        }))
+        .expect("frame parses");
+        let attempt = ContinuationDelivery::Payload.attempt(&frame);
+        assert_eq!(attempt, 0);
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, attempt),
+            GateClaimVerdict::Duplicate
+        );
+        // Even after a re-driven poll claimed attempt 1, a late attempt-0
+        // frame stays dropped.
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::GatePollRow { attempt: 1 }, 1),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, attempt),
+            GateClaimVerdict::Duplicate,
+            "a stale frame never re-runs a sealed episode"
+        );
+    }
+
+    /// Test (d), the race in the plan's Risks: attempt N is HELD (in flight,
+    /// not yet settled) when coord's re-drive lists the row at N+1. Exactly
+    /// one delivery of N+1 claims — so exactly one consume claim for N+1 can
+    /// leave this process — no matter how many copies (concurrent polls, a WS
+    /// frame) race it, and N's later settle/release cannot disturb N+1.
+    #[test]
+    fn a_held_attempt_and_a_redriven_poll_yield_exactly_one_claim() {
+        let gate = uuid::Uuid::now_v7();
+        const N: u32 = 2;
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, N),
+            GateClaimVerdict::Claim,
+            "attempt N in flight"
+        );
+
+        // N+1 arrives on many threads at once (two backstop polls, the
+        // reconnect replay, …): exactly one wins the in-process arbiter.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate_claim_verdict(
+                        gate,
+                        ContinuationDelivery::GatePollRow { attempt: N + 1 },
+                        N + 1,
+                    )
+                })
+            })
+            .collect();
+        let verdicts: Vec<GateClaimVerdict> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == GateClaimVerdict::Claim)
+                .count(),
+            1,
+            "exactly one claim path for N+1: {verdicts:?}"
+        );
+        assert!(
+            verdicts
+                .iter()
+                .all(|v| matches!(v, GateClaimVerdict::Claim | GateClaimVerdict::Duplicate)),
+            "a held (unsealed) N+1 makes the losers plain duplicates: {verdicts:?}"
+        );
+
+        // A copy of N (WS frame or poll) arriving now is stale.
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, N),
+            GateClaimVerdict::Duplicate
+        );
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::GatePollRow { attempt: N }, N),
+            GateClaimVerdict::Duplicate
+        );
+
+        // N's task finishes: coord accepted it (seal) and its error path
+        // releases. Neither may touch N+1's claim.
+        settle_claim_decision(&SpawnDecision::Spawn, ConsumeTarget::Gate(gate, N), gate);
+        release_gate_dispatch_attempt(gate, N);
+        assert_eq!(
+            gate_claim_verdict(
+                gate,
+                ContinuationDelivery::GatePollRow { attempt: N + 1 },
+                N + 1
+            ),
+            GateClaimVerdict::Duplicate,
+            "N+1 is still held after N settled — no second claim reaches coord"
+        );
+
+        // N+1 is then accepted by coord; a re-listing at N+1 is now the
+        // sealed contradiction, and still never a second claim.
+        settle_claim_decision(
+            &SpawnDecision::Spawn,
+            ConsumeTarget::Gate(gate, N + 1),
+            gate,
+        );
+        assert_eq!(
+            gate_claim_verdict(
+                gate,
+                ContinuationDelivery::GatePollRow { attempt: N + 1 },
+                N + 1
+            ),
+            GateClaimVerdict::SealedButRelisted
+        );
+    }
+
+    /// Test (e): the id list is capped at 20 while the count stays exact.
+    #[test]
+    fn sealed_but_relisted_gate_ids_are_capped_at_twenty() {
+        let ids: Vec<uuid::Uuid> = (0..25).map(|_| uuid::Uuid::now_v7()).collect();
+        let mut counts = PollRunCounts {
+            listed_n: 26,
+            ..Default::default()
+        };
+        for id in &ids {
+            counts.record(DispatchOutcome::SealedButRelisted(*id));
+        }
+        counts.record(DispatchOutcome::AlreadyDispatched);
+        assert_eq!(counts.sealed_but_relisted, 25);
+        assert_eq!(
+            counts.sealed_but_relisted_gate_ids.len(),
+            SEALED_BUT_RELISTED_GATE_IDS_CAP
+        );
+        assert_eq!(SEALED_BUT_RELISTED_GATE_IDS_CAP, 20);
+        assert_eq!(
+            counts.sealed_but_relisted_gate_ids[..],
+            ids[..20],
+            "the first 20, in poll order"
+        );
+
+        let dev = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let v = serde_json::to_value(ContinuationPollReportBody::new(dev, counts)).unwrap();
+        assert_eq!(v["skipped_n"], 26);
+        assert_eq!(
+            v["skip_reasons"],
+            serde_json::json!({ "already_dispatched": 1, "sealed_but_relisted": 25 })
+        );
+        let wire_ids = v["sealed_but_relisted_gate_ids"]
+            .as_array()
+            .expect("an array");
+        assert_eq!(wire_ids.len(), 20);
+        assert_eq!(wire_ids[0], serde_json::json!(ids[0].to_string()));
+        assert_eq!(wire_ids[19], serde_json::json!(ids[19].to_string()));
+    }
+
     /// The `retry` key parses into the typed annotation, is absent on a first
     /// delivery, and an unreadable value never fails the frame.
     #[test]
@@ -13994,6 +14713,60 @@ mod tests {
             continuation_session_id(&retried.clone()),
             "stable across copies of the same attempt"
         );
+    }
+
+    /// A poll row claimed under coord's `continuation_spawn_attempts` (no
+    /// `retry` block in the payload) runs under the SAME worktree-claim
+    /// discriminator a coord `retry` block for that attempt would give it —
+    /// never under attempt 0's, which the crashed attempt's tab still holds.
+    #[test]
+    fn a_redriven_poll_row_runs_under_its_own_claim_discriminator() {
+        let base: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "11111111-1111-1111-1111-111111111111",
+            "initial_prompt": "/x",
+            "anchor_key": "claim:pr:qontinui/qontinui-coord#1",
+        }))
+        .expect("parses");
+        let first_id = continuation_session_id(&base);
+
+        let mut polled = base.clone();
+        assert!(
+            stamp_dispatch_attempt(&mut polled, 1),
+            "raised to the claimed attempt"
+        );
+        assert_eq!(polled.retry_attempt(), 1);
+        assert_ne!(continuation_session_id(&polled), first_id);
+
+        let mut framed = base.clone();
+        framed.retry = Some(ContinuationRetry {
+            attempt: 1,
+            class: "never_started".into(),
+            ..ContinuationRetry::default()
+        });
+        assert_eq!(
+            continuation_session_id(&polled),
+            continuation_session_id(&framed),
+            "a frame and a poll row for one episode derive one id"
+        );
+
+        // Never lowers, and never rewrites a coord block that is already at
+        // or above the claimed attempt.
+        let mut ahead = framed.clone();
+        assert!(!stamp_dispatch_attempt(&mut ahead, 1));
+        assert!(!stamp_dispatch_attempt(&mut ahead, 0));
+        assert_eq!(ahead.retry, framed.retry);
+
+        // A first delivery (attempt 0) is left exactly as it arrived.
+        let mut untouched = base.clone();
+        assert!(!stamp_dispatch_attempt(&mut untouched, 0));
+        assert_eq!(untouched.retry, None);
+        assert_eq!(continuation_session_id(&untouched), first_id);
+
+        // Raising keeps coord's descriptive fields.
+        let mut behind = framed.clone();
+        assert!(stamp_dispatch_attempt(&mut behind, 3));
+        let r = behind.retry.expect("kept");
+        assert_eq!((r.attempt, r.class.as_str()), (3, "never_started"));
     }
 
     /// The lifetime runs to the recorded EXIT, not to whenever the reaper got
@@ -14449,6 +15222,8 @@ mod tests {
                 already_dispatched: 2,
                 not_addressed_to_self: 1,
                 spawn_authorization_denied: 0,
+                sealed_but_relisted: 0,
+                sealed_but_relisted_gate_ids: Vec::new(),
                 fetch_failed: false,
             },
         );
