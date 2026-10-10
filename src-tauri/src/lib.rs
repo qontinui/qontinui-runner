@@ -89,6 +89,11 @@ pub mod fs_perms;
 /// durable `device_id`. The runner bin imports it, and `auth` must consult it
 /// before falling back to its own cache.
 pub mod machine_identity;
+// Proxy resolution and the ONE proxy-aware WebSocket connect (plan
+// `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 4). In the lib
+// beside `coord_ws`, which it serves; the bin's relay and cloud tunnel reach it
+// as `qontinui_runner_lib::outbound_net`.
+pub mod outbound_net;
 pub mod secure_storage;
 /// The machine's tenant pin — moved out of the bin-only `session` tree so the
 /// LIB can read it too (plan

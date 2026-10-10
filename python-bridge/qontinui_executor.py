@@ -13,6 +13,10 @@ The executor acts as a facade, coordinating these modules while maintaining
 the same stdin/stdout protocol for Rust bridge communication.
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import contextlib
 import json
 import logging

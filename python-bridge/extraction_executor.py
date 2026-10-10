@@ -22,6 +22,10 @@ This separation enables concurrent execution because:
 3. Both can run simultaneously without contention
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import asyncio
 import json
 import logging

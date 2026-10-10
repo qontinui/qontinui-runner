@@ -9,6 +9,10 @@ Usage:
     python generate_embeddings.py --project-id <id>
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import argparse
 import asyncio
 import json

@@ -75,7 +75,12 @@ console-subscriber = { version = "0.5.0", optional = true }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 url = "2"
-sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "rustls"] }
+# `native-tls`, not `rustls`: sentry's `rustls` feature pins reqwest 0.12 to
+# `webpki-roots` (bundled Mozilla roots only), so crash reports could never
+# trust a corporate root CA. native-tls reads the OS trust store (plan
+# 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 5;
+# `outbound_net::tls_trust` pins the webpki-roots dependents).
+sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "native-tls"] }
 dirs = "6.0"
 # Without an explicit backend feature the keyring crate compiles a no-op
 # stub that returns Ok(()) from set_password and NoEntry from get_password
@@ -177,6 +182,13 @@ petgraph = "0.6"
 imageproc = "0.25"
 toml = "1"
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+# Proxy matching for the WebSocket transports (`outbound_net`, plan
+# 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 4). The SAME matcher
+# reqwest 0.13 delegates to, at the version reqwest already locks, so HTTP and
+# WebSocket traffic agree about which proxy applies. `client-proxy-system` reads
+# the Windows (WinINet registry) and macOS (SystemConfiguration) system proxy;
+# naming it here keeps that arm compiled in for reqwest too.
+hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-system"] }
 portable-pty = "0.8"
 # VT parser (Paul Williams state machine) used by alacritty/wezterm.
 # Powers per-session terminal grids in `terminal::grid`.
@@ -475,6 +487,13 @@ mut_range_bound = { level = "allow", priority = 2 }
 
 [dev-dependencies]
 tempfile = "3"
+# TLS trust census (`outbound_net::tls_trust` tests): mint a throwaway root and
+# leaf, and serve them over native-tls. All three are already in Cargo.lock
+# transitively (rcgen via adb_client, the TLS pair via tokio-tungstenite), so
+# these edges add no crate to the graph.
+rcgen = "0.14"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 tower = { version = "0.5", features = ["util"] }
 # Deterministic mtime control for tests (e.g. transcript::get_latest_session_id
 # `since` filter coverage). Cross-platform; on Windows wraps SetFileTime.

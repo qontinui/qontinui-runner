@@ -113,6 +113,73 @@ pub struct Profile {
     /// Auth provider configuration.
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    /// Outbound-network settings for a machine behind a corporate proxy. Read
+    /// once, early in `main`, by `outbound_net::apply_profile_environment`,
+    /// which exports them into the runner's own process environment so every
+    /// HTTP client, every WebSocket transport, `git` and the spawned `claude`
+    /// CLI honour them. Absent means "no profile-level proxy"; an operator's
+    /// own `HTTPS_PROXY` / `HTTP_PROXY` always wins over this.
+    #[serde(default)]
+    pub network: Option<NetworkProfile>,
+}
+
+/// The `network` block of a profile (plan
+/// `2026-10-10-spec-front-end-phase-9-generic-boundary`, decision C2).
+///
+/// `Debug` is hand-written: `proxy_url` may carry `user:password@`, and a
+/// profile is `Debug`-printed in diagnostics.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkProfile {
+    /// The HTTP proxy every outbound connection goes through
+    /// (`http://[user:password@]host:port`). Exported as `HTTPS_PROXY` and
+    /// `HTTP_PROXY` when the operator set neither.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Extra `NO_PROXY` entries (comma-separated, curl rules). Loopback is
+    /// always added whether or not this is set.
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    /// A PEM bundle holding the corporate root, for the stacks that cannot
+    /// read the OS trust store. Exported as `NODE_EXTRA_CA_CERTS`, which is
+    /// additive; never as `SSL_CERT_FILE`, which on Linux would REPLACE the OS
+    /// store for the runner and its children.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
+    /// Which trust source the runner points the stacks it CAN steer at.
+    /// Absent means "leave each stack as the machine configured it".
+    #[serde(default)]
+    pub trust: Option<TrustMode>,
+}
+
+impl std::fmt::Debug for NetworkProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkProfile")
+            .field(
+                "proxy_url",
+                &self
+                    .proxy_url
+                    .as_deref()
+                    .map(crate::outbound_net::redact_proxy_url),
+            )
+            .field("no_proxy", &self.no_proxy)
+            .field("ca_bundle", &self.ca_bundle)
+            .field("trust", &self.trust)
+            .finish()
+    }
+}
+
+/// `network.trust` (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`
+/// decision C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustMode {
+    /// The OS trust store — on Windows the runner's `git` is pointed at
+    /// Schannel (`http.sslBackend=schannel`), unless the machine's git config
+    /// already chose a backend or CA file.
+    Os,
+    /// Leave each stack on its own bundle (Git for Windows keeps its OpenSSL
+    /// bundle).
+    Bundled,
 }
 
 /// S3-compatible blob storage settings. `kind` distinguishes MinIO from
@@ -366,6 +433,33 @@ fn api_url_at(path: &std::path::Path, env_active: Option<&str>) -> Option<(Strin
         return None;
     }
     Some((url.to_string(), ApiUrlSource { profile: active }))
+}
+
+/// The active profile's `network` block, with the name of the profile that
+/// supplied it.
+///
+/// `None` when there is no profiles.json, it cannot be parsed, the active
+/// profile is absent, or it carries no `network` block. Read-only and
+/// side-effect free, like [`api_url_with_source`]: it runs in `main` before
+/// logging exists, so it must not try to log.
+pub fn network_with_source() -> Option<(NetworkProfile, String)> {
+    let path = profiles_path()?;
+    network_at(&path, std::env::var("QONTINUI_ENV").ok().as_deref())
+}
+
+/// Path-parameterized core of [`network_with_source`].
+fn network_at(
+    path: &std::path::Path,
+    env_active: Option<&str>,
+) -> Option<(NetworkProfile, String)> {
+    let bytes = std::fs::read(path).ok()?;
+    let file: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
+    let active = env_active
+        .map(str::to_string)
+        .or(file.active)
+        .unwrap_or_else(|| "dev".to_string());
+    let network = file.profiles.get(&active)?.network.clone()?;
+    Some((network, active))
 }
 
 // ============================================================================
@@ -2160,6 +2254,42 @@ mod tests {
         let path = dir.path().join("profiles.json");
         std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn network_block_is_read_from_the_active_profile_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_profiles(
+            &dir,
+            serde_json::json!({
+                "active": "dev",
+                "profiles": {
+                    "dev": {"network": {
+                        "proxy_url": "http://proxy.example.test:3128",
+                        "no_proxy": ".internal.example.test",
+                        "ca_bundle": "/etc/corp/root.pem"
+                    }},
+                    "bundled": {"network": {"trust": "bundled"}},
+                    "bare": {}
+                }
+            }),
+        );
+        let (net, profile) = network_at(&path, None).expect("dev carries a network block");
+        assert_eq!(profile, "dev");
+        assert_eq!(
+            net,
+            NetworkProfile {
+                proxy_url: Some("http://proxy.example.test:3128".into()),
+                no_proxy: Some(".internal.example.test".into()),
+                ca_bundle: Some(std::path::PathBuf::from("/etc/corp/root.pem")),
+                trust: None,
+            }
+        );
+        let (bundled, _) = network_at(&path, Some("bundled")).unwrap();
+        assert_eq!(bundled.trust, Some(TrustMode::Bundled));
+        // QONTINUI_ENV selects a profile without the block: no fallback to dev's.
+        assert_eq!(network_at(&path, Some("bare")), None);
+        assert_eq!(network_at(&dir.path().join("missing.json"), None), None);
     }
 
     #[test]
