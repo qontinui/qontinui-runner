@@ -673,3 +673,47 @@ fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
          `cancelled`, which the `if: failure()` expiry summariser never explains."
     );
 }
+
+#[test]
+fn no_step_after_the_build_half_invokes_cargo_again() {
+    // The run half is not the only place a second cargo invocation pays the
+    // full rebuild. The package is an input to itself (see the `Run Rust tests`
+    // comment), so ANY later cargo invocation in this job finds it Dirty and
+    // recompiles the main crate. That covers `build`, `check` and `clippy` as
+    // well as `test`. This test sees only cargo invocations written in a
+    // step's `run:` body. `Build Tauri app (development)` runs
+    // `pnpm run tauri build`, which calls cargo internally, and no pattern on
+    // the step text can see that. So a pass here does not prove the job has
+    // no second compile. `Live AI extractor smoke` ran `cargo test` there until
+    // this test was added, with no bound of its own and no compile throttle. It stayed
+    // dormant only because its secret is unset. Later steps run the binaries
+    // the build half produced, as the run half does.
+    //
+    // Unnamed steps are checked too. `step_name` returns `None` for them, and
+    // skipping them would let an anonymous `run: cargo test` through.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let start = position(&steps, BUILD) + 1;
+    let mut offenders = Vec::new();
+    for (i, step) in steps.iter().enumerate().skip(start) {
+        let label = step_name(step)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<unnamed step #{i}>"));
+        if step.get("run").is_none() {
+            continue;
+        }
+        let body = command_lines(step, &label);
+        for caps in CARGO_INVOCATION.captures_iter(&body) {
+            offenders.push(format!(
+                "`{label}`: `{}`",
+                caps.get(0).unwrap().as_str().trim()
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these steps invoke cargo after `{BUILD}`, and each one pays a full \
+         recompile of the main crate: {offenders:?}. Recover the binary from \
+         `cargo-test-build.log` and run it directly, as `{RUN}` does."
+    );
+}
