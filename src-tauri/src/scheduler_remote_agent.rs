@@ -183,33 +183,52 @@ pub(crate) fn compose_prompt(prompt: &str, mcp_connections: &[McpConnectionRef])
 /// child EXIT when the task is done — an interactive session would idle at its
 /// prompt forever. `--dangerously-skip-permissions` for the same reason every
 /// autonomous spawn carries it: nobody is at the keyboard to click Allow.
+///
+/// When the operator selected the allow-list session posture
+/// (`settings.claude_session_permission`, plan
+/// `2026-10-09-spec-front-end-of-the-software-factory` D7), bypass is replaced by
+/// `--permission-mode dontAsk` and the tool list: the task's own
+/// `allowed_tools` when it declares any (the narrower intent), else the
+/// operator's list. `--allowedTools` is rendered by the shared
+/// [`allowed_tools_args`](crate::claude_session::launch_spec::allowed_tools_args).
 pub(crate) fn claude_args(
     session_id: &str,
     model: Option<&str>,
     allowed_tools: &[String],
     max_turns: u32,
+    session_permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
 ) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        "--dangerously-skip-permissions".to_string(),
+    use crate::claude_session::launch_spec::{allowed_tools_args, PermissionMode};
+
+    let task_tools = allowed_tools_args(allowed_tools);
+    let (permission, tools_tail) = match session_permission.apply(PermissionMode::DangerouslySkip) {
+        PermissionMode::AllowList { tools } => {
+            let tail = if task_tools.is_empty() {
+                allowed_tools_args(&tools)
+            } else {
+                task_tools
+            };
+            (
+                PermissionMode::AllowList { tools: Vec::new() }.render(),
+                tail,
+            )
+        }
+        other => (other.render(), task_tools),
+    };
+
+    let mut args = vec!["-p".to_string()];
+    args.extend(permission);
+    args.extend([
         "--session-id".to_string(),
         session_id.to_string(),
         "--max-turns".to_string(),
         max_turns.to_string(),
-    ];
+    ]);
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(m.to_string());
     }
-    let tools: Vec<&str> = allowed_tools
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-    if !tools.is_empty() {
-        args.push("--allowedTools".to_string());
-        args.extend(tools.into_iter().map(str::to_string));
-    }
+    args.extend(tools_tail);
     args
 }
 
@@ -296,6 +315,7 @@ pub(crate) async fn launch(
         spec.model.as_deref(),
         &spec.allowed_tools,
         spec.max_turns,
+        &crate::settings::get_claude_session_permission(),
     );
 
     let (mut child, _preconditions) =
@@ -475,7 +495,7 @@ mod tests {
 
     #[test]
     fn args_are_print_mode_bounded_and_pinned() {
-        let args = claude_args("sid-1", None, &[], 200);
+        let args = claude_args("sid-1", None, &[], 200, &Default::default());
         assert_eq!(
             args,
             vec![
@@ -492,7 +512,7 @@ mod tests {
     #[test]
     fn args_carry_model_and_one_token_per_allowed_tool() {
         let tools = vec!["Bash".to_string(), " Read ".to_string(), "".to_string()];
-        let args = claude_args("sid", Some("claude-opus-5"), &tools, 5);
+        let args = claude_args("sid", Some("claude-opus-5"), &tools, 5, &Default::default());
         assert_eq!(
             args,
             vec![
@@ -508,6 +528,38 @@ mod tests {
                 "Bash",
                 "Read"
             ]
+        );
+    }
+
+    #[test]
+    fn allow_list_posture_replaces_bypass_and_prefers_the_task_tools() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let op = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+        };
+        let task = vec!["Bash(git status)".to_string()];
+        let args = claude_args("sid", None, &task, 3, &op);
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--permission-mode",
+                "dontAsk",
+                "--session-id",
+                "sid",
+                "--max-turns",
+                "3",
+                "--allowedTools",
+                "Bash(git status)"
+            ]
+        );
+        assert!(!args.iter().any(|a| a.contains("dangerously")));
+
+        // No task tools: the operator's list applies.
+        let args = claude_args("sid", None, &[], 3, &op);
+        assert_eq!(
+            args[args.len() - 3..].to_vec(),
+            vec!["--allowedTools", "Read", "Grep"]
         );
     }
 
