@@ -1,0 +1,206 @@
+name: Postgres integration tests
+
+# Runs the runner's `pg_integration_tests`-gated tests against a real Postgres.
+# No other workflow enables that feature, so until this job existed the tests
+# that carry the data-safety claims of the boot-time `atlas_managed` move
+# (merge verification, the refused drop, FK repointing, the no-lock steady
+# state) had only ever been run by hand -- plan
+# `2026-09-28-atlas-managed-follow-ups-embedded-provisioning-ci-and-script-hardening`,
+# item 2.
+#
+# The filters name the Postgres-backed modules, and nothing else, so a DB-free
+# test is not run twice:
+#   atlas_managed_move::tests::pg       the boot move / merge / drop
+#   atlas_managed_provision::tests::pg  creating a table an older cluster lacks
+#   provision_lock_tests                concurrent first boots of one database
+#   proposals::tests::pg,               the spec-proposal store (these share
+#   flywheel_dedupes_concurrent_scans   SPEC_PROPOSALS_TEST_LOCK)
+#
+# `spec-authoring` is on because the proposals tests live behind it
+# (spec_api/proposals.rs).
+#
+# The service database is seeded with the bundled `schema.pg.sql.generated`,
+# the same schema a fresh embedded cluster gets, so `PgDb::new` boots against
+# what a user's runner boots against.
+#
+# Triggers: pull_request on the files these tests cover (and this file -- a
+# paths-filtered gate that omits its own path never runs on the PR that edits
+# it; src-tauri/tests/workflow_paths_self_inclusion.rs), a nightly schedule for
+# a change that reaches them from elsewhere, and workflow_dispatch. Not a
+# required check.
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src-tauri/src/database/pg/mod.rs"
+      - "src-tauri/src/database/pg/atlas_managed_move.rs"
+      - "src-tauri/src/database/pg/atlas_managed_provision.rs"
+      - "src-tauri/src/database/pg/spec_proposals.rs"
+      - "src-tauri/src/database/pg/proposal_events.rs"
+      - "src-tauri/src/spec_api/proposals.rs"
+      - "src-tauri/src/flywheel_e2e_tests.rs"
+      - "src-tauri/src/embedded_pg.rs"
+      - "src-tauri/schema.pg.sql.generated"
+      - ".github/workflows/pg-integration-tests.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Cancel only a PR's FIRST attempt; re-runs and non-PR runs get their own group
+# so re-running an older head never cancels the current one.
+# Pattern: qontinui-claude-config#1475 (same as forbid-runner-schema.yml).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The `postgresql_embedded` build script enumerates GitHub releases at
+  # compile time; authenticate it (see ci.yml).
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  pg-tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: qontinui_user
+          POSTGRES_PASSWORD: qontinui_dev_password
+          POSTGRES_DB: qontinui_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qontinui_user -d qontinui_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://qontinui_user:qontinui_dev_password@localhost:5432/qontinui_test
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The one sibling the build needs: src-tauri/Cargo.toml path-depends on
+      # qontinui-schemas/rust. qontinui-web is deliberately NOT checked out --
+      # the database is seeded from the in-repo dump below, never from a clone
+      # (forbid-sibling-clone.yml); ui-bridge only feeds a test not run here.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            postgresql-client
+
+      # Same reclaim as ci.yml's test job: the runner's dep tree plus a swapfile
+      # do not fit the ~14 GB a hosted runner ships free.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+
+      - name: Add swapfile
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # tauri's generate_context! embeds the built frontend.
+      - name: Build frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      # The same transform `embedded_pg::apply_canonical_schema` makes, minus
+      # the vector -> bytea rewrite (this image ships pgvector): every
+      # `CREATE SCHEMA` idempotent, pgcrypto provisioned first.
+      - name: Seed the database with the bundled canonical schema
+        run: |
+          {
+            echo 'CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;'
+            echo 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;'
+            sed 's/^CREATE SCHEMA /CREATE SCHEMA IF NOT EXISTS /' src-tauri/schema.pg.sql.generated
+          } | psql -X -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null
+          psql -X -tA "$DATABASE_URL" \
+            -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'atlas_managed'"
+
+      # One invocation per filter, each single-threaded. The move tests take
+      # the global MOVE_LOCK_KEY session lock, which a concurrent PgDb::new boot
+      # (the other filters) would contend on; the proposals tests share
+      # SPEC_PROPOSALS_TEST_LOCK. Each filter must run at least one test -- a
+      # green invocation that ran nothing is a vacuous pass, not coverage.
+      - name: Run Postgres-backed tests
+        timeout-minutes: 60
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          for filter in \
+            atlas_managed_move::tests::pg \
+            atlas_managed_provision::tests::pg \
+            provision_lock_tests \
+            proposals::tests::pg \
+            flywheel_dedupes_concurrent_scans
+          do
+            echo "::group::$filter"
+            log="$RUNNER_TEMP/pg-tests-${filter//:/_}.log"
+            cargo test --locked --features spec-authoring,pg_integration_tests \
+              --bin qontinui-runner -- "$filter" --test-threads=1 2>&1 | tee "$log"
+            ran="$(grep -oE '^test result: ok\. [0-9]+ passed' "$log" \
+                   | grep -oE '[0-9]+' | head -1)"
+            echo "::endgroup::"
+            if [ "${ran:-0}" -lt 1 ]; then
+              echo "::error::filter '$filter' ran no tests"
+              exit 1
+            fi
+            echo "$filter: ${ran} passed"
+          done
