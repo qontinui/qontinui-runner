@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 import { ListTree, RefreshCw, TerminalSquare } from "lucide-react";
 
 import {
@@ -52,7 +53,7 @@ export function ProviderLaunchMenu({
       setProfiles(roster);
       setRosterError(null);
     } catch (e) {
-      setRosterError(e instanceof Error ? e.message : String(e));
+      setRosterError(describeThrown(e, "Could not read the CLI profiles"));
       return;
     }
     setAvailability({});
@@ -69,7 +70,7 @@ export function ProviderLaunchMenu({
         setAvailability((prev) => ({ ...prev, [profile.id]: null }));
         setProbeErrors((prev) => ({
           ...prev,
-          [profile.id]: e instanceof Error ? e.message : String(e),
+          [profile.id]: describeThrown(e, "Availability probe failed"),
         }));
       }
       // A CLI auto-update can take its binary off PATH for a moment: an

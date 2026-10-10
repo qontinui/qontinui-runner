@@ -60,7 +60,7 @@ import { Send, ShieldAlert, Square } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
-import { cn } from "@/lib/utils";
+import { cn, describeThrown } from "@/lib/utils";
 import {
   useAiSession,
   type SendMessageOutcome,
@@ -774,7 +774,7 @@ function useSessionPermissions(sessionId: string) {
       .catch((e: unknown) => {
         if (disposed) return;
         setReadStatus("failed");
-        setReadError(e instanceof Error ? e.message : String(e));
+        setReadError(describeThrown(e, "Pending permission read failed"));
       });
     return () => {
       disposed = true;
@@ -798,7 +798,7 @@ function useSessionPermissions(sessionId: string) {
         resolvedIdsRef.current.add(requestId);
         setRequests((list) => removePermissionRequest(list, requestId));
       } catch (e) {
-        setAnswerError({ id: requestId, error: e instanceof Error ? e.message : String(e) });
+        setAnswerError({ id: requestId, error: describeThrown(e, "Permission answer failed") });
       } finally {
         setBusyIds((ids) => {
           const next = new Set(ids);
