@@ -1434,14 +1434,7 @@ impl ClaudeSession {
         self.isolated_edit_ctx
             .lock()
             .ok()
-            .and_then(|slot| {
-                slot.as_ref().map(|ctx| {
-                    ctx.worktrees
-                        .iter()
-                        .map(|w| w.worktree_path.clone())
-                        .collect()
-                })
-            })
+            .and_then(|slot| slot.as_ref().map(parked_worktree_paths))
             .unwrap_or_default()
     }
 
@@ -2201,6 +2194,19 @@ impl std::fmt::Debug for ClaudeSession {
             .field("user_interacted", &self.has_user_interacted())
             .finish()
     }
+}
+
+/// The projection [`ClaudeSession::isolated_worktree_paths`] applies to a parked
+/// context: every materialized worktree path, in order. A free function so the
+/// snapshot loop in `SessionManager::task_run_id_for_workdir` can be tested
+/// against real contexts without a live `ClaudeSession`.
+pub(crate) fn parked_worktree_paths(
+    ctx: &crate::agent_worktree::isolated_edit::IsolatedEditContext,
+) -> Vec<PathBuf> {
+    ctx.worktrees
+        .iter()
+        .map(|w| w.worktree_path.clone())
+        .collect()
 }
 
 #[cfg(test)]
