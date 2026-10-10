@@ -1058,6 +1058,117 @@
       "id": "review-send-preview",
       "name": "Review Send Preview",
       "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The fan-out form renders inside the prompt modal.",
+          "enabled": true,
+          "id": "term-fanout-preview-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.fanout-preview"
+            },
+            "label": "FanoutPanel container",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The matrix input is present.",
+          "enabled": true,
+          "id": "term-fanout-preview-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.fanout-matrix"
+            },
+            "label": "Fan-out matrix field",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The Create button is present (enabled only when every ticked row is clean).",
+          "enabled": true,
+          "id": "term-fanout-preview-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.fanout-create"
+            },
+            "label": "Fan-out Create button",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The prompt-library modal in fan-out mode (`/fanout`, or \"Fan out…\" beside Start/Insert/Copy). One prompt template × a matrix (`axis:v1,v2;axis:v1,v2`, zip or product) renders a preview row per member — title, rendered prompt (expandable), missing parameters, errors/warnings and a per-member collision probe — with max-concurrent, account policy (best headroom per member or one fixed account), title template and working directory. Rows can be unticked; Create is disabled while any ticked row has an error or a missing parameter, and posts exactly the ticked rows to the runner's `POST /fanout`. Plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out Phase 7. Conditional state: the prompt modal is open in fan-out mode (/fanout, or \"Fan out…\" in /prompt) with a template selected — not rendered on the base terminal page, so it cannot match in a default snapshot (annotation pending the expectedConditionalStates baseline-waiver mechanism, plan §7).",
+      "id": "term-fanout-preview",
+      "metadata": {
+        "conditionalOn": "the prompt modal is open in fan-out mode (/fanout, or \"Fan out…\" in /prompt) with a template selected"
+      },
+      "name": "Prompt Fan-Out Preview",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The fan-out strip renders while a run is active (or the scheduler is UNKNOWN).",
+          "enabled": true,
+          "id": "term-fanout-running-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.fanout-strip"
+            },
+            "label": "FanoutStrip",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Each active run renders an expandable pill (matched by `data-fanout-part=run-toggle`; its id is suffixed per run).",
+          "enabled": true,
+          "id": "term-fanout-running-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "fanout-part": "run-toggle"
+              }
+            },
+            "label": "Fan-out run pill",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "While a fan-out run is active the status strip shows one pill per run — `run <slug> — N running · M queued · K refused (<reason>)` — fed by the runner's `fanout-changed` event with a `GET /fanout` poll as fallback. It expands to the member list with Cancel-queued, Release-slot (admitted members) and max-concurrent ± controls. An unreadable scheduler renders `fan-out UNKNOWN — <error>` instead of an empty strip; with no active runs nothing renders. Plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out Phase 7. Conditional state: a fan-out run is active (POST /fanout created one and it has a queued or admitted member), or GET /fanout is unreadable — not rendered on the base terminal page, so it cannot match in a default snapshot (annotation pending the expectedConditionalStates baseline-waiver mechanism, plan §7).",
+      "id": "term-fanout-running",
+      "metadata": {
+        "conditionalOn": "a fan-out run is active (POST /fanout created one and it has a queued or admitted member), or GET /fanout is unreadable"
+      },
+      "name": "Prompt Fan-Out Running",
+      "source": "ai-generated"
     }
   ],
   "metadata": {
@@ -1402,6 +1513,41 @@
         "id": "review-send-preview",
         "isInitial": false,
         "name": "Review Send Preview",
+        "transitions": []
+      },
+      {
+        "description": "The prompt-library modal in fan-out mode (`/fanout`, or \"Fan out…\" beside Start/Insert/Copy). One prompt template × a matrix (`axis:v1,v2;axis:v1,v2`, zip or product) renders a preview row per member — title, rendered prompt (expandable), missing parameters, errors/warnings and a per-member collision probe — with max-concurrent, account policy (best headroom per member or one fixed account), title template and working directory. Rows can be unticked; Create is disabled while any ticked row has an error or a missing parameter, and posts exactly the ticked rows to the runner's `POST /fanout`. Plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out Phase 7.",
+        "elements": [
+          {
+            "id": "terminal.fanout-preview"
+          },
+          {
+            "id": "terminal.fanout-matrix"
+          },
+          {
+            "id": "terminal.fanout-create"
+          }
+        ],
+        "id": "term-fanout-preview",
+        "isInitial": false,
+        "name": "Prompt Fan-Out Preview",
+        "transitions": []
+      },
+      {
+        "description": "While a fan-out run is active the status strip shows one pill per run — `run <slug> — N running · M queued · K refused (<reason>)` — fed by the runner's `fanout-changed` event with a `GET /fanout` poll as fallback. It expands to the member list with Cancel-queued, Release-slot (admitted members) and max-concurrent ± controls. An unreadable scheduler renders `fan-out UNKNOWN — <error>` instead of an empty strip; with no active runs nothing renders. Plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out Phase 7.",
+        "elements": [
+          {
+            "id": "terminal.fanout-strip"
+          },
+          {
+            "dataAttributes": {
+              "fanout-part": "run-toggle"
+            }
+          }
+        ],
+        "id": "term-fanout-running",
+        "isInitial": false,
+        "name": "Prompt Fan-Out Running",
         "transitions": []
       }
     ]

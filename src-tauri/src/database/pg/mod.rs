@@ -31,6 +31,7 @@ pub mod error_monitor;
 pub mod event_log;
 pub mod event_search;
 pub mod export;
+pub mod fanout;
 pub mod findings;
 pub mod flows;
 pub mod generation;
@@ -1161,6 +1162,16 @@ impl PgDb {
         conn.batch_execute(session_review::SESSION_REVIEW_DDL)
             .await
             .map_err(|e| format!("session review schema self-heal failed: {}", e))?;
+
+        // The fan-out dispatcher's ledger (plan
+        // `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`,
+        // Phase 6): runner-native `project.fanout_runs` / `project.fanout_members`,
+        // same self-heal idiom as `orchestration.*` above. NOT part of
+        // `MACHINE_LOCAL_TABLES_DDL` below, which is the re-homed-from-coord
+        // inventory a test pins to its list.
+        conn.batch_execute(fanout::FANOUT_TABLES_DDL)
+            .await
+            .map_err(|e| format!("fan-out ledger self-heal failed: {}", e))?;
 
         // P3 of plan
         // `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`:

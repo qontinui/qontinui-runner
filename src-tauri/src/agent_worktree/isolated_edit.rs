@@ -338,6 +338,254 @@ impl IsolatedEditContext {
     pub(crate) fn session_id(&self) -> Option<uuid::Uuid> {
         self.active_claims.first().and_then(|c| c.agent_session_id)
     }
+
+    /// What it takes to hand this context's allocation back if the spawn it
+    /// was acquired for never starts a session. Captured BEFORE the context is
+    /// moved into the spawn seam, which consumes it either way.
+    pub(crate) fn handback(&self) -> AllocationHandback {
+        AllocationHandback {
+            coord_http_base: self.coord_http_base.clone(),
+            device_id: self.device_id,
+            worktrees: self
+                .worktrees
+                .iter()
+                .map(|w| (w.worktree_path.clone(), w.branch.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// The hand-back of an allocation whose session never started (plan
+/// `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`,
+/// review fix 1).
+///
+/// Dropping an [`IsolatedEditContext`] releases its coord CLAIMS but leaves
+/// the materialized worktree on disk and its `coord.agent_worktrees` row
+/// `allocated` — correct for a session that ran (the reclaim engine judges
+/// its work), and a leak for one that never started: an autonomous spawner
+/// that retries a refusal would mint one orphaned allocation per attempt.
+/// [`Self::abandon`] removes each worktree this allocation created and posts
+/// `worktree-done {branch, abandoned: true}` for it — coord's own retire door,
+/// the one `allocate-worktree.sh --done --abandon` uses.
+#[derive(Debug, Clone)]
+pub(crate) struct AllocationHandback {
+    coord_http_base: String,
+    device_id: uuid::Uuid,
+    /// `(worktree_path, branch)` per materialized repo.
+    worktrees: Vec<(PathBuf, String)>,
+}
+
+impl AllocationHandback {
+    /// Remove every worktree this allocation created and retire its ledger
+    /// row(s). Best-effort and logged: a failure leaves the worktree to the
+    /// reclaim engine, exactly where a dropped context leaves it today.
+    ///
+    /// Only call this when NO session ever ran in the worktree — the caller's
+    /// spawn returned an error before a PTY child existed.
+    pub(crate) async fn abandon(self, why: &str) {
+        let targets = abandon_targets(&self.worktrees, |p| {
+            super::canonical_paths::allocated_worktree_for_path(p)
+                .is_some_and(|root| super::canonical_paths::paths_equal(&root, p))
+        });
+        for path in targets.paths {
+            let shown = path.display().to_string();
+            match tokio::task::spawn_blocking(move || unlink_links_then_remove(&path)).await {
+                Ok(Ok(unlinked)) => info!(worktree = %shown, why = %why, unlinked,
+                    "isolated_edit: abandoned an unused worktree — removed"),
+                Ok(Err(e)) => warn!(worktree = %shown, error = %e,
+                    "isolated_edit: could not remove an unused worktree — left for reclaim"),
+                Err(e) => warn!(worktree = %shown, error = %e,
+                    "isolated_edit: worktree removal task failed — left for reclaim"),
+            }
+        }
+        let Some(client) = crate::coord_http::coord_client() else {
+            warn!("isolated_edit: no shared coord client — allocation left for reclaim");
+            return;
+        };
+        for branch in targets.branches {
+            let url = format!(
+                "{}/coord/worktree-done/{}",
+                self.coord_http_base.trim_end_matches('/'),
+                self.device_id
+            );
+            let body = serde_json::json!({ "branch": branch, "abandoned": true });
+            match client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    match worktree_done_verdict(status.is_success(), &text) {
+                        WorktreeDoneVerdict::Retired { abandoned } => info!(branch = %branch,
+                            abandoned, why = %why,
+                            "isolated_edit: coord retired an unused allocation"),
+                        WorktreeDoneVerdict::Refused { abandoned, reason } => warn!(
+                            branch = %branch, abandoned, abandon_refused = %reason,
+                            "isolated_edit: coord did not retire all of an unused allocation — \
+                             the rest is left for reclaim"),
+                        WorktreeDoneVerdict::Unconfirmed => warn!(branch = %branch,
+                            status = status.as_u16(), response = %text,
+                            "isolated_edit: worktree-done {{abandoned}} answered without \
+                             confirming the retirement — UNKNOWN, left for reclaim"),
+                    }
+                }
+                Err(e) => warn!(branch = %branch, error = %e,
+                    "isolated_edit: worktree-done {{abandoned}} not delivered — left for reclaim"),
+            }
+        }
+    }
+}
+
+/// What coord's `worktree-done {abandoned: true}` answer says happened
+/// (`AgentDoneOutcome` in qontinui-coord `agent_worktrees.rs`). `abandoned` is
+/// the retire UPDATE's own row count and `abandon_refused` why it was not
+/// more; the two are independent, so both are read.
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreeDoneVerdict {
+    /// Rows retired, with no refusal.
+    Retired { abandoned: u64 },
+    /// A refusal reason — with whatever was retired anyway (a partial retire,
+    /// or 0).
+    Refused { abandoned: u64, reason: String },
+    /// A non-2xx, an unparseable body, or a body without `abandoned`. A post
+    /// that landed is not a retirement coord confirmed.
+    Unconfirmed,
+}
+
+fn worktree_done_verdict(success: bool, body: &str) -> WorktreeDoneVerdict {
+    if !success {
+        return WorktreeDoneVerdict::Unconfirmed;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return WorktreeDoneVerdict::Unconfirmed;
+    };
+    let Some(abandoned) = v.get("abandoned").and_then(serde_json::Value::as_u64) else {
+        return WorktreeDoneVerdict::Unconfirmed;
+    };
+    match v.get("abandon_refused").and_then(serde_json::Value::as_str) {
+        Some(reason) => WorktreeDoneVerdict::Refused {
+            abandoned,
+            reason: reason.to_string(),
+        },
+        None if abandoned > 0 => WorktreeDoneVerdict::Retired { abandoned },
+        // Zero retired and no reason: nothing says the row moved.
+        None => WorktreeDoneVerdict::Unconfirmed,
+    }
+}
+
+/// Remove an unused worktree under reclaim's INV-W4 rule: every link inside it
+/// (a `node_modules` / `target` junction on Windows, a symlink elsewhere) is
+/// unlinked — the link only, never what it points at — BEFORE the recursive
+/// remove, so the delete cannot follow one into the canonical tree. The walk
+/// never descends into a link. A tree that cannot be fully walked, or a link
+/// that cannot be unlinked, refuses the removal: an unmeasured tree is not a
+/// measured absence of links. Returns how many links were unlinked.
+///
+/// Two refusals run BEFORE anything is walked or unlinked, so a refused path
+/// is left exactly as it was found: the root itself being a link (junction or
+/// symlink — the walk would read, and unlink inside, whatever it points at),
+/// and the clone-rootness probe (INV-W5 — a real clone, or one that cannot be
+/// measured, is never touched, not merely never deleted).
+fn unlink_links_then_remove(path: &Path) -> Result<usize, String> {
+    // Before `exists()`, which follows a link: a dangling link root is still a
+    // link, not an absent worktree.
+    if super::census::is_junction(path) {
+        return Err(format!(
+            "refusing to remove {} — the worktree root is itself a link (junction or \
+             symlink); walking it would unlink entries inside its target (INV-W4)",
+            path.display()
+        ));
+    }
+    if !path.exists() {
+        return Ok(0);
+    }
+    match super::census::probe_clone_rootness(path) {
+        super::census::CloneRootness::NotCloneRoot => {}
+        super::census::CloneRootness::CloneRoot => {
+            return Err(format!(
+                "refusing to remove {} — `.git` is a DIRECTORY, so this is a real clone, \
+                 not a linked worktree (INV-W5); nothing was unlinked",
+                path.display()
+            ));
+        }
+        super::census::CloneRootness::Undetermined => {
+            return Err(format!(
+                "refusing to remove {} — could not determine whether it is a real clone \
+                 (INV-W5); nothing was unlinked",
+                path.display()
+            ));
+        }
+    }
+    let links = links_under(path)?;
+    for link in &links {
+        super::census::remove_link(link).map_err(|e| {
+            format!(
+                "refusing to remove {} — could not unlink {} first (INV-W4): {e}",
+                path.display(),
+                link.display()
+            )
+        })?;
+    }
+    super::reclaim::remove_worktree(path)?;
+    Ok(links.len())
+}
+
+/// Every link (reparse point / symlink) under `root`, without following any.
+fn links_under(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut links = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("could not walk {} for links: {e}", dir.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("could not walk {} for links: {e}", dir.display()))?;
+            let p = entry.path();
+            if super::census::is_junction(&p) {
+                links.push(p);
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&p)
+                .map_err(|e| format!("could not stat {}: {e}", p.display()))?;
+            if meta.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    Ok(links)
+}
+
+/// Which of an allocation's worktrees [`AllocationHandback::abandon`] may
+/// touch. Pure, so the guard is testable without a disk or coord.
+#[derive(Debug, Default, PartialEq)]
+struct AbandonTargets {
+    paths: Vec<PathBuf>,
+    branches: Vec<String>,
+}
+
+/// Only a worktree that IS an agent allocation root on a reserved `agent/`
+/// branch: a `shared_branch` row points at the canonical checkout on a real
+/// branch, and `worktree-done` matches by branch across the whole device, so
+/// handing that back could reach another session's row.
+fn abandon_targets(
+    worktrees: &[(PathBuf, String)],
+    is_allocation_root: impl Fn(&Path) -> bool,
+) -> AbandonTargets {
+    let mut out = AbandonTargets::default();
+    for (path, branch) in worktrees {
+        if !branch.starts_with("agent/") || !is_allocation_root(path) {
+            continue;
+        }
+        out.paths.push(path.clone());
+        if !out.branches.contains(branch) {
+            out.branches.push(branch.clone());
+        }
+    }
+    out
 }
 
 /// Inputs for [`acquire`]. `repos` are bare slugs (e.g.
@@ -1337,6 +1585,177 @@ impl IsolatedEditContext {
 
 #[cfg(test)]
 mod tests {
+    /// An unused allocation is handed back only where it is provably this
+    /// allocation's own: an allocation root on a reserved `agent/` branch. A
+    /// `shared_branch` row (the canonical checkout, on a real branch) is never
+    /// removed or retired, and siblings sharing one branch retire it once.
+    #[test]
+    fn handback_touches_only_allocation_roots_on_agent_branches() {
+        use std::path::{Path, PathBuf};
+        let wt = |p: &str, b: &str| (PathBuf::from(p), b.to_string());
+        let worktrees = vec![
+            wt("/ws/agent-worktrees/a1/qontinui-runner", "agent/m-a1"),
+            wt("/ws/agent-worktrees/a1/qontinui-schemas", "agent/m-a1"),
+            wt("/ws/qontinui-web", "feat/shared"),
+            wt("/ws/agent-worktrees/a1/not-a-root/sub", "agent/m-a1"),
+        ];
+        let is_root = |p: &Path| p.starts_with("/ws/agent-worktrees") && !p.ends_with("sub");
+        let got = super::abandon_targets(&worktrees, is_root);
+        assert_eq!(
+            got.paths,
+            vec![
+                PathBuf::from("/ws/agent-worktrees/a1/qontinui-runner"),
+                PathBuf::from("/ws/agent-worktrees/a1/qontinui-schemas"),
+            ]
+        );
+        assert_eq!(got.branches, vec!["agent/m-a1".to_string()]);
+        // A root on a non-agent branch is still refused.
+        let odd = vec![wt("/ws/agent-worktrees/a2/qontinui-runner", "main")];
+        assert_eq!(super::abandon_targets(&odd, |_| true), Default::default());
+    }
+
+    /// INV-W4 on the hand-back: a link inside the worktree is unlinked, never
+    /// followed — what it points at survives the removal.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_unlinks_links_before_removing_and_never_follows_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical-node_modules");
+        std::fs::create_dir_all(canonical.join("pkg")).unwrap();
+        std::fs::write(canonical.join("pkg").join("index.js"), b"keep me").unwrap();
+        let wt = dir
+            .path()
+            .join("agent-worktrees")
+            .join("a1")
+            .join("qontinui-web");
+        std::fs::create_dir_all(wt.join("frontend")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        std::os::unix::fs::symlink(&canonical, wt.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(&canonical, wt.join("frontend").join("node_modules")).unwrap();
+
+        let unlinked = super::unlink_links_then_remove(&wt).expect("removable");
+        assert_eq!(unlinked, 2);
+        assert!(!wt.exists(), "the worktree is removed");
+        assert!(
+            canonical.join("pkg").join("index.js").exists(),
+            "the canonical tree a link pointed at must survive"
+        );
+    }
+
+    /// A root that is itself a link is refused before anything is walked: the
+    /// links inside its TARGET are never unlinked, and the target survives.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_refuses_a_root_that_is_a_link_before_unlinking_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical-node_modules");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let target = dir.path().join("real-tree");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        std::os::unix::fs::symlink(&canonical, target.join("node_modules")).unwrap();
+        let root = dir.path().join("qontinui-web");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+
+        let verdict = super::unlink_links_then_remove(&root);
+        assert!(
+            matches!(verdict, Err(ref e) if e.contains("itself a link")),
+            "{verdict:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(target.join("node_modules")).is_ok(),
+            "a link inside the root's target must not be unlinked"
+        );
+        assert!(target.exists() && root.exists());
+
+        // A DANGLING link root is still a link, never "already gone".
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(super::unlink_links_then_remove(&dangling).is_err());
+    }
+
+    /// INV-W5 runs BEFORE the unlink walk: a real clone (`.git` a directory)
+    /// is refused with its links still in place, not unlinked and then refused.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_probes_clone_rootness_before_unlinking_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical-node_modules");
+        std::fs::create_dir_all(&canonical).unwrap();
+        let clone = dir.path().join("qontinui-web");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&canonical, clone.join("node_modules")).unwrap();
+
+        let verdict = super::unlink_links_then_remove(&clone);
+        assert!(
+            matches!(verdict, Err(ref e) if e.contains("INV-W5")),
+            "{verdict:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(clone.join("node_modules"))
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the clone's link must still be there"
+        );
+        assert!(clone.join(".git").is_dir());
+    }
+
+    /// A tree that cannot be walked is not removed.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_refuses_a_tree_it_cannot_walk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("qontinui-web");
+        let locked = wt.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let verdict = super::unlink_links_then_remove(&wt);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            eprintln!("skipping: this process can read a mode-000 directory (root?)");
+            return;
+        }
+        assert!(verdict.is_err(), "an unwalkable tree must not be removed");
+        assert!(wt.exists());
+    }
+
+    /// The worktree-done answer is logged as what coord said, not as "posted".
+    #[test]
+    fn worktree_done_answer_is_read_not_assumed() {
+        use super::{worktree_done_verdict as v, WorktreeDoneVerdict as W};
+        let body = |abandoned: u64, refused: Option<&str>| {
+            serde_json::json!({
+                "matched": 1, "statuses": ["allocated"],
+                "abandoned": abandoned, "abandon_refused": refused,
+            })
+            .to_string()
+        };
+        assert_eq!(v(true, &body(1, None)), W::Retired { abandoned: 1 });
+        // Independent fields: a refusal with nothing retired (the common
+        // all-sighted case), and a partial retire.
+        assert_eq!(
+            v(true, &body(0, Some("sighted_on_disk"))),
+            W::Refused {
+                abandoned: 0,
+                reason: "sighted_on_disk".to_string()
+            }
+        );
+        assert_eq!(
+            v(true, &body(1, Some("partial"))),
+            W::Refused {
+                abandoned: 1,
+                reason: "partial".to_string()
+            }
+        );
+        assert_eq!(v(true, &body(0, None)), W::Unconfirmed);
+        assert_eq!(v(true, r#"{"ok":true}"#), W::Unconfirmed);
+        assert_eq!(v(true, "not json"), W::Unconfirmed);
+        assert_eq!(v(false, &body(1, None)), W::Unconfirmed);
+    }
+
     /// Plan `2026-09-23-conductor-e2e-phase1-defects` Phase 1 regression: the
     /// worker path's typed `wait` must not change the terminal policy. An
     /// operator's shell still opens in its own cwd on `wait`, on any other

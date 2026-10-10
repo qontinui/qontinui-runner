@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useMemo, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { homeDir } from "@tauri-apps/api/path";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
@@ -12,12 +13,13 @@ import { useTenant } from "@/contexts/TenantContext";
 import { useAuth } from "../AuthProvider";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { DocFinderModal } from "./DocFinderModal";
-import { PromptModal } from "./PromptModal";
+import { PromptModal, type PromptModalMode } from "./PromptModal";
+import type { FanoutModalContext } from "./FanoutPanel";
 import { usePromptLibrary } from "./usePromptLibrary";
 import { usePromptLibraryCommands } from "./commands/usePromptLibraryCommands";
 import { deliverApprovals } from "./approveAll";
 import { writeToTerminalById } from "./writeToTerminalById";
-import { buildSessionCloseRecord } from "./useTerminalManager";
+import { buildSessionCloseRecord, resolveSpawnWorkingDir } from "./useTerminalManager";
 import { buildTerminalSessionRoster } from "./terminalSessionRoster";
 import { compareByUsageHeadroom } from "../settings/types";
 import { ZoneMinimap } from "./ZoneMinimap";
@@ -588,6 +590,25 @@ function TerminalPageInner({
   // prompt when a dynamic `/<slug>` command with parameters opens it.
   const [showPrompt, setShowPrompt] = useState(false);
   const [promptFocusSlug, setPromptFocusSlug] = useState<string | null>(null);
+  // `/fanout` opens the same modal in fan-out mode (plan
+  // 2026-09-20-…-prompt-matrix-fan-out Phase 7).
+  const [promptModalMode, setPromptModalMode] = useState<PromptModalMode>("prompt");
+  // The home dir: where a normal launch opens when the page has no default
+  // working dir (`TerminalSession::spawn` falls back to it). Resolved once;
+  // `null` until it answers, and the fan-out field then waits for the
+  // operator rather than inventing a path.
+  const [homeDirPath, setHomeDirPath] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    homeDir()
+      .then((dir) => {
+        if (!cancelled) setHomeDirPath(dir);
+      })
+      .catch((err) => logger.warn("homeDir() failed; fan-out working dir has no default:", err));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional sync: drop stale dismissals whenever fileLockStates changes so the banner re-shows on a fresh waiter wave (count 0 → 1 after a "Hold" click). The same React-rules exception pattern is used at lib/runner-api.ts:61 / :79 for the port-listener sync.
     setDismissedBanners((prev) => {
@@ -1187,6 +1208,9 @@ function TerminalPageInner({
     // deferred context write — would otherwise be handed a tab that is gone.
     const launchedTabIds: string[] = [];
     if (createdTabIds.length > 0) {
+      // Inside the async launch handler, which only ever runs from an
+      // operator action or a command — never during render.
+      // eslint-disable-next-line react-hooks/purity -- not a render path; see above
       const spawnAt = Date.now();
       for (const tabId of createdTabIds) {
         // Fresh uuid per tab/retype (a reused --session-id fails loudly) —
@@ -1271,9 +1295,41 @@ function TerminalPageInner({
    */
   const openPromptModal = (focusSlug?: string): { changed: boolean } => {
     setPromptFocusSlug(focusSlug ?? null);
-    const wasOpen = showPrompt;
+    const wasOpen = showPrompt && promptModalMode === "prompt";
+    setPromptModalMode("prompt");
     setShowPrompt(true);
     return { changed: !wasOpen };
+  };
+
+  /** Open the prompt modal in fan-out mode; `changed` as for `openPromptModal`. */
+  const openFanoutModal = (focusSlug?: string): { changed: boolean } => {
+    setPromptFocusSlug(focusSlug ?? null);
+    const wasOpen = showPrompt && promptModalMode === "fanout";
+    setPromptModalMode("fanout");
+    setShowPrompt(true);
+    return { changed: !wasOpen };
+  };
+
+  // What the fan-out mode needs from this page: the SAME account order
+  // `spawnWithPromptText` uses (configured accounts, best headroom first), the
+  // SAME working dir a normal launch opens in (`resolveSpawnWorkingDir`, then
+  // the home dir the PTY spawn falls back to), and the tenant a normal launch
+  // would stamp.
+  const fanoutContext: FanoutModalContext = {
+    accounts: [...spawnAccounts].sort(compareByUsageHeadroom).map((a) => ({
+      configDir: a.config_dir,
+      label:
+        a.label ||
+        (a.config_dir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? a.config_dir),
+    })),
+    defaultWorkingDir:
+      resolveSpawnWorkingDir(undefined, session.defaultWorkingDir) ?? homeDirPath ?? "",
+    tenantId: resolveTenantForSpawn() ?? null,
+    onCreated: (runId) =>
+      workflowGen.setNotification({
+        message: `Fan-out run ${runId.slice(0, 8)} created — progress is in the status strip`,
+        type: "success",
+      }),
   };
 
   // Spawn a fresh AI session with the rendered prompt auto-typed. Account
@@ -1377,6 +1433,7 @@ function TerminalPageInner({
   usePromptLibraryCommands({
     prompts: promptLibrary.prompts,
     openPromptModal,
+    openFanoutModal,
     spawnWithText: spawnWithPromptText,
     insertIntoFocused: (text) => {
       if (!activeId) return false;
@@ -1452,6 +1509,11 @@ function TerminalPageInner({
         )}
         {showPrompt && (
           <PromptModal
+            // Keyed on the mode so `/fanout` over an open single-session modal
+            // actually switches it (the modal reads its mode once, at mount).
+            key={promptModalMode}
+            initialMode={promptModalMode}
+            fanout={fanoutContext}
             prompts={promptLibrary.prompts}
             auth={promptLibrary.auth}
             reason={promptLibrary.reason}

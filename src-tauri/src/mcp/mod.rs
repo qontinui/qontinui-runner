@@ -75,6 +75,7 @@ pub mod envelope_audit;
 pub mod error_monitor;
 pub mod executor;
 pub mod extraction;
+pub mod fanout;
 pub mod file_browser;
 pub mod file_registry;
 pub mod findings_api;

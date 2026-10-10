@@ -2962,6 +2962,19 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// [`Self::get`], but a poisoned lock is an `Err` rather than `None`: a
+    /// caller that reads "no record" as "the session is gone" (the fan-out
+    /// dispatcher releasing a slot) must not read an unreadable store as one.
+    pub fn get_checked(
+        &self,
+        claude_session_id: &str,
+    ) -> Result<Option<TerminalSessionRecord>, String> {
+        self.map
+            .lock()
+            .map(|m| m.get(claude_session_id).cloned())
+            .map_err(|e| format!("session_lifecycle_store: lock poisoned: {e}"))
+    }
+
     /// Clone of every record whose `state == "open"`.
     pub fn open_records(&self) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {

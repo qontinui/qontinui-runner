@@ -618,7 +618,10 @@ pub(crate) fn spawn_resumed_pane(
         capture_hint,
         Some(spec.page_id),
         spec.resource_override,
+        // Unchanged from before the seam took a tenant: the device default.
+        None,
     )
+    .map_err(String::from)
 }
 
 /// The full PTY-child argv of the `--resume` respawn. With no operator launch

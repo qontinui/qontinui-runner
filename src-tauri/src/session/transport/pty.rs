@@ -92,7 +92,7 @@ impl Transport for PtyTransport {
                 // No tenant choice on this transport.
                 None,
             )
-            .map_err(TransportError::Runtime)?;
+            .map_err(|e| TransportError::Runtime(e.into()))?;
 
         Ok(TransportHandle::Pty {
             terminal_id: info.id,

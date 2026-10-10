@@ -1566,6 +1566,73 @@ pub struct IdleQuiescence {
     pub lines: Vec<String>,
 }
 
+/// Why a terminal could not be created — and whether a PTY child ever existed.
+///
+/// The distinction is load-bearing for a caller that acquired something FOR
+/// the child (an isolated worktree): only a [`CreateError::BeforeChild`]
+/// refusal proves nothing ever ran there, so only that variant licenses
+/// handing the allocation back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateError {
+    /// Refused before any child process existed (resource gate, PTY open,
+    /// identity seam, trust gate, the spawn call itself failing).
+    BeforeChild(String),
+    /// A child was spawned and the session around it could not be built; the
+    /// child was killed before this error was returned (best-effort: a kill
+    /// that could not be confirmed is logged).
+    ChildKilled(String),
+}
+
+impl CreateError {
+    /// The refusal or failure text.
+    pub fn message(&self) -> &str {
+        match self {
+            CreateError::BeforeChild(m) | CreateError::ChildKilled(m) => m,
+        }
+    }
+
+    /// Whether a child process existed at any point.
+    pub fn child_spawned(&self) -> bool {
+        matches!(self, CreateError::ChildKilled(_))
+    }
+}
+
+impl std::fmt::Display for CreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<CreateError> for String {
+    fn from(e: CreateError) -> Self {
+        match e {
+            CreateError::BeforeChild(m) | CreateError::ChildKilled(m) => m,
+        }
+    }
+}
+
+/// How long [`kill_child_on_err`] may spend confirming the kill.
+const ORPHAN_KILL_BUDGET: Duration = Duration::from_secs(5);
+
+/// A session build that failed AFTER its child was spawned must not leave the
+/// child running with nothing tracking it: kill it, then report
+/// [`CreateError::ChildKilled`].
+pub(crate) fn kill_child_on_err<T>(
+    built: Result<T, String>,
+    io: &dyn PaneIo,
+    terminal_id: &str,
+) -> Result<T, CreateError> {
+    built.map_err(|why| {
+        if let Err(e) = io.kill(ORPHAN_KILL_BUDGET) {
+            warn!(terminal_id = %terminal_id, error = %e,
+                "terminal: could not confirm the kill of a child whose session failed to build");
+        }
+        warn!(terminal_id = %terminal_id, error = %why,
+            "terminal: session build failed after its child was spawned — child killed");
+        CreateError::ChildKilled(why)
+    })
+}
+
 impl TerminalSession {
     /// Spawn a new terminal session with a shell process.
     ///
@@ -1608,7 +1675,7 @@ impl TerminalSession {
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CreateError> {
         // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
         // leaves no half-built session behind and nothing already running is
         // touched. Below the warn floor this emits a notice and returns
@@ -1619,9 +1686,10 @@ impl TerminalSession {
             "terminal session",
             resource_override,
             Some(&app_handle),
-        )?;
+        )
+        .map_err(CreateError::BeforeChild)?;
 
-        let opened = LocalPty::open(&id, cols, rows)?;
+        let opened = LocalPty::open(&id, cols, rows).map_err(CreateError::BeforeChild)?;
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell. Whether it
@@ -1721,7 +1789,8 @@ impl TerminalSession {
                 effective_claude_config_dir.clone(),
                 spawn_tenant,
             )
-        }?;
+        }
+        .map_err(CreateError::BeforeChild)?;
         let pinned_session_id = seam.pinned_session_id;
 
         // ---- The canonical runner-context briefing --------------------------
@@ -1794,9 +1863,16 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
-        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
+        let io: Arc<dyn PaneIo> = Arc::new(
+            opened
+                .spawn(ScrubbedCommand::seal(cmd))
+                .map_err(CreateError::BeforeChild)?,
+        );
 
-        Self::spawn_with_io(
+        // From here a child EXISTS: a failure to build the session around it
+        // (the pane's reader or writer) kills it rather than orphaning it.
+        let terminal_id = id.clone();
+        let built = Self::spawn_with_io(
             id,
             title,
             cwd,
@@ -1805,9 +1881,10 @@ impl TerminalSession {
             rows,
             app_handle,
             interceptor,
-            io,
+            io.clone(),
             pinned_session_id,
-        )
+        );
+        kill_child_on_err(built, io.as_ref(), &terminal_id)
     }
 
     /// Build a live session around an already-constructed [`PaneIo`].
@@ -4951,6 +5028,67 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A pane whose only observable is whether it was killed.
+    #[derive(Default)]
+    struct KillRecordingPane {
+        killed: AtomicBool,
+    }
+
+    impl PaneIo for KillRecordingPane {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Err("no reader".to_string())
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Err("no writer".to_string())
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> super::super::pane_io::CredentialScrub {
+            super::super::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A session build that fails after the child was spawned kills the child
+    /// and says so — it is never a plain refusal a caller could read as "no
+    /// child ever existed".
+    #[test]
+    fn a_session_build_failing_after_the_spawn_kills_the_child() {
+        let pane = KillRecordingPane::default();
+        let err = kill_child_on_err::<()>(Err("no writer".to_string()), &pane, "t1").unwrap_err();
+        assert!(
+            pane.killed.load(Ordering::SeqCst),
+            "the orphaned child must be killed"
+        );
+        assert_eq!(err, CreateError::ChildKilled("no writer".to_string()));
+        assert!(err.child_spawned());
+        assert_eq!(String::from(err), "no writer");
+
+        let pane = KillRecordingPane::default();
+        assert_eq!(kill_child_on_err(Ok(7), &pane, "t2"), Ok(7));
+        assert!(
+            !pane.killed.load(Ordering::SeqCst),
+            "a built session is never killed"
+        );
+        assert!(!CreateError::BeforeChild("x".to_string()).child_spawned());
+    }
 
     #[test]
     fn a_runner_initiated_close_hands_the_hook_no_exit_code() {
