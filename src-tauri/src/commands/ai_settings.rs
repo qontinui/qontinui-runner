@@ -1524,7 +1524,10 @@ mod usage_twin_report {
     #[derive(Serialize)]
     struct WireAccount<'a> {
         label: &'a str,
-        weekly_utilization: f64,
+        /// `None` (serialized `null`) when the probe FAILED without a reading
+        /// — see [`wire_weekly_utilization`]. coord stores `null` as "not
+        /// measured"; a placeholder `0.0`/`1.0` would render as a real number.
+        weekly_utilization: Option<f64>,
         weekly_resets_at: Option<u64>,
         session_utilization: Option<f64>,
         session_resets_at: Option<u64>,
@@ -1576,6 +1579,24 @@ mod usage_twin_report {
         }
     }
 
+    /// The weekly utilization to put on the wire for one probe result.
+    ///
+    /// A failed probe (401, network error, unreadable token…) fills
+    /// `utilization` with a PLACEHOLDER — `1.0` on the token/network arms,
+    /// `0.0` from an absent header on an API-error arm — which is not a
+    /// measurement. Such a result carries an `error` and no `resets_at` (no
+    /// rate-limit header was read), and is sent as `None` so coord records
+    /// "not measured" rather than a fabricated 0% / 100%. A result that
+    /// errored but DID read the rate-limit headers (e.g. a 429 carrying
+    /// `resets_at`) is a real reading and is sent unchanged.
+    fn wire_weekly_utilization(r: &super::AccountUsageInfo) -> Option<f64> {
+        if r.error.is_some() && r.resets_at.is_none() {
+            None
+        } else {
+            Some(r.utilization)
+        }
+    }
+
     #[derive(Serialize)]
     struct WireBody<'a> {
         accounts: Vec<WireAccount<'a>>,
@@ -1624,7 +1645,7 @@ mod usage_twin_report {
                 .iter()
                 .map(|r| WireAccount {
                     label: &r.label,
-                    weekly_utilization: r.utilization,
+                    weekly_utilization: wire_weekly_utilization(r),
                     weekly_resets_at: r.resets_at,
                     session_utilization: r.session_utilization,
                     session_resets_at: r.session_resets_at,
@@ -1677,7 +1698,7 @@ mod usage_twin_report {
             let body = WireBody {
                 accounts: vec![WireAccount {
                     label: ".claude-hotmail",
-                    weekly_utilization: 0.25,
+                    weekly_utilization: Some(0.25),
                     weekly_resets_at: Some(1_700_000_000),
                     session_utilization: Some(0.5),
                     session_resets_at: None,
@@ -1707,6 +1728,69 @@ mod usage_twin_report {
             );
         }
 
+        /// A failed probe's placeholder utilization never reaches the wire:
+        /// a 401 (error, no rate-limit headers read) posts
+        /// `weekly_utilization: null`, while a real reading — including one
+        /// from a probe that errored but DID read `resets_at` — is unchanged.
+        #[test]
+        fn failed_probe_posts_null_weekly_utilization() {
+            let unauthorized = super::super::AccountUsageInfo {
+                config_dir: "/home/x/.claude-work".into(),
+                label: ".claude-work".into(),
+                utilization: 0.0,
+                error: Some("API error (401): invalid token".into()),
+                source: Some("probe".into()),
+                ..Default::default()
+            };
+            let network = super::super::AccountUsageInfo {
+                utilization: 1.0,
+                error: Some("Network error: timed out".into()),
+                ..unauthorized.clone()
+            };
+            let rate_limited = super::super::AccountUsageInfo {
+                utilization: 1.0,
+                resets_at: Some(1_700_000_000),
+                error: Some("API error (429): rate limited".into()),
+                ..unauthorized.clone()
+            };
+            let healthy = super::super::AccountUsageInfo {
+                utilization: 0.42,
+                resets_at: Some(1_700_000_000),
+                error: None,
+                ..unauthorized.clone()
+            };
+            assert_eq!(wire_weekly_utilization(&unauthorized), None);
+            assert_eq!(wire_weekly_utilization(&network), None);
+            assert_eq!(wire_weekly_utilization(&rate_limited), Some(1.0));
+            assert_eq!(wire_weekly_utilization(&healthy), Some(0.42));
+
+            let limits: Vec<super::super::ModelLimitInfo> = Vec::new();
+            let body = WireBody {
+                accounts: vec![WireAccount {
+                    label: &unauthorized.label,
+                    weekly_utilization: wire_weekly_utilization(&unauthorized),
+                    weekly_resets_at: unauthorized.resets_at,
+                    session_utilization: None,
+                    session_resets_at: None,
+                    model_limits: &limits,
+                    exhausted: super::super::probe_result_exhausted(&unauthorized),
+                    source: unauthorized.source.as_deref(),
+                    error: true,
+                    is_active: false,
+                }],
+                prepaid: Vec::new(),
+                account_selection_mode: "manual",
+            };
+            let v = serde_json::to_value(&body).expect("serializes");
+            let acct = &v["accounts"][0];
+            assert!(
+                acct.get("weekly_utilization").is_some(),
+                "the key must be present as an explicit null, not omitted"
+            );
+            assert_eq!(acct["weekly_utilization"], serde_json::Value::Null);
+            assert_eq!(acct["error"], serde_json::json!(true));
+        }
+
         /// `is_active` is a per-account flag; a report where nothing has been
         /// resolved yet is all-`false`, not a missing key.
         #[test]
@@ -1715,7 +1799,7 @@ mod usage_twin_report {
             let body = WireBody {
                 accounts: vec![WireAccount {
                     label: ".claude-work",
-                    weekly_utilization: 0.0,
+                    weekly_utilization: None,
                     weekly_resets_at: None,
                     session_utilization: None,
                     session_resets_at: None,
