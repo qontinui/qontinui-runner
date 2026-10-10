@@ -10,6 +10,7 @@ import {
   buildEgressRows,
   describeEgressSource,
   EGRESS_FLOWS,
+  egressScope,
   isUpdateEgressOff,
   tenantPolicyLink,
 } from "./egressPrivacyHelpers";
@@ -57,6 +58,16 @@ describe("buildEgressRows", () => {
     const mirror = rows.find((r) => r.key === "code_mirror")!;
     expect(mirror.state).toBe("off");
     expect(mirror.sourceText).toBe(describeEgressSource("coord"));
+    const decided = buildEgressRows({
+      code_mirror: report({ source: "coord", decided_by: "tenant_row" }),
+      update_check: report({ source: "persisted", decided_by: "deployment_profile" }),
+    });
+    expect(decided.find((r) => r.key === "code_mirror")!.sourceText).toBe(
+      "set for this project in the web console",
+    );
+    expect(decided.find((r) => r.key === "update_check")!.sourceText).toContain(
+      "this deployment's default",
+    );
     expect(mirror.refused).toBe(3);
     expect(rows.find((r) => r.key === "skill_mirror")!.sourceText).toBe(
       "this machine's profile default",
@@ -95,5 +106,24 @@ describe("isUpdateEgressOff", () => {
     expect(isUpdateEgressOff({ status: "egress_off", available: false })).toBe(true);
     expect(isUpdateEgressOff({ available: false })).toBe(false);
     expect(isUpdateEgressOff(undefined)).toBe(false);
+  });
+});
+
+describe("egressScope", () => {
+  it("reads the polled scope and its note, and nothing from a failed read", () => {
+    expect(egressScope(undefined)).toBeNull();
+    expect(
+      egressScope({ scope: { coord_base: "x", tenant_id: "t-1", note: "default tenant only" } }),
+    ).toEqual({ tenantId: "t-1", note: "default tenant only" });
+  });
+
+  it("does not count the scope as a seventh flow", () => {
+    const rows = buildEgressRows({ scope: { note: "n" } });
+    expect(rows).toHaveLength(6);
+  });
+
+  it("says AI session output rides the terminal streaming switch", () => {
+    const flow = EGRESS_FLOWS.find((f) => f.key === "terminal_stream")!;
+    expect(flow.description).toContain("AI session output");
   });
 });

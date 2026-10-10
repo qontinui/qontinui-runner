@@ -15,6 +15,8 @@ export interface EgressFlowReport {
   allowed: boolean;
   /** `coord` | `persisted` | `profile` | `product_default`. */
   source: string;
+  /** For `coord` / `persisted`: `tenant_row` | `deployment_profile`. */
+  decided_by?: string | null;
   domain: string;
   applies_at_next_start: boolean;
   refused: number;
@@ -40,7 +42,7 @@ export const EGRESS_FLOWS = [
     key: "terminal_stream",
     label: "Terminal streaming",
     description:
-      "Raw terminal output sent to coord and through the web relay, and remote terminal attach in either direction.",
+      "Raw terminal output sent to coord and through the web relay, remote terminal attach in either direction, and AI session output streamed live to the web and mobile consoles.",
   },
   {
     key: "telemetry",
@@ -67,12 +69,18 @@ export type EgressFlowKey = (typeof EGRESS_FLOWS)[number]["key"];
 export const TENANT_POLICY_PATH = "/admin/coord/tenant-policy";
 
 /** Human wording for the rung that decided a flow's state. */
-export function describeEgressSource(source: string): string {
+export function describeEgressSource(source: string, decidedBy?: string | null): string {
+  const origin =
+    decidedBy === "deployment_profile"
+      ? "this deployment's default (self-hosted coord)"
+      : decidedBy === "tenant_row"
+        ? "set for this project in the web console"
+        : null;
   switch (source) {
     case "coord":
-      return "set for this project in the web console";
+      return origin ?? "decided by coord";
     case "persisted":
-      return "last answer from coord (it has not answered since this start)";
+      return `${origin ?? "decided by coord"} — last answer, coord has not answered since this start`;
     case "profile":
       return "this machine's profile default";
     case "product_default":
@@ -80,6 +88,21 @@ export function describeEgressSource(source: string): string {
     default:
       return `unrecognised source "${source}"`;
   }
+}
+
+/** The polled scope `/health` reports beside the flows, if any. */
+export interface EgressScope {
+  tenantId: string | null;
+  note: string;
+}
+
+export function egressScope(egress: unknown): EgressScope | null {
+  if (!egress || typeof egress !== "object") return null;
+  const scope = (egress as Record<string, unknown>).scope;
+  if (!scope || typeof scope !== "object") return null;
+  const s = scope as Record<string, unknown>;
+  if (typeof s.note !== "string") return null;
+  return { tenantId: typeof s.tenant_id === "string" ? s.tenant_id : null, note: s.note };
 }
 
 /** One rendered row. `state` is "unknown" when the runner reported nothing. */
@@ -128,7 +151,7 @@ export function buildEgressRows(egress: unknown): EgressRow[] {
       label: flow.label,
       description: flow.description,
       state: report.allowed ? "on" : "off",
-      sourceText: describeEgressSource(report.source),
+      sourceText: describeEgressSource(report.source, report.decided_by),
       nextStartNote,
       refused: report.refused,
     };
