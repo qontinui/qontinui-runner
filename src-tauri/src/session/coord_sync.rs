@@ -1815,8 +1815,8 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // coord counts it as
             // coord_commit_report_refusals_total{reason="unauthenticated"}.
             // A credentialed send can still be refused 403 (no_tenant_claim,
-            // repo_not_owned, presenter_unproven) and is dropped as a 4xx; a
-            // 503 from coord's ownership lookup is retried.
+            // presenter_unproven, repo_not_owned_by_caller_tenant) and is
+            // dropped as a 4xx; a 503 from coord's ownership lookup is retried.
             let url = format!("{base}/coord/commits/report");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
                 .send()
