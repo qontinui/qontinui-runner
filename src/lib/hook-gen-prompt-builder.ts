@@ -68,12 +68,23 @@ Provides framework-router integration for the navigation tracker.
 
 \`\`\`typescript
 interface RouteInfo {
-  pattern?: string;              // Route pattern (e.g., "/tasks/:id")
+  pattern?: string | null;       // Route PATTERN (e.g., "/tasks/[id]"), never the URL path
+  patternSource?: 'router';      // Asserts \`pattern\` came from the router
   params?: Record<string, string>;  // Extracted route parameters
   queryParams?: Record<string, string>;  // Query parameters
-  routeStack?: string[];         // Matched route stack / breadcrumb
+  routeStack?: string[];         // Matched route stack / breadcrumb (route ids)
 }
 \`\`\`
+
+**\`pattern\` is never the pathname.** A concrete path such as \`/search/<what the
+user typed>\` carries user input, and the runner's journey ledger stores
+\`pattern\` ONLY when \`patternSource: 'router'\` asserts it came from the router.
+Derive it with \`routePatternFromParams(pathname, params, { matched })\` from
+\`@qontinui/ui-bridge/react\`: it puts every param value back in its \`[name]\`
+slot and returns \`null\` when the route is unmatched (\`matched: false\`, e.g. a
+404) or a value cannot be substituted. Pass the router's params RAW — never
+pre-join a catch-all array. If the installed SDK predates the helper, OMIT
+\`pattern\` (and \`patternSource\`) entirely; never fall back to the pathname.
 
 ### usePageContext(context: DeveloperPageContext): void
 Annotates the current page with semantic context for AI automation.
@@ -225,17 +236,25 @@ const NEXTJS_GUIDANCE = `
 For route awareness, use Next.js navigation hooks:
 \`\`\`tsx
 import { usePathname, useParams, useSearchParams } from 'next/navigation';
+import { useRouteAwareness, routePatternFromParams } from '@qontinui/ui-bridge/react';
 
 // In a client component inside the layout:
 const pathname = usePathname();
-const params = useParams();
+const params = useParams(); // RAW: a catch-all is a string[] — do not join it
 const searchParams = useSearchParams();
 
 useRouteAwareness({
+  // "/search/abc" with { term: "abc" } -> "/search/[term]"; null when unmatched.
+  // Set \`matched: false\` while your not-found page renders: a 404 has
+  // useParams() === {}, so its pathname would otherwise pass through verbatim.
+  pattern: routePatternFromParams(pathname, params, { matched: true }),
+  patternSource: 'router',
   params: params as Record<string, string>,
   queryParams: Object.fromEntries(searchParams),
 });
 \`\`\`
+
+Never write \`pattern: pathname\` — the pathname is user input, not a pattern.
 
 For page context, derive the page name from the pathname:
 \`\`\`tsx
@@ -261,18 +280,27 @@ const REACT_ROUTER_GUIDANCE = `
 For route awareness, use React Router hooks:
 \`\`\`tsx
 import { useLocation, useParams, useMatches } from 'react-router-dom';
+import { useRouteAwareness, routePatternFromParams } from '@qontinui/ui-bridge/react';
 
 const location = useLocation();
 const params = useParams();
 const matches = useMatches();
 
 useRouteAwareness({
-  pattern: matches[matches.length - 1]?.pathname,
+  // A match's \`pathname\` is the CONCRETE path, not the route pattern: derive
+  // the pattern from the params instead. No match (a 404 / \`*\` route) -> null.
+  pattern: routePatternFromParams(location.pathname, params, {
+    matched: matches.length > 0,
+  }),
+  patternSource: 'router',
   params: params as Record<string, string>,
   queryParams: Object.fromEntries(new URLSearchParams(location.search)),
-  routeStack: matches.map(m => m.pathname),
+  routeStack: matches.map(m => m.id), // route ids, never concrete paths
 });
 \`\`\`
+
+Never write \`pattern: location.pathname\` or a match's \`pathname\` — both are
+the URL the user is on, not a pattern.
 
 For page context, derive from the current route:
 \`\`\`tsx
@@ -305,16 +333,26 @@ For route awareness, use Expo Router hooks (NOT \`react-router-dom\`, NOT
 import { usePathname, useSegments, useLocalSearchParams } from 'expo-router';
 import { useRouteAwareness } from '@qontinui/ui-bridge-native';
 
+import { routePatternFromParams } from '@qontinui/ui-bridge/react'; // pure, no DOM
+
 const pathname = usePathname();
 const segments = useSegments();
 const params = useLocalSearchParams();
 
 useRouteAwareness({
-  pattern: pathname,
+  // "/runner/42" with { id: "42" } -> "/runner/[id]"; the unmatched route
+  // (\`+not-found\`) -> null.
+  pattern: routePatternFromParams(pathname, params, {
+    matched: !segments.includes('+not-found'),
+  }),
+  patternSource: 'router',
   params: params as Record<string, string>,
   routeStack: segments,
 });
 \`\`\`
+
+Never write \`pattern: pathname\` — the pathname is user input, not a pattern.
+If the installed SDK has no \`routePatternFromParams\`, omit \`pattern\` entirely.
 
 For page context, map Expo Router file-based routes to semantic names:
 
@@ -516,16 +554,26 @@ provides the full route info from \`expo-router\` hooks.
 import { usePathname, useSegments, useLocalSearchParams } from 'expo-router';
 import { useRouteAwareness } from '@qontinui/ui-bridge-native';
 
+import { routePatternFromParams } from '@qontinui/ui-bridge/react'; // pure, no DOM
+
 const pathname = usePathname();
 const segments = useSegments();
 const params = useLocalSearchParams();
 
 useRouteAwareness({
-  pattern: pathname,
+  // "/runner/42" with { id: "42" } -> "/runner/[id]"; the unmatched route
+  // (\`+not-found\`) -> null.
+  pattern: routePatternFromParams(pathname, params, {
+    matched: !segments.includes('+not-found'),
+  }),
+  patternSource: 'router',
   params: params as Record<string, string>,
   routeStack: segments,
 });
 \`\`\`
+
+Never write \`pattern: pathname\` — the pathname is user input, not a pattern.
+If the installed SDK has no \`routePatternFromParams\`, omit \`pattern\` entirely.
 
 **Do NOT use** \`useLocation()\` (that's react-router-dom) or
 \`next/navigation\` hooks — they don't exist in Expo.
