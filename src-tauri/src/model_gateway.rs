@@ -54,12 +54,24 @@
 //! `Unknown` and an invalid `Declared` both resolve to [`Resolution::Unresolved`],
 //! which behaves like a gateway that cannot be reached: [`ModelCall::resolve`]
 //! errors, [`gateway_declared`] is true (so every subscription path stands
-//! down), headless spawns are refused ([`spawn_refusal`]), and any other session
-//! runs under the gateway config dir with vendor credentials stripped, an
-//! unroutable base URL and a key helper that fails. Nothing falls back to the
-//! vendor host.
+//! down), and headless spawns are refused ([`spawn_refusal`]). Any other child
+//! (a pane shell, a script that runs `claude`) gets vendor credentials stripped
+//! and an unroutable base URL, and its `CLAUDE_CONFIG_DIR` is pinned: to the
+//! gateway config dir with a key helper that fails when that dir could be
+//! written, otherwise to [`unresolvable_config_dir`], a dir that does not exist
+//! and cannot be created, so no subscription account is there to use, refresh
+//! or log in to. Typed launches and resumes are refused outright when the dir
+//! is missing. Removing `CLAUDE_CONFIG_DIR` instead would fall back to
+//! `~/.claude`, itself a subscription dir.
 //!
 //! ## Limits (documented, not enforced here)
+//!
+//! On macOS Claude Code stores `/login` credentials in the login Keychain, not
+//! in the config dir. [`materialize_session_config_at`] removes a
+//! `.credentials.json` from the gateway dir, but it cannot clear a Keychain
+//! entry, and a pinned `CLAUDE_CONFIG_DIR` does not by itself keep a session
+//! from reading one. On macOS the stripped env and the gateway's own
+//! `apiKeyHelper` are the controls; a Keychain login is outside them.
 //!
 //! The sticky marker lives under the runner's config dir. A session running in
 //! bypass mode (or with a filesystem tool that reaches that dir) can delete it,
@@ -481,8 +493,11 @@ fn base_session_env() -> serde_json::Map<String, serde_json::Value> {
     let mut env = serde_json::Map::new();
     env.insert(NONESSENTIAL_TRAFFIC_ENV.to_string(), "1".into());
     // A typed command can inherit these from the shell a pane was opened with
-    // (a profile export, or a pane older than the gateway). Blank them here
-    // too (review N2) — an empty value reads as unset to Claude Code.
+    // (a profile export, or a pane older than the gateway). The CONTROL is the
+    // shell scrub prefix the typed command starts with ([`env_scrub_prefix`],
+    // review N2), which unsets them before `claude` runs. Blanking them here is
+    // belt-and-braces only: whether Claude Code treats an empty value as unset
+    // is not something this module relies on.
     for var in SHADOWING_CREDENTIAL_ENV.iter().chain(PROVIDER_BASE_URL_ENV) {
         env.insert(var.to_string(), "".into());
     }
@@ -924,38 +939,28 @@ pub fn prepared_session() -> (Resolution, Option<String>) {
     }
 }
 
-/// The refusal for a container step that runs `claude` while a model gateway
-/// is declared or unknown (review N6): the network mediator substitutes
-/// credential placeholders only on plain-HTTP forwards, and an `https` gateway
-/// is reached through an opaque CONNECT tunnel, so a container `claude` could
-/// never authenticate to it — and must not fall back to anything else.
-pub fn container_claude_refusal(command: &str, resolution: &Resolution) -> Option<String> {
+/// The refusal for EVERY container step while a model gateway is declared or
+/// unknown (reviews N6, L1).
+///
+/// The network mediator substitutes credential placeholders only on plain-HTTP
+/// forwards, and an `https` gateway is reached through an opaque CONNECT
+/// tunnel, so a model call from inside a container could never authenticate to
+/// the gateway, and must not fall back to anything else. Which steps make
+/// model calls cannot be told from the command line (a wrapper script, an
+/// `npx` package or a build step can run `claude`), so no step is let through.
+pub fn container_step_refusal(resolution: &Resolution) -> Option<String> {
     if matches!(resolution, Resolution::NoGateway) {
         return None;
     }
-    let runs_claude = command
-        .split(|c: char| c.is_whitespace() || ";&|()".contains(c))
-        .filter(|t| !t.is_empty())
-        .any(|tok| {
-            let base = tok
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(tok)
-                .to_ascii_lowercase();
-            let base = base
-                .strip_suffix(".exe")
-                .or_else(|| base.strip_suffix(".cmd"))
-                .unwrap_or(&base)
-                .to_string();
-            base == "claude"
-        });
-    runs_claude.then(|| {
-        "refusing to run claude in a container while a model gateway is configured: the \
-         container's credential placeholder can only be substituted on plain-HTTP requests, \
-         and an https gateway is reached through an encrypted tunnel the runner cannot \
-         rewrite. Run the step on the host, where sessions route through the gateway."
-            .to_string()
-    })
+    Some(
+        "refusing to run a container step while a model gateway is configured (or its \
+         state is unknown): a model call from inside the container could not authenticate \
+         to the gateway, because the container's credential placeholder is substituted only \
+         on plain-HTTP requests and an https gateway is reached through an encrypted tunnel \
+         the runner cannot rewrite. Run the step on the host, where sessions route through \
+         the gateway."
+            .to_string(),
+    )
 }
 
 /// The config dir a gateway session must run under, or `None` when no gateway
@@ -999,10 +1004,13 @@ pub fn child_env_plan_for(
             .map(|s| s.to_string()),
     );
     plan.remove.push(CUSTOM_HEADERS_ENV.to_string());
-    if let Some(dir) = session_config_dir {
-        plan.set
-            .push(("CLAUDE_CONFIG_DIR".to_string(), dir.to_string()));
-    }
+    // Always pinned (review M1): a dir that could not be resolved must not
+    // leave an earlier subscription-account `CLAUDE_CONFIG_DIR` in force, and
+    // removing the var would fall back to `~/.claude`, also a subscription dir.
+    let dir = session_config_dir
+        .map(str::to_string)
+        .unwrap_or_else(unresolvable_config_dir);
+    plan.set.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
     plan.set
         .push((NONESSENTIAL_TRAFFIC_ENV.to_string(), "1".to_string()));
     match resolution {
@@ -1012,6 +1020,28 @@ pub fn child_env_plan_for(
         _ => plan.remove.push(BASE_URL_ENV.to_string()),
     }
     plan
+}
+
+/// The `CLAUDE_CONFIG_DIR` a gateway child gets when the gateway config dir
+/// could not be resolved (review M1): a path that does not exist and cannot be
+/// created, so `claude` finds no account to use, refresh or `/login` into.
+///
+/// It is a child of a regular FILE — the runner's own executable, which exists
+/// for as long as the runner runs — so creating it fails (`ENOTDIR`) on every
+/// platform. If the executable cannot be located, a child of the null device is
+/// used instead, which no filesystem lets anyone create either.
+pub fn unresolvable_config_dir() -> String {
+    const LEAF: &str = "model-gateway-unresolved";
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.is_file() {
+            return exe.join(LEAF).to_string_lossy().into_owned();
+        }
+    }
+    if cfg!(windows) {
+        format!(r"\\.\NUL\{LEAF}")
+    } else {
+        format!("/dev/null/{LEAF}")
+    }
 }
 
 /// [`child_env_plan_for`] over a declaration (tests and callers that hold
@@ -1761,25 +1791,49 @@ mod tests {
         assert!(err.contains("credentials"), "{err}");
     }
 
-    /// Review N6: a container step that runs `claude` is refused under a gateway.
+    /// Reviews N6 and L1: while a gateway is declared or unknown, EVERY
+    /// container step is refused — not only those whose command line names
+    /// `claude` (a wrapper script hides it). Without a gateway none is.
     #[test]
-    fn container_claude_steps_are_refused_under_a_gateway() {
+    fn every_container_step_is_refused_under_a_gateway() {
         let g = decl("https://gw.example.com").resolve().unwrap().unwrap();
         for res in [Resolution::Gateway(g), Resolution::Unresolved("x".into())] {
-            for cmd in [
-                "claude -p hi",
-                "cd /w && /usr/bin/claude --print x",
-                "npx claude",
-            ] {
-                let r = container_claude_refusal(cmd, &res);
-                assert!(
-                    r.as_deref().is_some_and(|m| m.contains("https")),
-                    "{cmd}: {r:?}"
-                );
-            }
-            assert!(container_claude_refusal("cargo test", &res).is_none());
+            let r = container_step_refusal(&res);
+            assert!(r.as_deref().is_some_and(|m| m.contains("https")), "{r:?}");
         }
-        assert!(container_claude_refusal("claude -p hi", &Resolution::NoGateway).is_none());
+        assert!(container_step_refusal(&Resolution::NoGateway).is_none());
+    }
+
+    /// Review M1 (re-review of 77076cc3c): when the gateway config dir cannot
+    /// be resolved, the plan must not leave an earlier subscription-account
+    /// `CLAUDE_CONFIG_DIR` in force (nor merely remove it, which falls back to
+    /// `~/.claude`, also a subscription dir). It pins a dir that does not exist
+    /// and cannot be created, so `claude` finds no account to use or refresh.
+    #[test]
+    fn an_unresolvable_gateway_dir_pins_a_config_dir_that_cannot_exist() {
+        let g = decl("https://gw.example.com").resolve().unwrap().unwrap();
+        for res in [Resolution::Unresolved("x".into()), Resolution::Gateway(g)] {
+            let plan = child_env_plan_for(&res, None);
+            let dir = plan
+                .set
+                .iter()
+                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("CLAUDE_CONFIG_DIR must be pinned: {plan:?}"));
+            let p = Path::new(&dir);
+            assert!(p.is_absolute(), "{dir}");
+            assert!(!p.exists(), "{dir} must not exist");
+            assert!(
+                std::fs::create_dir_all(p).is_err(),
+                "{dir} must not be creatable"
+            );
+            assert!(!plan.remove.iter().any(|v| v == "CLAUDE_CONFIG_DIR"));
+        }
+        // A resolved dir is still the one pinned.
+        let plan = child_env_plan_for(&Resolution::Unresolved("x".into()), Some("/cfg"));
+        assert!(plan
+            .set
+            .contains(&("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string())));
     }
 
     /// Review N8: a marker whose existence cannot be checked counts as present.
