@@ -325,6 +325,17 @@ impl CoordSync {
         }
     }
 
+    /// Test-only: rebuild this (not yet shared) facade's dual-write gate with
+    /// a fast flag-poll cadence, so a test can watch the real poll loop
+    /// follow a pin switch in milliseconds rather than a minute.
+    #[cfg(test)]
+    pub fn with_flag_poll_interval_for_test(mut self, interval: Duration) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("call before the facade is shared")
+            .dual_write = DualWriteGate::new_for_test(None, interval);
+        self
+    }
+
     /// Borrow the local outbox. Phase 2 surface — unchanged.
     pub fn outbox(&self) -> &OutboxWriter {
         &self.inner.outbox
@@ -612,15 +623,15 @@ impl CoordSync {
     /// `/tenant-policy?tenant_id=<id>` on a slow cadence and caches the
     /// `session_coordination_enabled` flag into the [`DualWriteGate`].
     ///
-    /// Short-circuits to a permanent no-op when no `active_tenant_id`
-    /// resolved from `machine.json` (single-tenant operators, MSI today)
-    /// — the gate then never opens regardless of any tenant's flag.
-    /// Returns `None` in that case so `main.rs` doesn't hold a dead
-    /// handle.
-    pub fn start_flag_poll_task(&self) -> Option<JoinHandle<()>> {
-        let tenant_id = self.inner.dual_write.tenant_id()?;
+    /// ALWAYS spawned, including on a machine with no `active_tenant_id`:
+    /// the loop re-reads the pin every tick ([`run_flag_poll_loop`]), so a
+    /// machine that is unpinned at boot and pinned later — by
+    /// `PUT /tenant/active`, the Tauri switcher, or a hand edit — is followed
+    /// without a restart. An unpinned tick asks coord nothing, so the idle
+    /// cost is one local file read per interval.
+    pub fn start_flag_poll_task(&self) -> JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
-        Some(tokio::spawn(run_flag_poll_loop(inner, tenant_id)))
+        tokio::spawn(run_flag_poll_loop(inner))
     }
 
     /// Phase 10 dual-write entry point — called by the **legacy** session
@@ -2971,61 +2982,107 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
 /// Poll coord's `/tenant-policy?tenant_id=<id>` and cache the
 /// `session_coordination_enabled` flag into the [`DualWriteGate`].
 ///
-/// Only spawned when a tenant resolved (see
-/// [`CoordSync::start_flag_poll_task`]). Robust to coord being down: a
-/// fetch failure leaves the cached value untouched (so a transient outage
-/// never spuriously flips the gate) and the loop simply tries again next
-/// tick. The flag is a rollout knob that changes rarely, so the default
-/// 60s cadence is plenty.
-async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>, tenant_id: Uuid) {
+/// **The pin is re-read at the top of every tick** (plan
+/// `2026-10-10-remote-create-residuals-followups` Phase 3). The loop used to
+/// take the tenant `DualWriteGate::new` froze at boot, so a
+/// `PUT /tenant/active` reached this gate only at the next runner start. Now
+/// each tick resolves `machine.json`'s `active_tenant_id` and hands it to
+/// [`flag_poll_tick`], which retargets the gate when it moved. A switch
+/// therefore takes effect within about one `QONTINUI_SESSION_FLAG_POLL_SECS`
+/// interval (plus at most one fetch already in flight for the old tenant,
+/// bounded by the 30 s request timeout), whichever writer made it — neither
+/// tenant door needs a handle to this loop. It assumes ONE loop per gate:
+/// `start_flag_poll_task` is called once (main.rs), and
+/// [`DualWriteGate::retarget`] is `pub(super)` so nothing outside `session`
+/// can drive the gate's tenant from a second place.
+///
+/// Robust to coord being down: a fetch failure leaves the cached value
+/// untouched (so a transient outage never spuriously flips the gate) and the
+/// loop simply tries again next tick. The flag is a rollout knob that changes
+/// rarely, so the default 60s cadence is plenty.
+async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>) {
     let interval = inner.dual_write.poll_interval();
     tracing::info!(
-        %tenant_id,
         ?interval,
-        "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips)"
+        "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips; \
+         follows the machine pin each tick)"
     );
     let mut refusals = TenantPolicyAuthReporter::default();
     loop {
-        match fetch_session_coordination_flag(&inner, tenant_id).await {
-            Ok(enabled) => {
-                if let Some(line) = refusals.clear() {
-                    tracing::info!(%tenant_id, "{line}");
-                }
-                inner.dual_write.apply(enabled);
+        let pin = crate::session::dual_write::resolve_active_tenant_id();
+        flag_poll_tick(&inner, &mut refusals, pin).await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// One pass of [`run_flag_poll_loop`] for the pin that pass read.
+///
+/// Split out so a test can drive single passes deterministically against a
+/// fake coord, with the pin rewritten between them through the real write
+/// path, instead of racing a sleeping loop.
+///
+/// Order is the contract when the pin moved: the gate is CLOSED and rebound
+/// ([`DualWriteGate::retarget`]) BEFORE the new tenant's flag is fetched, so
+/// a failed first fetch leaves the gate closed rather than holding the old
+/// tenant's answer; and the refusal reporter starts fresh, because a standing
+/// refusal about the old tenant says nothing about the new one.
+async fn flag_poll_tick(
+    inner: &Arc<CoordSyncInner>,
+    refusals: &mut TenantPolicyAuthReporter,
+    pin: Option<Uuid>,
+) {
+    if let Some(previous) = inner.dual_write.retarget(pin) {
+        *refusals = TenantPolicyAuthReporter::default();
+        tracing::info!(
+            ?previous,
+            tenant = ?pin,
+            "coord_sync: cutover-flag poll retargeted to the machine pin; the cached flag is \
+             closed until this tenant's own flag is read"
+        );
+    }
+    let Some(tenant_id) = pin else {
+        // Unpinned: nothing to ask coord about. The gate is closed (retarget
+        // closed it if a tenant was bound before) and the next tick re-reads.
+        return;
+    };
+    match fetch_session_coordination_flag(inner, tenant_id).await {
+        Ok(enabled) => {
+            if let Some(line) = refusals.clear() {
+                tracing::info!(%tenant_id, "{line}");
             }
-            Err(FlagPollError::Unauthorized { status, reason }) => {
-                // Resolving the presented credential costs a local file read,
-                // so it happens HERE — on the report path the throttle has
-                // already decided to take — and not on every pass. Note what
-                // it does and does not establish: it names what this device
-                // would resolve NOW, a moment AFTER the request that was
-                // refused, not what that request carried. The two differ if
-                // the refresher lands a slot in between, which is why the
-                // line says "currently resolves" and coord's own stated
-                // `reason` travels beside it.
-                if let Some(line) = refusals.observe(status, &reason, tenant_id, || {
-                    crate::auth::presented_tenant(tenant_policy_scope(tenant_id))
-                }) {
-                    tracing::warn!(%tenant_id, "{line}");
-                }
-            }
-            Err(FlagPollError::Other(e)) => {
-                // Leave the cached value as-is — a coord hiccup must not
-                // flip the gate in either direction.
-                //
-                // But DO end any standing refusal: coord answering some other
-                // way is coord answering differently, and leaving the key in
-                // place silences the next genuine refusal (`403`, `403`xN,
-                // `500`, `403` — the second `403` went unreported).
-                refusals.interrupted();
-                tracing::debug!(
-                    %tenant_id,
-                    error = %e,
-                    "coord_sync: tenant-policy fetch failed; keeping cached cutover flag"
-                );
+            inner.dual_write.apply(enabled);
+        }
+        Err(FlagPollError::Unauthorized { status, reason }) => {
+            // Resolving the presented credential costs a local file read,
+            // so it happens HERE — on the report path the throttle has
+            // already decided to take — and not on every pass. Note what
+            // it does and does not establish: it names what this device
+            // would resolve NOW, a moment AFTER the request that was
+            // refused, not what that request carried. The two differ if
+            // the refresher lands a slot in between, which is why the
+            // line says "currently resolves" and coord's own stated
+            // `reason` travels beside it.
+            if let Some(line) = refusals.observe(status, &reason, tenant_id, || {
+                crate::auth::presented_tenant(tenant_policy_scope(tenant_id))
+            }) {
+                tracing::warn!(%tenant_id, "{line}");
             }
         }
-        tokio::time::sleep(interval).await;
+        Err(FlagPollError::Other(e)) => {
+            // Leave the cached value as-is — a coord hiccup must not
+            // flip the gate in either direction.
+            //
+            // But DO end any standing refusal: coord answering some other
+            // way is coord answering differently, and leaving the key in
+            // place silences the next genuine refusal (`403`, `403`xN,
+            // `500`, `403` — the second `403` went unreported).
+            refusals.interrupted();
+            tracing::debug!(
+                %tenant_id,
+                error = %e,
+                "coord_sync: tenant-policy fetch failed; keeping cached cutover flag"
+            );
+        }
     }
 }
 
@@ -7510,6 +7567,213 @@ mod tests {
                 .flatten()
                 .any(|h| h.contains(&default_jwt)),
             "the default binding's JWT must never travel on a poll about another tenant"
+        );
+    }
+
+    /// A machine fixture with an identity (so the tenant write path accepts
+    /// it), pinned to `pin` when given, and bound to both `a` and `b`.
+    fn two_binding_machine(
+        amb: &crate::test_env::IsolatedAmbient,
+        pin: Option<Uuid>,
+        a: Uuid,
+        b: Uuid,
+    ) {
+        let pin_field = pin
+            .map(|t| format!(r#","active_tenant_id":"{t}""#))
+            .unwrap_or_default();
+        amb.write_machine_json(&format!(
+            r#"{{"device_id":"11111111-0000-4000-8000-000000000001","hostname":"box"{pin_field}}}"#
+        ));
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            format!(
+                r#"{{"user_id":"u","tenant_id":"{a}","default_tenant_id":"{a}",
+                    "bindings":[{{"tenant_id":"{a}","user_id":"u"}},
+                                {{"tenant_id":"{b}","user_id":"u"}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// PLAN `2026-10-10-remote-create-residuals-followups` Phase 3 — a tenant
+    /// switch through the `PUT /tenant/active` write path retargets the
+    /// dual-write flag poll WITHOUT a restart.
+    ///
+    /// Drives single passes exactly as [`run_flag_poll_loop`] does (pin read,
+    /// then [`flag_poll_tick`]) so the order is deterministic. Three
+    /// observables, each a mutation proof:
+    /// * the next poll's `?tenant_id=` is the NEW tenant — freeze the pin at
+    ///   construction again and the second query repeats tenant A;
+    /// * the gate was CLOSED before that fetch — the post-switch fetch fails
+    ///   (500, which keeps the cached flag), so if the reset were dropped or
+    ///   moved after the fetch the gate would still hold tenant A's `true`;
+    /// * the refusal reporter restarted — A's standing `403` is not carried
+    ///   into B's episode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_switch_retargets_the_flag_poll_without_a_restart() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
+        two_binding_machine(&amb, Some(a), a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let gate = &coord.inner.dual_write;
+        let mut refusals = TenantPolicyAuthReporter::default();
+        let pin = crate::session::dual_write::resolve_active_tenant_id;
+
+        // Tenant A, flag ON.
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+        assert_eq!(gate.tenant_id(), Some(a));
+        assert!(gate.enabled(), "tenant A's flag was fetched as true");
+
+        // A standing refusal about A.
+        rec.lock().await.tenant_policy_status = Some(403);
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+        assert!(refusals.reported.is_some(), "A's 403 is a standing refusal");
+        assert!(gate.enabled(), "a refusal keeps the cached flag");
+
+        // The PUT /tenant/active write path, then a pass whose fetch fails.
+        let written = crate::commands::tenant::apply_active_tenant(&b.to_string())
+            .expect("B is bound, so the switch is accepted");
+        assert_eq!(written, b.to_string());
+        rec.lock().await.tenant_policy_status = Some(500);
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+
+        assert_eq!(gate.tenant_id(), Some(b), "the gate follows the new pin");
+        assert!(
+            !gate.enabled(),
+            "the gate must be closed BEFORE the new tenant's fetch: a failed first fetch must \
+             not leave tenant A's flag standing under tenant B"
+        );
+        assert!(
+            refusals.reported.is_none(),
+            "a standing refusal about tenant A says nothing about tenant B"
+        );
+
+        // B's own flag opens it.
+        rec.lock().await.tenant_policy_status = None;
+        flag_poll_tick(&coord.inner, &mut refusals, pin()).await;
+        assert!(gate.enabled(), "tenant B's own flag is read and applied");
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.tenant_policy_queries,
+            vec![a.to_string(), a.to_string(), b.to_string(), b.to_string()],
+            "every poll after the switch must ask about the NEW tenant"
+        );
+    }
+
+    /// The poll's tenant comes from the PIN, read by the running loop — not
+    /// from whatever the gate was constructed with. The gate here is built
+    /// with no tenant (as `DualWriteGate::new` now builds it), the machine is
+    /// pinned to B, and the started task must ask coord about B. Before the
+    /// fix the task took the tenant the gate was built with and, holding none,
+    /// spawned nothing. Written against APIs that exist on both sides of the
+    /// change (the handle is ignored, no test-only cadence), so a revert fails
+    /// this by ASSERTION rather than by compilation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_started_flag_poll_asks_coord_about_the_pinned_tenant() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
+        two_binding_machine(&amb, Some(b), a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+
+        let _ = coord.start_flag_poll_task();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if rec
+                .lock()
+                .await
+                .tenant_policy_queries
+                .iter()
+                .any(|q| q == &b.to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the started flag poll never asked coord about the pinned tenant; queries: {:?}",
+                rec.lock().await.tenant_policy_queries
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The task is spawned even with NO pin at boot, and the REAL loop picks
+    /// up a pin written later — the case where `start_flag_poll_task` used to
+    /// spawn nothing at all. Bounded wait on an observable (the fake coord's
+    /// recorded query), never a fixed sleep standing in for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_flag_poll_spawns_unpinned_and_follows_a_later_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
+        two_binding_machine(&amb, None, a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .with_flag_poll_interval_for_test(Duration::from_millis(20));
+
+        let handle = coord.start_flag_poll_task();
+        // Several unpinned ticks: nothing is asked of coord.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            rec.lock().await.tenant_policy_queries.is_empty(),
+            "an unpinned machine asks coord nothing"
+        );
+        assert_eq!(coord.inner.dual_write.tenant_id(), None);
+
+        crate::commands::tenant::apply_active_tenant(&b.to_string())
+            .expect("B is bound, so the switch is accepted");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if coord.inner.dual_write.enabled() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the running poll never followed the new pin; queries: {:?}",
+                rec.lock().await.tenant_policy_queries
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        assert_eq!(coord.inner.dual_write.tenant_id(), Some(b));
+        let g = rec.lock().await;
+        assert!(
+            !g.tenant_policy_queries.is_empty()
+                && g.tenant_policy_queries.iter().all(|q| q == &b.to_string()),
+            "the loop polls the tenant the pin names now: {:?}",
+            g.tenant_policy_queries
         );
     }
 

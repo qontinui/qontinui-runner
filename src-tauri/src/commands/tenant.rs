@@ -15,9 +15,11 @@
 //! PINNED at creation keeps its tenant, but one frozen UNPINNED (the normal
 //! single-tenant shape, and a restored/adopted nonce with no recorded tenant)
 //! re-reads the machine pin on every request (`coord_mcp::decide_session_tenant`
-//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. And
-//! the dual-write gate and the nonce restore read the pin once at startup, so
-//! they see a switch only at the next runner start. [`PIN_SURFACES`] is the
+//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. The
+//! dual-write gate follows a switch within one flag-poll interval, because its
+//! poll re-reads the pin each tick. Only the coord-mcp nonce restore and the
+//! boot-time on-disk nonce adoption read the pin once at startup, so they see
+//! a switch only at the next runner start. [`PIN_SURFACES`] is the
 //! per-consumer table; `PUT /tenant/active` reports it with a live count.
 //!
 //! The frontend [`TenantContext`] reads the active tenant id (per machine)
@@ -359,12 +361,11 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     },
     PinSurface {
         surface: "session_coordination_dual_write_gate",
-        timing: PinTiming::NextStart,
-        readers: &["session/dual_write.rs::new"],
-        detail: "DualWriteGate::new resolves its tenant once at construction and this process \
-                 keeps it. CoordSync::start_flag_poll_task (session/coord_sync.rs) does not read \
-                 the pin: it consumes that frozen value, so the flag poll runs only for the \
-                 tenant read at startup",
+        timing: PinTiming::Live,
+        readers: &["session/coord_sync.rs::run_flag_poll_loop"],
+        detail: "the flag poll re-reads the pin each tick, so a switch takes effect within about \
+                 one QONTINUI_SESSION_FLAG_POLL_SECS interval (default 60s), plus at most one \
+                 fetch already in flight for the previous tenant",
     },
     PinSurface {
         surface: "coord_mcp_nonce_restore",
@@ -1189,7 +1190,6 @@ mod tests {
             [
                 "coord_mcp.rs::adopt_on_disk_nonce",
                 "coord_mcp.rs::restore_proxy_nonces_from",
-                "session/dual_write.rs::new",
             ]
             .into_iter()
             .collect()

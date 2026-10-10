@@ -5199,13 +5199,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
                 //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
                 //   GET, materializing each handoff_request as a child session.
-                //   Phase 10 flag-poll only spawns when an `active_tenant_id`
-                //   resolved from machine.json (None → dormant); dual-write
-                //   stays off until `session_coordination_enabled` flips.
+                //   Phase 10 flag-poll always spawns and re-reads the
+                //   machine.json `active_tenant_id` every tick (unpinned →
+                //   it asks coord nothing), so a tenant switch is followed
+                //   without a restart; dual-write stays off until that
+                //   tenant's `session_coordination_enabled` flips.
                 //   Multi-tenant (Phase 8b) disposition: the flag-poll is a
-                //   DEVICE-scoped surface — it polls the DEFAULT binding's
-                //   tenant policy and presents the default device-JWT slot
-                //   (unparameterized `coord_get`) by construction.
+                //   DEVICE-scoped surface — it polls the PINNED tenant's
+                //   policy and presents that tenant's own device-JWT slot
+                //   (`tenant_policy_scope`).
                 let loop_registry = registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();
