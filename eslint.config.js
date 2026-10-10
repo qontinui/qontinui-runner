@@ -88,6 +88,69 @@ const CATCH_SITE_DISCARD_SELECTORS = [
   'ConditionalExpression[test.type="BinaryExpression"][test.operator="instanceof"][test.right.name="Error"][consequent.type="MemberExpression"][consequent.property.name="message"]',
 ].map((selector) => ({ selector, message: CATCH_SITE_DISCARD_MESSAGE }));
 
+/**
+ * Output-text boundary — plan
+ * `2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task`.
+ *
+ * These two files turn raw AI and terminal (PTY) output text into findings.
+ * That text is untrusted: any program in any terminal tab can print it, so
+ * parsing it must stay display-only. A pending-verification marker line once
+ * reached disk through `invoke` from here and launched an unattended AI task
+ * on the next webview mount.
+ *
+ * What this enforces is ONE import hop over the named modules only: these
+ * files may not import Tauri IPC or plugins (`@tauri-apps/api`, any
+ * `core*` spelling, `@tauri-apps/plugin-*`), the operator doors, anything under
+ * `hooks` (the barrel and `useAiTaskPolling`, where `executeAiTask` lives),
+ * `runner-api`, or anything named `*VerificationService*` — statically or
+ * through a dynamic `import()`, with or without a file extension; a dynamic
+ * `import()` whose source is not a plain string literal is refused outright.
+ * It is not a transitive guarantee. `./ReportPersistenceService` (backend
+ * sync) and `../findings/FindingsPersistence` (the `save_findings_data`
+ * command) remain allowed for FindingsTracker's caller-invoked report/archive
+ * path — not for the parser, whose own no-side-effect contract is stated in
+ * FindingsTracker's header and pinned by its tests.
+ *
+ * `patterns`, not exact `paths` alone: `operatorDoors.ts` is a bare `invoke`,
+ * and `executeAiTask` is reachable through the `hooks` barrel, so an
+ * exact-alias list is bypassable by a relative spelling.
+ *
+ * Pinned by src/lib/eslintConfig.findingsBoundary.test.ts.
+ */
+const FINDINGS_BOUNDARY_FILES = [
+  "src/services/FindingsTracker.ts",
+  "src/components/terminal/useTerminalFindings.ts",
+];
+const FINDINGS_BOUNDARY_MESSAGE =
+  "Output-text parsing is display-only: no IPC, operator door, runner-api client or AI-task " +
+  "launcher from FindingsTracker / useTerminalFindings " +
+  "(plan 2026-10-06-terminal-and-ai-output-text-launches-an-unattended-ai-task).";
+const FINDINGS_BOUNDARY_PATTERNS = [
+  "@tauri-apps/api/core*",
+  "@tauri-apps/plugin-*",
+  "**/lib/operatorDoors",
+  "**/lib/operatorDoors.*",
+  "**/hooks",
+  "**/hooks/",
+  "**/hooks/index",
+  "**/hooks/useAiTaskPolling",
+  "**/hooks/useAiTaskPolling.*",
+  "**/lib/runner-api",
+  "**/lib/runner-api.*",
+  "**/*VerificationService*",
+];
+// Dynamic `import()`: a non-Literal source (template literal, variable) is
+// refused outright because its target cannot be read statically; the regexes
+// accept an optional `.ts`/`.js`-family extension and a trailing slash, and
+// `hooks` is refused as a whole directory to agree with the static `**/hooks`.
+const FINDINGS_BOUNDARY_DYNAMIC_IMPORT_SELECTORS = [
+  'ImportExpression[source.type!="Literal"]',
+  "ImportExpression[source.value=/^@tauri-apps\\//]",
+  "ImportExpression[source.value=/(^|\\/)lib\\/(operatorDoors|runner-api)(\\.[cm]?[jt]sx?)?\\/?$/]",
+  "ImportExpression[source.value=/(^|\\/)hooks(\\/|$)/]",
+  "ImportExpression[source.value=/VerificationService/]",
+].map((selector) => ({ selector, message: FINDINGS_BOUNDARY_MESSAGE }));
+
 export default [
   js.configs.recommended,
   {
@@ -203,6 +266,48 @@ export default [
     rules: {
       "no-restricted-syntax": [
         "error",
+        ...TERMINAL_POPULATION_NAME_SELECTORS,
+        ...CATCH_SITE_DISCARD_SELECTORS,
+      ],
+    },
+  },
+  {
+    // Output-text boundary (static imports) — see FINDINGS_BOUNDARY_* above.
+    files: FINDINGS_BOUNDARY_FILES,
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          // The root barrel re-exports `core`; `@tauri-apps/api/core` itself
+          // (and `core.js`) is covered by the `@tauri-apps/api/core*` pattern.
+          paths: [{ name: "@tauri-apps/api", message: FINDINGS_BOUNDARY_MESSAGE }],
+          patterns: [{ group: FINDINGS_BOUNDARY_PATTERNS, message: FINDINGS_BOUNDARY_MESSAGE }],
+        },
+      ],
+    },
+  },
+  {
+    // Output-text boundary (dynamic `import()`) for FindingsTracker.ts. Spreads
+    // CATCH_SITE_DISCARD_SELECTORS: flat config REPLACES this rule's options,
+    // and the `src/**` catch-site block above also matches this file.
+    files: ["src/services/FindingsTracker.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...FINDINGS_BOUNDARY_DYNAMIC_IMPORT_SELECTORS,
+        ...CATCH_SITE_DISCARD_SELECTORS,
+      ],
+    },
+  },
+  {
+    // Output-text boundary (dynamic `import()`) for useTerminalFindings.ts.
+    // Spreads both selector lists the earlier blocks apply under
+    // src/components/terminal/**, for the same REPLACE reason.
+    files: ["src/components/terminal/useTerminalFindings.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...FINDINGS_BOUNDARY_DYNAMIC_IMPORT_SELECTORS,
         ...TERMINAL_POPULATION_NAME_SELECTORS,
         ...CATCH_SITE_DISCARD_SELECTORS,
       ],

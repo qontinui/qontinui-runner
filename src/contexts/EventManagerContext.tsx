@@ -8,8 +8,6 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
 import { Event } from "@tauri-apps/api/event";
 import { eventRouter, logManager } from "../managers";
-import { verificationService } from "../services";
-import { executeAiTask } from "../hooks";
 import type { EventPayload } from "../types/eventPayloads";
 import { createLogger } from "@/lib/logger";
 
@@ -42,59 +40,6 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
     let unlistenExecutor: (() => void) | null = null;
     let unlistenAiOutput: (() => void) | null = null;
     let isMounted = true;
-
-    // Check for and auto-trigger pending verification
-    const checkPendingVerification = async () => {
-      try {
-        const pending = await verificationService.loadPendingVerification();
-        if (pending && pending.status === "pending") {
-          log.debug("Found pending verification, auto-triggering...");
-
-          // Small delay to ensure everything is ready
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-
-          // Get the verification prompt
-          const verificationPrompt = await verificationService.triggerVerification();
-          if (!verificationPrompt) {
-            console.warn("[EVENT_MGR] Failed to get verification prompt");
-            return;
-          }
-
-          // Build full prompt with conversation history for context
-          const aiOutputLogs = logManager.getAiOutputLogs();
-          let fullPrompt = "";
-
-          // Include previous conversation as context (not displayed again since it's loaded)
-          if (aiOutputLogs.length > 0) {
-            fullPrompt += "## Restored Conversation Context\n\n";
-            fullPrompt += "(Previous conversation has been restored from before the restart)\n\n";
-            fullPrompt += "---\n\n";
-          }
-
-          fullPrompt += verificationPrompt;
-
-          log.debug("Sending verification prompt to AI...");
-
-          // Use async task execution with polling
-          try {
-            const task = await executeAiTask({
-              name: "ai-analysis",
-              content: fullPrompt,
-              maxSessions: 1,
-              displayPrompt: "Verification: Checking if the fix worked...",
-              timeoutSeconds: 600,
-            });
-            log.debug("Verification prompt completed, task status:", task.status);
-          } catch (error) {
-            console.error("[EVENT_MGR] Verification prompt failed:", error);
-          }
-        } else if (pending) {
-          log.debug("Pending verification exists but status is:", pending.status);
-        }
-      } catch (error) {
-        console.error("[EVENT_MGR] Error checking pending verification:", error);
-      }
-    };
 
     const setupListeners = async () => {
       try {
@@ -161,9 +106,6 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
         unlistenAiOutput = unlistenAiOutputFn;
         setIsConnected(true);
         log.debug("Event listeners set up successfully");
-
-        // Check for pending verification after initialization
-        checkPendingVerification();
       } catch (error) {
         console.error("[EVENT_MGR] Failed to set up event listeners:", error);
         setIsConnected(false);
