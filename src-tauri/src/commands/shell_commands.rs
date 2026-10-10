@@ -10,6 +10,7 @@
 //! - Category and tag-based organization
 //! - Integration with task runs for audit logging
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::{BridgeCompartment, ExecutionCompartment, StorageCompartment};
 use crate::commands::CommandResponse;
 use crate::error::AppError;
@@ -24,6 +25,9 @@ use tauri::Runtime;
 use tauri::State;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
+
+/// One shell command's recent results. Default 10, clamped to `1..=500`.
+const SHELL_COMMAND_RESULTS_LIMIT: ReadLimit = ReadLimit::new(10, 500);
 
 // Fully migrated to compartment state (Workstream C):
 // Storage + Execution + Bridge compartments as needed per handler.
@@ -671,7 +675,7 @@ pub async fn get_shell_command_results(
 ) -> Result<CommandResponse, String> {
     info!("Getting results for shell command: {}", shell_command_id);
 
-    let limit = limit.unwrap_or(10);
+    let limit = SHELL_COMMAND_RESULTS_LIMIT.resolve(limit);
     let pg_results = state
         .pg_db()
         .get_shell_command_results(&shell_command_id, limit)

@@ -17,11 +17,15 @@
 //! For tools requiring external state (workflow execution, screenshot capture),
 //! use the HTTP API at port 9876 instead.
 
+use crate::bounded_read::ReadLimit;
 use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
+
+/// Lines per log file the embedded `read_runner_logs` tool returns. Default 100, clamped to `1..=1000`.
+const RUNNER_LOGS_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 /// Tool information for MCP discovery.
 ///
@@ -196,7 +200,7 @@ impl EmbeddedMcp {
             .get("log_type")
             .and_then(|v| v.as_str())
             .unwrap_or("all");
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let limit = RUNNER_LOGS_LIMIT.resolve(args.get("limit").and_then(|v| v.as_u64())) as usize;
 
         let mut result: std::collections::HashMap<String, Vec<Value>> =
             std::collections::HashMap::new();

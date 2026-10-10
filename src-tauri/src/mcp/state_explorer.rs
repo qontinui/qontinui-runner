@@ -9,10 +9,14 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info};
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::state_explorer::{
     ExplorationConfig, ExplorationStrategy, ExplorationTask, StateExplorer, StateMachineGraph,
 };
+
+/// Exploration runs `GET /state-explorer/history` lists. Default 20, clamped to `1..=500`.
+const EXPLORATION_HISTORY_LIMIT: ReadLimit = ReadLimit::new(20, 500);
 
 // ============================================================================
 // State Explorer HTTP API Handlers
@@ -210,10 +214,8 @@ pub async fn preview_exploration(
 pub async fn get_exploration_history(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    let limit: usize = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let limit: usize =
+        EXPLORATION_HISTORY_LIMIT.resolve(params.get("limit").and_then(|s| s.parse().ok()));
 
     let reports_dir = crate::paths::get_state_explorer_dir();
 

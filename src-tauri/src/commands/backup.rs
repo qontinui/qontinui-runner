@@ -187,7 +187,7 @@ pub async fn export_all_data_impl(
     };
 
     let learning_outcomes = if opts.learning_outcomes {
-        pg_db.get_learning_outcomes(None).await?
+        pg_db.export_all_learning_outcomes().await?
     } else {
         vec![]
     };

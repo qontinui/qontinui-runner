@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::testing::{
     execute_verification_test, execute_verification_test_suite, ExecuteTestResponse,
     ExecuteTestSuiteRequest, ExecuteTestSuiteResponse,
@@ -22,6 +23,9 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::test_executor::{
     RepoTestConfig, TestCategory, TestDefinition, TestStatus, TestType, VisionConfig,
 };
+
+/// Recent test results `GET /tests/history` returns beside its counts. Default 20, clamped to `1..=1000`.
+const TEST_HISTORY_LIMIT: ReadLimit = ReadLimit::new(20, 1000);
 
 // ============================================================================
 // Types
@@ -291,7 +295,7 @@ pub async fn get_test_history(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ListTestResultsQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(20);
+    let limit = TEST_HISTORY_LIMIT.resolve(query.limit);
     match state
         .app_state
         .pg_db

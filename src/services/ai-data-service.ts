@@ -314,9 +314,9 @@ export const aiDataService = {
     taskRunId: string,
     successFilter?: boolean,
     limit?: number,
-    offset?: number,
+    cursor?: string,
   ): Promise<AiDataResponse<TaskRunMcpCallsDbResult>> {
-    return invoke("get_task_run_mcp_calls", { taskRunId, successFilter, limit, offset });
+    return invoke("get_task_run_mcp_calls", { taskRunId, successFilter, limit, cursor });
   },
 
   /**

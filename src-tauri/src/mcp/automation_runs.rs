@@ -6,7 +6,11 @@ use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::ApiState;
+
+/// Recent automation runs `GET /runs` lists. Default 20, clamped to `1..=500`.
+const AUTOMATION_RUNS_LIMIT: ReadLimit = ReadLimit::new(20, 500);
 
 // ============================================================================
 // Automation Run HTTP API Handlers (for MCP/AI access)
@@ -26,7 +30,7 @@ pub async fn list_automation_runs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ListAutomationRunsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let limit = query.limit.unwrap_or(20);
+    let limit = AUTOMATION_RUNS_LIMIT.resolve(query.limit);
     let config_id = query.config_id.clone();
 
     // PG-first: use the tiered_info PG module

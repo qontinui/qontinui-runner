@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tracing::warn;
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::require_app_state;
 
 /// Mark an escalation resolved with a free-form `resolution` note. Returns
@@ -52,9 +53,9 @@ pub async fn resolve_escalation(
 // answer coord had.
 // ============================================================================
 
-/// Cap on the live-agent set the panel asks coord to consider when the
-/// frontend does not pass one. Coord clamps this to its own hard maximum.
-const OVERLAPPING_INTENTS_DEFAULT_LIMIT: i64 = 200;
+/// The live-agent set the panel asks coord to pair over: 200 when the
+/// frontend passes none, never more than coord's own hard maximum of 500.
+const OVERLAPPING_INTENTS_LIMIT: ReadLimit = ReadLimit::new(200, 500);
 
 /// Deadline for the panel's coord read. Bounded on purpose: an unreachable
 /// coord must leave the panel empty promptly, never stall the dashboard.
@@ -194,7 +195,7 @@ pub async fn list_overlapping_intents(
     // (guessing dev-localhost when nothing is configured), which would have
     // this panel dial a phantom coord on every standalone install.
     let base = qontinui_runner_lib::profiles::connected_coord_base();
-    let cap = limit.unwrap_or(OVERLAPPING_INTENTS_DEFAULT_LIMIT);
+    let cap = OVERLAPPING_INTENTS_LIMIT.resolve(limit);
     Ok(overlapping_intents_for_base(base, cap).await)
 }
 

@@ -13,9 +13,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
 
+use crate::bounded_read::ReadLimit;
 use crate::findings::{Finding, FindingStatus, FindingStatusExt};
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+
+/// Findings one `GET /findings` page holds. Default 50, clamped to `1..=200`.
+const FINDINGS_PAGE_LIMIT: ReadLimit = ReadLimit::new(50, 200);
 
 /// Request body for updating finding status
 #[derive(Debug, Deserialize)]
@@ -118,7 +122,7 @@ pub async fn list_findings_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<ListFindingsQuery>,
 ) -> Result<Json<ApiResponse<ListFindingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let limit = FINDINGS_PAGE_LIMIT.resolve(q.limit);
     let page = q.page.unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 
@@ -161,7 +165,7 @@ pub async fn findings_by_status_handler(
         ));
     }
 
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let limit = FINDINGS_PAGE_LIMIT.resolve(q.limit);
     let page = q.page.unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 

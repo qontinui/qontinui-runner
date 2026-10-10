@@ -49,7 +49,11 @@ use super::types::{
     UIBridgeDiscoveryRequest, UiBridgeError,
 };
 use super::{ipc_handler_path_get, ipc_handler_post};
+use crate::bounded_read::ReadLimit;
 use crate::str_utils::truncate_str_ellipsis;
+
+/// UI Bridge changes one `get_changes_since` call forwards for. Default 100, clamped to `1..=1000`.
+const CHANGES_SINCE_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 /// Phase 3.2b (plan 2026-05-03) — bidirectional simple-glob match between
 /// a query value and a single `reveals` entry. Mirrors the canonical SDK
@@ -4798,10 +4802,7 @@ pub async fn ui_bridge_get_changes_since_handler(
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let since: i64 = query.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let limit: usize = query
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+    let limit: usize = CHANGES_SINCE_LIMIT.resolve(query.get("limit").and_then(|s| s.parse().ok()));
     let payload = serde_json::json!({ "params": { "since": since, "limit": limit } });
     super::request::wrap_ipc_result(
         ui_bridge_request_sync(&state, "get_changes_since", payload).await,

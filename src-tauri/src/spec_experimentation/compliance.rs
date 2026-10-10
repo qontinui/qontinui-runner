@@ -7,7 +7,11 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::bounded_read::ReadLimit;
 use crate::database::pg::PgDb;
+
+/// Spec compliance results one history read returns. Default 50, clamped to `1..=500`.
+const COMPLIANCE_HISTORY_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ── Severity weights ──────────────────────────────────────────────────
 
@@ -272,7 +276,7 @@ pub async fn get_compliance_history(
     spec_id: Option<&str>,
     limit: Option<i64>,
 ) -> Result<Vec<SpecComplianceResult>, String> {
-    let limit = limit.unwrap_or(50);
+    let limit = COMPLIANCE_HISTORY_LIMIT.resolve(limit);
     let rows = pg.get_compliance_history(spec_id, limit).await?;
     Ok(rows
         .into_iter()

@@ -26,6 +26,10 @@ use regex::Regex;
 // (external code may reference crate::mcp::misc::load_config_internal etc.)
 pub use super::bridges::*;
 pub use super::gui_execution::*;
+use crate::bounded_read::ReadLimit;
+
+/// Log errors `GET /debug/app/errors` returns, newest first. Default 50, clamped to `1..=500`.
+const DEBUG_ERRORS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 pub fn generate_id_from_path(path: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -293,7 +297,7 @@ pub async fn get_debug_errors(
         }));
     }
 
-    let limit = query.limit.unwrap_or(50);
+    let limit = DEBUG_ERRORS_LIMIT.resolve(query.limit);
     let mut all_errors: Vec<DebugError> = Vec::new();
 
     // Build log file list from global settings

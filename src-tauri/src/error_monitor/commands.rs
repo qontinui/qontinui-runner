@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -21,10 +22,13 @@ use crate::error_monitor::types::{ErrorStatus, ErrorSummary, StoredErrorEvent};
 use serde::Serialize;
 
 // Default limits for error monitor queries
-const DEFAULT_QUERY_LIMIT: usize = 100;
-const DEFAULT_SEARCH_LIMIT: usize = 50;
+/// Unresolved error events one query returns. Default 100, clamped to `1..=1000`.
+const UNRESOLVED_ERRORS_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
+/// Matches one error search returns. Default 50, clamped to `1..=500`.
+const ERROR_SEARCH_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 const DEFAULT_RECENT_HOURS: u32 = 24;
-const DEFAULT_RECENT_LIMIT: u32 = 10;
+/// Recent errors one read returns. Default 10, clamped to `1..=500`.
+const RECENT_ERRORS_LIMIT: ReadLimit = ReadLimit::new(10, 500);
 const DEFAULT_DEBUG_CONTEXT_MAX_ERRORS: usize = 50;
 const STACK_TRACE_EXCERPT_LINES: usize = 3;
 const PRIORITY_CRITICAL: u32 = 100;
@@ -134,7 +138,7 @@ pub async fn get_unresolved_errors(
     task_run_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    let limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+    let limit = UNRESOLVED_ERRORS_LIMIT.resolve(limit);
 
     let pg_rows = app_state
         .pg_db
@@ -256,7 +260,7 @@ pub async fn search_errors(
     query: String,
     limit: Option<usize>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let limit = ERROR_SEARCH_LIMIT.resolve(limit);
 
     let pg_rows = app_state.pg_db.search_errors(&query, limit).await?;
 
@@ -293,7 +297,7 @@ pub async fn get_recent_errors(
     limit: Option<u32>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
     let hours = hours.unwrap_or(DEFAULT_RECENT_HOURS);
-    let limit = limit.unwrap_or(DEFAULT_RECENT_LIMIT);
+    let limit = RECENT_ERRORS_LIMIT.resolve(limit);
 
     let captured_after = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
     let statuses = ["new", "acknowledged", "in_progress"];

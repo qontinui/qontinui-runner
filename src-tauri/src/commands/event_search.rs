@@ -11,8 +11,12 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::StorageCompartment;
 use crate::error::AppError;
+
+/// Matches the event-search panel returns. Default 100, clamped to `1..=500`.
+const EVENT_SEARCH_LIMIT: ReadLimit = ReadLimit::new(100, 500);
 
 // Migrated to StorageCompartment (Workstream C).
 
@@ -55,7 +59,7 @@ async fn search_events_impl(
         None => (Utc::now() - Duration::days(7)).into(),
     };
 
-    let max_results = limit.unwrap_or(100).clamp(1, 500);
+    let max_results = EVENT_SEARCH_LIMIT.resolve(limit);
 
     let rows = state
         .pg_db()

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use crate::database::pipeline_traces;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
@@ -24,6 +25,29 @@ use crate::meta_optimizer::types::{
     ReflectionFixDetailL1, ReflectionFixSummaryL0,
 };
 use crate::str_utils::truncate_str;
+
+/// Traces `GET /meta-optimizer/agent-trace-aggregates` reads. Default 50, clamped to `1..=500`.
+const AGENT_TRACE_AGGREGATES_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Learning outcomes `GET /learning/outcomes` returns at L1/L2. Default 50, clamped to `1..=500`.
+const LEARNING_OUTCOMES_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Feedback rows `GET /workflow-generation/feedback` returns at L1/L2. Default 50, clamped to `1..=500`.
+const GENERATION_FEEDBACK_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Reflection fixes `GET /meta-optimizer/reflection-fixes` returns at L1/L2. Default 50, clamped to `1..=500`.
+const REFLECTION_FIXES_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Runs `GET /meta-optimizer/iteration-history` reads. Default 50, clamped to `1..=500`.
+const ITERATION_HISTORY_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Entries `GET /meta-optimizer/prompt-evolution` returns. Default 50, clamped to `1..=500`.
+const PROMPT_EVOLUTION_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Duel pools `GET /meta-optimizer/duel-pools` lists. Default 50, clamped to `1..=500`.
+const DUEL_POOLS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// A duel pool's results `GET /meta-optimizer/duel-pools/{id}/results` lists. Default 200, clamped to `1..=1000`.
+const DUEL_RESULTS_LIMIT: ReadLimit = ReadLimit::new(200, 1000);
+/// Beam-search runs `GET /meta-optimizer/beam-runs` lists. Default 50, clamped to `1..=500`.
+const BEAM_RUNS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Span events `GET /meta-optimizer/span-events` lists. Default 500, clamped to `1..=2000`.
+const SPAN_EVENTS_LIMIT: ReadLimit = ReadLimit::new(500, 2000);
+/// Completed canary rollouts `GET /meta-optimizer/canaries/history` lists. Default 20, clamped to `1..=500`.
+const CANARY_HISTORY_LIMIT: ReadLimit = ReadLimit::new(20, 500);
 
 // ---------------------------------------------------------------------------
 // Query parameter structs
@@ -93,7 +117,7 @@ pub async fn get_agent_trace_aggregates_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TraceAggregateQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50);
+    let limit = AGENT_TRACE_AGGREGATES_LIMIT.resolve(query.limit);
     let tier = query.tier.unwrap_or_default();
 
     let make_err = |e: String| {
@@ -690,7 +714,7 @@ pub async fn get_learning_outcomes_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<LearningOutcomesQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50);
+    let limit = LEARNING_OUTCOMES_LIMIT.resolve(query.limit);
     let status = query.status.clone();
     let workflow_architecture = query.workflow_architecture.clone();
     let tier = query.tier.unwrap_or_default();
@@ -757,7 +781,7 @@ pub async fn get_generation_feedback_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<GenerationFeedbackQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50);
+    let limit = GENERATION_FEEDBACK_LIMIT.resolve(query.limit);
     let feedback_type = query.feedback_type.clone();
     let tier = query.tier.unwrap_or_default();
 
@@ -838,7 +862,7 @@ pub async fn get_reflection_fixes_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ReflectionFixesQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50) as i64;
+    let limit = REFLECTION_FIXES_LIMIT.resolve(query.limit) as i64;
     let source_agent = query.source_agent.clone();
     let tier = query.tier.unwrap_or_default();
 
@@ -947,7 +971,7 @@ pub async fn get_iteration_history_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<IterationHistoryQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50) as i64;
+    let limit = ITERATION_HISTORY_LIMIT.resolve(query.limit) as i64;
     let status_filter = query.status.clone();
     let tier = query.tier.unwrap_or_default();
 
@@ -1282,10 +1306,8 @@ pub async fn get_canary_history_handler(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20u32);
+    let limit =
+        CANARY_HISTORY_LIMIT.resolve(params.get("limit").and_then(|v| v.parse::<u32>().ok()));
 
     let history = crate::meta_optimizer::canary::get_canary_history(&state.app_state.pg_db, limit)
         .map_err(|e| {
@@ -1455,7 +1477,7 @@ async fn get_prompt_evolution_handler(
     Query(query): Query<PromptEvolutionQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg_db = &state.app_state.pg_db;
-    let limit = query.limit.unwrap_or(50) as usize;
+    let limit = PROMPT_EVOLUTION_LIMIT.resolve(query.limit) as usize;
 
     let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(
         pg_db,
@@ -1497,7 +1519,7 @@ pub async fn list_duel_pools_handler(
         .list_duel_pools(
             query.agent_type.as_deref(),
             query.status.as_deref(),
-            query.limit.unwrap_or(50),
+            DUEL_POOLS_LIMIT.resolve(query.limit),
         )
         .await
         .map_err(|e| {
@@ -1562,7 +1584,7 @@ pub async fn list_duel_results_handler(
     let results = state
         .app_state
         .pg_db
-        .list_duel_results(&id, query.limit.unwrap_or(200))
+        .list_duel_results(&id, DUEL_RESULTS_LIMIT.resolve(query.limit))
         .await
         .map_err(|e| {
             (
@@ -1587,7 +1609,10 @@ pub async fn list_beam_runs_handler(
     let runs = state
         .app_state
         .pg_db
-        .list_beam_search_runs(query.agent_type.as_deref(), query.limit.unwrap_or(50))
+        .list_beam_search_runs(
+            query.agent_type.as_deref(),
+            BEAM_RUNS_LIMIT.resolve(query.limit),
+        )
         .await
         .map_err(|e| {
             (
@@ -1639,7 +1664,7 @@ pub async fn list_span_events_handler(
         .list_span_events(
             query.execution_id.as_deref(),
             query.trace_id.as_deref(),
-            query.limit.unwrap_or(500),
+            SPAN_EVENTS_LIMIT.resolve(query.limit),
         )
         .await
         .map_err(|e| {

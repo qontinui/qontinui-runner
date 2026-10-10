@@ -12,7 +12,11 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+
+/// Unresolved error events `GET /error-monitor/errors` returns. Default 100, clamped to `1..=1000`.
+const UNRESOLVED_ERRORS_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 // ============================================================================
 // Types
@@ -52,10 +56,8 @@ pub async fn get_error_monitor_errors(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     let task_run_id = query.get("task_run_id").cloned();
-    let limit = query
-        .get("limit")
-        .and_then(|l| l.parse::<usize>().ok())
-        .unwrap_or(100);
+    let limit =
+        UNRESOLVED_ERRORS_LIMIT.resolve(query.get("limit").and_then(|l| l.parse::<usize>().ok()));
 
     let pg_errors = state
         .app_state

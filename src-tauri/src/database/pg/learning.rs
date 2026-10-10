@@ -3,6 +3,10 @@
 //! Learning outcomes and patterns for the meta-optimizer.
 
 use super::PgDb;
+use crate::bounded_read::ReadLimit;
+
+/// Learning outcomes one filtered query returns. Default 100, clamped to `1..=1000`.
+const LEARNING_OUTCOMES_FILTERED_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 fn non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
@@ -103,17 +107,19 @@ impl PgDb {
         Ok(())
     }
 
-    /// Get learning outcomes for analysis.
+    /// The newest `limit` learning outcomes, for analyses that deliberately
+    /// work over a recent window (the caller names the window). Backup and
+    /// export, which need every row, walk [`Self::export_all_learning_outcomes`].
     pub async fn get_learning_outcomes(
         &self,
-        limit: Option<u32>,
+        limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let max_results = limit.unwrap_or(100) as i64;
+        let max_results = limit;
 
         let rows = qontinui_db::queries::learning::get_learning_outcomes()
             .bind(&conn, &max_results)
@@ -243,7 +249,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let limit_val = limit.unwrap_or(100);
+        let limit_val = LEARNING_OUTCOMES_FILTERED_LIMIT.resolve(limit);
 
         // Build dynamic WHERE clause
         let mut conditions = Vec::new();
@@ -373,22 +379,40 @@ impl PgDb {
         }))
     }
 
-    /// Get learning outcomes with pagination.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn get_learning_outcomes_paginated(
+    /// One keyset page of learning outcomes, newest first, walked on the
+    /// immutable `(created_at, id)`. Both are written once by the INSERT; the
+    /// two `UPDATE learning_outcomes` statements set `model_used` and
+    /// `composite_agentic_score` only (pinned by
+    /// `bounded_read::tests::keyset_keys_have_no_update_site`). Fetches up to
+    /// `limit + 1` rows — the extra row is the has-more probe. Each row is
+    /// served beside its exact `created_at`, the keyset value the next cursor
+    /// is minted from.
+    pub async fn get_learning_outcomes_page(
         &self,
-        offset: i64,
+        after: Option<qontinui_types::page::KeysetPosition>,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    ) -> Result<Vec<(serde_json::Value, chrono::DateTime<chrono::Utc>)>, String> {
+        let (after_at, after_id) = crate::bounded_read::keyset_binds(after);
+        self.learning_outcomes_after(after_at, after_id, limit)
+            .await
+    }
+
+    /// The statement behind [`Self::get_learning_outcomes_page`], resuming
+    /// strictly after a raw `(created_at, id)` — any TEXT id, canonical uuid
+    /// or not, so an internal walk never needs a cursor.
+    async fn learning_outcomes_after(
+        &self,
+        after_at: Option<chrono::DateTime<chrono::Utc>>,
+        after_id: Option<String>,
+        limit: i64,
+    ) -> Result<Vec<(serde_json::Value, chrono::DateTime<chrono::Utc>)>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let fetch = limit.max(1).saturating_add(1);
         let rows = conn
             .query(
                 r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
@@ -398,46 +422,76 @@ impl PgDb {
                        total_tokens, total_cost_usd, composite_agentic_score,
                        technology_tags, domain_tags, complexity_tier
                 FROM learning_outcomes
-                ORDER BY created_at DESC
-                LIMIT $1 OFFSET $2"#,
-                &[&limit, &offset],
+                WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1, $2::text))
+                ORDER BY created_at DESC, id DESC
+                LIMIT $3"#,
+                &[&after_at, &after_id, &fetch],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_paginated", &e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_page", &e))?;
 
-        let results = rows
-            .iter()
+        let decode = |e: tokio_postgres::Error| {
+            crate::database::pg::pg_err("PG get_learning_outcomes_page decode", &e)
+        };
+        rows.iter()
             .map(|r| {
-                let created: chrono::DateTime<chrono::Utc> = r.get(11);
-                serde_json::json!({
-                    "id": r.get::<_, String>(0),
-                    "task_id": r.get::<_, String>(1),
-                    "status": r.get::<_, String>(2),
-                    "duration_secs": r.get::<_, Option<f64>>(3),
-                    "iterations": r.get::<_, Option<i32>>(4),
-                    "strategy": r.get::<_, Option<String>>(5),
-                    "tools_used": r.get::<_, Option<String>>(6),
-                    "files_modified": r.get::<_, Option<String>>(7),
-                    "error_type": r.get::<_, Option<String>>(8),
-                    "error_message": r.get::<_, Option<String>>(9),
-                    "feedback": r.get::<_, Option<String>>(10),
-                    "created_at": created.to_rfc3339(),
-                    "workflow_architecture": r.get::<_, Option<String>>(12),
-                    "step_count": r.get::<_, Option<i64>>(13),
-                    "verification_step_count": r.get::<_, Option<i64>>(14),
-                    "agentic_step_count": r.get::<_, Option<i64>>(15),
-                    "has_ui_bridge": r.get::<_, Option<bool>>(16),
-                    "total_tokens": r.get::<_, Option<i64>>(17),
-                    "total_cost_usd": r.get::<_, Option<f64>>(18),
-                    "composite_agentic_score": r.get::<_, Option<f64>>(19),
-                    "technology_tags": r.get::<_, Option<String>>(20),
-                    "domain_tags": r.get::<_, Option<String>>(21),
-                    "complexity_tier": r.get::<_, Option<String>>(22),
-                })
+                let created: chrono::DateTime<chrono::Utc> = r.try_get(11).map_err(decode)?;
+                Ok((
+                    serde_json::json!({
+                        "id": r.try_get::<_, String>(0).map_err(decode)?,
+                        "task_id": r.try_get::<_, String>(1).map_err(decode)?,
+                        "status": r.try_get::<_, String>(2).map_err(decode)?,
+                        "duration_secs": r.try_get::<_, Option<f64>>(3).map_err(decode)?,
+                        "iterations": r.try_get::<_, Option<i32>>(4).map_err(decode)?,
+                        "strategy": r.try_get::<_, Option<String>>(5).map_err(decode)?,
+                        "tools_used": r.try_get::<_, Option<String>>(6).map_err(decode)?,
+                        "files_modified": r.try_get::<_, Option<String>>(7).map_err(decode)?,
+                        "error_type": r.try_get::<_, Option<String>>(8).map_err(decode)?,
+                        "error_message": r.try_get::<_, Option<String>>(9).map_err(decode)?,
+                        "feedback": r.try_get::<_, Option<String>>(10).map_err(decode)?,
+                        "created_at": created.to_rfc3339(),
+                        "workflow_architecture": r.try_get::<_, Option<String>>(12).map_err(decode)?,
+                        "step_count": r.try_get::<_, Option<i64>>(13).map_err(decode)?,
+                        "verification_step_count": r.try_get::<_, Option<i64>>(14).map_err(decode)?,
+                        "agentic_step_count": r.try_get::<_, Option<i64>>(15).map_err(decode)?,
+                        "has_ui_bridge": r.try_get::<_, Option<bool>>(16).map_err(decode)?,
+                        "total_tokens": r.try_get::<_, Option<i64>>(17).map_err(decode)?,
+                        "total_cost_usd": r.try_get::<_, Option<f64>>(18).map_err(decode)?,
+                        "composite_agentic_score": r.try_get::<_, Option<f64>>(19).map_err(decode)?,
+                        "technology_tags": r.try_get::<_, Option<String>>(20).map_err(decode)?,
+                        "domain_tags": r.try_get::<_, Option<String>>(21).map_err(decode)?,
+                        "complexity_tier": r.try_get::<_, Option<String>>(22).map_err(decode)?,
+                    }),
+                    created,
+                ))
             })
-            .collect();
+            .collect()
+    }
 
-        Ok(results)
+    /// EVERY learning outcome, newest first, walked page by page on the
+    /// keyset — for backup and export, which must hold the corpus, not a page
+    /// of it. (They used to call [`Self::get_learning_outcomes`] with `None`,
+    /// which silently meant "the newest 100".)
+    pub async fn export_all_learning_outcomes(&self) -> Result<Vec<serde_json::Value>, String> {
+        const EXPORT_PAGE: i64 = 1000;
+        let mut all = Vec::new();
+        let (mut after_at, mut after_id) = (None, None);
+        loop {
+            let mut rows = self
+                .learning_outcomes_after(after_at, after_id.take(), EXPORT_PAGE)
+                .await?;
+            let has_more = rows.len() as i64 > EXPORT_PAGE;
+            rows.truncate(EXPORT_PAGE as usize);
+            if let Some((last, at)) = rows.last() {
+                after_at = Some(*at);
+                after_id = last["id"].as_str().map(str::to_string);
+            }
+            all.extend(rows.into_iter().map(|(row, _)| row));
+            if !has_more {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     /// Get learning statistics for a date range.

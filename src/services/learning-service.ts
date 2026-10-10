@@ -15,7 +15,7 @@ import type {
   TaskOutcome,
   LearningDashboardData,
   LearningOutcomeFilter,
-  PaginatedResult,
+  LearningOutcomesPage,
   LearningStatsByDateRange,
   LearningOutcomeRecord,
   TaskRunWithOutcome,
@@ -150,16 +150,16 @@ export const learningService = {
   },
 
   /**
-   * Get learning outcomes with pagination.
-   * @param offset - Number of records to skip.
-   * @param limit - Maximum number of records to return.
-   * @returns Paginated result with items, total count, offset, and limit.
+   * Get one keyset page of learning outcomes, newest first.
+   * @param limit - Page size (default 50, max 500).
+   * @param cursor - The previous page's `next_cursor`; omit for the first page.
+   * @returns The page's items plus the shared bounded-read keys.
    */
   async getLearningOutcomesPaginated(
-    offset: number,
-    limit: number,
-  ): Promise<PaginatedResult<LearningOutcomeRecord[]>> {
-    return invoke("get_learning_outcomes_paginated", { offset, limit });
+    limit?: number,
+    cursor?: string,
+  ): Promise<LearningOutcomesPage> {
+    return invoke("get_learning_outcomes_paginated", { limit, cursor });
   },
 
   /**

@@ -12,9 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
+use crate::bounded_read::ReadLimit;
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+/// Integration test runs the testing door lists. Default 50, clamped to `1..=500`.
+const INTEGRATION_TEST_RUNS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ============================================================================
 // Types
@@ -307,10 +311,8 @@ pub async fn list_integration_test_runs(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
-    let limit: i32 = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let limit: i32 =
+        INTEGRATION_TEST_RUNS_LIMIT.resolve(params.get("limit").and_then(|s| s.parse().ok()));
 
     let params = serde_json::json!({
         "limit": limit,

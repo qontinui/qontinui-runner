@@ -10,7 +10,11 @@ use axum::response::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::{ApiResponse, ApiState};
+
+/// Event-bus history entries `GET /inngest/events` returns (the bus keeps 500). Default 50, clamped to `1..=500`.
+const EVENT_HISTORY_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ============================================================================
 // Event Bus Endpoints
@@ -27,7 +31,7 @@ pub async fn get_event_history(
     Query(query): Query<EventHistoryQuery>,
 ) -> Json<ApiResponse<Vec<crate::workflow_event_bus::WorkflowEvent>>> {
     let bus = crate::workflow_event_bus::get_workflow_event_bus();
-    let limit = query.limit.unwrap_or(50).min(500);
+    let limit = EVENT_HISTORY_LIMIT.resolve(query.limit);
     let history = bus.history(limit).await;
     Json(ApiResponse::success(history))
 }

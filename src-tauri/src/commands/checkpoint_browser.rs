@@ -6,6 +6,7 @@
 //! Uses PostgreSQL for persistence with in-memory CheckpointManager for
 //! real-time operations like replay.
 
+use crate::bounded_read::{decode_cursor, keyset_page, row_position, ReadLimit};
 use crate::commands::compartments::StorageCompartment;
 use crate::database::CreateTaskRunInput;
 use crate::error::AppError;
@@ -15,6 +16,7 @@ use crate::orchestrator::checkpoint::{
     StateRestorationConfig, StateSnapshot, VerificationSnapshot,
 };
 use once_cell::sync::Lazy;
+use qontinui_types::page::{BoundedReadMeta, CursorScope, ScopeFingerprint, SortKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -706,13 +708,33 @@ pub struct CheckpointFilter {
     pub since: Option<String>,
 }
 
-/// Paginated checkpoint result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaginatedCheckpointResult {
+/// One keyset page of orchestrator checkpoints: the rows plus the shared
+/// `BoundedReadMeta` keys (`count`, `limit`, `shown`, `total`, `truncated`,
+/// `bound_kind`, `next_cursor`, …). Pass `next_cursor` back as `cursor` for the
+/// next page.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckpointsPage {
     pub items: Vec<CheckpointSummary>,
-    pub total: i64,
-    pub offset: i64,
-    pub limit: i64,
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
+}
+
+/// A checkpoints page: 50 rows by default, never more than 500.
+const CHECKPOINTS_PAGE: ReadLimit = ReadLimit::new(50, 500);
+
+/// The keyset sequence of one task's checkpoints: `(created_at, id)`
+/// ascending. Both are written once by the INSERT and never updated (pinned
+/// by `bounded_read::tests::keyset_keys_have_no_update_site`).
+struct TaskCheckpointsWalk;
+impl SortKey for TaskCheckpointsWalk {
+    const ID: &'static str = "runner.orchestrator_checkpoints:created_at,id:asc";
+}
+
+/// The keyset sequence of every task's checkpoints: `(created_at, id)`
+/// descending, newest first.
+struct AllCheckpointsWalk;
+impl SortKey for AllCheckpointsWalk {
+    const ID: &'static str = "runner.orchestrator_checkpoints:created_at,id:desc";
 }
 
 /// Get checkpoints with optional filtering.
@@ -754,51 +776,72 @@ pub async fn get_checkpoints_filtered(
     Ok(summaries)
 }
 
-/// Get checkpoints with pagination.
+/// Get one keyset page of orchestrator checkpoints, optionally for one task.
+/// Omit `cursor` for the first page (which also carries the exact `total`);
+/// pass the previous page's `next_cursor` for the next.
 #[tauri::command]
 pub async fn get_checkpoints_paginated(
     state: State<'_, StorageCompartment>,
     task_id: Option<String>,
-    offset: i64,
-    limit: i64,
-) -> Result<PaginatedCheckpointResult, String> {
-    let checkpoints_json = state
-        .pg_db()
-        .get_checkpoints_paginated(task_id.as_deref(), offset, limit)
-        .await?;
+    limit: Option<i64>,
+    cursor: Option<String>,
+) -> Result<CheckpointsPage, String> {
+    match task_id.as_deref() {
+        Some(tid) => {
+            let scope = CursorScope::<TaskCheckpointsWalk>::new()
+                .opt_str("task_id", Some(tid))
+                .finish();
+            checkpoints_page(&state, task_id.as_deref(), limit, cursor.as_deref(), &scope).await
+        }
+        None => {
+            let scope = CursorScope::<AllCheckpointsWalk>::new()
+                .opt_str("task_id", None)
+                .finish();
+            checkpoints_page(&state, None, limit, cursor.as_deref(), &scope).await
+        }
+    }
+}
 
-    let summaries: Vec<CheckpointSummary> = checkpoints_json
+async fn checkpoints_page<K: SortKey>(
+    state: &StorageCompartment,
+    task_id: Option<&str>,
+    limit: Option<i64>,
+    cursor: Option<&str>,
+    scope: &ScopeFingerprint<K>,
+) -> Result<CheckpointsPage, String> {
+    let limit = CHECKPOINTS_PAGE.resolve(limit);
+    let after = decode_cursor(scope, cursor)
+        .map_err(|e| format!("{}: {}", e.code(), e.refusal("get_checkpoints_paginated")))?;
+    let rows = state
+        .pg_db()
+        .get_checkpoints_page(task_id, after, limit)
+        .await?;
+    let total = match after {
+        None => Some(state.pg_db().get_checkpoints_count(task_id).await?),
+        Some(_) => None,
+    };
+    let page = keyset_page(rows, limit, total, scope, |r| {
+        row_position(&r.id, r.created_at)
+    })?;
+    let meta = page.meta();
+    let items = page
+        .into_rows()
         .into_iter()
         .map(|cp| CheckpointSummary {
-            id: cp["id"].as_str().unwrap_or("").to_string(),
-            task_id: cp["task_id"].as_str().unwrap_or("").to_string(),
-            iteration: cp["iteration"].as_i64().unwrap_or(0) as u32,
-            trigger_type: cp["trigger"].as_str().unwrap_or("Manual").to_string(),
-            name: cp["name"].as_str().map(|s| s.to_string()),
-            created_at: cp["created_at"].as_str().unwrap_or("").to_string(),
-            state: cp["state"].as_str().unwrap_or("Unknown").to_string(),
-            tags: cp["tags"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            state: serde_json::from_str::<serde_json::Value>(&cp.state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "Unknown".to_string()),
+            id: cp.id,
+            task_id: cp.task_id,
+            iteration: u32::try_from(cp.iteration).unwrap_or(0),
+            trigger_type: cp.trigger,
+            name: cp.name,
+            created_at: cp.created_at.to_rfc3339(),
+            tags: Vec::new(),
         })
         .collect();
-
-    let total = state
-        .pg_db()
-        .get_checkpoints_count(task_id.as_deref())
-        .await?;
-
-    Ok(PaginatedCheckpointResult {
-        items: summaries,
-        total,
-        offset,
-        limit,
-    })
+    Ok(CheckpointsPage { items, page: meta })
 }
 
 /// Get total count of checkpoints.

@@ -55,9 +55,13 @@ use qontinui_types::spec_api_events::SpecApiEvent;
 // Flywheel Metrics — observability for the spec proposal lifecycle
 // =============================================================================
 
+use crate::bounded_read::ReadLimit;
 /// Global counters for flywheel metrics. Uses atomic increments for thread-safe
 /// observation across the runtime lifecycle.
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Proposals one `GET /apps/{app_id}/spec/proposals` page holds. Default 50, clamped to `1..=1000`.
+const PROPOSALS_LIST_LIMIT: ReadLimit = ReadLimit::new(50, 1000);
 
 pub static FLYWHEEL_PROPOSALS_SCANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static FLYWHEEL_PROPOSALS_EXECUTED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -104,7 +108,9 @@ fn metric_consecutive_greens_max(value: i32) {
 /// 90-day window are baked into the SQL").
 const DEFAULT_MIN_OBSERVATIONS: i32 = 50;
 const DEFAULT_LOOKBACK_DAYS: i32 = 90;
-const DEFAULT_SCAN_LIMIT: i64 = 100;
+/// Pathnames one `/spec/proposals/scan` examines. Default 100, clamped to
+/// `1..=1000`.
+const SCAN_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 /// Request body for `/spec/proposals/scan`. All fields optional.
 #[derive(Debug, Deserialize, Default)]
@@ -135,7 +141,7 @@ pub async fn post_scan(
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let min_obs = req.min_observations.unwrap_or(DEFAULT_MIN_OBSERVATIONS);
     let lookback = req.lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
-    let limit = req.limit.unwrap_or(DEFAULT_SCAN_LIMIT);
+    let limit = SCAN_LIMIT.resolve(req.limit);
 
     let pg_db = state.app_state.pg_db.clone();
     let root = match storage::resolve_specs_root(&pg_db, &app_id).await {
@@ -1022,7 +1028,7 @@ pub async fn get_list(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<ListQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(50);
+    let limit = PROPOSALS_LIST_LIMIT.resolve(q.limit);
     let offset = q.offset.unwrap_or(0);
     let pg_db = state.app_state.pg_db.clone();
     // Resolve so unregistered apps return 404 before we query proposals.
@@ -1440,7 +1446,7 @@ mod tests {
             req.lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS),
             DEFAULT_LOOKBACK_DAYS
         );
-        assert_eq!(req.limit.unwrap_or(DEFAULT_SCAN_LIMIT), DEFAULT_SCAN_LIMIT);
+        assert_eq!(SCAN_LIMIT.resolve(req.limit), 100);
     }
 
     #[test]

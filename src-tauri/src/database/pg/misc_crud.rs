@@ -2,6 +2,14 @@
 //! shell commands, saved API requests, MCP servers.
 
 use super::PgDb;
+use crate::bounded_read::ReadLimit;
+
+/// A run's mobile state snapshots one read returns. Default 100, clamped to `1..=1000`.
+const MOBILE_STATES_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
+/// A run's mobile log lines one read returns. Default 100, clamped to `1..=1000`.
+const MOBILE_LOGS_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
+/// Artifacts one UI Bridge plugin query returns. Default 100, clamped to `1..=1000`.
+const ARTIFACTS_QUERY_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
@@ -1197,7 +1205,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let limit_i64 = limit.unwrap_or(100) as i64;
+        let limit_i64 = MOBILE_STATES_LIMIT.resolve(limit) as i64;
 
         let rows = conn
             .query(
@@ -1260,7 +1268,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let limit_i64 = limit.unwrap_or(100) as i64;
+        let limit_i64 = MOBILE_LOGS_LIMIT.resolve(limit) as i64;
 
         let rows = if errors_only {
             conn.query(
@@ -1414,7 +1422,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let limit_i64 = query.limit.unwrap_or(100) as i64;
+        let limit_i64 = ARTIFACTS_QUERY_LIMIT.resolve(query.limit) as i64;
         let offset_i64 = query.offset.unwrap_or(0) as i64;
 
         // Build dynamic query

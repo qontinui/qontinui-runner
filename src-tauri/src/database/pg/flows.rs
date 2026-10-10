@@ -622,57 +622,54 @@ impl PgDb {
         Ok(results)
     }
 
-    /// Get flow executions with pagination.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn get_flow_executions_paginated(
+    /// One keyset page of flow executions, newest first, walked on the
+    /// immutable `(started_at, instance_id)`. `started_at` is written by the
+    /// first INSERT only — [`Self::save_flow_execution`]'s `ON CONFLICT … DO
+    /// UPDATE` deliberately leaves it out — and the key is pinned by
+    /// `bounded_read::tests::keyset_keys_have_no_update_site`. Fetches up to
+    /// `limit + 1` rows — the extra row is the has-more probe.
+    pub async fn get_flow_executions_page(
         &self,
         flow_id: Option<&str>,
-        offset: i64,
+        after: Option<qontinui_types::page::KeysetPosition>,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    ) -> Result<Vec<FlowExecutionRow>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let rows = if let Some(fid) = flow_id {
-            conn.query(
+        let (after_at, after_id) = crate::bounded_read::keyset_binds(after);
+        let fetch = limit.max(1).saturating_add(1);
+        let rows = conn
+            .query(
                 r#"SELECT instance_id, flow_id, current_step, status, started_at, completed_at
-                FROM flow_executions WHERE flow_id = $1 ORDER BY started_at DESC LIMIT $2 OFFSET $3"#,
-                &[&fid, &limit, &offset],
+                FROM flow_executions
+                WHERE ($1::text IS NULL OR flow_id = $1)
+                  AND ($2::timestamptz IS NULL OR (started_at, instance_id) < ($2, $3::text))
+                ORDER BY started_at DESC, instance_id DESC
+                LIMIT $4"#,
+                &[&flow_id, &after_at, &after_id, &fetch],
             )
             .await
-        } else {
-            conn.query(
-                r#"SELECT instance_id, flow_id, current_step, status, started_at, completed_at
-                FROM flow_executions ORDER BY started_at DESC LIMIT $1 OFFSET $2"#,
-                &[&limit, &offset],
-            )
-            .await
-        }
-        .map_err(|e| crate::database::pg::pg_err("PG get_flow_executions_paginated", &e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_flow_executions_page", &e))?;
 
-        let results = rows
-            .iter()
+        let decode = |e: tokio_postgres::Error| {
+            crate::database::pg::pg_err("PG get_flow_executions_page decode", &e)
+        };
+        rows.iter()
             .map(|r| {
-                let started: chrono::DateTime<chrono::Utc> = r.get(4);
-                let completed: Option<chrono::DateTime<chrono::Utc>> = r.get(5);
-                serde_json::json!({
-                    "instance_id": r.get::<_, String>(0),
-                    "flow_id": r.get::<_, String>(1),
-                    "current_step": r.get::<_, Option<String>>(2),
-                    "status": r.get::<_, String>(3),
-                    "started_at": started.to_rfc3339(),
-                    "completed_at": completed.map(|dt| dt.to_rfc3339()),
+                Ok(FlowExecutionRow {
+                    instance_id: r.try_get(0).map_err(decode)?,
+                    flow_id: r.try_get(1).map_err(decode)?,
+                    current_step: r.try_get(2).map_err(decode)?,
+                    status: r.try_get(3).map_err(decode)?,
+                    started_at: r.try_get(4).map_err(decode)?,
+                    completed_at: r.try_get(5).map_err(decode)?,
                 })
             })
-            .collect();
-
-        Ok(results)
+            .collect()
     }
 
     /// Get total count of flow executions.
@@ -772,4 +769,16 @@ impl PgDb {
             "version2": v2,
         }))
     }
+}
+
+/// One `flow_executions` row as a keyset page serves it.
+#[derive(Debug, Clone)]
+pub struct FlowExecutionRow {
+    pub instance_id: String,
+    pub flow_id: String,
+    pub current_step: Option<String>,
+    pub status: String,
+    /// The immutable keyset value.
+    pub started_at: chrono::DateTime<Utc>,
+    pub completed_at: Option<chrono::DateTime<Utc>>,
 }

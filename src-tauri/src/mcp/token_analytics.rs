@@ -15,7 +15,11 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::error;
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::ApiState;
+
+/// Most expensive task runs `GET /analytics/token-usage/task-runs` ranks. Default 50, clamped to `1..=500`.
+const TASK_RUN_COSTS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ============================================================================
 // Query parameters
@@ -164,7 +168,7 @@ pub async fn get_task_run_costs(
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
-    let limit = params.limit.unwrap_or(50);
+    let limit = TASK_RUN_COSTS_LIMIT.resolve(params.limit);
 
     let rows = state
         .app_state

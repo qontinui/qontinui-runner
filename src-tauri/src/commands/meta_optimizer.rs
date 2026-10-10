@@ -11,12 +11,18 @@ use tauri::State;
 // (`trigger_meta_optimizer`) uses ExecutionCompartment; see note above the
 // fn for why it goes through `execution.app_state()` for the legacy
 // `MetaOptimizerDeps.app_state` field.
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
 use crate::commands::AppState;
 use crate::error::AppError;
 use crate::meta_optimizer::types::{
     MetaOptimizerRun, OptimizerType, PromptVariant, Recommendation,
 };
+
+/// Agent trace aggregates the effectiveness panel reads. Default 200, clamped to `1..=1000`.
+const AGENT_EFFECTIVENESS_LIMIT: ReadLimit = ReadLimit::new(200, 1000);
+/// Prompt-evolution entries the meta-optimizer panel lists. Default 50, clamped to `1..=500`.
+const PROMPT_EVOLUTION_HISTORY_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ── Recommendations ────────────────────────────────────────────────────
 
@@ -28,6 +34,7 @@ use crate::meta_optimizer::types::{
 // runtime. That panic crosses the WebView2 FFI boundary and aborts the process
 // rather than unwinding. Async commands run on Tauri's tokio multi-thread
 // runtime, so we call `_async` helpers that `.await` PG calls directly.
+
 #[tauri::command]
 pub async fn get_meta_optimizer_recommendations(
     app_state: State<'_, StorageCompartment>,
@@ -160,7 +167,9 @@ pub async fn get_agent_effectiveness(
     limit: Option<u32>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentTraceAggregate>, String> {
     let _ = app_state;
-    crate::database::pipeline_traces::get_agent_trace_aggregates(limit.unwrap_or(200))
+    crate::database::pipeline_traces::get_agent_trace_aggregates(
+        AGENT_EFFECTIVENESS_LIMIT.resolve(limit),
+    )
 }
 
 // ── Failure Analysis ─────────────────────────────────────────────────────
@@ -748,7 +757,7 @@ pub async fn get_prompt_evolution_history(
     crate::meta_optimizer::prompt_evolution::get_evolution_history(
         app_state.pg_db(),
         agent_type.as_deref(),
-        limit.unwrap_or(50),
+        PROMPT_EVOLUTION_HISTORY_LIMIT.resolve(limit),
     )
 }
 

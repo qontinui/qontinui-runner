@@ -5,6 +5,8 @@
  * identifies patterns, and generates actionable insights.
  */
 
+import type { BoundedReadMeta } from "./aiData";
+
 /** Outcome status of a completed task */
 export type OutcomeStatus = "Success" | "PartialSuccess" | "Failure" | "Abandoned";
 
@@ -204,11 +206,9 @@ export interface LearningOutcomeFilter {
 }
 
 /** Generic paginated result wrapper */
-export interface PaginatedResult<T> {
-  items: T;
-  total: number;
-  offset: number;
-  limit: number;
+/** One keyset page of learning outcomes, newest first, with the shared bounded-read keys. */
+export interface LearningOutcomesPage extends BoundedReadMeta {
+  items: LearningOutcomeRecord[];
 }
 
 /** Learning statistics for a date range */

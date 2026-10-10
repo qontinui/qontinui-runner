@@ -4,6 +4,7 @@
 //! and external APIs for debugging context.
 
 use crate::auth::AuthManager;
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::StorageCompartment;
 use crate::executor::flakiness::{ExecutionOptions, FlakinessCache};
 use crate::tiered_info::{
@@ -14,6 +15,13 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info, warn};
+
+/// Recent automation runs the history tab lists. Default 10, clamped to `1..=500`.
+const RECENT_RUNS_LIMIT: ReadLimit = ReadLimit::new(10, 500);
+/// Recent failed runs the history tab lists. Default 5, clamped to `1..=500`.
+const FAILED_RUNS_LIMIT: ReadLimit = ReadLimit::new(5, 500);
+/// AI sessions the history tab lists. Default 50, clamped to `1..=500`.
+const AI_SESSION_HISTORY_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 /// Response for tiered info commands.
 #[derive(Debug, Serialize)]
@@ -220,7 +228,7 @@ pub async fn get_recent_runs(
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
-    let limit = limit.unwrap_or(10);
+    let limit = RECENT_RUNS_LIMIT.resolve(limit);
     match storage
         .pg_db()
         .get_recent_runs(config_id.as_deref(), limit)
@@ -244,7 +252,7 @@ pub async fn get_failed_runs(
     config_id: String,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
-    let limit = limit.unwrap_or(5);
+    let limit = FAILED_RUNS_LIMIT.resolve(limit);
     match storage.pg_db().get_failed_runs(&config_id, limit).await {
         Ok(vals) => {
             let runs: Vec<RunDetails> = vals
@@ -519,7 +527,7 @@ pub async fn get_ai_session_history(
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<AiSessionRun>>, String> {
-    let limit = limit.unwrap_or(50);
+    let limit = AI_SESSION_HISTORY_LIMIT.resolve(limit);
 
     let pg_rows = storage
         .pg_db()

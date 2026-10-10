@@ -10,11 +10,13 @@
 // Fully migrated to compartment state (Workstream C).
 // step/run/resume/step_into flow-execution handlers use multi-State
 // (Storage + Health) since they read both pg_db and doctor_handle.
+use crate::bounded_read::{decode_cursor, keyset_page, row_position, ReadLimit};
 use crate::commands::compartments::{HealthCompartment, StorageCompartment};
 use crate::error::AppError;
 use crate::orchestrator::flow::{Condition, Flow, FlowState, FlowStatus, FlowStep};
 use crate::orchestrator::flow_executor::{FlowEvent, FlowExecutor};
 use once_cell::sync::Lazy;
+use qontinui_types::page::{BoundedReadMeta, CursorScope, SortKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -637,13 +639,25 @@ pub struct FlowExecutionFilter {
     pub status: Option<String>,
 }
 
-/// Paginated flow execution result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaginatedFlowExecutionResult {
+/// One keyset page of flow executions, newest first: the rows plus the shared
+/// `BoundedReadMeta` keys. Pass `next_cursor` back as `cursor` for the next
+/// page.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowExecutionsPage {
     pub items: Vec<FlowExecutionSummary>,
-    pub total: i64,
-    pub offset: i64,
-    pub limit: i64,
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
+}
+
+/// A flow-executions page: 50 rows by default, never more than 500.
+const FLOW_EXECUTIONS_PAGE: ReadLimit = ReadLimit::new(50, 500);
+
+/// The keyset sequence of `flow_executions`: `(started_at, instance_id)`
+/// descending. `started_at` is written by the first INSERT only (pinned by
+/// `bounded_read::tests::keyset_keys_have_no_update_site`).
+struct FlowExecutionsWalk;
+impl SortKey for FlowExecutionsWalk {
+    const ID: &'static str = "runner.flow_executions:started_at,instance_id:desc";
 }
 
 /// Get flows filtered by tag.
@@ -702,42 +716,57 @@ pub async fn get_flow_executions_filtered(
     Ok(summaries)
 }
 
-/// Get flow executions with pagination.
+/// Get one keyset page of flow executions, newest first, optionally for one
+/// flow. Omit `cursor` for the first page (which also carries the exact
+/// `total`); pass the previous page's `next_cursor` for the next.
 #[tauri::command]
 pub async fn get_flow_executions_paginated(
     state: State<'_, StorageCompartment>,
     flow_id: Option<String>,
-    offset: i64,
-    limit: i64,
-) -> Result<PaginatedFlowExecutionResult, String> {
-    let executions_json = state
+    limit: Option<i64>,
+    cursor: Option<String>,
+) -> Result<FlowExecutionsPage, String> {
+    let limit = FLOW_EXECUTIONS_PAGE.resolve(limit);
+    let scope = CursorScope::<FlowExecutionsWalk>::new()
+        .opt_str("flow_id", flow_id.as_deref())
+        .finish();
+    let after = decode_cursor(&scope, cursor.as_deref()).map_err(|e| {
+        format!(
+            "{}: {}",
+            e.code(),
+            e.refusal("get_flow_executions_paginated")
+        )
+    })?;
+    let rows = state
         .pg_db()
-        .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)
+        .get_flow_executions_page(flow_id.as_deref(), after, limit)
         .await?;
-
-    let summaries = executions_json
+    let total = match after {
+        None => Some(
+            state
+                .pg_db()
+                .get_flow_executions_count(flow_id.as_deref())
+                .await?,
+        ),
+        Some(_) => None,
+    };
+    let page = keyset_page(rows, limit, total, &scope, |r| {
+        row_position(&r.instance_id, r.started_at)
+    })?;
+    let meta = page.meta();
+    let items = page
+        .into_rows()
         .into_iter()
         .map(|e| FlowExecutionSummary {
-            instance_id: e["instance_id"].as_str().unwrap_or("").to_string(),
-            flow_id: e["flow_id"].as_str().unwrap_or("").to_string(),
-            status: e["status"].as_str().unwrap_or("Unknown").to_string(),
-            current_step: e["current_step"].as_str().map(|s| s.to_string()),
-            started_at: e["started_at"].as_str().unwrap_or("").to_string(),
-            completed_at: e["completed_at"].as_str().map(|s| s.to_string()),
+            instance_id: e.instance_id,
+            flow_id: e.flow_id,
+            status: e.status,
+            current_step: e.current_step,
+            started_at: e.started_at.to_rfc3339(),
+            completed_at: e.completed_at.map(|dt| dt.to_rfc3339()),
         })
         .collect();
-
-    let total = state
-        .pg_db()
-        .get_flow_executions_count(flow_id.as_deref())
-        .await?;
-
-    Ok(PaginatedFlowExecutionResult {
-        items: summaries,
-        total,
-        offset,
-        limit,
-    })
+    Ok(FlowExecutionsPage { items, page: meta })
 }
 
 /// Get total count of flow executions.
