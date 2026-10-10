@@ -816,17 +816,11 @@ pub fn migrate_session(
             &record.claude_session_id[..8.min(record.claude_session_id.len())]
         )
     });
-    // The gate the carried continuation answers, paired with THIS device's id —
-    // the consuming device coord keys the outcome write on. Absent when the
-    // session was not a continuation, or when the local device id is unreadable
-    // (in which case nothing could report anyway).
+    // The gate the carried continuation answers, paired with the device coord
+    // keys the outcome write on: the STORED consuming device when the carry has
+    // one (a boot-restored continuation — plan 2026-10-03 D3), else this boot's.
     let carried_gate_identity = carried_continuation.as_ref().and_then(|(c, _reservation)| {
-        let gate_id = c.gate_id?;
-        let device_id = crate::agent_runtime::load_local_device_id()?;
-        Some(crate::commands::terminal::GateIdentity {
-            gate_id,
-            consuming_device_id: device_id,
-        })
+        carried_gate_identity_for(c, crate::agent_runtime::load_local_device_id())
     });
     let spawned = spawn_resumed_pane(
         app,
@@ -883,7 +877,11 @@ pub fn migrate_session(
             // handed on here: the live row replaces the reservation under one
             // lock, so the anchor moves from held-by-permit to
             // held-by-session with no gap.
-            if let Some((carried, reservation)) = carried_continuation {
+            if let Some((mut carried, reservation)) = carried_continuation {
+                // The respawned pane runs `claude --resume` as its direct
+                // child, so its exit facts are the agent's even when the old
+                // pane was a restored shell.
+                carried.shell_hosted = false;
                 crate::agent_runtime::restore_continuation_registration(
                     terminal_id.clone(),
                     carried,
@@ -977,9 +975,65 @@ fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &st
     }
 }
 
+/// The gate identity a migrated continuation is respawned with. The consuming
+/// device is the one CARRIED across the hop when present — a boot-restored
+/// continuation may have been claimed by a device id other than this boot's,
+/// and coord's outcome UPDATE is keyed `AND continuation_consumed_by` — and this
+/// boot's local id otherwise. `None` when the session was not a gate
+/// continuation, or no device id is known (nothing could report anyway).
+fn carried_gate_identity_for(
+    c: &crate::agent_runtime::CarriedContinuation,
+    local_device_id: Option<uuid::Uuid>,
+) -> Option<crate::commands::terminal::GateIdentity> {
+    let gate_id = c.gate_id?;
+    let consuming_device_id = c.consuming_device_id.or(local_device_id)?;
+    Some(crate::commands::terminal::GateIdentity {
+        gate_id,
+        consuming_device_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carried_gate_identity_keeps_the_stored_consuming_device() {
+        use crate::agent_runtime::CarriedContinuation;
+        let gate = uuid::Uuid::new_v4();
+        let claimer = uuid::Uuid::new_v4();
+        let local = uuid::Uuid::new_v4();
+        let carried = CarriedContinuation {
+            anchor_key: None,
+            gate_id: Some(gate),
+            consuming_device_id: Some(claimer),
+            shell_hosted: false,
+        };
+        let id = super::carried_gate_identity_for(&carried, Some(local)).expect("identity");
+        assert_eq!(id.gate_id, gate);
+        assert_eq!(
+            id.consuming_device_id, claimer,
+            "the stored claimer, never this boot's id"
+        );
+        let fresh = CarriedContinuation {
+            anchor_key: None,
+            gate_id: Some(gate),
+            consuming_device_id: None,
+            shell_hosted: false,
+        };
+        assert_eq!(
+            super::carried_gate_identity_for(&fresh, Some(local)).map(|i| i.consuming_device_id),
+            Some(local)
+        );
+        assert!(super::carried_gate_identity_for(&fresh, None).is_none());
+        let no_gate = CarriedContinuation {
+            anchor_key: None,
+            gate_id: None,
+            consuming_device_id: Some(claimer),
+            shell_hosted: false,
+        };
+        assert!(super::carried_gate_identity_for(&no_gate, Some(local)).is_none());
+    }
 
     // ---- idle-prompt watcher -------------------------------------------------
 
