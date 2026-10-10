@@ -3285,6 +3285,61 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Arming test for Phase 0 of plan
+    /// `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`.
+    /// It enters ONLY through the dispatch seam (`push_job_with`) and uses only
+    /// pre-existing APIs to set up: the production registrar constructor, and a
+    /// transcript bind that records the session's tenant through the normal
+    /// registration path. The commit report the job writes must carry that
+    /// tenant as its top-level `tenant_id`; before Phase 0 it carried none.
+    #[test]
+    fn a_dispatched_push_report_carries_the_sessions_tenant() {
+        const TENANT: uuid::Uuid = uuid::Uuid::from_u128(0x0a1b_0000_0000_4000_8000_0000_0000_0001);
+        fn pushed(_dir: &str) -> Option<ResolvedPush> {
+            Some(ResolvedPush {
+                repo: "o/r".into(),
+                branch: "arming-dispatched-push-carries-tenant".into(),
+                shas: vec!["arming-dispatched-push-carries-tenant-sha".into()],
+            })
+        }
+        let _env = crate::test_env::env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let registrar = Arc::new(
+            crate::claude_session::coord_register::AiCoordRegistrar::new(
+                outbox.clone(),
+                uuid::Uuid::new_v4(),
+            ),
+        );
+        let session = uuid::Uuid::new_v4().to_string();
+        registrar
+            .bind_transcript_session(&session, None, Some(TENANT))
+            .expect("transcript bind registers the session");
+
+        let job = push_job_with(
+            PushObservation {
+                working_dir: "/unused".into(),
+            },
+            session,
+            registrar,
+            pushed,
+        );
+        job();
+
+        let report = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event_kind == "commit_report")
+            .expect("the job wrote a commit report");
+        assert_eq!(report.payload["tenant_id"], json!(TENANT));
+    }
+
     /// Review (round 2) MINOR 1: the job resolves the pushing session's tenant
     /// when it is BUILT. Here a terminal-plane session (its tenant stamped by
     /// the registry) goes away between dispatch and the worker running the
