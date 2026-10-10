@@ -2439,7 +2439,11 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         let report = config_report_run();
         let specs: Vec<&LayerSpec> = report.rows.iter().map(|r| r.spec).collect();
-        assert_eq!(specs.len(), 15, "every layer gets a row");
+        assert_eq!(
+            specs.len(),
+            qontinui_runner_lib::config_report::LAYER_SPECS.len(),
+            "every layer gets a row"
+        );
 
         match &report
             .row("api_endpoint_registry")
@@ -4395,7 +4399,10 @@ mod tests {
 
         // …and the rows still resolved, so this is not a vacuous pass over a
         // report that failed to run.
-        assert_eq!(report.rows.len(), 15);
+        assert_eq!(
+            report.rows.len(),
+            qontinui_runner_lib::config_report::LAYER_SPECS.len()
+        );
         match &report.row("settings_struct").expect("row present").reading {
             LayerReading::Known { source, .. } => assert!(
                 source.contains("read_settings_from_disk"),

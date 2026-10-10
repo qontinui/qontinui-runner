@@ -23,6 +23,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::TransportError;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+/// Hard ceiling on one relay connect (proxy TCP + CONNECT + TLS + upgrade).
+/// The same 20 s as the runner's other WebSocket transports
+/// (`coord_ws::CONNECT_TIMEOUT`, `backend_relay::CONNECT_TIMEOUT`).
+const TUNNEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 // ============================================================================
 // Tunnel protocol types
@@ -97,13 +103,27 @@ impl CloudTransport {
         device_id: &str,
         auth_token: &str,
     ) -> Result<u16, TransportError> {
+        // `ws_url` carries `?token=<auth_token>`: it is NEVER logged. The log
+        // line names the relay host only.
         let ws_url = build_ws_url(&self.backend_url, device_id, auth_token);
 
-        info!("[cloud-transport] Connecting to relay: {}", ws_url);
+        info!(
+            "[cloud-transport] Connecting to relay {} for device {}",
+            relay_host_for_log(&self.backend_url),
+            device_id
+        );
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .map_err(|e| TransportError::PairingError(format!("WS connect failed: {e}")))?;
+        let request = ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| TransportError::PairingError(format!("invalid relay URL: {e}")))?;
+        // Proxy-aware (plan 2026-10-10-spec-front-end-phase-9-generic-boundary
+        // Phase 4) and bounded — the bare `connect_async` this replaced had no
+        // timeout, so a black-holed relay parked the caller forever.
+        let ws_stream =
+            qontinui_runner_lib::outbound_net::connect_ws(request, TUNNEL_CONNECT_TIMEOUT)
+                .await
+                .map_err(|e| TransportError::PairingError(format!("WS connect failed: {e}")))?;
 
         // Bind local listener on any available port
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -473,6 +493,20 @@ fn build_ws_url(backend_url: &str, device_id: &str, auth_token: &str) -> String 
     )
 }
 
+/// The relay's `host[:port]` for a log line — scheme, path and query
+/// stripped, so nothing credential-shaped can ride along. An unparseable base
+/// is withheld whole rather than printed raw.
+fn relay_host_for_log(backend_url: &str) -> String {
+    match url::Url::parse(backend_url.trim()) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            (None, _) => "<relay host unavailable>".to_string(),
+        },
+        Err(_) => "<unparseable relay base withheld>".to_string(),
+    }
+}
+
 /// Which cloud-relay path a given device should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudPath {
@@ -509,5 +543,97 @@ fn status_text(code: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The tunnel URL carries `?token=<device token>`. Opening a tunnel must
+    /// log the relay host and never the URL or the token (the line this
+    /// replaced logged the whole URL).
+    #[tokio::test]
+    async fn opening_a_tunnel_never_logs_the_device_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_token = Arc::new(StdMutex::new(None::<String>));
+        let saw = saw_token.clone();
+        tokio::spawn(async move {
+            use tokio_tungstenite::tungstenite::handshake::server::{
+                ErrorResponse, Request as SReq, Response as SResp,
+            };
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |req: &SReq, resp: SResp| -> Result<SResp, ErrorResponse> {
+                    *saw.lock().unwrap() = req.uri().query().map(str::to_string);
+                    Ok(resp)
+                },
+            )
+            .await;
+            if let Ok(mut ws) = ws {
+                while let Some(Ok(_)) = ws.next().await {}
+            }
+        });
+
+        let sink = Sink::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let transport = CloudTransport::new(format!("http://127.0.0.1:{port}"));
+        let local_port = transport
+            .open_tunnel("device-under-test", "TOKEN-must-not-be-logged")
+            .await
+            .expect("tunnel opens against the local relay");
+        drop(guard);
+        assert!(local_port > 0);
+        assert_eq!(
+            saw_token.lock().unwrap().as_deref(),
+            Some("token=TOKEN-must-not-be-logged"),
+            "the relay still receives the token on the wire"
+        );
+
+        let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            logs.contains(&format!("Connecting to relay 127.0.0.1:{port} for device device-under-test")),
+            "the capture must see the connect line, or this test proves nothing: {logs:?}"
+        );
+        assert!(!logs.contains("TOKEN-must-not-be-logged"), "token leaked: {logs:?}");
+        assert!(!logs.contains("token="), "a token query leaked: {logs:?}");
+    }
+
+    #[test]
+    fn relay_host_for_log_strips_everything_but_the_host() {
+        assert_eq!(relay_host_for_log("https://api.example.test/"), "api.example.test");
+        assert_eq!(relay_host_for_log("http://127.0.0.1:8000"), "127.0.0.1:8000");
+        assert_eq!(
+            relay_host_for_log("https://api.example.test/x?token=abc"),
+            "api.example.test"
+        );
+        assert_eq!(relay_host_for_log("not a url"), "<unparseable relay base withheld>");
     }
 }

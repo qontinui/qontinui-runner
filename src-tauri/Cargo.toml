@@ -177,6 +177,13 @@ petgraph = "0.6"
 imageproc = "0.25"
 toml = "1"
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+# Proxy matching for the WebSocket transports (`outbound_net`, plan
+# 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 4). The SAME matcher
+# reqwest 0.13 delegates to, at the version reqwest already locks, so HTTP and
+# WebSocket traffic agree about which proxy applies. `client-proxy-system` reads
+# the Windows (WinINet registry) and macOS (SystemConfiguration) system proxy;
+# naming it here keeps that arm compiled in for reqwest too.
+hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-system"] }
 portable-pty = "0.8"
 # VT parser (Paul Williams state machine) used by alacritty/wezterm.
 # Powers per-session terminal grids in `terminal::grid`.

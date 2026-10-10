@@ -465,6 +465,7 @@ fn cmd_init(host: &str) -> ExitCode {
             client_id: Some("qontinui-runner".to_string()),
             token: None,
         }),
+        network: None,
     };
     profiles.insert("canonical".to_string(), canonical);
     let file = ProfilesFile {

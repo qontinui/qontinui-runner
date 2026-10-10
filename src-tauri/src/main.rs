@@ -1653,6 +1653,17 @@ fn main() {
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Export the machine profile's outbound-network settings (HTTPS_PROXY /
+    // HTTP_PROXY from `network.proxy_url` when the operator set neither, and
+    // NO_PROXY always including loopback) into this process's environment, so
+    // every reqwest client, the three WebSocket transports (through
+    // `outbound_net::connect_ws`), `git` and the spawned `claude` CLI agree
+    // (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`, C2). HERE,
+    // beside the other `set_var`, because writing the environment is sound only
+    // before the runtime below starts any thread. Logged once logging exists
+    // (`outbound_net::log_startup_posture` in `run_app`).
+    qontinui_runner_lib::outbound_net::apply_profile_environment_at_startup();
+
     // Install the startup-panic hook FIRST, before any other setup. Panics
     // during early init (database connection, Tauri builder, axum router
     // construction) would otherwise vanish — the process exits with code 1
@@ -1738,6 +1749,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ..LoggingConfig::default()
     })?;
     setup_panic_handler();
+
+    // The proxy rung `main` resolved before logging existed (and an explicit
+    // UNKNOWN when a PAC script is configured, which is not evaluated).
+    qontinui_runner_lib::outbound_net::log_startup_posture();
 
     // Best-effort live crash writer for the CATCHABLE subset (Windows
     // deliverable structured exceptions). The panic hooks above already write
