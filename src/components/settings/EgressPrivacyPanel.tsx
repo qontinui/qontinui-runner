@@ -21,7 +21,12 @@ import { ExternalLink, RefreshCw, ShieldCheck } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { tracedFetch, useApiBase } from "@/lib/runner-api";
 import { describeThrown } from "@/lib/utils";
-import { buildEgressRows, tenantPolicyLink, type EgressRow } from "./egressPrivacyHelpers";
+import {
+  buildEgressRows,
+  egressScope,
+  tenantPolicyLink,
+  type EgressRow,
+} from "./egressPrivacyHelpers";
 
 interface HealthEnvelope {
   data?: { egress?: unknown };
@@ -72,6 +77,7 @@ export function EgressPrivacyPanel({ webAppUrl }: { webAppUrl: string | null }) 
   }, [load]);
 
   const rows = buildEgressRows(egress);
+  const scope = egressScope(egress);
 
   return (
     <div
@@ -104,6 +110,13 @@ export function EgressPrivacyPanel({ webAppUrl }: { webAppUrl: string | null }) 
         <p className="text-xs text-destructive">
           Could not read the runner&apos;s egress state: {error}. Every flow below is UNKNOWN — this
           is not a statement that any of them is on or off.
+        </p>
+      )}
+
+      {scope && (
+        <p className="text-[10px] text-muted-foreground">
+          Read for {scope.tenantId ? `project ${scope.tenantId}` : "this device's default project"}:{" "}
+          {scope.note}.
         </p>
       )}
 
