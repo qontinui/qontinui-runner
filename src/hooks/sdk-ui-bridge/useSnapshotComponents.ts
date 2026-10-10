@@ -23,9 +23,7 @@ export function useSnapshotComponents(): UseSnapshotComponentsReturn {
       const recency = options?.recency ?? "any";
       const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=${recency}`);
       const json = await resp.json();
-      // Only an explicit `success: true` is success: a body with no
-      // `success` key must not overwrite state with a non-answer.
-      if (json?.success === true) {
+      if (json.success !== false) {
         setSnapshot(json.data || json);
       }
     } catch {
@@ -38,9 +36,7 @@ export function useSnapshotComponents(): UseSnapshotComponentsReturn {
       const recency = options?.recency ?? "any";
       const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/components?recency=${recency}`);
       const json = await resp.json();
-      // Only an explicit `success: true` is success: a body with no
-      // `success` key must not overwrite state with a non-answer.
-      if (json?.success === true) {
+      if (json.success !== false) {
         setComponents(json.data?.components || json.components || json.data || []);
       }
     } catch {
