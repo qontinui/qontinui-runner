@@ -2991,7 +2991,7 @@ async fn handle_relay_command(
         | "remote_terminal_input_ack" => {
             // The return is "did this client CONSUME the frame"
             // (`handle_inbound`'s own doc), NOT "did it wake a waiter": every
-            // arm for these seven returns `true` unconditionally, warning
+            // arm for these eight returns `true` unconditionally, warning
             // internally on the no-waiter path. So there is nothing to branch
             // on here, and a check would be dead code. The sibling `error` arm
             // below checks it because `handle_inbound` genuinely can return
