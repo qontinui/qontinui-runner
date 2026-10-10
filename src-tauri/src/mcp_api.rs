@@ -5681,6 +5681,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_session",
     "coord_secret_presence",
     "coord_send_message",
+    // Plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account
+    // Phase 3: the cross-account session census read (coord grants it via
+    // DEVICE_DEFAULT_TOOLS; this list only forwards).
+    "coord_session_census",
     "coord_session_obligations",
     "coord_session_worktrees",
     "coord_set_gate_audience",
@@ -17386,6 +17390,11 @@ mod coord_mcp_body_gate_tests {
             // receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
             // Phase 1), pinned with the coord tool rather than after a -32601.
             "coord_memory_get",
+            // The cross-account session census read (plan
+            // 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account
+            // Phase 3). Pinned with the coord tool's landing, like the line
+            // above, so it is never a fourth silent subtraction.
+            "coord_session_census",
         ] {
             assert!(
                 gate(serde_json::json!({

@@ -57,8 +57,8 @@ use super::past_sessions::{account_from_config_dir, PastSessionAccount};
 /// Raw on-disk shape of `<config_dir>/sessions/<pid>.json`.
 ///
 /// Only the fields this reader needs are modelled; Claude Code adds others
-/// (`version`, `peerProtocol`, `entrypoint`, `statusUpdatedAt`) that are
-/// deliberately ignored so a new key in a future CLI release cannot break
+/// (`version`, `peerProtocol`, `peerFeatures`, `messagingSocketPath`, …) that
+/// are deliberately ignored so a new key in a future CLI release cannot break
 /// deserialization.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +90,54 @@ struct RegistryFile {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: Option<i64>,
+    /// When `status` last changed (epoch ms). NOT a liveness clock: it moves
+    /// on status changes only. The session census takes liveness from the last
+    /// turn line's own timestamp instead — not even from transcript mtime,
+    /// which coord finding `124c0ce9` measured moving without turns. Carried
+    /// for the session census only.
+    ///
+    /// The four census-only fields below are LENIENT ([`lenient_ms`],
+    /// [`lenient_string`]): a type the CLI changes in a future release reads
+    /// as `None` for that field, never as a parse failure — which would drop
+    /// the WHOLE row from every registry reader, the restore path's liveness
+    /// oracle included.
+    #[serde(default, deserialize_with = "lenient_ms")]
+    status_updated_at: Option<i64>,
+    /// Process start token (a string: `/proc/<pid>/stat` field 22 on Linux),
+    /// the pid-reuse discriminator beside `pid`.
+    #[serde(default, deserialize_with = "lenient_string")]
+    proc_start: Option<String>,
+    /// `cli`, `sdk-ts`, … — how the process was launched.
+    #[serde(default, deserialize_with = "lenient_string")]
+    entrypoint: Option<String>,
+    /// `<tmux session>:@<window>.%<pane>` when the CLI runs inside tmux.
+    #[serde(default, deserialize_with = "lenient_string")]
+    tmux: Option<String>,
+}
+
+/// String, or a number rendered as one; any other JSON type is `None`.
+fn lenient_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+/// Epoch ms as an integer, a float (truncated) or a numeric string; any other
+/// value is `None`.
+fn lenient_ms<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
 }
 
 /// One live Claude Code process, as the operator sees it.
@@ -128,6 +176,19 @@ pub struct LiveClaudeSession {
     pub kind: String,
     pub started_at: i64,
     pub updated_at: i64,
+    /// Registry `statusUpdatedAt` (epoch ms), when present. See
+    /// `RegistryFile::status_updated_at` — never a liveness clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_updated_at: Option<i64>,
+    /// Registry `procStart`, verbatim, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proc_start: Option<String>,
+    /// Registry `entrypoint`, verbatim, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    /// Registry `tmux` locator, verbatim, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<String>,
     /// Ready-to-run: `cd '<dir>' && <wrapper> --resume <id>`.
     ///
     /// The `cd` is **not** cosmetic — Claude Code scopes sessions by project
@@ -199,6 +260,10 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
         kind: raw.kind.unwrap_or_else(|| "interactive".to_string()),
         started_at: raw.started_at.unwrap_or(0),
         updated_at: raw.updated_at.unwrap_or(0),
+        status_updated_at: raw.status_updated_at,
+        proc_start: raw.proc_start,
+        entrypoint: raw.entrypoint,
+        tmux: raw.tmux,
         resume_command,
     })
 }
@@ -369,6 +434,42 @@ mod tests {
             s.resume_command,
             "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
         );
+    }
+
+    #[test]
+    fn a_retyped_census_field_never_drops_the_row() {
+        // procStart as a NUMBER and statusUpdatedAt as a non-numeric STRING:
+        // the row must still parse, with the odd values degraded per field.
+        let row = r#"{"pid":7,"sessionId":"7f7e6038-d85c-426f-b930-bc429fe62c58","procStart":123,"statusUpdatedAt":"x","entrypoint":["cli"],"tmux":null,"name":"n"}"#;
+        let s = parse_registry_file(row, Path::new("/home/x/.claude-a")).unwrap();
+        assert_eq!(s.pid, 7);
+        assert_eq!(s.proc_start.as_deref(), Some("123"));
+        assert_eq!(s.status_updated_at, None);
+        assert_eq!(s.entrypoint, None);
+        assert_eq!(s.tmux, None);
+        let numeric = r#"{"pid":8,"sessionId":"s","statusUpdatedAt":"1790832214000"}"#;
+        assert_eq!(
+            parse_registry_file(numeric, Path::new("/x/.claude-a"))
+                .unwrap()
+                .status_updated_at,
+            Some(1790832214000)
+        );
+    }
+
+    #[test]
+    fn census_fields_are_carried_through_verbatim() {
+        // A 2026-10 Linux row: `procStart` is a STRING, `tmux` a locator.
+        let row = r#"{"pid":1060775,"sessionId":"7f7e6038-d85c-426f-b930-bc429fe62c58","cwd":"/home/x/p","startedAt":1790794061417,"procStart":"285826587","kind":"interactive","entrypoint":"cli","tmux":"t-sess:@650.%652","name":"n","nameSource":"user","status":"idle","updatedAt":1790832214533,"statusUpdatedAt":1790832214000}"#;
+        let s = parse_registry_file(row, Path::new("/home/x/.claude-tiohorst")).unwrap();
+        assert_eq!(s.proc_start.as_deref(), Some("285826587"));
+        assert_eq!(s.entrypoint.as_deref(), Some("cli"));
+        assert_eq!(s.tmux.as_deref(), Some("t-sess:@650.%652"));
+        assert_eq!(s.status_updated_at, Some(1790832214000));
+        // The ground-truth row has no procStart/tmux: absent stays absent.
+        let old = parse_registry_file(SAMPLE, Path::new("C:/claude/.claude-paktis")).unwrap();
+        assert_eq!(old.proc_start, None);
+        assert_eq!(old.tmux, None);
+        assert_eq!(old.status_updated_at, Some(1784770342016));
     }
 
     #[test]

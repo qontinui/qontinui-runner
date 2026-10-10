@@ -4498,6 +4498,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `terminal::usage_limit::spawn_grid_scan_loop` and
                 // `terminal::auto_response::spawn_grid_scan_loop`.)
 
+                // Machine-wide live Claude session census (plan
+                // 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account,
+                // Phase 2). A SIBLING of the lifecycle poll below rather than
+                // part of its tick: that tick is 45s and idles without a
+                // process snapshot whenever no record is open, while the census
+                // must run every 60s regardless — it reports the sessions the
+                // runner does NOT host. Primary-only, device-authed,
+                // best-effort; see `session::census`.
+                session::census::spawn_publisher(app.handle().clone());
+
                 // Infrequent liveness poll for lazy close-detection. Every
                 // 45s it snapshots open lifecycle records against the live
                 // terminal manager + a single system process snapshot, runs
