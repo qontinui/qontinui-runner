@@ -121,6 +121,7 @@ mod display;
 mod doctor;
 mod dom_capture;
 mod drain;
+mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 — per-tenant egress switches
 #[cfg(test)]
 mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
@@ -1777,23 +1778,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Sentry for crash reporting (release builds only).
     // The guard must live for the entire application lifetime — when it drops, Sentry shuts down.
+    //
+    // Gated on the tenant's `egress_telemetry` switch (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), read at
+    // boot: a flip applies at the next start, and the persisted answer makes a
+    // tenant `off` hold before the first poll from the second start onwards.
     #[cfg(not(debug_assertions))]
-    let _sentry_guard = std::env::var("SENTRY_DSN").ok().map(|dsn| {
-        let guard = sentry::init((
-            dsn,
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                environment: Some("beta".into()),
-                before_send: Some(std::sync::Arc::new(|event| {
-                    info!("Sending error to Sentry: {:?}", event);
-                    Some(event)
-                })),
-                ..Default::default()
-            },
-        ));
-        info!("Sentry crash reporting initialized");
-        guard
-    });
+    let _sentry_guard = std::env::var("SENTRY_DSN")
+        .ok()
+        .filter(|_| egress::telemetry_permitted_at_boot())
+        .map(|dsn| {
+            let guard = sentry::init((
+                dsn,
+                sentry::ClientOptions {
+                    release: sentry::release_name!(),
+                    environment: Some("beta".into()),
+                    before_send: Some(std::sync::Arc::new(|event| {
+                        info!("Sending error to Sentry: {:?}", event);
+                        Some(event)
+                    })),
+                    ..Default::default()
+                },
+            ));
+            info!("Sentry crash reporting initialized");
+            guard
+        });
 
     // Initialize DisplayProcessor with ActionLogProfile
     let mut display_processor = DisplayProcessor::new();

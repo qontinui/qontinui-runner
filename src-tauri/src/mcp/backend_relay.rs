@@ -2428,6 +2428,11 @@ async fn handle_outbound(
             Ok(event) => {
                 let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
 
+                // Per-tenant egress switches (terminal stream, telemetry).
+                if !outbound_egress_permitted(channel) {
+                    continue;
+                }
+
                 // Flood control: only forward terminal-output / terminal-exit
                 // frames when the backend has an active terminal subscriber.
                 // Never gate phase-result / ui-error / recent-crash /
@@ -2859,6 +2864,48 @@ pub(crate) fn route_relay_frame(msg_type: &str, data: &Value) -> RelayRoute {
     RelayRoute::Refuse(remote_type_refusal(&msg_type, &data))
 }
 
+/// The relay `terminal_*` frames that stream a terminal (or open one to
+/// stream) and so stop at the tenant's `egress_terminal_stream` switch (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). Tear-down and
+/// flow-control frames (`terminal_detach`, `terminal_flow`, `terminal_subscribe`
+/// / `_unsubscribe`, which are fire-and-forget and expect no reply) pass: none
+/// of them sends terminal bytes, and the outbound forwarder withholds the
+/// output frames themselves.
+const EGRESS_GATED_TERMINAL_FRAMES: &[&str] = &[
+    "terminal_list",
+    "terminal_create",
+    "terminal_input",
+    "terminal_resize",
+    "terminal_close",
+    "terminal_buffer",
+    "terminal_attach",
+];
+
+/// `Some(refusal frame)` when `msg_type` is a gated terminal frame and the
+/// switch is off. Checked live on every frame.
+fn terminal_egress_refusal(msg_type: &str, data: &Value) -> Option<Value> {
+    if !EGRESS_GATED_TERMINAL_FRAMES.contains(&msg_type) {
+        return None;
+    }
+    if crate::egress::permit_or_count(crate::egress::Flow::TerminalStream) {
+        return None;
+    }
+    Some(crate::egress::terminal_refusal_frame(data))
+}
+
+/// Whether the outbound forwarder may send an event on `channel` right now:
+/// `terminal-output` / `terminal-exit` follow `egress_terminal_stream`, and
+/// `ui-error` / `recent-crash` follow `egress_telemetry` (checked live, unlike
+/// the boot-time crash reporter). Every other channel is not an egress flow.
+fn outbound_egress_permitted(channel: &str) -> bool {
+    use crate::egress::Flow;
+    match channel {
+        "terminal-output" | "terminal-exit" => crate::egress::permit_or_count(Flow::TerminalStream),
+        "ui-error" | "recent-crash" => crate::egress::permit_or_count(Flow::Telemetry),
+        _ => true,
+    }
+}
+
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
@@ -2869,6 +2916,10 @@ async fn handle_relay_command(
         RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
     };
     let data = &data;
+
+    if let Some(refusal) = terminal_egress_refusal(&msg_type, data) {
+        return Some(refusal);
+    }
 
     match msg_type.as_str() {
         // --------------------------------------------------------------
@@ -8838,5 +8889,81 @@ mod relay_create_drain_message_tests {
             );
             assert_eq!(message.matches(" — ").count(), 1, "{message}");
         }
+    }
+}
+
+/// The relay half of the egress switches (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7).
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::pin;
+    use crate::egress::{Flow, Level};
+
+    #[test]
+    fn gated_terminal_frames_answer_egress_off_while_the_switch_is_off() {
+        let data = serde_json::json!({"request_id": "r-1", "terminal_id": "t-1"});
+        let _pin = pin(Flow::TerminalStream, Level::Off);
+        for frame in EGRESS_GATED_TERMINAL_FRAMES {
+            let refusal = terminal_egress_refusal(frame, &data).expect(frame);
+            assert_eq!(refusal["type"], "terminal_response");
+            assert_eq!(refusal["error"], "egress_off");
+            assert_eq!(refusal["flow"], "terminal_stream");
+            assert_eq!(refusal["request_id"], "r-1");
+            assert_eq!(refusal["terminal_id"], "t-1");
+        }
+        for frame in [
+            "terminal_detach",
+            "terminal_flow",
+            "terminal_subscribe",
+            "chat_message",
+        ] {
+            assert!(terminal_egress_refusal(frame, &data).is_none(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn gated_terminal_frames_pass_while_the_switch_is_on() {
+        let _pin = pin(Flow::TerminalStream, Level::On);
+        for frame in EGRESS_GATED_TERMINAL_FRAMES {
+            assert!(terminal_egress_refusal(frame, &serde_json::json!({})).is_none());
+        }
+    }
+
+    #[test]
+    fn the_outbound_forwarder_follows_each_channels_own_switch() {
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        assert!(!outbound_egress_permitted("terminal-output"));
+        assert!(!outbound_egress_permitted("terminal-exit"));
+        assert!(
+            outbound_egress_permitted("ui-error"),
+            "telemetry is still on"
+        );
+        assert!(outbound_egress_permitted("phase-result"));
+        drop(_t);
+        let _m = pin(Flow::Telemetry, Level::Off);
+        assert!(!outbound_egress_permitted("ui-error"));
+        assert!(!outbound_egress_permitted("recent-crash"));
+        assert!(outbound_egress_permitted("terminal-output"));
+    }
+
+    /// Both checks are wired where they act: before dispatch, and before the
+    /// forwarder builds a frame.
+    #[test]
+    fn both_gates_are_wired() {
+        let src = include_str!("backend_relay.rs");
+        let cmd = src
+            .split_once("\nasync fn handle_relay_command(")
+            .unwrap()
+            .1;
+        let gate = cmd
+            .find("terminal_egress_refusal(&msg_type, data)")
+            .unwrap();
+        let dispatch = cmd.find("match msg_type.as_str()").unwrap();
+        assert!(gate < dispatch);
+        let out = src.split_once("\nasync fn handle_outbound(").unwrap().1;
+        let gate = out.find("outbound_egress_permitted(channel)").unwrap();
+        let build = out.find("let relay_msg = match channel").unwrap();
+        assert!(gate < build);
     }
 }

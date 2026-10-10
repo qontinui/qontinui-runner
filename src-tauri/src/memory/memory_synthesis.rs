@@ -276,7 +276,7 @@ impl MemoryJobPoller {
     /// embedder = the local embedding service.
     pub fn new() -> Self {
         Self::with_probes(
-            Box::new(crate::settings::get_cloud_sync_enabled),
+            Box::new(crate::egress::transcript_sync_permitted),
             Box::new(crate::auth::device_bearer),
             Arc::new(warm_synthesize),
         )

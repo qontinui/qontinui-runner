@@ -1853,6 +1853,14 @@ struct FleetPolicyResponse {
     /// at (`tenant`, `fleet`, …). Absent on a coord that predates the field.
     #[serde(default)]
     resolved_scope: Option<String>,
+    /// On a no-row answer, WHICH default coord applied:
+    /// `deployment_profile` (a self-hosted coord's egress `off`) or `product`.
+    /// Absent on a coord that predates the egress family — which is exactly
+    /// what [`crate::egress::classify_coord_answer`] needs to know, because
+    /// such a coord's no-row answer for an `egress_*` domain is its generic
+    /// unknown-domain default, not a tenant decision.
+    #[serde(default)]
+    default_source: Option<String>,
     /// Coord's own "I could not read the control columns" flag. `Some(false)`
     /// means the §D1 columns are not provisioned on that deployment yet, which
     /// is NOT the same statement as "the tenant set no floors" — but both
@@ -2246,6 +2254,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
 
     info!(
         "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN}, \
+         egress_*×6, \
          interval={}s, fail-safe defaults: mode={DEFAULT_MODE}, session floors unset; domain \
          default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture writes held until \
          coord answers)",
@@ -2268,6 +2277,9 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     // independently (coord can serve one and 404 another), so a shared marker
     // would suppress one document's transition because another's was logged.
     let mut last_logged_briefings: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // One key PER EGRESS FLOW, for the same reason.
+    let mut last_logged_egress: std::collections::HashMap<crate::egress::Flow, String> =
         std::collections::HashMap::new();
 
     loop {
@@ -2457,6 +2469,11 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // already makes. Each document applies to its own cache entry and logs
         // on its own transition, so no document's failure withholds another's.
         poll_session_briefings_once(&mut last_logged_briefings).await;
+
+        // Fifth: the six per-tenant egress switches (plan
+        // 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7). Each
+        // domain applies to its own slot and logs on its own transition.
+        poll_egress_once(&mut last_logged_egress).await;
 
         // Sleep until the next tick, waking early on shutdown.
         tokio::select! {
@@ -2650,6 +2667,87 @@ async fn poll_plan_capture_once() -> PlanCapturePoll {
             outcome: plan_capture_outcome_for_error(e),
             resolved_scope: None,
         },
+    }
+}
+
+/// What one egress-domain poll means for the switch cache. PURE.
+///
+/// `Some(level)` is an authoritative answer to record (rung 1 of C6, and the
+/// persisted store). `None` leaves the slot alone — a coord that does not know
+/// the egress family, an unpaired runner, a 401/404 or a network failure says
+/// nothing about the tenant's switch, so the last answer (or the persisted /
+/// profile / product rung beneath it) keeps governing.
+fn egress_level_for(
+    result: &Result<FleetPolicyResponse, FetchError>,
+) -> Option<crate::egress::Level> {
+    match result {
+        Ok(body) => match crate::egress::classify_coord_answer(
+            body.effective_level.as_deref(),
+            body.resolved_scope.as_deref(),
+            body.default_source.as_deref(),
+        ) {
+            crate::egress::CoordAnswer::Authoritative(level) => Some(level),
+            crate::egress::CoordAnswer::NotAnEgressAnswer => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// The edge-trigger key for one egress poll: the class plus the level, so a
+/// flip logs and a steady state does not.
+fn egress_log_key(result: &Result<FleetPolicyResponse, FetchError>) -> String {
+    match (result, egress_level_for(result)) {
+        (Ok(_), Some(level)) => format!("answer:{}", level.as_str()),
+        (Ok(_), None) => "coord-predates-egress".to_string(),
+        (Err(FetchError::NoJwt), _) => "unpaired".to_string(),
+        (Err(FetchError::AuthOrAbsent(status)), _) => format!("status:{status}"),
+        (Err(FetchError::Failed(_)), _) => "failed".to_string(),
+    }
+}
+
+/// Poll all six egress domains once, recording each authoritative answer.
+async fn poll_egress_once(
+    last_logged: &mut std::collections::HashMap<crate::egress::Flow, String>,
+) {
+    for flow in crate::egress::Flow::ALL {
+        let result = fetch_fleet_policy(flow.domain()).await;
+        if let Some(level) = egress_level_for(&result) {
+            crate::egress::record_coord_answer(flow, level);
+        }
+        let key = egress_log_key(&result);
+        if last_logged.get(&flow) == Some(&key) {
+            continue;
+        }
+        let verdict = crate::egress::permit(flow);
+        match &result {
+            Ok(_) if key.starts_with("answer:") => info!(
+                "fleet_policy_poller: egress {} ({}) = {} — {}",
+                flow.key(),
+                flow.domain(),
+                key.trim_start_matches("answer:"),
+                if verdict.allowed { "allowed" } else { "refused at the source" }
+            ),
+            Ok(_) => info!(
+                "fleet_policy_poller: coord does not know {} yet (no default_source on its                  no-row answer) — {} stays {} (source={})",
+                flow.domain(),
+                flow.key(),
+                if verdict.allowed { "on" } else { "off" },
+                verdict.source.as_str()
+            ),
+            Err(e) => warn!(
+                "fleet_policy_poller: {} poll gave no answer ({}) — {} stays {} (source={})",
+                flow.domain(),
+                match e {
+                    FetchError::NoJwt => "unpaired".to_string(),
+                    FetchError::AuthOrAbsent(s) => format!("coord {s}"),
+                    FetchError::Failed(m) => m.clone(),
+                },
+                flow.key(),
+                if verdict.allowed { "on" } else { "off" },
+                verdict.source.as_str()
+            ),
+        }
+        last_logged.insert(flow, key);
     }
 }
 
@@ -4135,5 +4233,74 @@ mod tests {
         // A restored document is `cached` by default — it has NOT been checked
         // against coord in this process.
         assert_eq!(doc.provenance, BriefingProvenance::Cached);
+    }
+}
+
+/// The egress half of the poller: how a decoded coord body maps onto the
+/// switch cache (plan 2026-10-10-spec-front-end-phase-9-generic-boundary).
+#[cfg(test)]
+mod egress_poll_tests {
+    use super::*;
+    use crate::egress::Level;
+
+    fn body(json: &str) -> Result<FleetPolicyResponse, FetchError> {
+        Ok(serde_json::from_str(json).expect("decode"))
+    }
+
+    #[test]
+    fn an_egress_aware_no_row_answer_is_recorded() {
+        let r =
+            body(r#"{"effective_level":"on","resolved_scope":"none","default_source":"product"}"#);
+        assert_eq!(egress_level_for(&r), Some(Level::On));
+        let r = body(
+            r#"{"effective_level":"off","resolved_scope":"none","default_source":"deployment_profile"}"#,
+        );
+        assert_eq!(egress_level_for(&r), Some(Level::Off));
+        assert_eq!(egress_log_key(&r), "answer:off");
+    }
+
+    #[test]
+    fn a_tenant_row_is_recorded_even_from_a_coord_without_default_source() {
+        let r = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
+        assert_eq!(egress_level_for(&r), Some(Level::Off));
+    }
+
+    #[test]
+    fn a_pre_egress_coord_no_row_answer_is_not_recorded() {
+        // Today's coord answers every unknown domain `off` with no
+        // default_source; recording it would switch all six flows off.
+        let r = body(r#"{"effective_level":"off","resolved_scope":"none","default_source":null}"#);
+        assert_eq!(egress_level_for(&r), None);
+        assert_eq!(egress_log_key(&r), "coord-predates-egress");
+    }
+
+    #[test]
+    fn a_failed_poll_records_nothing() {
+        for e in [
+            FetchError::NoJwt,
+            FetchError::AuthOrAbsent(401),
+            FetchError::AuthOrAbsent(404),
+            FetchError::Failed("boom".into()),
+        ] {
+            assert_eq!(egress_level_for(&Err(e)), None);
+        }
+    }
+
+    #[test]
+    fn the_egress_poll_runs_inside_the_poller_loop() {
+        let src = include_str!("fleet_policy_poller.rs");
+        let loop_body = src
+            .split_once("async fn poller_loop(")
+            .expect("poller_loop")
+            .1
+            .split_once("\nasync fn fetch_fleet_policy(")
+            .expect("fetch_fleet_policy follows the loop")
+            .0;
+        assert!(loop_body.contains("poll_egress_once(&mut last_logged_egress).await"));
+        let poll = src.split_once("async fn poll_egress_once(").unwrap().1;
+        let poll = poll.split_once("\n}\n").unwrap().0;
+        assert!(poll.contains("crate::egress::Flow::ALL"));
+        assert!(poll.contains("fetch_fleet_policy(flow.domain())"));
+        assert!(poll.contains("crate::egress::record_coord_answer(flow, level)"));
     }
 }

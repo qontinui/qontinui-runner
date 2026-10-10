@@ -2125,6 +2125,14 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // The six per-tenant egress switches (plan
+        // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7): for
+        // each flow, whether it may send right now, which rung decided it
+        // (coord | persisted | profile | product_default), its coord domain,
+        // whether a flip applies only at the next start, and how many sends
+        // the switch refused in this process. The per-deployment answer to
+        // "which flows are on" — read by the desktop Privacy section.
+        "egress": crate::egress::health_json(),
         // Per-local-user connection guard (plan 2026-10-04-runner-loopback-
         // api-refuses-other-local-users): installed/enabled/supported, the kill
         // switch's name, and admit/refusal counters. No uid or SID is served —
@@ -19417,6 +19425,39 @@ mod coord_provision_session_gate_tests {
             "the fields must be rendered from that live pin"
         );
         assert!(src.contains(".route(\"/health\", get(health))"));
+    }
+
+    /// Plan `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 7:
+    /// `/health` carries the `egress` block, rendered by the one
+    /// `egress::health_json` (same source-scan technique as the tests around
+    /// it), and that block names all six flows.
+    #[test]
+    fn the_health_handler_emits_the_egress_block() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"egress\": crate::egress::health_json()"),
+            "{region}"
+        );
+        let block = crate::egress::health_json();
+        for flow in crate::egress::Flow::ALL {
+            assert_eq!(block[flow.key()]["domain"], flow.domain());
+        }
     }
 
     /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-

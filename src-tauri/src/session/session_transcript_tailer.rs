@@ -632,7 +632,7 @@ impl SessionTranscriptTailer {
             file_start,
             appended,
             truncated,
-            crate::settings::get_cloud_sync_enabled(),
+            crate::egress::transcript_sync_permitted(),
         );
     }
 
