@@ -7,12 +7,6 @@ self-hosted-runner:
     # The only runner registered to this repo: merytshost-public
     # [self-hosted, Linux, X64, public-pool] (measured 2026-10-04).
     - public-pool
-    # Used by toolcache-probe.yml (`[self-hosted, qontinui]`). Declared so the
-    # label is not reported as a typo, but NOTE: no runner registered to this
-    # repo carries it (2026-10-04), so that workflow cannot currently be
-    # picked up. Left unchanged here; it is runner-fleet placement, owned by
-    # plan 2026-10-04-coord-managed-ephemeral-self-hosted-ci-runner-fleet.
-    - qontinui
 paths:
   .github/workflows/**/*.{yml,yaml}:
     ignore:
