@@ -61,6 +61,11 @@
 //!
 //! ## Limits (documented, not enforced here)
 //!
+//! The sticky marker lives under the runner's config dir. A session running in
+//! bypass mode (or with a filesystem tool that reaches that dir) can delete it,
+//! and with it the reset-to-defaults detection; the marker is a guard against
+//! accidents, not against a session acting on purpose.
+//!
 //! Claude Code merges settings in precedence order, and a repository's own
 //! `.claude/settings.json` / `.claude/settings.local.json` and the machine's
 //! managed settings rank ABOVE the user-level settings the runner provisions in
@@ -133,6 +138,43 @@ pub const PROVIDER_SWITCH_ENV: &[&str] = &[
     "ANTHROPIC_FOUNDRY_RESOURCE",
 ];
 
+/// The provider base-URL variables in [`PROVIDER_SWITCH_ENV`].
+pub const PROVIDER_BASE_URL_ENV: &[&str] = &[
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+];
+
+/// Every variable a typed gateway command clears in the shell before running
+/// `claude` ([`env_scrub_prefix`]).
+fn scrubbed_shell_env() -> impl Iterator<Item = &'static str> {
+    SHADOWING_CREDENTIAL_ENV
+        .iter()
+        .chain(PROVIDER_SWITCH_ENV)
+        .chain([BASE_URL_ENV, CUSTOM_HEADERS_ENV].iter())
+        .copied()
+}
+
+/// The prefix a typed gateway command (launch or resume) starts with: it
+/// clears every env-borne vendor credential and provider switch the pane's
+/// shell may hold (review N2), so neither reaches the gateway session.
+/// POSIX: `env -u A -u B … ` (the rest of the line, env assignments included,
+/// becomes `env`'s arguments); PowerShell: `Remove-Item Env:A …; ` per var.
+pub fn env_scrub_prefix(is_windows: bool) -> String {
+    if is_windows {
+        scrubbed_shell_env()
+            .map(|v| format!("Remove-Item Env:{v} -ErrorAction SilentlyContinue; "))
+            .collect()
+    } else {
+        let mut out = String::from("env ");
+        for v in scrubbed_shell_env() {
+            out.push_str(&format!("-u {v} "));
+        }
+        out
+    }
+}
+
 /// Header names refused in [`ModelGatewaySettings::headers`] (exact,
 /// case-insensitive). Credentials ride the api-key-helper, never plaintext
 /// settings.
@@ -147,8 +189,8 @@ const CREDENTIAL_HEADER_NAMES: &[&str] = &[
 ];
 
 /// Header-name SUFFIXES refused for the same reason (`x-auth-token`,
-/// `x-client-secret`, `x-service-api-key`, …).
-const CREDENTIAL_HEADER_SUFFIXES: &[&str] = &["-token", "-secret", "-api-key", "-password"];
+/// `x-client-secret`, `x-service-key`, `x-service-api-key`, …).
+const CREDENTIAL_HEADER_SUFFIXES: &[&str] = &["-token", "-secret", "-key", "-password"];
 
 /// How long the runner waits for the api-key-helper before giving up.
 const API_KEY_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -239,12 +281,26 @@ impl ModelGatewaySettings {
         let Some(raw) = n.base_url.as_deref() else {
             return Ok(None);
         };
+        // Errors name the URL as scheme://host ONLY (review N3): userinfo, a
+        // query, a fragment or even a path may carry a secret, and these
+        // errors are logged on every spawn.
         let url = url::Url::parse(raw)
-            .map_err(|e| format!("model gateway base URL '{raw}' does not parse: {e}"))?;
+            .map_err(|e| format!("model gateway base URL does not parse ({e})"))?;
+        let shown = redacted_url(&url);
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(format!(
+                "model gateway base URL {shown} must not carry credentials; use the api-key-helper"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "model gateway base URL {shown} must not carry a query or fragment"
+            ));
+        }
         let host = url
             .host_str()
             .filter(|h| !h.is_empty())
-            .ok_or_else(|| format!("model gateway base URL '{raw}' has no host"))?
+            .ok_or_else(|| format!("model gateway base URL {shown} has no host"))?
             .trim_start_matches('[')
             .trim_end_matches(']')
             .to_ascii_lowercase();
@@ -253,26 +309,15 @@ impl ModelGatewaySettings {
             "http" if is_loopback_host(&host) => {}
             "http" => {
                 return Err(format!(
-                    "model gateway base URL '{raw}' uses plain http to a non-loopback host; \
+                    "model gateway base URL {shown} uses plain http to a non-loopback host; \
                      use https (plain http is accepted for localhost only)"
                 ))
             }
-            other => {
+            _ => {
                 return Err(format!(
-                    "model gateway base URL '{raw}' has unsupported scheme '{other}'"
+                    "model gateway base URL {shown} has an unsupported scheme (https required)"
                 ))
             }
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(
-                "model gateway base URL must not carry credentials; use the api-key-helper"
-                    .to_string(),
-            );
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(format!(
-                "model gateway base URL '{raw}' must not carry a query or fragment"
-            ));
         }
         if n.api_key_helper.is_none() && !n.network_auth {
             return Err(
@@ -314,6 +359,15 @@ impl ModelGatewaySettings {
                 n.api_key_helper_ttl_secs.unwrap_or(DEFAULT_HELPER_TTL_SECS),
             ),
         }))
+    }
+}
+
+/// `scheme://host[:port]` — the only form of a gateway URL an error may show.
+fn redacted_url(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or("<no host>");
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
     }
 }
 
@@ -426,6 +480,12 @@ impl ModelGateway {
 fn base_session_env() -> serde_json::Map<String, serde_json::Value> {
     let mut env = serde_json::Map::new();
     env.insert(NONESSENTIAL_TRAFFIC_ENV.to_string(), "1".into());
+    // A typed command can inherit these from the shell a pane was opened with
+    // (a profile export, or a pane older than the gateway). Blank them here
+    // too (review N2) — an empty value reads as unset to Claude Code.
+    for var in SHADOWING_CREDENTIAL_ENV.iter().chain(PROVIDER_BASE_URL_ENV) {
+        env.insert(var.to_string(), "".into());
+    }
     for var in [
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_USE_VERTEX",
@@ -495,7 +555,9 @@ pub(crate) fn run_api_key_helper(cmd: &str, timeout: Duration) -> Result<String,
         let mut c = crate::process_helpers::no_window("cmd");
         // `raw_arg`: hand cmd.exe the operator's line verbatim instead of
         // letting Rust's MSVC-style quoting mangle its quotes.
-        c.arg("/C").raw_arg(cmd);
+        // `/S /C "<line>"`: cmd strips exactly the outer quote pair and runs
+        // the operator's line verbatim (review N11).
+        c.raw_arg(format!("/S /C \"{cmd}\""));
         c
     };
     #[cfg(not(target_os = "windows"))]
@@ -603,9 +665,8 @@ pub fn classify_state(
 /// The live gateway state.
 pub fn state() -> GatewayState {
     let loaded = crate::settings::read_settings_from_disk();
-    let marker = gateway_dir()
-        .map(|d| marker_present_at(&d))
-        .unwrap_or(false);
+    // An unresolvable config dir cannot rule the marker out: fail closed.
+    let marker = gateway_dir().map(|d| marker_present_at(&d)).unwrap_or(true);
     classify_state(
         loaded.is_authoritative(),
         loaded.error.as_deref(),
@@ -676,7 +737,7 @@ pub fn current() -> Result<Option<ModelGateway>, String> {
 /// The refusal a headless spawn returns while the gateway is unresolved, or
 /// `None` when a spawn may proceed.
 pub fn spawn_refusal() -> Option<String> {
-    match resolution() {
+    match prepared_session().0 {
         Resolution::Unresolved(reason) => Some(format!(
             "refusing to start a claude session: the model gateway cannot be resolved ({reason})"
         )),
@@ -708,7 +769,7 @@ pub fn provider_refusal(provider: &crate::settings::AiProvider) -> Option<String
 }
 
 /// The runner-owned gateway dir (`<config dir>/model-gateway`).
-fn gateway_dir() -> Result<PathBuf, String> {
+pub(crate) fn gateway_dir() -> Result<PathBuf, String> {
     let (dir, _source) = crate::settings::resolve_config_dir()?;
     Ok(dir.join(GATEWAY_SUBDIR))
 }
@@ -720,8 +781,26 @@ pub fn session_config_dir() -> Result<PathBuf, String> {
     Ok(gateway_dir()?.join(SESSION_CONFIG_LEAF))
 }
 
+/// Whether the sticky marker exists. A check that ERRORS (permissions, I/O)
+/// counts as present — fail closed (review N8).
 pub(crate) fn marker_present_at(gateway_dir: &Path) -> bool {
-    gateway_dir.join(MARKER_FILE).exists()
+    gateway_dir.join(MARKER_FILE).try_exists().unwrap_or(true)
+}
+
+/// The marker's path and recorded base URL, for the settings UI.
+pub fn marker_info() -> Option<serde_json::Value> {
+    let path = gateway_dir().ok()?.join(MARKER_FILE);
+    if !path.try_exists().unwrap_or(true) {
+        return None;
+    }
+    let base_url = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("base_url").cloned());
+    Some(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "base_url": base_url,
+    }))
 }
 
 pub(crate) fn write_marker_at(gateway_dir: &Path, gateway: &ModelGateway) -> Result<(), String> {
@@ -757,24 +836,6 @@ pub fn record_saved_declaration(saved: &ModelGatewaySettings) -> Result<(), Stri
     }
 }
 
-/// Write the gateway sessions' config dir for `resolution`: `settings.json`
-/// (helper and routing env, or the unresolved trap) and a `.claude.json` that
-/// marks onboarding done. A valid gateway also refreshes the sticky marker.
-pub fn materialize_session_config(resolution: &Resolution) -> Result<PathBuf, String> {
-    let gdir = gateway_dir()?;
-    let dir = gdir.join(SESSION_CONFIG_LEAF);
-    let settings = match resolution {
-        Resolution::NoGateway => return Ok(dir),
-        Resolution::Gateway(g) => {
-            write_marker_at(&gdir, g)?;
-            g.session_settings_json()
-        }
-        Resolution::Unresolved(_) => unresolved_session_settings_json(),
-    };
-    materialize_session_config_at(&dir, &settings)?;
-    Ok(dir)
-}
-
 pub(crate) fn materialize_session_config_at(
     dir: &Path,
     settings: &serde_json::Value,
@@ -788,6 +849,14 @@ pub(crate) fn materialize_session_config_at(
         std::fs::write(&settings_path, &body)
             .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
     }
+    // The gateway dir must never hold a subscription login (review N1): a
+    // `/login` that slipped through while the dir lacked its settings would
+    // otherwise pair that token with the gateway URL on the next session.
+    let creds = dir.join(".credentials.json");
+    if creds.exists() {
+        warn!("model gateway: removing a subscription credential from the gateway config dir");
+        std::fs::remove_file(&creds).map_err(|e| format!("remove {}: {e}", creds.display()))?;
+    }
     let state_path = dir.join(".claude.json");
     if !state_path.exists() {
         std::fs::write(&state_path, "{\n  \"hasCompletedOnboarding\": true\n}\n")
@@ -796,28 +865,105 @@ pub(crate) fn materialize_session_config_at(
     Ok(())
 }
 
-/// The config dir a gateway session must run under, or `None` when no gateway
-/// is declared. Materializes the dir as a side effect. An unresolved gateway
-/// still returns the dir (holding the unresolved trap), so the session runs
-/// with no subscription account.
-pub fn session_config_dir_override() -> Option<String> {
-    session_config_dir_for(&resolution())
+/// Prepare the gateway sessions' config dir under `gateway_dir` for
+/// `resolution`, and return the resolution that actually holds afterwards plus
+/// the dir (review N1).
+///
+/// A VALID gateway whose `settings.json` cannot be written is DOWNGRADED to
+/// [`Resolution::Unresolved`]: a session in a dir without the helper and the
+/// routing env would authenticate however Claude Code otherwise would — an
+/// interactive `/login` reaches the vendor. The unresolved trap is then written
+/// best-effort (it may fail for the same reason; the env plan still pins the
+/// unroutable base URL).
+pub(crate) fn prepare_session_at(
+    resolution: &Resolution,
+    gateway_dir: &Path,
+) -> (Resolution, Option<String>) {
+    let dir = gateway_dir.join(SESSION_CONFIG_LEAF);
+    let dir_str = Some(dir.to_string_lossy().into_owned());
+    match resolution {
+        Resolution::NoGateway => (Resolution::NoGateway, None),
+        Resolution::Gateway(g) => {
+            if let Err(e) = write_marker_at(gateway_dir, g) {
+                error!("model gateway: could not write the last-known-gateway marker: {e}");
+            }
+            match materialize_session_config_at(&dir, &g.session_settings_json()) {
+                Ok(()) => (resolution.clone(), dir_str),
+                Err(e) => {
+                    let reason = format!("the gateway session settings could not be written ({e})");
+                    error!("model gateway: {reason}; treating the gateway as unresolved");
+                    let _ =
+                        materialize_session_config_at(&dir, &unresolved_session_settings_json());
+                    (Resolution::Unresolved(reason), dir_str)
+                }
+            }
+        }
+        Resolution::Unresolved(_) => {
+            if let Err(e) = materialize_session_config_at(&dir, &unresolved_session_settings_json())
+            {
+                error!("model gateway: could not write the unresolved session trap: {e}");
+            }
+            (resolution.clone(), dir_str)
+        }
+    }
 }
 
-fn session_config_dir_for(resolution: &Resolution) -> Option<String> {
+/// The live resolution AFTER preparing the session dir, and the dir. An
+/// unresolvable config dir is itself an unresolved gateway (review N1).
+pub fn prepared_session() -> (Resolution, Option<String>) {
+    let resolution = resolution();
+    if matches!(resolution, Resolution::NoGateway) {
+        return (Resolution::NoGateway, None);
+    }
+    match gateway_dir() {
+        Ok(gdir) => prepare_session_at(&resolution, &gdir),
+        Err(e) => (
+            Resolution::Unresolved(format!("the runner config dir could not be resolved ({e})")),
+            None,
+        ),
+    }
+}
+
+/// The refusal for a container step that runs `claude` while a model gateway
+/// is declared or unknown (review N6): the network mediator substitutes
+/// credential placeholders only on plain-HTTP forwards, and an `https` gateway
+/// is reached through an opaque CONNECT tunnel, so a container `claude` could
+/// never authenticate to it — and must not fall back to anything else.
+pub fn container_claude_refusal(command: &str, resolution: &Resolution) -> Option<String> {
     if matches!(resolution, Resolution::NoGateway) {
         return None;
     }
-    if let Err(e) = materialize_session_config(resolution) {
-        error!("model gateway: could not write the session config dir: {e}");
-    }
-    match session_config_dir() {
-        Ok(dir) => Some(dir.to_string_lossy().into_owned()),
-        Err(e) => {
-            error!("model gateway: could not resolve the session config dir: {e}");
-            None
-        }
-    }
+    let runs_claude = command
+        .split(|c: char| c.is_whitespace() || ";&|()".contains(c))
+        .filter(|t| !t.is_empty())
+        .any(|tok| {
+            let base = tok
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(tok)
+                .to_ascii_lowercase();
+            let base = base
+                .strip_suffix(".exe")
+                .or_else(|| base.strip_suffix(".cmd"))
+                .unwrap_or(&base)
+                .to_string();
+            base == "claude"
+        });
+    runs_claude.then(|| {
+        "refusing to run claude in a container while a model gateway is configured: the \
+         container's credential placeholder can only be substituted on plain-HTTP requests, \
+         and an https gateway is reached through an encrypted tunnel the runner cannot \
+         rewrite. Run the step on the host, where sessions route through the gateway."
+            .to_string()
+    })
+}
+
+/// The config dir a gateway session must run under, or `None` when no gateway
+/// is declared OR the dir could not be resolved. Callers that see `None` while
+/// [`gateway_declared`] holds must refuse rather than fall back to an account
+/// dir (review N1). Materializes the dir as a side effect.
+pub fn session_config_dir_override() -> Option<String> {
+    prepared_session().1
 }
 
 /// The env a child process gets on a gateway install: what to set and what to
@@ -883,11 +1029,7 @@ pub fn child_env_plan(
 /// spawn seam, so the gateway config dir overrides any subscription-account pin
 /// set earlier in the seam. Empty when no gateway is declared.
 pub(crate) fn live_child_env_plan() -> ChildEnvPlan {
-    let resolution = resolution();
-    if matches!(resolution, Resolution::NoGateway) {
-        return ChildEnvPlan::default();
-    }
-    let dir = session_config_dir_for(&resolution);
+    let (resolution, dir) = prepared_session();
     child_env_plan_for(&resolution, dir.as_deref())
 }
 
@@ -1439,7 +1581,7 @@ mod tests {
         assert!(UNRESOLVED_BASE_URL.contains(".invalid"));
     }
 
-    #[cfg(not(target_os = "windows"))]
+    /// Review N11: covers Windows (`cmd /S /C`) and POSIX (`sh -c`) alike.
     #[test]
     fn the_unresolved_key_helper_always_fails() {
         assert!(run_api_key_helper(UNRESOLVED_KEY_HELPER, Duration::from_secs(5)).is_err());
@@ -1510,6 +1652,161 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 307);
         server.join().unwrap();
+    }
+
+    /// Review N1: a gateway whose session settings cannot be written is
+    /// UNRESOLVED, so no session runs in a dir without the helper and routing
+    /// env (where an interactive /login would reach the vendor).
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_gateway_dir_downgrades_to_unresolved() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let gdir = tmp.path().join("model-gateway");
+        std::fs::create_dir_all(&gdir).unwrap();
+        std::fs::set_permissions(&gdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(gdir.join("probe"), "x").is_ok() {
+            // Permissions are not enforced (running as root): nothing to test.
+            return;
+        }
+        let mut s = decl("https://gw.example.com");
+        s.api_key_helper = Some("echo k".into());
+        let g = s.resolve().unwrap().unwrap();
+        let (res, _dir) = prepare_session_at(&Resolution::Gateway(g), &gdir);
+        std::fs::set_permissions(&gdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(res, Resolution::Unresolved(_)), "{res:?}");
+    }
+
+    /// Review N1: a writable dir keeps the gateway and yields the session dir.
+    #[test]
+    fn writable_gateway_dir_keeps_the_gateway() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gdir = tmp.path().join("model-gateway");
+        let mut s = decl("https://gw.example.com");
+        s.api_key_helper = Some("echo k".into());
+        let g = s.resolve().unwrap().unwrap();
+        let (res, dir) = prepare_session_at(&Resolution::Gateway(g), &gdir);
+        assert!(matches!(res, Resolution::Gateway(_)), "{res:?}");
+        let dir = dir.expect("session dir");
+        assert!(std::path::Path::new(&dir).join("settings.json").exists());
+    }
+
+    /// Review N1 (defence): the gateway dir never keeps subscription
+    /// credentials — a /login that slipped through is removed on materialize.
+    #[test]
+    fn materialize_removes_stray_subscription_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gdir = tmp.path().join("model-gateway");
+        let cdir = gdir.join(SESSION_CONFIG_LEAF);
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(cdir.join(".credentials.json"), "{}").unwrap();
+        let g = decl("https://gw.example.com").resolve().unwrap().unwrap();
+        let (res, _) = prepare_session_at(&Resolution::Gateway(g), &gdir);
+        assert!(matches!(res, Resolution::Gateway(_)));
+        assert!(!cdir.join(".credentials.json").exists());
+    }
+
+    /// Review N2: the gateway settings.json blanks every env-borne vendor
+    /// credential and provider base URL a parent shell may have exported.
+    #[test]
+    fn session_settings_blank_inherited_vendor_env() {
+        let mut s = decl("https://gw.example.com");
+        s.api_key_helper = Some("echo k".into());
+        let v = s.resolve().unwrap().unwrap().session_settings_json();
+        for var in SHADOWING_CREDENTIAL_ENV {
+            assert_eq!(v["env"][*var], "", "{var}");
+        }
+        assert_eq!(v["env"]["ANTHROPIC_BEDROCK_BASE_URL"], "");
+        let u = unresolved_session_settings_json();
+        assert_eq!(u["env"]["ANTHROPIC_API_KEY"], "");
+    }
+
+    /// Review N2: the typed-command prefix clears vendor env in the shell.
+    #[test]
+    fn env_scrub_prefix_clears_vendor_env_on_both_shells() {
+        let posix = env_scrub_prefix(false);
+        assert!(posix.starts_with("env "), "{posix}");
+        for var in SHADOWING_CREDENTIAL_ENV.iter().chain(PROVIDER_SWITCH_ENV) {
+            assert!(posix.contains(&format!("-u {var} ")), "{var}: {posix}");
+        }
+        let ps = env_scrub_prefix(true);
+        assert!(
+            ps.contains("Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue; "),
+            "{ps}"
+        );
+    }
+
+    /// Review N3: no validation error echoes the raw base URL (credentials,
+    /// query or path may carry a secret) — only scheme://host.
+    #[test]
+    fn validation_errors_never_echo_url_secrets() {
+        for raw in [
+            "https://user:SECRET@gw.example.com",
+            "https://gw.example.com/?key=SECRET",
+            "https://gw.example.com/#SECRET",
+            "http://gw.example.com/SECRET/path",
+            "ftp://gw.example.com/SECRET",
+            "https://SECRET",
+            "not a url SECRET",
+        ] {
+            let mut s = decl(raw);
+            s.network_auth = true;
+            if let Err(e) = s.resolve() {
+                assert!(!e.contains("SECRET"), "{raw}: {e}");
+            }
+        }
+        // Credentials are checked first: a userinfo URL that is ALSO plain
+        // http is refused for its credentials.
+        let err = decl("http://u:p@gw.example.com").resolve().unwrap_err();
+        assert!(err.contains("credentials"), "{err}");
+    }
+
+    /// Review N6: a container step that runs `claude` is refused under a gateway.
+    #[test]
+    fn container_claude_steps_are_refused_under_a_gateway() {
+        let g = decl("https://gw.example.com").resolve().unwrap().unwrap();
+        for res in [Resolution::Gateway(g), Resolution::Unresolved("x".into())] {
+            for cmd in [
+                "claude -p hi",
+                "cd /w && /usr/bin/claude --print x",
+                "npx claude",
+            ] {
+                let r = container_claude_refusal(cmd, &res);
+                assert!(
+                    r.as_deref().is_some_and(|m| m.contains("https")),
+                    "{cmd}: {r:?}"
+                );
+            }
+            assert!(container_claude_refusal("cargo test", &res).is_none());
+        }
+        assert!(container_claude_refusal("claude -p hi", &Resolution::NoGateway).is_none());
+    }
+
+    /// Review N8: a marker whose existence cannot be checked counts as present.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_marker_counts_as_present() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let gdir = tmp.path().join("model-gateway");
+        std::fs::create_dir_all(&gdir).unwrap();
+        std::fs::set_permissions(&gdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&gdir).is_ok() {
+            // Permissions are not enforced (running as root): nothing to test.
+            std::fs::set_permissions(&gdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let present = marker_present_at(&gdir);
+        std::fs::set_permissions(&gdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(present);
+    }
+
+    /// Review N10: `*-key` header names are credentials too.
+    #[test]
+    fn key_suffixed_headers_are_refused() {
+        let mut s = decl("https://gw.example.com");
+        s.headers.insert("X-Service-Key".into(), "v".into());
+        assert!(s.resolve().is_err());
     }
 
     trait TapTtl {
@@ -1656,5 +1953,64 @@ mod tests {
         assert!(has("x-tenant: t1"), "{lines:?}");
         assert!(has("x-api-key: gw-key-1"), "{lines:?}");
         assert!(has("authorization: Bearer gw-key-1"), "{lines:?}");
+    }
+}
+
+/// Wiring tests: the live settings → marker → state → refusal chain, in an
+/// isolated config dir (`test_env::isolated_ambient`). Each goes red if the
+/// link it names is removed. The headless-spawn link is pinned beside
+/// `spawn_claude_child` (`agent_runtime::gateway_spawn_refusal_tests`).
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    fn helper_gateway() -> ModelGatewaySettings {
+        ModelGatewaySettings {
+            base_url: Some("https://wiring-gw.example.com".to_string()),
+            api_key_helper: Some("echo wiring-key".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// save_model_gateway writes the sticky marker; a reset to defaults then
+    /// reads UNKNOWN; an explicit clear deletes the marker and reads none.
+    #[test]
+    fn save_writes_and_clear_deletes_the_marker_and_state_reads_it() {
+        let _amb = crate::test_env::isolated_ambient();
+        let gdir = gateway_dir().unwrap();
+        assert!(!marker_present_at(&gdir));
+        assert_eq!(state(), GatewayState::NotDeclared);
+
+        crate::settings::save_model_gateway(helper_gateway()).unwrap();
+        assert!(marker_present_at(&gdir), "save did not write the marker");
+        assert!(matches!(state(), GatewayState::Declared(_)));
+
+        // A reset to defaults that bypasses the save path (a hand edit, a
+        // restored backup) leaves the marker: UNKNOWN, fail closed.
+        crate::settings::update_settings(|s| s.model_gateway = Default::default()).unwrap();
+        assert!(matches!(state(), GatewayState::Unknown(_)), "{:?}", state());
+        assert!(gateway_declared());
+
+        // Only an explicit clear through the save path deletes it.
+        crate::settings::save_model_gateway(Default::default()).unwrap();
+        assert!(!marker_present_at(&gdir), "clear did not delete the marker");
+        assert_eq!(state(), GatewayState::NotDeclared);
+    }
+
+    /// The typed-resume renderer refuses while the gateway is unresolved.
+    #[test]
+    fn build_ai_resume_command_refuses_an_unresolved_gateway() {
+        let _amb = crate::test_env::isolated_ambient();
+        let g = helper_gateway().resolve().unwrap().unwrap();
+        write_marker_at(&gateway_dir().unwrap(), &g).unwrap();
+        let err = crate::commands::config::build_ai_resume_command(
+            "sess-1".to_string(),
+            None,
+            None,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("model gateway"), "{err}");
     }
 }

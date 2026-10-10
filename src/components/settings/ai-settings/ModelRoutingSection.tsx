@@ -10,6 +10,56 @@ export interface ModelGatewaySettings {
   api_key_helper?: string | null;
   /** The gateway authenticates by network position / mTLS: no helper needed. */
   network_auth?: boolean;
+  /** Helper-key cache TTL (seconds). Not edited in the form; preserved on save. */
+  api_key_helper_ttl_secs?: number | null;
+}
+
+/** `model_gateway::GatewayState`, as `get_model_gateway` reports it. */
+export type GatewayStateName = "not_declared" | "declared" | "unknown";
+
+/** The sticky last-known-gateway marker, when one exists. */
+export interface GatewayMarker {
+  path?: string;
+  base_url?: string | null;
+}
+
+export interface GatewayForm {
+  baseUrl: string;
+  headers: Record<string, string>;
+  helper: string;
+  networkAuth: boolean;
+}
+
+/** The save payload: form fields over the loaded settings, so fields the form
+ * does not edit (`api_key_helper_ttl_secs`) survive a save. */
+export function buildGatewayPayload(
+  form: GatewayForm,
+  loaded: ModelGatewaySettings,
+): ModelGatewaySettings {
+  return {
+    ...loaded,
+    base_url: form.baseUrl.trim() || null,
+    headers: form.headers,
+    api_key_helper: form.helper.trim() || null,
+    network_auth: form.networkAuth,
+  };
+}
+
+/** Saving an empty URL clears the gateway (and its sticky marker) — confirm it
+ * whenever a gateway is, or may be, in force. */
+export function needsClearConfirmation(state: GatewayStateName, baseUrl: string): boolean {
+  return baseUrl.trim() === "" && state !== "not_declared";
+}
+
+/** In the unknown state (settings reset, marker present) prefill the URL from
+ * the marker so a save restores the gateway rather than clearing it. */
+export function prefillFromMarker(
+  state: GatewayStateName,
+  baseUrl: string,
+  marker: GatewayMarker | null | undefined,
+): string {
+  if (state === "unknown" && !baseUrl && marker?.base_url) return marker.base_url;
+  return baseUrl;
 }
 
 /** Mirrors `launch_spec::SessionPermissionSetting` (settings.json `claude_session_permission`). */
@@ -19,6 +69,8 @@ export type SessionPermissionSetting =
 
 interface GatewayData {
   gateway: ModelGatewaySettings;
+  state?: GatewayStateName;
+  marker?: GatewayMarker | null;
   declared?: boolean;
   valid?: boolean;
 }
@@ -94,6 +146,9 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
   const [headers, setHeaders] = useState("");
   const [helper, setHelper] = useState("");
   const [networkAuth, setNetworkAuth] = useState(false);
+  const [loadedGateway, setLoadedGateway] = useState<ModelGatewaySettings>({});
+  const [gatewayState, setGatewayState] = useState<GatewayStateName>("not_declared");
+  const [marker, setMarker] = useState<GatewayMarker | null>(null);
   const [gatewayError, setGatewayError] = useState<string | null>(null);
   const [savingGateway, setSavingGateway] = useState(false);
 
@@ -106,7 +161,11 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
     try {
       const g = await invoke<TauriResult<GatewayData>>("get_model_gateway");
       const gw = g?.data?.gateway ?? {};
-      setBaseUrl(gw.base_url ?? "");
+      const state = g?.data?.state ?? "not_declared";
+      setLoadedGateway(gw);
+      setGatewayState(state);
+      setMarker(g?.data?.marker ?? null);
+      setBaseUrl(prefillFromMarker(state, gw.base_url ?? "", g?.data?.marker));
       setHeaders(formatHeaderLines(gw.headers));
       setHelper(gw.api_key_helper ?? "");
       setNetworkAuth(gw.network_auth === true);
@@ -140,12 +199,19 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
           `header line(s) not in "Name: Value" form: ${parsed.malformed.join(" | ")}`,
         );
       }
-      const gateway: ModelGatewaySettings = {
-        base_url: baseUrl.trim() || null,
-        headers: parsed.headers,
-        api_key_helper: helper.trim() || null,
-        network_auth: networkAuth,
-      };
+      if (
+        needsClearConfirmation(gatewayState, baseUrl) &&
+        !window.confirm(
+          "Clear the model gateway? Model calls will go to your Claude subscription again." +
+            (marker?.path ? ` The last-known-gateway marker at ${marker.path} is removed.` : ""),
+        )
+      ) {
+        return;
+      }
+      const gateway = buildGatewayPayload(
+        { baseUrl, headers: parsed.headers, helper, networkAuth },
+        loadedGateway,
+      );
       await invoke("save_model_gateway", { gateway });
       onLog("success", baseUrl.trim() ? "Model gateway saved" : "Model gateway cleared");
       await load();
@@ -248,6 +314,13 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
             className={inputClass}
           />
         </div>
+        {gatewayState === "unknown" && (
+          <p className="text-xs text-destructive" data-ui-id="model-gateway-unknown">
+            The gateway state is unknown, so model calls and sessions are refused (fail closed).
+            {marker?.path ? ` This install recorded a gateway (marker: ${marker.path}).` : ""} Save
+            the gateway again to restore it, or clear the URL to return to your subscription.
+          </p>
+        )}
         {gatewayError && <p className="text-xs text-destructive">{gatewayError}</p>}
         <button
           type="button"
