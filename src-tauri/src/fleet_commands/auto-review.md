@@ -83,14 +83,20 @@ verdict on your own work is worth nothing either.
 
 ### 4. Run tests
 
-If the touched files include Rust under `qontinui-runner/src-tauri/`:
-- `Bash: cd qontinui-runner && bash <workspace-root>/qontinui-claude-config/scripts/cargo-guard.sh check --all-targets` (the checkout is shared; never raw `cargo` there)
-- `Bash: cd qontinui-runner && bash <workspace-root>/qontinui-claude-config/scripts/cargo-guard.sh test -- <module filter>`
+Run the project's own build and test commands in `<repo>` (from Step 3).
+Use your project's build wrapper where one exists (its `CLAUDE.md`, `README`
+or contributing guide names it); on a checkout shared by several agents, never
+run raw `cargo`.
+
+If the touched files include Rust:
+- `Bash: cd <repo> && cargo check --all-targets` (or the repo's documented
+  wrapper for it)
+- `Bash: cd <repo> && cargo test -- <module filter>`
   on the modules likely affected (use `--test <name>` filters when the touched
   set is narrow).
 
 If the touched files include TypeScript:
-- `Bash: cd qontinui-runner && npx tsc --noEmit`
+- `Bash: cd <repo> && npx tsc --noEmit`
 - The relevant `vitest` invocation if test files exist alongside.
 
 For unfamiliar test surfaces, refuse to run blind and note "tests not run:

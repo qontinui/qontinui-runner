@@ -12,7 +12,7 @@ Pre-implementation architectural review for complex features.
 - Features that will be hard to debug if implemented poorly
 
 **Skip for:**
-- Simple bug fixes (use `/debug` instead)
+- Simple bug fixes (use `/fix` instead, or `/debug` where your deployment provides it)
 - One-line changes
 - Trivial additions
 - Documentation updates
@@ -228,7 +228,7 @@ Once plan is approved:
 2. Follow the test-first approach outlined
 3. Add logging as planned
 4. Validate after each step
-5. Use `/debug` if issues arise during implementation
+5. Use `/fix` (or `/debug` where your deployment provides it) if issues arise during implementation
 
 ## Benefits of This Approach
 

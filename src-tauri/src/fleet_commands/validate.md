@@ -244,7 +244,7 @@ Code is ready to commit.
 
 ## Integration with Other Commands
 
-- After `/debug` fixes: Run `/validate` to ensure fix is clean
+- After a bug fix (`/fix`, or `/debug` where your deployment provides it): Run `/validate` to ensure fix is clean
 - After `/review-before-code` implementation: Run `/validate` at each step
 - Before `/clean-commit`: Validation should pass
 

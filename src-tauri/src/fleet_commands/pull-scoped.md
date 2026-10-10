@@ -80,9 +80,10 @@ current=$(git branch --show-current)
 # `.mcp.json`, a `.coord-mcp-status`, an `agent-worktrees/`, a stray log. On
 # this fleet the runner drops several of those into every managed repo, so a
 # bare porcelain read means Case B fires forever and the repo is never pulled
-# again — measured as exactly that pin in `dev-start.ps1`, where it held
-# qontinui-supervisor 26 commits behind main for weeks (qontinui-supervisor#166,
-# fixed for that surface by qontinui-claude-config#741). Chasing the artifacts
+# again — measured as exactly that pin in a dev-stack start script, where it
+# held qontinui-supervisor 26 commits behind main for weeks
+# (qontinui-supervisor#166, fixed for that surface in the fleet config repo,
+# #741). Chasing the artifacts
 # one `.gitignore` / `.git/info/exclude` entry at a time does not converge;
 # qontinui-supervisor#167 was the third round in one file.
 tracked_wip=$(git status --porcelain --untracked-files=no 2>/dev/null)
@@ -130,7 +131,7 @@ else
     # causes here and they need opposite remedies -- rebase/push for one, move
     # a file for the other -- so a single bucket sends the operator the wrong
     # way and hides a collision inside a section headed "local commits ahead of
-    # origin". Identify it the way dev-start.ps1 does: intersect the incoming
+    # origin". Identify it directly: intersect the incoming
     # paths with the untracked ones.
     collisions=$(comm -12 \
         <(git diff --name-only HEAD "origin/$default" 2>/dev/null | sort) \
