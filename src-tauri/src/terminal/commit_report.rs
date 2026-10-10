@@ -426,22 +426,15 @@ pub fn reset_dedup_for_test() {
 
 /// Full pipeline for one push observation: resolve git facts, apply dedup, and
 /// (when warranted) report via the registrar. Best-effort — logs and returns on
-/// any miss. Synchronous git calls are cheap and run on the tail task's thread.
+/// any miss. Runs on the bounded git worker thread, as the body of the job
+/// [`push_job`] builds.
 ///
 /// `session_key` is the harness id of the transcript the push was seen in.
 /// `dispatch_tenant` is its owning tenant as resolved when the push was
 /// observed; the registrar re-resolves from `session_key` only when that is
 /// `None` (see `AiCoordRegistrar::report_commits`).
-pub fn handle_push_observation(
-    obs: &PushObservation,
-    session_key: &str,
-    dispatch_tenant: Option<uuid::Uuid>,
-    registrar: &crate::claude_session::coord_register::AiCoordRegistrar,
-) {
-    handle_push_observation_with(obs, session_key, dispatch_tenant, registrar, resolve_push);
-}
-
-/// [`handle_push_observation`] with the git resolution injected (tests).
+/// `resolve` is the git resolution ([`resolve_push`] in production; tests
+/// inject it).
 fn handle_push_observation_with(
     obs: &PushObservation,
     session_key: &str,
@@ -479,7 +472,7 @@ fn handle_push_observation_with(
 // ── Bounded fan-out ──────────────────────────────────────────────────────────
 //
 // **The problem.** The transcript tail loop used to do
-// `for obs in pushes { spawn_blocking(|| handle_push_observation(..)) }` — one
+// `for obs in pushes { spawn_blocking(|| /* handle one push */) }` — one
 // blocking-pool task per transcript line, with no cap of any kind. The bound
 // was the transcript's line rate, i.e. none. Combined with an untimed `git`
 // (fixed above) that is a direct route to blocking-pool exhaustion, which is
@@ -502,6 +495,9 @@ fn handle_push_observation_with(
 //     is safe here: `report_commits` is best-effort and coord dedups, so a
 //     dropped observation costs at most one lineage row that the next push
 //     re-reports. Drops are counted and WARNed, never silent.
+//
+// The job each observation becomes is built by [`push_job`], which also
+// resolves the pushing session's tenant before the hand-off.
 
 /// Queue depth for pending git enumerations. Small on purpose: a backlog this
 /// deep already means git is pathological, and queueing more just delays the

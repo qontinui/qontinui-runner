@@ -1102,7 +1102,9 @@ impl AiCoordRegistrar {
     /// reads for the session's own rows. When no row resolves, a session this
     /// registrar CLOSED within [`RECENTLY_CLOSED_TTL`] answers the tenant it
     /// was recorded under ([`Inner::recently_closed`]; checked for the id and
-    /// its direct `/clear` predecessor). There is deliberately NO
+    /// its direct `/clear` predecessor ONLY — deliberately not the whole
+    /// adoption chain: past one hop the attribution is a guess, and a missing
+    /// stamp is better than a guessed one). There is deliberately NO
     /// fallback to the device's default binding at report time (the default
     /// may still be what the session was REGISTERED under — that is a recorded
     /// fact, not a guess): a guessed tenant on a
@@ -1465,6 +1467,18 @@ impl AiCoordRegistrar {
     /// `claude_session_id`. A key from neither plane is an index miss, which is
     /// the documented no-op.
     pub fn close_session(&self, session_key: &str) {
+        // The recently-closed grace lock is taken FIRST and held across the
+        // whole eviction, so `owning_tenant` (which consults the grace only
+        // after its index lookups missed, and takes no other lock while
+        // holding the grace lock) can never observe the key gone from
+        // `reverse` while a stale grace entry for it is still in place.
+        // Nothing takes `recently_closed` while holding `reverse`, `forward`
+        // or `tenants`, so this order cannot invert.
+        let mut recent = self
+            .inner
+            .recently_closed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session_id = {
             // Evict reverse first, capturing the coord id.
             let Some(id) = self
@@ -1495,18 +1509,16 @@ impl AiCoordRegistrar {
         // Every close purges this key's older entry (and expired ones) FIRST,
         // even one that recorded no tenant: a stale entry from an earlier
         // incarnation of the key must never outlive the latest close.
-        if let Ok(mut recent) = self.inner.recently_closed.lock() {
-            let now = std::time::Instant::now();
-            recent.retain(|(k, _, at)| {
-                k != session_key && now.duration_since(*at) < RECENTLY_CLOSED_TTL
-            });
-            if let Some(t) = closed_tenant {
-                recent.push_back((session_key.to_string(), t, now));
-            }
-            while recent.len() > RECENTLY_CLOSED_CAP {
-                recent.pop_front();
-            }
+        let now = std::time::Instant::now();
+        recent
+            .retain(|(k, _, at)| k != session_key && now.duration_since(*at) < RECENTLY_CLOSED_TTL);
+        if let Some(t) = closed_tenant {
+            recent.push_back((session_key.to_string(), t, now));
         }
+        while recent.len() > RECENTLY_CLOSED_CAP {
+            recent.pop_front();
+        }
+        drop(recent);
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
