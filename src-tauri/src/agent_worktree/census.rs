@@ -2996,9 +2996,11 @@ async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     cached.poster.post_volumes(volumes, cargo_locks).await;
 }
 
-/// Upper bound on the shared-target lock probe. It reads `/proc` and, on an
-/// unconfirmed holder, scans `/proc/*/fd` — normally milliseconds, but a
-/// saturated box must not stall the volume POST behind it.
+/// Upper bound on the shared-target lock probe. It reads `/proc` and scans
+/// `/proc/*/fd` once per tick (on an unconfirmed holder or a lock file with no
+/// `/proc/locks` row — which every idle lock is, so in practice most ticks) —
+/// normally milliseconds, but a saturated box must not stall the volume POST
+/// behind it.
 const CARGO_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared cargo target lock state for this tick

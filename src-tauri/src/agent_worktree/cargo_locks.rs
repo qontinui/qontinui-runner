@@ -43,8 +43,30 @@
 //! its `/proc/<pid>/fdinfo/*`). Otherwise the owner is resolved by the
 //! processes that hold the lock file open, confirmed the same way (fdinfo
 //! lists only a GRANTED lock, so a waiter never confirms); and if nothing confirms, `holder_pid` is `null` with
-//! `holder_kind: "unknown"` — never an unconfirmed pid. That scan runs at most
-//! once per tick, and only on such a miss.
+//! `holder_kind: "unknown"` — never an unconfirmed pid.
+//!
+//! ### A held lock can have NO `/proc/locks` row at all
+//!
+//! When `/proc` is mounted in a pid namespace other than the kernel's initial
+//! one (a WSL2 distro, a container) and the taker has exited, the kernel drops
+//! the lock's whole tree from `/proc/locks`, waiters included:
+//! `locks_translate_pid()` maps the freed taker pid to 0 and `locks_show()`
+//! skips the row (`fs/locks.c:2149-2172`, `:2781-2790` at WSL tag
+//! `linux-msft-wsl-6.6.87.2`). The holder's `/proc/<pid>/fdinfo/<fd>` still
+//! carries the `lock:` line (with pid 0). So a lock file with no holder row is
+//! resolved through the same path-confirmed fdinfo arm before it is reported
+//! idle. Plan `2026-10-09-cargo-target-liveness-holders-reads-a-hidden-lock-as-idle`.
+//!
+//! **Residue, stated so nobody reads an idle item as proof:** a row-less lock
+//! whose holder's fd this uid cannot read (another uid; the scan skips those up
+//! front) still reports idle, as does one held through a different path to the
+//! same inode (a hardlink). The census runs no `flock` probe of its own. That
+//! is a reporting gap, not a deletion risk: `cargo_locks` is display data and
+//! nothing reclaims from it (qontinui-coord has no reader of it).
+//!
+//! **Cost:** the open-file scan (bounded by [`MAX_FD_SCAN`]) is built at most
+//! once per tick, but since every IDLE lock is also a row miss it now runs on
+//! essentially every tick that has a shared lock file, not only on a held one.
 //!
 //! The owner is named from `/proc/<pid>/cmdline` (never `environ`) and aged
 //! from `/proc/<pid>/stat` `starttime` against `/proc/uptime`.
@@ -608,34 +630,42 @@ fn lock_item(
         None => (&[], &[]),
     };
 
-    let (holder_pid, holder_kind, holder_age_secs, holder_cmd) = match &matched {
-        Some((key, _, how)) if !holders.is_empty() => {
-            let owner = match how {
-                LockMatch::InodeOnly => path_owner,
-                LockMatch::Exact => procs.resolve_owner(*key, holders, &file.path, all_lock_paths),
+    // `Some(owner)` = held (owner confirmed or not); `None` = idle.
+    let held: Option<Option<u32>> = match &matched {
+        Some((key, _, how)) if !holders.is_empty() => Some(match how {
+            LockMatch::InodeOnly => path_owner,
+            LockMatch::Exact => procs.resolve_owner(*key, holders, &file.path, all_lock_paths),
+        }),
+        // No holder row (none at all, or only `->` waiter rows): the kernel
+        // hides a dead taker's row outside the initial pid namespace, so ask
+        // the fdinfo of the processes holding THIS file open before calling it
+        // idle. Only a CONFIRMED owner makes it held — a process that merely
+        // has the file open never does (fdinfo lists only granted locks).
+        _ => procs
+            .resolve_owner(stat_key, &[], &file.path, all_lock_paths)
+            .map(Some),
+    };
+
+    let (holder_pid, holder_kind, holder_age_secs, holder_cmd) = match held {
+        Some(Some(pid)) => {
+            let argv = procs.argv(pid);
+            let kind = if argv.is_empty() {
+                HolderKind::Unknown
+            } else {
+                let mut chain = vec![argv.clone()];
+                chain.extend(procs.ancestor_argvs(pid));
+                classify_holder(&chain)
             };
-            match owner {
-                Some(pid) => {
-                    let argv = procs.argv(pid);
-                    let kind = if argv.is_empty() {
-                        HolderKind::Unknown
-                    } else {
-                        let mut chain = vec![argv.clone()];
-                        chain.extend(procs.ancestor_argvs(pid));
-                        classify_holder(&chain)
-                    };
-                    (
-                        Some(pid),
-                        Some(kind),
-                        procs.age_secs(pid),
-                        argv_display(&argv),
-                    )
-                }
-                // Held, but no owner could be CONFIRMED: never publish a pid.
-                None => (None, Some(HolderKind::Unknown), None, None),
-            }
+            (
+                Some(pid),
+                Some(kind),
+                procs.age_secs(pid),
+                argv_display(&argv),
+            )
         }
-        _ => (None, None, None, None),
+        // Held, but no owner could be CONFIRMED: never publish a pid.
+        Some(None) => (None, Some(HolderKind::Unknown), None, None),
+        None => (None, None, None, None),
     };
     let oldest_wait_secs = waiters
         .iter()
@@ -655,7 +685,8 @@ fn lock_item(
 }
 
 /// Per-tick `/proc` reader: uptime and tick rate read once; `stat` memoized;
-/// the open-file index built at most once, on the first unconfirmed holder.
+/// the open-file index built at most once, on the first unconfirmed holder or
+/// row-less lock file (in practice: on most ticks, since an idle lock is one).
 #[cfg(target_os = "linux")]
 struct ProcReader {
     uptime_secs: Option<f64>,
@@ -1238,6 +1269,90 @@ lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
         assert_eq!(idle.waiters, 0);
         assert_eq!(idle.oldest_wait_secs, None);
         drop(f);
+    }
+
+    /// Spawn `sh` holding `lock` on fd 9 through a `flock(1)` that EXITS
+    /// (the sweeper's shape), with `mode` `-x` or `-s`. Returns the child once
+    /// the lock is granted; write a line to its stdin to release it.
+    #[cfg(target_os = "linux")]
+    fn spawn_inherited_holder(lock: &Path, mode: &str) -> std::process::Child {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec 9<\"$1\"; flock \"$2\" 9 && echo ready; read _x")
+            .arg("sh")
+            .arg(lock)
+            .arg(mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read ready");
+        assert_eq!(line.trim(), "ready");
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    fn release(mut child: std::process::Child) {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"\n");
+        }
+        let _ = child.wait();
+    }
+
+    /// Kernel-independent: the lock table a WSL2 distro / container shows for a
+    /// dead taker is EMPTY for that lock. Drive `lock_item` with an empty table
+    /// and require the inherited-fd holder (exclusive AND shared) to be named,
+    /// while a file another process merely has OPEN (not locked) stays idle.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_lock_with_no_proc_locks_row_is_resolved_through_fdinfo() {
+        use std::process::Command;
+        if Command::new("flock").arg("--version").output().is_err() {
+            eprintln!("flock(1) not installed — skipping the row-less owner test");
+            return;
+        }
+        let tmp = make_workspace();
+        let (files, _) = enumerate_shared_lock_files(tmp.path(), MAX_CARGO_LOCK_ITEMS);
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+        let file_for = |key: &str| {
+            files
+                .iter()
+                .find(|f| f.target_key == key)
+                .unwrap_or_else(|| panic!("{key} enumerated"))
+        };
+        let empty: HashMap<LockKey, LockEntry> = HashMap::new();
+
+        for mode in ["-x", "-s"] {
+            let f = file_for("qontinui-coord/target/debug");
+            let child = spawn_inherited_holder(&f.path, mode);
+            let sh_pid = child.id();
+            let item = lock_item(f, &empty, &mut ProcReader::new(), &paths).expect("item");
+            release(child);
+            assert_eq!(
+                item.holder_pid,
+                Some(sh_pid),
+                "{mode}: a row-less held lock must name the fd holder, not read idle: {item:?}"
+            );
+            assert!(item.holder_kind.is_some(), "{mode}: held, so a kind is set");
+            assert_eq!(item.waiters, 0);
+        }
+
+        // No false holder: open, never locked, no row -> idle.
+        let f = file_for("qontinui-coord/target/release");
+        let opener = std::fs::File::open(&f.path).expect("open without locking");
+        let item = lock_item(f, &empty, &mut ProcReader::new(), &paths).expect("item");
+        drop(opener);
+        assert_eq!(
+            item.holder_pid, None,
+            "an open-but-unlocked file is idle: {item:?}"
+        );
+        assert_eq!(item.holder_kind, None);
     }
 
     /// C1, live: the sweeper's shape. `sh` opens the lock on fd 9 and runs
