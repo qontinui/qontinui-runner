@@ -1492,12 +1492,17 @@ impl AiCoordRegistrar {
             .and_then(|mut g| g.remove(&session_id));
         // Keep the tenant resolvable by harness id for a bounded grace window:
         // a closeout push's transcript line can reach the tail after this.
-        if let (Some(t), Ok(mut recent)) = (closed_tenant, self.inner.recently_closed.lock()) {
+        // Every close purges this key's older entry (and expired ones) FIRST,
+        // even one that recorded no tenant: a stale entry from an earlier
+        // incarnation of the key must never outlive the latest close.
+        if let Ok(mut recent) = self.inner.recently_closed.lock() {
             let now = std::time::Instant::now();
             recent.retain(|(k, _, at)| {
                 k != session_key && now.duration_since(*at) < RECENTLY_CLOSED_TTL
             });
-            recent.push_back((session_key.to_string(), t, now));
+            if let Some(t) = closed_tenant {
+                recent.push_back((session_key.to_string(), t, now));
+            }
             while recent.len() > RECENTLY_CLOSED_CAP {
                 recent.pop_front();
             }
@@ -3697,6 +3702,74 @@ mod tests {
             commit_report_payload(&reg, "closeout")["tenant_id"],
             json!(OWNING_TENANT)
         );
+    }
+
+    /// A later close of the same key that recorded NO tenant purges the
+    /// earlier close's grace entry: the key must not keep answering a tenant
+    /// from an incarnation that is no longer the latest.
+    #[test]
+    fn a_tenantless_close_purges_the_keys_older_grace_entry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static NO_TENANT_NOW: AtomicBool = AtomicBool::new(false);
+        fn resolver() -> Option<Uuid> {
+            (!NO_TENANT_NOW.load(Ordering::SeqCst)).then_some(OWNING_TENANT)
+        }
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        NO_TENANT_NOW.store(false, Ordering::SeqCst);
+        let (reg, _dir) = registrar_with_tenant(resolver);
+        let key = Uuid::new_v4().to_string();
+        reg.register_session(&key, "first", None).unwrap();
+        reg.close_session(&key);
+        assert_eq!(reg.owning_tenant(&key), Some(OWNING_TENANT), "precondition");
+
+        NO_TENANT_NOW.store(true, Ordering::SeqCst);
+        reg.register_session(&key, "second", None).unwrap();
+        reg.close_session(&key);
+        assert_eq!(reg.owning_tenant(&key), None);
+    }
+
+    /// `/clear` in a registered X adopts Y; X is then closed. A push in Y's
+    /// transcript resolves X's tenant through the predecessor arm of the
+    /// recently-closed grace.
+    #[test]
+    fn a_push_after_clear_resolves_a_closed_predecessors_tenant() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (store, _sdir) = attach_store(&reg);
+        // Non-uuid ids keep the attached store's handle hook network-silent.
+        let x = "registered-x-then-closed";
+        reg.register_sniffed_session(x, "typed resume", None)
+            .expect("registered");
+        open_on(&store, x, "term-x", None);
+        open_on(&store, "cleared-y-of-closed-x", "term-x", Some(x));
+        reg.close_session(x);
+        assert!(reg.session_id_for(x).is_none(), "X's index entry is gone");
+
+        assert_eq!(
+            reg.owning_tenant("cleared-y-of-closed-x"),
+            Some(OWNING_TENANT)
+        );
+    }
+
+    /// The grace list is bounded: after `RECENTLY_CLOSED_CAP + 1` closes the
+    /// oldest is gone, and the newest still answers.
+    #[test]
+    fn the_recently_closed_grace_is_capped() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let keys: Vec<String> = (0..=RECENTLY_CLOSED_CAP)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect();
+        for k in &keys {
+            reg.register_session(k, "cap", None).unwrap();
+            reg.close_session(k);
+        }
+        assert_eq!(reg.owning_tenant(&keys[0]), None, "the oldest was evicted");
+        assert_eq!(reg.owning_tenant(&keys[1]), Some(OWNING_TENANT));
+        assert_eq!(reg.owning_tenant(keys.last().unwrap()), Some(OWNING_TENANT));
     }
 
     /// Review (round 2) MINOR 3: a terminal-plane hit whose coord row the live

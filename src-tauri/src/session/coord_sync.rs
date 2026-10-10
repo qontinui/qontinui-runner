@@ -1804,16 +1804,16 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
             // Body is the payload verbatim ({repo, branch, shas}, plus the
             // pushing session's top-level `tenant_id` when the registrar
-            // resolved one — which is also what made `scope` Owned above);
-            // coord resolves the session server-side from (repo, branch).
-            // For a row that carries NO tenant (`Unresolved`) the header below
-            // still falls back to the device's active tenant until Phase 2 of
-            // plan 2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-
-            // tenant-header removes it, and a pre-Phase-1 coord files that row
-            // under that default. Tenant
-            // comes from the X-Qontinui-Tenant-Id header (post_device_register
-            // posture) — Phase 8b: the OWNING SESSION's binding wins; the
-            // machine.json default only backfills tenant-less legacy rows.
+            // resolved one); coord resolves the session server-side from
+            // (repo, branch). Tenant, in order: (1) the payload `tenant_id`
+            // makes `scope` Owned above, so the bearer is that tenant's slot;
+            // (2) the X-Qontinui-Tenant-Id header (post_device_register
+            // posture) is taken from that same `scope`; (3) only for an
+            // `Unresolved` row (no payload tenant) does the header fall back to
+            // the device's active tenant — until Phase 2 of plan
+            // 2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header
+            // removes the header, a pre-Phase-1 coord files such a row under
+            // that default.
             let url = format!("{base}/coord/commits/report");
             let mut rb = crate::auth::attach_device_auth_for(
                 inner.http.post(&url).json(&rec.payload),
