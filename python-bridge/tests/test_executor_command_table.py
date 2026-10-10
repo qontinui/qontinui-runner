@@ -233,6 +233,42 @@ def test_unknown_command_returns_the_old_dict():
     assert _UNKNOWN_RETURN in returns
 
 
+@pytest.mark.parametrize(
+    ("method", "required"),
+    [
+        ("_cmd_load", "config_path"),
+        ("_cmd_start", "workflow_id"),
+        ("_cmd_navigate_to_state", "target_state_id"),
+    ],
+)
+def test_cmd_handlers_reject_a_missing_required_param(method, required):
+    """The handler's first statement after reading the key returns the required-param error."""
+    handler = _executor_methods()[method]
+    body = [
+        s
+        for s in handler.body
+        if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+    ]
+    guards = [s for s in body if isinstance(s, ast.If) and isinstance(s.test, ast.UnaryOp)]
+    assert guards, f"{method} has no `if not <param>:` guard"
+    ret = guards[0].body[0]
+    assert isinstance(ret, ast.Return) and ret.value is not None
+    assert ast.literal_eval(ret.value) == {"success": False, "error": f"{required} is required"}
+    # The guard sits before the first call that consumes the value.
+    first_self_call = next(
+        i
+        for i, s in enumerate(body)
+        if any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "self"
+            for n in ast.walk(s)
+        )
+    )
+    assert body.index(guards[0]) < first_self_call
+
+
 # 5 ---------------------------------------------------------------------------
 
 
