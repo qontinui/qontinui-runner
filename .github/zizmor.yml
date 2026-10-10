@@ -31,6 +31,7 @@ rules:
   self-repository:
     ignore:
       - atlas-schema-check.yml
+      - build-python-executor.yml
       - ci.yml
       - clippy-tiers.yml
       - clorinde-bindings-fresh.yml

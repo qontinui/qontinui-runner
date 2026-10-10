@@ -57,9 +57,44 @@ jobs:
       artifact-name: python-executors
 
     steps:
+      # LAYOUT. python-bridge/poetry.lock resolves its path dependencies as
+      # `../../<name>` from python-bridge/, i.e. as SIBLINGS of the runner
+      # checkout (qontinui, multistate, qontinui-schemas; qontinui's own
+      # pyproject then names ../multistate and ../qontinui-schemas), and
+      # qontinui-executor.spec reads `../../qontinui/src` the same way. With
+      # the runner at the workspace root those resolve OUTSIDE
+      # $GITHUB_WORKSPACE, where actions/checkout cannot write, which is why
+      # this workflow never built. So the runner goes under `path:` and every
+      # sibling sits beside it at the workspace root.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+          path: qontinui-runner
+
+      - name: Check out sibling qontinui
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          repository: qontinui/qontinui
+          path: qontinui
+
+      - name: Check out sibling multistate
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          repository: qontinui/multistate
+          path: multistate
+
+      # qontinui-schemas only through the sanctioned materialiser
+      # (forbid-sibling-clone.yml). It honours .github/sibling-pins.conf, the
+      # same pin release.yml builds the runner against.
+      - name: Check out sibling qontinui-schemas
+        uses: ./qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
+
+      # qontinui-train (the optional `ml` group) is deliberately NOT checked
+      # out: `poetry install` without `--with ml` skips an optional group.
 
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -76,101 +111,98 @@ jobs:
       - name: Cache Poetry dependencies
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: python-bridge/.venv
-          key: poetry-${{ matrix.platform }}-${{ hashFiles('python-bridge/poetry.lock') }}
+          path: qontinui-runner/python-bridge/.venv
+          key: poetry-${{ matrix.platform }}-${{ hashFiles('qontinui-runner/python-bridge/poetry.lock') }}
           restore-keys: |
             poetry-${{ matrix.platform }}-
 
       - name: Install Python dependencies
-        working-directory: python-bridge
+        working-directory: qontinui-runner/python-bridge
         run: |
           poetry install --no-interaction
 
+      # pip into the venv, NOT `poetry add`: `poetry add` rewrites
+      # pyproject.toml and poetry.lock on every run, so the executor was built
+      # from a resolution the repository does not record.
       - name: Install PyInstaller
-        working-directory: python-bridge
+        working-directory: qontinui-runner/python-bridge
         run: |
-          poetry add pyinstaller --group dev
+          poetry run pip install pyinstaller
 
-      # Install qontinui library
-      - name: Clone qontinui library
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          repository: qontinui/qontinui
-          path: qontinui-lib
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install qontinui library
-        working-directory: python-bridge
+      - name: Build Python executor
+        working-directory: qontinui-runner/python-bridge
+        env:
+          QONTINUI_INCLUDE_CUDA: ${{ inputs.include_cuda && '1' || '0' }}
+          QONTINUI_INCLUDE_SAM3: ${{ inputs.include_sam3 && '1' || '0' }}
         run: |
-          poetry run pip install -e ../qontinui-lib
+          poetry run python build_executor.py --skip-copy
 
-      # Build the executor
-      - name: Build Python executor (Linux/macOS)
+      # Copy to the binaries directory with correct naming.
+      # Note (macOS ARM): for a true ARM64 build we'd need an ARM runner; for
+      # now the macos-latest build is copied under the aarch64 name.
+      - name: Prepare executor for upload (Linux/macOS)
         if: runner.os != 'Windows'
-        working-directory: python-bridge
+        shell: bash
+        working-directory: qontinui-runner
         env:
-          QONTINUI_INCLUDE_CUDA: ${{ inputs.include_cuda && '1' || '0' }}
-          QONTINUI_INCLUDE_SAM3: ${{ inputs.include_sam3 && '1' || '0' }}
-        run: |
-          poetry run python build_executor.py --skip-copy
-
-      - name: Build Python executor (Windows)
-        if: runner.os == 'Windows'
-        working-directory: python-bridge
-        env:
-          QONTINUI_INCLUDE_CUDA: ${{ inputs.include_cuda && '1' || '0' }}
-          QONTINUI_INCLUDE_SAM3: ${{ inputs.include_sam3 && '1' || '0' }}
-        run: |
-          poetry run python build_executor.py --skip-copy
-
-      # Copy to the binaries directory with correct naming
-      - name: Prepare executor for upload (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p binaries
-          cp python-bridge/dist/qontinui-executor binaries/qontinui-executor-${{ matrix.target }}
-          chmod +x binaries/qontinui-executor-${{ matrix.target }}
-
-      - name: Prepare executor for upload (macOS x64)
-        if: matrix.platform == 'macos-latest' && matrix.target == 'x86_64-apple-darwin'
-        run: |
-          mkdir -p binaries
-          cp python-bridge/dist/qontinui-executor binaries/qontinui-executor-${{ matrix.target }}
-          chmod +x binaries/qontinui-executor-${{ matrix.target }}
-
-      - name: Prepare executor for upload (macOS ARM)
-        if: matrix.platform == 'macos-latest' && matrix.target == 'aarch64-apple-darwin'
-        run: |
-          mkdir -p binaries
-          # Note: For true ARM64 build, we'd need an ARM runner
-          # For now, we build universal or x64 and rename
-          cp python-bridge/dist/qontinui-executor binaries/qontinui-executor-${{ matrix.target }}
-          chmod +x binaries/qontinui-executor-${{ matrix.target }}
+          cp python-bridge/dist/qontinui-executor "binaries/qontinui-executor-${TARGET}"
+          chmod +x "binaries/qontinui-executor-${TARGET}"
 
       - name: Prepare executor for upload (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        working-directory: qontinui-runner
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           New-Item -ItemType Directory -Force -Path binaries
-          Copy-Item python-bridge/dist/qontinui-executor.exe binaries/qontinui-executor-${{ matrix.target }}.exe
+          Copy-Item python-bridge/dist/qontinui-executor.exe "binaries/qontinui-executor-$env:TARGET.exe"
 
-      # Get file size for logging
       - name: Report executable size
         shell: bash
+        working-directory: qontinui-runner
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          if [ -f "binaries/qontinui-executor-${{ matrix.target }}" ]; then
-            ls -lh binaries/qontinui-executor-${{ matrix.target }}
-          elif [ -f "binaries/qontinui-executor-${{ matrix.target }}.exe" ]; then
-            ls -lh binaries/qontinui-executor-${{ matrix.target }}.exe
+          if [ -f "binaries/qontinui-executor-${TARGET}" ]; then
+            ls -lh "binaries/qontinui-executor-${TARGET}"
+          elif [ -f "binaries/qontinui-executor-${TARGET}.exe" ]; then
+            ls -lh "binaries/qontinui-executor-${TARGET}.exe"
           fi
 
-      # Upload as artifact
+      # SMOKE the frozen executable: a build that freezes but cannot answer
+      # the runner's protocol is not a working executor. Framing, from
+      # python-bridge/qontinui_executor.py:
+      #   - one JSON object per stdin line, and a line is dispatched ONLY when
+      #     it carries "type": "command" (main loop), so a bare
+      #     {"command":"ping"} would be silently ignored; the probe uses the
+      #     runner's own framing {type, id, command, params};
+      #   - stdout gets a {"type":"ready"} line first, then per command a
+      #     {"type":"response","id":...,"success":...} line; `ping` also
+      #     prints {"type":"pong"} before its response;
+      #   - EOF on stdin ends the `for line in sys.stdin` loop.
+      # Driven from Python (setup-python is on every leg) because macOS has no
+      # GNU `timeout`; the bound is subprocess.run's timeout.
+      - name: Smoke-test frozen executor (ping + models_list)
+        shell: bash
+        working-directory: qontinui-runner
+        env:
+          TARGET: ${{ matrix.target }}
+          SMOKE_TIMEOUT_SECS: "180"
+        run: |
+          set -euo pipefail
+          exe="binaries/qontinui-executor-${TARGET}"
+          if [ ! -f "${exe}" ]; then exe="${exe}.exe"; fi
+          python scripts/ci/smoke-frozen-executor.py "${exe}"
+
       - name: Upload Python executor artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-executor-${{ matrix.name }}
-          path: binaries/
+          path: qontinui-runner/binaries/
           retention-days: 7
           if-no-files-found: error
 
