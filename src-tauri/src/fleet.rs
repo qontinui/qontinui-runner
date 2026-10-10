@@ -1565,7 +1565,94 @@ fn host_capabilities() -> Vec<String> {
         slow.powershell,
         slow.docker,
         webview_runtime_available(),
+        host_mem_total_bytes(),
     )
+}
+
+/// The host's TOTAL physical memory in bytes, or `None` when it could not be
+/// read.
+///
+/// Reuses the shipped, once-per-process `resource_guard::host_capacity` probe
+/// (`ci_node::host_sizing::probe` behind a `OnceLock`) rather than adding a
+/// third sysinfo reader, so the heartbeat's tiers and the resource guard judge
+/// the same `MemTotal`. Total memory does not change under a live process, so
+/// the process-lifetime cache costs nothing a TTL would buy back.
+///
+/// `None` advertises NO `mem_ge_*` token — never a guess. That is the
+/// fail-closed direction for a repo requiring a tier (plan
+/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6): the device is
+/// simply not electable for it.
+fn host_mem_total_bytes() -> Option<u64> {
+    let total = crate::resource_guard::host_capacity().mem_bytes;
+    if total.is_none() {
+        // debug!, the same posture as the other host probes' "not advertised"
+        // arms: an unreadable MemTotal is a standing property of a locked-down
+        // host, and the heartbeat asks every 30s.
+        debug!("host_capabilities: total physical memory unreadable — no mem_ge_* tier advertised");
+    }
+    total
+}
+
+/// The memory tiers, in GiB (1 GiB = 1024^3 bytes), for which the heartbeat
+/// advertises a `mem_ge_<N>` capability token (plan
+/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6 / D10).
+///
+/// * **Cumulative.** A host advertises EVERY tier it meets, not just the
+///   highest — a 48 GiB host sends `mem_ge_8`, `mem_ge_16` and `mem_ge_32` — so
+///   a repo listing `mem_ge_32` in `canonical_repos.ci_node_required_capabilities`
+///   matches it through coord's plain `capabilities @> required` containment
+///   filter, with no numeric comparison anywhere in coord.
+/// * **Coarse powers of two.** A small RAM change (a module added, a VM resized
+///   by a few GiB) does not churn the capability vector, and adjacent tiers are
+///   a factor of two apart, which is what makes the tolerance below safe.
+/// * **The spelling is a wire contract.** Respelling a token, or removing a
+///   tier, silently un-targets every repo that requires it, with nothing red on
+///   either side.
+pub(crate) const MEMORY_TIERS_GIB: [u64; 6] = [8, 16, 32, 64, 128, 256];
+
+/// Prefix of the memory-tier capability token: `mem_ge_<N>` for N in
+/// [`MEMORY_TIERS_GIB`].
+pub(crate) const MEMORY_TIER_CAPABILITY_PREFIX: &str = "mem_ge_";
+
+/// How far below a tier's nominal size the reported total may fall and still
+/// meet it, in percent.
+///
+/// **Why a tolerance at all.** The OS never reports the nominal DIMM size: the
+/// firmware, a hardware-reserved range and an integrated GPU's carve-out are
+/// subtracted first. A "16 GB" laptop reports ~15.6 GiB (`MemTotal`
+/// 16,375,488 KiB, the shape `resource_sample`'s fixtures carry), and a strict
+/// `total >= 16 GiB` would place it in the 8 GiB tier alongside machines with
+/// half its memory — the opposite of what the operator means by "a 16 GB
+/// machine".
+///
+/// **Why 10%.** It absorbs the usual firmware/iGPU reservation (a few percent
+/// of the nominal size) while staying far from the tier below: tiers are 2x
+/// apart, so a host is placed in tier N only if its total is at least 90% of
+/// N's nominal size — the "nominally that size" case the tolerance exists for.
+/// Common non-power-of-two configurations (12, 24, 48, 96, 192 GiB) all sit
+/// below the 90% line of the tier above them and stay in the tier below.
+const MEMORY_TIER_TOLERANCE_PERCENT: u64 = 10;
+
+/// The cumulative `mem_ge_<N>` tokens a host with `mem_total_bytes` of total
+/// physical memory meets. Pure.
+///
+/// A host meets tier N iff `total >= N GiB * (100 - MEMORY_TIER_TOLERANCE_PERCENT) / 100`
+/// (see [`MEMORY_TIER_TOLERANCE_PERCENT`] for why not a strict `>= N GiB`).
+/// `None` (memory unreadable) yields no tokens.
+fn memory_tier_capabilities(mem_total_bytes: Option<u64>) -> Vec<String> {
+    const GIB: u128 = 1024 * 1024 * 1024;
+    let Some(total) = mem_total_bytes else {
+        return Vec::new();
+    };
+    // u128 so `total * 100` cannot overflow for any u64 total.
+    let total_pct = u128::from(total) * 100;
+    MEMORY_TIERS_GIB
+        .iter()
+        .filter(|&&tier| {
+            total_pct >= u128::from(tier) * GIB * u128::from(100 - MEMORY_TIER_TOLERANCE_PERCENT)
+        })
+        .map(|tier| format!("{MEMORY_TIER_CAPABILITY_PREFIX}{tier}"))
+        .collect()
 }
 
 /// The capability token asserting this device has a usable webview runtime and
@@ -1650,8 +1737,16 @@ fn webview_runtime_available() -> bool {
 
 /// Pure host-capability assembly (unit-tested without disk or subprocesses),
 /// mirroring `build_ci_node_labels`. Every input is a settled probe verdict;
-/// this function performs no probing of its own.
-fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bool) -> Vec<String> {
+/// this function performs no probing of its own. `mem_total_bytes` is the
+/// host's total physical memory (`None` = unreadable, which advertises no
+/// memory tier); see [`memory_tier_capabilities`].
+fn build_host_capabilities(
+    os: &str,
+    powershell: bool,
+    docker: bool,
+    webview: bool,
+    mem_total_bytes: Option<u64>,
+) -> Vec<String> {
     let mut caps = vec![format!("os:{os}")];
     if powershell {
         caps.push("shell:powershell".to_string());
@@ -1662,6 +1757,7 @@ fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bo
     if webview {
         caps.push(WEBVIEW_RUNTIME_CAPABILITY.to_string());
     }
+    caps.extend(memory_tier_capabilities(mem_total_bytes));
     caps
 }
 
@@ -7553,7 +7649,7 @@ mod tests {",
         let caps = build_device_capabilities(
             true,
             &[],
-            &build_host_capabilities("windows", true, true, true),
+            &build_host_capabilities("windows", true, true, true, Some(48 * GIB_BYTES)),
         );
         let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
@@ -7563,7 +7659,10 @@ mod tests {",
                 "os:windows",
                 "shell:powershell",
                 "runtime:docker",
-                "runtime:webview"
+                "runtime:webview",
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32"
             ])),
             "populated capabilities must ride the wire verbatim, got {body}"
         );
@@ -7641,29 +7740,147 @@ mod tests {",
     #[test]
     fn host_capability_assembly_full_set() {
         assert_eq!(
-            build_host_capabilities("windows", true, true, true),
+            build_host_capabilities("windows", true, true, true, Some(64 * GIB_BYTES)),
             vec![
                 "os:windows",
                 "shell:powershell",
                 "runtime:docker",
-                "runtime:webview"
+                "runtime:webview",
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32",
+                "mem_ge_64"
             ]
         );
+    }
+
+    // ── Memory-tier tokens (plan
+    //    2026-10-02-fleet-machine-roles-workhorse-bench-ci-node A6 / D10) ──
+
+    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// The tokens are CUMULATIVE: a host advertises every tier it meets, so a
+    /// repo requiring `mem_ge_32` matches a 48 GiB host through plain `@>`.
+    #[test]
+    fn memory_tiers_are_cumulative() {
+        assert_eq!(
+            memory_tier_capabilities(Some(48 * GIB_BYTES)),
+            vec!["mem_ge_8", "mem_ge_16", "mem_ge_32"]
+        );
+        assert_eq!(
+            memory_tier_capabilities(Some(256 * GIB_BYTES)),
+            vec![
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32",
+                "mem_ge_64",
+                "mem_ge_128",
+                "mem_ge_256"
+            ]
+        );
+        assert_eq!(
+            memory_tier_capabilities(Some(u64::MAX)),
+            vec![
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32",
+                "mem_ge_64",
+                "mem_ge_128",
+                "mem_ge_256"
+            ],
+            "no overflow at the top of the range"
+        );
+    }
+
+    /// The case the tolerance exists for: a nominal "16 GB" machine reports
+    /// `MemTotal` 16,375,488 KiB (~15.6 GiB). It must land in the 16 GiB tier,
+    /// not alongside 8 GiB machines.
+    #[test]
+    fn nominal_16gb_host_reporting_15_6_gib_meets_mem_ge_16() {
+        let total = 16_375_488 * 1024;
+        assert!(total < 16 * GIB_BYTES, "fixture must be under nominal");
+        assert_eq!(
+            memory_tier_capabilities(Some(total)),
+            vec!["mem_ge_8", "mem_ge_16"]
+        );
+    }
+
+    /// The threshold sits at exactly 90% of the tier's nominal size, and
+    /// non-power-of-two configurations stay in the tier below.
+    #[test]
+    fn memory_tier_threshold_boundaries() {
+        // 90% of 16 GiB = 14.4 GiB — exactly on the line meets the tier...
+        let line = (16 * GIB_BYTES * 9).div_ceil(10);
+        assert!(memory_tier_capabilities(Some(line)).contains(&"mem_ge_16".to_string()));
+        // ...one byte under does not.
+        assert_eq!(memory_tier_capabilities(Some(line - 1)), vec!["mem_ge_8"]);
+        // A ~7.6 GiB "8 GB" box meets mem_ge_8.
+        assert_eq!(
+            memory_tier_capabilities(Some(7_800_000 * 1024)),
+            vec!["mem_ge_8"]
+        );
+        // 12 / 24 / 48 GiB stay in the tier below the next power of two.
+        assert_eq!(
+            memory_tier_capabilities(Some(12 * GIB_BYTES)),
+            vec!["mem_ge_8"]
+        );
+        assert_eq!(
+            memory_tier_capabilities(Some(24 * GIB_BYTES)),
+            vec!["mem_ge_8", "mem_ge_16"]
+        );
+        assert!(!memory_tier_capabilities(Some(48 * GIB_BYTES)).contains(&"mem_ge_64".to_string()));
+        // A small host meets no tier at all.
+        assert!(memory_tier_capabilities(Some(4 * GIB_BYTES)).is_empty());
+        assert!(memory_tier_capabilities(Some(0)).is_empty());
+    }
+
+    /// Unreadable memory advertises NO tier — never a guess. For a repo that
+    /// requires a tier, that fails closed (the device is not electable).
+    #[test]
+    fn unreadable_memory_advertises_no_tier() {
+        assert!(memory_tier_capabilities(None).is_empty());
+        let caps = build_host_capabilities("linux", false, false, false, None);
+        assert_eq!(caps, vec!["os:linux"]);
+        assert!(!caps
+            .iter()
+            .any(|c| c.starts_with(MEMORY_TIER_CAPABILITY_PREFIX)));
+    }
+
+    /// The spelling is a wire contract with `ci_node_required_capabilities`
+    /// seeds: pin the exact bytes of every tier token.
+    #[test]
+    fn memory_tier_token_spelling_is_pinned() {
+        assert_eq!(MEMORY_TIER_CAPABILITY_PREFIX, "mem_ge_");
+        assert_eq!(MEMORY_TIERS_GIB, [8, 16, 32, 64, 128, 256]);
+    }
+
+    /// The live probe path: this process can read its own memory, so the
+    /// assembled host set carries at least the tiers its `MemTotal` meets,
+    /// and the tokens agree with the shared resource-guard probe.
+    #[test]
+    fn live_host_capabilities_carry_the_probed_memory_tiers() {
+        let expected = memory_tier_capabilities(crate::resource_guard::host_capacity().mem_bytes);
+        let caps = host_capabilities();
+        let got: Vec<&String> = caps
+            .iter()
+            .filter(|c| c.starts_with(MEMORY_TIER_CAPABILITY_PREFIX))
+            .collect();
+        assert_eq!(got, expected.iter().collect::<Vec<_>>());
     }
 
     /// Each probe contributes independently.
     #[test]
     fn host_capability_assembly_partial_sets() {
         assert_eq!(
-            build_host_capabilities("linux", true, false, false),
+            build_host_capabilities("linux", true, false, false, None),
             vec!["os:linux", "shell:powershell"]
         );
         assert_eq!(
-            build_host_capabilities("macos", false, true, false),
+            build_host_capabilities("macos", false, true, false, None),
             vec!["os:macos", "runtime:docker"]
         );
         assert_eq!(
-            build_host_capabilities("linux", false, false, true),
+            build_host_capabilities("linux", false, false, true, None),
             vec!["os:linux", "runtime:webview"],
             "a headless-OS box WITH a webview runtime still advertises it — the \
              token is probed, never inferred from the OS"
@@ -7676,7 +7893,7 @@ mod tests {",
     /// coord must NOT see `shell:powershell` for it.
     #[test]
     fn host_capability_assembly_degrades_to_os_only() {
-        let caps = build_host_capabilities("linux", false, false, false);
+        let caps = build_host_capabilities("linux", false, false, false, None);
         assert_eq!(caps, vec!["os:linux"]);
         assert!(
             !caps.iter().any(|c| c == "shell:powershell"),
@@ -7703,7 +7920,7 @@ mod tests {",
             ("windows", true, true),
             ("macos", false, true),
         ] {
-            let caps = build_host_capabilities(os, powershell, docker, false);
+            let caps = build_host_capabilities(os, powershell, docker, false, None);
             assert!(
                 !caps.iter().any(|c| c == WEBVIEW_RUNTIME_CAPABILITY),
                 "os={os} with no webview runtime must not advertise \
@@ -7720,7 +7937,7 @@ mod tests {",
     fn webview_capability_token_spelling_is_pinned() {
         assert_eq!(WEBVIEW_RUNTIME_CAPABILITY, "runtime:webview");
         assert!(
-            build_host_capabilities("linux", false, false, true)
+            build_host_capabilities("linux", false, false, true, None)
                 .iter()
                 .any(|c| c == "runtime:webview"),
             "the advertised token must be the pinned literal, not a near-miss"
@@ -7750,7 +7967,7 @@ mod tests {",
     /// not a CI node. `ci_node` alone is conditional, and stays a BARE token.
     #[test]
     fn device_capabilities_advertise_host_facts_without_ci_node() {
-        let host = build_host_capabilities("linux", true, false, false);
+        let host = build_host_capabilities("linux", true, false, false, None);
         let allow = vec![
             "qontinui/qontinui-runner".to_string(),
             "qontinui-coord".to_string(),
