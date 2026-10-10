@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 106 | 107 | 104 | 2 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -256,7 +256,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (106 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -276,7 +276,7 @@ _No hits._
 | `src/ci_node/executor.rs` | `spawn_step_child` | `let mut shim = build_step_command("cmd.exe", &argv);` | 1 | unreviewed |
 | `src/ci_node/services.rs` | `reap_blocking` | `spawn("cmd.exe", &shim_argv)` | 1 | unreviewed |
 | `src/ci_node/tools.rs` | `run_capture_env` | `let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);` | 1 | unreviewed |
-| `src/cli_profile/mod.rs` | `program_stem` | `for suffix in [".exe", ".cmd", ".bat", ".ps1"] {` | 1 | unreviewed |
+| `src/cli_profile/mod.rs` | `program_stem` | `for suffix in [".exe", ".cmd", ".bat", ".ps1"] {` | 1 | fallback_correct — Strips a Windows launcher suffix (.exe/.cmd/.bat/.ps1) off a program name so 'claude.cmd' and 'claude' match the same CLI profile. On every other OS the names carry no suffix, the loop matches nothing and the bare basename is returned; no Windows tool is invoked. |
 | `src/commands/saved_projects.rs` | `is_drive_rooted` | `cfg(windows)-only fn 'is_drive_rooted' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `resolve_subst_once` | `cfg(windows)-only fn 'resolve_subst_once' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `rewrite_msys_root` | `cfg(windows)-only fn 'rewrite_msys_root' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
@@ -310,6 +310,7 @@ _No hits._
 | `src/health_monitor.rs` | `probe_ui_thread_blocking` | `cfg(windows)-only fn 'probe_ui_thread_blocking' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `copy_exe_stub` | `cfg(windows)-only fn 'copy_exe_stub' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `exe_shadow_needed` | `cfg(windows)-only fn 'exe_shadow_needed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/install_effects_producer/intercept/shim_materializer.rs` | `identity_cmd_template` | `cfg(windows)-only fn 'identity_cmd_template' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows '.cmd' flavour of the identity shim, called only from the cfg(windows) block of write_identity_shims_for. Every OS gets the extensionless bash shim from identity_bash_template, so a non-Windows sibling would have nothing to render. |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `locate_stub_exe` | `cfg(windows)-only fn 'locate_stub_exe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `From Windows PowerShell spell it 'curl.exe' (bare 'curl' there is an alias of 'Invoke-WebRequest'), or use 'Invoke-RestMethod -Method Pos...` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `Err(e) => error!("Shutdown: failed to taskkill PID {pid}: {e}"),` | 1 | unreviewed |
