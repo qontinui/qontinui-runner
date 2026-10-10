@@ -427,7 +427,10 @@ pub fn network_with_source() -> Option<(NetworkProfile, String)> {
 }
 
 /// Path-parameterized core of [`network_with_source`].
-fn network_at(path: &std::path::Path, env_active: Option<&str>) -> Option<(NetworkProfile, String)> {
+fn network_at(
+    path: &std::path::Path,
+    env_active: Option<&str>,
+) -> Option<(NetworkProfile, String)> {
     let bytes = std::fs::read(path).ok()?;
     let file: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
     let active = env_active
