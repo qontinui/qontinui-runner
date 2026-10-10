@@ -42,7 +42,10 @@ jobs:
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             name: linux-x64
-          - platform: macos-latest
+          # NATIVE Intel image, as release.yml uses: `macos-latest` is Apple
+          # Silicon, so an x86_64 artifact built there is an arm64 binary that
+          # cannot run on an Intel Mac.
+          - platform: macos-15-intel
             target: x86_64-apple-darwin
             name: macos-x64
           - platform: macos-latest
@@ -53,6 +56,7 @@ jobs:
             name: windows-x64
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
     outputs:
       artifact-name: python-executors
 
@@ -131,15 +135,19 @@ jobs:
 
       - name: Build Python executor
         working-directory: qontinui-runner/python-bridge
+        # build_executor.py sets QONTINUI_INCLUDE_CUDA / _SAM3 from its OWN
+        # flags (--cuda, --no-sam3), so the inputs must arrive as flags; env
+        # values would be overwritten.
         env:
-          QONTINUI_INCLUDE_CUDA: ${{ inputs.include_cuda && '1' || '0' }}
-          QONTINUI_INCLUDE_SAM3: ${{ inputs.include_sam3 && '1' || '0' }}
+          CUDA_FLAG: ${{ inputs.include_cuda && '--cuda' || '' }}
+          SAM3_FLAG: ${{ inputs.include_sam3 == false && '--no-sam3' || '' }}
+        shell: bash
         run: |
-          poetry run python build_executor.py --skip-copy
+          poetry run python build_executor.py --skip-copy ${CUDA_FLAG} ${SAM3_FLAG}
 
-      # Copy to the binaries directory with correct naming.
-      # Note (macOS ARM): for a true ARM64 build we'd need an ARM runner; for
-      # now the macos-latest build is copied under the aarch64 name.
+      # Copy to the binaries directory with correct naming. Each matrix leg
+      # runs on a native runner for its target (macos-latest is arm64,
+      # macos-15-intel is x86_64); the smoke step asserts the architecture.
       - name: Prepare executor for upload (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -187,6 +195,7 @@ jobs:
       # Driven from Python (setup-python is on every leg) because macOS has no
       # GNU `timeout`; the bound is subprocess.run's timeout.
       - name: Smoke-test frozen executor (ping + models_list)
+        timeout-minutes: 15
         shell: bash
         working-directory: qontinui-runner
         env:
@@ -196,6 +205,21 @@ jobs:
           set -euo pipefail
           exe="binaries/qontinui-executor-${TARGET}"
           if [ ! -f "${exe}" ]; then exe="${exe}.exe"; fi
+          # The binary must be built for the target's architecture: a
+          # mislabelled artifact passes the protocol probe on its own host.
+          case "${TARGET}" in
+            x86_64-apple-darwin|x86_64-unknown-linux-gnu) want="x86[-_]64" ;;
+            aarch64-apple-darwin) want="arm64|aarch64" ;;
+            *) want="" ;;
+          esac
+          if [ -n "${want}" ]; then
+            desc="$(file -b "${exe}")"
+            echo "file: ${desc}"
+            if ! echo "${desc}" | grep -Eq "${want}"; then
+              echo "::error::${exe} is not built for ${TARGET}: ${desc}"
+              exit 1
+            fi
+          fi
           python scripts/ci/smoke-frozen-executor.py "${exe}"
 
       - name: Upload Python executor artifact

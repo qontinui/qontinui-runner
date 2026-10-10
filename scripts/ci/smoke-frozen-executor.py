@@ -71,6 +71,7 @@ def main() -> int:
 
     responses: dict[str, dict] = {}
     pong = False
+    ready = False
     for line in text.splitlines():
         try:
             msg = json.loads(line)
@@ -78,12 +79,16 @@ def main() -> int:
             continue
         if not isinstance(msg, dict):
             continue
+        if msg.get("type") == "ready":
+            ready = True
         if msg.get("type") == "pong":
             pong = True
         if msg.get("type") == "response" and "success" in msg:
             responses[str(msg.get("id"))] = msg
 
     failures = []
+    if not ready:
+        failures.append('no {"type": "ready"} line at startup')
     if not pong:
         failures.append('no {"type": "pong"} line for ping')
     if responses.get(PING_ID, {}).get("success") is not True:
