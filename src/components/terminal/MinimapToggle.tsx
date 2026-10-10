@@ -34,7 +34,7 @@ export function MinimapToggle() {
       title={
         shown
           ? "Hide the zone minimap overlay"
-          : "Show the zone minimap overlay (top-right of the grid)"
+          : "Show the zone minimap overlay"
       }
       className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] leading-none whitespace-nowrap transition-colors ${
         shown
