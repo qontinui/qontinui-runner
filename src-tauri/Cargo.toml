@@ -109,7 +109,13 @@ base64 = "0.22"
 bollard = "0.18"
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "http-json", "reqwest-client"] }
+# `reqwest-blocking-client`, not `reqwest-client`: since 0.28 the batch span
+# processor exports from its own OS thread, where the async client panics with
+# "there is no reactor running" — so with `reqwest-client` no span was ever
+# exported. otlp builds the blocking client on a throwaway thread, so it is
+# safe to construct from inside the Tokio runtime. Found by the telemetry flow
+# test of plan 2026-10-10-spec-front-end-phase-9-generic-boundary.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "http-json", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
 axum = { version = "0.8", features = ["ws"] }
 async-graphql = { version = "8.0.0-rc.4", features = ["chrono", "uuid", "tracing"] }
