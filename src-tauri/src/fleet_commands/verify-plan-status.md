@@ -264,8 +264,11 @@ For each plan, extract a small set (5–15) of verifiable claims. Examples by cl
 - **"New endpoint POST /foo/bar"** → grep `mcp` modules for the route
   registration; confirm a handler function exists.
 - **"New slash command /foo"** → confirm `.claude/commands/foo.md` exists.
-- **"New Tauri command foo"** → grep `generate_handler!` in `src-tauri/src/main.rs`
-  for the symbol.
+- **"New Tauri command foo"** → grep the `ipc_group!` list in the module that
+  defines `foo` for the symbol, and confirm that module has its
+  `ipc_registry::GROUPS` entry (`src-tauri/src/ipc_registry.rs`). On a runner
+  ref predating plan `2026-10-02-split-run-app-invoke-handler` the commands are
+  still in `main.rs`'s central `generate_handler!` — grep there too.
 - **"New React component Foo.tsx"** → confirm the file exists and is mounted
   in a parent component.
 - **"Phase N — Foundation: ..."** → check the phase's "Definition of done"
@@ -308,8 +311,8 @@ in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEA
 > the twin confirms it landed — they are not the authority on *whether* it
 > landed.
 
-For plans that span multiple repos (productivity-stack touches qontinui-runner,
-qontinui-navigation, ui-bridge, .claude, qontinui-dev-notes), check each repo's
+For plans that span multiple repos (a plan may touch several application repos,
+the agent config, and the plans repository itself), check each repo's
 log independently.
 
 ### 4. Categorize the plan
@@ -317,6 +320,8 @@ log independently.
 Based on the verification, place each plan in one of:
 
 - **SHIPPED** — every claim verified; no open phase, no missing file/symbol/endpoint.
+  Then read the plan's `## Done when` (below) to choose between bare `SHIPPED`
+  and `SHIPPED — UNCONFIRMED (<claim ids>)`.
 - **PARTIAL** — some claims verified, some missing. Note which.
 - **NOT STARTED** — zero claims verified. The plan is still aspirational.
 - **SUPERSEDED** — the plan's body says it's superseded by another plan, OR
@@ -361,6 +366,33 @@ For NOT STARTED:
 
 For SUPERSEDED / OBSOLETE: cite the replacement or the reason.
 
+**A SHIPPED verdict reads the plan's `## Done when` before it is written**
+(roster rule: `.claude/commands/_status-writers.md` → "The `Done when` rule").
+"Every claim verified live in code" is this skill's evidence that the code
+LANDED; the plan's `## Done when` says what it was FOR, as claims coord
+re-verdicts itself. Read every claim the section names — cited
+`domain_spec/<name>#<claim_id>` and the `claim:` ids of any appended probe blocks —
+from the served `claims[]` (`coord_get_prompt_document`):
+
+- all `confirmed` → the SHIPPED block above, plus one line
+  `Done when: <claim id> confirmed @<observed_at>; …`;
+- any `unknown` / `contradicted` / absent from the served array / unreadable →
+  ```markdown
+  > **Status: SHIPPED — UNCONFIRMED (<those claim ids>) <YYYY-MM-DD>.** <1–3
+  > line summary of what's live>. Done when: <claim id> <state> @<observed_at>; …
+  > Commits: <repo>@<sha> (<short msg>); …
+  ```
+- `Done when: no claim — <reason>`, or no such section (a plan predating the
+  template) → bare SHIPPED, quoting the escape or saying `no Done-when section`.
+- a section that is present but unparseable — no claim bullet and no escape
+  line → `SHIPPED — UNCONFIRMED (done-when-unparseable)`, in the UNCONFIRMED
+  block above with `Done when: unparseable` in place of the claim list.
+
+An existing `SHIPPED — UNCONFIRMED (…)` stamp is rewritten to bare `SHIPPED`
+only when every named claim now reads `confirmed`; the claims alone never move
+it to `PARTIAL` or `NOT STARTED` — the code landed. The runner normalises the
+qualified stamp to `shipped`; the qualifier is for the human reader.
+
 #### Single-stamp invariant — read before stamping
 
 A plan must have **exactly one** `> **Status:` blockquote between the H1
@@ -404,7 +436,8 @@ finding in the body. Don't leave both.
 
 | State | When |
 |---|---|
-| SHIPPED | every claim verified live in code |
+| SHIPPED | every claim verified live in code, and every `## Done when` claim reads `confirmed` (or the plan took the escape / predates the section) |
+| SHIPPED — UNCONFIRMED (<claim ids>) | every claim verified live in code, but the named `## Done when` claims do not read `confirmed` |
 | PARTIAL | some phases shipped, others open |
 | NOT STARTED | zero source evidence of any claim |
 | SUPERSEDED | a different approach landed; cite the replacement |
@@ -618,7 +651,11 @@ Single message back to the user:
 Verified <N> plans in <scanned dir(s)>.
 
 SHIPPED:
-  - <plan>.md — <one-line shipment summary>
+  - <plan>.md — <one-line shipment summary>; Done when: <claims confirmed | escape | no section>
+  ...
+
+SHIPPED — UNCONFIRMED (landed; Done-when claims not confirmed):
+  - <plan>.md — <claim id> <state> @<observed_at>, ...
   ...
 
 PARTIAL:

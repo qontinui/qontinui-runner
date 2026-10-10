@@ -529,6 +529,17 @@ paragraph exists to prevent. ⚠️ **Empty output is UNKNOWN, not “the red is
 real”**: it means no `failure`/`cancelled` job on this run at all, so re-read
 the run's own conclusion rather than renewing the wait against it.
 
+⚠️ **One NON-empty `failed_steps` list is infra too: a declared step
+timeout.** GitHub reports a step-level `timeout-minutes` expiry as a plain
+`failure`, so that job shows exactly one failed step and looks genuine. It is
+told apart only by its check-run annotations — a title containing `TIMED OUT`
+and `(not a verdict on this PR)`:
+`gh api "repos/OWNER/REPO/check-runs/<job_id>/annotations" --jq '.[] | (.title // "") | select(test("TIMED OUT.*[(]not a verdict on this PR[)]"))'`
+(an Actions job id IS its check-run id). `qontinui-coord`'s `coord-db-tests`
+emits it, and on `main` it flaps red→green on the same commit — so it too
+self-heals only on a re-run. The classifier table is Tier T in
+`.claude/commands/babysit-prs.md` Step 3.
+
 Still emit `wait` — firing the re-run is not this agent's authority — but say
 so in the `rationale` so the wait is attributed and someone can clear it, and
 do not keep renewing `next_check_at` against a red that cannot clear itself.

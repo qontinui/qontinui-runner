@@ -1,6 +1,6 @@
 # UI Bridge — Inspect & Interact with Frontend UI
 
-Use the UI Bridge SDK to inspect page state, interact with elements, and verify UI behavior. This is a direct inspection tool — use `/ufix` instead if you need to fix a bug.
+Use the UI Bridge SDK to inspect page state, interact with elements, and verify UI behavior. This is a direct inspection tool — use `/ufix` (where your deployment provides it) or `/fix` instead if you need to fix a bug.
 
 ## Target Applications
 
@@ -38,7 +38,7 @@ The mobile app uses `ui-bridge-native` (`UIBridgeNativeProvider`) which runs an 
 - **Fallback**: If the native HTTP server is unavailable, use screenshot-based verification instead:
   ```bash
   python <workspace-root>/qontinui-claude-config/scripts/mobile-feedback.py capture
-  # Then read: <workspace-root>/.dev-logs/mobile/screenshots/latest.png
+  # Then read .dev-logs/mobile/screenshots/latest.png under your workspace root
   ```
 
 ## SDK vs Control Endpoints
@@ -353,24 +353,24 @@ If the user provides no arguments, asks "what's on the page", or wants to see UI
 3. Present a structured summary — don't dump raw JSON
 
 ### Injected Mode (`--injected <url>`)
-If the user passes `--injected <url>` (or asks to snapshot/interact a **bare pre-auth page** — sign-in / register / forgot-password — that ships no UI Bridge code), drive it via the `ui-bridge-inject` CLI in `@qontinui/ui-bridge-wrapper`. The CLI launches Chromium, injects the engine bundle into the bare page, and exposes it for snapshot/interaction. `<workspace-root>` is the directory that contains the repo checkouts (the parent of this repo's checkout). The CLI is a **build artifact**: it exists only if `<workspace-root>/ui-bridge` is checked out AND its packages have been built (`npm run build` at the ui-bridge root); if either is missing, report injected mode as unavailable instead of improvising.
+If the user passes `--injected <url>` (or asks to snapshot/interact a **bare pre-auth page** — sign-in / register / forgot-password — that ships no UI Bridge code), drive it via the `ui-bridge-inject` CLI in `@qontinui/ui-bridge-wrapper`. The CLI launches Chromium, injects the engine bundle into the bare page, and exposes it for snapshot/interaction. Below, `$WS` is your workspace root: the directory that contains the repo checkouts. The CLI is a **build artifact**: it exists only if `$WS/ui-bridge` is checked out AND its packages have been built (`npm run build` at the ui-bridge root); if either is missing, report injected mode as unavailable instead of improvising.
 
 Pick a variant:
 
 - **Variant A — quick one-shot snapshot (relay-free).** Best for "just show me what's on this bare page." Run each action with `--exec` (repeatable); the CLI runs them via the injected runtime and prints `{"action","result"}` JSON lines, then exits. No temp runner needed.
 
   ```bash
-  node <workspace-root>/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs \
+  node "${WS:?set WS to your workspace root, the directory holding your checkouts}/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs" \
     --url "<bare-page-url>" \
     --exec 'snapshot {}'
   # Prints {"action":"snapshot","result":{...elements...}} then exits.
   ```
 
-- **Variant B — live drive (relay mode, default).** For multi-step interaction. Spawn a temp runner (supervisor `:9875`, as `/manual-test` Phase 0 does), then point `--relay` at the **temp runner's** `/ui-bridge` base — **NOT** the page origin (the injected bundle's `startRelayClient` POSTs there to register the tab):
+- **Variant B — live drive (relay mode, default).** For multi-step interaction. Spawn a temp runner (your deployment's temp-runner spawner `$SPAWNER`, as `/manual-test` Phase 0 does — with no spawner there is no safe relay: registering a tab on your own primary runner changes its state, so use Variant A, or record the multi-step drive UNVERIFIED), then point `--relay` at the **temp runner's** `/ui-bridge` base — **NOT** the page origin (the injected bundle's `startRelayClient` POSTs there to register the tab):
 
   ```bash
   RELAY_BASE="http://127.0.0.1:${TEST_PORT}/ui-bridge"   # temp runner base, NOT the page origin
-  node <workspace-root>/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs \
+  node "${WS:?set WS to your workspace root, the directory holding your checkouts}/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs" \
     --url "<bare-page-url>" --relay "$RELAY_BASE" --ready-timeout 30000 &
   # Prints one stdout JSON line {"tabId":..,"uiBridgeRegistered":..,"url":..} then stays
   # alive until SIGTERM. Set BASE="$RELAY_BASE", capture tabId (or poll the runner's /tabs),
@@ -450,7 +450,7 @@ If the user says "explore" or wants a walkthrough of available UI:
 - **Re-snapshot after interactions** to show the effect of actions
 - **Summarize, don't dump** — present human-readable descriptions, not raw JSON. Include element IDs in parentheses so the user can reference them.
 - **After navigation or clicks that change the view**, wait 2 seconds then re-discover and re-snapshot
-- **If the app is not responding**, check if the service is running. Suggest `.\dev-start.ps1 -Frontend` or `-Runner` as appropriate.
+- **If the app is not responding**, check if the service is running. Suggest the project's own start command for that service (for a runner that is not running, the user's own way of starting it — never restart a running one).
 - **Report errors clearly** — if an endpoint returns an error, explain what it means and suggest a fix
 
 ### Probe before you name a cause
@@ -459,16 +459,19 @@ A snapshot that comes back empty, a `discover` that 404s, a bridge port that ref
 connection — those are **observations**, and they go into the report exactly as measured.
 *"the frontend isn't running"*, *"the UI Bridge isn't served"*, *"this runner build
 predates the endpoint"* are **causes**, and none of them may be written — nor turned into
-the `dev-start.ps1` suggestion the rule above offers — until you have asked a
+the restart suggestion the rule above offers — until you have asked a
 **second, independent instance** of the same door.
 
-For a runner target the second instance is a **temp runner from the supervisor**, never
-the primary on `:9876`, which you may not restart (CLAUDE.md → "Runner lifecycle"). Spawn
-one with `POST http://127.0.0.1:9875/runners/spawn-test` and drive the `ui_bridge_url` it
-returns:
+For a runner target the second instance is a **temp runner from your deployment's
+temp-runner spawner** (`$SPAWNER`, per `/manual-test`), never the primary on `:9876`,
+which you may not restart (CLAUDE.md → "Runner lifecycle"). Spawn one with
+`POST $SPAWNER/runners/spawn-test` and drive the `ui_bridge_url` it returns. With no
+spawner there is no second runner instance: say UNKNOWN and name the probe you ran.
 
 ```bash
-curl -fsS --max-time 20 http://127.0.0.1:9875/runners   # every runner the supervisor knows
+SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
+: "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
+curl -fsS --max-time 20 "$SPAWNER/runners"             # every runner the spawner knows
 curl -fsS --max-time 25 http://127.0.0.1:$PORT/health   # the temp runner's own build
 ```
 
