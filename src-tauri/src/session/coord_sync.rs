@@ -1805,7 +1805,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // Body is the payload verbatim ({repo, branch, shas}, plus the
             // pushing session's top-level `tenant_id` when the registrar
             // resolved one — which is also what made `scope` Owned above);
-            // coord resolves the session server-side from (repo, branch). Tenant
+            // coord resolves the session server-side from (repo, branch).
+            // For a row that carries NO tenant (`Unresolved`) the header below
+            // still falls back to the device's active tenant until Phase 2 of
+            // plan 2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-
+            // tenant-header removes it, and a pre-Phase-1 coord files that row
+            // under that default. Tenant
             // comes from the X-Qontinui-Tenant-Id header (post_device_register
             // posture) — Phase 8b: the OWNING SESSION's binding wins; the
             // machine.json default only backfills tenant-less legacy rows.
@@ -4835,7 +4840,7 @@ mod tests {
         );
         let harness = Uuid::new_v4().to_string();
         reg.register_session(&harness, "push work", None).unwrap();
-        reg.report_commits(&harness, "o/r", "feat/x", vec!["sha1".into()]);
+        reg.report_commits(&harness, None, "o/r", "feat/x", vec!["sha1".into()]);
 
         let row = outbox
             .pending()
@@ -4895,7 +4900,13 @@ mod tests {
             Uuid::new_v4(),
             || Some(DEFAULT),
         );
-        reg.report_commits("never-registered", "o/r", "feat/x", vec!["sha1".into()]);
+        reg.report_commits(
+            "never-registered",
+            None,
+            "o/r",
+            "feat/x",
+            vec!["sha1".into()],
+        );
 
         let row = outbox
             .pending()

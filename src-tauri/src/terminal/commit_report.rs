@@ -428,11 +428,14 @@ pub fn reset_dedup_for_test() {
 /// (when warranted) report via the registrar. Best-effort — logs and returns on
 /// any miss. Synchronous git calls are cheap and run on the tail task's thread.
 ///
-/// `session_key` is the harness id of the transcript the push was seen in; the
-/// registrar resolves the report's owning tenant from it.
+/// `session_key` is the harness id of the transcript the push was seen in.
+/// `dispatch_tenant` is its owning tenant as resolved when the push was
+/// observed; the registrar re-resolves from `session_key` only when that is
+/// `None` (see `AiCoordRegistrar::report_commits`).
 pub fn handle_push_observation(
     obs: &PushObservation,
     session_key: &str,
+    dispatch_tenant: Option<uuid::Uuid>,
     registrar: &crate::claude_session::coord_register::AiCoordRegistrar,
 ) {
     if !report_enabled() {
@@ -453,7 +456,13 @@ pub fn handle_push_observation(
         );
         return;
     }
-    registrar.report_commits(session_key, &resolved.repo, &resolved.branch, resolved.shas);
+    registrar.report_commits(
+        session_key,
+        dispatch_tenant,
+        &resolved.repo,
+        &resolved.branch,
+        resolved.shas,
+    );
 }
 
 // ── Bounded fan-out ──────────────────────────────────────────────────────────
@@ -562,15 +571,21 @@ static PUSH_DISPATCHER: Lazy<PushDispatcher> =
 /// This is what the transcript tail loop calls, in place of an unbounded
 /// `spawn_blocking` per line. Returns whether the observation was queued.
 /// `session_key` is the transcript's harness session id (see
-/// [`handle_push_observation`]); the tenant is resolved on the worker, at
-/// report time, so a registration that lands just after the push still counts.
+/// [`handle_push_observation`]). Its owning tenant is resolved HERE, at
+/// dispatch time, on the caller's thread (in-memory map reads only, no I/O):
+/// a closeout push usually comes right before the session ends, and
+/// `close_session` evicts the recorded tenant, so a worker that is backed up
+/// behind a slow git would otherwise find nothing and file the report
+/// `Unresolved`. The worker re-resolves only when this answers `None`, which
+/// still catches a registration that lands just after the push.
 pub fn dispatch_push_observation(
     obs: PushObservation,
     session_key: String,
     registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
 ) -> bool {
+    let dispatch_tenant = registrar.owning_tenant(&session_key);
     let accepted = PUSH_DISPATCHER.try_dispatch(move || {
-        handle_push_observation(&obs, &session_key, &registrar);
+        handle_push_observation(&obs, &session_key, dispatch_tenant, &registrar);
     });
     if !accepted {
         warn!(
