@@ -371,6 +371,7 @@ const READ_TOOLS: &[&str] = &[
     "coord_memory_overview",
     "coord_memory_search",
     "coord_merge_order",
+    "coord_message_status",
     "coord_migration_queue",
     "coord_orient",
     "coord_pr_status",
@@ -942,6 +943,12 @@ mod tests {
         );
         assert_eq!(
             operation_for_call("tools/call", Some("coord_can")),
+            OPERATION_READ
+        );
+        // The sender's receipt read matches no read prefix, so only its
+        // exact `READ_TOOLS` entry keeps it from defaulting to a write.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_message_status")),
             OPERATION_READ
         );
         // The by-id memory read-back is an exact read, while its write
