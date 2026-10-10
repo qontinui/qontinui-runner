@@ -137,24 +137,38 @@ impl EarsCategory {
     /// leading whitespace and a list prefix (`1.`, `2)`, `-`, `*`, `•`).
     ///
     /// Every pattern requires `shall` — a sentence with no `shall` is not an
-    /// EARS requirement. The sentence is read as comma-separated clauses, and
-    /// the keyword that completes a pattern must OPEN a clause before the one
-    /// holding `shall` (or open that clause itself), never sit inside the
-    /// trigger or after `shall`:
+    /// EARS requirement. The sentence is split into comma-separated clauses;
+    /// the opening keyword is the first word of the first clause, and it must
+    /// be followed by at least one trigger word.
     ///
-    /// * `If <trigger>, then the <system> shall …` →
-    ///   [`EarsCategory::UnwantedBehavior`]. Without commas
-    ///   (`IF x THEN the API shall …`) the `then` must follow at least one
-    ///   trigger word, not follow `and`/`or`/`but`, and precede the subject.
-    ///   "If the user logs in and then logs out, the session shall end" is
-    ///   NOT unwanted behaviour: its `then` is inside the trigger.
-    /// * `While <state>, when <event>, the <system> shall …` →
-    ///   [`EarsCategory::Complex`] (the `when` before `shall`; a `when` after
-    ///   `shall` belongs to the response).
-    /// * `When <event>, the <system> shall …` → [`EarsCategory::EventDriven`];
-    /// * `While <state>, the <system> shall …` → [`EarsCategory::StateDriven`];
-    /// * `Where <feature>, the <system> shall …` → [`EarsCategory::Optional`];
-    /// * `The <system> shall …` → [`EarsCategory::Ubiquitous`];
+    /// * **If** → [`EarsCategory::UnwantedBehavior`] when a `then` completes
+    ///   the template, in one of two places:
+    ///   - **with commas:** some clause after the first, up to and including
+    ///     the clause holding `shall`, OPENS with `then` —
+    ///     `If <trigger>, then the <system> shall …`, and also
+    ///     `If <trigger>, then <adverbial>, the <system> shall …`;
+    ///   - **without commas** (the whole sentence is one clause): a `then` at
+    ///     the third word or later, not directly after `and`/`or`/`but`, with
+    ///     at least one word between it and `shall`. Nothing checks that what
+    ///     follows the `then` is a subject, so a comma-less
+    ///     "If the user logs in then logs out the session shall end" still
+    ///     reads as unwanted behaviour.
+    ///
+    ///   Otherwise an `If` sentence is [`EarsCategory::NotApplicable`] — e.g.
+    ///   "If the user logs in and then logs out, the session shall end",
+    ///   whose `then` sits inside the trigger clause instead of opening one.
+    /// * **While** → [`EarsCategory::Complex`] when a `when` comes before
+    ///   `shall`: opening a later clause (`While <state>, when <event>, …`),
+    ///   or inside the first clause at the third word or later, not directly
+    ///   after a conjunction, with a word after it
+    ///   (`While <state> when <event>, the <system> shall …`, with or
+    ///   without the second comma). A `when` after `shall` belongs to the
+    ///   response, so "While uploading, the system shall show progress when
+    ///   asked" stays [`EarsCategory::StateDriven`], as does any other
+    ///   `While` sentence.
+    /// * **When** → [`EarsCategory::EventDriven`]; **Where** →
+    ///   [`EarsCategory::Optional`]; **The** (with `shall` in the same
+    ///   clause) → [`EarsCategory::Ubiquitous`];
     /// * anything else → [`EarsCategory::NotApplicable`].
     ///
     /// This is a keyword reading of the template, not a parser: it is meant to
@@ -178,35 +192,33 @@ impl EarsCategory {
         let first = &clauses[0];
         // A trigger needs at least one word after its keyword.
         let has_trigger = first.len() >= 2 && first[1] != "shall";
-        // Within one clause: index of `word` strictly between a trigger and
-        // `shall`, opening the main clause (not after a conjunction), with a
-        // subject between it and `shall`.
-        let inline_keyword = |words: &[&str], word: &str| -> bool {
-            let Some(shall) = words.iter().position(|w| *w == "shall") else {
-                return false;
-            };
-            (2..shall)
-                .any(|i| words[i] == word && !CONJUNCTIONS.contains(&words[i - 1]) && i + 1 < shall)
+        // `word` inside the FIRST clause: at the third word or later, not
+        // directly after a conjunction, with at least one word after it and
+        // before `shall` (or before the clause's end when `shall` is in a
+        // later clause).
+        let stop = first
+            .iter()
+            .position(|w| *w == "shall")
+            .unwrap_or(first.len());
+        let inline_in_first = |word: &str| -> bool {
+            (2..stop)
+                .any(|i| first[i] == word && !CONJUNCTIONS.contains(&first[i - 1]) && i + 1 < stop)
         };
-        // A later clause (up to and including the `shall` clause) opened by `word`.
-        let opens_clause = |word: &str| clauses[1..=shall_at].iter().any(|c| c[0] == word);
+        // A later clause, up to and including the `shall` clause, opened by `word`.
+        let opens_later_clause = |word: &str| clauses[1..=shall_at].iter().any(|c| c[0] == word);
 
         match first[0] {
             "if" if has_trigger => {
-                let then_opens_shall_clause = shall_at >= 1 && clauses[shall_at][0] == "then";
-                let then_inline = shall_at == 0 && inline_keyword(first, "then");
-                if then_opens_shall_clause || then_inline {
+                let then_opens_clause = opens_later_clause("then");
+                let then_inline = shall_at == 0 && inline_in_first("then");
+                if then_opens_clause || then_inline {
                     EarsCategory::UnwantedBehavior
                 } else {
                     EarsCategory::NotApplicable
                 }
             }
             "while" if has_trigger => {
-                let when_before_shall = if shall_at == 0 {
-                    inline_keyword(first, "when")
-                } else {
-                    opens_clause("when")
-                };
+                let when_before_shall = inline_in_first("when") || opens_later_clause("when");
                 if when_before_shall {
                     EarsCategory::Complex
                 } else {
@@ -1270,6 +1282,54 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_complex_without_a_comma_before_when() {
+        for sentence in [
+            "While logged in when the token expires, the app shall refresh it",
+            "While logged in when the token expires the app shall refresh it",
+        ] {
+            assert_eq!(
+                EarsCategory::classify(sentence),
+                EarsCategory::Complex,
+                "{sentence:?}"
+            );
+        }
+        // A `when` right after a conjunction is part of the state, not the event.
+        assert_eq!(
+            EarsCategory::classify("While idle and when paused, the app shall sleep"),
+            EarsCategory::StateDriven
+        );
+    }
+
+    #[test]
+    fn test_classify_if_then_adverbial_clause() {
+        // Pinned: a `then` opening ANY clause up to the `shall` clause
+        // completes the If template, so an adverbial between `then` and the
+        // subject is still unwanted behaviour.
+        assert_eq!(
+            EarsCategory::classify(
+                "If the disk is full, then immediately, the system shall reject the upload"
+            ),
+            EarsCategory::UnwantedBehavior
+        );
+        // …but a `then` after `shall` completes nothing.
+        assert_eq!(
+            EarsCategory::classify("If the disk is full, the system shall alert, then retry"),
+            EarsCategory::NotApplicable
+        );
+    }
+
+    #[test]
+    fn test_classify_comma_less_then_limitation_is_pinned() {
+        // Documented limitation: without commas nothing checks that a subject
+        // follows `then`, so this reads as unwanted behaviour. With the comma
+        // the same words are refused (see the negatives test).
+        assert_eq!(
+            EarsCategory::classify("If the user logs in then logs out the session shall end"),
+            EarsCategory::UnwantedBehavior
+        );
+    }
+
+    #[test]
     fn test_classify_strips_a_list_prefix() {
         let cases = [
             (
@@ -1298,6 +1358,37 @@ mod tests {
         for (sentence, expected) in cases {
             assert_eq!(EarsCategory::classify(sentence), expected, "{sentence:?}");
         }
+    }
+
+    #[test]
+    fn test_classify_inverts_render_for_the_comma_less_and_adverbial_forms() {
+        // Complex whose trigger carries no comma between state and event.
+        let complex = EarsCategory::Complex.render(
+            "app",
+            Some("While logged in when the token expires"),
+            "refresh it",
+        );
+        assert_eq!(
+            complex,
+            "While logged in when the token expires, the app shall refresh it"
+        );
+        assert_eq!(EarsCategory::classify(&complex), EarsCategory::Complex);
+
+        // Unwanted behaviour whose response starts with an adverbial clause.
+        let unwanted = EarsCategory::UnwantedBehavior.render(
+            "system",
+            Some("the disk is full"),
+            "reject the upload",
+        );
+        let with_adverbial = unwanted.replacen("then", "then immediately,", 1);
+        assert_eq!(
+            with_adverbial,
+            "If the disk is full, then immediately, the system shall reject the upload"
+        );
+        assert_eq!(
+            EarsCategory::classify(&with_adverbial),
+            EarsCategory::UnwantedBehavior
+        );
     }
 
     #[test]
