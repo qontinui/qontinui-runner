@@ -90,6 +90,20 @@ describe("buildEgressRows", () => {
   });
 });
 
+describe("unknown and legacy sources", () => {
+  it("says an unanswered project is refused, not on", () => {
+    const rows = buildEgressRows({
+      code_mirror: report({ allowed: false, source: "unknown", decided_by: null }),
+    });
+    const row = rows.find((r) => r.key === "code_mirror")!;
+    expect(row.state).toBe("off");
+    expect(row.sourceText).toContain("refused until it does");
+  });
+  it("names a migrated answer", () => {
+    expect(describeEgressSource("persisted", "legacy_store")).toContain("earlier runner");
+  });
+});
+
 describe("tenantPolicyLink", () => {
   it("deep-links into the web tenant-policy panel", () => {
     expect(tenantPolicyLink("https://example.test/", "code_mirror")).toBe(
