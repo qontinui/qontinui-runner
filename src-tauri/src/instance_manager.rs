@@ -658,7 +658,8 @@ impl InstanceManager {
 
 /// Path to the session file that tracks which instances were running.
 fn session_file_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("active_instances.json"))
+    qontinui_runner_lib::ambient::runner_platform_config_root("instance_manager::session_file_path")
+        .map(|d| d.join("com.qontinui.runner").join("active_instances.json"))
 }
 
 /// Persist the set of running instance IDs.
@@ -750,4 +751,27 @@ async fn probe_instance_api(port: u16) -> bool {
 
     let url = format!("http://localhost:{}/status", port);
     client.get(&url).send().await.is_ok()
+}
+
+/// A test process never resolves the operator's real
+/// `<config>/com.qontinui.runner`: this path roots at
+/// `ambient::runner_platform_config_root`, which in a test harness is the
+/// hermetic deflected root. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+#[cfg(test)]
+mod config_root_deflection_tests {
+    use super::*;
+
+    #[test]
+    fn active_instances_ledger_is_deflected_in_a_test_process() {
+        let root = qontinui_runner_lib::ambient::deflected_config_root();
+        let path = session_file_path().expect("resolves");
+        assert!(
+            path.starts_with(&root),
+            "{} must resolve under the deflected root {} in a test process",
+            path.display(),
+            root.display()
+        );
+    }
 }

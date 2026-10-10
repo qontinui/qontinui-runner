@@ -569,7 +569,9 @@ struct CachedSkills {
 /// Absolute path of the skill cache for this runner instance, or `None` when
 /// the platform has no config dir.
 fn cache_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?.join("com.qontinui.runner");
+    let base =
+        qontinui_runner_lib::ambient::runner_platform_config_root("agent_skills::cache_path")?
+            .join("com.qontinui.runner");
     Some(crate::instance::scope_path(&base).join(CACHE_FILE))
 }
 
@@ -1655,5 +1657,28 @@ pub(crate) mod tests {
     fn missing_cache_is_a_miss() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(read_cache_at(&tmp.path().join("absent.json"), "https://api.example").is_none());
+    }
+}
+
+/// A test process never resolves the operator's real
+/// `<config>/com.qontinui.runner`: this path roots at
+/// `ambient::runner_platform_config_root`, which in a test harness is the
+/// hermetic deflected root. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+#[cfg(test)]
+mod config_root_deflection_tests {
+    use super::*;
+
+    #[test]
+    fn skill_cache_is_deflected_in_a_test_process() {
+        let root = qontinui_runner_lib::ambient::deflected_config_root();
+        let path = cache_path().expect("resolves");
+        assert!(
+            path.starts_with(&root),
+            "{} must resolve under the deflected root {} in a test process",
+            path.display(),
+            root.display()
+        );
     }
 }
