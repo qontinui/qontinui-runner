@@ -119,6 +119,8 @@ fn structured_record(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        // A structured launch is never a `/clear` adoption of another session.
+        adopted_from: None,
     }
 }
 
