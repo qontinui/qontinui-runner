@@ -60,7 +60,10 @@
 //! **Residue, stated so nobody reads an idle item as proof:** a row-less lock
 //! whose holder's fd this uid cannot read (another uid; the scan skips those up
 //! front) still reports idle, as does one held through a different path to the
-//! same inode (a hardlink). The census runs no `flock` probe of its own. That
+//! same inode (a hardlink), and one on a filesystem whose `st_dev` differs from
+//! the device the kernel prints (overlayfs — the case [`lookup_lock`]'s
+//! inode-only fallback exists for), since the fdinfo confirmation compares the
+//! full key. The census runs no `flock` probe of its own. That
 //! is a reporting gap, not a deletion risk: `cargo_locks` is display data and
 //! nothing reclaims from it (qontinui-coord has no reader of it).
 //!
