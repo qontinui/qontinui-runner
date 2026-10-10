@@ -1814,6 +1814,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // `write_failure_outcome` maps to PermanentFailure and Ack-drops;
             // coord counts it as
             // coord_commit_report_refusals_total{reason="unauthenticated"}.
+            // A credentialed send can still be refused 403 (no_tenant_claim,
+            // repo_not_owned, presenter_unproven) and is dropped as a 4xx; a
+            // 503 from coord's ownership lookup is retried.
             let url = format!("{base}/coord/commits/report");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
                 .send()
@@ -6890,7 +6893,9 @@ mod tests {
     /// 2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header,
     /// Phase 2). The payload names an owning tenant, so the row resolves
     /// `TenantScope::Owned` — the scope under which the retired code DID stamp
-    /// the header, which is what makes this assertion discriminating.
+    /// the header, which is what makes this assertion discriminating. Only
+    /// the Owned path is pinned here: the `Unresolved` path's header came from
+    /// `resolve_active_tenant_id`, which the same deleted block removed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_commit_report_without_tenant_header() {
         let dir = tempfile::tempdir().unwrap();

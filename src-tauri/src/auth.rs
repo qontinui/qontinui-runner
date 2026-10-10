@@ -3024,10 +3024,10 @@ pub fn attach_device_auth_blocking(
 /// [`attach_device_auth_blocking`]. Returns `None` when no credential is held
 /// (unpaired runner, non-default tenant slot miss) or when the D2 degrade
 /// fired (an `Unresolved` scope on a multi-bound device) — the caller then
-/// sends the request unauthenticated. Coord REFUSES that send `401` on every
+/// sends the request unauthenticated. Coord refuses it 401 on every
 /// `require_jwt` route, `/coord/commits/report` included (plan
 /// `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`);
-/// only a deliberately anonymous door accepts it.
+/// a route mounted outside `require_jwt` may still accept it.
 ///
 /// The returned token is only ever moved into a request header; it must never
 /// reach a log line or a process argument.
