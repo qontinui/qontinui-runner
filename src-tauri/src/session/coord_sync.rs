@@ -98,9 +98,13 @@
 //! while coord keeps taking OTHER rows is quarantined after
 //! [`QUARANTINE_AFTER_SERVING_FAILURES`] such failures (a retried 429 never
 //! counts — coord pacing this runner is not coord refusing the row). The kinds
-//! that retry a 429 are `output_chunk` (any 429 but `warm_quota_exceeded`) and
-//! the session LIFECYCLE kinds `started` / `state_change` / `closed`
-//! ([`is_lifecycle_kind`]), whose loss would leave coord's row wrong for good;
+//! that retry a 429 are `output_chunk` (any 429 whose body `error` is not
+//! `warm_quota_exceeded` or `transcript_sync_disabled` — those two are standing
+//! tenant answers and ACK-drop the chunk, except a `transcript_sync_disabled`
+//! carrying `column_missing: true`, coord's deploy-window stand-in, which is
+//! retried) and the session LIFECYCLE kinds
+//! `started` / `state_change` / `closed` / `finished` ([`is_lifecycle_kind`]),
+//! whose loss would leave coord's row wrong for good;
 //! every other kind treats a 429 as coord refusing the row and ACK-drops it:
 //! its rows move to the `<outbox>.quarantine.jsonl` sidecar with a `warn!`,
 //! and stop being retried. Only a row coord itself took counts as "taking" —
@@ -1017,15 +1021,108 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
 
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
 /// its creation (`started` → `POST /sessions`), its state (`state_change` →
-/// `PATCH`) and its end (`closed` → `PATCH {state:"closed"}`). A 429 on one of
-/// these is retried rather than ACK-dropped (see `push_record`), because each
-/// is a one-shot fact no later row repeats. `heartbeat` is deliberately NOT
+/// `PATCH`), its end (`closed` → `PATCH {state:"closed"}`) and its work axis
+/// (`finished` → `PATCH {progress:{session_status:"finished"}}`, coord's
+/// work axis — read by coord's prompting gate and, through
+/// `GET /coord/sessions/work-status`, by this runner's restart-readiness
+/// verdict and drained-runner wind-down; resume offers do NOT read it, they
+/// come from the local lifecycle store). A 429 on one of these is retried
+/// rather than ACK-dropped (see `push_record`), because each is a one-shot
+/// fact no later row repeats. `heartbeat` is deliberately NOT
 /// here: the next heartbeat supersedes a dropped one within a tick, and
 /// retrying it would only hold the session's chain behind a stale stamp.
 fn is_lifecycle_kind(kind: &str) -> bool {
     kind == SessionEventKind::Started.as_str()
         || kind == SessionEventKind::StateChange.as_str()
         || kind == SessionEventKind::Closed.as_str()
+        || kind == SessionEventKind::Finished.as_str()
+}
+
+/// The `error` reasons coord answers an `output_chunk` 429 with that are
+/// STANDING tenant answers rather than pacing: `warm_quota_exceeded` (the
+/// tenant's warm transcript quota is spent) and `transcript_sync_disabled`
+/// (the tenant has transcript sync turned off). Retrying either cannot succeed
+/// until the tenant's state changes, and because a session's rows push in
+/// order it would hold that session's later lifecycle rows behind the chunk
+/// indefinitely — so both ACK-drop the chunk. Any other 429 (an edge or proxy
+/// rate limit, or a body that is not coord's JSON) stays retryable.
+///
+/// One exception, read from the body rather than the code: coord sends the
+/// SAME `transcript_sync_disabled` code with `"column_missing": true` during
+/// the deploy window in which `coord.tenant_policies.transcript_sync_enabled`
+/// is not provisioned yet (`transcript_sync_refusal` in qontinui-coord
+/// `crates/coord/src/sessions.rs` fails closed there). That is not an admin
+/// decision and clears on its own when the migration lands, so it stays a
+/// retried `Transport` — only `column_missing` false or absent ACK-drops.
+const OUTPUT_CHUNK_TERMINAL_429_REASONS: [&str; 2] =
+    ["warm_quota_exceeded", "transcript_sync_disabled"];
+
+/// coord's JSON answer to a 429 on `POST /sessions/:id/output`, parsed from
+/// its `error` field (never a substring of the raw body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputChunk429 {
+    /// coord's `error` code, verbatim.
+    pub error: String,
+    /// `true` only when the body carries `"column_missing": true` — the
+    /// deploy-window stand-in for `transcript_sync_disabled`.
+    pub column_missing: bool,
+}
+
+impl OutputChunk429 {
+    /// The reason this refusal ACK-drops the chunk, or `None` when it is
+    /// retryable (see [`OUTPUT_CHUNK_TERMINAL_429_REASONS`]).
+    fn terminal_reason(&self) -> Option<&'static str> {
+        if self.error == "transcript_sync_disabled" && self.column_missing {
+            return None;
+        }
+        OUTPUT_CHUNK_TERMINAL_429_REASONS
+            .iter()
+            .copied()
+            .find(|r| *r == self.error)
+    }
+
+    /// Human-readable reason for a log line.
+    fn label(&self) -> String {
+        if self.column_missing {
+            format!("{} (coord column not provisioned yet)", self.error)
+        } else {
+            self.error.clone()
+        }
+    }
+}
+
+/// Parse an `output_chunk` 429 response body into coord's `error` code (and
+/// its `column_missing` flag). `None` when the body is not JSON or carries no
+/// string `error` — an intermediary's page, or a bare edge rate limit.
+pub(crate) fn parse_output_chunk_429(body: &str) -> Option<OutputChunk429> {
+    let parsed: JsonValue = serde_json::from_str(body).ok()?;
+    let error = parsed.get("error")?.as_str()?.to_string();
+    let column_missing = parsed
+        .get("column_missing")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    Some(OutputChunk429 {
+        error,
+        column_missing,
+    })
+}
+
+/// Return the parsed `error` field of an `output_chunk` 429 body when it is
+/// a terminal refusal (see [`OUTPUT_CHUNK_TERMINAL_429_REASONS`]). Reads the
+/// parsed field, not a substring, so a `detail` string or an intermediary's
+/// page that merely mentions a reason does not turn a retryable 429 into a
+/// drop.
+fn output_chunk_terminal_429_reason(body: &str) -> Option<&'static str> {
+    parse_output_chunk_429(body)?.terminal_reason()
+}
+
+/// The reason to NAME in a log line for an `output_chunk` 429: coord's parsed
+/// `error` code (annotated when it is the deploy-window `column_missing`
+/// stand-in), or a generic "rate limited" when the body carries none.
+pub(crate) fn output_chunk_429_log_reason(body: &str) -> String {
+    parse_output_chunk_429(body)
+        .map(|p| p.label())
+        .unwrap_or_else(|| "rate limited".to_string())
 }
 
 /// Kinds drained under the BEST-EFFORT posture: a transport failure skips the
@@ -1468,7 +1565,8 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         entry.failures += 1;
         entry.failed_at_ack_tick = ack_ticks_at_start;
         // A 429 on a kind that retries it (`output_chunk`, and the lifecycle
-        // kinds of `is_lifecycle_kind`) is coord pacing this runner, not
+        // kinds of `is_lifecycle_kind`: `started` / `state_change` / `closed`
+        // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
         let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
         if serving && !rate_limited {
@@ -1906,21 +2004,27 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             let status = resp.status();
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
-                if detail.contains("warm_quota_exceeded") {
-                    // Tenant warm-quota exceeded (gate 2, enforced
-                    // coord-side). Retrying can't help until quota frees,
+                if let Some(reason) = output_chunk_terminal_429_reason(&detail) {
+                    // A standing tenant answer (warm quota spent, or
+                    // transcript sync turned off), enforced coord-side.
+                    // Retrying can't help until the tenant's state changes,
                     // and stalling the batch would head-of-line-block this
                     // session's lifecycle events — ACK-drop with an info
                     // line instead of the error-level PermanentFailure path.
+                    // No suppression latch: on a multi-bound device one
+                    // tenant's refusal must not silence another's transcript.
                     tracing::info!(
                         session = %rec.session_id,
                         seq = rec.seq,
-                        "coord_sync: output chunk rejected by warm quota (429) — dropping"
+                        reason,
+                        "coord_sync: output chunk refused by coord (429 {reason}) — dropping"
                     );
                     return PushOutcome::Acked;
                 }
-                // Any other 429 (proxy / edge rate limit) is transient —
-                // keep the row and retry, same as a 5xx.
+                // Any other 429 (proxy / edge rate limit, or the
+                // deploy-window `transcript_sync_disabled` with
+                // `column_missing: true`) is transient — keep the row and
+                // retry, same as a 5xx.
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
             if status.is_success() {
@@ -1930,10 +2034,15 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 // A rate-limited lifecycle row is coord PACING this runner,
                 // not refusing the row. Dropping it would leave coord's
                 // session row wrong for good (never created, stuck in a
-                // stale state, or never closed — so its claim is held until
-                // the staleness watcher reaps it), so keep the row and retry
-                // on the session's backoff, like `output_chunk`'s non-quota
-                // 429 above. Decided HERE rather than in the shared
+                // stale state, never closed — so its claim is held until
+                // the staleness watcher reaps it — or never marked finished,
+                // so coord's work axis keeps reading it as unfinished: coord
+                // keeps prompting it, and restart-readiness / the drained
+                // wind-down keep counting it as work in flight. The local
+                // mark stays `finish_synced: false`, but nothing re-sends it
+                // short of a late bind or a re-finish), so keep the row and
+                // retry on the session's backoff, like `output_chunk`'s
+                // retryable 429 above. Decided HERE rather than in the shared
                 // `classify_coord_write_status`, whose closeout-spool caller
                 // deliberately keeps 429 permanent. The drain's quarantine
                 // accounting reads the `429` prefix as `rate_limited` and never
@@ -3664,6 +3773,12 @@ mod tests {
         next_patch_429: usize,
         /// When >0, the next N `POST /sessions` return 429, recording nothing.
         next_post_429: usize,
+        /// When set, EVERY `POST /sessions/:id/output` answers 429 with this
+        /// raw body, recording nothing in `outputs` — a standing tenant answer
+        /// such as coord's `transcript_sync_disabled`, not a one-off pace.
+        output_429_body: Option<String>,
+        /// How many output POSTs were answered from `output_429_body`.
+        output_429_served: usize,
         /// When true, every PATCH answers coord's 403
         /// `close_requires_device_identity`, recording nothing.
         patch_forbidden: bool,
@@ -3865,7 +3980,17 @@ mod tests {
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
                      Json(body): Json<JsonValue>| async move {
-                        state.lock().await.outputs.push((id, body.clone()));
+                        let mut g = state.lock().await;
+                        if let Some(refusal) = g.output_429_body.clone() {
+                            g.output_429_served += 1;
+                            return (
+                                AxumStatus::TOO_MANY_REQUESTS,
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                refusal,
+                            )
+                                .into_response();
+                        }
+                        g.outputs.push((id, body.clone()));
                         (AxumStatus::OK, Json(json!({"id": id}))).into_response()
                     },
                 ),
@@ -4905,6 +5030,13 @@ mod tests {
                 json!({ "id": s, "state": "active" }),
             ),
             (SessionEventKind::Closed, json!({ "id": s })),
+            // `finished` (plan 2026-10-10-remote-create-residuals-followups,
+            // Phase 1): a one-shot work-axis PATCH, so a lost one leaves
+            // coord prompting a session that is done.
+            (
+                SessionEventKind::Finished,
+                json!({ "claude_session_id": "csid", "finished_at": 1 }),
+            ),
         ] {
             rec.lock().await.next_patch_429 = 1;
             let row = outbox.record(m, s, kind, payload).unwrap();
@@ -4922,7 +5054,15 @@ mod tests {
             let second = push_record(&coord.inner, &row).await;
             assert!(matches!(second, PushOutcome::Acked), "{kind:?}: {second:?}");
         }
-        assert_eq!(rec.lock().await.patches.len(), 2);
+        {
+            let g = rec.lock().await;
+            assert_eq!(g.patches.len(), 3, "{:?}", g.patches);
+            assert_eq!(
+                g.patches[2].1,
+                json!({ "progress": { "session_status": "finished" } }),
+                "the finished row was DELIVERED on retry"
+            );
+        }
 
         // `started` rides POST /sessions and is a lifecycle kind too.
         rec.lock().await.next_post_429 = 1;
@@ -5040,6 +5180,306 @@ mod tests {
         assert_eq!(g.patches.len(), 2, "{:?}", g.patches);
         assert_eq!(g.patches[0].1, json!({ "state": "closed" }));
         assert_eq!(g.patches[1].1, json!({ "heartbeat": true }));
+    }
+
+    /// Plan 2026-10-10-remote-create-residuals-followups, Phase 2: coord
+    /// answers an `output_chunk` with 429 `transcript_sync_disabled` for as
+    /// long as the tenant has transcript sync off. That is a standing tenant
+    /// setting, not pacing — the chunk is ACK-dropped, and the session's
+    /// `closed` row queued behind it in the same chain is then delivered
+    /// instead of waiting behind a chunk that can never land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transcript_sync_disabled_429_is_dropped_and_unblocks_the_session() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_429_body = Some(
+            json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": false,
+                "detail": "this tenant has transcript sync turned off",
+            })
+            .to_string(),
+        );
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let chunk = outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+        outbox
+            .record(m, s, SessionEventKind::Closed, json!({ "id": s }))
+            .unwrap();
+
+        // Row level: the refusal is an ACK-drop, not a retry.
+        assert!(
+            matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+            "a transcript_sync_disabled 429 must ACK-drop the chunk"
+        );
+
+        // Drain level: the chunk does not hold the close behind it.
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert!(g.output_429_served >= 2, "the drain pushed the chunk too");
+        assert!(
+            g.outputs.is_empty(),
+            "coord accepted no chunk: {:?}",
+            g.outputs
+        );
+        assert_eq!(g.patches.len(), 1, "{:?}", g.patches);
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(
+            g.patches[0].1,
+            json!({ "state": "closed" }),
+            "the close queued behind the refused chunk was delivered"
+        );
+    }
+
+    /// Drain-only twin of the test above (plan
+    /// 2026-10-10-remote-create-residuals-followups, Phase 2 review): enters
+    /// ONLY through `start_drain_task`, never a row-level helper, so it proves
+    /// the production path end to end. coord answers every chunk 429
+    /// `transcript_sync_disabled` (an admin decision, `column_missing: false`);
+    /// the chunk must be ACK-dropped and the `closed` row queued behind it in
+    /// the same session delivered. Before the fix the chunk was a retried
+    /// `Transport` forever and the close never left the outbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transcript_sync_disabled_chunk_does_not_hold_the_close_behind_it_in_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_429_body = Some(
+            json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": false,
+                "detail": "this tenant has transcript sync turned off",
+            })
+            .to_string(),
+        );
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+        outbox
+            .record(m, s, SessionEventKind::Closed, json!({ "id": s }))
+            .unwrap();
+
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert_eq!(
+            g.output_429_served, 1,
+            "the chunk was offered exactly once, then ACK-dropped"
+        );
+        assert!(
+            g.outputs.is_empty(),
+            "coord accepted no chunk: {:?}",
+            g.outputs
+        );
+        assert_eq!(g.patches.len(), 1, "{:?}", g.patches);
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(
+            g.patches[0].1,
+            json!({ "state": "closed" }),
+            "the close queued behind the refused chunk was delivered"
+        );
+        drop(g);
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "nothing is left pending behind the dropped chunk"
+        );
+    }
+
+    /// Plan 2026-10-10-remote-create-residuals-followups, Phase 1, entered
+    /// ONLY through `start_drain_task`: coord answers the first `finished`
+    /// PATCH 429 and the second 200. The drain must keep the row and deliver
+    /// it on retry — so a SECOND PATCH happens and is recorded. Before the
+    /// fix the 429 reached `write_failure_outcome`, the row was ACK-dropped,
+    /// and coord never recorded a finished PATCH at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_429_on_a_finished_row_is_retried_by_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_429 = 1;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::Finished,
+                json!({ "claude_session_id": "csid", "finished_at": 1 }),
+            )
+            .unwrap();
+
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(30), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        let g = rec.lock().await;
+        assert_eq!(g.next_patch_429, 0, "the one-shot 429 was served");
+        assert_eq!(
+            g.patches.len(),
+            1,
+            "the finished row was PATCHed again after the 429 and delivered: {:?}",
+            g.patches
+        );
+        assert_eq!(g.patches[0].0, s);
+        assert_eq!(
+            g.patches[0].1,
+            json!({ "progress": { "session_status": "finished" } })
+        );
+    }
+
+    /// The other standing `output_chunk` refusal, `warm_quota_exceeded`, is
+    /// still an ACK-drop through the same parser; a 429 whose body names
+    /// neither reason in its `error` field — an edge rate limit, or a page
+    /// that only MENTIONS a reason in prose — stays retryable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_chunk_429_drops_only_on_a_parsed_terminal_reason() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let s = Uuid::new_v4();
+        let chunk = outbox
+            .record(
+                Uuid::new_v4(),
+                s,
+                SessionEventKind::OutputChunk,
+                json!({ "stream": "transcript", "chunk_offset": 0, "payload_b64": "eA==" }),
+            )
+            .unwrap();
+
+        rec.lock().await.output_429_body = Some(
+            json!({ "error": "warm_quota_exceeded", "tenant_warm_bytes": 10, "quota": 5 })
+                .to_string(),
+        );
+        assert!(
+            matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+            "warm_quota_exceeded ACK-drops the chunk"
+        );
+
+        // `transcript_sync_disabled` with `column_missing: false` (an admin
+        // turned it off) ACK-drops; so does one with the flag absent.
+        for body in [
+            json!({ "error": "transcript_sync_disabled", "column_missing": false }),
+            json!({ "error": "transcript_sync_disabled" }),
+        ] {
+            rec.lock().await.output_429_body = Some(body.to_string());
+            assert!(
+                matches!(push_record(&coord.inner, &chunk).await, PushOutcome::Acked),
+                "{body}: a standing transcript_sync_disabled ACK-drops the chunk"
+            );
+        }
+
+        for body in [
+            // coord's deploy-window stand-in: the column is not provisioned
+            // yet, so the refusal clears by itself — retried, not dropped.
+            json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": true,
+                "detail": "transcript sync is treated as off (fail closed)",
+            })
+            .to_string(),
+            json!({ "error": "rate_limited" }).to_string(),
+            "upstream says transcript_sync_disabled and warm_quota_exceeded".to_string(),
+            json!({ "detail": "transcript_sync_disabled" }).to_string(),
+        ] {
+            rec.lock().await.output_429_body = Some(body.clone());
+            match push_record(&coord.inner, &chunk).await {
+                PushOutcome::Transport(msg) => assert_eq!(
+                    classify_push_failure(&msg, false).0,
+                    "rate_limited",
+                    "{body}: a retryable 429 never counts toward quarantine"
+                ),
+                other => panic!("{body}: must be retried, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn output_chunk_terminal_429_reason_reads_the_error_field() {
+        assert_eq!(
+            output_chunk_terminal_429_reason(r#"{"error":"transcript_sync_disabled"}"#),
+            Some("transcript_sync_disabled")
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(r#"{"error":"warm_quota_exceeded","quota":1}"#),
+            Some("warm_quota_exceeded")
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(r#"{"error":"rate_limited"}"#),
+            None
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(
+                r#"{"error":"transcript_sync_disabled","column_missing":false}"#
+            ),
+            Some("transcript_sync_disabled"),
+            "column_missing false is an admin decision — terminal"
+        );
+        assert_eq!(
+            output_chunk_terminal_429_reason(
+                r#"{"error":"transcript_sync_disabled","column_missing":true}"#
+            ),
+            None,
+            "column_missing true is the deploy window — retryable"
+        );
+        assert_eq!(output_chunk_terminal_429_reason(r#"{"error":42}"#), None);
+        assert_eq!(
+            output_chunk_terminal_429_reason("transcript_sync_disabled"),
+            None
+        );
+        assert_eq!(output_chunk_terminal_429_reason(""), None);
     }
 
     /// Phase 3 review: a 404 on the `closed` PATCH (coord no longer has the
