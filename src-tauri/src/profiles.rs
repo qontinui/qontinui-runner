@@ -170,13 +170,12 @@ impl std::fmt::Debug for NetworkProfile {
 
 /// `network.trust` (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`
 /// decision C3).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustMode {
     /// The OS trust store — on Windows the runner's `git` is pointed at
     /// Schannel (`http.sslBackend=schannel`), unless the machine's git config
     /// already chose a backend or CA file.
-    #[default]
     Os,
     /// Leave each stack on its own bundle (Git for Windows keeps its OpenSSL
     /// bundle).
