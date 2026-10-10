@@ -9,6 +9,7 @@ import { useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { Layers } from "lucide-react";
 import type { PhaseCostBreakdown } from "./types";
+import { describeCostProvenance } from "./costProvenance";
 
 interface PhaseBreakdownChartProps {
   data: PhaseCostBreakdown[];
@@ -21,6 +22,7 @@ interface ChartData {
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  provenance: string | null;
 }
 
 function formatTokenCount(count: number): string {
@@ -42,7 +44,10 @@ function CustomTooltip({
       <div className="bg-popover border border-border rounded-lg p-3 shadow-lg">
         <p className="font-semibold text-sm">{d.phase}</p>
         <div className="text-xs text-muted-foreground mt-1 space-y-1">
-          <p>Cost: ${d.cost.toFixed(4)}</p>
+          <p>
+            Cost: ${d.cost.toFixed(4)}
+            {d.provenance ? ` (${d.provenance})` : ""}
+          </p>
           <p>Input: {formatTokenCount(d.inputTokens)}</p>
           <p>Output: {formatTokenCount(d.outputTokens)}</p>
           <p>Cache created: {formatTokenCount(d.cacheCreationTokens)}</p>
@@ -65,6 +70,7 @@ export function PhaseBreakdownChart({ data }: PhaseBreakdownChartProps) {
           outputTokens: row.output_tokens,
           cacheCreationTokens: row.cache_creation_tokens,
           cacheReadTokens: row.cache_read_tokens,
+          provenance: describeCostProvenance(row.cost_provenance),
         }))
         .sort((a, b) => b.cost - a.cost),
     [data],

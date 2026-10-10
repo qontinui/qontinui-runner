@@ -77,7 +77,9 @@ pub(super) fn record_phase_token_usage(
 /// - A provider-REPORTED cost (Claude CLI `total_cost_usd`) wins: it is what
 ///   the call was billed at, at full precision.
 /// - Otherwise the cost is ESTIMATED from the token counts against the
-///   cache-aware price table (cache writes 1.25x, reads 0.1x base input).
+///   cache-aware price table (cache writes at the 5-minute-TTL 1.25x rate —
+///   a 1-hour-TTL write bills higher, so this under-estimates those — and
+///   reads at 0.1x base input).
 ///   For a model the catalog cannot price, `ai_pricing::pricing_or_fallback`
 ///   borrows a same-family price and logs that it did — an announced
 ///   estimate, never a fabricated zero. `cost_cents` is the whole-cent figure
