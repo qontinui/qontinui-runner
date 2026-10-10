@@ -1591,10 +1591,7 @@ mod tests {
             "named",
             "an unclassifiable id falls through to the instance name"
         );
-        assert_eq!(
-            resolve_runner_instance(None, None, None, true),
-            "secondary"
-        );
+        assert_eq!(resolve_runner_instance(None, None, None, true), "secondary");
         assert_eq!(resolve_runner_instance(None, None, None, false), "primary");
         assert_eq!(
             resolve_runner_instance(None, Some("primary"), None, false),
