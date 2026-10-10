@@ -489,65 +489,69 @@ impl PgDb {
         Ok(affected > 0)
     }
 
-    /// Get checkpoints with pagination.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn get_checkpoints_paginated(
+    /// One keyset page of orchestrator checkpoints, walked on the immutable
+    /// `(created_at, id)` (both written once by
+    /// [`Self::save_orchestrator_checkpoint`]'s INSERT, never updated — pinned
+    /// by `commands::checkpoint_browser::tests::checkpoint_keys_have_no_update_site`).
+    ///
+    /// Scoped to one task the walk is ASCENDING (the task's checkpoints in the
+    /// order they were taken, so ones a running task adds land ahead of the
+    /// cursor); unscoped it is DESCENDING (newest first). Fetches up to
+    /// `limit + 1` rows — the extra row is the has-more probe.
+    pub async fn get_checkpoints_page(
         &self,
         task_id: Option<&str>,
-        offset: i64,
+        after: Option<qontinui_types::page::KeysetPosition>,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    ) -> Result<Vec<OrchestratorCheckpointRow>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let (after_at, after_id) = crate::bounded_read::keyset_binds(after);
+        let fetch = limit.max(1).saturating_add(1);
         let rows = if let Some(tid) = task_id {
             conn.query(
                 r#"SELECT id, task_id, iteration, trigger, state, name, created_at
                 FROM orchestrator_checkpoints
                 WHERE task_id = $1
-                ORDER BY iteration ASC
-                LIMIT $2 OFFSET $3"#,
-                &[&tid, &limit, &offset],
+                  AND ($2::timestamptz IS NULL OR (created_at, id) > ($2, $3::text))
+                ORDER BY created_at ASC, id ASC
+                LIMIT $4"#,
+                &[&tid, &after_at, &after_id, &fetch],
             )
             .await
         } else {
             conn.query(
                 r#"SELECT id, task_id, iteration, trigger, state, name, created_at
                 FROM orchestrator_checkpoints
-                ORDER BY created_at DESC
-                LIMIT $1 OFFSET $2"#,
-                &[&limit, &offset],
+                WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1, $2::text))
+                ORDER BY created_at DESC, id DESC
+                LIMIT $3"#,
+                &[&after_at, &after_id, &fetch],
             )
             .await
         }
-        .map_err(|e| crate::database::pg::pg_err("PG get_checkpoints_paginated", &e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_checkpoints_page", &e))?;
 
-        let results = rows
-            .iter()
+        let decode = |e: tokio_postgres::Error| {
+            crate::database::pg::pg_err("PG get_checkpoints_page decode", &e)
+        };
+        rows.iter()
             .map(|r| {
-                let state_str: Option<String> = r.get(4);
-                let state_val =
-                    state_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-                let created: chrono::DateTime<chrono::Utc> = r.get(6);
-                serde_json::json!({
-                    "id": r.get::<_, String>(0),
-                    "task_id": r.get::<_, String>(1),
-                    "iteration": r.get::<_, i64>(2),
-                    "trigger": r.get::<_, String>(3),
-                    "state": state_val,
-                    "name": r.get::<_, Option<String>>(5),
-                    "created_at": created.to_rfc3339(),
+                Ok(OrchestratorCheckpointRow {
+                    id: r.try_get(0).map_err(decode)?,
+                    task_id: r.try_get(1).map_err(decode)?,
+                    iteration: r.try_get(2).map_err(decode)?,
+                    trigger: r.try_get(3).map_err(decode)?,
+                    state: r.try_get(4).map_err(decode)?,
+                    name: r.try_get(5).map_err(decode)?,
+                    created_at: r.try_get(6).map_err(decode)?,
                 })
             })
-            .collect();
-
-        Ok(results)
+            .collect()
     }
 
     /// Get total count of checkpoints (for pagination).
@@ -581,4 +585,18 @@ impl PgDb {
 
         Ok(count)
     }
+}
+
+/// One `orchestrator_checkpoints` row as a keyset page serves it.
+#[derive(Debug, Clone)]
+pub struct OrchestratorCheckpointRow {
+    pub id: String,
+    pub task_id: String,
+    pub iteration: i64,
+    pub trigger: String,
+    /// The serialized state snapshot (TEXT holding JSON).
+    pub state: String,
+    pub name: Option<String>,
+    /// The immutable keyset value.
+    pub created_at: chrono::DateTime<Utc>,
 }

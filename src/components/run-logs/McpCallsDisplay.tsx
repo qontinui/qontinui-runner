@@ -7,13 +7,18 @@ import { parseJson } from "./ai-data-viewer-utils";
 const PAGE_SIZE = 50;
 
 export function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
-  const [pageSize, setPageSize] = useState(PAGE_SIZE);
-  const { data: mcpData, isLoading, error } = useTaskRunMcpCalls(taskRunId, undefined, pageSize);
+  const {
+    data: mcpData,
+    isLoading,
+    error,
+    fetchNextPage,
+    isFetchingNextPage,
+  } = useTaskRunMcpCalls(taskRunId, undefined, PAGE_SIZE);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const loadMore = useCallback(() => {
-    setPageSize((prev) => prev + PAGE_SIZE);
-  }, []);
+    void fetchNextPage();
+  }, [fetchNextPage]);
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -44,7 +49,7 @@ export function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
     );
   }
 
-  if (!mcpData || mcpData.calls.length === 0) {
+  if (!mcpData || mcpData.rows.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
         <Wifi className="w-8 h-8 mb-3 opacity-50" />
@@ -56,13 +61,13 @@ export function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
   return (
     <div className="space-y-4">
       <div className="flex gap-4 text-xs text-muted-foreground">
-        <span>Total: {mcpData.count}</span>
-        <span className="text-green-400">Success: {mcpData.success_count}</span>
-        <span className="text-red-400">Failed: {mcpData.failed_count}</span>
+        <span>Total: {mcpData.first.total ?? mcpData.rows.length}</span>
+        <span className="text-green-400">Success: {mcpData.first.success_count ?? "—"}</span>
+        <span className="text-red-400">Failed: {mcpData.first.failed_count ?? "—"}</span>
       </div>
 
       <div className="space-y-3">
-        {mcpData.calls.map((call: TaskRunMcpCallDb) => {
+        {mcpData.rows.map((call: TaskRunMcpCallDb) => {
           const isExpanded = expandedIds.has(call.id);
           const response = parseJson(call.response);
           const args = parseJson(call.arguments);
@@ -158,13 +163,14 @@ export function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
             </div>
           );
         })}
-        {mcpData.has_more && (
+        {mcpData.hasMore && (
           <button
             onClick={loadMore}
+            disabled={isFetchingNextPage}
             className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
           >
             <ChevronDown className="w-3 h-3" />
-            Show more ({mcpData.count - mcpData.calls.length} remaining)
+            Show more ({mcpData.remaining ?? "more"} remaining)
           </button>
         )}
       </div>

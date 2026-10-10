@@ -14,8 +14,16 @@
 //! `ui_bridge_baselines` pattern).
 
 use super::PgDb;
+use crate::bounded_read::ReadLimit;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// A suite's recent regression diagnoses. Default 25, clamped to `1..=1000`.
+const RECENT_DIAGNOSES_LIMIT: ReadLimit = ReadLimit::new(25, 1000);
+/// A suite's recent regression runs. Default 25, clamped to `1..=1000`.
+const REGRESSION_RUNS_LIMIT: ReadLimit = ReadLimit::new(25, 1000);
+/// Regression suites one list returns. Default 50, clamped to `1..=1000`.
+const REGRESSION_SUITES_LIMIT: ReadLimit = ReadLimit::new(50, 1000);
 
 // =============================================================================
 // Row types returned to the command layer
@@ -318,7 +326,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let limit_i: i64 = limit.unwrap_or(25).min(1000) as i64;
+        let limit_i: i64 = RECENT_DIAGNOSES_LIMIT.resolve(limit) as i64;
         let rows = conn
             .query(
                 r#"
@@ -366,7 +374,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let limit_i: i64 = limit.unwrap_or(50).min(1000) as i64;
+        let limit_i: i64 = REGRESSION_SUITES_LIMIT.resolve(limit) as i64;
         let rows = conn
             .query(
                 r#"
@@ -502,7 +510,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let limit_i: i64 = limit.unwrap_or(25).min(1000) as i64;
+        let limit_i: i64 = REGRESSION_RUNS_LIMIT.resolve(limit) as i64;
         let rows = conn
             .query(
                 r#"

@@ -29,6 +29,10 @@ use super::events::{self, TraceChanged};
 use super::responses::{EmptyOk, TraceError};
 use super::storage;
 use super::types::{CausalChain, InboundRecordingSession};
+use crate::bounded_read::ReadLimit;
+
+/// Recording sessions `GET /trace/list` lists, newest first. Default 50, clamped to `1..=500`.
+const TRACE_LIST_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 /// Resolve the global `PgDb` or return a `503` error envelope. The trace API
 /// is only useful when PG is wired; we make that explicit rather than
@@ -74,7 +78,7 @@ pub async fn get_list(State(_state): State<Arc<ApiState>>, Query(q): Query<ListQ
         Ok(p) => p,
         Err(r) => return r,
     };
-    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let limit = TRACE_LIST_LIMIT.resolve(q.limit);
     match storage::list_recording_sessions(&pg, limit).await {
         Ok(sessions) => {
             let reason = if sessions.is_empty() {

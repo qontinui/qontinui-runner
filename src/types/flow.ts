@@ -5,6 +5,8 @@
  * Inspired by CrewAI's Flows system.
  */
 
+import type { BoundedReadMeta } from "./aiData";
+
 /** Merge strategy for parallel steps */
 export type ParallelMerge = "wait_all" | "wait_any" | { wait_n: number };
 
@@ -256,9 +258,7 @@ export interface FlowExecutionFilter {
 }
 
 /** Paginated flow execution result */
-export interface PaginatedFlowExecutionResult {
+/** One keyset page of flow executions, newest first, with the shared bounded-read keys. */
+export interface FlowExecutionsPage extends BoundedReadMeta {
   items: FlowExecutionSummary[];
-  total: number;
-  offset: number;
-  limit: number;
 }

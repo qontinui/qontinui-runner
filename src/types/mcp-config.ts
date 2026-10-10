@@ -5,6 +5,8 @@
  * MCP allows the runner to call external tools and services.
  */
 
+import type { BoundedReadMeta } from "./aiData";
+
 // =============================================================================
 // MCP Server Configuration
 // =============================================================================
@@ -159,16 +161,15 @@ export interface TaskRunMcpCallDb {
 }
 
 /**
- * Result of querying MCP calls from SQLite.
+ * One keyset page of a run's MCP calls. `success_count` / `failed_count` are
+ * the whole run's, present on the FIRST page only (absent, not zero, on later
+ * pages); the shared bounded-read keys say how much of the run this page is.
  */
-export interface TaskRunMcpCallsDbResult {
+export interface TaskRunMcpCallsDbResult extends BoundedReadMeta {
   task_run_id: string;
   calls: TaskRunMcpCallDb[];
-  count: number;
-  total_count?: number;
-  success_count: number;
-  failed_count: number;
-  has_more?: boolean;
+  success_count?: number;
+  failed_count?: number;
 }
 
 // =============================================================================

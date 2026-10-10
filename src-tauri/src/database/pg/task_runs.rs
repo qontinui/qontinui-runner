@@ -1420,94 +1420,110 @@ impl PgDb {
         Ok(id)
     }
 
-    /// Get all MCP calls for a task run, optionally filtered by success.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn get_task_run_mcp_calls(
+    /// One keyset page of a run's MCP calls, optionally filtered by success,
+    /// walked on the immutable `(created_at, id)` ASCENDING (chronological, so
+    /// calls a still-running task appends land ahead of the cursor and are
+    /// reached, never skipped). `created_at` is written once by the INSERT and
+    /// no statement updates it or `id` (pinned by
+    /// `commands::mcp::tests::mcp_call_keys_have_no_update_site`).
+    ///
+    /// Fetches up to `limit + 1` rows (the extra row is the has-more probe) and,
+    /// on the FIRST page only (`after == None`), the exact filtered counts from a
+    /// separate statement over the small columns — never a window count on the
+    /// page statement, which would read every remaining row's big text columns
+    /// on every page.
+    pub async fn get_task_run_mcp_calls_page(
         &self,
         task_run_id: &str,
         success_filter: Option<bool>,
-    ) -> Result<crate::mcp_client::McpCallsResult, String> {
+        after: Option<qontinui_types::page::KeysetPosition>,
+        limit: i64,
+    ) -> Result<McpCallsPageRows, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        // ::TEXT cast on created_at (TIMESTAMPTZ) + try_get below — same
-        // driver-drift-resistance pattern as step_type_knowledge.rs.
-        let rows = if let Some(success) = success_filter {
-            conn.query(
+        let (after_at, after_id) = crate::bounded_read::keyset_binds(after);
+        let fetch = limit.max(1).saturating_add(1);
+        let rows = conn
+            .query(
                 r#"SELECT id, task_run_id, step_id, step_name,
                        server_id, server_name, tool_name,
                        arguments, resolved_arguments,
                        response, response_type, duration_ms,
                        extractions, assertions,
-                       success, error_message, created_at::TEXT
-                FROM task_run_mcp_calls
-                WHERE task_run_id = $1 AND success = $2
-                ORDER BY created_at ASC"#,
-                &[&task_run_id, &success],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_mcp_calls", &e))?
-        } else {
-            conn.query(
-                r#"SELECT id, task_run_id, step_id, step_name,
-                       server_id, server_name, tool_name,
-                       arguments, resolved_arguments,
-                       response, response_type, duration_ms,
-                       extractions, assertions,
-                       success, error_message, created_at::TEXT
+                       success, error_message, created_at
                 FROM task_run_mcp_calls
                 WHERE task_run_id = $1
-                ORDER BY created_at ASC"#,
-                &[&task_run_id],
+                  AND ($2::boolean IS NULL OR success = $2)
+                  AND ($3::timestamptz IS NULL OR (created_at, id) > ($3, $4::text))
+                ORDER BY created_at ASC, id ASC
+                LIMIT $5"#,
+                &[&task_run_id, &success_filter, &after_at, &after_id, &fetch],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_mcp_calls", &e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_mcp_calls_page", &e))?;
+
+        let decode = |e: tokio_postgres::Error| {
+            crate::database::pg::pg_err("PG get_task_run_mcp_calls_page decode", &e)
+        };
+        let mut calls = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let created_at: chrono::DateTime<chrono::Utc> = r.try_get(16).map_err(decode)?;
+            calls.push((
+                crate::mcp_client::McpCallRecord {
+                    id: r.try_get(0).map_err(decode)?,
+                    task_run_id: r.try_get(1).map_err(decode)?,
+                    step_id: r.try_get(2).map_err(decode)?,
+                    step_name: r.try_get(3).map_err(decode)?,
+                    server_id: r.try_get(4).map_err(decode)?,
+                    server_name: r.try_get(5).map_err(decode)?,
+                    tool_name: r.try_get(6).map_err(decode)?,
+                    arguments: r.try_get(7).map_err(decode)?,
+                    resolved_arguments: r.try_get(8).map_err(decode)?,
+                    response: r.try_get(9).map_err(decode)?,
+                    response_type: r.try_get(10).map_err(decode)?,
+                    duration_ms: r.try_get(11).map_err(decode)?,
+                    extractions: r.try_get(12).map_err(decode)?,
+                    assertions: r.try_get(13).map_err(decode)?,
+                    success: r.try_get(14).map_err(decode)?,
+                    error_message: r.try_get(15).map_err(decode)?,
+                    created_at: created_at.to_rfc3339(),
+                },
+                created_at,
+            ));
+        }
+
+        let counts = if after.is_none() {
+            let row = conn
+                .query_one(
+                    r#"SELECT COUNT(*)::bigint,
+                           (COUNT(*) FILTER (WHERE success))::bigint
+                    FROM task_run_mcp_calls
+                    WHERE task_run_id = $1
+                      AND ($2::boolean IS NULL OR success = $2)"#,
+                    &[&task_run_id, &success_filter],
+                )
+                .await
+                .map_err(|e| {
+                    crate::database::pg::pg_err("PG get_task_run_mcp_calls_page counts", &e)
+                })?;
+            let total: i64 = row.try_get(0).map_err(decode)?;
+            let succeeded: i64 = row.try_get(1).map_err(decode)?;
+            Some(McpCallsCounts {
+                total,
+                succeeded,
+                failed: total - succeeded,
+            })
+        } else {
+            None
         };
 
-        let calls: Vec<crate::mcp_client::McpCallRecord> = rows
-            .iter()
-            .map(|r| crate::mcp_client::McpCallRecord {
-                id: r.get(0),
-                task_run_id: r.get(1),
-                step_id: r.get(2),
-                step_name: r.get(3),
-                server_id: r.get(4),
-                server_name: r.get(5),
-                tool_name: r.get(6),
-                arguments: r.get(7),
-                resolved_arguments: r.get(8),
-                response: r.get(9),
-                response_type: r.get(10),
-                duration_ms: r.get(11),
-                extractions: r.get(12),
-                assertions: r.get(13),
-                success: r.get(14),
-                error_message: r.get(15),
-                created_at: r.try_get(16).unwrap_or_else(|e| {
-                    tracing::warn!("task_run_mcp_calls created_at decode drift: {}", e);
-                    String::new()
-                }),
-            })
-            .collect();
-
-        let success_count = calls.iter().filter(|c| c.success).count();
-        let failed_count = calls.iter().filter(|c| !c.success).count();
-
-        let total = calls.len();
-        Ok(crate::mcp_client::McpCallsResult {
-            task_run_id: task_run_id.to_string(),
-            calls,
-            count: total,
-            total_count: total,
-            success_count,
-            failed_count,
-            has_more: false,
+        Ok(McpCallsPageRows {
+            rows: calls,
+            counts,
         })
     }
 
@@ -2302,6 +2318,28 @@ impl PgDb {
         .map_err(|e| crate::database::pg::pg_err("PG save_task_run_automation", &e))?;
         Ok(())
     }
+}
+
+/// One keyset page of `task_run_mcp_calls`: up to `limit + 1` rows in walk
+/// order, each beside its exact `created_at` (the keyset value the next cursor
+/// is minted from); the last one, when present, is the has-more probe.
+#[derive(Debug, Clone)]
+pub struct McpCallsPageRows {
+    pub rows: Vec<(
+        crate::mcp_client::McpCallRecord,
+        chrono::DateTime<chrono::Utc>,
+    )>,
+    /// The whole filtered run's counts — FIRST page only, `None` (never
+    /// computed, not zero) on every later page.
+    pub counts: Option<McpCallsCounts>,
+}
+
+/// The counts the first page's separate statement measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpCallsCounts {
+    pub total: i64,
+    pub succeeded: i64,
+    pub failed: i64,
 }
 
 #[cfg(test)]

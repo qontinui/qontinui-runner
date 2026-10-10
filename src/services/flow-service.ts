@@ -12,7 +12,7 @@ import type {
   FlowSummary,
   FlowExecutionSummary,
   FlowExecutionFilter,
-  PaginatedFlowExecutionResult,
+  FlowExecutionsPage,
 } from "../types/flow";
 
 /**
@@ -235,18 +235,18 @@ export const flowService = {
   },
 
   /**
-   * Get flow executions with pagination.
+   * Get one keyset page of flow executions, newest first.
    * @param flowId - Optional flow ID to filter by.
-   * @param offset - Number of records to skip.
-   * @param limit - Maximum number of records to return.
-   * @returns Paginated result with items, total count, offset, and limit.
+   * @param limit - Page size (default 50, max 500).
+   * @param cursor - The previous page's `next_cursor`; omit for the first page.
+   * @returns The page's items plus the shared bounded-read keys.
    */
   async getFlowExecutionsPaginated(
     flowId: string | undefined,
-    offset: number,
-    limit: number,
-  ): Promise<PaginatedFlowExecutionResult> {
-    return invoke("get_flow_executions_paginated", { flowId, offset, limit });
+    limit?: number,
+    cursor?: string,
+  ): Promise<FlowExecutionsPage> {
+    return invoke("get_flow_executions_paginated", { flowId, limit, cursor });
   },
 
   /**

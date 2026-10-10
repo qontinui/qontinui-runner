@@ -9,8 +9,12 @@ use tauri::State;
 use tracing::{error, info};
 
 use super::CommandResponse;
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::ExecutionCompartment;
 use crate::state_explorer::{ExplorationConfig, ExplorationStrategy, ExplorationTask};
+
+/// Exploration sessions the state-explorer panel lists. Default 20, clamped to `1..=500`.
+const EXPLORATION_HISTORY_LIMIT: ReadLimit = ReadLimit::new(20, 500);
 
 /// Start a state exploration task
 ///
@@ -206,7 +210,7 @@ pub async fn preview_exploration_plan(
 /// * `Ok(CommandResponse)` - List of exploration runs in data
 #[tauri::command]
 pub async fn get_exploration_history(limit: Option<u32>) -> Result<CommandResponse, String> {
-    let limit = limit.unwrap_or(20);
+    let limit = EXPLORATION_HISTORY_LIMIT.resolve(limit);
 
     // Read from exploration reports directory
     let reports_dir = crate::paths::get_state_explorer_dir();

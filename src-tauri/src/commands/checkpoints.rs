@@ -2,7 +2,7 @@
 
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::CommandResponse;
-use crate::database::{CheckpointData, SessionEvent};
+use crate::database::CheckpointData;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::{Emitter, State};
@@ -67,18 +67,6 @@ pub async fn checkpoint_status(
     // checkpoint_db removed — checkpoint status was SQLite-only, returns None
     let _ = (&workflow_name, completion_value);
     Ok(None)
-}
-
-/// Get session/checkpoint history.
-#[tauri::command]
-pub async fn checkpoint_history(
-    app_state: State<'_, StorageCompartment>,
-    workflow_name: Option<String>,
-    limit: Option<u32>,
-) -> Result<Vec<SessionEvent>, String> {
-    let _limit = limit.unwrap_or(50);
-    // checkpoint_db removed — session history was SQLite-only, returns empty
-    Ok(Vec::new())
 }
 
 /// Create a new session record.
@@ -179,7 +167,6 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             checkpoint_delete,
             checkpoint_list_active,
             checkpoint_status,
-            checkpoint_history,
             session_create,
             session_update_status,
             setting_get,

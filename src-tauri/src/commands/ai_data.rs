@@ -3,6 +3,7 @@
 //! These commands expose the data that is available to AI via MCP,
 //! allowing the frontend to display it in the same format.
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::StorageCompartment;
 use crate::database::TaskRun;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,13 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::warn;
+
+/// Recent task runs the AI Data Viewer lists. Default 20, clamped to `1..=500`.
+const VIEWER_TASK_RUNS_LIMIT: ReadLimit = ReadLimit::new(20, 500);
+/// Lines the AI Data Viewer reads from a `.dev-logs` JSONL file. Default 100, clamped to `1..=5000`.
+const JSONL_VIEWER_LIMIT: ReadLimit = ReadLimit::new(100, 5000);
+/// A run's events the AI Data Viewer reads in one call. Default 1000, clamped to `1..=10000`.
+const TASK_RUN_EVENTS_LIMIT: ReadLimit = ReadLimit::new(1000, 10000);
 
 /// Response wrapper for AI data commands.
 #[derive(Debug, Serialize)]
@@ -64,7 +72,7 @@ pub async fn get_task_runs_for_viewer(
     state: State<'_, StorageCompartment>,
     limit: Option<u32>,
 ) -> Result<AiDataResponse<Vec<TaskRun>>, String> {
-    let limit = limit.unwrap_or(20);
+    let limit = VIEWER_TASK_RUNS_LIMIT.resolve(limit);
 
     let result = state.pg_db().get_recent_task_runs(limit, None).await;
     match result {
@@ -177,7 +185,7 @@ pub async fn read_jsonl_logs_for_viewer(
     log_type: String,
     limit: Option<u32>,
 ) -> Result<AiDataResponse<JsonlLogsResult>, String> {
-    let limit = limit.unwrap_or(100) as usize;
+    let limit = JSONL_VIEWER_LIMIT.resolve(limit) as usize;
     let dev_logs_dir = get_dev_logs_dir();
 
     let filename = match log_type.as_str() {
@@ -1214,12 +1222,13 @@ pub async fn get_contexts_for_viewer() -> Result<AiDataResponse<ContextsResult>,
 // SQLite Event Queries (migrated from JSONL)
 // =============================================================================
 
+use crate::bounded_read::{keyset_page, row_position};
 use crate::database::pg::task_run_events::{TaskRunLogCounts, TaskRunLogPage};
 use crate::database::{
     TaskRunApiRequest, TaskRunAwasStep, TaskRunEvent, TaskRunPlaywrightResult, TaskRunScreenshot,
 };
 use qontinui_types::page::{
-    BoundedReadMeta, CursorScope, KeysetPosition, Page, ScopeFingerprint, SortKey,
+    BoundedReadMeta, CursorScope, KeysetPosition, ScopeFingerprint, SortKey,
 };
 
 /// Result of querying task run events from SQLite.
@@ -1240,7 +1249,7 @@ pub async fn get_task_run_events_from_db(
     event_type: Option<String>,
     limit: Option<u32>,
 ) -> Result<AiDataResponse<TaskRunEventsResult>, String> {
-    let limit = limit.unwrap_or(1000);
+    let limit = TASK_RUN_EVENTS_LIMIT.resolve(limit);
 
     match state
         .pg_db()
@@ -1315,11 +1324,9 @@ pub async fn get_task_run_screenshots_from_db(
 // `bound_kind: exact`; every later page is `at_least` (or `complete` on the last)
 // and omits the per-status counts.
 
-/// The page size when the caller passes no `limit`.
-const TASK_RUN_LOG_PAGE_DEFAULT: i64 = 200;
-/// The largest page a caller can ask for; `limit` is clamped to `1..=` this,
-/// and the envelope's `limit` reports the cap actually applied.
-const TASK_RUN_LOG_PAGE_MAX: i64 = 1000;
+/// A per-run log page: 200 rows when the caller names no `limit`, never more
+/// than 1000. The envelope's `limit` reports the cap actually applied.
+const TASK_RUN_LOG_PAGE: ReadLimit = ReadLimit::new(200, 1000);
 
 /// The keyset sequence of `task_run_playwright_results`: `(created_at, id)`
 /// ascending. Both columns are written once by the INSERT and never updated
@@ -1341,14 +1348,6 @@ impl SortKey for AwasStepsWalk {
     const ID: &'static str = "runner.task_run_awas_steps:created_at,id:asc";
 }
 
-/// The cap a per-run log page applies: the caller's `limit`, defaulted and
-/// clamped to `1..=TASK_RUN_LOG_PAGE_MAX`.
-fn task_run_log_limit(limit: Option<i64>) -> i64 {
-    limit
-        .unwrap_or(TASK_RUN_LOG_PAGE_DEFAULT)
-        .clamp(1, TASK_RUN_LOG_PAGE_MAX)
-}
-
 /// Decode a caller-supplied `cursor` against the read's scope. `None` is the
 /// first page; a token this read did not mint is the typed `cursor_malformed`
 /// refusal (never a clamp to the nearest position, which would resume the walk
@@ -1364,23 +1363,6 @@ fn decode_log_cursor<K: SortKey, T>(
             .decode(token)
             .map(Some)
             .map_err(|e| AiDataResponse::err_coded(e.code(), e.refusal(surface))),
-    }
-}
-
-/// The keyset position of a served row. The statement compares `id` as TEXT,
-/// so the position is only exact when the stored id is the canonical
-/// lowercase-hyphenated form `Uuid::to_string` re-renders — every row the
-/// runner inserts is (`Uuid::new_v4().to_string()`). Anything else cannot be
-/// resumed after, and saying so beats minting a cursor that skips rows.
-fn log_row_position(id: &str, created_at: DateTime<Utc>) -> Result<KeysetPosition, String> {
-    match uuid::Uuid::parse_str(id) {
-        Ok(uuid) if uuid.to_string() == id => Ok(KeysetPosition {
-            at: created_at,
-            id: uuid,
-        }),
-        _ => Err(format!(
-            "row id {id:?} is not a canonical lowercase uuid, so the walk cannot resume after it"
-        )),
     }
 }
 
@@ -1400,31 +1382,10 @@ fn log_page<T, K: SortKey>(
     scope: &ScopeFingerprint<K>,
     id_of: fn(&T) -> &str,
 ) -> Result<(Vec<T>, BoundedReadMeta), String> {
-    let TaskRunLogPage { mut rows, counts } = fetched;
-    let keep = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
-    let has_more = rows.len() > keep;
-    // Refuse to mint a cursor that would skip rows (non-canonical id) before
-    // the page is built; a last page needs no cursor and so no such id.
-    if has_more {
-        if let Some((row, at)) = rows.get(keep - 1) {
-            log_row_position(id_of(row), *at)?;
-        }
-    }
-    let cursor_of = |(row, at): &(T, DateTime<Utc>)| {
-        log_row_position(id_of(row), *at)
-            .map(|pos| scope.encode(pos))
-            .unwrap_or_default()
-    };
-    let exact_total = counts
-        .map(|c| c.total)
-        .filter(|total| (*total > keep as i64) == has_more);
-    let page = match exact_total {
-        Some(total) => {
-            rows.truncate(keep);
-            Page::from_window_count(rows, limit, total, cursor_of)
-        }
-        None => Page::from_probe(rows, limit, cursor_of),
-    };
+    let TaskRunLogPage { rows, counts } = fetched;
+    let page = keyset_page(rows, limit, counts.map(|c| c.total), scope, |(row, at)| {
+        row_position(id_of(row), *at)
+    })?;
     let meta = page.meta();
     Ok((
         page.into_rows().into_iter().map(|(row, _)| row).collect(),
@@ -1460,7 +1421,7 @@ pub async fn get_task_run_playwright_results_from_db(
     limit: Option<i64>,
     cursor: Option<String>,
 ) -> Result<AiDataResponse<TaskRunPlaywrightResultsResult>, String> {
-    let limit = task_run_log_limit(limit);
+    let limit = TASK_RUN_LOG_PAGE.resolve(limit);
     let scope = CursorScope::<PlaywrightResultsWalk>::new()
         .opt_str("task_run_id", Some(&task_run_id))
         .finish();
@@ -1580,7 +1541,7 @@ pub async fn get_task_run_api_requests_from_db(
     limit: Option<i64>,
     cursor: Option<String>,
 ) -> Result<AiDataResponse<TaskRunApiRequestsResult>, String> {
-    let limit = task_run_log_limit(limit);
+    let limit = TASK_RUN_LOG_PAGE.resolve(limit);
     let scope = CursorScope::<ApiRequestsWalk>::new()
         .opt_str("task_run_id", Some(&task_run_id))
         .opt_str(
@@ -1651,7 +1612,7 @@ pub async fn get_task_run_awas_steps_from_db(
     limit: Option<i64>,
     cursor: Option<String>,
 ) -> Result<AiDataResponse<TaskRunAwasStepsResult>, String> {
-    let limit = task_run_log_limit(limit);
+    let limit = TASK_RUN_LOG_PAGE.resolve(limit);
     let scope = CursorScope::<AwasStepsWalk>::new()
         .opt_str("task_run_id", Some(&task_run_id))
         .opt_str("step_type", step_type.as_deref())
@@ -1897,11 +1858,11 @@ mod tests {
 
     #[test]
     fn limit_is_defaulted_and_clamped() {
-        assert_eq!(task_run_log_limit(None), TASK_RUN_LOG_PAGE_DEFAULT);
-        assert_eq!(task_run_log_limit(Some(0)), 1);
-        assert_eq!(task_run_log_limit(Some(-5)), 1);
-        assert_eq!(task_run_log_limit(Some(50)), 50);
-        assert_eq!(task_run_log_limit(Some(i64::MAX)), TASK_RUN_LOG_PAGE_MAX);
+        assert_eq!(TASK_RUN_LOG_PAGE.resolve(None::<i64>), 200);
+        assert_eq!(TASK_RUN_LOG_PAGE.resolve(Some(0_i64)), 1);
+        assert_eq!(TASK_RUN_LOG_PAGE.resolve(Some(-5_i64)), 1);
+        assert_eq!(TASK_RUN_LOG_PAGE.resolve(Some(50_i64)), 50);
+        assert_eq!(TASK_RUN_LOG_PAGE.resolve(Some(i64::MAX)), 1000);
     }
 
     #[test]

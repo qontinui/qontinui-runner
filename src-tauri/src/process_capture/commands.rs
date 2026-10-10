@@ -13,6 +13,14 @@ use crate::commands::AppState;
 
 use super::primary_proxy;
 use super::types::*;
+use crate::bounded_read::ReadLimit;
+
+/// Captured process sessions the process manager lists. Default 50, clamped to `1..=500`.
+const PROCESS_SESSIONS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Lines of one captured session's output a read returns. Default 5000, clamped to `1..=20000`.
+const PROCESS_OUTPUT_LINES_LIMIT: ReadLimit = ReadLimit::new(5000, 20000);
+/// Matches one process-log search returns. Default 200, clamped to `1..=1000`.
+const PROCESS_LOG_SEARCH_LIMIT: ReadLimit = ReadLimit::new(200, 1000);
 
 /// Start a managed process by ID.
 #[tauri::command]
@@ -248,7 +256,7 @@ pub async fn get_process_sessions_from_db(
 ) -> Result<Vec<crate::database::ProcessSession>, String> {
     state
         .pg_db
-        .get_process_sessions(config_id.as_deref(), limit.unwrap_or(50))
+        .get_process_sessions(config_id.as_deref(), PROCESS_SESSIONS_LIMIT.resolve(limit))
         .await
 }
 
@@ -262,7 +270,11 @@ pub async fn get_process_session_output_from_db(
 ) -> Result<Vec<crate::database::ProcessSessionOutputLine>, String> {
     state
         .pg_db
-        .get_process_session_output(&session_id, limit.unwrap_or(5000), offset.unwrap_or(0))
+        .get_process_session_output(
+            &session_id,
+            PROCESS_OUTPUT_LINES_LIMIT.resolve(limit),
+            offset.unwrap_or(0),
+        )
         .await
 }
 
@@ -303,7 +315,11 @@ pub async fn search_process_logs(
     }
     state
         .pg_db
-        .search_process_logs(&query, config_id.as_deref(), limit.unwrap_or(200))
+        .search_process_logs(
+            &query,
+            config_id.as_deref(),
+            PROCESS_LOG_SEARCH_LIMIT.resolve(limit),
+        )
         .await
 }
 

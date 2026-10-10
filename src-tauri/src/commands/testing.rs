@@ -11,6 +11,7 @@
 
 use super::compartments::{BridgeCompartment, StorageCompartment};
 use super::CommandResponse;
+use crate::bounded_read::ReadLimit;
 use crate::database::{CreateVerificationTestInput, TriggerPoint, VerificationTest};
 use crate::executor::{is_default_bridge_running_compartment, with_default_bridge_compartment};
 use crate::test_executor::{
@@ -23,6 +24,9 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
+
+/// Recent task runs the testing panel lists. Default 20, clamped to `1..=500`.
+const RECENT_TASK_RUNS_LIMIT: ReadLimit = ReadLimit::new(20, 500);
 
 /// Request to execute a single verification test
 #[derive(Debug, Serialize, Deserialize)]
@@ -1686,7 +1690,7 @@ pub async fn list_recent_task_runs(
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("[list_recent_task_runs] Called with limit: {:?}", limit);
-    let limit = limit.unwrap_or(20);
+    let limit = RECENT_TASK_RUNS_LIMIT.resolve(limit);
 
     let pg_runs = state.pg_db().list_recent_task_runs_pg(limit).await?;
 

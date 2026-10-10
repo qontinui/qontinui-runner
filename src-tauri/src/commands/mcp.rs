@@ -10,11 +10,13 @@
 //! - Call tools with arguments
 //! - Query MCP call history for task runs
 
+use crate::bounded_read::{decode_cursor, keyset_page, row_position, ReadLimit};
 use crate::commands::compartments::{IntegrationCompartment, StorageCompartment};
 use crate::mcp_client::{
-    CreateMcpServerInput, McpCallsResult, McpServerConfig, McpServerStatus, McpToolCallResult,
+    CreateMcpServerInput, McpCallRecord, McpServerConfig, McpServerStatus, McpToolCallResult,
     McpToolInfo, UpdateMcpServerInput,
 };
+use qontinui_types::page::{BoundedReadMeta, CursorScope, SortKey};
 use serde::Serialize;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -304,33 +306,114 @@ pub async fn call_mcp_tool(
 // MCP Call History Commands
 // ============================================================================
 
-/// Get MCP calls for a task run
+/// One keyset page of a run's MCP calls: the rows, the run's success/failure
+/// counts (FIRST page only — absent, not zero, on later pages), and the
+/// shared `BoundedReadMeta` keys. Pass `next_cursor` back as `cursor` for the
+/// next page.
+#[derive(Debug, Serialize)]
+pub struct TaskRunMcpCallsPage {
+    pub task_run_id: String,
+    pub calls: Vec<McpCallRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_count: Option<i64>,
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
+}
+
+/// An MCP-calls page: 200 rows by default, never more than 1000. Shared by the
+/// Tauri command and the agent-facing `GET /task-runs/{id}/mcp-calls`.
+pub const MCP_CALLS_PAGE: ReadLimit = ReadLimit::new(200, 1000);
+
+/// The keyset sequence of `task_run_mcp_calls`: `(created_at, id)` ascending.
+/// Both are written once by the INSERT and never updated (pinned by
+/// `bounded_read::tests::keyset_keys_have_no_update_site`).
+struct McpCallsWalk;
+impl SortKey for McpCallsWalk {
+    const ID: &'static str = "runner.task_run_mcp_calls:created_at,id:asc";
+}
+
+/// Why an MCP-calls page could not be served.
+#[derive(Debug)]
+pub enum McpCallsPageError {
+    /// The `cursor` was not minted by this read (wrong run, wrong filter,
+    /// garbage): `(code, refusal)` — the caller restarts without `cursor`.
+    Cursor(&'static str, String),
+    /// The store did not answer.
+    Store(String),
+}
+
+/// One keyset page of a run's MCP calls — the single implementation behind
+/// the Tauri command and the :9876 door. `limit` is resolved through
+/// [`MCP_CALLS_PAGE`]; the cursor is fingerprinted by the run and the success
+/// filter, so it cannot be replayed under another.
+pub async fn task_run_mcp_calls_page(
+    pg: &crate::database::pg::PgDb,
+    task_run_id: &str,
+    success_filter: Option<bool>,
+    limit: Option<i64>,
+    cursor: Option<&str>,
+    surface: &str,
+) -> Result<TaskRunMcpCallsPage, McpCallsPageError> {
+    let limit = MCP_CALLS_PAGE.resolve(limit);
+    let scope = CursorScope::<McpCallsWalk>::new()
+        .opt_str("task_run_id", Some(task_run_id))
+        .opt_str(
+            "success",
+            success_filter.map(|s| if s { "true" } else { "false" }),
+        )
+        .finish();
+    let after = decode_cursor(&scope, cursor)
+        .map_err(|e| McpCallsPageError::Cursor(e.code(), e.refusal(surface)))?;
+    let fetched = pg
+        .get_task_run_mcp_calls_page(task_run_id, success_filter, after, limit)
+        .await
+        .map_err(McpCallsPageError::Store)?;
+    let page = keyset_page(
+        fetched.rows,
+        limit,
+        fetched.counts.map(|c| c.total),
+        &scope,
+        |(call, at)| row_position(&call.id, *at),
+    )
+    .map_err(McpCallsPageError::Store)?;
+    let meta = page.meta();
+    Ok(TaskRunMcpCallsPage {
+        task_run_id: task_run_id.to_string(),
+        calls: page.into_rows().into_iter().map(|(call, _)| call).collect(),
+        success_count: fetched.counts.map(|c| c.succeeded),
+        failed_count: fetched.counts.map(|c| c.failed),
+        page: meta,
+    })
+}
+
+/// Get one keyset page of a run's MCP calls. Omit `cursor` for the first page
+/// (which also carries the exact `total` and the success/failure counts);
+/// pass the previous page's `next_cursor` for the next.
 #[tauri::command]
 pub async fn get_task_run_mcp_calls(
     storage: State<'_, StorageCompartment>,
     task_run_id: String,
     success_filter: Option<bool>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> Result<McpResponse<McpCallsResult>, String> {
-    match storage
-        .pg_db()
-        .get_task_run_mcp_calls(&task_run_id, success_filter)
-        .await
+    limit: Option<i64>,
+    cursor: Option<String>,
+) -> Result<McpResponse<TaskRunMcpCallsPage>, String> {
+    match task_run_mcp_calls_page(
+        storage.pg_db(),
+        &task_run_id,
+        success_filter,
+        limit,
+        cursor.as_deref(),
+        "get_task_run_mcp_calls",
+    )
+    .await
     {
-        Ok(mut result) => {
-            // Apply offset/limit pagination to prevent large IPC payloads
-            let total_count = result.calls.len();
-            let off = offset.unwrap_or(0);
-            let lim = limit.unwrap_or(200);
-            let paginated: Vec<_> = result.calls.into_iter().skip(off).take(lim).collect();
-            let has_more = off + paginated.len() < total_count;
-            result.calls = paginated;
-            result.total_count = total_count;
-            result.has_more = has_more;
-            Ok(McpResponse::ok(result))
+        Ok(page) => Ok(McpResponse::ok(page)),
+        Err(McpCallsPageError::Cursor(code, refusal)) => {
+            Ok(McpResponse::err(format!("{code}: {refusal}")))
         }
-        Err(e) => {
+        Err(McpCallsPageError::Store(e)) => {
             error!("Failed to get task run MCP calls: {}", e);
             Ok(McpResponse::err(e))
         }

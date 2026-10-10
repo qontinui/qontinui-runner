@@ -85,7 +85,10 @@ mod tests {
             // 536 -> 535: task_run_events.rs `count_task_run_table` deleted —
             // the per-run log pages carry a window count (plan
             // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            baseline: 535,
+            // 535 -> 531: the four OFFSET paginators (MCP calls, orchestrator
+            // checkpoints, flow executions, learning outcomes) became keyset
+            // pages decoded with try_get (same plan, Phase 6).
+            baseline: 531,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),

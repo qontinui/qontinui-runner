@@ -7,10 +7,11 @@
 //!
 //! Returns the most recent `state_discovery_drift_scores` rows — optionally
 //! filtered by `spec_id` — sorted by `computed_at DESC`. `limit` is clamped
-//! to `[1, MAX_LIMIT]` so a stray `?limit=100000` can't DOS the DB.
+//! through `DRIFT_SCORES_LIMIT` so a stray `?limit=100000` can't DOS the DB.
 
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -21,11 +22,10 @@ use tracing::error;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
-/// Upper bound on the number of rows returned. The UI only renders the most
-/// recent widget and a short sparkline — it does not need the full history.
-const MAX_LIMIT: i64 = 100;
-/// Default row count when the caller omits `limit`.
-const DEFAULT_LIMIT: i64 = 20;
+/// Rows `GET /state-discovery/drift-scores` returns: 20 by default, never more
+/// than 100. The UI only renders the most recent widget and a short sparkline
+/// — it does not need the full history.
+const DRIFT_SCORES_LIMIT: ReadLimit = ReadLimit::new(20, 100);
 
 #[derive(Debug, Deserialize)]
 pub struct DriftScoresQuery {
@@ -39,7 +39,7 @@ pub struct DriftScoresQuery {
 /// - `spec_id` — optional; if omitted, matches `WHERE spec_id IS NULL` to
 ///   mirror the current drift-detector which writes NULL until SM configs
 ///   carry spec_id natively.
-/// - `limit` — optional; clamped to [1, MAX_LIMIT], default DEFAULT_LIMIT.
+/// - `limit` — optional; clamped through `DRIFT_SCORES_LIMIT`.
 #[expect(
     clippy::disallowed_methods,
     reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
@@ -48,7 +48,7 @@ pub async fn list_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DriftScoresQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = DRIFT_SCORES_LIMIT.resolve(query.limit);
 
     let conn = match state.app_state.pg_db.pool().get().await {
         Ok(c) => c,

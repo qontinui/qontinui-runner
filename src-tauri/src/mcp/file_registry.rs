@@ -13,10 +13,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
+use crate::bounded_read::ReadLimit;
 use crate::database::pg::session_touched_files::{HotFileRow, HotSessionRow};
 use crate::executor::file_registry::{FileConflict, FileLockInfo, FileRegistryInfo};
 use crate::mcp::types::ApiState;
 use crate::util::path_extraction::{extract_paths_via_ai, AiContextBundle, ExtractError};
+
+/// Hot files and hot sessions `GET /file-activity/heatmap` ranks. Default 25, clamped to `1..=100`.
+const HEATMAP_LIMIT: ReadLimit = ReadLimit::new(25, 100);
 
 // =============================================================================
 // Request / Response Types
@@ -401,7 +405,7 @@ async fn get_heatmap(
     Query(q): Query<HeatmapQuery>,
 ) -> Result<Json<HeatmapResponse>, (StatusCode, String)> {
     let window_secs = q.window_secs.unwrap_or(3600).clamp(60, 86_400);
-    let limit = q.limit.unwrap_or(25).clamp(1, 100);
+    let limit = HEATMAP_LIMIT.resolve(q.limit);
 
     let live = state.app_state.file_registry_manager.info().await;
 

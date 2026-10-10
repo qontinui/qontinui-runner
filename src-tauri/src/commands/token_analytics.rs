@@ -1,10 +1,14 @@
 //! Tauri commands for LLM observability / token usage analytics.
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::StorageCompartment;
 use crate::database::token_analytics::*;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
+
+/// Most expensive task runs the token-analytics panel ranks. Default 50, clamped to `1..=500`.
+const TASK_RUN_COSTS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 /// Get daily cost breakdown for the last N days (default: 7).
 #[tauri::command]
@@ -54,7 +58,7 @@ pub async fn get_task_run_costs(
     limit: Option<u32>,
 ) -> Result<Vec<TaskRunCostRow>, String> {
     let d = days.unwrap_or(7);
-    let l = limit.unwrap_or(50);
+    let l = TASK_RUN_COSTS_LIMIT.resolve(limit);
     state.pg_db().get_task_run_costs(d, l).await
 }
 

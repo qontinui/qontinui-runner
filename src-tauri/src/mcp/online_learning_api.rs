@@ -7,12 +7,18 @@
 //! - Strategy bank contents
 //! - Experience summaries
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Step types `GET /online-learning/step-scorecard` ranks. Default 20, clamped to `1..=200`.
+const STEP_SCORECARD_LIMIT: ReadLimit = ReadLimit::new(20, 200);
+/// Experience summaries `GET /online-learning/experiences` lists. Default 20, clamped to `1..=500`.
+const EXPERIENCES_LIMIT: ReadLimit = ReadLimit::new(20, 500);
 
 // =============================================================================
 // Query parameters
@@ -200,7 +206,7 @@ pub async fn get_step_scorecard(
     let scorecard = state
         .app_state
         .pg_db
-        .get_step_type_scorecard(query.limit.unwrap_or(20))
+        .get_step_type_scorecard(STEP_SCORECARD_LIMIT.resolve(query.limit))
         .await
         .map_err(|e| {
             (
@@ -243,7 +249,10 @@ pub async fn get_experiences(
     let experiences = state
         .app_state
         .pg_db
-        .get_experience_summaries(query.domain.as_deref(), query.limit.unwrap_or(20))
+        .get_experience_summaries(
+            query.domain.as_deref(),
+            EXPERIENCES_LIMIT.resolve(query.limit),
+        )
         .await
         .map_err(|e| {
             (

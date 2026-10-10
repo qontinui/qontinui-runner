@@ -20,6 +20,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::api_config::get_api_base_url;
+use crate::bounded_read::ReadLimit;
+
+/// Nearest RAG elements a semantic search returns. Default 10, clamped to `1..=100`.
+const RAG_SEMANTIC_SEARCH_LIMIT: ReadLimit = ReadLimit::new(10, 100);
 
 /// Send embedding results to the web backend
 ///
@@ -539,7 +543,7 @@ pub async fn search_rag_elements_semantic(
         project_id, query, limit, min_similarity
     );
 
-    let limit = limit.unwrap_or(10);
+    let limit = RAG_SEMANTIC_SEARCH_LIMIT.resolve(limit);
 
     // Validate min_similarity
     if let Some(score) = min_similarity {

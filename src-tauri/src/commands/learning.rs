@@ -3,16 +3,21 @@
 //! Provides access to learning data persisted in SQLite for displaying
 //! AI learning patterns, insights, and task outcome history.
 
+use crate::bounded_read::{decode_cursor, keyset_page, row_position, ReadLimit};
 use crate::commands::compartments::StorageCompartment;
 use crate::orchestrator::learning::{
     AnalysisResult, Feedback, Insight, LearningSummary, LearningSystem, Pattern, TaskOutcome,
 };
 use once_cell::sync::Lazy;
+use qontinui_types::page::{BoundedReadMeta, CursorScope, SortKey};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
+
+/// Recent task runs the learning dashboard pairs with their outcomes. Default 10, clamped to `1..=500`.
+const RECENT_TASKS_WITH_OUTCOMES_LIMIT: ReadLimit = ReadLimit::new(10, 500);
 
 /// Global learning system instance for in-memory analysis.
 /// The database stores outcomes; this provides real-time analysis.
@@ -34,7 +39,10 @@ pub async fn get_learning_summary(
     state: State<'_, StorageCompartment>,
 ) -> Result<LearningSummary, String> {
     // Get outcomes from database
-    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
+    let outcomes = state
+        .pg_db()
+        .get_learning_outcomes(LEARNING_ANALYSIS_WINDOW)
+        .await?;
     let patterns = state.pg_db().get_learning_patterns().await?;
 
     // Calculate summary from outcomes
@@ -141,7 +149,10 @@ pub async fn get_learning_insights(
     state: State<'_, StorageCompartment>,
 ) -> Result<Vec<Insight>, String> {
     // Load outcomes from database into the learning system
-    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
+    let outcomes = state
+        .pg_db()
+        .get_learning_outcomes(LEARNING_ANALYSIS_WINDOW)
+        .await?;
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
     // Rebuild system from database outcomes
@@ -162,7 +173,10 @@ pub async fn analyze_learning_data(
     state: State<'_, StorageCompartment>,
 ) -> Result<AnalysisResult, String> {
     // Load outcomes from database
-    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
+    let outcomes = state
+        .pg_db()
+        .get_learning_outcomes(LEARNING_ANALYSIS_WINDOW)
+        .await?;
     let result = {
         let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
@@ -230,7 +244,10 @@ pub async fn get_learning_dashboard_data(
     state: State<'_, StorageCompartment>,
 ) -> Result<LearningDashboardData, String> {
     // Load outcomes from database
-    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
+    let outcomes = state
+        .pg_db()
+        .get_learning_outcomes(LEARNING_ANALYSIS_WINDOW)
+        .await?;
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
     // Rebuild system from database outcomes
@@ -343,7 +360,10 @@ pub async fn record_task_outcome(
 pub async fn get_best_strategy(
     state: State<'_, StorageCompartment>,
 ) -> Result<Option<(String, f64)>, String> {
-    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
+    let outcomes = state
+        .pg_db()
+        .get_learning_outcomes(LEARNING_ANALYSIS_WINDOW)
+        .await?;
 
     let mut strategy_stats: std::collections::HashMap<String, (u32, u32)> =
         std::collections::HashMap::new();
@@ -369,7 +389,7 @@ pub async fn get_best_strategy(
 /// Export learning data as JSON for backup.
 #[tauri::command]
 pub async fn export_learning_data(state: State<'_, StorageCompartment>) -> Result<String, String> {
-    let outcomes = state.pg_db().get_learning_outcomes(None).await?;
+    let outcomes = state.pg_db().export_all_learning_outcomes().await?;
     let patterns = state.pg_db().get_learning_patterns().await?;
 
     let export = serde_json::json!({
@@ -488,13 +508,30 @@ pub struct LearningOutcomeFilter {
     pub limit: Option<i64>,
 }
 
-/// Paginated result wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaginatedResult<T> {
-    pub items: T,
-    pub total: i64,
-    pub offset: i64,
-    pub limit: i64,
+/// The recent window the dashboard analyses (stats, strategy and architecture
+/// comparisons, recommendations) compute over: the newest 500 outcomes. A
+/// window by design, not the corpus — export walks every row instead.
+const LEARNING_ANALYSIS_WINDOW: i64 = 500;
+
+/// One keyset page of learning outcomes, newest first: the rows plus the
+/// shared `BoundedReadMeta` keys. Pass `next_cursor` back as `cursor` for the
+/// next page.
+#[derive(Debug, Clone, Serialize)]
+pub struct LearningOutcomesPage {
+    pub items: Vec<serde_json::Value>,
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
+}
+
+/// A learning-outcomes page: 50 rows by default, never more than 500.
+const LEARNING_OUTCOMES_PAGE: ReadLimit = ReadLimit::new(50, 500);
+
+/// The keyset sequence of `learning_outcomes`: `(created_at, id)` descending.
+/// Neither column has an UPDATE site (pinned by
+/// `bounded_read::tests::keyset_keys_have_no_update_site`).
+struct LearningOutcomesWalk;
+impl SortKey for LearningOutcomesWalk {
+    const ID: &'static str = "runner.learning_outcomes:created_at,id:desc";
 }
 
 /// Get learning outcomes with optional filtering.
@@ -514,24 +551,38 @@ pub async fn get_learning_outcomes_filtered(
         .await
 }
 
-/// Get learning outcomes with pagination.
+/// Get one keyset page of learning outcomes, newest first. Omit `cursor` for
+/// the first page (which also carries the exact `total`); pass the previous
+/// page's `next_cursor` for the next.
 #[tauri::command]
 pub async fn get_learning_outcomes_paginated(
     state: State<'_, StorageCompartment>,
-    offset: i64,
-    limit: i64,
-) -> Result<PaginatedResult<Vec<serde_json::Value>>, String> {
-    let items = state
+    limit: Option<i64>,
+    cursor: Option<String>,
+) -> Result<LearningOutcomesPage, String> {
+    let limit = LEARNING_OUTCOMES_PAGE.resolve(limit);
+    let scope = CursorScope::<LearningOutcomesWalk>::new().finish();
+    let after = decode_cursor(&scope, cursor.as_deref()).map_err(|e| {
+        format!(
+            "{}: {}",
+            e.code(),
+            e.refusal("get_learning_outcomes_paginated")
+        )
+    })?;
+    let rows = state
         .pg_db()
-        .get_learning_outcomes_paginated(offset, limit)
+        .get_learning_outcomes_page(after, limit)
         .await?;
-    let total = state.pg_db().get_learning_outcomes_count().await?;
-    Ok(PaginatedResult {
-        items,
-        total,
-        offset,
-        limit,
-    })
+    let total = match after {
+        None => Some(state.pg_db().get_learning_outcomes_count().await?),
+        Some(_) => None,
+    };
+    let page = keyset_page(rows, limit, total, &scope, |(row, at)| {
+        row_position(row["id"].as_str().unwrap_or_default(), *at)
+    })?;
+    let meta = page.meta();
+    let items = page.into_rows().into_iter().map(|(row, _)| row).collect();
+    Ok(LearningOutcomesPage { items, page: meta })
 }
 
 /// Get learning statistics for a date range.
@@ -566,7 +617,7 @@ pub async fn get_recent_tasks_with_outcomes(
     state: State<'_, StorageCompartment>,
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let limit = limit.unwrap_or(10);
+    let limit = RECENT_TASKS_WITH_OUTCOMES_LIMIT.resolve(limit);
     state
         .pg_db()
         .get_recent_task_runs_with_outcomes(limit)

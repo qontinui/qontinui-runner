@@ -22,7 +22,15 @@ use crate::reflection::{
     fuzzy_matching, graph_engine::KnowledgeGraph, graph_types::GraphSummary, unified_search,
 };
 
+use crate::bounded_read::ReadLimit;
 use crate::database::types::{Observation, ObservationSearchResult};
+
+/// Ranked results `GET /graph/search` returns. Default 20, clamped to `1..=100`.
+const GRAPH_SEARCH_LIMIT: ReadLimit = ReadLimit::new(20, 100);
+/// Ranked matches `GET /graph/similar-errors` returns. Default 10, clamped to `1..=100`.
+const SIMILAR_ERRORS_LIMIT: ReadLimit = ReadLimit::new(10, 100);
+/// Fused, ranked results `GET /memory/search` returns. Default 20, clamped to `1..=200`.
+const MEMORY_SEARCH_LIMIT: ReadLimit = ReadLimit::new(20, 200);
 
 // ============================================================================
 // Observation loading helper (async PG fetch for sync graph build)
@@ -372,7 +380,7 @@ async fn search_handler(
     Json<ApiResponse<Vec<unified_search::UnifiedSearchResult>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let limit = query.limit.unwrap_or(20);
+    let limit = GRAPH_SEARCH_LIMIT.resolve(query.limit);
     let results = state
         .app_state
         .pg_db
@@ -600,7 +608,7 @@ async fn similar_errors_handler(
 ) -> Result<Json<ApiResponse<Vec<fuzzy_matching::SimilarError>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
     let min_similarity = query.min_similarity.unwrap_or(0.6);
-    let limit = query.limit.unwrap_or(10);
+    let limit = SIMILAR_ERRORS_LIMIT.resolve(query.limit);
     let results = state
         .app_state
         .pg_db
@@ -817,7 +825,7 @@ async fn memory_search_handler(
 
     let params = UnifiedMemoryQuery {
         query: query.q.clone(),
-        limit: query.limit.unwrap_or(20),
+        limit: MEMORY_SEARCH_LIMIT.resolve(query.limit),
         sources,
         from,
         to,

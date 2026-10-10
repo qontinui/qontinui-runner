@@ -36,7 +36,7 @@ import type {
   ProcessSession,
   ProcessSessionOutputLine,
 } from "../types/aiData";
-import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
+import type { TaskRunMcpCallDb, TaskRunMcpCallsDbResult } from "../types/mcp-config";
 
 // Thin wrappers for GraphQL subscriptions used for cache invalidation
 function useRunnerEventsForInvalidation() {
@@ -573,34 +573,34 @@ export function useTaskRunAwasSteps(taskRunId: string | null, stepType?: string,
 }
 
 /**
- * Hook to get MCP calls from SQLite database.
+ * Hook to walk a run's MCP calls by keyset cursor. `fetchNextPage` loads the
+ * following page; the merged walk is in `data`.
  * @param taskRunId - Task run ID to get MCP calls for
  * @param successFilter - Optional filter by success status
+ * @param limit - Page size (default 200, max 1000)
  */
 export function useTaskRunMcpCalls(
   taskRunId: string | null,
   successFilter?: boolean,
   limit?: number,
-  offset?: number,
 ) {
-  return useQuery({
-    queryKey: [...aiDataKeys.taskRunMcpCalls(taskRunId ?? "", successFilter), limit, offset],
-    queryFn: async (): Promise<TaskRunMcpCallsDbResult | null> => {
-      if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunMcpCalls(
-        taskRunId,
-        successFilter,
-        limit,
-        offset,
-      );
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load MCP calls");
-      }
-      return response.data;
-    },
+  const query = useInfiniteQuery({
+    queryKey: [...aiDataKeys.taskRunMcpCalls(taskRunId ?? "", successFilter), limit],
+    queryFn: async ({ pageParam }): Promise<TaskRunMcpCallsDbResult> =>
+      pageOrThrow(
+        await aiDataService.getTaskRunMcpCalls(taskRunId ?? "", successFilter, limit, pageParam),
+        "MCP calls",
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: !!taskRunId,
     staleTime: 10000,
   });
+  const data = useMemo(
+    () => mergeWalk<TaskRunMcpCallsDbResult, TaskRunMcpCallDb>(query.data?.pages, (p) => p.calls),
+    [query.data],
+  );
+  return { ...query, data };
 }
 
 /**

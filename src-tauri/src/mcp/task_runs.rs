@@ -9,11 +9,19 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::bounded_read::ReadLimit;
 use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::safe_lock::safe_lock_or_recover;
 use crate::unified_workflows::UnifiedWorkflowExt;
+
+/// Task runs `GET /task-runs` lists, most recently updated first. Default 50, clamped to `1..=500`.
+const TASK_RUNS_LIST_LIMIT: ReadLimit = ReadLimit::new(50, 500);
+/// Step checkpoints one `GET /task-runs/{id}/checkpoints` page holds. Default 50, clamped to `1..=100`.
+const CHECKPOINTS_PAGE_LIMIT: ReadLimit = ReadLimit::new(50, 100);
+/// Spans `GET /execution-spans` returns. Default 100, clamped to `1..=1000`.
+const EXECUTION_SPANS_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 /// PG-primary get_task_run helper.
 async fn pg_get_task_run(state: &Arc<ApiState>, id: &str) -> Result<Option<TaskRun>, String> {
@@ -42,7 +50,7 @@ pub async fn list_task_runs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ListTaskRunsQuery>,
 ) -> Result<Json<ApiResponse<Vec<TaskRun>>>, (StatusCode, String)> {
-    let limit = query.limit.unwrap_or(50);
+    let limit = TASK_RUNS_LIST_LIMIT.resolve(query.limit);
     let workflow_type = query.workflow_type;
     let port = state
         .app_state
@@ -888,7 +896,7 @@ pub async fn get_task_run_checkpoints(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
+    let limit = CHECKPOINTS_PAGE_LIMIT.resolve(query.limit);
 
     let (checkpoints, next_cursor) = state
         .app_state
@@ -1053,15 +1061,21 @@ pub async fn get_task_run_verification_phase_results(
 pub struct McpCallsQuery {
     /// Filter by success status (optional)
     success: Option<bool>,
-    /// Limit number of results (optional, default: all)
-    limit: Option<u32>,
+    /// Page size (default 200, clamped to 1..=1000)
+    limit: Option<i64>,
+    /// The previous page's `next_cursor`; omit for the first page.
+    cursor: Option<String>,
 }
 
-/// Get MCP tool calls for a task run.
+/// Get one keyset page of a task run's MCP tool calls, in call order —
+/// server, tool, arguments, response and timing for each.
 ///
-/// Returns all MCP tool calls made during the task execution,
-/// including server info, tool name, arguments, response, and timing.
-/// Useful for AI to understand what external tools were used.
+/// The response carries the shared bounded-read keys (`count`, `limit`,
+/// `shown`, `total`, `truncated`, `bound_kind`, `next_cursor`, …): pass
+/// `next_cursor` back as `cursor` until it is `null` to read the whole run.
+/// The first page also carries `summary` (the whole run's counts); later
+/// pages carry `summary: null`. A cursor this read did not mint is a 400
+/// naming `cursor`.
 pub async fn get_task_run_mcp_calls(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1076,39 +1090,41 @@ pub async fn get_task_run_mcp_calls(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    // Get MCP calls
-    let result = state
-        .app_state
-        .pg_db
-        .get_task_run_mcp_calls(&id, query.success)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    // Apply limit if specified
-    let calls = if let Some(limit) = query.limit {
-        result
-            .calls
-            .into_iter()
-            .take(limit as usize)
-            .collect::<Vec<_>>()
-    } else {
-        result.calls
-    };
-
-    Ok(Json(serde_json::json!({
-        "task_run_id": id,
-        "task_name": task.task_name,
-        "calls": calls,
-        "summary": {
-            "total": result.count,
-            "success": result.success_count,
-            "failed": result.failed_count
-        },
-        "query": {
-            "success_filter": query.success,
-            "limit": query.limit
+    let page = crate::commands::mcp::task_run_mcp_calls_page(
+        &state.app_state.pg_db,
+        &id,
+        query.success,
+        query.limit,
+        query.cursor.as_deref(),
+        "GET /task-runs/{id}/mcp-calls",
+    )
+    .await
+    .map_err(|e| match e {
+        crate::commands::mcp::McpCallsPageError::Cursor(code, refusal) => {
+            (StatusCode::BAD_REQUEST, format!("{code}: {refusal}"))
         }
-    })))
+        crate::commands::mcp::McpCallsPageError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
+    })?;
+
+    let summary = match (page.success_count, page.failed_count) {
+        (Some(success), Some(failed)) => serde_json::json!({
+            "total": success + failed,
+            "success": success,
+            "failed": failed
+        }),
+        _ => serde_json::Value::Null,
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("task_run_id".into(), serde_json::json!(id));
+    body.insert("task_name".into(), serde_json::json!(task.task_name));
+    body.insert("calls".into(), serde_json::json!(page.calls));
+    body.insert("summary".into(), summary);
+    body.insert(
+        "query".into(),
+        serde_json::json!({ "success_filter": query.success }),
+    );
+    page.page.insert_into(&mut body);
+    Ok(Json(serde_json::Value::Object(body)))
 }
 
 /// Query parameters for API requests endpoint.
@@ -1930,6 +1946,7 @@ pub async fn get_execution_spans(
     axum::extract::Query(query): axum::extract::Query<ExecutionSpansQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let execution_id = query.execution_id.as_deref().unwrap_or("");
+    let limit = EXECUTION_SPANS_LIMIT.resolve(query.limit);
     let spans = state
         .app_state
         .pg_db
@@ -1937,7 +1954,7 @@ pub async fn get_execution_spans(
             execution_id,
             query.name_pattern.as_deref(),
             query.min_duration_ms,
-            Some(query.limit.unwrap_or(100)),
+            Some(limit),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1949,7 +1966,7 @@ pub async fn get_execution_spans(
             "execution_id": query.execution_id,
             "name_pattern": query.name_pattern,
             "min_duration_ms": query.min_duration_ms,
-            "limit": query.limit.unwrap_or(100)
+            "limit": limit
         }
     })))
 }

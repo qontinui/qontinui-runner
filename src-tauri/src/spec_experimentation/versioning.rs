@@ -3,7 +3,11 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::bounded_read::ReadLimit;
 use crate::database::pg::PgDb;
+
+/// A spec's versions one history read returns. Default 50, clamped to `1..=500`.
+const VERSION_HISTORY_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -196,7 +200,7 @@ pub async fn get_version_history(
     spec_id: &str,
     limit: Option<i64>,
 ) -> Result<Vec<SpecVersion>, String> {
-    let limit = limit.unwrap_or(50);
+    let limit = VERSION_HISTORY_LIMIT.resolve(limit);
     let rows = pg.get_spec_version_history(spec_id, limit).await?;
     Ok(rows
         .into_iter()

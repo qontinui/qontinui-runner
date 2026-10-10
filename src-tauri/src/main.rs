@@ -163,6 +163,11 @@ mod git_trunk;
 // D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
 // no live observer's scope covers, ranked by information value.
 mod blind_spots;
+// The bounded-read contract's runner half: named, clamped `limit`s and the
+// shared keyset-cursor glue, plus the census that keeps every `limit` site on
+// it (plan `2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus`,
+// Phase 6).
+mod bounded_read;
 // Runner-local GitHub REST budget meter + ETag cache (plan
 // `2026-08-30-github-rest-budget-is-structurally-oversubscribed`, Phase A).
 // The runner spends the operator's USER token (`gh auth token`) at ~62 req/min
@@ -2857,7 +2862,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checkpoint_browser::start_replay_session,
             commands::checkpoints::checkpoint_delete,
             commands::checkpoints::checkpoint_get,
-            commands::checkpoints::checkpoint_history,
             commands::checkpoints::checkpoint_list_active,
             commands::checkpoints::checkpoint_save,
             commands::checkpoints::checkpoint_status,

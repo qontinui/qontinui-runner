@@ -10,7 +10,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::bounded_read::ReadLimit;
 use crate::mcp::types::ApiState;
+
+/// Audit events `GET /security/audit/events` returns. Default 100, clamped to `1..=1000`.
+const AUDIT_EVENTS_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 #[derive(Debug, Deserialize)]
 struct AuditEventsQuery {
@@ -62,7 +66,7 @@ async fn get_audit_events(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<AuditEventsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let limit = params.limit.unwrap_or(100).min(1000);
+    let limit = AUDIT_EVENTS_LIMIT.resolve(params.limit);
 
     match state
         .app_state

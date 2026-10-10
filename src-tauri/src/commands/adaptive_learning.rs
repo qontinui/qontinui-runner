@@ -4,11 +4,19 @@
 //! GEPA optimization history, and learning statistics.
 //! All queries go through PostgreSQL via `state.pg_db()`.
 
+use crate::bounded_read::ReadLimit;
 use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
+
+/// Playbook entries the adaptive-learning panel lists. Default 100, clamped to `1..=500`.
+const PLAYBOOK_ENTRIES_LIMIT: ReadLimit = ReadLimit::new(100, 500);
+/// Curated examples the adaptive-learning panel lists. Default 20, clamped to `1..=500`.
+const CURATED_EXAMPLES_LIMIT: ReadLimit = ReadLimit::new(20, 500);
+/// GEPA optimisation runs the adaptive-learning panel lists. Default 50, clamped to `1..=500`.
+const GEPA_RUNS_LIMIT: ReadLimit = ReadLimit::new(50, 500);
 
 // ============================================================================
 // Response types
@@ -109,7 +117,7 @@ pub async fn get_playbook_entries(
     limit: Option<u32>,
 ) -> Result<Vec<PlaybookEntryResponse>, String> {
     let pg = state.pg_db();
-    let limit = limit.unwrap_or(100) as i64;
+    let limit = PLAYBOOK_ENTRIES_LIMIT.resolve(limit) as i64;
 
     let rows = pg
         .list_playbook_entries(domain.as_deref(), status.as_deref(), limit)
@@ -143,7 +151,7 @@ pub async fn get_curated_examples(
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let pg = state.pg_db();
-    let limit = limit.unwrap_or(20) as i64;
+    let limit = CURATED_EXAMPLES_LIMIT.resolve(limit) as i64;
     pg.get_curated_examples_by_domain(&domain, limit).await
 }
 
@@ -179,7 +187,7 @@ pub async fn get_gepa_runs(
     limit: Option<u32>,
 ) -> Result<Vec<GepaRunResponse>, String> {
     let pg = state.pg_db();
-    let limit = limit.unwrap_or(50) as i64;
+    let limit = GEPA_RUNS_LIMIT.resolve(limit) as i64;
     let rows = pg.get_recent_gepa_runs(limit).await?;
 
     let runs = rows

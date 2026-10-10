@@ -10,6 +10,7 @@
 //! - Custom: Any command-line tool
 
 use super::CommandResponse;
+use crate::bounded_read::ReadLimit;
 use crate::check_executor::{
     detect_project_checks, execute_check, execute_check_suite, CheckDefinition,
     CheckExecutionResult, CheckSuiteSummary, CheckToolInfoSerialized, ProjectDetectionResult,
@@ -24,6 +25,9 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
+
+/// One check's recent results. Default 10, clamped to `1..=500`.
+const CHECK_RESULTS_LIMIT: ReadLimit = ReadLimit::new(10, 500);
 
 // ============================================================================
 // Request/Response Types
@@ -420,7 +424,7 @@ pub async fn get_check_results(
     limit: Option<u32>,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let limit = limit.unwrap_or(10);
+    let limit = CHECK_RESULTS_LIMIT.resolve(limit);
 
     match state.pg_db().get_check_results(&check_id, limit).await {
         Ok(results) => Ok(CommandResponse {

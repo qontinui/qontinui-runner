@@ -7,8 +7,12 @@
 //! so all timestamps are cast to TEXT in SQL and extracted as String.
 
 use super::PgDb;
+use crate::bounded_read::ReadLimit;
 use serde_json::json;
 use std::collections::HashMap;
+
+/// Error events one query returns (GraphQL `errorEvents`, `POST /query`, and the error-monitor commands). Default 100, clamped to `1..=1000`.
+const ERROR_EVENTS_QUERY_LIMIT: ReadLimit = ReadLimit::new(100, 1000);
 
 /// Coerce a parser-scraped timestamp into something Postgres will accept as
 /// `timestamptz`, or `None`.
@@ -792,7 +796,7 @@ impl PgDb {
             param_idx += 1;
         }
 
-        let limit_val = limit.unwrap_or(100) as i64;
+        let limit_val = ERROR_EVENTS_QUERY_LIMIT.resolve(limit) as i64;
         let limit_param = format!("${}", param_idx);
         params.push(Box::new(limit_val));
 
