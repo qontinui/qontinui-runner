@@ -168,6 +168,11 @@ or non-2xx → `unknown` / `producer_failed`; the frame capture was attempted an
 failed (window gone, device capture error) → `unknown` / `producer_failed`,
 with `unknown.detail` saying it was the capture.
 
+An `absent` always carries `coverage.considered` of at least 1 — the canon
+refuses `absent` over nothing considered. When the model returned zero blocks,
+the item considered is the region it read: `{"considered": 1, "measured": 1,
+"unmeasured": []}`. Otherwise coverage counts raw model blocks.
+
 An unknown answer:
 
 ```json
