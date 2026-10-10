@@ -13,10 +13,12 @@ default contexts at import time — which is why it is an import-time side
 effect placed ahead of every other import, not a call inside ``main()``.
 
 Plan ``2026-10-10-spec-front-end-phase-9-generic-boundary``, Phase 5 (C3).
-The runner additionally exports ``SSL_CERT_FILE`` when the machine profile
-names ``network.ca_bundle``; with ``truststore`` injected the OS store is the
-primary source and that bundle covers the machines where the root lives only
-in a file.
+The corporate root must therefore be in the OS store. The runner deliberately
+does NOT export ``SSL_CERT_FILE`` from the profile's ``network.ca_bundle``: on
+Linux that variable REPLACES the system trust store (OpenSSL, which
+``truststore`` uses there, reads only the named file), so it would remove the
+public roots rather than add the corporate one. ``network.ca_bundle`` reaches
+Node only, through the additive ``NODE_EXTRA_CA_CERTS``.
 """
 
 from __future__ import annotations

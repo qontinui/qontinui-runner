@@ -4,10 +4,17 @@
 //!
 //! On a managed machine IT installs the corporate root into the OS trust
 //! store, so every stack must read that store; no product-level CA option is
-//! added for Rust code. The two stacks that cannot read it natively (Node, and
-//! Python without `truststore`) take the profile's `network.ca_bundle` through
-//! `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`, which
-//! [`super::apply_profile_environment`] exports.
+//! added for Rust code. Node cannot read the store natively and takes the
+//! profile's `network.ca_bundle` through `NODE_EXTRA_CA_CERTS`, which
+//! [`super::apply_profile_environment`] exports; the Python bridge reads the
+//! store through `truststore`.
+//!
+//! `network.ca_bundle` is exported to Node ONLY, as the additive
+//! `NODE_EXTRA_CA_CERTS`. It is never exported as `SSL_CERT_FILE`: on Linux
+//! that variable REPLACES the system trust store for rustls-native-certs and
+//! OpenSSL (and so for `truststore` in the Python bridge), which would drop
+//! the public roots instead of adding the corporate one. Python therefore
+//! reads the OS store only, through `truststore`.
 //!
 //! [`census`] is the table the config report's `tls_trust` layer prints, so a
 //! deployment can show its security team what it trusts. Each row says how its
@@ -15,7 +22,7 @@
 //! configured (a setting whose only trust source is the OS store), or UNKNOWN.
 //! A row nobody measured is never rendered `os-store`.
 
-use super::{ProxyEnvOutcome, TrustMode};
+use super::{GitTrustDecision, ProxyEnvOutcome};
 
 /// Where a stack's trust anchors come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -63,7 +70,6 @@ pub fn census(outcome: Option<&ProxyEnvOutcome>) -> Vec<TrustRow> {
 /// any host.
 pub fn census_for(outcome: Option<&ProxyEnvOutcome>, windows: bool) -> Vec<TrustRow> {
     let ca_bundle = outcome.and_then(|o| o.ca_bundle.as_deref());
-    let trust = outcome.map(|o| o.trust);
     let mut rows = vec![
         TrustRow {
             stack: "reqwest 0.13 (HTTP clients, OTLP export, updater)",
@@ -95,47 +101,69 @@ pub fn census_for(outcome: Option<&ProxyEnvOutcome>, windows: bool) -> Vec<Trust
         },
     ];
 
-    rows.push(
-        match (
-            windows,
-            trust,
-            outcome.and_then(|o| o.git_ssl_backend.as_deref()),
-        ) {
-            (true, _, Some(backend)) => TrustRow {
-                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-                source: format!("http.sslBackend={backend} (GIT_CONFIG_* exported at startup)"),
-                verdict: TrustVerdict::OsStore,
-                basis: "configured: Git for Windows' Schannel backend has the Windows store as \
-                    its only trust source; not measured on CI"
-                    .into(),
-            },
-            (true, Some(TrustMode::Bundled), None) => TrustRow {
-                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-                source: "Git for Windows' OpenSSL bundle (network.trust = bundled)".into(),
-                verdict: TrustVerdict::Bundled,
-                basis: "configured: the profile opted out of Schannel".into(),
-            },
-            (true, _, None) => TrustRow {
-                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-                source: "Git for Windows default backend (an operator GIT_CONFIG_* or an \
-                     unreadable count left http.sslBackend unset by the runner)"
-                    .into(),
-                verdict: TrustVerdict::Unknown,
-                basis: "the runner did not set the backend; whatever the machine's git config \
-                    says applies"
-                    .into(),
-            },
-            (false, _, _) => TrustRow {
-                stack: "git subprocesses (agent_pusher, canonical_corpus, ci_node)",
-                source: "the system git's libcurl TLS backend".into(),
-                verdict: TrustVerdict::Unknown,
-                basis: "not measured: depends on how the distribution built libcurl \
+    const GIT: &str = "git subprocesses (agent_pusher, canonical_corpus, ci_node)";
+    let machine = "the machine's own git config (http.sslBackend / http.sslCAInfo, or Git \
+                   for Windows' default OpenSSL bundle when it names neither)";
+    rows.push(match (windows, outcome.map(|o| o.git_trust)) {
+        (false, _) | (_, Some(GitTrustDecision::NotWindows)) => TrustRow {
+            stack: GIT,
+            source: "the system git's libcurl TLS backend".into(),
+            verdict: TrustVerdict::Unknown,
+            basis: "not measured: depends on how the distribution built libcurl \
                     (OpenSSL reads the system CA file; GnuTLS builds honour only \
-                    GIT_SSL_CAINFO)"
-                    .into(),
-            },
+                    GIT_SSL_CAINFO); the runner never changes it off Windows"
+                .into(),
         },
-    );
+        (true, Some(GitTrustDecision::Schannel)) => TrustRow {
+            stack: GIT,
+            source: "http.sslBackend=schannel (GIT_CONFIG_* exported at startup)".into(),
+            verdict: TrustVerdict::OsStore,
+            basis: "configured: the profile says network.trust = \"os\" and the machine's \
+                    git config chose no backend or CA file; Schannel's only trust source is \
+                    the Windows store; not measured on CI"
+                .into(),
+        },
+        (true, Some(GitTrustDecision::Bundled)) => TrustRow {
+            stack: GIT,
+            source: machine.into(),
+            verdict: TrustVerdict::Unknown,
+            basis: "network.trust = \"bundled\": the runner leaves git as the machine \
+                    configured it"
+                .into(),
+        },
+        (true, Some(GitTrustDecision::OperatorConfigured)) => TrustRow {
+            stack: GIT,
+            source: machine.into(),
+            verdict: TrustVerdict::Unknown,
+            basis: "the machine's git config (or the operator's GIT_CONFIG_*) already \
+                    chooses a TLS backend or CA file; the runner does not override it"
+                .into(),
+        },
+        (true, Some(GitTrustDecision::NotRequested)) => TrustRow {
+            stack: GIT,
+            source: machine.into(),
+            verdict: TrustVerdict::Unknown,
+            basis: "the profile does not say network.trust = \"os\", so the runner \
+                    leaves git alone; set it to point git at Schannel (the Windows store)"
+                .into(),
+        },
+        (true, Some(GitTrustDecision::ConfigUnreadable | GitTrustDecision::UnreadableCount)) => {
+            TrustRow {
+                stack: GIT,
+                source: machine.into(),
+                verdict: TrustVerdict::Unknown,
+                basis: "the startup step could not read git's configuration, so it left git \
+                        alone"
+                    .into(),
+            }
+        }
+        (true, None) => TrustRow {
+            stack: GIT,
+            source: machine.into(),
+            verdict: TrustVerdict::Unknown,
+            basis: "this process did not run the startup step".into(),
+        },
+    });
 
     rows.push(TrustRow {
         stack: "claude CLI (Node)",
@@ -153,13 +181,12 @@ pub fn census_for(outcome: Option<&ProxyEnvOutcome>, windows: bool) -> Vec<Trust
 
     rows.push(TrustRow {
         stack: "python-bridge (requests / httpx / aiohttp)",
-        source: match ca_bundle {
-            Some(p) => format!("truststore.inject_into_ssl() at startup; SSL_CERT_FILE={p}"),
-            None => "truststore.inject_into_ssl() at startup".into(),
-        },
+        source: "truststore.inject_into_ssl() at startup (OS store)".into(),
         verdict: TrustVerdict::Unknown,
         basis: "not measured on CI: the bridge's interpreter and its truststore install \
-                are not part of the Rust test host"
+                are not part of the Rust test host. network.ca_bundle is NOT passed to it: \
+                SSL_CERT_FILE would replace the OS store on Linux, so the corporate root \
+                must be in the OS store"
             .into(),
     });
     rows
@@ -574,38 +601,49 @@ mod tests {
     // The census rows themselves.
     // ---------------------------------------------------------------------
 
-    fn outcome(trust: TrustMode, git: Option<&str>, ca: Option<&str>) -> ProxyEnvOutcome {
+    fn outcome(git_trust: GitTrustDecision, ca: Option<&str>) -> ProxyEnvOutcome {
         ProxyEnvOutcome {
             arm: crate::outbound_net::ProxyEnvArm::None,
             proxy: None,
             profile: None,
-            no_proxy: "127.0.0.1,::1,localhost".into(),
+            no_proxy: String::new(),
             exported: vec![],
-            trust,
+            trust: None,
             ca_bundle: ca.map(str::to_string),
-            git_ssl_backend: git.map(str::to_string),
+            git_ssl_backend: (git_trust == GitTrustDecision::Schannel)
+                .then(|| "schannel".to_string()),
+            git_trust,
         }
     }
 
     #[test]
-    fn census_git_row_follows_the_exported_backend() {
-        let git = |rows: Vec<TrustRow>| {
-            rows.into_iter()
+    fn census_git_row_follows_the_startup_decision() {
+        let git = |o: Option<ProxyEnvOutcome>, windows: bool| {
+            census_for(o.as_ref(), windows)
+                .into_iter()
                 .find(|r| r.stack.starts_with("git"))
                 .unwrap()
         };
-        let on = git(census_for(
-            Some(&outcome(TrustMode::Os, Some("schannel"), None)),
-            true,
-        ));
+        let on = git(Some(outcome(GitTrustDecision::Schannel, None)), true);
         assert_eq!(on.verdict, TrustVerdict::OsStore);
         assert!(on.source.contains("schannel"));
-        let off = git(census_for(
-            Some(&outcome(TrustMode::Bundled, None, None)),
-            true,
-        ));
-        assert_eq!(off.verdict, TrustVerdict::Bundled);
-        let linux = git(census_for(Some(&outcome(TrustMode::Os, None, None)), false));
+        for d in [
+            GitTrustDecision::NotRequested,
+            GitTrustDecision::Bundled,
+            GitTrustDecision::OperatorConfigured,
+            GitTrustDecision::ConfigUnreadable,
+            GitTrustDecision::UnreadableCount,
+        ] {
+            let row = git(Some(outcome(d, None)), true);
+            assert_eq!(
+                row.verdict,
+                TrustVerdict::Unknown,
+                "{d:?}: the machine decides"
+            );
+            assert!(row.source.contains("machine's own git config"), "{d:?}");
+        }
+        assert_eq!(git(None, true).verdict, TrustVerdict::Unknown);
+        let linux = git(Some(outcome(GitTrustDecision::NotWindows, None)), false);
         assert_eq!(
             linux.verdict,
             TrustVerdict::Unknown,
@@ -616,7 +654,10 @@ mod tests {
     #[test]
     fn census_names_the_ca_bundle_for_node_and_python() {
         let rows = census_for(
-            Some(&outcome(TrustMode::Os, None, Some("/corp/root.pem"))),
+            Some(&outcome(
+                GitTrustDecision::NotWindows,
+                Some("/corp/root.pem"),
+            )),
             false,
         );
         let node = rows
@@ -628,7 +669,11 @@ mod tests {
             .iter()
             .find(|r| r.stack.starts_with("python-bridge"))
             .unwrap();
-        assert!(py.source.contains("SSL_CERT_FILE=/corp/root.pem"));
+        assert!(
+            !py.source.contains("SSL_CERT_FILE"),
+            "the bundle never reaches Python as SSL_CERT_FILE (it would replace the OS store)"
+        );
+        assert!(py.basis.contains("replace the OS store"));
         assert_eq!(py.verdict, TrustVerdict::Unknown);
         assert!(render_line(&rows).contains("sentry 0.35 (crash reports) = os-store"));
     }
