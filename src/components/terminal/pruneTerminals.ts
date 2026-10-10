@@ -15,6 +15,7 @@
 
 import type { TerminalTab } from "./useTerminalManager";
 import { pickLayout, type SessionState, type ZoneAssignments } from "./useZoneLayout";
+import { isNeedsInputState } from "./agentTruth";
 
 type PruneTab = Pick<
   TerminalTab,
@@ -72,7 +73,7 @@ export function hasAiSession(tab: PruneTab, signals: PruneSignals = {}): boolean
     return true;
   }
   const state = signals.sessionStates?.[tab.id];
-  if (state === "working" || state === "needs-input") return true;
+  if (state === "working" || isNeedsInputState(state)) return true;
   const { now } = signals;
   return (
     now !== undefined && tab.createdAt !== undefined && now - tab.createdAt < RECENT_TAB_GRACE_MS
