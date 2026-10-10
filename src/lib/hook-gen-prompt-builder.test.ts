@@ -169,22 +169,64 @@ describe("buildHookGenPrompt — RN smoke test reads coherently", () => {
  * verbatim into the journey ledger.
  */
 describe("buildHookGenPrompt — route patterns never come from the pathname", () => {
-  const frameworks = ["next.js", "react", "expo_router"];
+  // The framework keys the selector actually dispatches on (`nextjs` /
+  // `next_js` for NEXTJS_GUIDANCE — "next.js" selects nothing).
+  const frameworks = ["nextjs", "react", "expo_router"];
 
   for (const framework of frameworks) {
     const prompt = buildHookGenPrompt({ framework, project_path: "/x" }, [
       "route-awareness",
     ]);
 
-    it(`${framework}: teaches routePatternFromParams with patternSource`, () => {
-      expect(prompt).toContain("routePatternFromParams(");
+    it(`${framework}: asserts patternSource router`, () => {
       expect(prompt).toContain("patternSource: 'router'");
     });
 
-    it(`${framework}: never generates \`pattern: <pathname>\` code`, () => {
-      expect(prompt).not.toMatch(/pattern: (location\.)?pathname,/);
+    it(`${framework}: never generates a pathname as the pattern`, () => {
+      // Code only: prose that names the anti-pattern in backticks is allowed.
+      expect(prompt).not.toMatch(
+        /(?<!`)pattern:\s*(location\.)?(pathname|usePathname\(\))(?!`)/,
+      );
       expect(prompt).not.toMatch(/pattern: matches\[/);
       expect(prompt).not.toContain("routeStack: matches.map(m => m.pathname)");
+      expect(prompt).not.toContain("matched: matches.length > 0");
     });
   }
+
+  it("nextjs guidance teaches the not-found signal", () => {
+    const prompt = buildHookGenPrompt({ framework: "nextjs", project_path: "/x" }, [
+      "route-awareness",
+    ]);
+    expect(prompt).toContain("### Next.js App Router Integration");
+    expect(prompt).toContain("routePatternFromParams(pathname, params, { matched: true })");
+    expect(prompt).toContain("useRouteUnmatchedSignal()");
+    expect(prompt).toContain("<RouteUnmatchedContext.Provider value={unmatched}>");
+    expect(prompt).toContain("{ unmatched },");
+    expect(prompt).toContain("app/not-found.tsx");
+    expect(prompt).toContain("useMarkRouteUnmatched();");
+  });
+
+  it("react router guidance requires a path=\"*\" route marking the signal", () => {
+    const prompt = buildHookGenPrompt({ framework: "react", project_path: "/x" }, [
+      "route-awareness",
+    ]);
+    expect(prompt).toContain('A `path="*"` route is REQUIRED.');
+    expect(prompt).toContain("useRouteUnmatchedSignal()");
+    expect(prompt).toContain("useMarkRouteUnmatched();");
+    expect(prompt).toContain("templates the path as `[...*]`");
+  });
+
+  it("expo guidance builds the pattern from useSegments without the DOM barrel", () => {
+    const prompt = buildHookGenPrompt({ framework: "expo_router", project_path: "/x" }, [
+      "route-awareness",
+    ]);
+    const start = prompt.indexOf("Route Awareness (`useRouteAwareness`) — React Native");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = prompt.indexOf("\n### ", start + 1);
+    const section = prompt.slice(start, end === -1 ? undefined : end);
+    expect(section).toContain("pattern: unmatched ? null : '/' + segments.join('/')");
+    // The section's code imports no DOM barrel (prose may name it as a warning).
+    expect(section).not.toMatch(/^import .* from '@qontinui\/ui-bridge\/react'/m);
+    expect(section).not.toContain("routePatternFromParams(");
+  });
 });
