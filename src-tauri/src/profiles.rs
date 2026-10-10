@@ -137,9 +137,28 @@ pub struct NetworkProfile {
     #[serde(default)]
     pub no_proxy: Option<String>,
     /// A PEM bundle holding the corporate root, for the stacks that cannot
-    /// read the OS trust store (Node, Python).
+    /// read the OS trust store (Node, Python). Exported as
+    /// `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE`.
     #[serde(default)]
     pub ca_bundle: Option<PathBuf>,
+    /// Which trust source the runner points the stacks it CAN steer at.
+    /// Absent means [`TrustMode::Os`].
+    #[serde(default)]
+    pub trust: Option<TrustMode>,
+}
+
+/// `network.trust` (plan `2026-10-10-spec-front-end-phase-9-generic-boundary`
+/// decision C3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustMode {
+    /// The OS trust store everywhere — on Windows the runner's `git` is pointed
+    /// at Schannel (`http.sslBackend=schannel`) so it reads the Windows store.
+    #[default]
+    Os,
+    /// Leave each stack on its own bundle (opt-out; Git for Windows keeps its
+    /// OpenSSL bundle).
+    Bundled,
 }
 
 /// S3-compatible blob storage settings. `kind` distinguishes MinIO from
@@ -2226,6 +2245,7 @@ mod tests {
                         "no_proxy": ".internal.example.test",
                         "ca_bundle": "/etc/corp/root.pem"
                     }},
+                    "bundled": {"network": {"trust": "bundled"}},
                     "bare": {}
                 }
             }),
@@ -2238,8 +2258,11 @@ mod tests {
                 proxy_url: Some("http://proxy.example.test:3128".into()),
                 no_proxy: Some(".internal.example.test".into()),
                 ca_bundle: Some(std::path::PathBuf::from("/etc/corp/root.pem")),
+                trust: None,
             }
         );
+        let (bundled, _) = network_at(&path, Some("bundled")).unwrap();
+        assert_eq!(bundled.trust, Some(TrustMode::Bundled));
         // QONTINUI_ENV selects a profile without the block: no fallback to dev's.
         assert_eq!(network_at(&path, Some("bare")), None);
         assert_eq!(network_at(&dir.path().join("missing.json"), None), None);
