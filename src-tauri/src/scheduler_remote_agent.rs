@@ -187,9 +187,12 @@ pub(crate) fn compose_prompt(prompt: &str, mcp_connections: &[McpConnectionRef])
 /// When the operator selected the allow-list session posture
 /// (`settings.claude_session_permission`, plan
 /// `2026-10-09-spec-front-end-of-the-software-factory` D7), bypass is replaced by
-/// `--permission-mode dontAsk` and the tool list: the task's own
-/// `allowed_tools` when it declares any (the narrower intent), else the
-/// operator's list. `--allowedTools` is rendered by the shared
+/// `--permission-mode dontAsk` and a tool list that can only NARROW the
+/// operator's: the INTERSECTION of the task's `allowed_tools` and the
+/// operator's list (review M1), or the operator's list when the task declares
+/// none. A task whose tools share nothing with the operator's list is refused —
+/// running it with the task's wider list, or with none, would both be wrong.
+/// `--allowedTools` is rendered by the shared
 /// [`allowed_tools_args`](crate::claude_session::launch_spec::allowed_tools_args).
 pub(crate) fn claude_args(
     session_id: &str,
@@ -197,20 +200,29 @@ pub(crate) fn claude_args(
     allowed_tools: &[String],
     max_turns: u32,
     session_permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
-) -> Vec<String> {
-    use crate::claude_session::launch_spec::{allowed_tools_args, PermissionMode};
+) -> Result<Vec<String>, String> {
+    use crate::claude_session::launch_spec::{
+        allowed_tools_args, intersect_tool_lists, PermissionMode,
+    };
 
     let task_tools = allowed_tools_args(allowed_tools);
     let (permission, tools_tail) = match session_permission.apply(PermissionMode::DangerouslySkip) {
         PermissionMode::AllowList { tools } => {
-            let tail = if task_tools.is_empty() {
-                allowed_tools_args(&tools)
+            let effective = if task_tools.is_empty() {
+                tools.clone()
             } else {
-                task_tools
+                let kept = intersect_tool_lists(&tools, allowed_tools);
+                if kept.is_empty() {
+                    return Err(format!(
+                        "scheduled task refused: none of its allowed_tools {allowed_tools:?} is on \
+                         the operator's session allow-list {tools:?}"
+                    ));
+                }
+                kept
             };
             (
                 PermissionMode::AllowList { tools: Vec::new() }.render(),
-                tail,
+                allowed_tools_args(&effective),
             )
         }
         other => (other.render(), task_tools),
@@ -229,7 +241,7 @@ pub(crate) fn claude_args(
         args.push(m.to_string());
     }
     args.extend(tools_tail);
-    args
+    Ok(args)
 }
 
 /// Classify a child's end into the scheduler's `(success, error)` pair.
@@ -316,7 +328,7 @@ pub(crate) async fn launch(
         &spec.allowed_tools,
         spec.max_turns,
         &crate::settings::get_claude_session_permission(),
-    );
+    )?;
 
     let (mut child, _preconditions) =
         crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
@@ -495,7 +507,7 @@ mod tests {
 
     #[test]
     fn args_are_print_mode_bounded_and_pinned() {
-        let args = claude_args("sid-1", None, &[], 200, &Default::default());
+        let args = claude_args("sid-1", None, &[], 200, &Default::default()).unwrap();
         assert_eq!(
             args,
             vec![
@@ -512,7 +524,8 @@ mod tests {
     #[test]
     fn args_carry_model_and_one_token_per_allowed_tool() {
         let tools = vec!["Bash".to_string(), " Read ".to_string(), "".to_string()];
-        let args = claude_args("sid", Some("claude-opus-5"), &tools, 5, &Default::default());
+        let args =
+            claude_args("sid", Some("claude-opus-5"), &tools, 5, &Default::default()).unwrap();
         assert_eq!(
             args,
             vec![
@@ -531,14 +544,16 @@ mod tests {
         );
     }
 
+    /// Review M1: under the allow-list posture the task's tools are
+    /// INTERSECTED with the operator's list — a task can narrow, never widen.
     #[test]
-    fn allow_list_posture_replaces_bypass_and_prefers_the_task_tools() {
+    fn allow_list_posture_intersects_task_and_operator_tools() {
         use crate::claude_session::launch_spec::SessionPermissionSetting;
         let op = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string(), "Grep".to_string()],
         };
-        let task = vec!["Bash(git status)".to_string()];
-        let args = claude_args("sid", None, &task, 3, &op);
+        let task = vec!["Bash(git status)".to_string(), "Read".to_string()];
+        let args = claude_args("sid", None, &task, 3, &op).expect("non-empty intersection");
         assert_eq!(
             args,
             vec![
@@ -550,17 +565,31 @@ mod tests {
                 "--max-turns",
                 "3",
                 "--allowedTools",
-                "Bash(git status)"
+                "Read"
             ]
         );
-        assert!(!args.iter().any(|a| a.contains("dangerously")));
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("dangerously") || a.contains("Bash")));
 
         // No task tools: the operator's list applies.
-        let args = claude_args("sid", None, &[], 3, &op);
+        let args = claude_args("sid", None, &[], 3, &op).unwrap();
         assert_eq!(
             args[args.len() - 3..].to_vec(),
             vec!["--allowedTools", "Read", "Grep"]
         );
+    }
+
+    /// Review M1: a task whose tools share nothing with the operator's list is
+    /// refused rather than run with the task's (wider) list or with none.
+    #[test]
+    fn allow_list_posture_refuses_an_empty_intersection() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let op = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string()],
+        };
+        let err = claude_args("sid", None, &["Bash".to_string()], 3, &op).unwrap_err();
+        assert!(err.contains("allow-list"), "{err}");
     }
 
     #[test]

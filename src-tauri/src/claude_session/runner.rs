@@ -383,6 +383,9 @@ fn run_claude_session_inline(
 ) -> Result<CliSessionOutput, String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        return Err(refusal);
+    }
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};

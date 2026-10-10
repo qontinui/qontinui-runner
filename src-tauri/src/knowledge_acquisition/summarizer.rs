@@ -101,6 +101,9 @@ fn summarize_via(
 
     let resp = call
         .post_blocking(&client, crate::model_gateway::MESSAGES_PATH)
+        // Per request, not only per client: a gateway call uses the runner's
+        // own no-redirect client, which carries no timeout of its own.
+        .timeout(std::time::Duration::from_secs(30))
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(request_body)
@@ -225,6 +228,7 @@ mod gateway_routing_tests {
         let (base, server) = one_shot_messages_server("a summary");
         let mut decl = ModelGatewaySettings {
             base_url: Some(format!("{base}/llm")),
+            network_auth: true,
             ..Default::default()
         };
         decl.headers.insert("X-Route".into(), "kb".into());

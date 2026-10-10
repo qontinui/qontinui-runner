@@ -8,6 +8,8 @@ export interface ModelGatewaySettings {
   base_url?: string | null;
   headers?: Record<string, string>;
   api_key_helper?: string | null;
+  /** The gateway authenticates by network position / mTLS: no helper needed. */
+  network_auth?: boolean;
 }
 
 /** Mirrors `launch_spec::SessionPermissionSetting` (settings.json `claude_session_permission`). */
@@ -25,17 +27,29 @@ interface PermissionData {
   permission: SessionPermissionSetting;
 }
 
-/** `Name: Value` per line <-> header map. Blank lines are ignored. */
-export function parseHeaderLines(text: string): Record<string, string> {
-  const out: Record<string, string> = {};
+export interface ParsedHeaders {
+  headers: Record<string, string>;
+  /** Non-blank lines that are not `Name: Value` — surfaced, never dropped. */
+  malformed: string[];
+}
+
+/** `Name: Value` per line -> header map. Blank lines are ignored; any other
+ * line without a name before its first `:` is reported in `malformed`. */
+export function parseHeaderLines(text: string): ParsedHeaders {
+  const headers: Record<string, string> = {};
+  const malformed: string[] = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     const idx = line.indexOf(":");
-    if (idx <= 0) continue;
-    out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+    const name = idx > 0 ? line.slice(0, idx).trim() : "";
+    if (!name) {
+      malformed.push(line);
+      continue;
+    }
+    headers[name] = line.slice(idx + 1).trim();
   }
-  return out;
+  return { headers, malformed };
 }
 
 export function formatHeaderLines(headers: Record<string, string> | undefined): string {
@@ -44,12 +58,29 @@ export function formatHeaderLines(headers: Record<string, string> | undefined): 
     .join("\n");
 }
 
-/** One tool spec per line (or comma-separated) -> trimmed, non-blank list. */
+/** One tool spec per line (or comma-separated) -> trimmed, non-blank list.
+ * A comma or newline inside parentheses belongs to the specifier
+ * (`Bash(git log, status)` is one tool). */
 export function parseToolList(text: string): string[] {
-  return text
-    .split(/[\n,]/)
-    .map((t) => t.trim())
-    .filter((t) => t.length > 0);
+  const out: string[] = [];
+  let depth = 0;
+  let current = "";
+  const flush = () => {
+    const t = current.trim();
+    if (t) out.push(t);
+    current = "";
+  };
+  for (const ch of text) {
+    if (ch === "(") depth += 1;
+    if (ch === ")" && depth > 0) depth -= 1;
+    if ((ch === "," || ch === "\n") && depth === 0) {
+      flush();
+      continue;
+    }
+    current += ch;
+  }
+  flush();
+  return out;
 }
 
 /**
@@ -62,6 +93,7 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
   const [baseUrl, setBaseUrl] = useState("");
   const [headers, setHeaders] = useState("");
   const [helper, setHelper] = useState("");
+  const [networkAuth, setNetworkAuth] = useState(false);
   const [gatewayError, setGatewayError] = useState<string | null>(null);
   const [savingGateway, setSavingGateway] = useState(false);
 
@@ -77,6 +109,7 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
       setBaseUrl(gw.base_url ?? "");
       setHeaders(formatHeaderLines(gw.headers));
       setHelper(gw.api_key_helper ?? "");
+      setNetworkAuth(gw.network_auth === true);
       setGatewayError(g?.data?.valid === false ? (g.message ?? "invalid gateway") : null);
 
       const p = await invoke<TauriResult<PermissionData>>("get_claude_session_permission");
@@ -101,10 +134,17 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
     setSavingGateway(true);
     setGatewayError(null);
     try {
+      const parsed = parseHeaderLines(headers);
+      if (parsed.malformed.length > 0) {
+        throw new Error(
+          `header line(s) not in "Name: Value" form: ${parsed.malformed.join(" | ")}`,
+        );
+      }
       const gateway: ModelGatewaySettings = {
         base_url: baseUrl.trim() || null,
-        headers: parseHeaderLines(headers),
+        headers: parsed.headers,
         api_key_helper: helper.trim() || null,
+        network_auth: networkAuth,
       };
       await invoke("save_model_gateway", { gateway });
       onLog("success", baseUrl.trim() ? "Model gateway saved" : "Model gateway cleared");
@@ -150,7 +190,10 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
           When set, every model call goes through this gateway: spawned Claude sessions use it as
           their API base URL with the key from the helper command, and the runner&apos;s own API
           calls use it too. Subscription accounts and account rotation are off while a gateway is
-          set. Leave the URL empty to use your Claude subscription.
+          set, and the Gemini, pi and OpenAI-compatible providers are refused. Leave the URL empty
+          to use your Claude subscription. A repository&apos;s own{" "}
+          <code>.claude/settings.json</code> or managed settings take precedence over the
+          runner&apos;s session settings and can still redirect a session; govern those layers too.
         </p>
         <div className="space-y-1.5">
           <label htmlFor="model-gateway-base-url" className="text-xs font-medium">
@@ -178,8 +221,20 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
             className={inputClass}
           />
           <p className="text-[10px] text-muted-foreground">
-            A command that prints the gateway key. The key itself is never stored.
+            A command that prints the gateway key. The key itself is never stored. Required unless
+            the gateway authenticates by network position.
           </p>
+        </div>
+        <div className="space-y-1.5">
+          <label className="flex items-start gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={networkAuth}
+              onChange={(e) => setNetworkAuth(e.target.checked)}
+              className="mt-0.5 accent-primary"
+            />
+            <span>The gateway authenticates by network position or mTLS (no key helper)</span>
+          </label>
         </div>
         <div className="space-y-1.5">
           <label htmlFor="model-gateway-headers" className="text-xs font-medium">
@@ -227,8 +282,10 @@ export function ModelRoutingSection({ onLog }: { onLog: LogFunction }) {
             className="mt-0.5 accent-primary"
           />
           <span>
-            Allow-list: sessions run only the tools listed below and are refused anything else
-            without a prompt. Use this where managed Claude Code settings disable bypass mode.
+            Allow-list: the runner pre-approves only the tools listed below and never asks; a tool
+            nothing approved is refused. Settings layers the runner does not control (a
+            repository&apos;s <code>.claude/settings.json</code>, managed settings) can still
+            pre-approve more. Use this where managed Claude Code settings disable bypass mode.
           </span>
         </label>
         {allowListMode && (
