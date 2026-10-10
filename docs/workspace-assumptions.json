@@ -560,7 +560,8 @@
       "symbol": "booted_at",
       "excerpt": "cfg(windows)-only fn `booted_at` has no cfg(not(windows)) sibling in this file",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "note": "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
     },
     {
       "class": "os_bound_tooling",
@@ -568,7 +569,8 @@
       "symbol": "config_written_at",
       "excerpt": "cfg(windows)-only fn `config_written_at` has no cfg(not(windows)) sibling in this file",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "note": "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
     },
     {
       "class": "os_bound_tooling",
@@ -576,7 +578,8 @@
       "symbol": "live",
       "excerpt": "cfg(windows)-only fn `live` has no cfg(not(windows)) sibling in this file",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "note": "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
     },
     {
       "class": "os_bound_tooling",
@@ -584,7 +587,8 @@
       "symbol": "memory_management",
       "excerpt": "cfg(windows)-only fn `memory_management` has no cfg(not(windows)) sibling in this file",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "note": "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
     },
     {
       "class": "os_bound_tooling",
@@ -592,7 +596,8 @@
       "symbol": "reading",
       "excerpt": "cfg(windows)-only fn `reading` has no cfg(not(windows)) sibling in this file",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "note": "Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero."
     },
     {
       "class": "os_bound_tooling",

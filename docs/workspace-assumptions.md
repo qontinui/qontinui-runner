@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 110 | 111 | 105 | 5 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -256,7 +256,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (110 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -297,6 +297,11 @@ _No hits._
 | `src/execution_core/unified_tools.rs` | `execute_shell_command` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/fleet.rs` | `build_host_capabilities` | `caps.push("shell:powershell".to_string());` | 1 | unreviewed |
 | `src/fleet.rs` | `powershell_on_path` | `binary_on_path("pwsh") \|\| binary_on_path("powershell")` | 1 | unreviewed |
+| `src/fleet/machine_capability.rs` | `booted_at` | `cfg(windows)-only fn 'booted_at' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero. |
+| `src/fleet/machine_capability.rs` | `config_written_at` | `cfg(windows)-only fn 'config_written_at' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero. |
+| `src/fleet/machine_capability.rs` | `live` | `cfg(windows)-only fn 'live' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero. |
+| `src/fleet/machine_capability.rs` | `memory_management` | `cfg(windows)-only fn 'memory_management' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero. |
+| `src/fleet/machine_capability.rs` | `reading` | `cfg(windows)-only fn 'reading' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows-only pagefile/registry probe of the MachineCapability block (plan 2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated, Phase 1). The non-Windows arm is platform_inputs (cfg(not(windows))), which reads /proc/meminfo and reports every pagefile field null with a capability_unknown reason, never a zero. |
 | `src/fleet/resource_sample.rs` | `attach_wsl_disk` | `cfg(windows)-only fn 'attach_wsl_disk' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `decode_utf16le` | `cfg(windows)-only fn 'decode_utf16le' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `resolve_wsl_distro` | `cfg(windows)-only fn 'resolve_wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
