@@ -7754,12 +7754,13 @@ mod tenant_slot_refresh_tests {
         let expected = PostureTransition {
             from: None,
             to: CoordCredentialPosture::Expired,
+            detail_changed: false,
         };
         assert_eq!(transition, Some(expected));
         assert_eq!(recorded_posture_transitions(), vec![expected]);
         assert!(!expected.to.can_answer());
         assert!(
-            should_notify_posture(expected.from, expected.to),
+            should_notify_posture(expected.from, expected.to) && transition_notifies(expected),
             "a legacy boot into an expired credential must fire the banner"
         );
         let published = coord_credential_posture().expect("the boot pass publishes");
@@ -7780,11 +7781,12 @@ mod tenant_slot_refresh_tests {
         let expected = PostureTransition {
             from: None,
             to: CoordCredentialPosture::Absent,
+            detail_changed: false,
         };
         assert_eq!(transition, Some(expected));
         assert_eq!(recorded_posture_transitions(), vec![expected]);
         assert!(!expected.to.can_answer());
-        assert!(should_notify_posture(expected.from, expected.to));
+        assert!(should_notify_posture(expected.from, expected.to) && transition_notifies(expected));
         reset_posture();
     }
 
