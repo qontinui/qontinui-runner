@@ -560,25 +560,32 @@ mod tests {
     #[test]
     fn pty_holder_handshake_timeout_drops_idle_and_trickling_clients() {
         use std::io::{Read, Write};
+        // What this pins is that the server ENDS the connection by its own
+        // deadline, not how promptly a loaded CI runner schedules it. So
+        // every upper bound below is several timeouts wide, but each stays
+        // below what the defect it guards against would take (findings
+        // 53528293 and 338f66d9: the old 3x bound flaked on a busy runner).
         let timeout = Duration::from_millis(300);
         let params = ConnParams {
             handshake_timeout: timeout,
             expected_uid: transport::own_uid(),
         };
 
+        // `started` precedes the spawn, so the server's own deadline (stamped
+        // inside its thread) is at least `started + timeout`: the lower bound
+        // below holds by construction, whatever the scheduler does.
+        let started = Instant::now();
         let (mut client, t) = serve_pair(params);
         // Bounded: a server that never closes fails the test, not hangs it.
-        client.set_read_timeout(Some(timeout * 5)).unwrap();
-        let started = Instant::now();
+        client.set_read_timeout(Some(timeout * 20)).unwrap();
         let mut buf = [0u8; 8];
         // The server closes: EOF, with nothing sent.
         assert_eq!(client.read(&mut buf).unwrap(), 0);
         t.join().unwrap();
         let took = started.elapsed();
-        assert!(took >= timeout && took < timeout * 3, "idle: {took:?}");
+        assert!(took >= timeout && took < timeout * 10, "idle: {took:?}");
 
-        let (mut client, t) = serve_pair(params);
-        let started = Instant::now();
+        let (client, t) = serve_pair(params);
         // A hello prefix, one byte every 100 ms: each byte lands inside a
         // per-read timeout, so only a whole-frame deadline can stop it.
         let hello = crate::frame::encode_frame(
@@ -586,18 +593,29 @@ mod tests {
             &to_payload(&Request::Hello { versions: vec![1] }).unwrap(),
         )
         .unwrap();
-        for b in hello {
-            if client.write_all(&[b]).is_err() {
-                break;
+        let step = Duration::from_millis(100);
+        let bound = timeout * 7;
+        // Self-check: a server with only a per-read timeout would hold the
+        // thread for the whole trickle, which must outlast the bound by a
+        // clear margin or this half could not tell the two servers apart.
+        assert!(step * (hello.len() as u32) > bound + timeout * 3);
+        let started = Instant::now();
+        // The trickle runs on its own thread so that `took` measures how
+        // long the SERVER held the connection, not how long the client
+        // kept writing into a socket the server already closed.
+        let writer = std::thread::spawn(move || {
+            let mut client = client;
+            for b in hello {
+                if client.write_all(&[b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(step);
             }
-            std::thread::sleep(Duration::from_millis(100));
-            if started.elapsed() > timeout * 4 {
-                break;
-            }
-        }
+        });
         t.join().unwrap();
         let took = started.elapsed();
-        assert!(took < timeout * 3, "trickle held the thread: {took:?}");
+        writer.join().unwrap();
+        assert!(took < bound, "trickle held the thread: {took:?}");
     }
 
     /// Peer-uid rejection, wired end to end through `serve_conn_with`.
