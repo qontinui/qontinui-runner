@@ -7,12 +7,15 @@
 //     session PR CLI the identity-shim materializer hardlinks onto every
 //     terminal's PATH — without this sidecar, installed/bundled runners have
 //     no binary next to the exe and `qontinui-pr create` never materializes).
+//   - `qontinui-pty-holder` (plan
+//     2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2:
+//     the per-pane PTY holder, which the runner spawns from beside its own exe).
 //
 // `tauri.conf.json` declares `bundle.externalBin: ["binaries/qontinui_profile",
-// "binaries/qontinui-pr"]`. Tauri resolves each to
+// "binaries/qontinui-pr", "binaries/qontinui-pty-holder"]`. Tauri resolves each to
 // `src-tauri/binaries/<name>-<target-triple>[.exe]` at bundle time and copies it
-// next to the app binary (as plain `<name>[.exe]`). Both are `[[bin]]`s in the
-// SAME cargo crate, so we just cargo-build them in release and copy the
+// next to the app binary (as plain `<name>[.exe]`). We cargo-build them in
+// release (one invocation over the packages that own them) and copy the
 // artifacts to the triple-suffixed paths Tauri expects.
 //
 // Wired into `beforeBuildCommand` (`tauri.conf.json`), so it runs on every
@@ -52,7 +55,14 @@ const srcTauri = join(runnerRoot, "src-tauri");
 // Keep in sync with `tauri.conf.json` `bundle.externalBin` and
 // `src-tauri/build.rs` `EXTERNAL_BIN_SIDECARS` (a build.rs test pins the
 // latter to tauri.conf.json).
-const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr"];
+const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr", "qontinui-pty-holder"];
+
+// The cargo PACKAGES those bins live in. `qontinui-pty-holder` (plan
+// 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2:
+// the per-pane PTY holder the runner spawns from beside its own exe) is a bin
+// of `crates/pty-holder`, not of this crate, so the build selects both
+// packages; cargo applies the `--bin` filters across every selected package.
+const SIDECAR_PACKAGES = ["qontinui-runner", "qontinui-pty-holder"];
 
 function fail(msg) {
   console.error(`\n[bundle-profile-sidecar] ERROR: ${msg}\n`);
@@ -86,7 +96,7 @@ const exeExt = isWindows ? ".exe" : "";
 //    keeps machine JSON on stdout while rendering warnings/errors to stderr
 //    (which we inherit for visibility).
 console.log(
-  `[bundle-profile-sidecar] cargo build --release ${SIDECAR_BINS.map((b) => `--bin ${b}`).join(" ")} (target=${triple})`,
+  `[bundle-profile-sidecar] cargo build --release ${SIDECAR_PACKAGES.map((p) => `-p ${p}`).join(" ")} ${SIDECAR_BINS.map((b) => `--bin ${b}`).join(" ")} (target=${triple})`,
 );
 let stdout;
 try {
@@ -95,6 +105,7 @@ try {
     [
       "build",
       "--release",
+      ...SIDECAR_PACKAGES.flatMap((p) => ["-p", p]),
       ...SIDECAR_BINS.flatMap((b) => ["--bin", b]),
       "--message-format=json-render-diagnostics",
     ],

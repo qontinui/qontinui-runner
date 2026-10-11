@@ -27,15 +27,50 @@
 //! HIGHEST version both speak ([`negotiate`]), or `no_common_version`. Versions
 //! are never compared for equality (D15 replaces Phase 1's original "compared
 //! for equality"). The envelope verbs — `census`, `prepare_upgrade` — stay
-//! answerable after `no_common_version`; version-scoped verbs (`ping` today) do
-//! not.
+//! answerable after `no_common_version`; version-scoped verbs do not.
+//!
+//! ## Versions
+//!
+//! - **1** (Phase 1) — `ping`. Transport only.
+//! - **2** (Phase 2) — the DATA PATH. A version-2 holder owns its pane's PTY.
+//!   - `attach {from_offset}` → `attached {...}`, after which the holder
+//!     STREAMS, unprompted, on that connection: `KIND_OUTPUT` frames (absolute
+//!     offset + raw bytes), `output_lost {from_offset, to_offset}` when bytes
+//!     the client asked for have left the holder's ring, and one final
+//!     `exit {code, signal}` once the child has exited and every byte before
+//!     the exit has been sent.
+//!   - Input is a `KIND_DATA` frame of raw bytes, accepted ONLY on a
+//!     connection that sent `open_input` — never on the attached one. It gets
+//!     no reply. Keeping input off the attached connection is what lets a
+//!     child that does not read its stdin stall nothing but its input socket:
+//!     `resize`/`pause`/`resume`/`detach` on the attached connection, and
+//!     `kill` on any connection, are always read and answered.
+//!   - `resize {cols, rows}`, `pause`, `resume`, `kill` and `detach` each get
+//!     `ok {verb}`. On an attached connection that reply arrives INTERLEAVED
+//!     with the output stream, so a client reads it as one more event.
+//!   - `pause` / `resume` mirror the consumer's emission gate and NEVER pause
+//!     the PTY read (the runner's one flow-control invariant: "gate emission,
+//!     never pause reads" — `RemoteFlowGates`, `terminal/session.rs`). While a
+//!     connection is paused the holder keeps reading the PTY into its ring and
+//!     withholds frames; on `resume` it continues from that connection's own
+//!     next offset, so nothing is skipped unless the ring rolled past it, which
+//!     is reported as `output_lost`, never silently.
+//!   - `kill` ends the child (SIGHUP to its process group, SIGKILL after a
+//!     grace; Windows: terminate). `detach` closes this connection only; the
+//!     child keeps running and a later client can attach and resume.
+//!
+//! A build only ever ADDS a version at the top of [`PROTOCOL_VERSIONS`]; the
+//! version a build emits never moves backwards (D15).
 
 use serde::{Deserialize, Serialize};
 
 /// Every protocol version THIS build speaks, ascending. A build only ever adds
 /// to this list at the top; a version is dropped only when no holder that needs
 /// it can still exist (D15: holders age out with their pane).
-pub const PROTOCOL_VERSIONS: &[u32] = &[1];
+pub const PROTOCOL_VERSIONS: &[u32] = &[1, 2];
+
+/// The first version that carries the data path (attach, input, output, exit).
+pub const DATA_PATH_VERSION: u32 = 2;
 
 /// The highest version in both lists, or `None`.
 pub fn negotiate(offered: &[u32], supported: &[u32]) -> Option<u32> {
@@ -56,7 +91,19 @@ pub fn holder_build() -> String {
 /// [`RejectReason::UnknownVerb`] and the connection is closed. Adding a verb
 /// means adding it here AND an arm to the server's dispatch; the dispatch's
 /// fall-through arm is a rejection, never a default action.
-pub const REQUEST_VERBS: &[&str] = &["hello", "census", "prepare_upgrade", "ping"];
+pub const REQUEST_VERBS: &[&str] = &[
+    "hello",
+    "census",
+    "prepare_upgrade",
+    "ping",
+    "attach",
+    "resize",
+    "pause",
+    "resume",
+    "kill",
+    "detach",
+    "open_input",
+];
 
 /// Runner → holder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +118,29 @@ pub enum Request {
     PrepareUpgrade,
     /// Version 1. A liveness round trip after the handshake.
     Ping,
+    /// Version 2. Start streaming this pane's output on this connection.
+    /// `from_offset: None` is a fresh consumer: it gets the ring's last
+    /// [`ATTACH_TAIL_BYTES`]. `Some(n)` resumes at absolute offset `n` — the
+    /// first byte the consumer has NOT yet seen. Answered `attached`.
+    Attach { from_offset: Option<u64> },
+    /// Version 2. Resize the PTY. Answered `ok`.
+    Resize { cols: u16, rows: u16 },
+    /// Version 2, attached only. Withhold output frames (never the PTY read).
+    Pause,
+    /// Version 2, attached only. Resume output frames where they stopped.
+    Resume,
+    /// Version 2. End the child. Answered `ok`; the `exit` frame follows on
+    /// every attached connection.
+    Kill,
+    /// Version 2. Close this connection; the child keeps running. Answered
+    /// `ok`, then the holder closes.
+    Detach,
+    /// Version 2. Make this connection the pane's INPUT stream: from now on it
+    /// accepts `KIND_DATA` frames (and `ping`, `resize`, `kill`, `detach`),
+    /// never `attach`. Answered `ok`. Input lives on its own connection so a
+    /// child that is slow to read its stdin back-pressures only this socket —
+    /// the attached connection's control verbs are never queued behind it.
+    OpenInput,
 }
 
 impl Request {
@@ -81,8 +151,52 @@ impl Request {
             Request::Census => "census",
             Request::PrepareUpgrade => "prepare_upgrade",
             Request::Ping => "ping",
+            Request::Attach { .. } => "attach",
+            Request::Resize { .. } => "resize",
+            Request::Pause => "pause",
+            Request::Resume => "resume",
+            Request::Kill => "kill",
+            Request::Detach => "detach",
+            Request::OpenInput => "open_input",
         }
     }
+}
+
+/// How much of the ring a FRESH attach (`from_offset: None`) is sent — the
+/// same 64 KiB the remote path ships (`REMOTE_ATTACH_TAIL_BYTES`,
+/// `mcp/remote_terminal.rs`), so a local and a remote pane open alike.
+pub const ATTACH_TAIL_BYTES: u64 = 64 * 1024;
+
+/// `attached` — version 2. Where this connection's stream begins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachedReply {
+    /// Absolute offset of the first stream position this connection covers.
+    /// When it is below `ring_start_offset` the bytes in between are gone, and
+    /// an `output_lost {start_offset, ring_start_offset}` frame comes first.
+    /// A requested offset past `end_offset` (one the holder never produced —
+    /// the client's offset belongs to another stream) is clamped to
+    /// `end_offset`, so `start_offset < from_offset` says exactly that.
+    pub start_offset: u64,
+    /// Absolute offset of the oldest byte the holder's ring still holds.
+    pub ring_start_offset: u64,
+    /// Absolute offset one past the newest byte produced so far.
+    pub end_offset: u64,
+    pub child_pid: u32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// `exit` — version 2. The child exited and every byte it produced before
+/// that has been sent on this connection.
+///
+/// `code` is `None` whenever the exit code is not known — killed by a signal
+/// (then `signal` names it), or (Phase 8, D12a rule 3) an adopted pane whose
+/// holder is not the child's parent. `None` must never be rendered as 0 or as
+/// a fabricated failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitReply {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
 }
 
 /// `hello_ack` — FROZEN.
@@ -134,6 +248,11 @@ pub enum RejectReason {
     PeerNotAuthorized,
     /// The holder is at its connection cap.
     Busy,
+    /// A second `attach` on one connection (version 2).
+    AlreadyAttached,
+    /// An attached-only verb on a connection that has not attached, or an
+    /// input frame on one that has not sent `open_input` (version 2).
+    NotAttached,
     /// DESERIALIZE-ONLY: a reason string this build does not know — a newer
     /// holder's. The reason set is part of the frozen `rejected` shape, but it
     /// may GROW, so an older runner must still read the rejection as typed
@@ -164,6 +283,15 @@ pub enum Reply {
     },
     /// Version 1.
     Pong,
+    /// Version 2: the answer to `attach`. Output frames follow.
+    Attached(AttachedReply),
+    /// Version 2: `resize` / `pause` / `resume` / `kill` / `detach` done.
+    Ok { verb: String },
+    /// Version 2: bytes `[from_offset, to_offset)` left the ring before this
+    /// connection was sent them. Streaming continues at `to_offset`.
+    OutputLost { from_offset: u64, to_offset: u64 },
+    /// Version 2: the child exited. The last frame on the connection.
+    Exit(ExitReply),
 }
 
 /// Serialize a message to its control-frame payload.
@@ -317,6 +445,8 @@ mod tests {
             (RejectReason::Malformed, "malformed"),
             (RejectReason::PeerNotAuthorized, "peer_not_authorized"),
             (RejectReason::Busy, "busy"),
+            (RejectReason::AlreadyAttached, "already_attached"),
+            (RejectReason::NotAttached, "not_attached"),
         ];
         for (r, s) in all {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{s}\""));
@@ -340,6 +470,103 @@ mod tests {
             detail: "d".into(),
         })
         .is_err());
+    }
+
+    /// WIRE SHAPE — the version-2 data-path messages, byte for byte. Not part
+    /// of the frozen envelope (a later version may add new messages beside
+    /// them), but a v2 holder still running after a runner upgrade must keep
+    /// understanding — and being understood by — every runner that offers v2,
+    /// so their shape is pinned exactly like the envelope's.
+    #[test]
+    fn pty_holder_wire_shape_v2_data_path() {
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                frame_of(&Request::Attach { from_offset: None }),
+                r#"{"type":"attach","from_offset":null}"#,
+            ),
+            (
+                frame_of(&Request::Attach {
+                    from_offset: Some(4096),
+                }),
+                r#"{"type":"attach","from_offset":4096}"#,
+            ),
+            (
+                frame_of(&Request::Resize {
+                    cols: 120,
+                    rows: 40,
+                }),
+                r#"{"type":"resize","cols":120,"rows":40}"#,
+            ),
+            (frame_of(&Request::Pause), r#"{"type":"pause"}"#),
+            (frame_of(&Request::Resume), r#"{"type":"resume"}"#),
+            (frame_of(&Request::Kill), r#"{"type":"kill"}"#),
+            (frame_of(&Request::Detach), r#"{"type":"detach"}"#),
+            (frame_of(&Request::OpenInput), r#"{"type":"open_input"}"#),
+            (
+                frame_of(&Reply::Attached(AttachedReply {
+                    start_offset: 10,
+                    ring_start_offset: 5,
+                    end_offset: 99,
+                    child_pid: 4243,
+                    cols: 80,
+                    rows: 24,
+                })),
+                r#"{"type":"attached","start_offset":10,"ring_start_offset":5,"end_offset":99,"child_pid":4243,"cols":80,"rows":24}"#,
+            ),
+            (
+                frame_of(&Reply::Ok {
+                    verb: "resize".into(),
+                }),
+                r#"{"type":"ok","verb":"resize"}"#,
+            ),
+            (
+                frame_of(&Reply::OutputLost {
+                    from_offset: 0,
+                    to_offset: 8192,
+                }),
+                r#"{"type":"output_lost","from_offset":0,"to_offset":8192}"#,
+            ),
+            (
+                frame_of(&Reply::Exit(ExitReply {
+                    code: Some(7),
+                    signal: None,
+                })),
+                r#"{"type":"exit","code":7,"signal":null}"#,
+            ),
+            (
+                frame_of(&Reply::Exit(ExitReply {
+                    code: None,
+                    signal: Some(9),
+                })),
+                r#"{"type":"exit","code":null,"signal":9}"#,
+            ),
+        ];
+        for (got, json) in cases {
+            assert_eq!(got, expected(json), "v2 data-path message moved: {json}");
+        }
+        // Every message parses back to itself.
+        let exit = br#"{"type":"exit","code":null,"signal":null}"#;
+        assert_eq!(
+            parse_reply(exit).unwrap(),
+            Reply::Exit(ExitReply {
+                code: None,
+                signal: None
+            })
+        );
+        assert_eq!(
+            parse_request(br#"{"type":"attach","from_offset":null}"#).unwrap(),
+            Request::Attach { from_offset: None }
+        );
+    }
+
+    /// The version list only grows at the top, and the data path is in it.
+    #[test]
+    fn pty_holder_versions_ascend_and_include_the_data_path() {
+        assert!(PROTOCOL_VERSIONS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(PROTOCOL_VERSIONS.first(), Some(&1), "v1 is still spoken");
+        assert!(PROTOCOL_VERSIONS.contains(&DATA_PATH_VERSION));
+        // A Phase 1 runner (offers only [1]) still negotiates with this holder.
+        assert_eq!(negotiate(&[1], PROTOCOL_VERSIONS), Some(1));
     }
 
     /// A newer holder may add fields to the envelope replies; an older runner
@@ -396,6 +623,15 @@ mod tests {
                 "census" => Request::Census,
                 "prepare_upgrade" => Request::PrepareUpgrade,
                 "ping" => Request::Ping,
+                "attach" => Request::Attach {
+                    from_offset: Some(3),
+                },
+                "resize" => Request::Resize { cols: 80, rows: 24 },
+                "pause" => Request::Pause,
+                "resume" => Request::Resume,
+                "kill" => Request::Kill,
+                "detach" => Request::Detach,
+                "open_input" => Request::OpenInput,
                 other => panic!("REQUEST_VERBS has {other:?} with no Request variant"),
             };
             assert_eq!(req.verb(), *verb);

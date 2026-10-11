@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockRecord {
     pub holder_pid: u32,
-    /// The pane's child pid; `null` until Phase 2 spawns one.
+    /// The pane's child pid. Set by every Phase 2 holder (it spawns the child
+    /// before it writes the record); `null` only from a Phase 1 holder.
     pub child_pid: Option<u32>,
     /// Every protocol version the holder speaks.
     pub versions: Vec<u32>,

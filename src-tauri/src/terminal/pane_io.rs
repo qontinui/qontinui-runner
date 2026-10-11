@@ -70,6 +70,16 @@ pub enum CredentialScrub {
     /// The implementation launches no child and hands no environment to
     /// anything. Only an in-memory double can honestly answer this.
     NoChildEnv,
+    /// The child's environment was assembled in THIS process and passed
+    /// through [`super::scrub_credential_env_pty`] — witnessed by
+    /// [`ScrubbedCommand`] — and then shipped, complete, to an OUT-OF-PROCESS
+    /// PTY holder that spawns the child with exactly that environment and
+    /// nothing else (`qontinui-pty-holder` clears its own environment first).
+    /// [`ScrubbedCommand::to_holder_spec`] is the only constructor of a holder
+    /// spec from a runner command, so the proof travels in the type (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D6 as resolved 2026-09-27). `DaemonPaneIo` answers this.
+    ScrubbedOutOfProcess,
 }
 
 /// A byte source and sink for one terminal pane.
@@ -126,6 +136,27 @@ pub trait PaneIo: Send + Sync {
     /// pid namespace.
     fn pid(&self) -> Option<u32>;
 
+    /// The pid the runner's own crash-safety reaping (the Windows
+    /// `KILL_ON_JOB_CLOSE` Job Object, `TerminalSession::spawn_with_io`) may
+    /// enroll — by default [`Self::pid`]. A pane whose child is owned by an
+    /// out-of-process holder answers `None`: enrolling it would end the child
+    /// exactly when the runner exits, the event the holder exists to survive,
+    /// and reaping is the holder's job (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D8).
+    fn job_enroll_pid(&self) -> Option<u32> {
+        self.pid()
+    }
+
+    /// Whether `WireFlow` should pause this source while NO pane renders the
+    /// terminal (the `Unwatched` tier). True by default — a remote pane's
+    /// state is tracked on its target, so nothing here needs the bytes. A pane
+    /// whose state tracking (grid, auto-response, needs-input) happens in THIS
+    /// runner answers `false`: pausing it would starve those readers. Only
+    /// the emission gate's backpressure is projected onto such a source.
+    fn unwatched_pauses_source(&self) -> bool {
+        true
+    }
+
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
 
@@ -154,6 +185,41 @@ impl ScrubbedCommand {
     #[cfg(test)]
     pub(crate) fn as_command(&self) -> &CommandBuilder {
         &self.0
+    }
+
+    /// The child spec an out-of-process PTY holder runs this command from
+    /// (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D6 as resolved 2026-09-27: "the holder's spawn path builds its child
+    /// through `ScrubbedCommand::seal` — the proof travels in the type"). This
+    /// is the ONLY constructor of a holder spec from a runner command, so a
+    /// holder child's environment is always one that went through the scrub;
+    /// the holder clears its own environment and sets exactly these pairs.
+    ///
+    /// argv and cwd are copied as OS strings. The environment is copied
+    /// through `CommandBuilder::iter_full_env_as_str`, the builder's only
+    /// whole-environment iterator, which SKIPS any variable whose name or
+    /// value is not valid UTF-8 — such a variable does not reach a holder pane
+    /// (it does reach a `LocalPty` one). Ring size and exit linger are left at
+    /// the holder's defaults.
+    pub(crate) fn to_holder_spec(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> qontinui_pty_holder::spec::ChildSpec {
+        let b = &self.0;
+        let mut spec = qontinui_pty_holder::spec::ChildSpec::new(if b.is_default_prog() {
+            Vec::new()
+        } else {
+            b.get_argv().clone()
+        });
+        spec.cwd = b.get_cwd().cloned();
+        spec.env = b
+            .iter_full_env_as_str()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        spec.cols = cols.max(1);
+        spec.rows = rows.max(1);
+        spec
     }
 }
 
@@ -549,6 +615,38 @@ mod tests {
             Some("yes"),
             "the seal removes credentials and nothing else"
         );
+    }
+
+    /// Plan 2026-09-12 D6: a holder spec built from a sealed command carries
+    /// the scrubbed environment — no credential value reaches an
+    /// out-of-process pane — plus argv, cwd and the size.
+    #[test]
+    fn pty_holder_spec_from_a_sealed_command_is_scrubbed() {
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.arg("--resume");
+        cmd.cwd("/work/tree");
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+        cmd.env("KEEP_ME", "yes");
+        let spec = ScrubbedCommand::seal(cmd).to_holder_spec(120, 0);
+
+        assert_eq!(
+            spec.argv,
+            vec![std::ffi::OsString::from("claude"), "--resume".into()]
+        );
+        assert_eq!(spec.cwd, Some("/work/tree".into()));
+        assert_eq!((spec.cols, spec.rows), (120, 1), "a zero size is clamped");
+        for (k, v) in &spec.env {
+            assert!(
+                !crate::terminal::CREDENTIAL_VALUE_ENV_VARS
+                    .iter()
+                    .any(|n| k == *n),
+                "credential {k:?} reached the holder spec"
+            );
+            assert_ne!(v, "hunter2");
+        }
+        assert!(spec.env.iter().any(|(k, v)| k == "KEEP_ME" && v == "yes"));
     }
 
     /// The inert double answers the way the old `NoopMaster` placeholder did:

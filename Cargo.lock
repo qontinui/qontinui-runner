@@ -6717,6 +6717,8 @@ name = "qontinui-pty-holder"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "portable-pty",
+ "qontinui-runner-win32",
  "serde",
  "serde_json",
  "windows-sys 0.59.0",
@@ -6783,6 +6785,7 @@ dependencies = [
  "proc-macro2",
  "qontinui-code-graph",
  "qontinui-db",
+ "qontinui-pty-holder",
  "qontinui-runner-stats",
  "qontinui-runner-win32",
  "qontinui-spec-check",

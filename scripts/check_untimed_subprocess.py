@@ -98,7 +98,8 @@ ratchet would then tell the contributor to DELETE the newly-unresolvable
 baseline entries, permanently ungating them. An extraction necessarily adds a
 path dependency, so the closure picks the new crate up with no edit here.
 Today that resolves to `src-tauri/src`, `src-tauri/clorinde/src`,
-`crates/spec-check/src`, `crates/runner-stats/src`, `crates/runner-win32/src`.
+`crates/spec-check/src`, `crates/runner-stats/src`, `crates/runner-win32/src`,
+`crates/pty-holder/src`.
 
 Two things are deliberately OUT of scope, and `--list-roots` prints both so the
 boundary is inspectable rather than assumed:
@@ -496,6 +497,9 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 #: Update it in the same commit that changes the dependency, and say in the
 #: commit message why the coverage change is correct.
 EXPECTED_SCAN_ROOTS: tuple[str, ...] = (
+    # Linked since plan 2026-09-12-out-of-process-pty-owner Phase 2: the
+    # runner spawns holders through `qontinui_pty_holder::spawn`.
+    "crates/pty-holder/src",
     "crates/runner-stats/src",
     "crates/runner-win32/src",
     "crates/spec-check/src",

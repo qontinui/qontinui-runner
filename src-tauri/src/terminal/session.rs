@@ -297,11 +297,17 @@ pub(crate) struct WireFlow {
     /// relay reconnect re-presents the grant.
     sent: Mutex<bool>,
     wire_paused: AtomicBool,
+    /// `io.unwatched_pauses_source()`, read once: when false, `hidden` never
+    /// contributes to the wire state (a PTY-holder pane's grid and state
+    /// tracking live HERE, so an unwatched tier must keep its bytes flowing).
+    hidden_pauses: bool,
 }
 
 impl WireFlow {
     pub(crate) fn new(io: Arc<dyn PaneIo>) -> Self {
+        let hidden_pauses = io.unwatched_pauses_source();
         Self {
+            hidden_pauses,
             io,
             gate_paused: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
@@ -330,8 +336,8 @@ impl WireFlow {
     fn sync(&self) {
         // Held across the decision AND the send — see the `sent` field's note.
         let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        let desired =
-            self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
+        let desired = self.gate_paused.load(Ordering::Acquire)
+            || (self.hidden_pauses && self.hidden.load(Ordering::Acquire));
         if *sent == desired {
             return;
         }
@@ -1621,7 +1627,29 @@ impl TerminalSession {
             Some(&app_handle),
         )?;
 
-        let opened = LocalPty::open(&id, cols, rows)?;
+        // The pane's backend: in-process `LocalPty`, or — behind
+        // `terminal.pty_holder`, default OFF — an out-of-process PTY holder
+        // (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`
+        // Phase 2). Read once per spawn. A local PTY is opened HERE, before the
+        // environment is assembled, so an `openpty` failure leaves none of
+        // that side-effecting work behind; a holder pane has no PTY in this
+        // process to open.
+        //
+        // Cost on the OFF path (review round 2, N10): `get_terminal_settings`
+        // is `read_settings_from_disk`, the mtime-keyed in-process settings
+        // cache — one `stat` and a clone on a hit, no file read or parse. That
+        // is the same per-spawn price this function already pays for
+        // `get_performance_settings` (the scrollback capacity, `spawn_with_io`), not a
+        // new kind of read.
+        let backend = crate::terminal::daemon_pane_io::pane_backend_for(
+            &crate::settings::get_terminal_settings(),
+        );
+        let opened = match backend {
+            crate::terminal::daemon_pane_io::PaneBackend::LocalPty => {
+                Some(LocalPty::open(&id, cols, rows)?)
+            }
+            crate::terminal::daemon_pane_io::PaneBackend::Holder => None,
+        };
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell. Whether it
@@ -1794,7 +1822,13 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
-        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
+        let sealed = ScrubbedCommand::seal(cmd);
+        let io: Arc<dyn PaneIo> = match opened {
+            Some(opened) => Arc::new(opened.spawn(sealed)?),
+            None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
+                &id, sealed, cols, rows,
+            )?,
+        };
 
         Self::spawn_with_io(
             id,
@@ -1853,9 +1887,11 @@ impl TerminalSession {
             "Terminal session spawned"
         );
 
-        // Assign to Windows Job Object for crash safety
+        // Assign to Windows Job Object for crash safety — the pid the pane
+        // allows, which is `None` for a PTY-holder pane (its child must outlive
+        // this runner; see `PaneIo::job_enroll_pid`).
         #[cfg(target_os = "windows")]
-        if let Some(pid) = child_pid {
+        if let Some(pid) = io.job_enroll_pid() {
             Self::assign_to_job_object(pid);
         }
 
@@ -4688,12 +4724,15 @@ impl TerminalSession {
         // Release the pane's handles — for a local PTY this closes the OS pipe
         // and unblocks the reader thread which may be stuck in a blocking
         // read() call. Bounded for the same reason as the writer above.
+        // `release` can fail for more than a spent budget — a holder pane
+        // released after a kill that did not land says so in its error — so
+        // the log carries the pane's own reason rather than assuming one.
         if let Err(e) = self.io.release(lock_budget) {
             warn!(
                 terminal_id = %self.id,
                 error = %e,
-                "Could not release the pane within the shutdown budget — the \
-                 handle will be released by process exit"
+                "pane release reported an error (see `error`); any handle it \
+                 could not release is released by process exit"
             );
         }
 

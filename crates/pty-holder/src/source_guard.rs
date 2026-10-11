@@ -29,6 +29,14 @@ const GUARDED: &[(&str, &str)] = &[
     ("lock.rs", include_str!("lock.rs")),
     ("pane.rs", include_str!("pane.rs")),
     ("main.rs", include_str!("main.rs")),
+    // Phase 2 data path: the PTY owner, its ring, the spec, the spawner.
+    ("pty.rs", include_str!("pty.rs")),
+    ("ring.rs", include_str!("ring.rs")),
+    ("spec.rs", include_str!("spec.rs")),
+    ("startup.rs", include_str!("startup.rs")),
+    ("spawn.rs", include_str!("spawn.rs")),
+    // Review round 2: out-of-band termination of a verified holder.
+    ("terminate.rs", include_str!("terminate.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned
