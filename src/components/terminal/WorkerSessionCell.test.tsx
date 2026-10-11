@@ -684,15 +684,16 @@ describe("ConversationView", () => {
 });
 
 describe("ZoneGrid wiring", () => {
-  // The grid's maximized view lives in ZoneGrid; the zone content (grid cells
-  // and the tmux viewport's panes) in zone-grid/ZoneCell.
+  // Every zone content — grid cells, the maximized zone and the tmux
+  // viewport's panes — is zone-grid/ZoneCell, in one of its presentations.
   const source = [
     readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8"),
     readFileSync(resolve(__dirname, "./zone-grid/ZoneCell.tsx"), "utf8"),
   ].join("\n");
 
-  it("mounts WorkerSessionCell at both TerminalInstance sites (maximized + zoned)", () => {
-    expect(source.match(/<WorkerSessionCell\s/g)?.length).toBe(2);
+  it("mounts WorkerSessionCell beside the one TerminalInstance site (zoned, maximized, parked)", () => {
+    expect(source.match(/<WorkerSessionCell\s/g)?.length).toBe(1);
+    expect(source.match(/<TerminalInstance\s/g)?.length).toBe(1);
   });
 
   it("never gives a worker tab the hidden TerminalInstance mount", () => {
@@ -706,7 +707,7 @@ describe("ZoneGrid wiring", () => {
   it("passes the zone's visibility through to every WorkerSessionCell mount", () => {
     // The cell's file-changes read is gated on `visible`; a mount that hard-
     // coded `visible` would defeat that silently.
-    expect(source.match(/<WorkerSessionCell[^>]*visible=\{/g)?.length).toBe(2);
+    expect(source.match(/<WorkerSessionCell[^>]*visible=\{paneVisible\}/g)?.length).toBe(1);
   });
 });
 

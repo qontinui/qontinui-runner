@@ -29,18 +29,36 @@ vi.mock("@/lib/instance-storage", () => ({
 import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
 import { useZoneLayout } from "./useZoneLayout";
 
-/** Mount on a persisted state; the returned function re-renders, optionally with new tabs. */
-function mount(persisted: unknown, tabIds: string[]) {
+/** What the page threads besides the tab ids: liveness and session keys. */
+interface TabFacts {
+  /** Tab ids whose process is alive; absent = every tab is alive. */
+  alive?: string[];
+  /** tab id → claudeSessionId. */
+  keys?: Record<string, string>;
+}
+
+/**
+ * Mount on a persisted state; the returned function re-renders, optionally
+ * with new tabs (and new liveness / session keys).
+ */
+function mount(persisted: unknown, tabIds: string[], initialFacts: TabFacts = {}) {
   harness.reset();
   storage.value = persisted;
   storage.written = [];
   let live = tabIds;
+  // Built once per change, as the page memoizes them on its tab list.
+  const toInputs = (f: TabFacts) => ({
+    alive: f.alive ? new Set(f.alive) : undefined,
+    keys: f.keys ? new Map(Object.entries(f.keys)) : undefined,
+  });
+  let facts = toInputs(initialFacts);
   function ZoneLayoutHost() {
     harness.beginRender();
-    return useZoneLayout(live, "tmux-test", "main");
+    return useZoneLayout(live, "tmux-test", "main", facts.alive, facts.keys);
   }
-  return (next?: string[]) => {
+  return (next?: string[], nextFacts?: TabFacts) => {
     if (next) live = next;
+    if (nextFacts) facts = toInputs(nextFacts);
     return harness.renderSettled(ZoneLayoutHost);
   };
 }
@@ -114,8 +132,13 @@ describe("persisted work mode", () => {
       assignments: { 0: "b" },
       focusedZone: 0,
       workMode: "tmux",
-      mru: ["b"],
-      gridSnapshot: { layoutId: "split", assignments: { 0: "a", 1: "b" }, focusedZone: 1 },
+      mru: ["b", "a"],
+      gridSnapshot: {
+        layoutId: "split",
+        assignments: { 0: "a", 1: "b" },
+        focusedZone: 1,
+        sessionKeys: {},
+      },
     });
   });
 });
@@ -170,7 +193,9 @@ describe("entering tmux mode — 0 / 1 / 2 / many tabs", () => {
       layoutId: "single",
       assignments: { 0: "b" },
       shownTabId: "b",
-      mru: ["b"],
+      // The grid's other session follows the shown one: it was on screen a
+      // moment ago, so it is the most recently seen.
+      mru: ["b", "a"],
     });
     expect(r.maximizedZone).toBeNull();
     expect(r.isMultiZone).toBe(false);
@@ -189,7 +214,7 @@ describe("entering tmux mode — 0 / 1 / 2 / many tabs", () => {
       layoutId: "single",
       assignments: { 0: "d" },
       shownTabId: "d",
-      mru: ["d"],
+      mru: ["d", "a", "b", "c", "e", "f"],
     });
     // Background ingest (not an operator spawn) does not take the screen.
     const more = [...six, "g", "h", "i", "j", "k"];
@@ -198,7 +223,7 @@ describe("entering tmux mode — 0 / 1 / 2 / many tabs", () => {
       layoutId: "single",
       assignments: { 0: "d" },
       shownTabId: "d",
-      mru: ["d"],
+      mru: ["d", "a", "b", "c", "e", "f"],
     });
   });
 
@@ -221,6 +246,11 @@ describe("swaps, closes and the MRU", () => {
     return render;
   }
 
+  it("entering seeds the MRU with the shown tab, then the grid's zones in order", () => {
+    // The quad's reconcile zoned b, c and d before the switch.
+    expect(inTmux(["a", "b", "c", "d"])().mru).toStrictEqual(["a", "b", "c", "d"]);
+  });
+
   it("each swap into zone 0 is recorded newest-first", () => {
     const render = inTmux(["a", "b", "c", "d"]);
     render().assignTabToZone(0, "c");
@@ -230,7 +260,7 @@ describe("swaps, closes and the MRU", () => {
       layoutId: "single",
       assignments: { 0: "b" },
       shownTabId: "b",
-      mru: ["b", "c", "a"],
+      mru: ["b", "c", "a", "d"],
     });
   });
 
@@ -243,7 +273,7 @@ describe("swaps, closes and the MRU", () => {
       layoutId: "single",
       assignments: { 0: "c" },
       shownTabId: "c",
-      mru: ["c", "b", "a"],
+      mru: ["c", "b", "a", "d"],
     });
   });
 
@@ -271,7 +301,7 @@ describe("swaps, closes and the MRU", () => {
       layoutId: "single",
       assignments: { 0: "b" },
       shownTabId: "b",
-      mru: ["b", "a"],
+      mru: ["b", "a", "c"],
     });
   });
 
@@ -318,7 +348,7 @@ describe("layout requests by source", () => {
       layoutId: "single",
       assignments: { 0: "n" },
       shownTabId: "n",
-      mru: ["n", "a"],
+      mru: ["n", "a", "b"],
     });
   });
 
@@ -330,7 +360,7 @@ describe("layout requests by source", () => {
       layoutId: "single",
       assignments: { 0: "a" },
       shownTabId: "a",
-      mru: ["a"],
+      mru: ["a", "b"],
     });
   });
 
@@ -344,7 +374,7 @@ describe("layout requests by source", () => {
       layoutId: "six-pack",
       assignments: { 0: "a", 1: "b", 2: "c", 3: "d" },
       shownTabId: null,
-      mru: ["c"],
+      mru: ["c", "a", "b", "d"],
     });
     expect(r.focusedZone).toBe(2);
   });
@@ -400,7 +430,7 @@ describe("enter / exit round trip", () => {
       layoutId: "quad",
       assignments: { 0: "a", 1: "e", 2: "c", 3: "d" },
       shownTabId: null,
-      mru: ["e", "c"],
+      mru: ["e", "c", "a", "b", "d"],
     });
     expect(r.focusedZone).toBe(2);
   });
@@ -415,7 +445,7 @@ describe("enter / exit round trip", () => {
       layoutId: "quad",
       assignments: { 0: "a", 1: "b", 2: "c" },
       shownTabId: null,
-      mru: ["a"],
+      mru: ["a", "b"],
     });
   });
 
@@ -470,12 +500,152 @@ describe("enter / exit round trip", () => {
       layoutId: "single",
       assignments: { 0: "a1" },
       shownTabId: "a1",
-      mru: ["a1"],
+      mru: ["a1", "s1", "a2"],
     });
     render().exitTmuxMode();
     const r = render();
     expect(r.layoutId).toBe("split");
     expect(r.assignments).toStrictEqual({ 0: "a1", 1: "a2" });
     expect(r.focusedZone).toBe(0);
+  });
+});
+
+describe("exited tabs are shown only when no live tab is left", () => {
+  it("closing the shown tab skips an exited MRU entry for a live tab", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }), ["a", "b", "c"], {
+      alive: ["a", "b", "c"],
+    });
+    render().enterTmuxMode();
+    render().assignTabToZone(0, "b");
+    render().assignTabToZone(0, "c");
+    // MRU is c, b, a; b has exited and stays as a tombstone tab.
+    render(undefined, { alive: ["a", "c"] });
+    expect(render(["a", "b"], { alive: ["a"] }).shownTabId).toBe("a");
+  });
+
+  it("falls back to an exited tab when nothing live is left", () => {
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"], { alive: ["a", "b"] });
+    render().enterTmuxMode();
+    render(undefined, { alive: ["a"] });
+    expect(render(["b"], { alive: [] }).shownTabId).toBe("b");
+  });
+
+  it("an exited shown tab stays on screen as its tombstone", () => {
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"], { alive: ["a", "b"] });
+    render().enterTmuxMode();
+    expect(render(undefined, { alive: ["b"] }).shownTabId).toBe("a");
+  });
+});
+
+describe("the grid snapshot survives a runner restart", () => {
+  it("re-keys zones by session id when the sessions come back under new tab ids", () => {
+    const keys = { a: "sess-a", b: "sess-b", c: "sess-c" };
+    const render = mount(grid("quad", { 0: "a", 1: "b", 3: "c" }, 3), ["a", "b", "c"], { keys });
+    render().enterTmuxMode();
+    // The runner restarts: every tab is gone, the sessions cold-resume into
+    // new tabs in creation order — which is not their zone order.
+    const r = render(["c2", "a2", "b2"], { keys: { c2: "sess-c", a2: "sess-a", b2: "sess-b" } });
+    expect(r.gridView.assignments).toStrictEqual({ 0: "a2", 1: "b2", 3: "c2" });
+    r.exitTmuxMode();
+    const after = render();
+    expect(after.layoutId).toBe("quad");
+    expect(after.assignments).toStrictEqual({ 0: "a2", 1: "b2", 3: "c2" });
+    expect(after.focusedZone).toBe(3);
+  });
+
+  it("records a session key bound after entering, so that session re-keys too", () => {
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"]);
+    render().enterTmuxMode();
+    render(undefined, { keys: { b: "sess-b" } });
+    const r = render(["a", "b2"], { keys: { b2: "sess-b" } });
+    expect(r.gridView.assignments).toStrictEqual({ 0: "a", 1: "b2" });
+  });
+
+  it("a restore in tmux places the session in the snapshot, never on screen", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b" }), ["a", "b"]);
+    render().enterTmuxMode();
+    const r = render(["a", "b", "r"]);
+    r.placeRestoredTab(0, "r");
+    const after = render();
+    expect(after.shownTabId).toBe("a");
+    expect(after.gridView.assignments).toStrictEqual({ 0: "r", 1: "b" });
+  });
+
+  it("a restore in grid mode is a zone assignment", () => {
+    const render = mount(grid("quad", { 0: "a" }), ["a", "r"]);
+    render().placeRestoredTab(3, "r");
+    expect(render().assignments).toStrictEqual({ 0: "a", 3: "r" });
+  });
+
+  it("a focus request for a zone tmux does not show is dropped", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b" }, 1), ["a", "b"]);
+    render().enterTmuxMode();
+    render().setFocusedZone(3);
+    const r = render();
+    expect(r.focusedZone).toBe(0);
+    expect(r.gridView.focusedZone).toBe(1);
+  });
+});
+
+describe("gridView and cosmeticZoneFor", () => {
+  it("grid mode: the live grid, and every zone is its own cosmetic zone", () => {
+    const r = mount(grid("quad", { 0: "a", 1: "b" }, 1), ["a", "b"])();
+    expect(r.gridView).toStrictEqual({
+      layoutId: "quad",
+      assignments: { 0: "a", 1: "b" },
+      focusedZone: 1,
+    });
+    expect(r.cosmeticZoneFor(1)).toBe(1);
+  });
+
+  it("tmux: the snapshot, and the viewport's cosmetics are the shown session's grid zone", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }, 2), ["a", "b", "c"]);
+    render().enterTmuxMode();
+    let r = render();
+    expect(r.gridView).toStrictEqual({
+      layoutId: "quad",
+      assignments: { 0: "a", 1: "b", 2: "c" },
+      focusedZone: 2,
+    });
+    expect(r.cosmeticZoneFor(0)).toBe(2);
+    r.assignTabToZone(0, "b");
+    r = render();
+    expect(r.cosmeticZoneFor(0)).toBe(1);
+  });
+
+  it("tmux: a session created during tmux has no grid zone, so no cosmetics", () => {
+    const render = mount(grid("split", { 0: "a", 1: "b" }), ["a", "b"]);
+    render().enterTmuxMode();
+    render(["a", "b", "n"]).showSpawnedTab("n");
+    expect(render().cosmeticZoneFor(0)).toBeNull();
+  });
+});
+
+describe("keyboard focus on exit", () => {
+  it("exiting asks for the restored focused zone's tab to take the keyboard", () => {
+    const render = mount(grid("quad", { 0: "a", 1: "b", 2: "c" }, 1), ["a", "b", "c"]);
+    render().enterTmuxMode();
+    render().assignTabToZone(0, "c");
+    const before = render().revealRequest?.seq ?? 0;
+    render().exitTmuxMode();
+    const r = render();
+    expect(r.focusedZone).toBe(1);
+    expect(r.revealRequest).toStrictEqual({ tabId: "b", seq: before + 1 });
+  });
+});
+
+describe("a malformed persisted snapshot", () => {
+  it("is ignored with a warning naming it", () => {
+    const r = mount(
+      {
+        ...grid("single", { 0: "a" }),
+        workMode: "tmux",
+        gridSnapshot: { layoutId: "quad", assignments: { 0: "a" }, focusedZone: 1.5 },
+      },
+      ["a"],
+    )();
+    expect(r.gridView.layoutId).toBe("single");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("gridSnapshot");
   });
 });

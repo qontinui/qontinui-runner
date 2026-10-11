@@ -24,7 +24,8 @@ vi.mock("@/lib/surfaceVisible", () => ({ isSurfaceVisible: () => true }));
 vi.mock("./commands", () => ({ runRegistryAction: vi.fn() }));
 
 import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
-import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
+import { nextCycledLayoutId, useKeyboardShortcuts } from "./useKeyboardShortcuts";
+import { FLOW_GRID_ID, LAYOUT_PRESETS } from "./useZoneLayout";
 import { stepShownTab } from "./terminalWorkMode";
 import type { SessionState } from "./useZoneLayout";
 
@@ -64,6 +65,8 @@ interface Fixture {
   assignCalls: Array<[number, string]>;
   setActiveIdCalls: string[];
   focusNextNeedsInputCalls: number;
+  layoutCalls: Array<[string, { source: string }]>;
+  pinCalls: number[];
 }
 
 /** Mount the hook with a fake zone layout whose zone 0 is the shown tab. */
@@ -72,6 +75,10 @@ function mount(opts: {
   tabs: Array<{ id: string; isAlive?: boolean }>;
   shown: string;
   sessionStates?: Record<string, SessionState>;
+  /** The grid's layout (`gridView.layoutId`): the snapshot's, in tmux. */
+  gridLayoutId?: string;
+  /** tmux: the shown session's grid zone (`cosmeticZoneFor(0)`). */
+  shownGridZone?: number | null;
 }): Fixture {
   harness.reset();
   let handler: Handler | null = null;
@@ -91,6 +98,8 @@ function mount(opts: {
     assignCalls: [],
     setActiveIdCalls: [],
     focusNextNeedsInputCalls: 0,
+    layoutCalls: [],
+    pinCalls: [],
   };
   const noop = () => {};
   const zoneLayout = {
@@ -110,7 +119,12 @@ function mount(opts: {
     },
     toggleMaximize: noop,
     setMaximizedZone: noop,
-    setLayoutId: noop,
+    setLayoutId: (id: string, request: { source: string }) => {
+      fx.layoutCalls.push([id, request]);
+    },
+    gridView: { layoutId: opts.gridLayoutId ?? "single" },
+    cosmeticZoneFor: (zoneIdx: number) =>
+      opts.workMode === "tmux" ? (zoneIdx === 0 ? (opts.shownGridZone ?? null) : null) : zoneIdx,
     assignTabToZone: (idx: number, tabId: string) => {
       fx.assignCalls.push([idx, tabId]);
       if (idx === 0) state.shown = tabId;
@@ -135,7 +149,11 @@ function mount(opts: {
       zoneLayout,
       sessionStates: opts.sessionStates ?? {},
       handleRestartInZone: noop,
-      labelsAndTags: { allTags: [], togglePin: noop, setActiveTagFilters: noop },
+      labelsAndTags: {
+        allTags: [],
+        togglePin: (zone: number) => fx.pinCalls.push(zone),
+        setActiveTagFilters: noop,
+      },
       focusHistory: { goBack: noop, goForward: noop },
       transitionEffects: {
         toggleAutoFocus: noop,
@@ -222,5 +240,44 @@ describe("useKeyboardShortcuts in tmux mode", () => {
     expect(fx.assignCalls).toEqual([]);
     fx.press(ctrlShiftN);
     expect(fx.focusNextNeedsInputCalls).toBe(1);
+  });
+});
+
+describe("layout cycling and pinning in tmux mode", () => {
+  const tabs = [{ id: "a" }, { id: "b" }];
+  const ctrlShiftL = { key: "L", ctrlKey: true, shiftKey: true };
+  const ctrlShiftO = { key: "O", ctrlKey: true, shiftKey: true };
+
+  it("Ctrl+Shift+L steps from the grid tmux returns to, not from the viewport's single", () => {
+    const fx = mount({ workMode: "tmux", tabs, shown: "a", gridLayoutId: "quad" });
+    fx.press(ctrlShiftL);
+    expect(fx.layoutCalls).toEqual([[nextCycledLayoutId("quad"), { source: "operator" }]]);
+    expect(nextCycledLayoutId("quad")).not.toBe(nextCycledLayoutId("single"));
+  });
+
+  it("Ctrl+Shift+L is a no-op when the grid it would step from is the flow grid", () => {
+    const fx = mount({ workMode: "tmux", tabs, shown: "a", gridLayoutId: "flow-grid" });
+    fx.press(ctrlShiftL);
+    expect(fx.layoutCalls).toEqual([]);
+  });
+
+  it("Ctrl+Shift+O pins the shown session's grid zone, or nothing when it has none", () => {
+    const zoned = mount({ workMode: "tmux", tabs, shown: "a", shownGridZone: 3 });
+    zoned.press(ctrlShiftO);
+    expect(zoned.pinCalls).toEqual([3]);
+    const unzoned = mount({ workMode: "tmux", tabs, shown: "a", shownGridZone: null });
+    unzoned.press(ctrlShiftO);
+    expect(unzoned.pinCalls).toEqual([]);
+  });
+});
+
+describe("nextCycledLayoutId", () => {
+  it("steps to the next preset and wraps", () => {
+    expect(nextCycledLayoutId("single")).toBe("split");
+    expect(nextCycledLayoutId(LAYOUT_PRESETS.at(-1)!.id)).toBe("single");
+  });
+
+  it("is null in the flow grid", () => {
+    expect(nextCycledLayoutId(FLOW_GRID_ID)).toBeNull();
   });
 });
