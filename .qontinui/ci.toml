@@ -282,6 +282,25 @@ command = [
 ]
 
 [[steps]]
+# ci.yml "Run termhost-bench unit tests" — node built-ins only, beside the
+# CI-tooling tests exactly as ci.yml places it. A command here is an argv with no
+# shell, so the files are listed where ci.yml lets bash expand the glob;
+# scripts/termhost-bench/__tests__/ci-toml-parity.test.mjs fails when this list
+# and that directory disagree.
+name = "termhost-bench-node-tests"
+command = [
+  "node",
+  "--test",
+  "scripts/termhost-bench/__tests__/calibrate.test.mjs",
+  "scripts/termhost-bench/__tests__/ci-toml-parity.test.mjs",
+  "scripts/termhost-bench/__tests__/generator.test.mjs",
+  "scripts/termhost-bench/__tests__/kpi-catalog.test.mjs",
+  "scripts/termhost-bench/__tests__/marker.test.mjs",
+  "scripts/termhost-bench/__tests__/stats.test.mjs",
+  "scripts/termhost-bench/__tests__/validate.test.mjs",
+]
+
+[[steps]]
 name = "frontend-install"
 command = ["pnpm", "install", "--frozen-lockfile"]
 
