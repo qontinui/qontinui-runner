@@ -12,6 +12,7 @@
 //! | `POST /plan-library/links` | `POST {web}/api/v1/plan-library/{id}/edges` | **yes** |
 //! | `DELETE /plan-library/links/{id}` | `DELETE {web}/api/v1/plan-library/edges/{id}` | **yes** |
 //! | `PUT /plan-library/links/{id}` | `PUT {web}/api/v1/plan-library/edges/{id}` | **yes** |
+//! | `DELETE /plan-library/artifacts/{id}` | `DELETE {web}/api/v1/plan-library/{id}` | **yes** |
 //! | `GET /plan-library/search` | `GET {web}/api/v1/plan-library?…` | no |
 //! | `GET /plan-library/candidates` | `GET {web}/api/v1/plan-library/candidates?…` | no |
 //! | `GET /plan-library/artifacts/{id}` | `GET {web}/api/v1/plan-library/{id}[?include_coord]` | no |
@@ -34,6 +35,12 @@
 //! /plan-library/{id}/edges` is idempotent on an IDENTICAL triple but silently
 //! APPENDS a second edge for a different one, which is how two permanent FALSE
 //! `supersedes` edges landed on a real artifact with no way to retract them.
+//! The `DELETE /plan-library/artifacts/{id}` row lands Phase 3 of
+//! `2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent`: an
+//! artifact ARCHIVE (a soft delete — upstream stamps `archived_at` /
+//! `archived_by` / `archive_reason` and keeps the row and its version log), so
+//! a junk row is no longer permanent. The search, candidates and divergent
+//! reads take `include_archived=true` to see archived rows again.
 //! The export forward is the one route that does **not** wrap its answer in
 //! [`ApiResponse`] — it passes the upstream's `text/markdown` bytes and its
 //! `X-Content-Sha256` through unmodified, because the corpus-authority
@@ -87,6 +94,7 @@
 //!
 //! ```text
 //! POST /plan-library/artifacts  |  POST /plan-library/links
+//!   (and DELETE / PUT /plan-library/links/{id}, DELETE /plan-library/artifacts/{id})
 //!   ├─ Authorization: Bearer <nonce> / X-Coord-Mcp-Proxy-Key resolves a principal?  ──no──> 401 COORD_MCP_PROXY_UNAUTHORIZED
 //!   ├─ QONTINUI_PLAN_LIBRARY_WRITE != "0"  (absent ⇒ enabled)                        ──no──> 403 PLAN_LIBRARY_WRITE_KILLED
 //!   ├─ coord has answered this process's plan_capture poll                           ──no──> 403 PLAN_LIBRARY_DIAL_UNANSWERED
@@ -319,10 +327,10 @@ fn write_killed_error() -> (StatusCode, Json<ApiResponse<()>>) {
         format!(
             "the plan-library write door is KILLED on this machine: {PLAN_LIBRARY_WRITE_FLAG}=0 \
              is set in the runner's environment. POST /plan-library/artifacts, \
-             POST /plan-library/links, and DELETE / PUT /plan-library/links/{{id}} refuse \
-             until it is unset (absent means on; only the \
-             exact value \"0\" kills) — the switch is read per request, so no restart is \
-             needed. GET /plan-library/search and GET /plan-library/candidates work \
+             POST /plan-library/links, DELETE / PUT /plan-library/links/{{id}} and \
+             DELETE /plan-library/artifacts/{{id}} refuse until it is unset (absent means \
+             on; only the exact value \"0\" kills) — the switch is read per request, so no \
+             restart is needed. GET /plan-library/search and GET /plan-library/candidates work \
              regardless and advertise this switch."
         ),
     )
@@ -438,33 +446,40 @@ fn write_capability() -> serde_json::Map<String, Value> {
     let enabled = flag_on && dial;
     let instruction = if enabled {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are ENABLED: the \
-             machine kill switch ({PLAN_LIBRARY_WRITE_FLAG}) is not engaged and the tenant's \
-             plan_capture dial is `{level}`. Send the coord-mcp proxy nonce from this \
-             session's .mcp.json as `Authorization: Bearer <nonce>` — a request without a \
-             registered nonce answers 401 {CODE_PROXY_UNAUTHORIZED}."
+            "POST /plan-library/artifacts and POST /plan-library/links (and the \
+             DELETE / PUT /plan-library/links/{{id}} and DELETE /plan-library/artifacts/{{id}} \
+             corrections) are ENABLED: the machine kill switch ({PLAN_LIBRARY_WRITE_FLAG}) \
+             is not engaged and the tenant's plan_capture dial is `{level}`. Send the \
+             coord-mcp proxy nonce from this session's .mcp.json as \
+             `Authorization: Bearer <nonce>` — a request without a registered nonce \
+             answers 401 {CODE_PROXY_UNAUTHORIZED}."
         )
     } else if !flag_on {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
-             403 {CODE_WRITE_KILLED}: {PLAN_LIBRARY_WRITE_FLAG}=0 is set in the runner's \
-             environment (the machine kill switch; absent means on). Unset it — it is read per \
-             request, no restart needed. These read routes work regardless."
+            "POST /plan-library/artifacts and POST /plan-library/links (and the \
+             DELETE / PUT /plan-library/links/{{id}} and DELETE /plan-library/artifacts/{{id}} \
+             corrections) are DISABLED and will 403 {CODE_WRITE_KILLED}: \
+             {PLAN_LIBRARY_WRITE_FLAG}=0 is set in the runner's environment (the machine \
+             kill switch; absent means on). Unset it — it is read per request, no restart \
+             needed. These read routes work regardless."
         )
     } else if !answered {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are HELD and will 403 \
-             {CODE_DIAL_UNANSWERED}: coord has not yet answered this runner's plan_capture \
-             poll (the dial defaults to `{level}`, but writes wait for coord so an explicit \
-             `off` can win). It clears on the first successful poll. These read routes work \
-             regardless."
+            "POST /plan-library/artifacts and POST /plan-library/links (and the \
+             DELETE / PUT /plan-library/links/{{id}} and DELETE /plan-library/artifacts/{{id}} \
+             corrections) are HELD and will 403 {CODE_DIAL_UNANSWERED}: coord has not yet \
+             answered this runner's plan_capture poll (the dial defaults to `{level}`, but \
+             writes wait for coord so an explicit `off` can win). It clears on the first \
+             successful poll. These read routes work regardless."
         )
     } else {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
-             403 {CODE_DIAL_OFF}: the tenant's plan_capture fleet dial reads `{level}`, not \
-             `record`. Set it at /admin/coord/plan-library; it is re-polled every 45s. These \
-             read routes work regardless."
+            "POST /plan-library/artifacts and POST /plan-library/links (and the \
+             DELETE / PUT /plan-library/links/{{id}} and DELETE /plan-library/artifacts/{{id}} \
+             corrections) are DISABLED and will 403 {CODE_DIAL_OFF}: the tenant's \
+             plan_capture fleet dial reads `{level}`, not `record`. Set it at \
+             /admin/coord/plan-library; it is re-polled every 45s. These read routes work \
+             regardless."
         )
     };
     let mut m = serde_json::Map::new();
@@ -617,6 +632,18 @@ replaces relation/to_id/note IN PLACE and stamps source: \"corrected\" plus \
 corrected_by/corrected_at/corrected_reason, so a correction is distinguishable from an \
 original recording. Both require a non-empty `reason`: an unexplained retraction or \
 correction is exactly the silent overwrite this pair of doors exists to prevent. \
+`DELETE /plan-library/artifacts/{id}` (body: {\"reason\", \"session_id\"?}, reason REQUIRED \
+and non-blank) ARCHIVES an artifact — a soft delete: the row and its version log survive, \
+archived_at/archived_by/archive_reason are stamped, and it drops out of the search, \
+candidates and divergent reads unless they are asked with `include_archived=true`; the \
+by-id read still returns it. The forwarded reason (on this and on the edge retraction) \
+carries this door's principal and the optional `session_id` label, and a reason that \
+exceeds 2000 characters once that attribution is appended is refused with a 400 — \
+shorten the reason or the label. Upstream refuses with 409 while a scanned FILE still backs the row \
+(`file_backed`, or `file_backing_unknown` when the scan census is withheld — delete the file \
+first, or the next scan resurrects the row) and while live inbound edges point at it \
+(`inbound_edges` — retract them first through `DELETE /plan-library/links/{id}`). \
+Archiving an already-archived row is idempotent; verify by read. \
 POST /plan-library/artifacts identity is (organization, kind, slug, source_repo) — \
 `source_repo` is part of the key, so omitting it does NOT update an artifact that has \
 one, it creates a second row. Pass the same `source_repo` the artifact was captured \
@@ -921,6 +948,20 @@ pub struct LinkRetractRequest {
     /// Same caller-chosen label as [`LinkRequest::session_id`]: folded into
     /// the forwarded reason by [`retraction_payload`], so a retraction is as
     /// attributable as the create it retracts.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// `DELETE /plan-library/artifacts/{id}` body — archive (soft-delete) an
+/// artifact. `reason` is required and non-blank for the same reason as
+/// [`LinkRetractRequest`]: a deletion with no stated cause is
+/// indistinguishable from a mistake six weeks later.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactArchiveRequest {
+    pub reason: String,
+    /// Same caller-chosen label as [`LinkRequest::session_id`]: folded into
+    /// the forwarded reason by [`archive_payload`], so an archive is as
+    /// attributable as an edge retraction.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1760,7 +1801,9 @@ pub async fn retract_link_handler(
 /// (`WorkArtifactEdgeRetract` in qontinui-web). Checked here AFTER the
 /// attribution fold, because the fold lengthens a reason the caller sent
 /// within bounds — an upstream 422 on text the caller never wrote would be
-/// undiagnosable from the caller's side.
+/// undiagnosable from the caller's side. The artifact archive's `reason`
+/// (`WorkArtifactArchiveRequest`) carries the same limit and is checked the
+/// same way, after [`archive_payload`]'s fold.
 const EDGE_REASON_MAX_CHARS: usize = 2000;
 
 /// The upstream body for a retraction: the caller's `reason` with the
@@ -1773,6 +1816,68 @@ const EDGE_REASON_MAX_CHARS: usize = 2000;
 /// the same device, and "who retracted this, and why" — the point of a soft
 /// retract over a hard delete — would have only half an answer.
 pub fn retraction_payload(req: &LinkRetractRequest, principal: &WritePrincipal) -> Value {
+    serde_json::json!({
+        "reason": provenance_note(Some(&req.reason), principal, req.session_id.as_deref()),
+    })
+}
+
+/// `DELETE /plan-library/artifacts/{id}` — ARCHIVE (soft-delete) an
+/// artifact. The row is never removed; upstream stamps `archived_at` /
+/// `archived_by` / `archive_reason`, keeps the version log, and the row drops
+/// out of the default search/candidates/divergent reads (`include_archived=true`
+/// brings it back). **Nonce-authorized, then kill switch, then dial**
+/// ([`authorize_write`]) — the same authority as writing the artifact. The
+/// forwarded `reason` carries the principal and the optional `session_id`
+/// label ([`archive_payload`]), and a reason that exceeds
+/// [`EDGE_REASON_MAX_CHARS`] once that attribution is folded in is refused
+/// with a local 400 — exactly as on the edge retraction.
+///
+/// Upstream's refusals pass through with their status: `409 file_backed` /
+/// `file_backing_unknown` (a scanned file still backs the row, so the next
+/// scan would resurrect it) and `409 inbound_edges` (retract those first via
+/// `DELETE /plan-library/links/{id}`).
+pub async fn archive_artifact_handler(
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    let principal = authorize_write(&headers)?;
+    let req: ArtifactArchiveRequest = parse_write_body(&body)?;
+    if req.reason.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "`reason` is required and must be non-empty — an archive with no stated \
+                 cause is indistinguishable from a mistake later",
+            )),
+        ));
+    }
+    let path = artifact_upstream_path(&artifact_id)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error(msg))))?;
+    let payload = archive_payload(&req, &principal);
+    let folded_len = payload["reason"].as_str().map_or(0, |r| r.chars().count());
+    if folded_len > EDGE_REASON_MAX_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "`reason` is {folded_len} characters once this door appends its \
+                 attribution (the calling principal and session) — upstream \
+                 accepts at most {EDGE_REASON_MAX_CHARS}; shorten the reason or \
+                 the `session_id` label"
+            ))),
+        ));
+    }
+    let upstream = upstream_delete(&path, &payload).await?;
+    Ok(Json(ApiResponse::success(upstream)))
+}
+
+/// The upstream body for an artifact archive: the caller's `reason` with the
+/// nonce's principal folded in by [`provenance_note`] — the same fold as
+/// [`retraction_payload`], for the same reason. Upstream stamps `archived_by`
+/// from the AUDIT ACTOR, which through this door is the runner's own device
+/// user for every session on the box, so the reason is the only place the
+/// archiving session is recorded at all.
+pub fn archive_payload(req: &ArtifactArchiveRequest, principal: &WritePrincipal) -> Value {
     serde_json::json!({
         "reason": provenance_note(Some(&req.reason), principal, req.session_id.as_deref()),
     })
@@ -1811,7 +1916,7 @@ pub async fn correct_link_handler(
 
 /// Query parameters this door forwards to the web list route. Anything else is
 /// dropped rather than passed through, so a typo cannot silently widen a read.
-const SEARCH_PARAMS: [&str; 9] = [
+const SEARCH_PARAMS: [&str; 10] = [
     "q",
     "kind",
     "slug",
@@ -1821,6 +1926,7 @@ const SEARCH_PARAMS: [&str; 9] = [
     "work_unit_slug",
     "offset",
     "limit",
+    "include_archived",
 ];
 
 /// `GET /plan-library/search` — full-text + filtered read over the corpus.
@@ -1837,7 +1943,7 @@ pub async fn search_handler(Query(params): Query<HashMap<String, String>>) -> Re
 }
 
 /// Query parameters forwarded to the web candidates route.
-const CANDIDATE_PARAMS: [&str; 3] = ["offset", "limit", "include_coord"];
+const CANDIDATE_PARAMS: [&str; 4] = ["offset", "limit", "include_coord", "include_archived"];
 
 /// `GET /plan-library/candidates` — unshipped plans with the ranking INPUTS
 /// attached and **no score** (D6: the agent ranks). **Ungated**, and advertises
@@ -1953,16 +2059,19 @@ pub async fn export_artifact_handler(
 
 /// Query parameters forwarded to the web divergent route.
 ///
-/// `kind` is its SOLE query parameter upstream, and it is load-bearing on both
-/// halves of the answer — it filters `groups` via `crud.find_divergent(...)`
-/// and post-filters `kind_forks`. There is **no pagination on that route at
-/// all**: `total` is `len(groups)` over the whole result. An earlier draft
-/// forwarded `["offset", "limit"]` here, reasoning from the shape of the
-/// NEIGHBOURING list reads rather than from the route actually being
-/// forwarded — which silently stripped the one filter that works and forwarded
-/// two that FastAPI ignores, so `?kind=plan` returned the entire unfiltered
-/// fork report and `?limit=5` looked like a page.
-const DIVERGENT_PARAMS: [&str; 1] = ["kind"];
+/// `kind` and `include_archived` are its only query parameters upstream.
+/// `include_archived` (plan
+/// `2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent`) brings
+/// archived rows back into both halves, which exclude them by default. `kind`
+/// is load-bearing on both halves of the answer — it filters `groups` via
+/// `crud.find_divergent(...)` and post-filters `kind_forks`. There is **no
+/// pagination on that route at all**: `total` is `len(groups)` over the whole
+/// result. An earlier draft forwarded `["offset", "limit"]` here, reasoning
+/// from the shape of the NEIGHBOURING list reads rather than from the route
+/// actually being forwarded — which silently stripped the one filter that
+/// works and forwarded two that FastAPI ignores, so `?kind=plan` returned the
+/// entire unfiltered fork report and `?limit=5` looked like a page.
+const DIVERGENT_PARAMS: [&str; 2] = ["kind", "include_archived"];
 
 /// `GET /plan-library/divergent` — the same-`(kind, slug)` groups whose digests
 /// disagree, plus kind forks: the corpus fork surfaced rather than declared
@@ -2012,6 +2121,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
         ("POST", "/plan-library/links", true),
         ("DELETE", "/plan-library/links/{id}", true),
         ("PUT", "/plan-library/links/{id}", true),
+        ("DELETE", "/plan-library/artifacts/{id}", true),
         ("GET", "/plan-library/search", false),
         ("GET", "/plan-library/candidates", false),
         ("GET", "/plan-library/artifacts/{id}", false),
@@ -2031,7 +2141,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/plan-library/search", get(search_handler))
         .route("/plan-library/candidates", get(candidates_handler))
-        .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
+        .route(
+            "/plan-library/artifacts/{id}",
+            get(read_artifact_handler).delete(archive_artifact_handler),
+        )
         .route(
             "/plan-library/artifacts/{id}/export",
             get(export_artifact_handler),
@@ -2524,6 +2637,39 @@ mod tests {
             retraction_payload(&unlabelled, &p)["reason"],
             serde_json::json!(format!(
                 "false supersedes claim (agent write by {actor}, session workdir D:/wt)"
+            ))
+        );
+    }
+
+    /// An archive forwards the caller's reason WITH the principal folded in,
+    /// exactly as a retraction does: upstream's `archived_by` is the runner's
+    /// device user for every session, so the reason is the only place the
+    /// archiving session is recorded at all.
+    #[test]
+    fn an_archive_forwards_its_reason_attributed_to_the_principal() {
+        let p = principal();
+        let actor = "agent:0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60";
+        let labelled = ArtifactArchiveRequest {
+            reason: "junk row from a scratch worktree".to_string(),
+            session_id: Some("db54260f".to_string()),
+        };
+        assert_eq!(
+            archive_payload(&labelled, &p),
+            serde_json::json!({
+                "reason": format!(
+                    "junk row from a scratch worktree (agent write by {actor}, session db54260f)"
+                ),
+            })
+        );
+        // No caller label: what the runner knows about the session stands in.
+        let unlabelled = ArtifactArchiveRequest {
+            reason: "junk row from a scratch worktree".to_string(),
+            session_id: None,
+        };
+        assert_eq!(
+            archive_payload(&unlabelled, &p)["reason"],
+            serde_json::json!(format!(
+                "junk row from a scratch worktree (agent write by {actor}, session workdir D:/wt)"
             ))
         );
     }
@@ -3156,6 +3302,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("q".to_string(), "merge train".to_string());
         params.insert("limit".to_string(), "10".to_string());
+        params.insert("include_archived".to_string(), "true".to_string());
         params.insert("organization_id".to_string(), "sneaky".to_string());
         params.insert("nonsense".to_string(), "x".to_string());
 
@@ -3163,16 +3310,37 @@ mod tests {
             .into_iter()
             .filter(|(k, _)| SEARCH_PARAMS.contains(&k.as_str()))
             .collect();
-        assert_eq!(forwarded.len(), 2);
+        assert_eq!(forwarded.len(), 3);
         assert_eq!(forwarded.get("q").map(String::as_str), Some("merge train"));
+        assert_eq!(
+            forwarded.get("include_archived").map(String::as_str),
+            Some("true")
+        );
         assert!(!forwarded.contains_key("organization_id"));
         assert!(!forwarded.contains_key("nonsense"));
     }
 
     #[test]
-    fn the_candidate_params_are_the_documented_three() {
+    fn the_candidate_params_are_the_documented_four() {
         assert!(CANDIDATE_PARAMS.contains(&"include_coord"));
+        assert!(CANDIDATE_PARAMS.contains(&"include_archived"));
         assert!(!CANDIDATE_PARAMS.contains(&"organization_id"));
+    }
+
+    /// `include_archived` (plan
+    /// `2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent`
+    /// Phase 3) reaches the three corpus reads that exclude archived rows by
+    /// default (search, candidates, divergent), so a session can verify an
+    /// archive by read. It does NOT ride the by-id export: upstream returns an
+    /// archived row on an explicit id regardless, so the parameter would be one
+    /// this door never reviewed.
+    #[test]
+    fn include_archived_is_forwarded_on_the_corpus_reads_only() {
+        assert!(SEARCH_PARAMS.contains(&"include_archived"));
+        assert!(CANDIDATE_PARAMS.contains(&"include_archived"));
+        assert!(DIVERGENT_PARAMS.contains(&"include_archived"));
+        assert!(!EXPORT_PARAMS.contains(&"include_archived"));
+        assert!(!ARTIFACT_PARAMS.contains(&"include_archived"));
     }
 
     /// The exact-`slug` filter the web list route gains
@@ -3299,7 +3467,7 @@ mod tests {
     #[test]
     fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 10, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 11, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
             assert!(matches!(*method, "GET" | "POST" | "PUT" | "DELETE"));
@@ -3316,6 +3484,7 @@ mod tests {
                 "/plan-library/links",
                 "/plan-library/links/{id}",
                 "/plan-library/links/{id}",
+                "/plan-library/artifacts/{id}",
             ]
         );
         let ungated: Vec<&str> = entries
@@ -3367,11 +3536,20 @@ mod tests {
                 "/plan-library/artifacts",
                 "/plan-library/links",
                 "/plan-library/links/{id}",
+                "/plan-library/artifacts/{id}",
             ]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
-            "the nonce-authorized surface must stay exactly these three write paths"
+            "the nonce-authorized surface must stay exactly these four write paths"
         );
+        // The artifact archive shares its PATH with the open by-id read; only
+        // the DELETE verb on it is authorized.
+        let on_artifact_id: Vec<_> = route_entries()
+            .iter()
+            .filter(|(_, p, _)| *p == "/plan-library/artifacts/{id}")
+            .map(|(m, _, g)| (*m, *g))
+            .collect();
+        assert_eq!(on_artifact_id, vec![("DELETE", true), ("GET", false)]);
 
         // …and both original new routes are on the open side, by name.
         let open: std::collections::BTreeSet<&str> = route_entries()
@@ -3513,6 +3691,74 @@ mod tests {
         );
     }
 
+    /// Every `route_entries()` row is registered in `routes()` WITH ITS
+    /// METHOD, and `routes()` registers no method the table does not list.
+    ///
+    /// `route_entries_covers_every_route_registration_in_this_file` counts
+    /// distinct PATHS, so a verb chained onto an existing path — the archive's
+    /// `.delete(archive_artifact_handler)` on `/plan-library/artifacts/{id}` —
+    /// could be deleted and that test, and every gating test that reads
+    /// `route_entries()`, would stay green while the route 405s. This scans the
+    /// `routes()` FUNCTION BODY per `.route(` call instead: the path literal,
+    /// then every method router (`get(`, `post(`, `put(`, `delete(`) chained in
+    /// that same call.
+    #[test]
+    fn routes_registers_every_route_entry_with_its_method() {
+        // Built at runtime so this test's own source cannot match itself.
+        let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
+        let needle = format!(".{}(", "route");
+        let src = include_str!("plan_library.rs");
+        let (_, after) = src
+            .split_once(fn_header.as_str())
+            .expect("routes() signature — update this test if it changes");
+        let (body, _) = after
+            .split_once("\n}")
+            .expect("routes() must be closed by a brace at column 0");
+
+        /// Method routers called in one `.route(` chunk, as upper-case verbs.
+        /// A verb counts only when the character before it is not part of an
+        /// identifier, so `target(` never reads as `get(`.
+        fn verbs_in(chunk: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for verb in ["get", "post", "put", "delete"] {
+                let call = format!("{verb}(");
+                for (at, _) in chunk.match_indices(call.as_str()) {
+                    let prev = chunk.get(..at).and_then(|h| h.chars().next_back());
+                    if !prev.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                        out.push(verb.to_uppercase());
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        let mut registered: Vec<(String, String)> = Vec::new();
+        for chunk in body.split(needle.as_str()).skip(1) {
+            let path = chunk
+                .split('"')
+                .nth(1)
+                .expect("each .route( call opens with a path literal");
+            for verb in verbs_in(chunk) {
+                registered.push((verb, path.to_string()));
+            }
+        }
+        registered.sort();
+
+        let mut listed: Vec<(String, String)> = route_entries()
+            .iter()
+            .map(|(m, p, _)| ((*m).to_string(), (*p).to_string()))
+            .collect();
+        listed.sort();
+
+        assert_eq!(
+            registered, listed,
+            "routes() and route_entries() disagree on (method, path) — a verb \
+             registered without its row is unclassified by the gating tests, and a row \
+             whose verb is not registered is a documented route that answers 405"
+        );
+    }
+
     // ---- the export route's two guards ------------------------------------
 
     /// The export allowlist forwards `version_number` and drops everything
@@ -3554,17 +3800,27 @@ mod tests {
         }
     }
 
-    /// The divergent route forwards `kind` — its only upstream parameter — and
-    /// drops the paging pair, which that route does not implement.
+    /// The divergent route forwards `kind` and `include_archived` — its only
+    /// upstream parameters — and drops the paging pair, which that route does
+    /// not implement.
     #[test]
-    fn the_divergent_param_allowlist_is_kind_alone() {
-        let raw: HashMap<String, String> = [("offset", "10"), ("limit", "5"), ("kind", "plan")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+    fn the_divergent_param_allowlist_is_kind_and_include_archived() {
+        let raw: HashMap<String, String> = [
+            ("offset", "10"),
+            ("limit", "5"),
+            ("kind", "plan"),
+            ("include_archived", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
         let forwarded = forward_only(raw, &DIVERGENT_PARAMS);
-        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded.len(), 2);
         assert_eq!(forwarded.get("kind").map(String::as_str), Some("plan"));
+        assert_eq!(
+            forwarded.get("include_archived").map(String::as_str),
+            Some("true")
+        );
         for dropped in ["offset", "limit"] {
             assert!(
                 !forwarded.contains_key(dropped),
@@ -3701,7 +3957,10 @@ mod tests {
     fn test_app() -> Router {
         Router::new()
             .route("/plan-library/artifacts", post(write_artifact_handler))
-            .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
+            .route(
+                "/plan-library/artifacts/{id}",
+                get(read_artifact_handler).delete(archive_artifact_handler),
+            )
             .route(
                 "/plan-library/artifacts/{id}/export",
                 get(export_artifact_handler),
@@ -4260,6 +4519,111 @@ mod tests {
         }
     }
 
+    fn valid_archive() -> Value {
+        serde_json::json!({"reason": "junk row captured from a scratch worktree"})
+    }
+
+    /// A placeholder artifact id for the archive route.
+    const ARTIFACT_ID_URI: &str = "/plan-library/artifacts/44444444-4444-4444-4444-444444444444";
+
+    /// The artifact archive (`DELETE /plan-library/artifacts/{id}`, Phase 3 of
+    /// `2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent`) is
+    /// gated EXACTLY like `POST /plan-library/artifacts` — nonce, then kill
+    /// switch, then dial — asserted side by side with the POST at each layer
+    /// so the two cannot drift. Driven over HTTP: a handler that forgot
+    /// `authorize_write` would compile clean and only this test would notice.
+    #[tokio::test]
+    async fn the_artifact_archive_is_gated_the_same_as_the_artifact_write() {
+        // Layer 1: no nonce ⇒ 401, dial open, switch off.
+        {
+            let _pin = pin("record");
+            let _guard = crate::test_env::env_lock();
+            let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+            std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+            for (status, body) in [
+                post_json("/plan-library/artifacts", None, valid_artifact()).await,
+                delete_json(ARTIFACT_ID_URI, None, valid_archive()).await,
+            ] {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+                assert_eq!(body["code"], serde_json::json!(CODE_PROXY_UNAUTHORIZED));
+            }
+            // An empty body without a nonce is still the 401, not a 400.
+            let (status, body) = delete_json(ARTIFACT_ID_URI, None, serde_json::json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        }
+
+        // Layer 2: registered nonce, kill switch engaged ⇒ 403 killed.
+        {
+            let _pin = pin("record");
+            let _guard = crate::test_env::env_lock();
+            let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+            std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "0");
+            let nonce = registered_nonce();
+            for (status, body) in [
+                post_json("/plan-library/artifacts", Some(&nonce), valid_artifact()).await,
+                delete_json(ARTIFACT_ID_URI, Some(&nonce), valid_archive()).await,
+            ] {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert_eq!(body["code"], serde_json::json!(CODE_WRITE_KILLED));
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("DELETE /plan-library/artifacts/{id}"));
+            }
+        }
+
+        // Layer 3: past the kill switch, dial off ⇒ 403 dial-off.
+        {
+            let _pin = pin("off");
+            let _guard = crate::test_env::env_lock();
+            let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+            std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+            let nonce = registered_nonce();
+            for (status, body) in [
+                post_json("/plan-library/artifacts", Some(&nonce), valid_artifact()).await,
+                delete_json(ARTIFACT_ID_URI, Some(&nonce), valid_archive()).await,
+            ] {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert_eq!(body["code"], serde_json::json!(CODE_DIAL_OFF));
+            }
+        }
+    }
+
+    /// Past the gate, the archive refuses a blank `reason` and a non-UUID id
+    /// locally, before any upstream dial (hermetic) — the same pass-through
+    /// proof as `at_dial_record_a_registered_nonce_reaches_validation`.
+    #[tokio::test]
+    async fn the_artifact_archive_requires_a_reason_and_a_uuid_before_any_dial() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        for reason in ["", "   "] {
+            let (status, body) = delete_json(
+                ARTIFACT_ID_URI,
+                Some(&nonce),
+                serde_json::json!({"reason": reason}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "reason={reason:?}");
+            assert!(body["error"].as_str().unwrap().contains("`reason`"));
+        }
+
+        let (status, body) = delete_json(
+            "/plan-library/artifacts/not-a-uuid",
+            Some(&nonce),
+            valid_archive(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be an artifact UUID"));
+    }
+
     /// Both edge-correction routes require a non-empty `reason` — refused
     /// BEFORE any upstream dial, matching the `edge_payload` /
     /// `missing_replace_fields` precedent of refusing a malformed write body
@@ -4311,6 +4675,31 @@ mod tests {
         let reason = "x".repeat(EDGE_REASON_MAX_CHARS - 5);
         let (status, body) = delete_json(
             EDGE_ID_URI,
+            Some(&nonce),
+            serde_json::json!({"reason": reason}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("at most 2000"), "{err}");
+        assert!(err.contains("attribution"), "{err}");
+    }
+
+    /// An archive reason that fits upstream's limit on its own but not once
+    /// the attribution is appended is a local 400 naming the limit — the same
+    /// refusal as the edge retraction, never an upstream 422 about text the
+    /// caller did not write.
+    #[tokio::test]
+    async fn an_archive_reason_overflowed_by_the_attribution_is_a_local_400() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        let reason = "x".repeat(EDGE_REASON_MAX_CHARS - 5);
+        let (status, body) = delete_json(
+            ARTIFACT_ID_URI,
             Some(&nonce),
             serde_json::json!({"reason": reason}),
         )
