@@ -9,14 +9,18 @@
  * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 1.
  *
  * Recording recipe (on a Linux box with `script` and `claude`; README.md has it):
- *   script -q --log-timing t1.tm --log-out t1.ts -c 'timeout 300 claude ...'
+ *   script -q --logging-format advanced --log-timing t1.tm --log-out t1.ts -c '...'
  *
  * Inputs: both util-linux timing formats —
  *   classic   "<delay-seconds> <bytes>" per output chunk (`--log-timing` with only
  *             output logged); geometry then comes from --cols/--rows;
- *   advanced  "<O|I|H|S> <delay-seconds> <data>" (`--log-io`, or `--logging-format
- *             advanced`); COLUMNS/LINES headers give the geometry.
- * The typescript's "Script started on ..." line, when present, is skipped.
+ *   advanced  "<O|I|H|S> <delay-seconds> <data>" (`--logging-format advanced`, or
+ *             any input logging); COLUMNS/LINES headers give the geometry.
+ * and both typescript layouts — output only (`--log-out`), or output and input
+ * interleaved in one file (`--log-io`). The layout is DETECTED from byte totals: the
+ * body (minus util-linux's "Script started" / "Script done" lines) must hold exactly
+ * the output bytes, or exactly output plus input; anything else, or both, is refused
+ * rather than guessed. Input bytes are skipped, never analysed.
  *
  * Analysis (thresholds in ANALYSIS_DEFAULTS):
  *   frames   a DEC 2026 synchronized block is one frame; other output chunks closer
@@ -70,6 +74,7 @@ const SYNC_BEGIN_BYTES = Buffer.from(SYNC_BEGIN, "latin1");
 const SYNC_END_BYTES = Buffer.from(SYNC_END, "latin1");
 const ALT_SCREEN_BYTES = Buffer.from("\x1b[?1049h", "latin1");
 const SCRIPT_HEADER = Buffer.from("Script started on ", "latin1");
+const SCRIPT_TRAILER = Buffer.from("\nScript done on ", "latin1");
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -134,26 +139,76 @@ export function stripScriptHeader(typescript) {
 }
 
 /**
+ * Drop util-linux's closing "\nScript done on ... [...]\n" line, when it is the last
+ * line of the typescript.
+ *
+ * @param {Buffer} body a typescript with its header already stripped
+ * @returns {Buffer}
+ */
+export function stripScriptTrailer(body) {
+  const at = body.lastIndexOf(SCRIPT_TRAILER);
+  if (at < 0) return body;
+  const nl = body.indexOf(0x0a, at + 1);
+  return nl < 0 || nl === body.length - 1 ? body.subarray(0, at) : body;
+}
+
+/**
+ * Work out which typescript layout the timing describes, from byte totals alone: the
+ * body (header stripped, with or without the trailer) must equal the output total
+ * (`--log-out`) or the output plus input total (`--log-io`). Exactly one match is
+ * accepted; none or several is refused.
+ *
+ * @param {ReturnType<typeof parseTiming>} timing
+ * @param {Buffer} typescript
+ * @returns {{layout: "output_only" | "combined", body: Buffer}}
+ */
+export function detectLayout(timing, typescript) {
+  let output = 0;
+  let input = 0;
+  for (const e of timing.entries) {
+    if (e.type === "O") output += e.bytes;
+    if (e.type === "I") input += e.bytes;
+  }
+  const withTrailer = stripScriptHeader(typescript);
+  const bodies = [stripScriptTrailer(withTrailer), withTrailer];
+  const layouts =
+    input > 0
+      ? [
+          ["output_only", output],
+          ["combined", output + input],
+        ]
+      : [["output_only", output]];
+  const matches = [];
+  for (const body of new Set(bodies)) {
+    for (const [layout, total] of layouts)
+      if (body.length === total) matches.push({ layout, body });
+  }
+  if (matches.length === 1) return matches[0];
+  const sizes = `the typescript body holds ${bodies[0].length} bytes (${withTrailer.length} with its trailer); output alone is ${output}${input > 0 ? `, output and input ${output + input}` : ""}`;
+  if (matches.length === 0) {
+    throw new Error(`the timing does not describe this typescript: ${sizes}`);
+  }
+  throw new Error(`the typescript's layout is ambiguous: ${sizes}`);
+}
+
+/**
  * Pair timing entries with typescript bytes: one chunk per output entry, timed at
- * the cumulative delay (every entry's delay counts in the advanced format).
+ * the cumulative delay (every entry's delay counts in the advanced format). In a
+ * combined (`--log-io`) typescript the input bytes are skipped.
  *
  * @param {ReturnType<typeof parseTiming>} timing
  * @param {Buffer} typescript
  * @returns {{t: number, bytes: Buffer}[]} t in seconds from the recording's start
  */
 export function reconstructChunks(timing, typescript) {
-  const body = stripScriptHeader(typescript);
+  const { layout, body } = detectLayout(timing, typescript);
   const chunks = [];
   let t = 0;
   let offset = 0;
   for (const e of timing.entries) {
     t += e.delay;
+    if (e.type === "I" && layout === "combined") offset += e.bytes;
     if (e.type !== "O") continue;
-    if (offset + e.bytes > body.length) {
-      throw new Error(
-        `timing claims ${offset + e.bytes} output bytes but the typescript holds ${body.length}`,
-      );
-    }
     if (e.bytes > 0) chunks.push({ t, bytes: body.subarray(offset, offset + e.bytes) });
     offset += e.bytes;
   }
@@ -404,7 +459,13 @@ export function fitProfile(
     });
   }
   const classes = Object.keys(PHASE_CLASSES).filter((c) => per[c]);
+  // No usable data is a refusal, never a profile of zeros.
   if (classes.length === 0) throw new Error("the recordings contain no output to calibrate from");
+  if (!(durationS > 0) || !(totalBytes > 0)) {
+    throw new Error("the recordings hold no timed output: refusing to write 0 B/s statistics");
+  }
+  const allFrames = analyses.flatMap((a) => a.frames.map((f) => f.bytes));
+  if (allFrames.length === 0) throw new Error("the recordings contain no output frames");
   const initial = mostCommon(firsts);
   for (const cls of classes) if (!transitions[cls]) transitions[cls] = { [initial]: 1 };
 
@@ -415,8 +476,10 @@ export function fitProfile(
       kind: PHASE_CLASSES[cls],
       duration_ms: quantileTable(p.durationsMs, (v) => Math.max(1, roundInt(v))),
     };
+    if (!(p.seconds > 0)) throw new Error(`phase ${cls} has no duration to compute a rate from`);
     if (cls !== "idle") {
-      phase.fps = round3(Math.max(0.001, p.frames / Math.max(p.seconds, 1e-6)));
+      if (!(p.frames > 0)) throw new Error(`phase ${cls} has no frames`);
+      phase.fps = Number((p.frames / p.seconds).toPrecision(6));
       const sizes = quantileTable(p.frameBytes, (v) => Math.max(1, roundInt(v)));
       if (cls === "repaint") phase.frame_bytes = sizes;
       if (cls === "stream" || cls === "tool_burst") phase.chunk_bytes = sizes;
@@ -424,7 +487,6 @@ export function fitProfile(
     phases[cls] = phase;
   }
   const totalRunSeconds = classes.reduce((a, c) => a + per[c].seconds, 0);
-  const allFrames = analyses.flatMap((a) => a.frames.map((f) => f.bytes));
   const profile = {
     schema: PROFILE_SCHEMA_ID,
     id,
@@ -435,7 +497,7 @@ export function fitProfile(
       kind: "calibration",
       source: FITTED_SOURCE,
       recordings: analyses.length,
-      duration_s: round3(Math.max(durationS, 0.001)),
+      duration_s: round3(durationS),
       calibrated_at: calibratedAt,
     },
     geometry: { cols: geometry.cols, rows: geometry.rows },
@@ -445,14 +507,12 @@ export function fitProfile(
     phases,
     transitions: Object.fromEntries(classes.map((c) => [c, transitions[c]])),
     expected: {
-      bytes_per_s: round3(durationS > 0 ? totalBytes / durationS : 0),
-      sync_share: round3(totalBytes > 0 ? syncBytes / totalBytes : 0),
+      bytes_per_s: round3(totalBytes / durationS),
+      sync_share: round3(syncBytes / totalBytes),
       phase_share: Object.fromEntries(
-        classes.map((c) => [c, round3(totalRunSeconds > 0 ? per[c].seconds / totalRunSeconds : 0)]),
+        classes.map((c) => [c, round3(per[c].seconds / totalRunSeconds)]),
       ),
-      frame_bytes: quantileTable(allFrames.length ? allFrames : [1], (v) =>
-        Math.max(1, roundInt(v)),
-      ),
+      frame_bytes: quantileTable(allFrames, (v) => Math.max(1, roundInt(v))),
     },
   };
   assertValidProfile(profile, "fitted by calibrate.mjs");

@@ -93,8 +93,9 @@ export const NEEDS = Object.freeze({
   capture: "an operative screen-capture source for the measured window (D2)",
   safe_injection: "the D9 input-injection safeguard established for this run",
   gpu_counters: "per-process GPU engine counters (Windows with a WDDM 2.0+ GPU)",
-  baseline_level: "a measured N = 1 row for the same setup, variant and arm",
+  baseline_level: "a measured N = 1 row for the same setup, variant, build role and arm",
   n_ladder: "measured rows at three or more N levels",
+  refresh_rate: "a known display refresh rate (intervals are counted in refresh intervals)",
 });
 
 /**
@@ -107,6 +108,8 @@ export const REASON_CODES = Object.freeze({
   capture_unavailable: "no operative capture source for this environment",
   capture_disagreement:
     "WGC and DDA disagreed on marker first-appearance by more than one refresh interval (D2)",
+  refresh_rate_unknown:
+    "the display refresh rate is unknown, so nothing measured in refresh intervals can be counted",
   clock_unaligned: "the generator and probe clocks could not be shown to share a timebase",
   marker_unreadable: "the setup's calibration marker was unreadable or altered",
   sessions_not_rendered: "the probe did not see the expected number of sessions' markers",
@@ -120,7 +123,8 @@ export const REASON_CODES = Object.freeze({
   admission_refused: "the runner's spawn-time resource guard refused sessions at this N",
   host_crashed: "a host process exited during the run",
   gpu_counters_unavailable: "no per-process GPU engine counters on this machine",
-  no_baseline_level: "the ratio needs a measured N = 1 value for the same setup and arm",
+  no_baseline_level:
+    "the ratio needs a measured N = 1 value for the same setup, variant, build role and arm",
   baseline_level: "this is the N = 1 row; a ratio against itself carries no information",
   zero_baseline: "the N = 1 value is 0, so the ratio is undefined",
   too_few_levels: "fewer N levels than the slope needs",
@@ -159,7 +163,6 @@ export const INCIDENT_KINDS = Object.freeze({
 
 const PCT_RANGE = Object.freeze({ minimum: 0, maximum: 100 });
 const NON_NEGATIVE = Object.freeze({ minimum: 0 });
-const POSITIVE = Object.freeze({ exclusiveMinimum: 0 });
 const UNBOUNDED = Object.freeze({});
 const CORE_PCT = "% of one logical core";
 
@@ -248,7 +251,7 @@ export const KPI_CATALOG = deepFreeze(
       sample_unit: "interval between consecutive captured frames",
       min_n: 100,
       instrument: "capture frame times",
-      needs: ["capture"],
+      needs: ["capture", "refresh_rate"],
       comparable: true,
       attribution: "host",
       derived_from: ["frame_interval_ms"],
@@ -503,7 +506,7 @@ export const KPI_CATALOG = deepFreeze(
       sample_unit: "eligible visible-pane marker sequence",
       min_n: 100,
       instrument: "capture",
-      needs: ["capture"],
+      needs: ["capture", "refresh_rate"],
       comparable: true,
       attribution: "host",
       exclusion: "valid_intervals",
@@ -518,13 +521,13 @@ export const KPI_CATALOG = deepFreeze(
         "carried them (current for < 2 refresh intervals and never observed): the host coalesced " +
         "frames, which is not loss. Same interval exclusion as hangs.",
       unit: "%",
-      direction: "lower_is_better",
+      direction: "neutral",
       shape: "value",
       statistics: ["share"],
       sample_unit: "visible-pane marker sequence emitted",
       min_n: 100,
       instrument: "capture",
-      needs: ["capture"],
+      needs: ["capture", "refresh_rate"],
       comparable: true,
       attribution: "host",
       exclusion: "valid_intervals",
@@ -548,7 +551,7 @@ export const KPI_CATALOG = deepFreeze(
       derived_from: ["output_latency_ms"],
       degradation_of: { kpi: "output_latency_ms", statistic: "p95" },
       headline_statistic: null,
-      value_range: POSITIVE,
+      value_range: NON_NEGATIVE,
     },
     {
       id: "degradation_input_latency_ms",
@@ -567,7 +570,7 @@ export const KPI_CATALOG = deepFreeze(
       derived_from: ["input_latency_ms"],
       degradation_of: { kpi: "input_latency_ms", statistic: "p95" },
       headline_statistic: null,
-      value_range: POSITIVE,
+      value_range: NON_NEGATIVE,
     },
     {
       id: "degradation_cpu_pct",
@@ -586,7 +589,7 @@ export const KPI_CATALOG = deepFreeze(
       derived_from: ["cpu_pct"],
       degradation_of: { kpi: "cpu_pct", statistic: "mean" },
       headline_statistic: null,
-      value_range: POSITIVE,
+      value_range: NON_NEGATIVE,
     },
     {
       id: "workload_cpu_pct",

@@ -253,13 +253,35 @@ export function sampleQuantiles(table, u) {
 }
 
 /**
- * `sha256:<hex>` over the profile's canonical JSON (whitespace-independent).
+ * `sha256:<hex>` over the profile's canonical JSON (`canonicalJson`: sorted keys, no
+ * whitespace), so key order and formatting never change a digest.
  *
  * @param {object} profile
  * @returns {string}
  */
 export function profileDigest(profile) {
-  return `sha256:${createHash("sha256").update(JSON.stringify(profile)).digest("hex")}`;
+  return `sha256:${createHash("sha256").update(canonicalJson(profile)).digest("hex")}`;
+}
+
+/**
+ * Canonical JSON: object keys sorted (UTF-16 code-unit order) at every level, no
+ * whitespace, undefined members dropped. Two profiles that differ only in key order or
+ * formatting have one text, hence one digest — and the generator reads transitions in
+ * sorted key order too, so they also generate one stream.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const members = Object.keys(value)
+      .filter((k) => value[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`);
+    return `{${members.join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 /**

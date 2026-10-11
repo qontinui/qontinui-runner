@@ -1,8 +1,9 @@
 /**
  * A minimal VT interpreter for tests — enough of xterm to place background-coloured
  * cells: printable text, CUP, SGR backgrounds (256-colour and truecolour), ED 2,
- * DECSC/DECRC, CR, LF with scrolling and autowrap. Everything else is ignored. It
- * answers one question: what does a cell region show after a write?
+ * DECSC/DECRC, CR, LF with scrolling and autowrap, and cursor visibility (DECTCEM,
+ * CSI ? 25 h / l). Everything else is ignored. It answers two questions: what does a
+ * cell region show after a write, and where is a visible cursor?
  */
 
 export class MiniVt {
@@ -20,6 +21,21 @@ export class MiniVt {
     this.pendingWrap = false;
     this.saved = null;
     this.scrolls = 0;
+    this.cursorVisible = true;
+  }
+
+  /**
+   * True when a VISIBLE cursor sits inside `region` (the host would draw it there).
+   *
+   * @param {{row: number, col: number, cells: number}} region
+   */
+  visibleCursorIn(region) {
+    return (
+      this.cursorVisible &&
+      this.r === region.row &&
+      this.c >= region.col &&
+      this.c < region.col + region.cells
+    );
   }
 
   blankRow() {
@@ -77,6 +93,10 @@ export class MiniVt {
   }
 
   csi(params, final) {
+    if (params === "?25" && (final === "h" || final === "l")) {
+      this.cursorVisible = final === "h";
+      return;
+    }
     if (params.startsWith("?")) return;
     const nums = params === "" ? [] : params.split(";").map((p) => (p === "" ? 0 : Number(p)));
     if (final === "H" || final === "f") {

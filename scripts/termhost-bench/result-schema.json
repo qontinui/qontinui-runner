@@ -47,6 +47,7 @@
         "degenerate_input",
         "capture_unavailable",
         "capture_disagreement",
+        "refresh_rate_unknown",
         "clock_unaligned",
         "marker_unreadable",
         "sessions_not_rendered",
@@ -1728,7 +1729,7 @@
               },
               "value": {
                 "type": "number",
-                "exclusiveMinimum": 0
+                "minimum": 0
               }
             },
             "not": {
@@ -1771,7 +1772,7 @@
               },
               "value": {
                 "type": "number",
-                "exclusiveMinimum": 0
+                "minimum": 0
               }
             },
             "not": {
@@ -1814,7 +1815,7 @@
               },
               "value": {
                 "type": "number",
-                "exclusiveMinimum": 0
+                "minimum": 0
               }
             },
             "not": {

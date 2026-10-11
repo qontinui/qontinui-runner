@@ -254,7 +254,7 @@ test("REJECTS measured statistics that do not match the catalog", () => {
   rejects(negative, /output_latency_ms\/stats\/p50 \[minimum\]/);
 });
 
-test("REJECTS out-of-range values: a fractional count, a share over 100, a zero ratio", () => {
+test("REJECTS out-of-range values: a fractional count, a share over 100, a negative ratio", () => {
   const fractional = desktop();
   fractional.rows[1].kpis.hangs.value = 1.5;
   rejects(fractional, /kpis\/hangs\/value \[type\] expected integer/);
@@ -262,8 +262,14 @@ test("REJECTS out-of-range values: a fractional count, a share over 100, a zero 
   share.rows[1].kpis.jank_share.value = 101;
   rejects(share, /kpis\/jank_share\/value \[maximum\]/);
   const ratio = desktop();
-  ratio.rows[1].kpis.degradation_cpu_pct.value = 0;
-  rejects(ratio, /degradation_cpu_pct\/value \[exclusiveMinimum\]/);
+  ratio.rows[1].kpis.degradation_cpu_pct.value = -0.5;
+  rejects(ratio, /degradation_cpu_pct\/value \[minimum\]/);
+});
+
+test("ACCEPTS a degradation ratio of 0 (the KPI measured 0 at N)", () => {
+  const zero = desktop();
+  zero.rows[1].kpis.degradation_cpu_pct.value = 0;
+  assert.deepEqual(validateResults(zero).errors, []);
 });
 
 test("REJECTS a row without its profile_calibrated flag, and an unknown environment", () => {
@@ -295,8 +301,9 @@ test("REJECTS an absent field that is neither a value nor an honest absence", ()
 
 test("REJECTS cross-field contradictions the schema cannot state", () => {
   const order = desktop();
-  order.rows[1].kpis.output_latency_ms.stats.p50 = 90;
-  rejects(order, /output_latency_ms\/stats \[semantic\] p50 90 > p95/);
+  const stats = order.rows[1].kpis.output_latency_ms.stats;
+  stats.p50 = stats.p95 + 10;
+  rejects(order, new RegExp(`output_latency_ms/stats \\[semantic\\] p50 ${stats.p50} > p95`));
   const meanMax = desktop();
   meanMax.rows[1].kpis.producer_stall_pct.stats = { mean: 5, max: 4 };
   rejects(meanMax, /producer_stall_pct\/stats \[semantic\] mean 5 > max 4/);
@@ -314,7 +321,75 @@ test("REJECTS cross-field contradictions the schema cannot state", () => {
   rejects(coverage, /coverage \[semantic\] observed 16 > expected 15/);
   const duplicate = desktop();
   duplicate.rows.push(structuredClone(duplicate.rows[1]));
-  rejects(duplicate, /rows\/3 \[semantic\] duplicate row/);
+  rejects(duplicate, /rows\/5 \[semantic\] duplicate row/);
+});
+
+test("REJECTS a measured degradation with no N = 1 row behind it", () => {
+  const noBaseline = desktop();
+  noBaseline.rows.splice(3, 2); // drop the N = 1 tiled baselines
+  rejects(
+    noBaseline,
+    /rows\/1\/kpis\/degradation_output_latency_ms \[semantic\] measured degradation_output_latency_ms has no N = 1 row/,
+  );
+  rejects(noBaseline, /rows\/2\/kpis\/degradation_cpu_pct \[semantic\]/);
+});
+
+test("REJECTS a baseline that is not the same setup, variant, build role and arm", () => {
+  const setup = desktop();
+  setup.rows[3].setup.id = "windows-terminal";
+  rejects(
+    setup,
+    /rows\/1\/kpis\/degradation_cpu_pct \[semantic\] measured degradation_cpu_pct has no N = 1 row/,
+  );
+  const variant = desktop();
+  variant.rows[3].setup.variant = "ghostty";
+  rejects(
+    variant,
+    /rows\/1\/kpis\/degradation_cpu_pct \[semantic\] measured degradation_cpu_pct has no N = 1 row/,
+  );
+  const role = desktop();
+  role.rows[3].setup.build.role = "baseline";
+  rejects(role, /rows\/1\/kpis\/degradation_cpu_pct \[semantic\]/);
+  const arm = desktop();
+  arm.rows[4].scenario.arm = "focus";
+  rejects(arm, /rows\/2\/kpis\/degradation_cpu_pct \[semantic\]/);
+});
+
+test("REJECTS a baseline whose base KPI is not measured, and a measured degradation on an N = 1 row", () => {
+  const unmeasuredBase = desktop();
+  unmeasuredBase.rows[3].kpis.output_latency_ms = {
+    state: "unknown",
+    unit: "ms",
+    reason: "occluded",
+  };
+  rejects(
+    unmeasuredBase,
+    /rows\/1\/kpis\/degradation_output_latency_ms \[semantic\] .*with a measured output_latency_ms/,
+  );
+  const onBaseline = desktop();
+  onBaseline.rows[0].kpis.degradation_cpu_pct = {
+    state: "measured",
+    unit: "ratio",
+    n: 2,
+    value: 1,
+  };
+  rejects(
+    onBaseline,
+    /rows\/0\/kpis\/degradation_cpu_pct \[semantic\] a measured degradation_cpu_pct on an N = 1 row/,
+  );
+});
+
+test("$ref checking walks a property merely NAMED enum / const / default / examples", () => {
+  const dangling = { properties: { enum: { $ref: "#/$defs/missing" } } };
+  assert.throws(() => compileSchema(dangling), /does not resolve/);
+  const named = {
+    $defs: { n: { type: "integer" } },
+    properties: { const: { $ref: "#/$defs/n" }, default: { $ref: "#/$defs/n" } },
+  };
+  assert.equal(validateAgainst(named, { const: 1, default: 2 }).valid, true);
+  assert.equal(validateAgainst(named, { const: "x" }).valid, false);
+  const data = { enum: [{ $ref: "#/not/a/schema" }], const: { $ref: "#/nor/this" } };
+  assert.doesNotThrow(() => compileSchema(data), "enum and const VALUES are data, never refs");
 });
 
 test("the validator CLI exits 0 on valid files, 1 on an invalid one, 2 on a usage or read error", () => {
