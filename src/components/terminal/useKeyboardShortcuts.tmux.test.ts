@@ -69,8 +69,7 @@ interface Fixture {
   pinCalls: number[];
 }
 
-/** Mount the hook with a fake zone layout whose zone 0 is the shown tab. */
-function mount(opts: {
+interface MountOptions {
   workMode: "grid" | "tmux";
   tabs: Array<{ id: string; isAlive?: boolean }>;
   shown: string;
@@ -79,20 +78,23 @@ function mount(opts: {
   gridLayoutId?: string;
   /** tmux: the shown session's grid zone (`cosmeticZoneFor(0)`). */
   shownGridZone?: number | null;
-}): Fixture {
+}
+
+/** Mount the hook with a fake zone layout whose zone 0 is the shown tab. */
+function mount(opts: MountOptions): Fixture {
   harness.reset();
-  let handler: Handler | null = null;
+  let keydown: Handler | null = null;
   vi.stubGlobal("window", {
     addEventListener: (_type: string, h: Handler) => {
-      handler = h;
+      keydown = h;
     },
     removeEventListener: () => {},
   });
   const state = { shown: opts.shown };
   const fx: Fixture = {
     press: (e) => {
-      if (!handler) throw new Error("no keydown listener registered");
-      handler({ preventDefault: () => {}, ctrlKey: false, shiftKey: false, metaKey: false, ...e });
+      if (!keydown) throw new Error("no keydown listener registered");
+      keydown({ preventDefault: () => {}, ctrlKey: false, shiftKey: false, metaKey: false, ...e });
     },
     shown: () => state.shown,
     assignCalls: [],
@@ -251,8 +253,11 @@ describe("layout cycling and pinning in tmux mode", () => {
   it("Ctrl+Shift+L steps from the grid tmux returns to, not from the viewport's single", () => {
     const fx = mount({ workMode: "tmux", tabs, shown: "a", gridLayoutId: "quad" });
     fx.press(ctrlShiftL);
-    expect(fx.layoutCalls).toEqual([[nextCycledLayoutId("quad"), { source: "operator" }]]);
-    expect(nextCycledLayoutId("quad")).not.toBe(nextCycledLayoutId("single"));
+    // The preset after the grid's quad — not the one after the viewport's single.
+    const ids = LAYOUT_PRESETS.map((l) => l.id);
+    const afterQuad = ids[(ids.indexOf("quad") + 1) % ids.length];
+    expect(afterQuad).not.toBe(ids[(ids.indexOf("single") + 1) % ids.length]);
+    expect(fx.layoutCalls).toEqual([[afterQuad, { source: "operator" }]]);
   });
 
   it("Ctrl+Shift+L is a no-op when the grid it would step from is the flow grid", () => {
