@@ -1048,8 +1048,8 @@ impl PgDb {
         // `scheduled_tasks.conditions` above — an embedded Postgres has no
         // alembic, and `create_phase_token_usage_with_cache` writes both
         // columns on every AI call. The alembic revision is itself
-        // `IF NOT EXISTS` and guards its CHECK on `pg_constraint`, as this does
-        // with the SAME constraint name, so whichever runs first the other is
+        // `IF NOT EXISTS` and guards its two CHECKs on `pg_constraint`, as this
+        // does with the SAME constraint names, so whichever runs first the other is
         // a no-op. Gated on the table existing and on a column being absent, so
         // the ACCESS EXCLUSIVE `ALTER TABLE` does not run on every boot.
         conn.batch_execute(
@@ -1085,6 +1085,19 @@ impl PgDb {
                  ALTER TABLE project.phase_token_usage
                      ADD CONSTRAINT ck_phase_token_usage_cost_source
                      CHECK (cost_source IN ('reported', 'estimated'));
+               END IF;
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'project' AND table_name = 'phase_token_usage'
+                   AND column_name = 'cost_microusd'
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM pg_constraint
+                 WHERE conname = 'ck_phase_token_usage_cost_microusd_nonneg'
+                   AND conrelid = to_regclass('project.phase_token_usage')
+               ) THEN
+                 ALTER TABLE project.phase_token_usage
+                     ADD CONSTRAINT ck_phase_token_usage_cost_microusd_nonneg
+                     CHECK (cost_microusd IS NULL OR cost_microusd >= 0);
                END IF;
              END $$;",
         )
