@@ -30,6 +30,25 @@ handler, never from an argument**.
 > is not a dead end — run `/policy`.** A masked or absent MCP tool is exactly
 > what the cascade below is for.
 
+**What a product term MEANS (gate, work unit, claim, drain, tenant, UNKNOWN, …)
+is not a policy — read the glossary door, not this one:** coord `GET
+https://coord.qontinui.io/coord/glossary` (anonymous) or the MCP tool
+`coord_glossary`, and the local runner's `GET http://127.0.0.1:9876/glossary`
+(the glossary that runner build compiled in). One term: `?term=<id>` (MCP
+argument `term`), where the id is the snake_case one — `work_unit`, `unknown`.
+An unknown id is a refusal with `code: "glossary_term_unknown"` and
+`known_version` (HTTP `404`; a tool error carrying the same body over MCP) —
+about the id you asked for, distinct from an empty glossary (the whole-glossary
+read is never empty). A `404` WITHOUT that code — coord's `error:
+"no_such_route"`, the runner's `code: "NOT_FOUND"` "No route for GET /glossary"
+— or an unknown-tool / `-32601` answer, means the build you reached has no
+glossary door; confirm it against that build's id (runner `GET
+http://127.0.0.1:9876/health` `buildId`; coord `GET
+https://coord.qontinui.io/health` `build_sha`) rather than assuming, and do not
+read it as "the term is unknown". Over the runner's `/coord-mcp` proxy a
+`-32601` speaks for the RUNNER build's tool allowlist, not coord's: read
+`http://127.0.0.1:9876/health` `buildDrift`.
+
 ## Arguments — `$ARGUMENTS`
 
 - `list` — list every prompt document the caller's tenant can see (kinds

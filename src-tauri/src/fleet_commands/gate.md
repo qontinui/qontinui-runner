@@ -304,9 +304,11 @@ Prefer the typed `continuation` on MCP (e.g.
 `continuation_prompt` (e.g. `run /implement-phase <stem> "Phase N"`) still works
 but hardcodes `"repos": []`, dropping the spawned terminal's cwd onto the shared
 root uncoordinated. Over HTTP the field is `continuation_spawn`, where you can
-populate `repos` yourself. Delivery is currently a live defect — continuations
-are being dispatched but never consumed, and coord's 7-day pending window drops
-them permanently — so treat any spawn as best-effort and read
+populate `repos` yourself. Delivery is best-effort. The 2026-07-23 defect
+(continuations dispatched but never consumed) is no longer the standing state,
+but nothing guarantees delivery (`_gate-registration` → "Continuation
+policy" holds the dated measurement), and one never claimed inside coord's
+7-day pending window is dropped permanently. So treat any spawn as best-effort and read
 `continuation_consumed_outcome` rather than assuming a `consumed` continuation
 actually ran (a **null** outcome means never claimed, which is worse than a
 recorded `spawn_failed`).
