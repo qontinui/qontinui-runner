@@ -409,13 +409,19 @@ impl AllocationHandback {
                 self.device_id
             );
             let body = serde_json::json!({ "branch": branch, "abandoned": true });
-            match client
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(5))
-                .json(&body)
-                .send()
-                .await
-            {
+            // `POST /coord/worktree-done/{device_id}` is a credential-free door
+            // that ignores the bearer: coord's `post_worktree_done` reads only the
+            // path's device id and the body's branch, so the default binding is
+            // correct by construction. Routed through the helper so this write is counted in
+            // the data-plane auth coverage (`coord_auth_pin`).
+            let request = crate::auth::attach_device_auth_for(
+                client
+                    .post(&url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .json(&body),
+                crate::auth::TenantScope::Device,
+            );
+            match request.send().await {
                 Ok(r) => {
                     let status = r.status();
                     let text = r.text().await.unwrap_or_default();
