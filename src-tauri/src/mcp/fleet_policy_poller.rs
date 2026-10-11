@@ -3071,20 +3071,28 @@ fn egress_poll_scope(
 }
 
 /// Every tenant this device may hold a credential for: the per-tenant slots,
-/// the default binding, and the tenant the default slot's credential names.
+/// the default binding, and the tenant the default slot's credential names —
+/// with whether the enumeration was COMPLETE (the slot store was readable).
+/// An incomplete enumeration is merged but can never mark the device unbound.
 /// Blocking (secure-storage and paired_user.json reads).
-fn egress_poll_tenants() -> Vec<uuid::Uuid> {
+fn egress_poll_tenants() -> (Vec<uuid::Uuid>, bool) {
     let am = crate::auth::AuthManager::new();
     let mut tenants = std::collections::BTreeSet::new();
-    match am.try_list_tenant_device_jwt_tenants() {
-        Ok(slots) => tenants.extend(slots),
-        Err(e) => warn!("fleet_policy_poller: egress: tenant slots unreadable ({e:#})"),
-    }
+    let complete = match am.try_list_tenant_device_jwt_tenants() {
+        Ok(slots) => {
+            tenants.extend(slots);
+            true
+        }
+        Err(e) => {
+            warn!("fleet_policy_poller: egress: tenant slots unreadable ({e:#})");
+            false
+        }
+    };
     tenants.extend(crate::auth::default_binding_tenant());
     if let Ok(token) = am.get_access_token() {
         tenants.extend(crate::auth::jwt_tenant_claim(&token));
     }
-    tenants.into_iter().collect()
+    (tenants.into_iter().collect(), complete)
 }
 
 /// The edge-trigger key for one egress poll: the class plus the level, so a
@@ -3136,11 +3144,14 @@ async fn poll_egress_once(
         .flatten();
     // Every bound tenant, each paired with ITS OWN slot credential (blocking
     // secure-storage reads, so off the async runtime).
-    let targets = tokio::task::spawn_blocking(|| {
-        egress_poll_tenants()
+    // A join failure is an incomplete enumeration (nothing merged).
+    let (targets, enumeration_complete) = tokio::task::spawn_blocking(|| {
+        let (tenants, complete) = egress_poll_tenants();
+        let targets = tenants
             .into_iter()
             .map(|tenant| (tenant, crate::auth::device_bearer_for(Some(&tenant))))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (targets, complete)
     })
     .await
     .unwrap_or_default();
@@ -3149,6 +3160,7 @@ async fn poll_egress_once(
         &base,
         default_tenant,
         targets,
+        enumeration_complete,
         |domain, bearer| async move { fetch_fleet_policy_with(domain, &bearer).await },
         last_logged,
     )
@@ -3163,6 +3175,7 @@ async fn poll_egress_with<F, Fut>(
     base: &str,
     default_tenant: Option<uuid::Uuid>,
     targets: Vec<(uuid::Uuid, Option<String>)>,
+    enumeration_complete: bool,
     fetch: F,
     last_logged: &mut std::collections::HashMap<(Option<uuid::Uuid>, crate::egress::Flow), String>,
 ) where
@@ -3170,7 +3183,12 @@ async fn poll_egress_with<F, Fut>(
     Fut: std::future::Future<Output = Result<FleetPolicyResponse, FetchError>>,
 {
     state.set_current_scope(crate::egress::ScopeKey::new(base, default_tenant));
-    state.set_bound_tenants(targets.iter().map(|(t, _)| *t).collect());
+    // Merged, never replaced: a failed or partial enumeration cannot shrink
+    // the set the strictest rule is taken across.
+    state.record_bound_enumeration(
+        targets.iter().map(|(t, _)| *t).collect(),
+        enumeration_complete,
+    );
 
     for (tenant, bearer) in targets {
         let Some(bearer) = bearer else {
@@ -5196,6 +5214,7 @@ mod egress_poll_tests {
             base,
             Some(b),
             vec![(b, Some(jwt_for(b)))],
+            true,
             |_domain, _bearer| async { Err(FetchError::Failed("down".into())) },
             &mut logged,
         )
@@ -5230,6 +5249,7 @@ mod egress_poll_tests {
             base,
             Some(a),
             vec![(a, Some(ja.clone())), (b, Some(jb.clone())), (c, None)],
+            true,
             |domain, bearer| {
                 let seen = seen.clone();
                 let off = bearer == ja2;
@@ -5282,6 +5302,7 @@ mod egress_poll_tests {
             base,
             Some(a),
             vec![(a, Some(jwt_for(a)))],
+            true,
             |_domain, _bearer| {
                 let barrier = barrier.clone();
                 async move {
