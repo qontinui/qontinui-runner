@@ -41,7 +41,7 @@ interface TabFacts {
  * Mount on a persisted state; the returned function re-renders, optionally
  * with new tabs (and new liveness / session keys).
  */
-function mount(persisted: unknown, tabIds: string[], initialFacts: TabFacts = {}) {
+function mount(persisted: unknown, tabIds: string[], initialFacts?: TabFacts) {
   harness.reset();
   storage.value = persisted;
   storage.written = [];
@@ -51,7 +51,7 @@ function mount(persisted: unknown, tabIds: string[], initialFacts: TabFacts = {}
     alive: f.alive ? new Set(f.alive) : undefined,
     keys: f.keys ? new Map(Object.entries(f.keys)) : undefined,
   });
-  let facts = toInputs(initialFacts);
+  let facts = toInputs(initialFacts ?? {});
   function ZoneLayoutHost() {
     harness.beginRender();
     return useZoneLayout(live, "tmux-test", "main", facts.alive, facts.keys);
