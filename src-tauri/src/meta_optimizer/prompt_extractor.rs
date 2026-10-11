@@ -53,7 +53,7 @@ pub fn extract_prompt_samples_pg(
 ) -> Result<Vec<PromptSample>, String> {
     let limit = limit as i64;
 
-    let rows = tokio::task::block_in_place(|| {
+    let rows = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.extract_prompt_samples(limit))
     })?;
 
@@ -136,7 +136,7 @@ fn compute_group_metrics_inner(
             // falling back to the hardcoded default for the agent type.
             let latest_prompt = pg_db
                 .and_then(|pg| {
-                    tokio::task::block_in_place(|| {
+                    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                         Handle::current().block_on(pg.get_active_prompt(&agent_type))
                     })
                     .ok()
@@ -276,14 +276,15 @@ pub fn collect_evidence_samples_pg(
     max_failures: usize,
     max_successes: usize,
 ) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
-    let (fail_tuples, success_tuples) = tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.collect_evidence_samples(
-            phase,
-            agent_type,
-            max_failures as i64,
-            max_successes as i64,
-        ))
-    })?;
+    let (fail_tuples, success_tuples) =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            Handle::current().block_on(pg_db.collect_evidence_samples(
+                phase,
+                agent_type,
+                max_failures as i64,
+                max_successes as i64,
+            ))
+        })?;
 
     let to_sample = |t: (String, String, String, f64, String, i64, f64)| -> PromptSample {
         PromptSample {

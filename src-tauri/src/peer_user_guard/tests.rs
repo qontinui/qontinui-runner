@@ -665,9 +665,11 @@ async fn real_proc_resolver_finds_this_process_as_the_peer_owner() {
     let client = tokio::net::TcpStream::connect(local).await.unwrap();
     let (_server, peer) = listener.accept().await.unwrap();
     assert_eq!(client.local_addr().unwrap(), peer);
-    let r = tokio::task::spawn_blocking(move || resolver.resolve(local, peer, SystemTime::now()))
-        .await
-        .unwrap();
+    let r = crate::wedge_diagnostics::spawn_blocking_tracked(move || {
+        resolver.resolve(local, peer, SystemTime::now())
+    })
+    .await
+    .unwrap();
     // SAFETY: no preconditions.
     let me = unsafe { libc::geteuid() };
     assert_eq!(r.owner, Ok(LocalUser::Uid(me)));
@@ -683,13 +685,15 @@ async fn netlink_and_proc_each_find_this_process_as_the_peer_owner() {
     let (_server, peer) = listener.accept().await.unwrap();
     // SAFETY: no preconditions.
     let me = unsafe { libc::geteuid() };
-    let nl = tokio::task::spawn_blocking(move || linux::netlink_owner(local, peer))
-        .await
-        .unwrap();
+    let nl =
+        crate::wedge_diagnostics::spawn_blocking_tracked(move || linux::netlink_owner(local, peer))
+            .await
+            .unwrap();
     assert_eq!(nl, Ok(Ok(me)), "exact sock_diag lookup");
-    let pr = tokio::task::spawn_blocking(move || linux::proc_owner(local, peer))
-        .await
-        .unwrap();
+    let pr =
+        crate::wedge_diagnostics::spawn_blocking_tracked(move || linux::proc_owner(local, peer))
+            .await
+            .unwrap();
     assert_eq!(pr, Ok(me), "/proc fallback");
 }
 

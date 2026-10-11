@@ -821,10 +821,16 @@ async fn resolve_node(
                 Ok(Some(loaded)) => {
                     let app_id = app_id.to_string();
                     let snap = Arc::clone(&snapshot);
-                    let evaluated = tokio::task::spawn_blocking(move || {
-                        evaluate_present_states(snapshot_view(&snap), &loaded, app_id, app_version)
-                    })
-                    .await;
+                    let evaluated =
+                        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                            evaluate_present_states(
+                                snapshot_view(&snap),
+                                &loaded,
+                                app_id,
+                                app_version,
+                            )
+                        })
+                        .await;
                     match evaluated {
                         Ok(Some(present_state_ids)) => SpecLookup::Evaluated {
                             spec_id: page_id,

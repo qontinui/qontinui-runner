@@ -16,7 +16,9 @@ pub fn get_active_prompt(
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Option<PromptVariant>, String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_active_prompt(agent_type)))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.get_active_prompt(agent_type))
+    })
 }
 
 /// Create a new prompt variant (initially inactive).
@@ -29,7 +31,7 @@ pub fn create_variant(
     prompt_content: &str,
     source_recommendation_id: Option<&str>,
 ) -> Result<PromptVariant, String> {
-    let variant = tokio::task::block_in_place(|| {
+    let variant = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.create_prompt_variant(
             agent_type,
             variant_name,
@@ -60,7 +62,9 @@ pub fn create_variant(
 
 /// Activate a prompt variant (deactivating any previously active variant for that agent_type).
 pub fn activate_variant(pg_db: &Arc<PgDb>, variant_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.activate_variant(variant_id)))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.activate_variant(variant_id))
+    })
 }
 
 /// List all prompt variants, optionally filtered by agent type.
@@ -68,7 +72,9 @@ pub fn list_variants(
     pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<PromptVariant>, String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.list_variants(agent_type)))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.list_variants(agent_type))
+    })
 }
 
 /// Get a prompt variant by agent_type and version number.
@@ -78,7 +84,7 @@ pub fn get_prompt_by_version(
     agent_type: &str,
     version: i32,
 ) -> Result<Option<PromptVariant>, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.get_prompt_by_version(agent_type, version))
     })
 }
@@ -89,7 +95,7 @@ pub fn update_performance_metrics(
     variant_id: &str,
     metrics_json: &str,
 ) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.update_performance_metrics(variant_id, metrics_json))
     })
 }

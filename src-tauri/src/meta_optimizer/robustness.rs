@@ -281,7 +281,7 @@ fn generate_regression_cases(
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Vec<RobustnessTestCase>, String> {
-    let tuples = tokio::task::block_in_place(|| {
+    let tuples = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.query_golden_datasets_by_agent(agent_type))
     })?;
     let datasets: Vec<super::golden_dataset::GoldenDataset> = tuples
@@ -404,7 +404,7 @@ pub fn save_robustness_report(pg_db: &Arc<PgDb>, report: &RobustnessReport) -> R
     let report_json =
         serde_json::to_string(report).map_err(|e| format!("Failed to serialize report: {}", e))?;
 
-    let pg_result = tokio::task::block_in_place(|| {
+    let pg_result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.save_robustness_report(
             &id,
             variant_id.as_deref(),
@@ -429,7 +429,7 @@ pub fn list_robustness_reports(
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<RobustnessReport>, String> {
-    let jsons = tokio::task::block_in_place(|| {
+    let jsons = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current()
             .block_on(pg_db.list_robustness_reports(prompt_variant_id, recommendation_id))
     })?;

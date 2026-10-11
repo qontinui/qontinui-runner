@@ -422,7 +422,7 @@ fn auto_register_file(
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             // Use block_in_place to run async code on this sync thread
             // without blocking the tokio runtime's thread pool.
-            let waited_for = tokio::task::block_in_place(|| {
+            let waited_for = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 rt.block_on(async {
                     // Emit waiting event if the file is held by another session
                     let blocker = lock_manager

@@ -302,7 +302,7 @@ pub fn launch_workflow_by_id(
     let restate_settings = crate::settings::load_settings().restate;
     let restate_workflow_input =
         crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
