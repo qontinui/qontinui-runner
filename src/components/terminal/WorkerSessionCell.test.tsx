@@ -684,7 +684,12 @@ describe("ConversationView", () => {
 });
 
 describe("ZoneGrid wiring", () => {
-  const source = readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8");
+  // The grid's maximized view lives in ZoneGrid; the zone content (grid cells
+  // and the tmux viewport's panes) in zone-grid/ZoneCell.
+  const source = [
+    readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8"),
+    readFileSync(resolve(__dirname, "./zone-grid/ZoneCell.tsx"), "utf8"),
+  ].join("\n");
 
   it("mounts WorkerSessionCell at both TerminalInstance sites (maximized + zoned)", () => {
     expect(source.match(/<WorkerSessionCell\s/g)?.length).toBe(2);
