@@ -269,10 +269,38 @@ test("conformance: markers advance exactly at the profile's cadence, and every w
   }
 });
 
-test("conformance: each phase emits frames at its profile frame rate (exactly ceil(D * fps) frames)", () => {
-  for (const id of SHIPPED_PROFILES) {
-    const profile = shipped(id);
-    const seconds = id === "claude-tui" ? 900 : 120;
+/** The frames the schedule places in a phase: j = 0, 1, ... while start + floor(j * 1e6 / fps) < end. */
+function framesPlaced({ startUs, endUs }, fps) {
+  let j = 0;
+  while (startUs + Math.floor((j * 1e6) / fps) < endUs) j += 1;
+  return j;
+}
+
+/** A profile whose frame rates are fractional, written as calibrate.mjs writes them (6 significant digits). */
+function withFractionalFps(profile) {
+  const out = structuredClone(profile);
+  out.id = `${profile.id}-fractional`;
+  for (const def of Object.values(out.phases)) {
+    if (def.fps) def.fps = Number((def.fps * 0.9973).toPrecision(6));
+  }
+  return out;
+}
+
+test("conformance: each phase emits exactly the frames its frame rate places, integer or fractional", () => {
+  const fractional = [
+    withFractionalFps(shipped("claude-tui")),
+    withFractionalFps(shipped("all-repaint")),
+  ];
+  for (const profile of fractional) {
+    assert.deepEqual(validateProfile(profile).errors, [], profile.id);
+    assert.ok(
+      Object.values(profile.phases).every((def) => !def.fps || !Number.isInteger(def.fps)),
+      `${profile.id}: every frame rate is fractional`,
+    );
+  }
+  for (const profile of [...SHIPPED_PROFILES.map((id) => shipped(id)), ...fractional]) {
+    const id = profile.id;
+    const seconds = id.startsWith("claude-tui") ? 900 : 120;
     const writes = scheduleWrites(profile, seconds);
     const byPhase = new Map();
     for (const w of writes) {
@@ -285,10 +313,7 @@ test("conformance: each phase emits frames at its profile frame rate (exactly ce
     for (const p of byPhase.values()) {
       if (p.endUs > seconds * 1e6) continue;
       const def = profile.phases[p.id];
-      assert.ok(Number.isInteger(def.fps), `${id}/${p.id}: the shipped frame rates are integers`);
-      // Frame j sits at start + floor(j * 1e6 / fps) while that is before the end, so a
-      // phase of D us holds exactly ceil(D * fps / 1e6) frames (integer arithmetic).
-      const expected = Math.floor(((p.endUs - p.startUs) * def.fps + 1e6 - 1) / 1e6);
+      const expected = framesPlaced(p, def.fps);
       assert.equal(
         p.frames,
         expected,
@@ -966,24 +991,65 @@ function startGenerator(runDir, extra = [], profile = QUIET_PROFILE, { keepStdou
   };
 }
 
+/** How long CLI-test cleanup waits after SIGTERM, and again after SIGKILL. */
+const CLEANUP_GRACE_MS = 2000;
+
+/** Resolves true when `g` exits within `ms`, else false (the timer is cleared on exit). */
+function exitsWithin(g, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    g.done.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * Stop the generators a CLI test started: SIGTERM first (the generator traps it and
+ * exits cleanly), then SIGKILL for any still alive after `graceMs` — a generator blocked
+ * inside one write never runs its SIGTERM handler. Each step waits at most `graceMs`, so
+ * cleanup is bounded whatever the children do. Resolves to the generators still alive
+ * after both steps (normally none); their pipes are destroyed and their handles unref'd,
+ * so they cannot hold the test process open.
+ *
+ * @param {{child: object, done: Promise<unknown>}[]} started
+ * @param {{graceMs?: number}} [opts]
+ */
+async function stopGenerators(started, { graceMs = CLEANUP_GRACE_MS } = {}) {
+  const running = started.filter((g) => g.child.exitCode === null && g.child.signalCode === null);
+  for (const g of running) g.child.kill("SIGTERM");
+  const termed = await Promise.all(running.map((g) => exitsWithin(g, graceMs)));
+  const stubborn = running.filter((_, i) => !termed[i]);
+  for (const g of stubborn) g.child.kill("SIGKILL");
+  const killed = await Promise.all(stubborn.map((g) => exitsWithin(g, graceMs)));
+  const left = stubborn.filter((_, i) => !killed[i]);
+  for (const g of left) {
+    for (const stream of [g.child.stdin, g.child.stdout, g.child.stderr]) stream?.destroy();
+    g.child.unref?.();
+  }
+  return left;
+}
+
 /**
  * A run directory for one CLI test, cleaned up AFTER the test whatever happened: every
- * generator still alive is killed and awaited first, then the directory is removed
- * (retrying, never throwing), so a Windows file lock cannot replace the test's own
- * failure with an EBUSY.
+ * generator still alive is stopped (stopGenerators: bounded, SIGKILL after a grace) and
+ * then the directory is removed (retrying, never throwing), so a Windows file lock cannot
+ * replace the test's own failure with an EBUSY. A generator that survives SIGKILL fails
+ * the test rather than hanging it.
  */
 function cliHarness(t) {
   const dir = mkdtempSync(join(tmpdir(), "termhost-gen-"));
   const started = [];
   t.after(async () => {
-    for (const g of started) {
-      if (g.child.exitCode === null && g.child.signalCode === null) g.child.kill();
-    }
-    await Promise.all(started.map((g) => g.done));
+    const left = await stopGenerators(started);
     try {
       rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch {
       // the OS temp dir keeps it; the test's own result stands
+    }
+    if (left.length > 0) {
+      throw new Error(`generator pid(s) ${left.map((g) => g.child.pid)} survived SIGKILL`);
     }
   });
   return {
@@ -1025,6 +1091,50 @@ const hasMarker = (runDir, slot) => genRecords(runDir, slot).some((r) => r.type 
 const backlogged = (runDir) =>
   genRecords(runDir, 0).some((r) => r.type === "progress" && r.queued >= 20);
 const echoCount = (runDir) => genRecords(runDir, 0).filter((r) => r.type === "echo").length;
+
+test(
+  "CLI cleanup sends SIGTERM, then SIGKILL after a grace, and never waits unbounded",
+  { timeout: 10000 },
+  async () => {
+    const fake = (exitsOn) => {
+      let exit;
+      const done = new Promise((resolve) => (exit = resolve));
+      const child = {
+        exitCode: null,
+        signalCode: null,
+        signals: [],
+        unrefed: false,
+        kill(signal) {
+          this.signals.push(signal);
+          if (exitsOn.includes(signal) && this.signalCode === null) {
+            this.signalCode = signal;
+            exit({ code: null, signal });
+          }
+          return true;
+        },
+        unref() {
+          this.unrefed = true;
+        },
+      };
+      return { child, done };
+    };
+    const polite = fake(["SIGTERM", "SIGKILL"]);
+    const wedged = fake(["SIGKILL"]); // blocked inside a write: its SIGTERM handler never runs
+    const immortal = fake([]);
+    const exited = fake([]);
+    exited.child.exitCode = 0;
+    const t0 = Date.now();
+    const left = await stopGenerators([polite, wedged, immortal, exited], { graceMs: 100 });
+    const elapsed = Date.now() - t0;
+    assert.deepEqual(polite.child.signals, ["SIGTERM"]);
+    assert.deepEqual(wedged.child.signals, ["SIGTERM", "SIGKILL"]);
+    assert.deepEqual(immortal.child.signals, ["SIGTERM", "SIGKILL"]);
+    assert.deepEqual(exited.child.signals, [], "an exited generator is left alone");
+    assert.deepEqual(left, [immortal], "only a survivor of SIGKILL is reported");
+    assert.equal(immortal.child.unrefed, true, "and it cannot hold the test process open");
+    assert.ok(elapsed < 1500, `cleanup took ${elapsed} ms with a 100 ms grace`);
+  },
+);
 
 test(
   "CLI: the D13 command line claims slot 0, logs its records, and exits 0 at --duration-ms",

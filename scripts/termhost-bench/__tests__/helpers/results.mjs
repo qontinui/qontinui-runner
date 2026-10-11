@@ -13,8 +13,9 @@ import { writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { KPI_CATALOG } from "../../kpi-catalog.mjs";
-import { degradationKpi, measureKpi, notApplicableKpi, unknownKpi } from "../../stats.mjs";
+import { KPI_CATALOG, getKpi } from "../../kpi-catalog.mjs";
+import { degradationKpi, measureKpi, notApplicableKpi, slope, unknownKpi } from "../../stats.mjs";
+import { subjectKey } from "../../validate.mjs";
 
 export const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const DEGRADATION_IDS = KPI_CATALOG.filter((k) => k.degradation_of).map((k) => k.id);
@@ -46,7 +47,6 @@ const VALUES = {
   cpu_ms_per_mb: { value: 41.2, n: 120 },
   memory_mb: { value: 812.4, n: 120 },
   memory_growth_mb_per_min: { value: 0.8, n: 120 },
-  memory_mb_per_session: { value: 22.5, n: 4 },
   delivered_ratio: { value: 0.998, n: 15 },
   hangs: { value: 0, n: 116 },
   crashes: { value: 0, n: 6 },
@@ -60,6 +60,8 @@ const VALUES = {
 /**
  * Every KPI measured, except those `overrides` replaces. A degradation_* defaults to
  * unknown(no_baseline_level): only `withDegradations` and a real N = 1 row measure one.
+ * A slope over the N ladder defaults to unknown(too_few_levels): only `withLadderSlopes`,
+ * which reads the whole file, knows how many N levels there are.
  *
  * @param {Record<string, object>} [overrides] id -> KPI value
  */
@@ -68,6 +70,7 @@ export function measuredKpis(overrides = {}) {
   for (const row of KPI_CATALOG) {
     if (overrides[row.id]) out[row.id] = overrides[row.id];
     else if (row.degradation_of) out[row.id] = unknownKpi(row.id, "no_baseline_level");
+    else if (row.needs.includes("n_ladder")) out[row.id] = unknownKpi(row.id, "too_few_levels");
     else if (row.shape === "stats") out[row.id] = measureKpi(row.id, SAMPLES[row.id]());
     else out[row.id] = measureKpi(row.id, VALUES[row.id]);
   }
@@ -79,6 +82,40 @@ export function withDegradations(kpis, kpisAtOne) {
   const out = { ...kpis };
   for (const id of DEGRADATION_IDS) out[id] = degradationKpi(id, kpis, kpisAtOne);
   return out;
+}
+
+/**
+ * Fill every row's slopes over the N ladder (memory_mb_per_session) from the document's
+ * own rows: the least-squares slope of the base KPI over the distinct N of the rows for
+ * the same subject and arm (validate.mjs `subjectKey`), measured from `min_n` levels up,
+ * else unknown(too_few_levels) with n = the levels the file holds. Mutates and returns doc.
+ */
+export function withLadderSlopes(doc) {
+  for (const kpi of KPI_CATALOG.filter((k) => k.needs.includes("n_ladder"))) {
+    const base = kpi.derived_from[0];
+    const ladders = new Map();
+    for (const row of doc.rows) {
+      if (row.kpis[base]?.state !== "measured") continue;
+      const key = subjectKey(row);
+      if (!ladders.has(key)) ladders.set(key, new Map());
+      ladders.get(key).set(row.scenario.n, row.kpis[base].value);
+    }
+    for (const row of doc.rows) {
+      const ladder = ladders.get(subjectKey(row)) ?? new Map();
+      const xs = [...ladder.keys()];
+      row.kpis[kpi.id] =
+        ladder.size >= getKpi(kpi.id).min_n
+          ? measureKpi(
+              kpi.id,
+              slope(
+                xs,
+                xs.map((x) => ladder.get(x)),
+              ),
+            )
+          : unknownKpi(kpi.id, "too_few_levels", { n: ladder.size });
+    }
+  }
+  return doc;
 }
 
 /** An N = 1 row's degradation_* values: it is the baseline itself. */
@@ -203,7 +240,7 @@ export function windowsDesktopResults() {
   };
   const runnerBase = measuredKpis({ ...baselineDegradations(), ...naWsl });
   const vscodeBase = measuredKpis({ ...baselineDegradations(), ...naWsl });
-  return {
+  return withLadderSlopes({
     schema: "termhost-bench/v1",
     run: RUN,
     machine: {
@@ -282,7 +319,7 @@ export function windowsDesktopResults() {
       row({ setupId: "vscode", scenarioOverrides: n1Tiled, kpis: vscodeBase }),
     ],
     incidents: [],
-  };
+  });
 }
 
 /** A complete linux-xvfb results document with honest unknowns. */
@@ -292,7 +329,7 @@ export function linuxXvfbResults() {
       n: 12,
       detail: "the window lost the foreground for most of the soak",
     });
-  return {
+  return withLadderSlopes({
     schema: "termhost-bench/v1",
     run: {
       ...RUN,
@@ -346,7 +383,6 @@ export function linuxXvfbResults() {
             marker_loss: unknownCapture("marker_loss"),
             marker_skipped: unknownCapture("marker_skipped"),
             input_latency_ms: unknownKpi("input_latency_ms", "insufficient_samples", { n: 40 }),
-            memory_mb_per_session: unknownKpi("memory_mb_per_session", "too_few_levels", { n: 2 }),
             wsl_vm_cpu_pct: notApplicableKpi("wsl_vm_cpu_pct", "not_applicable_to_setup"),
             wsl_vm_memory_mb: notApplicableKpi("wsl_vm_memory_mb", "not_applicable_to_setup"),
           }),
@@ -379,7 +415,7 @@ export function linuxXvfbResults() {
       }),
     ],
     incidents: [],
-  };
+  });
 }
 
 /** The committed fixtures: file name -> exact bytes. */

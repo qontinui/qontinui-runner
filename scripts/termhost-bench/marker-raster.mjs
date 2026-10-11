@@ -8,8 +8,11 @@
  *
  * The rules are `PIXEL_RULE_TEXT` in marker-golden.mjs (copied into the golden file as
  * `codec.pixel.rules`), an exact algorithm; in short:
- *   1. Positions are pixel edges (pixel i spans [i, i + 1), a segment [start, end));
- *      gap(A, B) = B.start - A.end, mid(A, B) = (A.end + B.start) / 2; round = half up.
+ *   1. The rules decode ONE pixel row (which rows of a frame to decode is Phase 2's to
+ *      define). Positions are pixel edges (pixel i spans [i, i + 1), a segment
+ *      [start, end)); gap(A, B) = B.start - A.end, mid(A, B) = (A.end + B.start) / 2;
+ *      round = the nearest integer, ties toward +infinity (Math.round; Rust f64::round
+ *      is the same for x >= 0).
  *   2. A channel <= 63 is 0, >= 192 is 1, anything else is impure; a pixel is pure when
  *      all three channels are, with value 4R + 2G + B.
  *   3. Segments: maximal runs of pure pixels with one value; impure pixels are gaps.

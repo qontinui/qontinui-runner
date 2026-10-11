@@ -213,16 +213,22 @@ function notApplicable(reason, n) {
 /**
  * A `degradation_*` KPI value for one row: the base KPI and statistic come from the
  * catalog's `degradation_of`, read out of the row's `kpis` at N and the matching
- * N = 1 row's `kpis` (pass `undefined` when there is no N = 1 row).
+ * N = 1 row's `kpis` (pass `undefined` when there is no N = 1 row). An N = 1 row is the
+ * baseline itself: pass its `n` (or the same `kpis` object twice) and the value is
+ * not_applicable(baseline_level), never a measured ratio of 1.
  *
  * @param {string} id a degradation_* catalog id
  * @param {Record<string, object>} kpisAtN the row's `kpis`
  * @param {Record<string, object> | undefined} kpisAtOne the matching N = 1 row's `kpis`
+ * @param {{n?: number}} [opts] the row's N
  * @returns {object}
  */
-export function degradationKpi(id, kpisAtN, kpisAtOne) {
+export function degradationKpi(id, kpisAtN, kpisAtOne, { n } = {}) {
   const of = getKpi(id).degradation_of;
   if (!of) throw new RangeError(`${id} is not a degradation KPI`);
+  if (n === 1 || (kpisAtN !== undefined && kpisAtN === kpisAtOne)) {
+    return notApplicableKpi(id, "baseline_level");
+  }
   const operand = (kpiValue) => {
     if (kpiValue?.state !== "measured") return kpiValue;
     const value = kpiValue.stats?.[of.statistic];

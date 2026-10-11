@@ -469,9 +469,10 @@ const ORDERED_STATS = ["min", "p50", "p95", "p99", "max"];
 /**
  * Validate a parsed results document: the schema first, then the cross-field rules
  * a schema cannot state (percentile order, mean within [min, max], coverage, scenario
- * consistency, duplicate rows, and a measured degradation_* backed by an N = 1 row of
- * the same setup, variant, build role and arm with its base KPI measured). Semantic
- * checks run only on a schema-valid document.
+ * consistency, duplicate rows, a measured degradation_* whose own base KPI is measured
+ * and backed by an N = 1 row of the same setup, variant, build role and arm with that KPI
+ * measured, and a slope over the N ladder counting no more N levels than the file holds).
+ * Semantic checks run only on a schema-valid document.
  *
  * @param {unknown} doc
  * @param {{schema?: object}} [opts] defaults to the committed result-schema.json
@@ -542,21 +543,29 @@ function semanticErrors(doc) {
     for (const [id, kpi] of Object.entries(row.kpis)) kpiSemantics(`${at}/kpis/${id}`, kpi, errors);
   });
   errors.push(...baselineErrors(doc));
+  errors.push(...ladderErrors(doc));
   return errors;
 }
 
 const DEGRADATIONS = KPI_CATALOG.filter((k) => k.degradation_of);
 
-/** One subject at one arm: setup, variant, build role (A/B builds never share a baseline). */
-function subjectKey(row) {
+/**
+ * One subject at one arm: setup, variant, build role (A/B builds never share a baseline)
+ * and arm. Degradation baselines and slopes over the N ladder are computed within one.
+ *
+ * @param {{setup: object, scenario: object}} row
+ * @returns {string}
+ */
+export function subjectKey(row) {
   const role = isPlainObject(row.setup.build) && row.setup.build.role ? row.setup.build.role : "-";
   return [row.setup.id, row.setup.variant, role, row.scenario.arm].join("|");
 }
 
 /**
- * A measured degradation_* needs an N = 1 row for the same subject and arm whose base
- * KPI (the catalog's degradation_of) is measured; an N = 1 row is itself the baseline,
- * so a measured degradation there is a contradiction (it is not_applicable(baseline_level)).
+ * A measured degradation_* is a ratio of two measured values: the row's own base KPI (the
+ * catalog's degradation_of, the numerator) and the same KPI on an N = 1 row for the same
+ * subject and arm (the denominator). An N = 1 row is itself the baseline, so a measured
+ * degradation there is a contradiction (it is not_applicable(baseline_level)).
  */
 function baselineErrors(doc) {
   const errors = [];
@@ -577,6 +586,16 @@ function baselineErrors(doc) {
         );
         continue;
       }
+      if (row.kpis[d.degradation_of.kpi]?.state !== "measured") {
+        errors.push(
+          err(
+            at,
+            "semantic",
+            `a measured ${d.id} on a row whose own ${d.degradation_of.kpi} is not measured`,
+          ),
+        );
+        continue;
+      }
       const base = (baselines.get(subjectKey(row)) ?? []).filter(
         (b) => b.kpis[d.degradation_of.kpi]?.state === "measured",
       );
@@ -586,6 +605,45 @@ function baselineErrors(doc) {
             at,
             "semantic",
             `measured ${d.id} has no N = 1 row for the same setup, variant, build role and arm with a measured ${d.degradation_of.kpi}`,
+          ),
+        );
+      }
+    }
+  });
+  return errors;
+}
+
+const LADDER_KPIS = KPI_CATALOG.filter((k) => k.needs.includes("n_ladder"));
+
+/**
+ * A KPI over the N ladder (memory_mb_per_session) is computed within one file, so the N
+ * levels it counts (its n, measured or not) cannot exceed the distinct N of the file's
+ * rows for the same subject and arm whose base KPI (derived_from) is measured.
+ */
+function ladderErrors(doc) {
+  const levels = new Map();
+  for (const row of doc.rows) {
+    for (const k of LADDER_KPIS) {
+      const base = k.derived_from[0];
+      if (row.kpis[base]?.state !== "measured") continue;
+      const key = `${subjectKey(row)}|${base}`;
+      if (!levels.has(key)) levels.set(key, new Set());
+      levels.get(key).add(row.scenario.n);
+    }
+  }
+  const errors = [];
+  doc.rows.forEach((row, r) => {
+    for (const k of LADDER_KPIS) {
+      const value = row.kpis[k.id];
+      if (typeof value?.n !== "number") continue;
+      const base = k.derived_from[0];
+      const have = levels.get(`${subjectKey(row)}|${base}`)?.size ?? 0;
+      if (value.n > have) {
+        errors.push(
+          err(
+            `/rows/${r}/kpis/${k.id}`,
+            "semantic",
+            `${k.id} counts ${value.n} N levels; this file holds ${have} for the same setup, variant, build role and arm with a measured ${base}`,
           ),
         );
       }

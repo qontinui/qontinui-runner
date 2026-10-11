@@ -180,7 +180,7 @@
           "state": "unknown",
           "unit": "MB/session",
           "reason": "too_few_levels",
-          "n": 2
+          "n": 1
         },
         "gpu_pct": {
           "state": "not_applicable",
@@ -414,10 +414,10 @@
           "value": 0.8
         },
         "memory_mb_per_session": {
-          "state": "measured",
+          "state": "unknown",
           "unit": "MB/session",
-          "n": 4,
-          "value": 22.5
+          "reason": "too_few_levels",
+          "n": 1
         },
         "gpu_pct": {
           "state": "not_applicable",
