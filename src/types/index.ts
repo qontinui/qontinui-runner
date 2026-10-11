@@ -40,7 +40,6 @@ export { createDisplayNode } from "./treeEvents";
 
 // State machine types and functions
 export type {
-  TransitionExecutionResult,
   NavigationResult,
   ActiveStatesResult,
   TransitionInfo,
@@ -48,11 +47,7 @@ export type {
 } from "./state-machine";
 
 export {
-  executeTransition,
   navigateToState,
-  navigateToMultipleStates,
-  getActiveStates,
-  getAvailableTransitions,
   isStateActive,
   findTransitionById,
   getTransitionsToState,

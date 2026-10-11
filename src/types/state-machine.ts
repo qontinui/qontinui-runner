@@ -16,35 +16,6 @@ import { describeThrown } from "@/lib/utils";
 // ============================================================================
 
 /**
- * Result of executing a state transition.
- *
- * Contains information about the transition execution including success status,
- * the states that were activated/deactivated, and any error messages.
- */
-export interface TransitionExecutionResult {
-  /**
-   * Whether the transition executed successfully.
-   */
-  success: boolean;
-
-  /**
-   * ID of the transition that was executed.
-   */
-  transition_id: string;
-
-  /**
-   * List of state IDs that are currently active after transition.
-   */
-  active_states: string[];
-
-  /**
-   * Error message if the transition failed.
-   * Undefined if success is true.
-   */
-  error?: string;
-}
-
-/**
  * Result of navigating to one or more states.
  *
  * Contains the navigation path taken, current active states, and success status.
@@ -263,41 +234,6 @@ export interface ResolvedInitialStatesResult {
 // ============================================================================
 
 /**
- * Execute a specific state transition by ID.
- *
- * This command triggers a transition in the state machine, executing any
- * associated workflows and updating the active state set.
- *
- * @param transitionId - The unique identifier of the transition to execute
- * @returns Promise resolving to the execution result
- *
- * @example
- * ```typescript
- * const result = await executeTransition("login_to_dashboard");
- * if (result.success) {
- *   console.log("Active states:", result.active_states);
- * } else {
- *   console.error("Transition failed:", result.error);
- * }
- * ```
- */
-export async function executeTransition(transitionId: string): Promise<TransitionExecutionResult> {
-  try {
-    const result = await invoke<TransitionExecutionResult>("execute_transition", {
-      transitionId,
-    });
-    return result;
-  } catch (error) {
-    return {
-      success: false,
-      transition_id: transitionId,
-      active_states: [],
-      error: describeThrown(error, "Failed to execute transition"),
-    };
-  }
-}
-
-/**
  * Navigate to a target state by finding and executing the optimal path.
  *
  * The state machine will automatically determine the best path from the current
@@ -330,105 +266,6 @@ export async function navigateToState(stateId: string): Promise<NavigationResult
       active_states: [],
       target_state: stateId,
       error: describeThrown(error, "Failed to navigate to state"),
-    };
-  }
-}
-
-/**
- * Navigate to multiple target states simultaneously.
- *
- * In multi-state mode, this command will navigate to all specified states,
- * finding optimal paths for each and handling any conflicts.
- *
- * @param stateIds - Array of target state identifiers
- * @returns Promise resolving to the navigation result with detailed per-state results
- *
- * @example
- * ```typescript
- * const result = await navigateToMultipleStates(["email_open", "chat_open"]);
- * if (result.success) {
- *   console.log("All states reached:", result.active_states);
- *   result.results?.forEach((r, i) => {
- *     console.log(`State ${stateIds[i]}: ${r.success ? 'OK' : 'FAILED'}`);
- *   });
- * }
- * ```
- */
-export async function navigateToMultipleStates(stateIds: string[]): Promise<NavigationResult> {
-  try {
-    const result = await invoke<NavigationResult>("navigate_to_multiple_states", {
-      stateIds,
-    });
-    return result;
-  } catch (error) {
-    return {
-      success: false,
-      path: [],
-      active_states: [],
-      error: describeThrown(error, "Failed to navigate to states"),
-    };
-  }
-}
-
-/**
- * Get the currently active states in the state machine.
- *
- * This query returns which states are currently active, along with the
- * primary current state and state history.
- *
- * @returns Promise resolving to the active states result
- *
- * @example
- * ```typescript
- * const result = await getActiveStates();
- * if (result.success) {
- *   console.log("Active states:", result.active_states);
- *   console.log("Current state:", result.current_state);
- *   console.log("Recent history:", result.state_history);
- * }
- * ```
- */
-export async function getActiveStates(): Promise<ActiveStatesResult> {
-  try {
-    const result = await invoke<ActiveStatesResult>("get_active_states");
-    return result;
-  } catch (error) {
-    return {
-      success: false,
-      active_states: [],
-      error: describeThrown(error, "Failed to get active states"),
-    };
-  }
-}
-
-/**
- * Get all transitions available from the current state.
- *
- * This query returns information about which transitions can be executed
- * from the current state, including their destinations and triggering workflows.
- *
- * @returns Promise resolving to the available transitions result
- *
- * @example
- * ```typescript
- * const result = await getAvailableTransitions();
- * if (result.success) {
- *   console.log("Current state:", result.current_state);
- *   result.transitions.forEach(t => {
- *     console.log(`Transition ${t.id}: ${t.from_state} -> ${t.to_state}`);
- *   });
- * }
- * ```
- */
-export async function getAvailableTransitions(): Promise<AvailableTransitionsResult> {
-  try {
-    const result = await invoke<AvailableTransitionsResult>("get_available_transitions");
-    return result;
-  } catch (error) {
-    return {
-      success: false,
-      transitions: [],
-      error: describeThrown(error, "Failed to get available transitions"),
     };
   }
 }
@@ -515,7 +352,7 @@ export async function getResolvedInitialStates(
  *
  * @example
  * ```typescript
- * const activeStates = await getActiveStates();
+ * const activeStates = ["dashboard", "email_open"];
  * if (isStateActive("dashboard", activeStates)) {
  *   console.log("Dashboard is active");
  * }
@@ -538,7 +375,7 @@ export function isStateActive(
  *
  * @example
  * ```typescript
- * const transitions = await getAvailableTransitions();
+ * const transitions: AvailableTransitionsResult = { success: true, transitions: [] };
  * const loginTransition = findTransitionById("login", transitions);
  * if (loginTransition) {
  *   console.log("Login goes to:", loginTransition.to_state);
@@ -561,7 +398,7 @@ export function findTransitionById(
  *
  * @example
  * ```typescript
- * const transitions = await getAvailableTransitions();
+ * const transitions: AvailableTransitionsResult = { success: true, transitions: [] };
  * const pathsToDashboard = getTransitionsToState("dashboard", transitions);
  * console.log(`Found ${pathsToDashboard.length} ways to reach dashboard`);
  * ```
@@ -582,7 +419,7 @@ export function getTransitionsToState(
  *
  * @example
  * ```typescript
- * const activeStates = await getActiveStates();
+ * const activeStates = ["dashboard", "email_open"];
  * if (isAnyStateActive(["logged_in", "authenticated"], activeStates)) {
  *   console.log("User is authenticated in some way");
  * }
@@ -605,7 +442,7 @@ export function isAnyStateActive(
  *
  * @example
  * ```typescript
- * const activeStates = await getActiveStates();
+ * const activeStates = ["dashboard", "email_open"];
  * if (areAllStatesActive(["logged_in", "email_open"], activeStates)) {
  *   console.log("User is logged in with email open");
  * }

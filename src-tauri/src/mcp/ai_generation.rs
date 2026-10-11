@@ -80,30 +80,6 @@ impl RequestHints for GeneratePromptRequest {
     }
 }
 
-/// Request body for POST /ai/generate-macro
-#[derive(Debug, Deserialize)]
-pub struct GenerateMacroRequest {
-    pub user_prompt: String,
-    #[serde(default)]
-    pub category: Option<String>,
-}
-
-/// Request body for POST /ai/generate-prompt-snippet
-#[derive(Debug, Deserialize)]
-pub struct GeneratePromptSnippetRequest {
-    pub user_prompt: String,
-    #[serde(default)]
-    pub language: Option<String>,
-}
-
-/// Request body for POST /ai/suggest-check-groups
-#[derive(Debug, Deserialize)]
-pub struct SuggestCheckGroupsRequest {
-    pub user_prompt: String,
-    #[serde(default)]
-    pub existing_checks: Vec<serde_json::Value>,
-}
-
 /// Request body for POST /ai/suggest-exploration-strategy
 #[derive(Debug, Deserialize)]
 pub struct SuggestExplorationStrategyRequest {
@@ -378,150 +354,6 @@ pub async fn generate_prompt_handler(
     handle_bridge_result(result, "Task prompt generated successfully")
 }
 
-/// POST /ai/generate-macro
-///
-/// Generate a macro (action sequence) using AI via the Python bridge.
-pub async fn generate_macro_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<GenerateMacroRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::settings;
-
-    info!(
-        "HTTP: Generating macro with AI: {}",
-        request.user_prompt.chars().take(50).collect::<String>()
-    );
-
-    let ai_settings = settings::get_ai_settings();
-    let ai_provider = ai_provider_str(&ai_settings.provider);
-    let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.app_state.clone();
-
-    let result = spawn_blocking_tracked(move || {
-        let params = serde_json::json!({
-            "user_prompt": request.user_prompt,
-            "category": request.category.unwrap_or_else(|| "general".to_string()),
-            "ai_provider": ai_provider,
-            "ai_settings": provider_settings,
-        });
-
-        with_default_bridge(&app_state, |bridge| {
-            bridge.send_command_and_wait(
-                "generate_macro_with_ai",
-                Some(params),
-                std::time::Duration::from_secs(120),
-            )
-        })
-    })
-    .await
-    .map_err(|e| {
-        error!("HTTP: spawn_blocking error for generate-macro: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    handle_bridge_result(result, "Macro generated successfully")
-}
-
-/// POST /ai/generate-prompt-snippet
-///
-/// Generate a prompt snippet using AI via the Python bridge.
-pub async fn generate_prompt_snippet_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<GeneratePromptSnippetRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::settings;
-
-    info!(
-        "HTTP: Generating prompt snippet with AI: {}",
-        request.user_prompt.chars().take(50).collect::<String>()
-    );
-
-    let ai_settings = settings::get_ai_settings();
-    let ai_provider = ai_provider_str(&ai_settings.provider);
-    let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.app_state.clone();
-
-    let result = spawn_blocking_tracked(move || {
-        let params = serde_json::json!({
-            "user_prompt": request.user_prompt,
-            "language": request.language.unwrap_or_else(|| "python".to_string()),
-            "ai_provider": ai_provider,
-            "ai_settings": provider_settings,
-        });
-
-        with_default_bridge(&app_state, |bridge| {
-            bridge.send_command_and_wait(
-                "generate_prompt_snippet_with_ai",
-                Some(params),
-                std::time::Duration::from_secs(120),
-            )
-        })
-    })
-    .await
-    .map_err(|e| {
-        error!(
-            "HTTP: spawn_blocking error for generate-prompt-snippet: {}",
-            e
-        );
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    handle_bridge_result(result, "Prompt snippet generated successfully")
-}
-
-/// POST /ai/suggest-check-groups
-///
-/// Suggest check groupings using AI via the Python bridge.
-pub async fn suggest_check_groups_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SuggestCheckGroupsRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::settings;
-
-    info!(
-        "HTTP: Suggesting check groups with AI: {}",
-        request.user_prompt.chars().take(50).collect::<String>()
-    );
-
-    let ai_settings = settings::get_ai_settings();
-    let ai_provider = ai_provider_str(&ai_settings.provider);
-    let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.app_state.clone();
-
-    let result = spawn_blocking_tracked(move || {
-        let params = serde_json::json!({
-            "user_prompt": request.user_prompt,
-            "existing_checks": request.existing_checks,
-            "ai_provider": ai_provider,
-            "ai_settings": provider_settings,
-        });
-
-        with_default_bridge(&app_state, |bridge| {
-            bridge.send_command_and_wait(
-                "suggest_check_groups_with_ai",
-                Some(params),
-                std::time::Duration::from_secs(120),
-            )
-        })
-    })
-    .await
-    .map_err(|e| {
-        error!("HTTP: spawn_blocking error for suggest-check-groups: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    handle_bridge_result(result, "Check groups suggested successfully")
-}
-
 /// POST /ai/suggest-exploration-strategy
 ///
 /// Suggest an exploration strategy using AI via the Python bridge.
@@ -633,15 +465,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         .route("/ai/generate-context", post(generate_context_handler))
         .route("/ai/generate-prompt", post(generate_prompt_handler))
-        .route("/ai/generate-macro", post(generate_macro_handler))
-        .route(
-            "/ai/generate-prompt-snippet",
-            post(generate_prompt_snippet_handler),
-        )
-        .route(
-            "/ai/suggest-check-groups",
-            post(suggest_check_groups_handler),
-        )
         .route(
             "/ai/suggest-exploration-strategy",
             post(suggest_exploration_strategy_handler),
