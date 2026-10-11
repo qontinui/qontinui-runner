@@ -282,6 +282,30 @@
       "reason": "respawn log names the per-PTY account env var; profile.account_isolation"
     },
     {
+      "file": "src-tauri/src/session/resume_door.rs",
+      "item": "classify",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "M",
+      "reason": "resume door refuses non-claude rows (provider_<p>); resuming them needs the row's CliProfile resume argv rather than the claude_session_id relaunch"
+    },
+    {
+      "file": "src-tauri/src/session/resume_door.rs",
+      "item": "config_dir_of_pid",
+      "pattern": "CLAUDE_CONFIG_DIR",
+      "count": 1,
+      "class": "M",
+      "reason": "reads the live claude process's account pin from /proc environ; the env var name is the profile's account_isolation fact"
+    },
+    {
+      "file": "src-tauri/src/session/resume_door.rs",
+      "item": "select_ids",
+      "pattern": "DEFAULT_PROVIDER",
+      "count": 1,
+      "class": "M",
+      "reason": "the bulk resume door selects only claude-provider rows because it relaunches by claude_session_id; a non-claude row would need its CliProfile resume argv (profile_for_program) to be resumable here"
+    },
+    {
       "file": "src-tauri/src/session/session_ledger.rs",
       "item": "diff",
       "pattern": "--resume",
