@@ -219,7 +219,15 @@ let container: HTMLDivElement;
 let root: Root;
 
 /** Render the tmux viewport — `ZoneGrid`'s root element around the cell list. */
-function renderViewport(tabs: TerminalTab[], assigned: string, shownTabId: string | null) {
+function renderViewport(
+  tabs: TerminalTab[],
+  assigned: string,
+  shownTabId: string | null,
+  opts: {
+    cellProps?: Partial<ZoneCellSharedProps>;
+    cosmeticZoneFor?: (zoneIdx: number) => number | null;
+  } = {},
+) {
   act(() => {
     root.render(
       createElement(
@@ -228,8 +236,10 @@ function renderViewport(tabs: TerminalTab[], assigned: string, shownTabId: strin
         buildZoneCells({
           workMode: "tmux",
           zones: [{ col: "1", row: "1" }],
-          cellProps: cellPropsFor(tabs, assigned),
+          cellProps: { ...cellPropsFor(tabs, assigned), ...opts.cellProps },
           shownTabId,
+          maximizedZone: null,
+          cosmeticZoneFor: opts.cosmeticZoneFor ?? (() => null),
           promptTabs: new Set<string>(),
           reviewTabs: new Set<string>(),
           dropTargetZone: null,
@@ -328,6 +338,12 @@ describe("tmux cells — keep-mounted swap", () => {
     expect(container.querySelector("[title='session b']")?.textContent).toBe("session b");
   });
 
+  it("k / n counts the live sessions the session manager lists — not exited ones", () => {
+    const withExited = [pty("a"), { ...pty("dead"), isAlive: false }, pty("b"), pty("c")];
+    show(withExited, "b");
+    expect(container.querySelector("[data-tmux-position]")?.textContent).toBe("2 / 3");
+  });
+
   it("renders zone chrome only on the shown pane — every parked cell is zone 0 too", () => {
     show(tabs, "a");
     // One header's session-info trigger for the whole viewport: chrome on a
@@ -397,6 +413,8 @@ describe("grid cells — one mount per tab", () => {
               isSingleView: false,
             },
             shownTabId: null,
+            maximizedZone: null,
+            cosmeticZoneFor: (zoneIdx) => zoneIdx,
             promptTabs: new Set<string>(),
             reviewTabs: new Set<string>(),
             dropTargetZone: null,
@@ -450,21 +468,31 @@ describe("tmux cells — WebGL context cap", () => {
     show(tabs, "t1");
 
     expect(rec.restores).toEqual(["t1"]);
-    // t0 was just parked, so it is the oldest hidden holder and gives way.
-    expect(rec.downgrades).toEqual(["t1", "t2", "t0"]);
-    expect(__webglDormantKeys()).toEqual(["t2", "t0"]);
-    expect(__webglSlotKeys()).toEqual(["t3", "t4", "t5", "t6", "t7", "t8", "t9", "t1"]);
+    // The shown cell comes first (cells follow zone order), so t1's reveal
+    // runs before t0's hide: the oldest HIDDEN holder, t3, gives way, and t0 —
+    // the pane the operator just left — keeps its context.
+    expect(rec.downgrades).toEqual(["t1", "t2", "t3"]);
+    expect(__webglDormantKeys()).toEqual(["t2", "t3"]);
+    expect(__webglSlotKeys()).toEqual(["t0", "t4", "t5", "t6", "t7", "t8", "t9", "t1"]);
     expect(rec.mounts).toEqual(ids);
     expect(rec.unmounts).toEqual([]);
   });
 
-  it("swapping back restores the pane that gave way", () => {
+  it("swapping back to the pane just left needs no restore: it kept its context", () => {
     show(tabs, "t0");
     show(tabs, "t1");
     show(tabs, "t0");
-    expect(rec.restores).toEqual(["t1", "t0"]);
+    expect(rec.restores).toEqual(["t1"]);
     expect(__webglSlotKeys().at(-1)).toBe("t0");
     expect(__webglDormantKeys()).toEqual(["t2", "t3"]);
+  });
+
+  it("swapping to a pane that gave way restores it", () => {
+    show(tabs, "t0");
+    show(tabs, "t1");
+    show(tabs, "t3");
+    expect(rec.restores).toEqual(["t1", "t3"]);
+    expect(__webglSlotKeys().at(-1)).toBe("t3");
   });
 });
 
@@ -483,5 +511,97 @@ describe("the stand-in pane matches the code it stands in for", () => {
     expect(backend).toMatch(
       /acquireWebglSlot\(\s*this\.instanceKey,\s*\(\) => this\.evictWebglRenderer\(\),\s*true,\s*\(\) => this\.restoreWebglRenderer\(\),\s*\)/,
     );
+  });
+});
+
+describe("tmux cells — zone cosmetics follow the session's grid zone", () => {
+  const tabs = [pty("a"), pty("b")];
+  // The grid: a in zone 0 labelled "zero", b in zone 2 labelled "two" and pinned.
+  const cosmetics = {
+    zoneLabels: { 0: "zero", 2: "two" },
+    pinnedZones: new Set([2]),
+  };
+
+  it("shows the shown session's own label and pin, and edits land on its grid zone", () => {
+    const setZoneLabel = vi.fn();
+    const togglePin = vi.fn();
+    renderViewport(tabs, "b", "b", {
+      cellProps: { ...cosmetics, onSetZoneLabel: setZoneLabel, onTogglePin: togglePin },
+      cosmeticZoneFor: (zoneIdx) => (zoneIdx === 0 ? 2 : null),
+    });
+    expect(container.textContent).toContain("two");
+    expect(container.textContent).not.toContain("zero");
+    const pin = container.querySelector("[title^='Unpin zone']") as HTMLElement | null;
+    expect(pin).not.toBeNull();
+    act(() => pin!.click());
+    expect(togglePin.mock.calls).toEqual([[2]]);
+  });
+
+  it("a session with no grid zone shows no cosmetics and offers no editor for them", () => {
+    renderViewport(tabs, "b", "b", {
+      cellProps: { ...cosmetics, onSetZoneLabel: vi.fn(), onTogglePin: vi.fn() },
+      cosmeticZoneFor: () => null,
+    });
+    expect(container.textContent).not.toContain("zero");
+    expect(container.querySelector("[title^='Pin zone']")).toBeNull();
+    expect(container.querySelector("[title^='Unpin zone']")).toBeNull();
+    expect(container.querySelector("[title='Double-click to add label']")).toBeNull();
+  });
+});
+
+describe("grid cells — the maximized view", () => {
+  const zones = [
+    { col: "1", row: "1" },
+    { col: "2", row: "1" },
+  ];
+  function renderMaximized(tabs: TerminalTab[], assignments: ZoneAssignments, maximized: number) {
+    act(() => {
+      root.render(
+        createElement(
+          "div",
+          { "data-terminal-work-mode": "grid" },
+          buildZoneCells({
+            workMode: "grid",
+            zones,
+            cellProps: {
+              ...cellPropsFor(tabs, "unused"),
+              assignments,
+              tabClassification: classifyTabs(tabs, assignments, false, new Set(), "grid"),
+              isMultiZone: true,
+              showLabels: true,
+              isSingleView: true,
+            },
+            shownTabId: null,
+            maximizedZone: maximized,
+            maximizedNav: {
+              prevZone: null,
+              nextZone: null,
+              onGoToZone: noop,
+              onDeleteAndForward: noop,
+            },
+            cosmeticZoneFor: (zoneIdx) => zoneIdx,
+            promptTabs: new Set<string>(),
+            reviewTabs: new Set<string>(),
+            dropTargetZone: null,
+          }),
+        ),
+      );
+    });
+  }
+
+  it("shows the maximized zone's terminal under the maximized header, the others parked", () => {
+    renderMaximized([pty("a"), pty("b")], { 0: "a", 1: "b" }, 1);
+    expect(visiblePanes()).toEqual(["b"]);
+    expect(rec.visible.get("a")).toBe(false);
+    expect(container.textContent).toContain("Maximized");
+    expect(container.querySelector("[aria-label='Previous terminal']")).not.toBeNull();
+    // No zone chrome: the maximized header carries the session's info trigger.
+    expect(container.querySelectorAll("[data-zone-index]")).toHaveLength(0);
+  });
+
+  it("an empty maximized zone shows its placeholder", () => {
+    renderMaximized([pty("a")], { 0: "a" }, 1);
+    expect(visiblePanes()).toEqual([]);
+    expect(container.textContent).toContain("Zone 2");
   });
 });

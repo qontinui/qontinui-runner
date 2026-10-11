@@ -30,16 +30,21 @@ import type { TerminalWorkMode } from "./terminalWorkMode";
  * tmux work mode (plan `2026-10-11-runner-terminal-tmux-work-mode` D2) zones
  * only the shown tab, and nothing is `hidden`:
  *  - `"assigned"`            — the shown tab (zone 0) → its visible cell.
- *  - `"offscreen"`           — any other PTY tab → a parked cell that keeps
- *                              its `TerminalInstance` mounted with
- *                              `visible={false}`, so a swap is a prop flip,
- *                              not a remount.
- *  - `"offscreen-unmounted"` — a parked plan tab or Conductor worker
- *                              (`sessionBacked`) tab → mounts NOTHING. Neither
- *                              has a PTY to keep warm, and an off-screen
- *                              `TerminalInstance` for one would attach to a
- *                              terminal id naming no process (the same
- *                              exclusion grid mode's hidden parking applies).
+ *  - `"offscreen"`           — a WARM off-screen PTY tab (one of the most
+ *                              recently shown, `tmuxMountedTabIds`) → a parked
+ *                              cell that keeps its `TerminalInstance` mounted
+ *                              with `visible={false}`, so a swap to it is a
+ *                              prop flip, not a remount.
+ *  - `"offscreen-unmounted"` — every other off-screen tab, and any parked
+ *                              plan tab or Conductor worker (`sessionBacked`)
+ *                              tab → mounts NOTHING. A cold PTY tab mounts on
+ *                              reveal and rebuilds from the scrollback ring;
+ *                              the bound is what keeps a page of dozens of
+ *                              sessions from mounting a parser for each (the
+ *                              flow grid's OOM, incident #535). A plan or
+ *                              worker tab has no PTY to keep warm, and an
+ *                              off-screen `TerminalInstance` for one would
+ *                              attach to a terminal id naming no process.
  */
 export type TabClassification =
   | "assigned"
@@ -76,6 +81,9 @@ export function mountOwnerCount(classification: TabClassification): 0 | 1 {
  *                       zone 0's and every other tab is parked; `isFlowMode`
  *                       and `nearViewport` are ignored (the layout is pinned
  *                       to `single`).
+ * @param tmuxMounted    tmux only: the tabs to keep mounted (the shown tab and
+ *                       the warm MRU, `tmuxMountedTabIds`). Omitted, every
+ *                       off-screen PTY tab is warm.
  */
 export function classifyTabs(
   tabs: readonly { id: string; type?: string; sessionBacked?: boolean }[],
@@ -83,6 +91,7 @@ export function classifyTabs(
   isFlowMode: boolean,
   nearViewport: ReadonlySet<string>,
   workMode: TerminalWorkMode = "grid",
+  tmuxMounted?: ReadonlySet<string>,
 ): Map<string, TabClassification> {
   const m = new Map<string, TabClassification>();
   if (workMode === "tmux") {
@@ -90,6 +99,7 @@ export function classifyTabs(
     for (const t of tabs) {
       if (t.id === shown) m.set(t.id, "assigned");
       else if (t.type === "plan" || t.sessionBacked) m.set(t.id, "offscreen-unmounted");
+      else if (tmuxMounted && !tmuxMounted.has(t.id)) m.set(t.id, "offscreen-unmounted");
       else m.set(t.id, "offscreen");
     }
     return m;

@@ -14,17 +14,19 @@
  *
  * The five paths that render a live session:
  *   1. full zone header      `zone-grid/ZoneLabel.tsx`      → mounts
- *   2. single / maximized    `ZoneGrid.tsx`                 → mounts
+ *   2. maximized header      `zone-grid/MaximizedHeader.tsx`→ mounts
  *   3. solo session strip    `zone-grid/ZoneCell.tsx`       → mounts
  *   4. compact zone card     `zone-grid/CompactZoneCard.tsx`→ mounts (this fix)
  *   5. parked cell           `zone-grid/ZoneCell.tsx`       → deliberately NOT
- *      (an unzoned grid tab, or an off-screen tmux tab: `isParked`)
+ *      (an unzoned grid tab, an off-screen tmux tab, or a zone behind the
+ *      maximized one: `isParked`)
  *
  * (5) is a `display: none` cell: a trigger there would be invisible, not
- * keyboard-reachable, and — every parked cell being zone 0 — would register
- * the SAME `terminal-session-info-trigger-0` id as zone 0's real one. Its
- * reachable homes are the zone control panel's Unassigned list and the session
- * manager.
+ * keyboard-reachable, and — a parked cell's index being no zone on screen —
+ * would register the same `terminal-session-info-trigger-<n>` id as a real
+ * one. Its reachable homes are the zone control panel's Unassigned list and
+ * the session manager. The maximized zone's cell hides the zone chrome too
+ * (`hideZoneChrome`); its trigger is the maximized header's.
  */
 
 import { readFileSync } from "node:fs";
@@ -38,7 +40,7 @@ const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.met
 
 const COMPACT = read("./CompactZoneCard.tsx");
 const ZONE_LABEL = read("./ZoneLabel.tsx");
-const ZONE_GRID = read("../ZoneGrid.tsx");
+const MAXIMIZED_HEADER = read("./MaximizedHeader.tsx");
 const ZONE_CELL = read("./ZoneCell.tsx");
 
 /** The one call shape every mount site uses. */
@@ -55,7 +57,8 @@ describe("SessionInfoDropdown mount sites", () => {
   });
 
   it("still mounts in the single/maximized header and the solo strip", () => {
-    expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={singleViewZone} />`);
+    expect(MAXIMIZED_HEADER).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
+    expect(ZONE_CELL).toContain("{isMaximizedPane && maximizedNav && (");
     expect(ZONE_CELL).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
   });
 
@@ -64,11 +67,10 @@ describe("SessionInfoDropdown mount sites", () => {
     // a parked tab has no zone index of its own to key the element ids off. If
     // this ever changes, the id scheme has to grow a non-zone discriminator
     // first. Both mount sites in the cell are gated off for a parked cell.
-    expect(ZONE_CELL).toContain(
-      'const isParked = classification === "offscreen" || classification === "hidden";',
-    );
-    expect(ZONE_CELL).toContain("const showLabels = showLabelsProp && !isParked;");
-    expect(ZONE_CELL).toMatch(/const soloSessionInfo =\s*!isParked &&/);
+    expect(ZONE_CELL).toContain('const isParked = presentation === "parked";');
+    expect(ZONE_CELL).toContain("const hideZoneChrome = isParked || isMaximizedPane;");
+    expect(ZONE_CELL).toContain("const showLabels = showLabelsProp && !hideZoneChrome;");
+    expect(ZONE_CELL).toMatch(/const soloSessionInfo =\s*!hideZoneChrome &&/);
     expect(ZONE_CELL).toContain('${isParked ? "hidden" : ""}');
   });
 });

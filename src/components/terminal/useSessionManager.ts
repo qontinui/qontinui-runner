@@ -346,6 +346,13 @@ export interface UseSessionManagerParams {
    * rather than to a read-only transcript of it.
    */
   onFocusSessionTab: (sessionId: string, tabId: string, source: UnifiedSession["source"]) => void;
+  /**
+   * Close a session's terminal tab — the page's own close path
+   * (`useTerminalManager().closeTerminal`, which records the durable close).
+   * In tmux mode the panel is the only navigator, so without a close on the
+   * row a hidden session could be closed only by showing it first.
+   */
+  onCloseSessionTab?: (tabId: string) => void;
 }
 
 export interface UseSessionManagerReturn {
@@ -380,6 +387,13 @@ export interface UseSessionManagerReturn {
    */
   openSession: (session: UnifiedSession) => void;
   copySessionId: (session: UnifiedSession) => void;
+  /**
+   * The live tab a row's close action would close, or `null` when the row has
+   * none in this window (a transcript-only row) — its card offers no close.
+   */
+  closableTabId: (session: UnifiedSession) => string | null;
+  /** Close the row's live terminal tab (no-op when it has none). */
+  closeSession: (session: UnifiedSession) => void;
 
   // Multi-select & bulk actions
   selectedIds: Set<string>;
@@ -588,6 +602,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     onResumeSession,
     onSelectSession,
     onFocusSessionTab,
+    onCloseSessionTab,
   } = params;
 
   // Digest state
@@ -1258,6 +1273,19 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     navigator.clipboard.writeText(session.sessionId).catch(() => {});
   }, []);
 
+  const closableTabId = useCallback(
+    (session: UnifiedSession) => (onCloseSessionTab ? liveTabIdForSession(session, tabs) : null),
+    [tabs, onCloseSessionTab],
+  );
+
+  const closeSession = useCallback(
+    (session: UnifiedSession) => {
+      const tabId = closableTabId(session);
+      if (tabId) onCloseSessionTab?.(tabId);
+    },
+    [closableTabId, onCloseSessionTab],
+  );
+
   // ── Multi-select & bulk actions ──────────────────────────────────────────
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -1331,6 +1359,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     viewTranscript,
     openSession,
     copySessionId,
+    closableTabId,
+    closeSession,
     selectedIds,
     toggleSelect,
     selectAllFrozen,

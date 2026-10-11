@@ -146,6 +146,8 @@ export function SessionManagerPanel({
     openSession,
     viewTranscript,
     copySessionId,
+    closableTabId,
+    closeSession,
     selectedIds,
     toggleSelect,
     selectAllFrozen,
@@ -347,6 +349,7 @@ export function SessionManagerPanel({
                   onAfterPromote={refresh}
                   onOpenWorktrees={setWorktreeFocus}
                   isOnScreen={isRowOnScreen(session, onScreenTabId)}
+                  onClose={closableTabId(session) !== null ? closeSession : undefined}
                   isOffScreen={isRowOffScreen(session, workMode, onScreenTabId)}
                 />
               ))}

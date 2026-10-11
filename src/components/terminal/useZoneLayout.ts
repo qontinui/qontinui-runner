@@ -1,16 +1,22 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageWindowStorageKey } from "./pageWindowStorageKey";
 import {
+  gridZoneOfTab,
+  mruOnEnter,
   parseGridSnapshot,
   parseMru,
   parseWorkMode,
+  placeInGridSnapshot,
   pushMru,
   reconcileTmuxAssignments,
+  rekeyGridSnapshot,
   restoreGridSnapshot,
+  sessionKeysFor,
   shownTabOnEnter,
   type GridSnapshot,
   type LayoutRequestSource,
+  type SessionKeyOf,
   type TerminalWorkMode,
 } from "./terminalWorkMode";
 
@@ -353,6 +359,9 @@ export function computeQuickLaunchLayoutId(
 /** Maps zone index → tab ID */
 export type ZoneAssignments = Record<number, string>;
 
+/** Shared empty assignments, so a memo over "no snapshot" keeps its identity. */
+const EMPTY_ASSIGNMENTS: ZoneAssignments = {};
+
 // ── Session State (for status borders) ─────────────────────────────────────
 
 export type SessionState = "idle" | "working" | "needs-input" | "completed" | "error";
@@ -413,10 +422,19 @@ function loadWorkModeState(persisted: PersistedState | null): {
       `[useZoneLayout] persisted workMode ${JSON.stringify(raw)} is not a known mode; using "grid"`,
     );
   }
+  const rawSnapshot = persisted?.gridSnapshot as unknown;
+  const gridSnapshot = parseGridSnapshot(rawSnapshot);
+  if (gridSnapshot === null && rawSnapshot !== undefined && rawSnapshot !== null) {
+    // Unreadable is not "no snapshot" silently: exiting tmux will fall back to
+    // `pickLayout(tabCount)`, and the log says why the grid was re-dealt.
+    console.warn(
+      `[useZoneLayout] persisted gridSnapshot ${JSON.stringify(rawSnapshot)} is malformed; ignoring it`,
+    );
+  }
   return {
     workMode: mode,
     mru: parseMru(persisted?.mru),
-    gridSnapshot: parseGridSnapshot(persisted?.gridSnapshot),
+    gridSnapshot,
   };
 }
 
@@ -655,8 +673,16 @@ export function useZoneLayout(
    * live" when omitted, preserving prior behavior for any caller that doesn't
    * thread liveness. Assignment/reconcile logic keeps using the full `tabIds`
    * — a dead-but-assigned tab still renders a tombstone card in its zone.
+   * tmux mode reads it too: a new shown tab is picked from the live tabs
+   * before any exited one.
    */
   liveTabIds?: ReadonlySet<string>,
+  /**
+   * Each tab's durable session key (its `claudeSessionId`), for tabs that have
+   * one. tmux mode's grid snapshot records it per zone so a session keeps its
+   * grid zone across a runner restart, which re-creates its tab under a new id.
+   */
+  sessionKeyByTab?: ReadonlyMap<string, string>,
 ) {
   const [persistedState] = useState(() => loadPersistedState(pageId, windowLabel));
   const [initialMode] = useState(() => loadWorkModeState(persistedState));
@@ -687,6 +713,19 @@ export function useZoneLayout(
    * it is now, not as it was when its closure was created.
    */
   const workModeRef = useRef<TerminalWorkMode>(initialMode.workMode);
+  /**
+   * Liveness and session keys as of the last commit, for the transitions and
+   * effects below that must read them without re-running whenever a tab's
+   * liveness or session id moves (the tab list itself is what they key on).
+   */
+  const tabFactsRef = useRef({ liveTabIds, sessionKeyByTab });
+  useEffect(() => {
+    tabFactsRef.current = { liveTabIds, sessionKeyByTab };
+  }, [liveTabIds, sessionKeyByTab]);
+  const sessionKeyOf: SessionKeyOf = useCallback(
+    (tabId: string) => tabFactsRef.current.sessionKeyByTab?.get(tabId),
+    [],
+  );
   /**
    * A one-shot "bring this tab into view and give it the keyboard" request
    * (a Session Manager card click). `seq` makes a repeat click on the same tab
@@ -757,10 +796,35 @@ export function useZoneLayout(
   useEffect(() => {
     setAssignments((prev) =>
       workMode === "tmux"
-        ? reconcileTmuxAssignments(prev, tabIds, committedRef.current.mru)
+        ? reconcileTmuxAssignments(
+            prev,
+            tabIds,
+            committedRef.current.mru,
+            tabFactsRef.current.liveTabIds ?? null,
+          )
         : reconcileAssignments(prev, tabIds, layout.zones.length, reservedZonesRef.current),
     );
   }, [tabIds, layout.zones.length, workMode]);
+
+  // tmux mode: keep the grid snapshot pointing at the tabs that exist now. A
+  // runner restart cold-resumes every session into a NEW tab id, and a Claude
+  // session binds its id only after its tab exists; re-keying by session id
+  // is what lets the snapshot's zones — and the labels, notes and pins keyed
+  // by them — follow their sessions (`rekeyGridSnapshot`). Adjusted during
+  // render, like the MRU below, so the snapshot never lags the tab list.
+  const [rekeyedFor, setRekeyedFor] = useState<{
+    tabIds: string[];
+    keys: ReadonlyMap<string, string> | undefined;
+  } | null>(null);
+  if (
+    workMode === "tmux" &&
+    gridSnapshot !== null &&
+    (rekeyedFor?.tabIds !== tabIds || rekeyedFor?.keys !== sessionKeyByTab)
+  ) {
+    setRekeyedFor({ tabIds, keys: sessionKeyByTab });
+    const rekeyed = rekeyGridSnapshot(gridSnapshot, tabIds, (id) => sessionKeyByTab?.get(id));
+    if (rekeyed !== gridSnapshot) setGridSnapshot(rekeyed);
+  }
 
   // tmux mode's shown tab, and the ONE place the MRU is maintained: every swap
   // (a session-manager click, a cycler, a spawn, a close falling back, the UI
@@ -858,18 +922,21 @@ export function useZoneLayout(
       committed.focusedZone,
       committed.mru,
       tabIds,
+      tabFactsRef.current.liveTabIds ?? null,
     );
     setGridSnapshot({
       layoutId: committed.layoutId,
       assignments: committed.assignments,
       focusedZone: committed.focusedZone,
+      sessionKeys: sessionKeysFor(committed.assignments, sessionKeyOf),
     });
+    setMru(mruOnEnter(shown, committed.assignments, committed.mru, tabIds));
     setWorkMode("tmux");
     setLayoutIdState("single");
     setMaximizedZone(null);
     setFocusedZone(0);
     setAssignments(shown === null ? {} : { 0: shown });
-  }, [tabIds]);
+  }, [tabIds, sessionKeyOf]);
 
   /**
    * Leave tmux mode for the grid the operator left: the snapshot, reconciled
@@ -885,12 +952,13 @@ export function useZoneLayout(
       workModeRef.current = "grid";
       const committed = committedRef.current;
       const snapshot = committed.gridSnapshot;
-      const restored: GridSnapshot = snapshot
+      const restored: Omit<GridSnapshot, "sessionKeys"> = snapshot
         ? restoreGridSnapshot(
             snapshot,
             tabIds,
             resolveLayout(snapshot.layoutId, flowGridSlotCount(tabIds, snapshot.assignments)).zones
               .length,
+            sessionKeyOf,
           )
         : (() => {
             const fallbackId = pickLayout(tabIds.length);
@@ -920,8 +988,14 @@ export function useZoneLayout(
       setAssignments(next.assignments);
       setFocusedZone(next.focusedZone);
       setMaximizedZone(null);
+      // The keyboard goes where the restored focus ring is. Without this the
+      // DOM focus stays in the last-shown tab's terminal — now one zone among
+      // many, and not the highlighted one — so typing would land somewhere
+      // other than where the page says it will.
+      const focusedTab = next.assignments[next.focusedZone];
+      if (focusedTab) requestReveal(focusedTab);
     },
-    [tabIds],
+    [tabIds, sessionKeyOf, requestReveal],
   );
 
   const exitTmuxMode = useCallback(() => exitTmux(null), [exitTmux]);
@@ -1011,10 +1085,12 @@ export function useZoneLayout(
       // of the grid tmux mode will return to, so it lands in the snapshot.
       const snapshot = committedRef.current.gridSnapshot;
       const snapshotFocused = snapshot ? snapshot.assignments[snapshot.focusedZone] : undefined;
+      const compacted = compactAssignments(ordered);
       setGridSnapshot({
         layoutId: pickLayout(ordered.length),
-        assignments: compactAssignments(ordered),
+        assignments: compacted,
         focusedZone: Math.max(0, snapshotFocused ? ordered.indexOf(snapshotFocused) : 0),
+        sessionKeys: sessionKeysFor(compacted, sessionKeyOf),
       });
       return;
     }
@@ -1023,7 +1099,7 @@ export function useZoneLayout(
     setAssignments(compactAssignments(ordered));
     setMaximizedZone(null);
     setFocusedZone(Math.max(0, focusedTab ? ordered.indexOf(focusedTab) : 0));
-  }, [pendingCompaction, tabIds, focusedZone]);
+  }, [pendingCompaction, tabIds, focusedZone, sessionKeyOf]);
 
   const assignTabToZone = useCallback((zoneIndex: number, tabId: string) => {
     // tmux mode renders zone 0 only: assigning there is a swap (the MRU effect
@@ -1056,6 +1132,77 @@ export function useZoneLayout(
       return next;
     });
   }, []);
+
+  /**
+   * Restore placing a session at its RECORDED grid zone (the session-registry
+   * restore and the cosmetic-snapshot plan tabs). In grid mode this is
+   * `assignTabToZone`. In tmux mode the recorded zone is a zone of the grid
+   * the operator will return to, not of the one viewport, so the placement
+   * goes into the grid snapshot: a restore must never swap the shown session
+   * (a reload in tmux would otherwise show whichever session the grid had in
+   * zone 0), and the restored session must get back the grid zone its label,
+   * notes and pin are keyed by. Without a snapshot there is no grid to place
+   * into, and the tab simply stays off screen.
+   */
+  const placeRestoredTab = useCallback(
+    (zoneIndex: number, tabId: string) => {
+      if (workModeRef.current !== "tmux") {
+        assignTabToZone(zoneIndex, tabId);
+        return;
+      }
+      if (zoneIndex < 0) return;
+      setGridSnapshot((prev) => (prev ? placeInGridSnapshot(prev, zoneIndex, tabId) : prev));
+    },
+    [assignTabToZone],
+  );
+
+  /**
+   * Focus a zone. tmux mode has one zone on screen, so a request for any
+   * other (a restore re-applying the grid's saved focus) names a zone that is
+   * not there and is dropped rather than leaving the focus ring on nothing.
+   */
+  const setFocusedZoneInMode = useCallback((zone: number) => {
+    if (workModeRef.current === "tmux" && zone !== 0) return;
+    setFocusedZone(zone);
+  }, []);
+
+  /**
+   * The grid of this page as the operator will see it in grid mode: the live
+   * grid in grid mode, the snapshot it returns to in tmux mode. What persists
+   * a grid zone — the session registry's recorded zone, the cosmetic session
+   * layout — reads this, so tmux mode's one viewport never overwrites the
+   * zones sessions are recorded in.
+   */
+  const gridView = useMemo(
+    () =>
+      workMode === "tmux"
+        ? {
+            layoutId: gridSnapshot?.layoutId ?? "single",
+            assignments: gridSnapshot?.assignments ?? EMPTY_ASSIGNMENTS,
+            focusedZone: gridSnapshot?.focusedZone ?? 0,
+          }
+        : { layoutId, assignments, focusedZone },
+    [workMode, gridSnapshot, layoutId, assignments, focusedZone],
+  );
+
+  /**
+   * The zone whose label, notes, pin, tags and filter a rendered zone shows
+   * and edits. In grid mode that is the zone itself. In tmux mode the one
+   * viewport (zone 0) shows the shown session's GRID zone, from the snapshot —
+   * so each session keeps its own cosmetics on screen, and an edit lands on
+   * the zone the session returns to. `null` when the shown session has no
+   * grid zone (created during tmux): it has no cosmetics to show, and the
+   * editors are hidden rather than writing into some other session's zone.
+   */
+  const shownGridZone =
+    workMode === "tmux" ? gridZoneOfTab(gridSnapshot, assignments[0] ?? null) : null;
+  const cosmeticZoneFor = useCallback(
+    (zoneIdx: number): number | null => {
+      if (workMode !== "tmux") return zoneIdx;
+      return zoneIdx === 0 ? shownGridZone : null;
+    },
+    [workMode, shownGridZone],
+  );
 
   const focusedTabId = assignments[focusedZone] ?? null;
 
@@ -1168,9 +1315,10 @@ export function useZoneLayout(
     setLayoutId,
     assignments,
     assignTabToZone,
+    placeRestoredTab,
     requestCompaction,
     focusedZone,
-    setFocusedZone,
+    setFocusedZone: setFocusedZoneInMode,
     focusedTabId,
     focusNextZone,
     focusPrevZone,
@@ -1183,6 +1331,8 @@ export function useZoneLayout(
     shownTabId,
     mru,
     showSpawnedTab,
+    gridView,
+    cosmeticZoneFor,
     revealRequest,
     requestReveal,
     consumeReveal,

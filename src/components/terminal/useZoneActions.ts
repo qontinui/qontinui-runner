@@ -3,7 +3,7 @@ import { useDisplayTitleResolver } from "./displayTitle";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { computeQuickLaunchLayoutId, type SessionState } from "./useZoneLayout";
-import type { LayoutRequestSource } from "./terminalWorkMode";
+import type { LayoutRequestSource, TerminalWorkMode } from "./terminalWorkMode";
 import type { UIAction } from "./useUIState";
 import type { TerminalTab } from "./useTerminalManager";
 import type { Metrics } from "./useEventHistory";
@@ -23,6 +23,7 @@ interface UseZoneActionsParams {
     assignTabToZone: (zoneIdx: number, tabId: string) => void;
     setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
     showSpawnedTab: (tabId: string) => void;
+    workMode: TerminalWorkMode;
     isMultiZone: boolean;
     toggleMaximize: (zoneIdx?: number) => void;
   };
@@ -106,14 +107,17 @@ export function useZoneActions({
   const handleOpenDocFile = useCallback(
     (filePath: string) => {
       const tabId = createPlanTab(filePath);
-      if (tabId) {
-        const emptyZone = zoneLayout.layout.zones.findIndex(
-          (_, idx) => !zoneLayout.assignments[idx],
-        );
-        if (emptyZone >= 0) {
-          zoneLayout.assignTabToZone(emptyZone, tabId);
-          zoneLayout.setFocusedZone(emptyZone);
-        }
+      if (!tabId) return;
+      if (zoneLayout.workMode === "tmux") {
+        // The one viewport has no empty zone to find: the opened doc is shown
+        // in place of the current session, which stays live off screen.
+        zoneLayout.showSpawnedTab(tabId);
+        return;
+      }
+      const emptyZone = zoneLayout.layout.zones.findIndex((_, idx) => !zoneLayout.assignments[idx]);
+      if (emptyZone >= 0) {
+        zoneLayout.assignTabToZone(emptyZone, tabId);
+        zoneLayout.setFocusedZone(emptyZone);
       }
     },
     [createPlanTab, zoneLayout],
