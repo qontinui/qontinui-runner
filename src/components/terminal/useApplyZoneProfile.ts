@@ -101,13 +101,14 @@ export function useApplyZoneProfile(
     lt.setPinnedZones(new Set(profile.pins));
     te.setAutoApprovePatterns(profile.autoApprovePatterns);
 
-    if (!profile.sessions || profile.sessions.length === 0) return;
-
-    // A later apply supersedes this one at every await below: its sessions,
-    // not this (older, slower) call's, are the ones to park.
+    // EVERY apply — a layout-only one included — supersedes any earlier apply
+    // still awaiting below: the earlier call must not park its sessions (or
+    // spawn its panes) into this profile's grid. Sessions an earlier apply
+    // parked but never typed are dropped for the same reason.
     const generation = ++generationRef.current;
-    // Drop sessions an earlier apply parked but never typed.
     pendingRef.current = null;
+
+    if (!profile.sessions || profile.sessions.length === 0) return;
 
     // Resolve every session's account BEFORE parking it: the resume typed
     // for it (and the pin on a pane spawned for it) must name the account its
@@ -140,7 +141,13 @@ export function useApplyZoneProfile(
           step.pin,
         );
         if (generation !== generationRef.current) return;
-        if (!tabId) continue;
+        if (!tabId) {
+          console.warn(
+            `[applyZoneProfile] no pane spawned for session ${step.session.claudeSessionId} ` +
+              `(zone ${step.session.zoneIndex}) — its resume is skipped`,
+          );
+          continue;
+        }
       }
       zl.assignTabToZone(step.session.zoneIndex, tabId);
       pendingRef.current = [

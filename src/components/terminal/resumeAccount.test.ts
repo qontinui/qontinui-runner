@@ -50,7 +50,10 @@ describe("zone-profile resume (null configDir, transcript only under the default
     for (const s of resolved) {
       expect(profileSessionAccount(s)).toBe(DEFAULT_DIR);
       const cmd = profileResumeCommand(s);
-      expect(cmd.startsWith(`CLAUDE_CONFIG_DIR="${DEFAULT_DIR}" `)).toBe(true);
+      // Platform-neutral: `CLAUDE_CONFIG_DIR="…" ` (POSIX) or
+      // `$env:CLAUDE_CONFIG_DIR="…"; ` (PowerShell on a Windows CI leg).
+      expect(cmd).toContain(`CLAUDE_CONFIG_DIR="${DEFAULT_DIR}"`);
+      expect(cmd.indexOf("CLAUDE_CONFIG_DIR")).toBeLessThan(cmd.indexOf("claude "));
       expect(cmd).toContain(`--resume ${s.claudeSessionId}\r`);
     }
     // The backend was asked with NO account, so it searches by the transcript.
@@ -85,7 +88,8 @@ describe("zone-profile resume (null configDir, transcript only under the default
       resumeConfigDir: DEFAULT_DIR,
     };
     expect(profileSessionAccount(s)).toBe(DEFAULT_DIR);
-    expect(profileResumeCommand(s).startsWith(`CLAUDE_CONFIG_DIR="${DEFAULT_DIR}" `)).toBe(true);
+    expect(profileResumeCommand(s)).toContain(`CLAUDE_CONFIG_DIR="${DEFAULT_DIR}"`);
+    expect(profileResumeCommand(s)).not.toContain(PICKER_DIR);
   });
 });
 

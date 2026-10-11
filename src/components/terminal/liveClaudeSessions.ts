@@ -56,7 +56,10 @@ export interface LiveClaudeSession {
   kind: string;
   startedAt: number;
   updatedAt: number;
-  /** Ready-to-run `cd '<dir>' && <wrapper> --resume <id>`. */
+  /**
+   * Ready-to-run `cd '<dir>' && CLAUDE_CONFIG_DIR="<account dir>" claude --resume <id>`
+   * (PowerShell `;` / `$env:` form on a Windows runner).
+   */
   resumeCommand: string;
 }
 

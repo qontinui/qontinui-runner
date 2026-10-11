@@ -1771,20 +1771,28 @@ fn resolve_resume_account_in(
 /// `terminal_session_record_open` with the resolved dir is what heals a
 /// `configDir: null` row).
 #[tauri::command]
-pub fn terminal_resolve_resume_account(
+pub async fn terminal_resolve_resume_account(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
     claude_session_id: String,
     config_dir: Option<String>,
     working_dir: Option<String>,
 ) -> Result<CommandResponse, String> {
-    let account = resolve_resume_account_in(
-        &store,
-        &claude_session_id,
-        config_dir.as_deref(),
-        working_dir.as_deref(),
-        &crate::session::past_sessions::transcript_search_dirs(),
-        crate::terminal::transcript::ambient_claude_config_dir().as_deref(),
-    );
+    // Off the main thread: the account search walks every discovered account
+    // home (the roster, the `C:\claude` sweep) and stats a path in each, and a
+    // zone-profile apply fans out one call per session.
+    let store = store.inner().clone();
+    let account = spawn_blocking_tracked(move || {
+        resolve_resume_account_in(
+            &store,
+            &claude_session_id,
+            config_dir.as_deref(),
+            working_dir.as_deref(),
+            &crate::session::past_sessions::transcript_search_dirs(),
+            crate::terminal::transcript::ambient_claude_config_dir().as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("terminal_resolve_resume_account: resolver task failed: {e}"))?;
     Ok(CommandResponse {
         success: true,
         message: None,

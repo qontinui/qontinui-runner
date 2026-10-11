@@ -52,7 +52,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::past_sessions::{account_from_config_dir, account_resume_command, PastSessionAccount};
+use super::past_sessions::{
+    account_from_config_dir, account_resume_command, cd_then_resume, PastSessionAccount,
+};
 
 /// Raw on-disk shape of `<config_dir>/sessions/<pid>.json`.
 ///
@@ -128,8 +130,10 @@ pub struct LiveClaudeSession {
     pub kind: String,
     pub started_at: i64,
     pub updated_at: i64,
-    /// Ready-to-run: `cd '<dir>' && <resume>`, where `<resume>` names the
-    /// account explicitly (`super::past_sessions::account_resume_command`).
+    /// Ready-to-run: `cd '<dir>' && <resume>` (`;` on Windows), where
+    /// `<resume>` names the account dir explicitly
+    /// (`super::past_sessions::account_resume_command`). Empty when the id is
+    /// not a shell-safe token.
     ///
     /// The `cd` is **not** cosmetic — Claude Code scopes sessions by project
     /// directory, so resuming from the wrong cwd does not find the session.
@@ -178,21 +182,19 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
         return None;
     }
     let account = account_from_config_dir(config_dir.to_str());
-    // Normalize separators so the emitted `cd` works verbatim in the POSIX-ish
-    // shells the operator pastes into (Git Bash, the runner's own PTY).
+    // Normalize separators so the emitted `cd` works verbatim in both shells
+    // the line targets (PowerShell on a Windows runner, POSIX elsewhere; Git
+    // Bash also accepts the Windows form's `;` join and forward slashes).
     let working_dir = raw.cwd.unwrap_or_default().replace('\\', "/");
-    // The account is named explicitly: a generic-wrapper (`claude`) account —
-    // the default `~/.claude` above all — gets a `CLAUDE_CONFIG_DIR="<dir>"`
-    // prefix, so the line resumes under THIS registry file's account even when
-    // pasted into a pane pinned to another (`account_resume_command`).
-    // An id that is not a shell-safe token renders NO line (empty), never a
-    // broken one. On Windows the env form is a PowerShell statement, so it is
-    // joined with `;` (a pipeline chain cannot carry an assignment).
+    // The account DIR is named explicitly (`account_resume_command`), so the
+    // line resumes under THIS registry file's account even when pasted into a
+    // pane pinned to another. An id that is not a shell-safe token renders NO
+    // line (empty), never a broken one. The `cd` join is the host shell's
+    // (`cd_then_resume`).
     let resume_command = match account_resume_command(config_dir.to_str(), &raw.session_id) {
         None => String::new(),
         Some(resume) if working_dir.is_empty() => resume,
-        Some(resume) if resume.starts_with("$env:") => format!("cd '{working_dir}'; {resume}"),
-        Some(resume) => format!("cd '{working_dir}' && {resume}"),
+        Some(resume) => cd_then_resume(&working_dir, &resume, cfg!(windows)),
     };
     Some(LiveClaudeSession {
         session_id: raw.session_id,
@@ -373,8 +375,19 @@ mod tests {
         assert_eq!(s.status, "idle");
         assert_eq!(
             s.resume_command,
-            "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            cd_then_resume(
+                "D:/qontinui-root",
+                &account_resume_command(
+                    Some("C:/claude/.claude-paktis"),
+                    "b770ae37-1ffa-4888-a5d1-89d058307adf"
+                )
+                .unwrap(),
+                cfg!(windows)
+            )
         );
+        assert!(s
+            .resume_command
+            .contains("CLAUDE_CONFIG_DIR=\"C:/claude/.claude-paktis\""));
     }
 
     #[test]
@@ -541,7 +554,14 @@ mod tests {
         let s = parse_registry_file(nameless, Path::new(".claude-gmail")).unwrap();
         assert_eq!(s.session_id, "s");
         assert_eq!(s.name, "");
-        assert_eq!(s.resume_command, "cd '/x' && clg --resume s");
+        assert_eq!(
+            s.resume_command,
+            cd_then_resume(
+                "/x",
+                &account_resume_command(Some(".claude-gmail"), "s").unwrap(),
+                cfg!(windows)
+            )
+        );
     }
 
     #[test]
@@ -578,10 +598,10 @@ mod tests {
         assert_eq!(pids.len(), 1);
     }
 
-    /// A live session under the DEFAULT account (`~/.claude`, generic
-    /// `claude` wrapper) used to render a bare `claude --resume <id>`, which a
-    /// pane pinned to another account resolves under THAT account ("No
-    /// conversation found"). The line must name the registry file's own dir.
+    /// A live session under the DEFAULT account (`~/.claude`) used to render
+    /// a bare `claude --resume <id>`, which a pane pinned to another account
+    /// resolves under THAT account ("No conversation found"). The line must
+    /// name the registry file's own dir, joined in the host shell's syntax.
     #[test]
     fn default_account_live_row_names_its_config_dir() {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n","cwd":"/w"}"#;
@@ -598,7 +618,10 @@ mod tests {
     fn omits_cd_when_cwd_is_absent() {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n"}"#;
         let s = parse_registry_file(json, Path::new(".claude-gmail")).unwrap();
-        assert_eq!(s.resume_command, "clg --resume abc");
+        assert_eq!(
+            s.resume_command,
+            account_resume_command(Some(".claude-gmail"), "abc").unwrap()
+        );
     }
 
     #[test]

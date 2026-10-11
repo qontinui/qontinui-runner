@@ -19,7 +19,7 @@ export interface PastSessionAccount {
  *
  * The headline field is `resumeName` — the real `/rename` name the operator
  * gave the session — and `resumeCommand` is a ready-to-paste
- * `clg --resume <id>`-style command.
+ * `CLAUDE_CONFIG_DIR="<dir>" claude --resume <id>` command.
  *
  * Keys are camelCase, matching the Rust command's serde output exactly.
  */
@@ -29,9 +29,10 @@ export interface PastSession {
   /** The real `/rename` name (the headline — show prominently). */
   resumeName: string;
   /**
-   * Ready-to-copy resume command naming its account explicitly, e.g.
-   * `"clg --resume <id>"`, or `CLAUDE_CONFIG_DIR="<dir>" claude --resume <id>`
-   * for a non-roster (e.g. the default `~/.claude`) account.
+   * Ready-to-copy resume command naming its account DIR explicitly:
+   * `CLAUDE_CONFIG_DIR="<dir>" claude --resume <id>` (PowerShell
+   * `$env:CLAUDE_CONFIG_DIR="<dir>"; …` on a Windows runner). Empty when the
+   * id is not a shell-safe token.
    */
   resumeCommand: string;
   /**

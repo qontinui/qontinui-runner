@@ -59,10 +59,11 @@ pub struct PastSession {
     /// → auto summary → first-message preview → registry title →
     /// `"Session <date>"`).
     pub resume_name: String,
-    /// Ready-to-run resume command naming its account explicitly — see
-    /// [`account_resume_command`]: `"<wrapper> --resume <id>"` for a roster
-    /// account, else `CLAUDE_CONFIG_DIR="<dir>" claude --resume <id>`, built
-    /// from [`Self::resume_config_dir`] rather than the raw `config_dir`.
+    /// Ready-to-run resume command naming its account dir explicitly — see
+    /// [`account_resume_command`]: `CLAUDE_CONFIG_DIR="<dir>" claude --resume
+    /// <id>` (PowerShell `$env:` form on Windows), built from
+    /// [`Self::resume_config_dir`] rather than the raw `config_dir`. Empty
+    /// when the id is not a shell-safe token.
     pub resume_command: String,
     /// The account a resume of this session MUST run under — the config dir
     /// its transcript is found under, else the record's own, else the ambient
@@ -320,22 +321,26 @@ pub(crate) fn resolve_resume_config_dir(
 
 /// A ready-to-paste `--resume` line that names its account EXPLICITLY.
 ///
-/// A roster account's wrapper (`clg`/`clh`/…) pins its own config dir, so it
-/// stays `"<wrapper> --resume <id>"`. Every other dir — the default `~/.claude`
-/// above all — used to render as a bare `claude --resume <id>`, which runs
-/// under whatever `CLAUDE_CONFIG_DIR` the shell it is pasted into carries; a
-/// runner pane carries the spawn picker's account, so a default-account
-/// session answered "No conversation found". Those now carry the dir in the
-/// HOST shell's syntax — the shell the runner's own panes run, which is what
-/// `buildResumeCmd` targets for the typed resume too: PowerShell's
+/// The line carries the config dir itself — never a bare `claude --resume
+/// <id>` (which runs under whatever `CLAUDE_CONFIG_DIR` the shell it is pasted
+/// into carries: a runner pane carries the spawn picker's account, so a
+/// default-account session answered "No conversation found"), and never a
+/// roster wrapper (`clg`/`clh`/…) either: [`account_from_config_dir`] maps a
+/// dir to a wrapper by its `.claude-<x>` SUFFIX alone, while the wrapper pins
+/// its own fixed dir, so a transcript found under some other `.claude-gmail`
+/// would be resumed under the wrong one.
+///
+/// Syntax is the HOST shell's — the shell the runner's own panes run, the
+/// same target `buildResumeCmd` uses for the typed resume: PowerShell's
 /// `$env:CLAUDE_CONFIG_DIR="<dir>"; …` on Windows, a POSIX `VAR="<dir>" …`
 /// prefix elsewhere ([`resume_line_for`]). Backslashes are written as forward
 /// slashes (both shells accept them).
 ///
 /// `None` when the id is not a shell-safe token — no line beats a broken one,
 /// the same rule `session_ledger` / `on_demand` follow. A dir that cannot be
-/// quoted safely, or no dir at all, yields the bare form: there is no account
-/// that can be named.
+/// quoted safely (including `!`, which bash history-expands inside double
+/// quotes on paste), or no dir at all, yields the bare form: there is no
+/// account that can be named.
 pub(crate) fn account_resume_command(config_dir: Option<&str>, session_id: &str) -> Option<String> {
     resume_line_for(config_dir, session_id, cfg!(windows))
 }
@@ -346,13 +351,10 @@ fn resume_line_for(config_dir: Option<&str>, session_id: &str, windows: bool) ->
     if !crate::agent_worktree::custody::is_shell_safe_token(session_id) {
         return None;
     }
-    let account = account_from_config_dir(config_dir);
-    if account.wrapper != "claude" {
-        return Some(format!("{} --resume {}", account.wrapper, session_id));
-    }
     let dir = config_dir
         .filter(|d| !d.trim().is_empty())
         .map(|d| d.trim().replace('\\', "/"))
+        .filter(|d| !d.contains('!'))
         .as_deref()
         .and_then(crate::agent_worktree::custody::shell_quote_path);
     Some(match dir {
@@ -362,6 +364,18 @@ fn resume_line_for(config_dir: Option<&str>, session_id: &str, windows: bool) ->
         Some(dir) => format!("CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {session_id}"),
         None => format!("claude --resume {session_id}"),
     })
+}
+
+/// Join a `cd` into the session's project dir with its resume line, in the
+/// host shell's syntax: `&&` (skip the resume when the `cd` fails) on POSIX,
+/// `;` on Windows, whose runner panes are Windows PowerShell 5.1 — which has
+/// no `&&` at all. `;` also runs in Git Bash.
+pub(crate) fn cd_then_resume(working_dir: &str, resume: &str, windows: bool) -> String {
+    if windows {
+        format!("cd '{working_dir}'; {resume}")
+    } else {
+        format!("cd '{working_dir}' && {resume}")
+    }
 }
 
 /// Format a unix-millis timestamp into a short human date for the `"Session
@@ -631,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_uses_account_wrapper() {
+    fn resume_command_names_the_account_dir() {
         let ps = build_enriched(
             "sess-1".to_string(),
             Some("C:/claude/.claude-hotmail".to_string()),
@@ -652,7 +666,17 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(ps.resume_command, "clh --resume sess-1");
+        assert_eq!(
+            ps.resume_command,
+            account_resume_command(Some("C:/claude/.claude-hotmail"), "sess-1").unwrap()
+        );
+        assert!(ps
+            .resume_command
+            .contains("CLAUDE_CONFIG_DIR=\"C:/claude/.claude-hotmail\""));
+        assert_eq!(
+            ps.account.wrapper, "clh",
+            "the account label/wrapper is still derived"
+        );
         assert_eq!(ps.account.label, "hotmail");
         // No transcript on disk → not restorable, title used as the name.
         assert!(!ps.transcript_exists);
@@ -761,12 +785,12 @@ mod tests {
         assert_eq!(distinct.len(), 2);
     }
 
-    /// The ready-to-paste resume line names its account: a roster wrapper
-    /// keeps its own pin; the DEFAULT dir (generic `claude` wrapper) — the
-    /// account a `configDir: null` record resolves to — carries an explicit
-    /// `CLAUDE_CONFIG_DIR` in the host shell's syntax, never the bare
-    /// `claude --resume <id>` that resumed under the pane's picker-chosen
-    /// account (2026-10-08).
+    /// The ready-to-paste resume line names its account DIR: the default
+    /// `~/.claude` — the account a `configDir: null` record resolves to — and
+    /// a roster-suffixed dir alike carry an explicit `CLAUDE_CONFIG_DIR` in the
+    /// host shell's syntax, never the bare `claude --resume <id>` that resumed
+    /// under the pane's picker-chosen account (2026-10-08), and never a
+    /// suffix-guessed wrapper that pins a different dir.
     #[test]
     fn resume_line_names_the_default_account_explicitly() {
         assert_eq!(
@@ -778,22 +802,24 @@ mod tests {
             Some("$env:CLAUDE_CONFIG_DIR=\"C:/Users/u/.claude\"; claude --resume s1"),
             "a Windows runner's panes are PowerShell; backslashes become forward slashes"
         );
+        assert_eq!(
+            resume_line_for(Some("/home/u/.claude-gmail"), "s1", false).as_deref(),
+            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude-gmail\" claude --resume s1"),
+            "a roster-suffixed dir is named, not mapped to a wrapper pinning another dir"
+        );
         for windows in [false, true] {
-            assert_eq!(
-                resume_line_for(Some("C:/claude/.claude-hotmail"), "s1", windows).as_deref(),
-                Some("clh --resume s1"),
-                "a roster wrapper pins its own account"
-            );
             // Nothing nameable → the bare form (no account to name).
             assert_eq!(
                 resume_line_for(None, "s1", windows).as_deref(),
                 Some("claude --resume s1")
             );
-            assert_eq!(
-                resume_line_for(Some("/x/$(rm)/.claude"), "s1", windows).as_deref(),
-                Some("claude --resume s1"),
-                "an unquotable dir is never spliced into a shell line"
-            );
+            for unquotable in ["/x/$(rm)/.claude", "/x/a!b/.claude"] {
+                assert_eq!(
+                    resume_line_for(Some(unquotable), "s1", windows).as_deref(),
+                    Some("claude --resume s1"),
+                    "an unquotable dir is never spliced into a shell line: {unquotable}"
+                );
+            }
             assert_eq!(
                 resume_line_for(Some("/home/u/.claude"), "s1; rm -rf ~", windows),
                 None,
@@ -805,6 +831,8 @@ mod tests {
             account_resume_command(Some("/home/u/.claude"), "s1"),
             resume_line_for(Some("/home/u/.claude"), "s1", cfg!(windows))
         );
+        assert_eq!(cd_then_resume("/w", "R", false), "cd '/w' && R");
+        assert_eq!(cd_then_resume("/w", "R", true), "cd '/w'; R");
     }
 
     /// End to end over the resolver: a `configDir: null` record whose
