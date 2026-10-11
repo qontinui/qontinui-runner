@@ -345,7 +345,7 @@ export interface UseSessionManagerParams {
    * this window, so a card click takes the operator to the running session
    * rather than to a read-only transcript of it.
    */
-  onFocusSessionTab: (sessionId: string, tabId: string) => void;
+  onFocusSessionTab: (sessionId: string, tabId: string, source: UnifiedSession["source"]) => void;
 }
 
 export interface UseSessionManagerReturn {
@@ -549,6 +549,31 @@ export function liveTabIdForSession(
   const tabId = session.zoneTabId;
   if (!tabId || isInjectedSession(session)) return null;
   return tabs.some((t) => t.id === tabId && t.isAlive) ? tabId : null;
+}
+
+/**
+ * Where a session-card click goes.
+ *
+ *   - `focus-tab`: the row has a live tab in this window — bring it into view
+ *     (in tmux mode, swap it on screen).
+ *   - `transcript`: a transcript row with no live tab — open its transcript.
+ *   - `none`: a tab-sourced row whose tab is gone. Its key is a TAB id, so
+ *     handing it to the transcript panel would show a "transcript" for an id
+ *     no transcript has — the panel would keep painting the PREVIOUS session's
+ *     messages under it. There is nothing to open.
+ */
+export type OpenSessionRoute =
+  | { kind: "focus-tab"; tabId: string }
+  | { kind: "transcript" }
+  | { kind: "none" };
+
+export function routeOpenSession(
+  session: Pick<UnifiedSession, "source" | "zoneTabId" | "_transcript">,
+  tabs: readonly Pick<TerminalTab, "id" | "isAlive">[],
+): OpenSessionRoute {
+  const tabId = liveTabIdForSession(session, tabs);
+  if (tabId) return { kind: "focus-tab", tabId };
+  return session.source === "transcript" ? { kind: "transcript" } : { kind: "none" };
 }
 
 export function useSessionManager(params: UseSessionManagerParams): UseSessionManagerReturn {
@@ -1218,12 +1243,12 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   const openSession = useCallback(
     (session: UnifiedSession) => {
-      const tabId = liveTabIdForSession(session, tabs);
-      if (tabId) {
-        onFocusSessionTab(session.sessionId, tabId);
-        return;
+      const route = routeOpenSession(session, tabs);
+      if (route.kind === "focus-tab") {
+        onFocusSessionTab(session.sessionId, route.tabId, session.source);
+      } else if (route.kind === "transcript") {
+        onSelectSession(session.sessionId);
       }
-      onSelectSession(session.sessionId);
     },
     [tabs, onSelectSession, onFocusSessionTab],
   );
