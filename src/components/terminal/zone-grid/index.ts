@@ -16,3 +16,7 @@ export {
   ZONE_FILTER_BAR_HEIGHT_PX,
 } from "./constants";
 export { formatUptime, countMatches, showSoloSessionInfo } from "./utils";
+export { ZoneCell, reviewPanelAvailable } from "./ZoneCell";
+export type { ZoneCellProps, ZoneCellSharedProps } from "./ZoneCell";
+export { TmuxViewport } from "./TmuxViewport";
+export type { TmuxViewportProps } from "./TmuxViewport";
