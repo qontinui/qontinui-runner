@@ -82,6 +82,9 @@ export function useApplyZoneProfile(
     };
   });
 
+  // Monotonic apply counter — see the supersede check inside the callback.
+  const generationRef = useRef(0);
+
   return useCallback(async (profile: ZoneProfile) => {
     const {
       deps: { createAndAssignTerminal, resolveTenantForSpawn },
@@ -100,17 +103,27 @@ export function useApplyZoneProfile(
 
     if (!profile.sessions || profile.sessions.length === 0) return;
 
+    // A later apply supersedes this one at every await below: its sessions,
+    // not this (older, slower) call's, are the ones to park.
+    const generation = ++generationRef.current;
+    // Drop sessions an earlier apply parked but never typed.
+    pendingRef.current = null;
+
     // Resolve every session's account BEFORE parking it: the resume typed
     // for it (and the pin on a pane spawned for it) must name the account its
     // transcript is under. A profile saved without an account (null/undefined
     // `claudeConfigDir`) otherwise resumed under the spawn picker's account
     // and answered "No conversation found".
     const sessions = await withResolvedResumeAccounts(profile.sessions);
-    pendingRef.current = sessions;
+    if (generation !== generationRef.current) return;
+
     // Existing tabs are reused first, in order; every remaining session gets a
-    // freshly spawned pane PINNED to its resolved account and placed in its
-    // own zone explicitly, so the pane the resume is typed into is the pinned
-    // one (an auto-filled spawn could land in another session's zone).
+    // freshly spawned pane PINNED to its resolved account, placed in its own
+    // zone explicitly. A session is parked only AFTER its own tab is placed,
+    // bound to that tab (`expectedTabId`): a freshly spawned pane can be
+    // auto-filled into ANOTHER session's zone before its explicit placement
+    // lands, and a session parked earlier would have its resume typed into it
+    // — then the pane's own session typed on top, into a live Claude.
     for (const step of planProfileTabs(
       sessions,
       liveTabs.map((t) => t.id),
@@ -126,9 +139,14 @@ export function useApplyZoneProfile(
           resolveTenantForSpawn(),
           step.pin,
         );
+        if (generation !== generationRef.current) return;
         if (!tabId) continue;
       }
       zl.assignTabToZone(step.session.zoneIndex, tabId);
+      pendingRef.current = [
+        ...(pendingRef.current ?? []),
+        { ...step.session, expectedTabId: tabId },
+      ];
     }
   }, []);
 }

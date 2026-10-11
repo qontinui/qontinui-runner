@@ -30,6 +30,13 @@ export interface ZoneSessionInfo {
    * on the spawn picker's account and found no conversation.
    */
   resumeConfigDir?: string;
+  /**
+   * DERIVED at apply time: the tab the profile placed for this session. The
+   * resume is typed only into THAT tab once it holds the session's zone —
+   * never into whatever pane an auto-fill dropped there first (which may
+   * already be running another resumed session).
+   */
+  expectedTabId?: string;
 }
 
 export interface ZoneProfile {

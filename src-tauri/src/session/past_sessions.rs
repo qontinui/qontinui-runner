@@ -325,25 +325,43 @@ pub(crate) fn resolve_resume_config_dir(
 /// above all — used to render as a bare `claude --resume <id>`, which runs
 /// under whatever `CLAUDE_CONFIG_DIR` the shell it is pasted into carries; a
 /// runner pane carries the spawn picker's account, so a default-account
-/// session answered "No conversation found". Those now carry
-/// `CLAUDE_CONFIG_DIR="<dir>"`. Backslashes are written as forward slashes
-/// (the line targets the POSIX-ish shells the registry already normalizes
-/// for). A dir that cannot be quoted safely, or no dir at all, yields the
-/// bare form — there is no account to name.
-pub(crate) fn account_resume_command(config_dir: Option<&str>, session_id: &str) -> String {
+/// session answered "No conversation found". Those now carry the dir in the
+/// HOST shell's syntax — the shell the runner's own panes run, which is what
+/// `buildResumeCmd` targets for the typed resume too: PowerShell's
+/// `$env:CLAUDE_CONFIG_DIR="<dir>"; …` on Windows, a POSIX `VAR="<dir>" …`
+/// prefix elsewhere ([`resume_line_for`]). Backslashes are written as forward
+/// slashes (both shells accept them).
+///
+/// `None` when the id is not a shell-safe token — no line beats a broken one,
+/// the same rule `session_ledger` / `on_demand` follow. A dir that cannot be
+/// quoted safely, or no dir at all, yields the bare form: there is no account
+/// that can be named.
+pub(crate) fn account_resume_command(config_dir: Option<&str>, session_id: &str) -> Option<String> {
+    resume_line_for(config_dir, session_id, cfg!(windows))
+}
+
+/// [`account_resume_command`] with the host shell explicit, so both syntaxes
+/// are unit-tested on every OS.
+fn resume_line_for(config_dir: Option<&str>, session_id: &str, windows: bool) -> Option<String> {
+    if !crate::agent_worktree::custody::is_shell_safe_token(session_id) {
+        return None;
+    }
     let account = account_from_config_dir(config_dir);
     if account.wrapper != "claude" {
-        return format!("{} --resume {}", account.wrapper, session_id);
+        return Some(format!("{} --resume {}", account.wrapper, session_id));
     }
-    match config_dir
+    let dir = config_dir
         .filter(|d| !d.trim().is_empty())
         .map(|d| d.trim().replace('\\', "/"))
         .as_deref()
-        .and_then(crate::agent_worktree::custody::shell_quote_path)
-    {
+        .and_then(crate::agent_worktree::custody::shell_quote_path);
+    Some(match dir {
+        Some(dir) if windows => {
+            format!("$env:CLAUDE_CONFIG_DIR=\"{dir}\"; claude --resume {session_id}")
+        }
         Some(dir) => format!("CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {session_id}"),
         None => format!("claude --resume {session_id}"),
-    }
+    })
 }
 
 /// Format a unix-millis timestamp into a short human date for the `"Session
@@ -388,26 +406,35 @@ fn build_enriched(
     // type error.
     finish: Option<(i64, Option<String>)>,
 ) -> PastSession {
-    let transcript_path = resolve_transcript_path(
+    // ONE search answers both "where is the transcript" (name, existence)
+    // and "which account resumes it", so the row can never show one copy's
+    // name while its resume line opens another's. A null-account record
+    // searches the ambient dir first (`resolve_resume_config_dir_in`).
+    let (resume_config_dir, transcript_exists) = resolve_resume_config_dir(
         config_dir.as_deref(),
         working_dir.as_deref(),
         &claude_session_id,
     );
-    let transcript_exists = transcript_path.is_some();
+    let transcript_path = match (
+        transcript_exists,
+        resume_config_dir.as_deref(),
+        working_dir.as_deref(),
+    ) {
+        (true, Some(dir), Some(wd)) => Some(transcript::session_transcript_path(
+            Path::new(dir),
+            wd,
+            &claude_session_id,
+        )),
+        _ => None,
+    };
     let restorable = confirmed && transcript_exists;
 
-    let account = account_from_config_dir(config_dir.as_deref());
-    // The resume line names the account the TRANSCRIPT is under, never "none"
-    // for a null-account record (see `account_resume_command`).
-    let (resume_config_dir, _) = resolve_resume_config_dir(
-        config_dir.as_deref(),
-        working_dir.as_deref(),
-        &claude_session_id,
-    );
-    let resume_command = account_resume_command(
-        resume_config_dir.as_deref().or(config_dir.as_deref()),
-        &claude_session_id,
-    );
+    // The account the session resumes under — where its transcript is, else
+    // the record's own — labels the row too, so label and line agree.
+    let account_dir = resume_config_dir.as_deref().or(config_dir.as_deref());
+    let account = account_from_config_dir(account_dir);
+    let resume_command =
+        account_resume_command(account_dir, &claude_session_id).unwrap_or_default();
 
     // resume name: on-disk resume/preview name → registry title → date default.
     let resume_name = transcript_path
@@ -737,29 +764,46 @@ mod tests {
     /// The ready-to-paste resume line names its account: a roster wrapper
     /// keeps its own pin; the DEFAULT dir (generic `claude` wrapper) — the
     /// account a `configDir: null` record resolves to — carries an explicit
-    /// `CLAUDE_CONFIG_DIR`, never the bare `claude --resume <id>` that resumed
-    /// under the pane's picker-chosen account (2026-10-08).
+    /// `CLAUDE_CONFIG_DIR` in the host shell's syntax, never the bare
+    /// `claude --resume <id>` that resumed under the pane's picker-chosen
+    /// account (2026-10-08).
     #[test]
     fn resume_line_names_the_default_account_explicitly() {
         assert_eq!(
+            resume_line_for(Some("/home/u/.claude"), "s1", false).as_deref(),
+            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume s1")
+        );
+        assert_eq!(
+            resume_line_for(Some("C:\\Users\\u\\.claude"), "s1", true).as_deref(),
+            Some("$env:CLAUDE_CONFIG_DIR=\"C:/Users/u/.claude\"; claude --resume s1"),
+            "a Windows runner's panes are PowerShell; backslashes become forward slashes"
+        );
+        for windows in [false, true] {
+            assert_eq!(
+                resume_line_for(Some("C:/claude/.claude-hotmail"), "s1", windows).as_deref(),
+                Some("clh --resume s1"),
+                "a roster wrapper pins its own account"
+            );
+            // Nothing nameable → the bare form (no account to name).
+            assert_eq!(
+                resume_line_for(None, "s1", windows).as_deref(),
+                Some("claude --resume s1")
+            );
+            assert_eq!(
+                resume_line_for(Some("/x/$(rm)/.claude"), "s1", windows).as_deref(),
+                Some("claude --resume s1"),
+                "an unquotable dir is never spliced into a shell line"
+            );
+            assert_eq!(
+                resume_line_for(Some("/home/u/.claude"), "s1; rm -rf ~", windows),
+                None,
+                "an unsafe session id yields no line at all"
+            );
+        }
+        // The host-shell entry point agrees with the explicit one.
+        assert_eq!(
             account_resume_command(Some("/home/u/.claude"), "s1"),
-            "CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume s1"
-        );
-        assert_eq!(
-            account_resume_command(Some("C:\\Users\\u\\.claude"), "s1"),
-            "CLAUDE_CONFIG_DIR=\"C:/Users/u/.claude\" claude --resume s1",
-            "backslashes render as forward slashes for the POSIX-ish paste target"
-        );
-        assert_eq!(
-            account_resume_command(Some("C:/claude/.claude-hotmail"), "s1"),
-            "clh --resume s1"
-        );
-        // Nothing nameable → the bare form (no account to name).
-        assert_eq!(account_resume_command(None, "s1"), "claude --resume s1");
-        assert_eq!(
-            account_resume_command(Some("/x/$(rm)/.claude"), "s1"),
-            "claude --resume s1",
-            "an unquotable dir is never spliced into a shell line"
+            resume_line_for(Some("/home/u/.claude"), "s1", cfg!(windows))
         );
     }
 
@@ -781,13 +825,13 @@ mod tests {
             Some(&picker),
         );
         assert!(found);
-        let line = account_resume_command(dir.as_deref(), "sess-null");
+        let line = resume_line_for(dir.as_deref(), "sess-null", false);
         assert_eq!(
             line,
-            format!(
+            Some(format!(
                 "CLAUDE_CONFIG_DIR=\"{}\" claude --resume sess-null",
                 default.to_string_lossy().replace('\\', "/")
-            )
+            ))
         );
     }
 

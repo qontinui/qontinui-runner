@@ -81,7 +81,11 @@ import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
-import { profileResumeCommand, profileSessionAccount } from "../resumeAccount";
+import {
+  partitionParkedProfileSessions,
+  profileResumeCommand,
+  profileSessionAccount,
+} from "../resumeAccount";
 import {
   buildSessionOpenArgs,
   describeRecordOpenOutcome,
@@ -337,7 +341,6 @@ const PageSessionScope = memo(function PageSessionScope({
   const pendingProfileSessionsRef = useRef<ZoneSessionInfo[] | null>(null);
 
   useEffect(() => {
-    const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
     const sessions = pendingProfileSessionsRef.current;
     if (!sessions || sessions.length === 0) return;
 
@@ -352,16 +355,10 @@ const PageSessionScope = memo(function PageSessionScope({
     // rest in the ref for the next assignments tick. The partition (and the
     // ref update) stays SYNCHRONOUS so a re-fire of this effect while the
     // async liveness gate below is in flight can never double-type a resume.
-    const remaining: ZoneSessionInfo[] = [];
-    const toResume: Array<{ s: ZoneSessionInfo; tabId: string }> = [];
-    for (const s of sessions) {
-      const tabId = zoneLayout.assignments[s.zoneIndex];
-      if (tabId && SESSION_ID_RE.test(s.claudeSessionId)) {
-        toResume.push({ s, tabId });
-      } else {
-        remaining.push(s);
-      }
-    }
+    const { toResume, remaining } = partitionParkedProfileSessions(
+      sessions,
+      zoneLayout.assignments,
+    );
     pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
     if (toResume.length === 0) return;
 

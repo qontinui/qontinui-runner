@@ -3216,6 +3216,40 @@ mod tests {
         );
     }
 
+    /// A caller-supplied account outranks the record's: a record naming an
+    /// account that holds no transcript must not shadow the dir the caller
+    /// (a transcript row) knows the conversation is under.
+    #[test]
+    fn resolve_resume_account_caller_dir_outranks_the_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorded = tmp.path().join(".claude-rec");
+        let caller = tmp.path().join(".claude-caller");
+        let mut rec = restore_candidate_record("sess-caller");
+        rec.config_dir = Some(recorded.to_string_lossy().into_owned());
+        let wd = rec.working_dir.clone().unwrap();
+        let tpath =
+            crate::terminal::transcript::session_transcript_path(&caller, &wd, "sess-caller");
+        std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+        std::fs::write(&tpath, "{}\n").unwrap();
+        let store = SessionLifecycleStore::open(tmp.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        store.record_open(rec);
+
+        let got = resolve_resume_account_in(
+            &store,
+            "sess-caller",
+            Some(caller.to_str().unwrap()),
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(
+            got.resume_config_dir.as_deref(),
+            Some(caller.to_string_lossy().as_ref())
+        );
+        assert!(got.transcript_exists);
+    }
+
     /// The restore pane's PTY account: a caller-supplied dir replaces any pin
     /// already present and becomes THE pin `TerminalSession::spawn` honors
     /// over the spawn-time picker; absent/blank leaves the env untouched.

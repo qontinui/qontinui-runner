@@ -12,6 +12,7 @@
 import { describe, it, expect, vi } from "vitest";
 
 import {
+  partitionParkedProfileSessions,
   planProfileTabs,
   profileResumeCommand,
   profileSessionAccount,
@@ -125,5 +126,34 @@ describe("resolveResumeAccount (transcript / Past Sessions resume)", () => {
         backendResolving('/bad";rm -rf ~'),
       ),
     ).resolves.toBe("/acct/x");
+  });
+});
+
+describe("partitionParkedProfileSessions (no resume into another session's pane)", () => {
+  it("never types a session's resume into a pane placed for a different session", () => {
+    // Session A is bound to pane PA (zone 3); PA was auto-filled into zone 0
+    // (B's zone) before its explicit placement. B is bound to PB. Neither may
+    // be resumed into PA at zone 0.
+    const a: ZoneSessionInfo = { zoneIndex: 3, claudeSessionId: "A", expectedTabId: "PA" };
+    const b: ZoneSessionInfo = { zoneIndex: 0, claudeSessionId: "B", expectedTabId: "PB" };
+    const early = partitionParkedProfileSessions([a, b], { 0: "PA" });
+    expect(early.toResume).toEqual([]);
+    expect(early.remaining).toEqual([a, b]);
+
+    // Once each pane holds its own session's zone, each resumes exactly once.
+    const settled = partitionParkedProfileSessions([a, b], { 0: "PB", 3: "PA" });
+    expect(settled.toResume).toEqual([
+      { s: a, tabId: "PA" },
+      { s: b, tabId: "PB" },
+    ]);
+    expect(settled.remaining).toEqual([]);
+  });
+
+  it("keeps unbound sessions on the zone-only rule, and never types an unsafe id", () => {
+    const unbound: ZoneSessionInfo = { zoneIndex: 1, claudeSessionId: "U" };
+    const unsafe: ZoneSessionInfo = { zoneIndex: 2, claudeSessionId: "x; rm -rf ~" };
+    const out = partitionParkedProfileSessions([unbound, unsafe], { 1: "T1", 2: "T2" });
+    expect(out.toResume).toEqual([{ s: unbound, tabId: "T1" }]);
+    expect(out.remaining).toEqual([unsafe]);
   });
 });

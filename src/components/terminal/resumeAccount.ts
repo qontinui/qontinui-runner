@@ -63,10 +63,20 @@ export async function resolveResumeAccount(
       err,
     );
   }
-  return resolveRestoreConfigDir({
+  const account = resolveRestoreConfigDir({
     resumeConfigDir: resolved,
     configDir: q.configDir || undefined,
   });
+  if (resolved !== undefined && account !== resolved) {
+    // The backend named the transcript's account but it failed the shell
+    // sanitizer, so the resume falls back to an account NOT known to hold the
+    // transcript — leave a trail for the "No conversation found" it may hit.
+    console.warn(
+      `[resumeAccount] resolved account for ${q.claudeSessionId} is not shell-safe; ` +
+        `resuming under ${account ?? "<no account>"} instead`,
+    );
+  }
+  return account;
 }
 
 /**
@@ -140,4 +150,36 @@ export function planProfileTabs(
       ? { session, reuseTabId: liveTabIds[i] }
       : { session, pin: profileSessionAccount(session) },
   );
+}
+
+const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * Split the parked zone-profile sessions into those to resume NOW and those
+ * to keep parked. A session is resumed only when its zone holds a tab, its id
+ * is a plain token (it is typed into a shell), and — when the profile bound
+ * it to a tab (`expectedTabId`) — that zone holds THAT tab. Without the last
+ * rule an auto-filled pane spawned for another session, landing in this zone
+ * before its own explicit placement, got this session's resume typed into it,
+ * and then its own session typed on top into the live Claude. Pure.
+ */
+export function partitionParkedProfileSessions(
+  sessions: ZoneSessionInfo[],
+  assignments: Record<number, string>,
+): { toResume: Array<{ s: ZoneSessionInfo; tabId: string }>; remaining: ZoneSessionInfo[] } {
+  const toResume: Array<{ s: ZoneSessionInfo; tabId: string }> = [];
+  const remaining: ZoneSessionInfo[] = [];
+  for (const s of sessions) {
+    const tabId = assignments[s.zoneIndex];
+    if (
+      tabId &&
+      SESSION_ID_RE.test(s.claudeSessionId) &&
+      (s.expectedTabId === undefined || s.expectedTabId === tabId)
+    ) {
+      toResume.push({ s, tabId });
+    } else {
+      remaining.push(s);
+    }
+  }
+  return { toResume, remaining };
 }

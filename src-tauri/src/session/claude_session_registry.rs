@@ -185,11 +185,14 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     // the default `~/.claude` above all — gets a `CLAUDE_CONFIG_DIR="<dir>"`
     // prefix, so the line resumes under THIS registry file's account even when
     // pasted into a pane pinned to another (`account_resume_command`).
-    let resume = account_resume_command(config_dir.to_str(), &raw.session_id);
-    let resume_command = if working_dir.is_empty() {
-        resume
-    } else {
-        format!("cd '{working_dir}' && {resume}")
+    // An id that is not a shell-safe token renders NO line (empty), never a
+    // broken one. On Windows the env form is a PowerShell statement, so it is
+    // joined with `;` (a pipeline chain cannot carry an assignment).
+    let resume_command = match account_resume_command(config_dir.to_str(), &raw.session_id) {
+        None => String::new(),
+        Some(resume) if working_dir.is_empty() => resume,
+        Some(resume) if resume.starts_with("$env:") => format!("cd '{working_dir}'; {resume}"),
+        Some(resume) => format!("cd '{working_dir}' && {resume}"),
     };
     Some(LiveClaudeSession {
         session_id: raw.session_id,
@@ -583,10 +586,12 @@ mod tests {
     fn default_account_live_row_names_its_config_dir() {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n","cwd":"/w"}"#;
         let s = parse_registry_file(json, Path::new("/home/u/.claude")).unwrap();
-        assert_eq!(
-            s.resume_command,
+        let expected = if cfg!(windows) {
+            "cd '/w'; $env:CLAUDE_CONFIG_DIR=\"/home/u/.claude\"; claude --resume abc"
+        } else {
             "cd '/w' && CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume abc"
-        );
+        };
+        assert_eq!(s.resume_command, expected);
     }
 
     #[test]

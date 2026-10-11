@@ -161,6 +161,12 @@ export function useShellIntegration({
   const handleResumeSession = useCallback(
     async (session: TranscriptSession) => {
       // Derive a short label from the session ID for the tab title
+      // The id is typed into a shell below — refuse anything but a plain token,
+      // the same rule the zone-profile and boot-restore resumes apply.
+      if (!/^[a-zA-Z0-9_-]+$/.test(session.session_id)) {
+        console.warn(`[ShellIntegration] refusing to resume unsafe session id`, session.session_id);
+        return;
+      }
       const tabTitle = `claude ${session.session_id.slice(0, 8)}`;
       // The account this resume runs under, resolved by the backend from where
       // the transcript actually lives (`resumeAccount.ts`). A Past Sessions row
