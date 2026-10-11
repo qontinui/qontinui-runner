@@ -238,6 +238,9 @@ pub(crate) async fn poll_pending_redeem(
     }
 }
 
+/// Longest refusal code kept from a web response.
+const REFUSAL_CODE_MAX_CHARS: usize = 64;
+
 /// web's typed refusal code, wherever this backend put it:
 ///
 /// 1. top-level `error` — what qontinui-web's app error handler emits for an
@@ -246,12 +249,15 @@ pub(crate) async fn poll_pending_redeem(
 /// 2. `detail.code` — FastAPI's default shape, when no handler rewrites it;
 /// 3. nothing — e.g. an older handler that stringified the whole detail dict
 ///    under `message`. The caller then keys on the status alone.
+///
+/// Capped at [`REFUSAL_CODE_MAX_CHARS`]: it is server text that lands in log
+/// lines and failure keys.
 pub(crate) fn refusal_code(body: &serde_json::Value) -> Option<String> {
     let non_empty = |v: Option<&serde_json::Value>| {
         v.and_then(|c| c.as_str())
             .map(str::trim)
             .filter(|c| !c.is_empty())
-            .map(str::to_string)
+            .map(|c| c.chars().take(REFUSAL_CODE_MAX_CHARS).collect::<String>())
     };
     non_empty(body.get("error"))
         .or_else(|| non_empty(body.get("detail").and_then(|d| d.get("code"))))
@@ -536,6 +542,7 @@ impl RedeemEffects for LiveEffects {
         crate::commands::web_integration::complete_pairing_after_redeem(
             &resp,
             tenant_id,
+            web_base,
             "pending_redeem",
             || {
                 if crate::auth::AuthManager::new().is_interactive_signed_out() {
@@ -553,8 +560,12 @@ impl RedeemEffects for LiveEffects {
     }
 
     async fn clear_anchor(&self) {
-        if let Err(e) = crate::auth::AuthManager::new().reset_redeem_anchor() {
-            warn!("pending_redeem: could not reset the spent redeem anchor: {e:#}");
+        // Takes the store lock, which may wait: off the runtime.
+        match spawn_blocking_tracked(|| crate::auth::AuthManager::new().reset_redeem_anchor()).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("pending_redeem: could not reset the spent redeem anchor: {e:#}"),
+            Err(e) => warn!("pending_redeem: the anchor-reset task failed: {e}"),
         }
     }
 
@@ -1122,6 +1133,12 @@ mod tests {
                 "{body:?}"
             );
         }
+        // A runaway code is capped before it reaches a log line or a key.
+        let long = "x".repeat(500);
+        assert_eq!(
+            refusal_code(&serde_json::json!({ "error": long })).map(|c| c.chars().count()),
+            Some(REFUSAL_CODE_MAX_CHARS)
+        );
         // Top-level `error` wins over `detail.code` when both are present.
         assert_eq!(
             refusal_code(&serde_json::json!({"error": "a", "detail": {"code": "b"}})).as_deref(),
