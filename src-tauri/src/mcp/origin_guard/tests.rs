@@ -1777,3 +1777,66 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
         StatusCode::OK
     );
 }
+
+/// Plan `2026-09-20-terminal-session-state-comes-from-events-not-screen-
+/// scraping` Phase 3: the hook ingest route inherits the `/terminals/*` door,
+/// so a browser origin cannot forge an agent state (or read them all), while
+/// the CLI's http hook — which sends no `Origin` — is admitted.
+#[tokio::test]
+async fn agent_event_route_refuses_a_browser_origin() {
+    assert!(is_credential_door("POST", "/terminals/agent-event"));
+    assert!(is_credential_door("GET", "/terminals/agent-state"));
+
+    let h = harness("off");
+    let calls = Calls::default();
+    let c = calls.clone();
+    let router = apply(
+        Router::new().route(
+            "/terminals/agent-event",
+            post(move || {
+                let c = c.clone();
+                async move {
+                    c.hit("agent_event");
+                    axum::Json(json!({}))
+                }
+            }),
+        ),
+        h.guard.clone(),
+    );
+    let send_to = |headers: Vec<(&'static str, String)>| {
+        let router = router.clone();
+        async move {
+            let mut b = HttpRequest::builder()
+                .method("POST")
+                .uri("/terminals/agent-event");
+            for (k, v) in &headers {
+                b = b.header(*k, v.as_str());
+            }
+            let r = b
+                .body(Body::from(r#"{"hook_event_name":"PermissionRequest"}"#))
+                .unwrap();
+            router.oneshot(r).await.unwrap().status()
+        }
+    };
+
+    for origin in [EVIL, WEB] {
+        let status = send_to(vec![("host", host(&h)), ("origin", origin.to_string())]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
+    }
+    assert_eq!(
+        calls.get("agent_event"),
+        0,
+        "a refused POST never reached the ingest"
+    );
+
+    let status = send_to(vec![
+        ("host", host(&h)),
+        ("content-type", "application/json".to_string()),
+    ])
+    .await;
+    assert!(
+        status.is_success(),
+        "the CLI's origin-less POST is admitted: {status}"
+    );
+    assert_eq!(calls.get("agent_event"), 1);
+}

@@ -1,4 +1,5 @@
 import type { SessionState } from "./useZoneLayout";
+import { isNeedsInputState } from "./agentTruth";
 
 /**
  * Tool-approval-shaped patterns — Claude asking the operator to authorize a
@@ -138,14 +139,14 @@ export function detectSessionState(
   // answered — transition back to `working` instead of staying stuck. Without
   // this the working/error/completed branches below all return `null` for a
   // `needs-input` tab, so the latch never decays on its own.
-  if (currentState === "needs-input" && RESUMED_PATTERNS.some((p) => p.test(stripped))) {
+  if (isNeedsInputState(currentState) && RESUMED_PATTERNS.some((p) => p.test(stripped))) {
     return "working";
   }
 
   // Error patterns
   if (ERROR_PATTERNS.some((p) => p.test(stripped))) {
     // Don't override needs-input with error (the error might be in context)
-    if (currentState === "needs-input") return null;
+    if (isNeedsInputState(currentState)) return null;
     return "error";
   }
 
@@ -157,9 +158,27 @@ export function detectSessionState(
   // Working patterns or substantial output
   if (WORKING_PATTERNS.some((p) => p.test(stripped)) || stripped.length > 20) {
     // Don't override needs-input with working
-    if (currentState === "needs-input") return null;
+    if (isNeedsInputState(currentState)) return null;
     return "working";
   }
 
+  return null;
+}
+
+/**
+ * Which needs-input shape `text` matched, for the observation offered to the
+ * runner's reducer (`offer_agent_observation`): an approval-shaped prompt or
+ * a question-shaped one. `null` when neither matched (or, for a bypass
+ * session, only an approval shape did — which can only be a phantom).
+ */
+export function needsInputShape(
+  text: string,
+  opts?: { bypassPermissions?: boolean },
+): "approval_shaped" | "question_shaped" | null {
+  // eslint-disable-next-line no-control-regex
+  const stripped = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+  const hit = (ps: RegExp[]) => ps.some((p) => p.test(text) || p.test(stripped));
+  if (!opts?.bypassPermissions && hit(APPROVAL_SHAPED_PATTERNS)) return "approval_shaped";
+  if (hit(QUESTION_SHAPED_PATTERNS)) return "question_shaped";
   return null;
 }

@@ -64,6 +64,7 @@ import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import type { ApprovalReport } from "../approveAll";
+import { describeSkippedInferred, isNeedsInputState, partitionPermissionAsks } from "../agentTruth";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -626,6 +627,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     closeTerminal,
     terminalRefs,
     sessionStates,
+    agentVerdicts,
     pageId,
     stateTimeAccum: stateTimeAccumRef,
     zoneLayout,
@@ -690,7 +692,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           detail: moved.changed ? undefined : "no other session to focus",
         });
       }
-      if (target === "needs-input") {
+      if (typeof target === "string" && isNeedsInputState(target)) {
         // Already honest: `focusNextNeedsInput` returns whether it found one.
         const found = zoneLayout.focusNextNeedsInput(sessionStates);
         return found ? ok(effect("focused", "zone", 1)) : fail("none-needs-input");
@@ -853,12 +855,20 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     // a keystroke already delivered to a subprocess.
     destructive: true,
     description:
-      "Sends 'y' followed by Enter to every session currently waiting on input. " +
-      "Same behavior as Ctrl+Shift+Enter.",
+      "Sends 'y' followed by Enter to every session a hook reports as asking for " +
+      "permission. Panes whose needs-input is only inferred from the screen are " +
+      "skipped and listed. Same behavior as Ctrl+Shift+Enter.",
     paramSchema: SCHEMA.empty,
     patterns: [/^approve(?:\s+all)?$/i, /^yes\s+all$/i],
     handler: async (): Promise<CommandResult<EffectReport>> => {
-      const waiting = tabs.filter((t) => sessionStates[t.id] === "needs-input");
+      // Only panes an EVENT reports as asking for permission are typed into
+      // (`isAuthoritativePermissionAsk`, via `partitionPermissionAsks`). A
+      // screen-inferred needs-input is listed as skipped, never approved.
+      const { actionable: waiting, skippedInferred } = partitionPermissionAsks(
+        tabs,
+        sessionStates,
+        agentVerdicts,
+      );
       // The count comes from DELIVERY, not from intent. `ctx.approveAll`
       // awaits each pane's `TerminalWriteResult` and counts the envelopes
       // that said the bytes reached a process; see `../approveAll.ts` for why
@@ -878,7 +888,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       return ok(
         effect("approved", "session", report.delivered, {
           requested: report.targeted,
-          detail: report.delivered === report.targeted ? undefined : describeUndelivered(report),
+          detail:
+            [
+              report.delivered === report.targeted ? "" : describeUndelivered(report),
+              describeSkippedInferred(skippedInferred),
+            ]
+              .filter(Boolean)
+              .join("; ") || undefined,
         }),
       );
     },
@@ -1066,7 +1082,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");
       const tabId = zoneLayout.assignments[zone.index];
-      const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
+      const state = tabId ? (sessionStates[tabId] ?? "unknown") : "unknown";
       if (state !== "completed" && state !== "error") {
         return fail("not-restartable", `session state is ${state}`);
       }
@@ -1570,22 +1586,22 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     label: "Select zones by state",
     description:
       "Select all zones whose session is in the given state " +
-      "(idle, working, needs-input, completed, error). Same as clicking " +
+      "(unknown, idle, working, needs-input, completed, error). Same as clicking " +
       "a state-count pill in ZoneStatusBar.",
     paramSchema: {
-      state: 'string — one of "idle", "working", "needs-input", "completed", "error"',
+      state: 'string — one of "unknown", "idle", "working", "needs-input", "completed", "error"',
     },
-    patterns: [/^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i],
+    patterns: [/^select(?:-by-state)?\s+(?<state>unknown|idle|working|needs[-_ ]?input|completed|error)$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
       const raw = textArg(args, "state").toLowerCase();
       const state = /^needs[-_ ]?input$/.test(raw) ? "needs-input" : raw;
-      const valid = ["idle", "working", "needs-input", "completed", "error"];
+      const valid = ["unknown", "idle", "working", "needs-input", "completed", "error"];
       if (!valid.includes(state)) {
         return fail("invalid-args", `state must be one of: ${valid.join(", ")}`);
       }
       const zones = new Set<number>();
       for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
-        if ((sessionStates[tabId] ?? "idle") === state) {
+        if ((sessionStates[tabId] ?? "unknown") === state) {
           zones.add(Number(zoneStr));
         }
       }

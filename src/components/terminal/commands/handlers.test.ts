@@ -316,6 +316,31 @@ describe("handlers — the no-ops that used to render as effects", () => {
   });
 
   /**
+   * Plan `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+   * Phase 5: `/approve-all` types only into panes the runner reports as a
+   * HOOK permission ask (`isAuthoritativePermissionAsk`). The same waiting
+   * pane with no verdict — needs-input inferred from the screen — is skipped,
+   * never typed into, and the result names it with the reason.
+   */
+  it("`/approve-all` skips an inferred needs-input pane and says why", async () => {
+    h.resetArms();
+    h.reset();
+    delete h.agentVerdicts["tab-a"];
+    try {
+      const o = await run("/approve-all", (id) => h.byId(id));
+      expect(o.verdict).toBe("ok");
+      expect(h.callNames()).toEqual(["ctx.approveAll"]);
+      expect(h.calls[0].args[0]).toEqual([]);
+      const report = reportOf(o.value);
+      expect(report.affected).toBe(0);
+      expect(report.detail).toContain("skipped 1 inferred");
+      expect(report.detail).toContain("not reported by a hook");
+    } finally {
+      h.resetArms();
+    }
+  });
+
+  /**
    * `/tag-clear` calls `setActiveTagFilters(new Set())` unconditionally. The
    * setter is still void — a React setter cannot report — so the verdict
    * comes from the OBSERVED pre-state: how many filters were active before.

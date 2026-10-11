@@ -1,6 +1,23 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
 import type { SessionState } from "./useZoneLayout";
-import { detectSessionState } from "./sessionStateDetector";
+import { detectSessionState, needsInputShape } from "./sessionStateDetector";
+import {
+  TERMINAL_AGENT_STATE_EVENT,
+  fetchTerminalAgentStates,
+  isEventSourced,
+  isNeedsInputState,
+  admitAgentState,
+  isTerminalAgentStateEvent,
+  offerAgentObservation,
+  sessionStateToObservation,
+  verdictOverridesLocalState,
+  verdictToSessionState,
+  type AgentStateOrigin,
+  type AgentTruthEntry,
+  type HeldAgentSeq,
+  type TerminalAgentStateEvent,
+} from "./agentTruth";
 import { applyActivityDigest } from "./activityDigestTracking";
 import { nextOutputLines, OUTPUT_LINES_WINDOW } from "./outputLineTracking";
 import { getTerminalHotStore } from "./terminalHotStore";
@@ -56,8 +73,33 @@ export interface UseSessionStateTrackingParams {
  * `useHotField` / `useTabHotSlice`.
  */
 export interface UseSessionStateTrackingReturn {
+  /**
+   * What each tab's chip renders. For a tab whose runner verdict comes from an
+   * event channel (hooks / OSC 9999) this is the verdict's projection; for any
+   * other tab it is the webview's own fallback inference, which is also
+   * offered to the runner as a `regex` observation. `unknown` means nothing
+   * has been observed — never read it as `idle`.
+   */
   sessionStates: Record<string, SessionState>;
   setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
+  /**
+   * The runner's merged verdict + hook delivery per terminal id, from the
+   * `terminal-agent-state` event (and `get_terminal_agent_states` at mount).
+   * Empty on a runner build that predates the reducer. Keystroke writers read
+   * it ONLY through `isAuthoritativePermissionAsk`.
+   */
+  agentVerdicts: Record<string, AgentTruthEntry>;
+  /**
+   * The one door for any NON-event inference about a tab's state (the screen
+   * detector, shell integration). Ignored for a tab whose verdict is
+   * event-sourced; otherwise applied locally and offered to the runner's
+   * reducer. `compute` receives the current state and returns the new one, or
+   * `null` for no change.
+   */
+  offerInferredState: (
+    tabId: string,
+    compute: (current: SessionState) => SessionState | null,
+  ) => void;
   staleTabs: Set<string>;
   stateTimeAccum: React.MutableRefObject<Record<SessionState, number>>;
   stateEntryTimeRef: React.MutableRefObject<Record<string, number>>;
@@ -88,8 +130,35 @@ export function useSessionStateTracking(
 
   // ── State ─────────────────────────────────────────────────────────────────
 
-  const [sessionStates, setSessionStates] = useState<Record<string, SessionState>>({});
+  const [sessionStates, setSessionStatesRaw] = useState<Record<string, SessionState>>({});
   const [staleTabs, setStaleTabs] = useState<Set<string>>(new Set());
+  const [agentVerdicts, setAgentVerdicts] = useState<Record<string, AgentTruthEntry>>({});
+
+  /**
+   * Synchronous mirror of `sessionStates`. Every write goes through
+   * {@link setSessionStates} below, which computes the next map from this ref
+   * and publishes it, so the detector always sees the state it last produced
+   * (and the offer to the runner is made outside any React updater).
+   */
+  const sessionStatesRef = useRef<Record<string, SessionState>>({});
+  const agentVerdictsRef = useRef<Record<string, AgentTruthEntry>>({});
+  /** Highest runner publish `seq` (and its epoch) applied per terminal (see `admitAgentState`). */
+  const agentSeqRef = useRef<Record<string, HeldAgentSeq>>({});
+  /**
+   * Terminals whose PROCESS has exited. Their exit-derived `completed` /
+   * `error` is final: only a new session start may replace it (L6).
+   */
+  const exitedRef = useRef<Record<string, true>>({});
+
+  const setSessionStates = useCallback<
+    React.Dispatch<React.SetStateAction<Record<string, SessionState>>>
+  >((action) => {
+    const prev = sessionStatesRef.current;
+    const next = typeof action === "function" ? action(prev) : action;
+    if (next === prev) return;
+    sessionStatesRef.current = next;
+    setSessionStatesRaw(next);
+  }, []);
 
   // ── Refs ───────────────────────────────────────────────────────────────────
 
@@ -98,6 +167,7 @@ export function useSessionStateTracking(
   const prevSessionStatesRef = useRef<Record<string, SessionState>>({});
 
   const stateTimeAccum = useRef<Record<SessionState, number>>({
+    unknown: 0,
     idle: 0,
     working: 0,
     "needs-input": 0,
@@ -122,22 +192,34 @@ export function useSessionStateTracking(
       const now = Date.now();
       const currentTabs = tabsRef.current;
 
+      const quietTabs: string[] = [];
       setSessionStates((prev) => {
         const next = { ...prev };
         let changed = false;
         for (const tab of currentTabs) {
           const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
-          const current = next[tab.id] ?? "idle";
+          const current = next[tab.id] ?? "unknown";
+          if (!tab.isAlive) exitedRef.current[tab.id] = true;
           if (!tab.isAlive && current !== "completed" && current !== "error") {
             next[tab.id] = tab.exitCode === 0 || tab.exitCode === null ? "completed" : "error";
             changed = true;
-          } else if (current === "working" && now - lastOutput > 10000) {
+          } else if (
+            current === "working" &&
+            now - lastOutput > 10000 &&
+            // A quiet screen is not evidence against an event-sourced verdict
+            // (a 12-minute `rm -rf` is legitimately quiet).
+            !isEventSourced(agentVerdictsRef.current[tab.id]?.verdict)
+          ) {
             next[tab.id] = "idle";
+            quietTabs.push(tab.id);
             changed = true;
           }
         }
         return changed ? next : prev;
       });
+      for (const tabId of quietTabs) {
+        offerAgentObservation({ terminalId: tabId, source: "screen_stability", busy: false });
+      }
 
       // Detect stale "working" sessions (no output for 60s)
       // Read sessionStates via the updater to get the latest value
@@ -158,7 +240,7 @@ export function useSessionStateTracking(
       });
     }, 2000);
     return () => clearInterval(interval);
-  }, []); // Stable interval — reads tabs via ref
+  }, [setSessionStates]); // Stable interval — reads tabs via ref
 
   // ── Seed pre-aged lastOutput for synthetic (test-fixture) tabs ────────────
   //
@@ -181,12 +263,18 @@ export function useSessionStateTracking(
   useEffect(() => {
     const tabIdSet = new Set(tabs.map((t) => t.id));
 
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- cleanup state for removed tabs
     setSessionStates((prev) => {
       const deadKeys = Object.keys(prev).filter((id) => !tabIdSet.has(id));
-      if (deadKeys.length === 0) return prev;
+      // A verdict can arrive before its tab exists on this page (initial
+      // load races tab hydration); render it once the tab appears.
+      const seeds = tabs.filter((t) => {
+        const entry = agentVerdictsRef.current[t.id];
+        return prev[t.id] === undefined && !!entry && entry.verdict.state.name !== "unknown";
+      });
+      if (deadKeys.length === 0 && seeds.length === 0) return prev;
       const next = { ...prev };
       for (const key of deadKeys) delete next[key];
+      for (const t of seeds) next[t.id] = verdictToSessionState(agentVerdictsRef.current[t.id].verdict);
       return next;
     });
 
@@ -207,7 +295,107 @@ export function useSessionStateTracking(
     for (const id of Object.keys(activityBuffersRef.current)) {
       if (!tabIdSet.has(id)) delete activityBuffersRef.current[id];
     }
-  }, [tabs, hotStore]);
+    for (const id of Object.keys(exitedRef.current)) {
+      if (!tabIdSet.has(id)) delete exitedRef.current[id];
+    }
+  }, [tabs, hotStore, setSessionStates]);
+
+  // ── Runner verdicts (`terminal-agent-state`) ──────────────────────────────
+  //
+  // The merge lives in the runner's `agent_truth` reducer; this only mirrors
+  // it. A runner build without the event simply never calls back, leaving the
+  // fallback inference below in charge — the defensive default.
+
+  const applyAgentState = useCallback(
+    (payload: TerminalAgentStateEvent, origin: AgentStateOrigin) => {
+      if (!isTerminalAgentStateEvent(payload)) return;
+      // The initial snapshot can resolve AFTER a live event; an older verdict
+      // must never overwrite a newer one.
+      const id = payload.terminalId;
+      // A new epoch (a restarted runner) always wins and resets the held seq.
+      const held = admitAgentState(agentSeqRef.current[id], payload, origin);
+      if (!held) return;
+      agentSeqRef.current[id] = held;
+      const entry: AgentTruthEntry = {
+        verdict: payload.verdict,
+        hookDelivery: payload.hookDelivery ?? { status: "unknown" },
+      };
+      agentVerdictsRef.current = { ...agentVerdictsRef.current, [payload.terminalId]: entry };
+      setAgentVerdicts(agentVerdictsRef.current);
+      // A verdict that has observed nothing must not erase what the fallback
+      // has already inferred; every other verdict is what the chip renders.
+      if (entry.verdict.state.name === "unknown") return;
+      if (!tabsRef.current.some((t) => t.id === payload.terminalId)) return;
+      // An echo of the webview's own fallback offer never overwrites what the
+      // webview derived since, and once the pane's PROCESS exited only a new
+      // session start may replace the exit-derived state (L6).
+      const exited =
+        !!exitedRef.current[id] || tabsRef.current.some((t) => t.id === id && !t.isAlive);
+      if (!verdictOverridesLocalState(entry.verdict, sessionStatesRef.current[id], exited)) {
+        return;
+      }
+      if (exited) delete exitedRef.current[id];
+      const mapped = verdictToSessionState(entry.verdict);
+      setSessionStates((prev) =>
+        prev[payload.terminalId] === mapped ? prev : { ...prev, [payload.terminalId]: mapped },
+      );
+    },
+    [setSessionStates],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    try {
+      listen<TerminalAgentStateEvent>(TERMINAL_AGENT_STATE_EVENT, (event) => {
+        if (!cancelled) applyAgentState(event.payload, "event");
+      })
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisten = fn;
+        })
+        .catch(() => {});
+    } catch {
+      // No Tauri event bridge (tests, plain browser): fallback inference only.
+    }
+    void fetchTerminalAgentStates().then((rows) => {
+      if (cancelled) return;
+      for (const row of rows) applyAgentState(row, "row");
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [applyAgentState]);
+
+  /**
+   * Apply a non-event inference for `tabId` and offer it to the runner, unless
+   * an event channel already owns this tab's state.
+   */
+  const applyInference = useCallback(
+    (
+      tabId: string,
+      compute: (current: SessionState) => SessionState | null,
+      /** Lazily classifies a needs-input match — only called when one is offered. */
+      shapeOf?: () => "approval_shaped" | "question_shaped" | null,
+    ): void => {
+      if (isEventSourced(agentVerdictsRef.current[tabId]?.verdict)) return;
+      const current = sessionStatesRef.current[tabId] ?? "unknown";
+      const next = compute(current);
+      if (!next || next === current) return;
+      setSessionStates((prev) => ({ ...prev, [tabId]: next }));
+      const shape = isNeedsInputState(next) ? (shapeOf?.() ?? undefined) : undefined;
+      const state = sessionStateToObservation(next, shape);
+      if (state) offerAgentObservation({ terminalId: tabId, source: "regex", state });
+    },
+    [setSessionStates],
+  );
+
+  const offerInferredState = useCallback(
+    (tabId: string, compute: (current: SessionState) => SessionState | null) =>
+      applyInference(tabId, compute),
+    [applyInference],
+  );
 
   // ── Duration formatting interval (10s) ────────────────────────────────────
 
@@ -273,11 +461,12 @@ export function useSessionStateTracking(
 
   const handleExit = useCallback((terminalId: string, exitCode: number | null) => {
     // Note: the caller (TerminalPage) should also call updateTab to set isAlive/exitCode
+    exitedRef.current[terminalId] = true;
     setSessionStates((prev) => ({
       ...prev,
       [terminalId]: exitCode === 0 || exitCode === null ? "completed" : "error",
     }));
-  }, []);
+  }, [setSessionStates]);
 
   const handleOutput = useCallback(
     (tabId: string, text: string) => {
@@ -295,16 +484,17 @@ export function useSessionStateTracking(
       // tab's bypass flag (via the stable `tabsRef`, so this callback need not
       // re-create when tabs change) so the detector can suppress approval-
       // shaped patterns for bypass sessions.
+      //
+      // For a tab whose verdict is event-sourced (hooks / OSC 9999) the
+      // detector is NOT run at all — `applyInference` returns before
+      // `compute` is called.
       const bypassPermissions =
         tabsRef.current.find((t) => t.id === tabId)?.bypassPermissions === true;
-      setSessionStates((prev) => {
-        const current = prev[tabId] ?? "idle";
-        const detected = detectSessionState(text, current, { bypassPermissions });
-        if (detected && detected !== current) {
-          return { ...prev, [tabId]: detected };
-        }
-        return prev;
-      });
+      applyInference(
+        tabId,
+        (current) => detectSessionState(text, current, { bypassPermissions }),
+        () => needsInputShape(text, { bypassPermissions }),
+      );
 
       // Track last output lines for compact view. `nextOutputLines` owns the
       // choice between the tab's xterm buffer (authoritative) and the ANSI-strip
@@ -323,7 +513,7 @@ export function useSessionStateTracking(
 
       processOutput?.(tabId, text);
     },
-    [processOutput, hotStore],
+    [processOutput, hotStore, applyInference],
   );
 
   /**
@@ -365,17 +555,14 @@ export function useSessionStateTracking(
       // same detector the tap runs — on the digest instead of on raw bytes.
       const bypassPermissions =
         tabsRef.current.find((t) => t.id === tabId)?.bypassPermissions === true;
-      setSessionStates((prev) => {
-        const current = prev[tabId] ?? "idle";
-        const detected = detectSessionState(detectorText, current, { bypassPermissions });
-        if (detected && detected !== current) {
-          return { ...prev, [tabId]: detected };
-        }
-        return prev;
-      });
+      applyInference(
+        tabId,
+        (current) => detectSessionState(detectorText, current, { bypassPermissions }),
+        () => needsInputShape(detectorText, { bypassPermissions }),
+      );
       processOutput?.(tabId, detectorText);
     },
-    [processOutput, hotStore],
+    [processOutput, hotStore, applyInference],
   );
 
   // Memoize the return so the value object's identity only changes when
@@ -386,6 +573,8 @@ export function useSessionStateTracking(
     () => ({
       sessionStates,
       setSessionStates,
+      agentVerdicts,
+      offerInferredState,
       staleTabs,
       stateTimeAccum,
       stateEntryTimeRef,
@@ -394,6 +583,15 @@ export function useSessionStateTracking(
       handleOutput,
       handleActivityDigest,
     }),
-    [sessionStates, staleTabs, handleExit, handleOutput, handleActivityDigest],
+    [
+      sessionStates,
+      setSessionStates,
+      agentVerdicts,
+      offerInferredState,
+      staleTabs,
+      handleExit,
+      handleOutput,
+      handleActivityDigest,
+    ],
   );
 }

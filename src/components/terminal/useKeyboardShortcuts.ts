@@ -3,6 +3,7 @@ import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { deliverApprovals } from "./approveAll";
+import { partitionPermissionAsks, type AgentTruthEntry } from "./agentTruth";
 import { runRegistryAction } from "./commands";
 import {
   GLOBAL_CHORDS,
@@ -39,6 +40,8 @@ interface UseKeyboardShortcutsParams {
     assignTabToZone: (idx: number, tabId: string) => void;
   };
   sessionStates: Record<string, SessionState>;
+  /** Runner verdicts — Ctrl+Shift+Enter types only into `isAuthoritativePermissionAsk` panes. */
+  agentVerdicts: Record<string, AgentTruthEntry>;
   handleRestartInZone: (zoneIdx: number) => void;
   labelsAndTags: {
     allTags: string[];
@@ -108,6 +111,7 @@ export function useKeyboardShortcuts({
   setActiveId,
   zoneLayout,
   sessionStates,
+  agentVerdicts,
   handleRestartInZone,
   labelsAndTags,
   focusHistory,
@@ -199,7 +203,13 @@ export function useKeyboardShortcuts({
         // So the page's metrics card and event log recorded approvals that
         // reached no process — and those are exactly the numbers `/metrics`
         // and `/history` render. The counter now counts deliveries.
-        const waiting = tabs.filter((t) => sessionStates[t.id] === "needs-input");
+        // Only hook-reported permission asks are typed into; inferred panes are
+        // counted as skipped in the history entry.
+        const { actionable: waiting, skippedInferred } = partitionPermissionAsks(
+          tabs,
+          sessionStates,
+          agentVerdicts,
+        );
         void deliverApprovals(
           waiting.map((t) => t.id),
           terminalRefs,
@@ -208,9 +218,10 @@ export function useKeyboardShortcuts({
           if (report.delivered > 0) incrementMetric("totalApprovals", report.delivered);
           addHistoryEvent(
             "Approve all",
-            report.delivered === report.targeted
+            (report.delivered === report.targeted
               ? `${report.delivered} sessions`
-              : `${report.delivered} of ${report.targeted} sessions`,
+              : `${report.delivered} of ${report.targeted} sessions`) +
+              (skippedInferred.length > 0 ? `; skipped ${skippedInferred.length} inferred` : ""),
             undefined,
             report.delivered === report.targeted ? "#9ece6a" : "#e0af68",
           );
@@ -419,6 +430,7 @@ export function useKeyboardShortcuts({
     workflowGen.rightPanelMode,
     zoneLayout,
     sessionStates,
+    agentVerdicts,
     swapSource,
     selectedZones,
     handleRestartInZone,

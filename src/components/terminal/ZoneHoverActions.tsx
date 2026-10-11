@@ -65,7 +65,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
 
   const tabId = zoneLayout.assignments[zoneIdx];
   const isMaximized = zoneLayout.maximizedZone === zoneIdx;
-  const state = tabId ? sessionStates[tabId] ?? "idle" : "idle";
+  const state = tabId ? sessionStates[tabId] ?? "unknown" : "unknown";
   const canRestart = !!tabId && (state === "completed" || state === "error");
   const hasTab = !!tabId;
 

@@ -59,6 +59,7 @@
  */
 
 import type { SessionState } from "./useZoneLayout";
+import { isAuthoritativePermissionAsk, isNeedsInputState, type AgentTruthEntry } from "./agentTruth";
 
 /** How many trailing lines an approval pattern is matched against. */
 export const APPROVAL_MATCH_LINES = 5;
@@ -89,6 +90,13 @@ export interface EvaluateTransitionsInput {
    * nothing.
    */
   getLastOutputLines: (tabId: string) => readonly string[];
+  /**
+   * The runner's verdict per terminal. Auto-approve fires ONLY for a tab whose
+   * verdict passes `isAuthoritativePermissionAsk` — a hook-reported permission
+   * ask. A screen-inferred needs-input edge is never auto-approved: a regex
+   * false positive would be `y` typed into an agent that was not asking.
+   */
+  verdicts: Readonly<Record<string, AgentTruthEntry | undefined>>;
 }
 
 /** One tab's state change, in the order it was observed. */
@@ -191,6 +199,7 @@ export function evaluateTransitions(input: EvaluateTransitionsInput): Transition
     autoApprovePatterns,
     autoRestart,
     getLastOutputLines,
+    verdicts,
   } = input;
 
   const newNeedsInput: string[] = [];
@@ -231,7 +240,7 @@ export function evaluateTransitions(input: EvaluateTransitionsInput): Transition
       }
     }
 
-    if (state === "needs-input" && before !== "needs-input") newNeedsInput.push(tabId);
+    if (isNeedsInputState(state) && !isNeedsInputState(before)) newNeedsInput.push(tabId);
     if (state === "error" && before !== "error") newErrors.push(tabId);
     if (state === "completed" && before !== "completed") newCompleted.push(tabId);
   }
@@ -242,6 +251,9 @@ export function evaluateTransitions(input: EvaluateTransitionsInput): Transition
   const approvals: string[] = [];
   if (autoApprovePatterns.length > 0) {
     for (const tabId of newNeedsInput) {
+      // The keystroke gate comes first, so an inferred pane's output is not
+      // even read.
+      if (!isAuthoritativePermissionAsk(verdicts[tabId]?.verdict)) continue;
       if (matchesApprovalPattern(getLastOutputLines(tabId), autoApprovePatterns)) {
         approvals.push(tabId);
       }

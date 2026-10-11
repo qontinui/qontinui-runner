@@ -119,6 +119,7 @@ function Pill({ icon, text, color, onClick, title }: PillProps) {
 /** Color codes mirror the per-state palette in ZoneStatusBar so the
  *  visual identity stays consistent across the lifted-out pills. */
 const STATE_COLORS: Record<SessionState, string> = {
+  unknown: "#414868",
   idle: "#565f89",
   working: "#7aa2f7",
   "needs-input": "#e0af68",

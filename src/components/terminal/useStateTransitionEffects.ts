@@ -3,6 +3,7 @@ import { deliverApprovals } from "./approveAll";
 import { evaluateTransitions } from "./transitionAutomation";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { SessionState } from "./useZoneLayout";
+import { isNeedsInputState, type AgentTruthEntry } from "./agentTruth";
 import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./notificationSound";
 
 export interface UseStateTransitionEffectsParams {
@@ -19,6 +20,12 @@ export interface UseStateTransitionEffectsParams {
    * `2026-07-28-runner-many-sessions-performance` §0 A1).
    */
   getLastOutputLines: (tabId: string) => string[];
+  /**
+   * The runner's verdicts. Auto-approve is decided through
+   * `isAuthoritativePermissionAsk` in `evaluateTransitions`; this hook only
+   * delivers what that decision allows.
+   */
+  agentVerdicts: Readonly<Record<string, AgentTruthEntry | undefined>>;
   terminalRefs: Map<string, React.RefObject<{ writeToTerminal: (data: string) => void } | null>>;
   stateEntryTimeRef: React.MutableRefObject<Record<string, number>>;
   stateTimeAccumRef: React.MutableRefObject<Record<SessionState, number>>;
@@ -56,6 +63,7 @@ export function useStateTransitionEffects(
     tabs,
     assignments,
     getLastOutputLines,
+    agentVerdicts,
     terminalRefs,
     stateEntryTimeRef,
     stateTimeAccumRef,
@@ -173,6 +181,7 @@ export function useStateTransitionEffects(
       autoApprovePatterns,
       autoRestart,
       getLastOutputLines,
+      verdicts: agentVerdicts,
     });
 
     const {
@@ -192,7 +201,7 @@ export function useStateTransitionEffects(
       }
       stateEntryTimeRef.current[change.tabId] = now;
 
-      if (change.to === "needs-input") {
+      if (isNeedsInputState(change.to)) {
         addHistoryEvent("Needs input", change.title, change.zoneIdx, "#e0af68");
       } else if (change.to === "error") {
         addHistoryEvent("Error", change.title, change.zoneIdx, "#f7768e");
@@ -344,6 +353,7 @@ export function useStateTransitionEffects(
     assignments,
     autoApprovePatterns,
     getLastOutputLines,
+    agentVerdicts,
     tabs,
     addHistoryEvent,
     autoRestart,

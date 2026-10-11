@@ -96,10 +96,98 @@ pub struct MigrationOutcome {
     pub to_config_dir: String,
 }
 
+/// What raised a migration hint. Every origin runs the SAME confirm →
+/// cooldown → cap → target path; the origin only labels the logs.
+#[derive(Debug, Clone)]
+pub enum HintOrigin {
+    /// Reactive: a usage-limit message on screen (the matched pattern), or a
+    /// hook `StopFailure{error: rate_limit}` (its label).
+    UsageLimit(&'static str),
+    /// Proactive: a headroom reading or projection (plan
+    /// `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+    /// Phase 8) — the trigger's label.
+    Headroom(String),
+}
+
+impl std::fmt::Display for HintOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UsageLimit(p) => write!(f, "usage-limit:{p}"),
+            Self::Headroom(l) => f.write_str(l),
+        }
+    }
+}
+
+/// The confirm step's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmStep {
+    /// The probe agrees the account is exhausted — proceed.
+    Confirmed,
+    /// The probe does not — a hint (echoed text, a forged or optimistic
+    /// headroom reading, transient throttling) migrates nothing.
+    NotConfirmed,
+}
+
+/// CONFIRM: only the (just-refreshed) probe snapshot decides. Every hint is
+/// only a hint.
+pub fn confirm_step(src_config_dir: &str) -> ConfirmStep {
+    if crate::ai_provider::account_known_exhausted(src_config_dir) {
+        ConfirmStep::Confirmed
+    } else {
+        ConfirmStep::NotConfirmed
+    }
+}
+
+/// The PROACTIVE (headroom) confirm. The reactive [`confirm_step`] asks "is
+/// the account exhausted?", which a 95 % headroom threshold reaches long
+/// before — it would leave the proactive trigger dead. So a headroom hint is
+/// confirmed when the just-refreshed PROBE (`usage`, never the cached file
+/// that raised the hint) reads at/over the threshold, or the projection over
+/// the probe's own five-hour samples agrees ([`super::headroom::probe_confirms`]);
+/// an exhausted account confirms as well.
+pub fn headroom_confirm_step(
+    src_config_dir: &str,
+    usage: &[crate::commands::ai_settings::AccountUsageInfo],
+    now_ms: u64,
+) -> ConfirmStep {
+    if confirm_step(src_config_dir) == ConfirmStep::Confirmed {
+        return ConfirmStep::Confirmed;
+    }
+    let probe = usage
+        .iter()
+        .find(|i| i.config_dir == src_config_dir)
+        .and_then(|i| super::agent_metrics::reading_from_usage_info(i, now_ms));
+    let history = super::agent_metrics::probe_five_hour_history(src_config_dir);
+    if super::headroom::probe_confirms(
+        probe.as_ref(),
+        &history,
+        super::headroom::threshold_pct(),
+        now_ms,
+    ) {
+        ConfirmStep::Confirmed
+    } else {
+        ConfirmStep::NotConfirmed
+    }
+}
+
 /// Entry point for a PTY usage-limit hint (spawned async off the reader
 /// thread). Resolves everything it needs from the global app handle, mirrors
 /// `agent_runtime`'s state-access pattern.
 pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'static str) {
+    run_hint(terminal_id, HintOrigin::UsageLimit(matched_pattern)).await;
+}
+
+/// Entry point for a proactive headroom hint (`terminal::headroom`). Runs the
+/// unchanged confirm path; re-checks the ramp flag so a hint spawned just
+/// before the flag flipped off does nothing.
+pub async fn handle_headroom_hint(terminal_id: String, label: String) {
+    if super::headroom::mode() != crate::mcp::continuation_verdict::Mode::On {
+        return;
+    }
+    run_hint(terminal_id, HintOrigin::Headroom(label)).await;
+}
+
+async fn run_hint(terminal_id: String, origin: HintOrigin) {
     use tauri::Manager;
 
     let Some(app) = crate::tauri_app_handle::current() else {
@@ -114,8 +202,8 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     let Some(record) = store.find_open_by_terminal(&terminal_id) else {
         info!(
             terminal_id,
-            matched_pattern,
-            "usage-limit hint on a terminal with no registered Claude session — ignoring"
+            origin = %origin,
+            "migration hint on a terminal with no registered Claude session — ignoring"
         );
         return;
     };
@@ -131,7 +219,8 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         warn!(
             terminal_id,
             session = %record.claude_session_id,
-            "usage-limit hint but the session's account is unknown — cannot migrate"
+            origin = %origin,
+            "migration hint but the session's account is unknown — cannot migrate"
         );
         return;
     };
@@ -152,13 +241,20 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // and require the account to actually be exhausted before acting.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    if !crate::ai_provider::account_known_exhausted(&src) {
+    let confirmed = match &origin {
+        HintOrigin::UsageLimit(_) => confirm_step(&src),
+        HintOrigin::Headroom(_) => {
+            let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+            headroom_confirm_step(&src, &usage, now_ms)
+        }
+    };
+    if confirmed == ConfirmStep::NotConfirmed {
         info!(
             terminal_id,
             session = %record.claude_session_id,
             account = %src,
-            matched_pattern,
-            "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
+            origin = %origin,
+            "migration hint NOT confirmed by probe — skipping (echoed text, a reading that is only a hint, or transient throttling)"
         );
         return;
     }
@@ -206,7 +302,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         session = %record.claude_session_id,
         from = %src,
         to = %dst,
-        matched_pattern,
+        origin = %origin,
         "token exhaustion confirmed — migrating session to a fresh account"
     );
 
@@ -1106,6 +1202,81 @@ mod tests {
         assert!(
             !d.settled(changed),
             "a refusal in between restarts the count"
+        );
+    }
+
+    #[test]
+    fn migration_confirm_step_reads_only_the_probe() {
+        // Unique dirs: the usage snapshot is process-global.
+        let healthy = format!("/test/migration/healthy-{}", uuid::Uuid::new_v4());
+        let dry = format!("/test/migration/dry-{}", uuid::Uuid::new_v4());
+        crate::ai_provider::record_account_usage(&[
+            (healthy.clone(), 0.3, Some(-0.1), Some(0.4), false),
+            (dry.clone(), 1.0, Some(0.2), Some(0.8), true),
+        ]);
+        // A hint (screen text, a hook, or a 100% headroom reading) against a
+        // healthy probe is not confirmed — nothing migrates.
+        assert_eq!(confirm_step(&healthy), ConfirmStep::NotConfirmed);
+        assert_eq!(confirm_step(&dry), ConfirmStep::Confirmed);
+        // An account the probe never measured is not confirmed either.
+        assert_eq!(
+            confirm_step("/test/migration/never-probed"),
+            ConfirmStep::NotConfirmed
+        );
+    }
+
+    /// M5: the headroom confirm reads the fresh PROBE result, not the
+    /// (forgeable) reading that raised the hint.
+    #[test]
+    fn migration_headroom_confirm_reads_the_probe_not_the_hint() {
+        use crate::commands::ai_settings::AccountUsageInfo;
+        let dir = format!("/test/migration/headroom-{}", uuid::Uuid::new_v4());
+        let now_ms: u64 = 1_900_000_000_000;
+        let resets = now_ms / 1000 + 2 * 3600;
+        let info = |session: f64| AccountUsageInfo {
+            config_dir: dir.clone(),
+            utilization: 0.3,
+            resets_at: Some(now_ms / 1000 + 4 * 24 * 3600),
+            session_utilization: Some(session),
+            session_resets_at: Some(resets),
+            ..Default::default()
+        };
+        // Healthy probe (a forged 100 % hint elsewhere does not matter).
+        assert_eq!(
+            headroom_confirm_step(&dir, &[info(0.2)], now_ms),
+            ConfirmStep::NotConfirmed
+        );
+        // The probe itself at/over the threshold.
+        assert_eq!(
+            headroom_confirm_step(&dir, &[info(0.97)], now_ms),
+            ConfirmStep::Confirmed
+        );
+        // A failed probe confirms nothing.
+        let failed = AccountUsageInfo {
+            error: Some("probe failed".into()),
+            utilization: 1.0,
+            ..info(1.0)
+        };
+        assert_eq!(
+            headroom_confirm_step(&dir, &[failed], now_ms),
+            ConfirmStep::NotConfirmed
+        );
+        // No probe row for the account at all.
+        assert_eq!(
+            headroom_confirm_step(&dir, &[], now_ms),
+            ConfirmStep::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn migration_hint_origin_labels() {
+        assert_eq!(
+            HintOrigin::UsageLimit("limit reached").to_string(),
+            "usage-limit:limit reached"
+        );
+        assert_eq!(
+            HintOrigin::Headroom("headroom:five_hour=97%".into()).to_string(),
+            "headroom:five_hour=97%"
         );
     }
 

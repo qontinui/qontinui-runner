@@ -1,0 +1,43 @@
+{
+  "channel": "hook",
+  "cli_version": "2.1.285",
+  "event": "SessionStart",
+  "variants": [
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "session_id": "string",
+      "source": "string",
+      "transcript_path": "string"
+    },
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "scratchpad_dir": "string",
+      "session_id": "string",
+      "source": "string",
+      "transcript_path": "string"
+    },
+    {
+      "cwd": "string",
+      "hook_event_name": "string",
+      "model": "string",
+      "scratchpad_dir": "string",
+      "session_id": "string",
+      "source": "string",
+      "transcript_path": "string"
+    },
+    {
+      "context_tokens": "number",
+      "cwd": "string",
+      "estimated_cache_write_usd": "number",
+      "hook_event_name": "string",
+      "prompt_cache_likely_expired": "boolean",
+      "scratchpad_dir": "string",
+      "seconds_since_last_response": "number",
+      "session_id": "string",
+      "source": "string",
+      "transcript_path": "string"
+    }
+  ]
+}

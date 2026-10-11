@@ -3,6 +3,7 @@ import { ChevronDown } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import type { SessionState } from "../useZoneLayout";
 import { TabTitle } from "../displayTitle";
+import { isAuthoritativePermissionAsk, isNeedsInputState, type Verdict } from "../agentTruth";
 
 function ZoneMenuItem({
   label,
@@ -48,6 +49,7 @@ export function ZoneContextMenu({
   onSwap,
   onUnassign,
   onRestart,
+  verdict,
 }: {
   x: number;
   y: number;
@@ -63,6 +65,12 @@ export function ZoneContextMenu({
   onSwap: (targetZone: number) => void;
   onUnassign: () => void;
   onRestart?: () => void;
+  /**
+   * The runner's verdict for this pane. Approve/Reject stay available on a
+   * pane whose needs-input is inferred (the operator is choosing it) but are
+   * labelled "inferred" unless `isAuthoritativePermissionAsk` holds.
+   */
+  verdict?: Verdict | null;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [showSwapSub, setShowSwapSub] = useState(false);
@@ -84,7 +92,8 @@ export function ZoneContextMenu({
     };
   }, [onClose]);
 
-  const needsInput = state === "needs-input";
+  const needsInput = isNeedsInputState(state);
+  const inferredSuffix = isAuthoritativePermissionAsk(verdict) ? "" : " \u2014 inferred";
 
   return (
     <div
@@ -111,8 +120,8 @@ export function ZoneContextMenu({
       {needsInput && (
         <>
           <div className="h-px bg-[#2a2d3d] my-1" />
-          <ZoneMenuItem label="Approve (y)" onClick={onApprove} onClose={onClose} />
-          <ZoneMenuItem label="Reject (n)" onClick={onReject} onClose={onClose} />
+          <ZoneMenuItem label={`Approve (y)${inferredSuffix}`} onClick={onApprove} onClose={onClose} />
+          <ZoneMenuItem label={`Reject (n)${inferredSuffix}`} onClick={onReject} onClose={onClose} />
         </>
       )}
 

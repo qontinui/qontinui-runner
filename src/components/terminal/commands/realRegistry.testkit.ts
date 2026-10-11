@@ -221,6 +221,11 @@ export interface RealRegistryHarness {
   byId(id: string): CommandAction;
   /** The effects ledger — every stubbed closure call since the last reset. */
   calls: EffectCall[];
+  /**
+   * The fixture's runner verdicts, keyed by tab id — mutable in place; the next
+   * {@link setArms} / {@link resetArms} restores them from the arms.
+   */
+  agentVerdicts: Record<string, unknown>;
   /** Names only, for terse assertions. */
   callNames(): string[];
   /** Clear the ledger. Call between handler invocations. */
@@ -322,6 +327,13 @@ async function build(): Promise<RealRegistryHarness> {
    * getter. So those are single objects created here and mutated in place.
    */
   const sessionStates: Record<string, string> = {};
+  /**
+   * The runner's verdicts, mutated in place like `sessionStates`. The
+   * "waiting" fixture's needs-input pane is a HOOK-reported permission ask, so
+   * `/approve-all` (which types only into `isAuthoritativePermissionAsk`
+   * panes) keeps targeting it. Delete the entry to model an inferred pane.
+   */
+  const agentVerdicts: Record<string, unknown> = {};
   const metricsRef: { current: Record<string, number> } = { current: {} };
   const eventHistory: unknown[] = [];
 
@@ -334,6 +346,19 @@ async function build(): Promise<RealRegistryHarness> {
         ? { "tab-a": "error", "tab-b": "idle" }
         : { "tab-a": "needs-input", "tab-b": "idle" },
     );
+    for (const k of Object.keys(agentVerdicts)) delete agentVerdicts[k];
+    if (arms.sessionStates !== "errored") {
+      agentVerdicts["tab-a"] = {
+        verdict: {
+          state: { name: "needs_you", reason: "permission" },
+          source: "hook",
+          sinceMs: 0,
+          confidence: "authoritative",
+          disagreement: null,
+        },
+        hookDelivery: { status: "installed" },
+      };
+    }
     metricsRef.current =
       arms.cards === "empty"
         ? {}
@@ -423,6 +448,7 @@ async function build(): Promise<RealRegistryHarness> {
       closeTerminal: rec("session.closeTerminal", undefined),
       terminalRefs: { current: terminalRefs },
       sessionStates,
+      agentVerdicts,
       pageId: "page-1",
       stateTimeAccum: { current: {} },
       zoneLayout: {
@@ -670,6 +696,7 @@ async function build(): Promise<RealRegistryHarness> {
       return found;
     },
     calls,
+    agentVerdicts,
     callNames: () => calls.map((c) => c.name),
     reset: () => {
       calls.length = 0;
