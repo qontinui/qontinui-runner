@@ -23,6 +23,7 @@ vi.mock("./FleetSessionPicker", () => ({ FleetSessionPicker: () => null }));
 vi.mock("./PastSessionsView", () => ({ PastSessionsView: () => null }));
 
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import { sessionCardCloseElementId } from "./SessionCard";
 import type { UnifiedSession, UseSessionManagerReturn } from "./useSessionManager";
 
 let container: HTMLDivElement;
@@ -78,7 +79,13 @@ function runningTabRow(tabId: string, title: string): UnifiedSession {
 }
 
 /** The manager surface the panel reads, over a fixed list of rows. */
-function managerOver(sessions: UnifiedSession[]): UseSessionManagerReturn {
+function managerOver(
+  sessions: UnifiedSession[],
+  close: {
+    closableTabId?: (s: UnifiedSession) => string | null;
+    closeSession?: (s: UnifiedSession) => void;
+  } = {},
+): UseSessionManagerReturn {
   const noop = () => {};
   return {
     sessions,
@@ -102,6 +109,8 @@ function managerOver(sessions: UnifiedSession[]): UseSessionManagerReturn {
     viewTranscript: noop,
     openSession: noop,
     copySessionId: noop,
+    closableTabId: close.closableTabId ?? (() => null),
+    closeSession: close.closeSession ?? noop,
     selectedIds: new Set<string>(),
     toggleSelect: noop,
     selectAllFrozen: noop,
@@ -165,5 +174,36 @@ describe("SessionManagerPanel — tmux mode off-screen wording", () => {
       (el) => el.getAttribute("title"),
     );
     expect(labels).toContain("Active, off screen");
+  });
+});
+
+describe("SessionManagerPanel — closing a session from its row", () => {
+  it("a row with a live tab offers a close button (UI Bridge id), which closes that session", () => {
+    const rows = [runningTabRow("tab-a", "shell-a"), runningTabRow("tab-b", "shell-b")];
+    const closeSession = vi.fn();
+    function Page() {
+      return SessionManagerPanel({
+        manager: managerOver(rows, {
+          // Only tab-a still has a live tab in this window.
+          closableTabId: (s) => (s.zoneTabId === "tab-a" ? "tab-a" : null),
+          closeSession,
+        }),
+        selectedSessionId: null,
+        onScreenTabId: "tab-b",
+        workMode: "tmux",
+      });
+    }
+    act(() => root.render(createElement(Page)));
+
+    const close = container.querySelector(
+      `[data-ui-bridge-id='${sessionCardCloseElementId("tab-a")}']`,
+    ) as HTMLElement | null;
+    expect(close).not.toBeNull();
+    expect(
+      container.querySelector(`[data-ui-bridge-id='${sessionCardCloseElementId("tab-b")}']`),
+    ).toBeNull();
+    act(() => close!.click());
+    expect(closeSession).toHaveBeenCalledTimes(1);
+    expect(closeSession.mock.calls[0][0].zoneTabId).toBe("tab-a");
   });
 });

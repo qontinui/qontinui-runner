@@ -15,6 +15,23 @@ import {
 } from "@/lib/globalChords";
 import { isSurfaceVisible } from "@/lib/surfaceVisible";
 
+/**
+ * `Ctrl+Shift+L`'s target: the preset after `gridLayoutId`, wrapping. `null`
+ * for the synthetic flow grid — it is not in the preset table, so the cycle
+ * would jump to `single` and collapse 10+ live sessions into one zone; the
+ * cycle is a no-op there instead.
+ *
+ * `gridLayoutId` is the GRID's layout (`useZoneLayout().gridView`): in tmux
+ * mode the page shows `single`, but the cycle exits tmux into a grid, so it
+ * steps from the grid that exit returns to — the layout the operator will
+ * actually see change.
+ */
+export function nextCycledLayoutId(gridLayoutId: string): string | null {
+  if (gridLayoutId === FLOW_GRID_ID) return null;
+  const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === gridLayoutId);
+  return LAYOUT_PRESETS[(currentIdx + 1) % LAYOUT_PRESETS.length].id;
+}
+
 interface UseKeyboardShortcutsParams {
   activeId: string | null;
   tabs: Array<{ id: string; isAlive?: boolean }>;
@@ -45,6 +62,14 @@ interface UseKeyboardShortcutsParams {
     exitTmuxMode: () => void;
     shownTabId: string | null;
     requestReveal: (tabId: string) => void;
+    /**
+     * The grid the operator sees in grid mode — in tmux mode the snapshot it
+     * returns to. `Ctrl+Shift+L` cycles from ITS layout: in tmux the cycle
+     * exits to a grid, and the step should be from the grid that exit shows.
+     */
+    gridView: { layoutId: string };
+    /** The zone whose pin `Ctrl+Shift+O` toggles (`null`: none to pin). */
+    cosmeticZoneFor: (zoneIdx: number) => number | null;
   };
   sessionStates: Record<string, SessionState>;
   handleRestartInZone: (zoneIdx: number) => void;
@@ -304,7 +329,9 @@ export function useKeyboardShortcuts({
       }
       if (isCtrlShiftChord(e, "o")) {
         e.preventDefault();
-        labelsAndTags.togglePin(zoneLayout.focusedZone);
+        // In tmux mode the shown session's GRID zone, so the pin stays on it.
+        const pinZone = zoneLayout.cosmeticZoneFor(zoneLayout.focusedZone);
+        if (pinZone !== null) labelsAndTags.togglePin(pinZone);
         return;
       }
       if (isCtrlShiftChord(e, "d")) {
@@ -319,14 +346,10 @@ export function useKeyboardShortcuts({
       }
       if (isCtrlShiftChord(e, "l")) {
         e.preventDefault();
-        // In flow-grid (synthetic id, not in LAYOUT_PRESETS) `findIndex` returns
-        // -1 and the cycle would jump to preset[0]/`single`, collapsing 10+ live
-        // sessions back into a 1-zone layout. v1 wart: no-op the cycle in flow
-        // mode rather than cycling into a preset that re-hides sessions.
-        if (zoneLayout.layoutId === FLOW_GRID_ID) return;
-        const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === zoneLayout.layoutId);
-        const nextIdx = (currentIdx + 1) % LAYOUT_PRESETS.length;
-        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id, { source: "operator" });
+        // Steps from the grid's layout, and no-ops in flow mode — see
+        // `nextCycledLayoutId`.
+        const next = nextCycledLayoutId(zoneLayout.gridView.layoutId);
+        if (next !== null) zoneLayout.setLayoutId(next, { source: "operator" });
         return;
       }
       // Ctrl+Shift+K — command palette. The chord comes from the shared

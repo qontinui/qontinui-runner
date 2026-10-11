@@ -44,9 +44,18 @@ transitions `enter-tmux-work-mode`, `tmux-swap-session` and
   `layoutId: "single"` in tmux mode.
 - **"Exactly one pane visible"** is observable per tab: only the shown tab's
   `terminal-input-<tabId>` and `terminal.close-session-<tabId>` have a
-  non-zero rect, and there is no `terminal-zone-header-1`. The off-screen
-  panes stay mounted (their `terminal-input-<tabId>` is registered with a 0×0
-  rect), so `registeredAt` is unchanged across a swap.
+  non-zero rect, and there is no `terminal-zone-header-1`. The most recently
+  shown off-screen panes stay mounted — up to `TMUX_WARM_TAB_LIMIT` (8, the
+  WebGL context cap) besides the shown one; their `terminal-input-<tabId>` is
+  registered with a 0×0 rect, so `registeredAt` is unchanged across a swap
+  between them. A colder session has no `terminal-input-<tabId>` at all until
+  it is shown, when it mounts and replays its scrollback ring.
+- **Maximize is refused in tmux mode.** `maximize-zone` and
+  `toggle-maximize-zone` fail with an error naming the mode rather than
+  reporting `changed: true` for a view tmux already is.
+- **A session manager row closes its session** through
+  `terminal.session-card-close-<sessionId>` (a row with a live tab in this
+  window only) — the way to close an off-screen session without showing it.
 - **Output continuity** is checked by comparing the revealed pane's xterm
   buffer (`getScrollback` custom action on `terminal-input-<tabId>`) with the
   server grid (`GET /ui-bridge/sdk/terminal/sessions/<id>/text`), not by a

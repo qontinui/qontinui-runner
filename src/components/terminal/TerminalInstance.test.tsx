@@ -165,8 +165,9 @@ describe("stdin ownership gate", () => {
 
   it("passes pageId at every <TerminalInstance> mount site", () => {
     const sites = terminalInstanceMountSites();
-    // ZoneGrid's maximized-view mount and ZoneCell's (zoned AND parked) mount.
-    expect(sites.length).toBeGreaterThanOrEqual(2);
+    // ZoneCell's mount — the ONE site since the maximized view became a
+    // presentation of the same cell (zoned, maximized AND parked).
+    expect(sites.length).toBeGreaterThanOrEqual(1);
     const missing = sites.filter((s) => !/\bpageId=/.test(s.props)).map((s) => s.file);
     expect(missing).toEqual([]);
   });

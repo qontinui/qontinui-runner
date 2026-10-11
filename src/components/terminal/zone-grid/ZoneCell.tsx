@@ -4,13 +4,22 @@
  * the quick and hover actions, and the terminal body — a `TerminalInstance`,
  * a `PlanViewer` or a Conductor `WorkerSessionCell`.
  *
- * `buildZoneCells` (`zoneCells.tsx`) mounts it for both work modes: one cell
- * per tab that owns a mount, keyed by tab id in either mode so a grid ⇄ tmux
- * switch re-renders a terminal rather than remounting it, plus one cell per
- * empty zone. A tab with no zone on screen — unzoned in the grid, off screen
- * in tmux — gets a PARKED cell: its terminal body alone, `display: none`.
- * Every cell gets the same {@link ZoneCellSharedProps}, so a zone looks and
- * behaves the same in either mode.
+ * `buildZoneCells` (`zoneCells.tsx`) mounts it for both work modes and for the
+ * grid's maximized view: one cell per tab that owns a mount, keyed by tab id
+ * everywhere so a grid ⇄ maximized ⇄ tmux switch re-renders a terminal rather
+ * than remounting it, plus one cell per empty zone. Its `presentation` says
+ * how it shows:
+ *  - `zone`: a zone on screen, with the full zone chrome;
+ *  - `parked`: no zone on screen (unzoned in the grid, off screen in tmux, or
+ *    a zone behind the maximized one) — its terminal body alone,
+ *    `display: none`;
+ *  - `maximized`: the grid's maximized zone filling the page, under the
+ *    maximized view's own header instead of the zone chrome.
+ * The three render the SAME element tree with different pieces switched off,
+ * so the terminal body sits at the same place in it whichever one a cell is —
+ * that, plus the key, is what lets a presentation change leave the terminal
+ * mounted. Every cell gets the same {@link ZoneCellSharedProps}, so a zone
+ * looks and behaves the same in either mode.
  */
 import { memo, useCallback, useMemo, useRef, type RefObject } from "react";
 import { Terminal, Filter, RefreshCw, MessageSquare } from "lucide-react";
@@ -39,6 +48,7 @@ import {
   zoneBodyPadding,
 } from "../promptsPanelLayout";
 import { useElementHeight } from "../useElementHeight";
+import { MaximizedHeader, type MaximizedNav } from "./MaximizedHeader";
 import type { TabClassification } from "../classifyTabs";
 import { writeToTerminalById } from "../writeToTerminalById";
 import { useTabHotSlice } from "../useTerminalHotStore";
@@ -51,6 +61,7 @@ import {
   STATE_GLOW,
   ZONE_HEADER_HEIGHT_PX,
   ZONE_FILTER_BAR_HEIGHT_PX,
+  MAXIMIZED_HEADER_HEIGHT_PX,
 } from "./constants";
 import { formatUptime, countMatches, showSoloSessionInfo } from "./utils";
 
@@ -162,7 +173,21 @@ export interface ZoneCellProps {
    * their count, rendered as `k / n` in the zone header.
    */
   panePosition?: { index: number; count: number };
+  /** How this cell shows — see the module comment. */
+  presentation: ZoneCellPresentation;
+  /**
+   * The zone whose label, notes, pin, tags and output filter this cell shows
+   * and edits (`useZoneLayout().cosmeticZoneFor`). The zone itself in grid
+   * mode; in tmux mode the shown session's GRID zone, so each session keeps
+   * its own. `null`: the session has no grid zone, so the cell shows no
+   * cosmetics and offers no editor for them.
+   */
+  cosmeticZone: number | null;
+  /** The maximized view's header navigation; the `maximized` cell only. */
+  maximizedNav?: MaximizedNav;
 }
+
+export type ZoneCellPresentation = "zone" | "parked" | "maximized";
 
 /**
  * The props every cell of one render pass shares. `ZoneGrid` builds this bag
@@ -171,7 +196,16 @@ export interface ZoneCellProps {
  */
 export type ZoneCellSharedProps = Omit<
   ZoneCellProps,
-  "zone" | "zoneIdx" | "isDropTarget" | "promptsOpen" | "reviewOpen" | "paneTabId" | "panePosition"
+  | "zone"
+  | "zoneIdx"
+  | "isDropTarget"
+  | "promptsOpen"
+  | "reviewOpen"
+  | "paneTabId"
+  | "panePosition"
+  | "presentation"
+  | "cosmeticZone"
+  | "maximizedNav"
 >;
 
 function ZoneCellInner({
@@ -236,18 +270,24 @@ function ZoneCellInner({
   isSingleView,
   paneTabId,
   panePosition,
+  presentation,
+  cosmeticZone,
+  maximizedNav,
 }: ZoneCellProps) {
   const tabId = paneTabId;
   const tab = tabs.find((t) => t.id === tabId);
   const classification = tab ? tabClassification.get(tab.id) : undefined;
-  // A live tab with no zone on screen: parked behind the shown one in tmux
-  // mode (`offscreen`), or unzoned in the grid (`hidden`). Its cell renders
-  // the terminal body alone, `display: none` — no header, no panels, no
-  // overlays. Every piece of chrome registers UI Bridge ids keyed by zone
-  // index, and every parked cell is zone 0, so chrome on a parked cell would
-  // collide with zone 0's own registrations.
-  const isParked = classification === "offscreen" || classification === "hidden";
-  const showLabels = showLabelsProp && !isParked;
+  // A tab with no zone on screen: parked behind the shown one in tmux mode,
+  // unzoned in the grid, or behind the maximized zone. Its cell renders the
+  // terminal body alone, `display: none` — no header, no panels, no overlays.
+  // Every piece of chrome registers UI Bridge ids keyed by zone index, and a
+  // parked cell's index is not a zone on screen, so chrome on it would collide
+  // with the visible zone's own registrations.
+  const isParked = presentation === "parked";
+  // The maximized zone: the maximized view's header replaces the zone chrome.
+  const isMaximizedPane = presentation === "maximized";
+  const hideZoneChrome = isParked || isMaximizedPane;
+  const showLabels = showLabelsProp && !hideZoneChrome;
   // Per-tab subscription — THIS is what stops one pane's output frame from
   // re-rendering the other 39 zones (plan §0 A1). Only the cell whose tab
   // produced output (or whose duration/sparkline/lock state moved) re-renders.
@@ -257,7 +297,10 @@ function ZoneCellInner({
   // A far-offscreen assigned zone in flow mode: render only the CompactZoneCard,
   // NO TerminalInstance. Plan tabs are never virtualized (PlanViewer is already
   // lightweight and carries no xterm parser).
-  const isVirtual = classification === "assigned-virtual" && tab?.type !== "plan";
+  // The maximized zone always mounts its terminal: it fills the page, so a
+  // flow grid's virtualization of it would leave the page blank.
+  const isVirtual =
+    classification === "assigned-virtual" && tab?.type !== "plan" && !isMaximizedPane;
   // Mount the inline TerminalInstance only for a non-plan tab the classifier
   // owns as live (`assigned` in preset mode, `assigned-live` near the viewport
   // in flow mode, `assigned` in tmux mode) or as parked (`hidden` in the grid,
@@ -265,17 +308,18 @@ function ZoneCellInner({
   const shouldMountInstance =
     !!tab &&
     tab.type !== "plan" &&
-    (classification === "assigned" ||
+    (isMaximizedPane ||
+      classification === "assigned" ||
       classification === "assigned-live" ||
       classification === "offscreen" ||
       classification === "hidden");
 
   // Zero-arg wrapper for ZoneLabel's `onToggleFilter` slot; stable so the
-  // label doesn't get a fresh prop on every cell render.
-  const handleToggleFilterInput = useCallback(
-    () => onToggleFilterInput(zoneIdx),
-    [onToggleFilterInput, zoneIdx],
-  );
+  // label doesn't get a fresh prop on every cell render. The filter is keyed
+  // by the cosmetic zone, like the label it sits beside.
+  const handleToggleFilterInput = useCallback(() => {
+    if (cosmeticZone !== null) onToggleFilterInput(cosmeticZone);
+  }, [onToggleFilterInput, cosmeticZone]);
 
   // Same shape for the prompts toggle. `tabId` (not zoneIdx) is the key — the
   // panel belongs to the conversation, not the tile.
@@ -325,12 +369,16 @@ function ZoneCellInner({
   const cellRef = useCallback(
     (el: HTMLDivElement | null) => {
       zoneElRef.current = el;
-      // A parked cell is no zone the flow grid could scroll to.
-      if (!isFlowMode || !tabId || isParked) return;
+      // Registered whatever the presentation: a cell parked behind the
+      // maximized zone keeps its registration, so restoring the grid does not
+      // re-register (and re-observe) every cell. A parked cell never
+      // intersects, and nothing scrolls to one — the grid scrolls to a
+      // focused tab's ZONE, and a parked tab has none.
+      if (!isFlowMode || !tabId) return;
       if (el) registerCell(tabId, el);
       else unregisterCell(tabId);
     },
-    [isFlowMode, tabId, isParked, registerCell, unregisterCell],
+    [isFlowMode, tabId, registerCell, unregisterCell],
   );
 
   const isFocused = zoneIdx === focusedZone;
@@ -341,9 +389,23 @@ function ZoneCellInner({
       : STATE_BORDER_COLORS[state]
     : STATE_BORDER_COLORS[state];
 
-  const isPinned = pinnedZones?.has(zoneIdx);
+  const isPinned = cosmeticZone !== null && !!pinnedZones?.has(cosmeticZone);
+  const zoneLabel = cosmeticZone === null ? undefined : zoneLabels?.[cosmeticZone];
+  const zoneNote = cosmeticZone === null ? undefined : zoneNotes?.[cosmeticZone];
+  const zoneTagList = cosmeticZone === null ? [] : (zoneTags?.[cosmeticZone] ?? []);
+  const setLabel =
+    onSetZoneLabel && cosmeticZone !== null
+      ? (label: string) => onSetZoneLabel(cosmeticZone, label)
+      : undefined;
+  const setNote =
+    onSetZoneNote && cosmeticZone !== null
+      ? (note: string) => onSetZoneNote(cosmeticZone, note)
+      : undefined;
+  const togglePin =
+    onTogglePin && cosmeticZone !== null ? () => onTogglePin(cosmeticZone) : undefined;
+  const zoneFilter = cosmeticZone === null ? undefined : zoneFilters[cosmeticZone];
   const useCompact =
-    !isParked &&
+    !hideZoneChrome &&
     tab &&
     tab.type !== "plan" &&
     !isFocused &&
@@ -357,7 +419,7 @@ function ZoneCellInner({
   // the strip and the terminal body's top padding have to agree, or the strip
   // covers the first output line.
   const soloSessionInfo =
-    !isParked &&
+    !hideZoneChrome &&
     showSoloSessionInfo({
       showLabels,
       showCompactCard,
@@ -374,16 +436,21 @@ function ZoneCellInner({
   // parked behind the shown tmux pane. The instance's `visible` prop — and with
   // it the pane's `focused`/`background` tier — follows this alone.
   const paneVisible = !showCompactCard && !isParked;
-  // The filter bar is keyed by zone index, and every tmux cell is zone 0.
-  const showFilterBar = !showCompactCard && !isParked && showFilterInput === zoneIdx;
+  // The filter bar is keyed by the cosmetic zone, like the label beside it.
+  const showFilterBar =
+    !showCompactCard &&
+    !hideZoneChrome &&
+    cosmeticZone !== null &&
+    showFilterInput === cosmeticZone;
   const reviewAvailable = reviewPanelAvailable(tab, promptsAvailable);
   // The review panel and the prompts panel share one overlay slot.
   const showReviewPanel = reviewAvailable && reviewOpen;
   const showPromptsPanel = promptsAvailable && promptsOpen && !showReviewPanel;
   // Changes + read state for the badge and the panel. Visible-gated: a zone
-  // behind a compact card (or virtualized), a parked tmux cell, or one whose
-  // tab the grid classifies hidden, reads nothing. (The maximized view's read lives in the grid: no
-  // ZoneCell is mounted while a zone is maximized, so the two never overlap.)
+  // behind a compact card (or virtualized), a parked cell, or one whose tab
+  // the grid classifies hidden, reads nothing. The maximized zone is a cell
+  // like any other, so its header badge and panel read here too — one read
+  // per session, whichever way it is shown.
   const reviewReadable = reviewAvailable && classification !== "hidden";
   const review = useSessionReview(reviewReadable ? (tab?.claudeSessionId ?? null) : null, {
     visible: reviewReadable,
@@ -396,7 +463,11 @@ function ZoneCellInner({
   const panelGeometry = showReviewPanel ? REVIEW_PANEL_GEOMETRY : PROMPTS_PANEL_GEOMETRY;
   // Measured only while a panel is open — a closed panel allocates no observer.
   const zoneHeightPx = useElementHeight(zoneElRef, panelOpen);
-  const zoneHeaderPx = showLabels || soloSessionInfo ? ZONE_HEADER_HEIGHT_PX : 0;
+  const zoneHeaderPx = isMaximizedPane
+    ? MAXIMIZED_HEADER_HEIGHT_PX
+    : showLabels || soloSessionInfo
+      ? ZONE_HEADER_HEIGHT_PX
+      : 0;
   const filterBarPx = showFilterBar ? ZONE_FILTER_BAR_HEIGHT_PX : 0;
   const promptsChromeTopPx = zoneHeaderPx + filterBarPx;
   const promptsOrientation = promptsPanelOrientation({
@@ -423,17 +494,14 @@ function ZoneCellInner({
   const isSwapSource = swapSource === zoneIdx;
   const isSelected = selectedZones?.has(zoneIdx);
 
-  const firstTagColor = zoneTags?.[zoneIdx]?.[0]
-    ? labelColorMap?.[zoneTags[zoneIdx][0]]
-    : undefined;
+  const firstTagColor = zoneTagList[0] ? labelColorMap?.[zoneTagList[0]] : undefined;
   // Tag filter. Dimming (rather than unmounting) is the precedent this
   // grid already sets for `outputSearchQuery` a few lines below, and it
   // is the only honest option in a fixed CSS grid: removing a cell would
   // leave a hole where the layout preset put it, and would tear down the
   // zone's live PTY with it.
   const tagFilterActive = (activeTagFilters?.size ?? 0) > 0;
-  const tagFilteredOut =
-    tagFilterActive && !(zoneTags?.[zoneIdx] ?? []).some((t) => activeTagFilters?.has(t));
+  const tagFilteredOut = tagFilterActive && !zoneTagList.some((t) => activeTagFilters?.has(t));
   const stateColor = STATE_COLORS[state];
 
   const baseBoxShadow = isDropTarget
@@ -462,57 +530,62 @@ function ZoneCellInner({
       // Ground truth for the tag filter, readable through the UI Bridge
       // without inferring anything from a computed opacity.
       data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
-      style={{
-        gridColumn: zone.col,
-        gridRow: zone.row,
-        border: `${isFocused ? "2px" : isSwapSource ? "2px" : isSelected ? "2px" : searchMatch ? "2px" : "1px"} solid ${
-          isDropTarget
-            ? "#7aa2f7"
-            : isSwapSource
-              ? "#ff9e64"
-              : isSelected
-                ? "#bb9af7"
-                : searchMatch
-                  ? "#9ece6a"
-                  : isStale
-                    ? "#e0af68"
-                    : borderColor
-        }`,
-        borderLeftWidth: state === "needs-input" ? "3px" : "2px",
-        borderLeftColor: stateColor,
-        borderStyle: isSwapSource
-          ? "dashed"
-          : isStale && !isFocused && !searchMatch
-            ? "dashed"
-            : "solid",
-        borderLeftStyle: "solid",
-        borderRadius: "4px",
-        boxShadow: zoneShadow,
-        transition: "border-color 0.2s, box-shadow 0.2s, opacity 0.3s",
-        // EVERY dim lives in this one inline value, most-specific first.
-        //
-        // The output-search dim used to be a Tailwind `opacity-40` CLASS on
-        // the same element — and an inline `style.opacity` beats a class,
-        // so `opacity: 1` from the focus-mode expression below silently
-        // won and the search dim never rendered at all. The tag filter was
-        // written the same way and had the same non-effect; a `data-`
-        // attribute test passed while the page showed nothing. Two
-        // competing mechanisms for one property is the whole bug, so there
-        // is now exactly one.
-        opacity: tagFilteredOut
-          ? 0.25
-          : outputSearchQuery && !searchMatch
-            ? 0.4
-            : focusMode && !isFocused && state !== "needs-input" && state !== "error"
-              ? 0.3
-              : 1,
-        animation: isFlashing ? "zone-flash-border 1s ease-out" : undefined,
-        ...(firstTagColor
-          ? {
-              background: `linear-gradient(135deg, ${firstTagColor}08 0%, transparent 60%)`,
+      style={
+        isMaximizedPane
+          ? // The maximized view draws no zone border: the page is the zone.
+            { gridColumn: zone.col, gridRow: zone.row }
+          : {
+              gridColumn: zone.col,
+              gridRow: zone.row,
+              border: `${isFocused ? "2px" : isSwapSource ? "2px" : isSelected ? "2px" : searchMatch ? "2px" : "1px"} solid ${
+                isDropTarget
+                  ? "#7aa2f7"
+                  : isSwapSource
+                    ? "#ff9e64"
+                    : isSelected
+                      ? "#bb9af7"
+                      : searchMatch
+                        ? "#9ece6a"
+                        : isStale
+                          ? "#e0af68"
+                          : borderColor
+              }`,
+              borderLeftWidth: state === "needs-input" ? "3px" : "2px",
+              borderLeftColor: stateColor,
+              borderStyle: isSwapSource
+                ? "dashed"
+                : isStale && !isFocused && !searchMatch
+                  ? "dashed"
+                  : "solid",
+              borderLeftStyle: "solid",
+              borderRadius: "4px",
+              boxShadow: zoneShadow,
+              transition: "border-color 0.2s, box-shadow 0.2s, opacity 0.3s",
+              // EVERY dim lives in this one inline value, most-specific first.
+              //
+              // The output-search dim used to be a Tailwind `opacity-40` CLASS on
+              // the same element — and an inline `style.opacity` beats a class,
+              // so `opacity: 1` from the focus-mode expression below silently
+              // won and the search dim never rendered at all. The tag filter was
+              // written the same way and had the same non-effect; a `data-`
+              // attribute test passed while the page showed nothing. Two
+              // competing mechanisms for one property is the whole bug, so there
+              // is now exactly one.
+              opacity: tagFilteredOut
+                ? 0.25
+                : outputSearchQuery && !searchMatch
+                  ? 0.4
+                  : focusMode && !isFocused && state !== "needs-input" && state !== "error"
+                    ? 0.3
+                    : 1,
+              animation: isFlashing ? "zone-flash-border 1s ease-out" : undefined,
+              ...(firstTagColor
+                ? {
+                    background: `linear-gradient(135deg, ${firstTagColor}08 0%, transparent 60%)`,
+                  }
+                : {}),
             }
-          : {}),
-      }}
+      }
       onMouseDown={(e) => handleZoneMouseDown(zoneIdx, e)}
       onDoubleClick={() => onZoneDoubleClick(zoneIdx)}
       onContextMenu={(e) => {
@@ -570,10 +643,9 @@ function ZoneCellInner({
         }
       }}
     >
-      {!isParked &&
+      {!hideZoneChrome &&
         (() => {
-          const label = zoneLabels?.[zoneIdx];
-          const groupColor = label && labelColorMap?.[label];
+          const groupColor = zoneLabel && labelColorMap?.[zoneLabel];
           return groupColor ? (
             <div
               className="absolute left-0 top-0 bottom-0 w-[3px] z-10 rounded-l"
@@ -582,7 +654,7 @@ function ZoneCellInner({
           ) : null;
         })()}
 
-      {!isParked && pendingRestarts?.[zoneIdx] && (
+      {!hideZoneChrome && pendingRestarts?.[zoneIdx] && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 rounded">
           <div className="flex items-center gap-2 bg-[#1a1b26] border border-[#7dcfff]/30 rounded-lg px-3 py-1.5">
             <RefreshCw className="w-3 h-3 text-[#7dcfff] animate-spin" />
@@ -615,16 +687,14 @@ function ZoneCellInner({
               isStale={isStale ?? false}
               searchQuery={outputSearchQuery}
               activity={hot.activity}
-              zoneLabel={zoneLabels?.[zoneIdx]}
-              onSetZoneLabel={
-                onSetZoneLabel ? (label) => onSetZoneLabel(zoneIdx, label) : undefined
-              }
+              zoneLabel={zoneLabel}
+              onSetZoneLabel={setLabel}
               onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
-              groupColor={zoneLabels?.[zoneIdx] ? labelColorMap?.[zoneLabels[zoneIdx]] : undefined}
+              groupColor={zoneLabel ? labelColorMap?.[zoneLabel] : undefined}
               uptime={formatUptime(tab.createdAt)}
               lastCommand={commandHistories?.[tab.id]?.slice(-1)[0]?.command}
-              note={zoneNotes?.[zoneIdx]}
-              onSetNote={onSetZoneNote ? (n) => onSetZoneNote(zoneIdx, n) : undefined}
+              note={zoneNote}
+              onSetNote={setNote}
               allTabs={tabs}
               assignments={assignments}
               sessionStates={sessionStates}
@@ -642,19 +712,17 @@ function ZoneCellInner({
               sessionStates={sessionStates}
               onAssignTab={onAssignTab}
               isPinned={isPinned}
-              onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
-              zoneLabel={zoneLabels?.[zoneIdx]}
-              onSetZoneLabel={
-                onSetZoneLabel ? (label) => onSetZoneLabel(zoneIdx, label) : undefined
-              }
+              onTogglePin={togglePin}
+              zoneLabel={zoneLabel}
+              onSetZoneLabel={setLabel}
               onScrollToBottom={() => {
                 const ref = terminalRefs.get(tab.id);
                 ref?.current?.scrollToBottom();
               }}
               outputLineCount={lastLines.length}
               outputByteSize={lastLines.reduce((sum, l) => sum + l.length, 0)}
-              onToggleFilter={handleToggleFilterInput}
-              filterActive={!!zoneFilters[zoneIdx]}
+              onToggleFilter={cosmeticZone !== null ? handleToggleFilterInput : undefined}
+              filterActive={!!zoneFilter}
               onTogglePrompts={promptsAvailable ? handleTogglePrompts : undefined}
               promptsVisible={showPromptsPanel}
               position={panePosition}
@@ -664,6 +732,25 @@ function ZoneCellInner({
                     open={showReviewPanel}
                     onToggle={handleToggleReview}
                     badge={reviewBadge}
+                  />
+                ) : undefined
+              }
+            />
+          )}
+          {isMaximizedPane && maximizedNav && (
+            <MaximizedHeader
+              tab={tab}
+              zoneIdx={zoneIdx}
+              nav={maximizedNav}
+              onTogglePrompts={promptsAvailable ? handleTogglePrompts : undefined}
+              promptsVisible={showPromptsPanel}
+              reviewSlot={
+                reviewAvailable ? (
+                  <SessionReviewToggle
+                    open={showReviewPanel}
+                    onToggle={handleToggleReview}
+                    badge={reviewBadge}
+                    iconClassName="w-3 h-3"
                   />
                 ) : undefined
               }
@@ -719,12 +806,12 @@ function ZoneCellInner({
               <Filter className="w-3 h-3 text-[#565f89]" />
               <input
                 autoFocus
-                value={zoneFilters[zoneIdx] ?? ""}
-                onChange={(e) => onSetZoneFilter(zoneIdx, e.target.value)}
+                value={zoneFilter ?? ""}
+                onChange={(e) => onSetZoneFilter(cosmeticZone, e.target.value)}
                 onKeyDown={(e) => {
                   e.stopPropagation();
                   if (e.key === "Escape") {
-                    onToggleFilterInput(zoneIdx);
+                    onToggleFilterInput(cosmeticZone);
                   }
                 }}
                 onMouseDown={(e) => e.stopPropagation()}
@@ -732,13 +819,13 @@ function ZoneCellInner({
                 placeholder="Filter output..."
                 className="flex-1 bg-transparent text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden font-mono"
               />
-              {zoneFilters[zoneIdx] && (
+              {zoneFilter && (
                 <>
                   <span className="text-[9px] text-[#e0af68] font-mono">
-                    {countMatches(lastLines, zoneFilters[zoneIdx])} matches
+                    {countMatches(lastLines, zoneFilter)} matches
                   </span>
                   <button
-                    onClick={() => onClearZoneFilter(zoneIdx)}
+                    onClick={() => onClearZoneFilter(cosmeticZone)}
                     onMouseDown={(e) => e.stopPropagation()}
                     className="text-[9px] text-[#565f89] hover:text-[#f7768e] px-1"
                   >
@@ -769,11 +856,11 @@ function ZoneCellInner({
               onClose={handleToggleReview}
             />
           )}
-          {!showCompactCard && !isParked && isMultiZone && (
+          {!showCompactCard && !hideZoneChrome && isMultiZone && (
             <ZoneQuickActions
               zoneIndex={zoneIdx}
               isPinned={isPinned}
-              onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
+              onTogglePin={togglePin}
               onMaximize={() => onZoneDoubleClick(zoneIdx)}
               onCopyOutput={() => {
                 const lines = lastLines;
@@ -791,7 +878,7 @@ function ZoneCellInner({
           )}
           {tab.type === "plan" && tab.planFilePath ? (
             <div className="h-full w-full">
-              <PlanViewer filePath={tab.planFilePath} visible={!useCompact} />
+              <PlanViewer filePath={tab.planFilePath} visible={!useCompact && !isParked} />
             </div>
           ) : (
             <div
@@ -810,7 +897,7 @@ function ZoneCellInner({
                   by its id, so the dual-mount race (two owners evicting each
                   other's UI Bridge registrations) stays impossible. */}
               {shouldMountInstance && tab.sessionBacked && tab.taskRunId && (
-                <WorkerSessionCell tab={tab} taskRunId={tab.taskRunId} visible={!showCompactCard} />
+                <WorkerSessionCell tab={tab} taskRunId={tab.taskRunId} visible={paneVisible} />
               )}
               {shouldMountInstance && !tab.sessionBacked && instanceHandlers && (
                 <TerminalInstance
@@ -855,12 +942,14 @@ function ZoneCellInner({
       {/* Phase 4 — per-zone suggestion chip overlay. Renders nothing
           when the engine has no chip for this zone, keeping cell
           chrome quiet by default. */}
-      {!isParked && <SuggestionChip zoneIdx={zoneIdx} />}
+      {!hideZoneChrome && <SuggestionChip zoneIdx={zoneIdx} />}
 
       {/* Phase 5 — per-zone hover-revealed action cluster (maximize /
           restart / label / export / close). Fades in on cell hover
           via group-hover from the cell's outer div. */}
-      {!isParked && <ZoneHoverActions zoneIdx={zoneIdx} onExportZone={onExportZone} />}
+      {!hideZoneChrome && (
+        <ZoneHoverActions zoneIdx={zoneIdx} labelZone={cosmeticZone} onExportZone={onExportZone} />
+      )}
     </div>
   );
 }
