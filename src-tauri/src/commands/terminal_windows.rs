@@ -721,6 +721,64 @@ pub async fn focus_runner_window(app: tauri::AppHandle, label: String) -> Result
     }
 }
 
+/// Open an elevated (Administrator) PowerShell window via a UAC prompt.
+///
+/// This is a SEPARATE OS window, not a PTY tab: Windows cannot elevate a child
+/// of this non-elevated process in place, and an elevated process could not be
+/// driven by the runner's own PTY plumbing anyway. Resolves once the prompt is
+/// answered — `Err` when the operator declines it (or elevation fails), so the
+/// command bar can say so instead of reporting a window that never opened.
+#[tauri::command]
+pub async fn open_elevated_terminal() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // Single-flight: the call blocks until the UAC prompt is answered, so
+        // repeated invocations would otherwise pile up blocking threads and
+        // stacked prompts.
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+            return Err("an elevation prompt is already open".to_string());
+        }
+        let output = tauri::async_runtime::spawn_blocking(|| {
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                // Message to stderr as plain text: an uncaught error under
+                // -NonInteractive is emitted as CLIXML, not a readable line.
+                "try { Start-Process -FilePath powershell.exe -Verb RunAs -ErrorAction Stop }                  catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }",
+            ])
+            .creation_flags(CREATE_NO_WINDOW);
+            // The wait is human-paced (the UAC prompt), so the bound is generous;
+            // it exists so an unanswered prompt cannot park this thread forever.
+            crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(300))
+        })
+        .await;
+        IN_FLIGHT.store(false, Ordering::Release);
+        let output = output
+            .map_err(|e| format!("elevation task failed: {e}"))?
+            .map_err(|e| format!("could not launch powershell: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.lines().next().unwrap_or("").trim();
+            Err(if detail.is_empty() {
+                "elevation was declined or failed".to_string()
+            } else {
+                format!("elevation was declined or failed: {detail}")
+            })
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("elevated terminals are only supported on Windows".to_string())
+    }
+}
+
 /// Central handling of a pop-out window closing — called from `main.rs`'s
 /// `on_window_event` `CloseRequested` for any non-`"main"` window. Reassigns
 /// the closing window's sessions to `"main"` (never orphans a PTY), emits one

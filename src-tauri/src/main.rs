@@ -3574,6 +3574,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_windows::focus_runner_window,
             commands::terminal_windows::get_window_assignments,
             commands::terminal_windows::list_runner_windows,
+            commands::terminal_windows::open_elevated_terminal,
             commands::terminal_windows::open_terminal_window,
             commands::test_orchestrator::delete_orchestration_plan,
             commands::test_orchestrator::execute_test_orchestration,
