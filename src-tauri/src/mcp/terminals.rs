@@ -218,12 +218,37 @@ pub async fn list_terminals_handler(
     }))))
 }
 
-/// `POST /terminals`' answer to a refused spawn tenant: a 400 naming the
-/// refusal, since a malformed or unpaired tenant is the caller's to fix. The
-/// refusal itself is the shared [`crate::commands::terminal::admit_spawn_tenant`].
+/// `POST /terminals`' answer to a refused spawn tenant. The refusal itself is
+/// the shared [`crate::commands::terminal::admit_spawn_tenant`], whose text
+/// always opens with a stable `terminal:tenant_<kind>:` prefix.
+///
+/// That prefix is lifted into the envelope's top-level `code`
+/// (`TERMINAL_TENANT_<KIND>`) so a client can branch on it. Without one, the
+/// envelope derived the code from the status and a live refusal read
+/// `"code": "INVALID_JSON"` (coord finding `9f2a0a0d`), which is a lie about
+/// what failed. The status follows the kind: an unreadable credential store is
+/// UNKNOWN and not the caller's to fix, so it is a 503 — as the
+/// provision-session door answers it — and every other kind (malformed,
+/// unpaired, a cwd declaring another tenant) is a 400.
 fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
     warn!("HTTP: rejecting terminal create — {refusal}");
-    (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
+    let kind = refusal
+        .strip_prefix("terminal:tenant_")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(kind, _)| kind)
+        .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+    let Some(kind) = kind else {
+        // Not a spawn-tenant refusal text; keep the untyped 400 rather than
+        // inventing a code for it.
+        return (StatusCode::BAD_REQUEST, Json(api_error(refusal)));
+    };
+    let status = if kind == "credential_store_unreadable" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let code = format!("TERMINAL_TENANT_{}", kind.to_ascii_uppercase());
+    (status, Json(ApiResponse::error_with_code(refusal, code)))
 }
 
 /// Create a new terminal session.
@@ -281,7 +306,8 @@ pub async fn create_terminal_handler(
 
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
-    // caller's to fix, so both are a 400 naming the heal.
+    // caller's to fix (a typed 400 naming the heal); an unreadable credential
+    // store is UNKNOWN, so a 503 — see `spawn_tenant_bad_request`.
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
         .map_err(spawn_tenant_bad_request)?;
 
@@ -1106,6 +1132,8 @@ mod tests {
         };
         let (status, Json(body)) = admit(Some(&b.to_string())).expect_err("unpaired → refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Finding 9f2a0a0d: the code is the refusal's own, not status-derived.
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("terminal:tenant_not_paired"), "{text}");
         assert!(
@@ -1113,10 +1141,39 @@ mod tests {
             "{text}"
         );
 
-        let (status, _) = admit(Some("not-a-uuid")).unwrap_err();
+        let (status, Json(body)) = admit(Some("not-a-uuid")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_INVALID"));
         assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
         assert_eq!(admit(None).ok(), Some(None));
+    }
+
+    /// Finding 9f2a0a0d, the other arms: an unreadable credential store is
+    /// UNKNOWN, so 503 with its own code, and a text outside the
+    /// `terminal:tenant_` family keeps the untyped 400 rather than a made-up code.
+    #[test]
+    fn spawn_tenant_refusal_code_and_status_follow_the_refusal_kind() {
+        let (status, Json(body)) = spawn_tenant_bad_request(
+            "terminal:tenant_credential_store_unreadable: tenant x: io error".to_string(),
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
+        );
+
+        let (status, Json(body)) = spawn_tenant_bad_request(
+            "terminal:tenant_workdir_declares_other_tenant: /w/.mcp.json".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
+        );
+
+        let (status, Json(body)) = spawn_tenant_bad_request("something else".to_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code, None);
     }
 
     #[test]
