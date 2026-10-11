@@ -1151,6 +1151,11 @@ pub enum CreateRefusal {
     NoTargetDirectory,
     WorkingDirNotAllowed,
     IntentRepoNotAllowed,
+    /// A declared edit sibling is not on this device's `allowed_intent_repos`,
+    /// the value is not an array of repo names, or a GRANTED create declared
+    /// one at all (no grant names an edit sibling). Plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`.
+    EditSiblingNotAllowed,
     /// The device's own `accept_remote_create` dial reads `same_user`, and the
     /// grant's source user is not this device's paired user — or is not
     /// knowable at all. The LOCAL half of a three-valued dial coord also
@@ -1170,6 +1175,7 @@ impl CreateRefusal {
             CreateRefusal::NoTargetDirectory => "remote_create_no_target_directory",
             CreateRefusal::WorkingDirNotAllowed => "remote_create_working_dir_not_allowed",
             CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
+            CreateRefusal::EditSiblingNotAllowed => "remote_create_edit_sibling_not_allowed",
             CreateRefusal::SourceUserNotAllowed => "remote_create_source_user_not_allowed",
         }
     }
@@ -1205,6 +1211,11 @@ impl CreateRefusal {
             CreateRefusal::IntentRepoNotAllowed => {
                 "the requested intent_repo is not one this device offers for remote creation — \
                  list it in `remote_create.allowed_intent_repos`"
+            }
+            CreateRefusal::EditSiblingNotAllowed => {
+                "edit_siblings must be an array naming only repos this device offers for remote \
+                 creation (`remote_create.allowed_intent_repos`), and a create admitted under a \
+                 grant may declare none — no grant names an edit sibling"
             }
             CreateRefusal::SourceUserNotAllowed => {
                 "this device accepts remote terminal creation only from its OWN user \
@@ -1339,6 +1350,13 @@ pub struct RelayCreate {
     /// exactly the impersonation. The local Tauri command and the loopback HTTP
     /// route, whose callers ARE the initiator, still read it.
     pub agent_session_id: Option<Uuid>,
+    /// The repos the session will EDIT beside `intent_repo` (plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+    /// Each one is REQUESTED in the allocate too (another worktree, another
+    /// coord claim), so it resolves through the SAME device-owned
+    /// `allowed_intent_repos` an `intent_repo` does — empty by default, so a
+    /// relay frame declares none unless this device offers it.
+    pub edit_siblings: Vec<String>,
 }
 
 /// Gate one inbound `terminal_create` that carries **no `remote` block**.
@@ -1391,11 +1409,85 @@ pub fn resolve_relay_create(targets: &CreateTargets, data: &Value) -> Result<Rel
         create_refusal_frame(refusal, data, Some(targets))
     })?;
 
+    let edit_siblings = resolve_create_edit_siblings(targets, data).map_err(|refusal| {
+        warn!(
+            code = refusal.code(),
+            "relay create: refused the requested edit_siblings — a frame with no grant may only \
+             name repos this device offers"
+        );
+        create_refusal_frame(refusal, data, Some(targets))
+    })?;
+
     Ok(RelayCreate {
         working_dir,
         intent_repo,
         agent_session_id: None,
+        edit_siblings,
     })
+}
+
+/// The edit siblings a relay frame declares (`edit_siblings`, or
+/// `editSiblings`), each resolved against this device's `allowed_intent_repos`
+/// exactly as [`resolve_create_intent_repo`] resolves `intent_repo` — an edit
+/// sibling is requested in the allocate, so it allocates a worktree and takes a
+/// claim just as the intent repo does. Absent, `null` or `[]` declares none. A
+/// value that is not an array of strings is refused rather than ignored.
+pub fn resolve_create_edit_siblings(
+    targets: &CreateTargets,
+    data: &Value,
+) -> Result<Vec<String>, CreateRefusal> {
+    let declared: Vec<&Value> = EDIT_SIBLING_KEYS
+        .iter()
+        .filter_map(|k| data.get(*k))
+        .filter(|v| !v.is_null())
+        .collect();
+    let items: Vec<&Value> = match declared.as_slice() {
+        [] => return Ok(Vec::new()),
+        // Both spellings at once is ambiguous; refuse rather than pick one.
+        [raw] => raw
+            .as_array()
+            .ok_or(CreateRefusal::EditSiblingNotAllowed)?
+            .iter()
+            .collect(),
+        _ => return Err(CreateRefusal::EditSiblingNotAllowed),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let requested = item
+            .as_str()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or(CreateRefusal::EditSiblingNotAllowed)?;
+        let offered = targets
+            .repos
+            .iter()
+            .find(|r| r.trim() == requested)
+            .ok_or(CreateRefusal::EditSiblingNotAllowed)?;
+        out.push(offered.clone());
+    }
+    Ok(out)
+}
+
+/// The two wire spellings of a frame's edit siblings.
+const EDIT_SIBLING_KEYS: [&str; 2] = ["edit_siblings", "editSiblings"];
+
+/// Whether a frame declares any edit sibling at all, under either spelling. A
+/// REMOTE (granted) create is refused when it does: the grant answers every
+/// spawn parameter, and no grant names an edit sibling.
+pub fn frame_declares_edit_siblings(data: &Value) -> bool {
+    EDIT_SIBLING_KEYS
+        .iter()
+        .filter_map(|k| data.get(*k))
+        .any(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
+}
+
+/// The refusal for a frame carrying a `remote` block (a GRANTED create) that
+/// also declares edit siblings — decided BEFORE the grant gate, so the refusal
+/// spends no create grant. `None` for every other frame.
+pub fn granted_create_edit_sibling_refusal(data: &Value) -> Option<Value> {
+    let granted = data.get("remote").is_some_and(|b| !b.is_null());
+    (granted && frame_declares_edit_siblings(data))
+        .then(|| create_refusal_frame(CreateRefusal::EditSiblingNotAllowed, data, None))
 }
 
 /// Resolve a remote create's `intent_repo` against this device's allowlist.
@@ -5997,6 +6089,7 @@ mod grant_gate_tests {
             CreateRefusal::NoTargetDirectory,
             CreateRefusal::WorkingDirNotAllowed,
             CreateRefusal::IntentRepoNotAllowed,
+            CreateRefusal::EditSiblingNotAllowed,
         ] {
             assert!(
                 !refusal_warrants_a_coord_reread(GrantFamily::Create, final_refusal.code()),
@@ -6599,6 +6692,98 @@ mod relay_create_tests {
             &json!({ "type": "terminal_create", "intent_repo": "qontinui-runner" })
         )
         .is_err());
+    }
+
+    /// Plan 2026-10-10: an edit sibling is requested in the allocate (a
+    /// worktree AND a claim), so a blockless frame may declare only repos this
+    /// device offers — the same allowlist as `intent_repo`.
+    #[test]
+    fn a_blockless_relay_frame_may_declare_only_offered_edit_siblings() {
+        let ok = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "edit_siblings": ["qontinui-runner"] }),
+        )
+        .expect("an offered repo");
+        assert_eq!(ok.edit_siblings, vec!["qontinui-runner".to_string()]);
+        let camel = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "editSiblings": ["qontinui-runner"] }),
+        )
+        .expect("camelCase spelling");
+        assert_eq!(camel.edit_siblings, vec!["qontinui-runner".to_string()]);
+
+        for bad in [
+            json!(["qontinui-schemas"]),
+            json!(["../x"]),
+            json!([""]),
+            json!([3]),
+            json!("qontinui-runner"),
+        ] {
+            let err = resolve_relay_create(
+                &targets(),
+                &json!({ "type": "terminal_create", "edit_siblings": bad }),
+            )
+            .expect_err("refused");
+            assert_eq!(
+                err["code"], "remote_create_edit_sibling_not_allowed",
+                "{bad}"
+            );
+        }
+
+        let none = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "edit_siblings": null }),
+        )
+        .expect("null declares none");
+        assert!(none.edit_siblings.is_empty());
+        assert!(!frame_declares_edit_siblings(
+            &json!({ "edit_siblings": [] })
+        ));
+        assert!(!frame_declares_edit_siblings(
+            &json!({ "edit_siblings": null })
+        ));
+        assert!(!frame_declares_edit_siblings(&json!({})));
+        assert!(frame_declares_edit_siblings(
+            &json!({ "editSiblings": ["x"] })
+        ));
+        assert!(frame_declares_edit_siblings(
+            &json!({ "edit_siblings": "x" })
+        ));
+
+        // A null snake_case key does not hide a camelCase declaration, and
+        // both spellings at once is refused as ambiguous.
+        let fallback = resolve_relay_create(
+            &targets(),
+            &json!({ "edit_siblings": null, "editSiblings": ["qontinui-runner"] }),
+        )
+        .expect("the non-null spelling is read");
+        assert_eq!(fallback.edit_siblings, vec!["qontinui-runner".to_string()]);
+        assert!(resolve_relay_create(
+            &targets(),
+            &json!({ "edit_siblings": [], "editSiblings": ["qontinui-runner"] }),
+        )
+        .is_err());
+        assert!(frame_declares_edit_siblings(
+            &json!({ "edit_siblings": null, "editSiblings": ["x"] })
+        ));
+
+        // A GRANTED frame (one carrying a `remote` block) that declares edit
+        // siblings is refused before the grant gate; anything else passes.
+        let granted = json!({
+            "remote": { "grant_jti": "j1", "kind": "create" },
+            "editSiblings": ["qontinui-runner"],
+        });
+        let refusal = granted_create_edit_sibling_refusal(&granted).expect("refused");
+        assert_eq!(refusal["code"], "remote_create_edit_sibling_not_allowed");
+        assert_eq!(refusal["grant_jti"], "j1");
+        assert!(granted_create_edit_sibling_refusal(
+            &json!({ "remote": { "grant_jti": "j1" }, "edit_siblings": [] })
+        )
+        .is_none());
+        assert!(granted_create_edit_sibling_refusal(
+            &json!({ "edit_siblings": ["qontinui-runner"] })
+        )
+        .is_none());
     }
 
     /// …and above all it may not name whose claim it takes. This is the field

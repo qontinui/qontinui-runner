@@ -86,6 +86,15 @@ pub struct CreateTerminalRequest {
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
     #[serde(default, alias = "tenant_id")]
     pub tenant_id: Option<String>,
+    /// Repos the session will EDIT beside `intentRepo` (bare or `owner/name`),
+    /// taken off the sibling-store cargo override so its edits reach its build
+    /// (plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+    /// Each is validated before any allocate — a bad name, one with no checkout
+    /// on this device, or a non-empty list with no `intentRepo` is a 400
+    /// `invalid_edit_sibling`.
+    #[serde(default, alias = "edit_siblings")]
+    pub edit_siblings: Vec<String>,
 }
 
 /// Request body for writing data to a terminal.
@@ -226,6 +235,17 @@ fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()
     (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
 }
 
+/// A refused `editSiblings` input → the typed 400 `invalid_edit_sibling`,
+/// answered before any allocation (vet V9).
+pub(crate) fn edit_sibling_bad_request(
+    refusal: crate::agent_worktree::edit_sibling::EditSiblingRefusal,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    warn!("HTTP: rejecting terminal create — {refusal}");
+    let mut body = api_error(refusal.message.clone());
+    body.code = Some(refusal.code().to_string());
+    (StatusCode::BAD_REQUEST, Json(body))
+}
+
 /// Create a new terminal session.
 pub async fn create_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -285,6 +305,15 @@ pub async fn create_terminal_handler(
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
         .map_err(spawn_tenant_bad_request)?;
 
+    // The declared edit siblings are judged here too, before the allocation a
+    // refusal would otherwise leak — and before `acquire_for_terminal`'s
+    // fail-open policy could turn a typo into a pane in the shared checkout.
+    let edit_siblings = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+        request.intent_repo.as_deref(),
+        &request.edit_siblings,
+    )
+    .map_err(edit_sibling_bad_request)?;
+
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
     // terminal_manager.create call sites. `intent_repo == None` is a
@@ -298,6 +327,7 @@ pub async fn create_terminal_handler(
         request.working_dir,
         request.agent_session_id,
         spawn_tenant,
+        &edit_siblings,
     )
     .await;
 
@@ -1117,6 +1147,53 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
         assert_eq!(admit(None).ok(), Some(None));
+    }
+
+    /// Plan 2026-10-10 Phase 2: `editSiblings` and `edit_siblings` both reach
+    /// the field, and an absent one is empty.
+    #[test]
+    fn create_terminal_request_accepts_edit_siblings_both_spellings() {
+        let camel: CreateTerminalRequest = serde_json::from_value(serde_json::json!({
+            "intentRepo": "qontinui-coord",
+            "editSiblings": ["qontinui-schemas"]
+        }))
+        .unwrap();
+        assert_eq!(camel.edit_siblings, vec!["qontinui-schemas".to_string()]);
+        let snake: CreateTerminalRequest = serde_json::from_value(serde_json::json!({
+            "intent_repo": "qontinui-coord",
+            "edit_siblings": ["qontinui/qontinui-schemas"]
+        }))
+        .unwrap();
+        assert_eq!(
+            snake.edit_siblings,
+            vec!["qontinui/qontinui-schemas".to_string()]
+        );
+        let none: CreateTerminalRequest =
+            serde_json::from_value(serde_json::json!({ "intentRepo": "qontinui-coord" })).unwrap();
+        assert!(none.edit_siblings.is_empty());
+    }
+
+    /// Vet V8/V9: a bad element is a typed 400 `invalid_edit_sibling`, decided
+    /// before any allocation.
+    #[test]
+    fn create_terminal_refuses_a_bad_edit_sibling_with_a_typed_400() {
+        let refusal = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+            Some("qontinui-coord"),
+            &["..".to_string()],
+        )
+        .unwrap_err();
+        let (status, Json(body)) = edit_sibling_bad_request(refusal);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("invalid_edit_sibling"));
+        assert!(!body.success);
+        let refusal = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+            None,
+            &["qontinui-schemas".to_string()],
+        )
+        .unwrap_err();
+        let (status, Json(body)) = edit_sibling_bad_request(refusal);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("invalid_edit_sibling"));
     }
 
     #[test]
