@@ -1079,7 +1079,10 @@ mod tests {
     /// out-of-line `mod name;` (trailing `//` comment allowed) is not skipped,
     /// because its code lives in another file the walk visits on its own
     /// ([`test_mod_skip_end`]); files named `tests.rs` or under a `tests/` dir are
-    /// skipped; `//` lines are skipped; the enclosing function is the last
+    /// skipped, and so is any file opening `#![cfg(test)]` — an extracted test
+    /// module carries no in-file span ([`crate::source_lex::is_test_only_file`],
+    /// plan `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b);
+    /// `//` lines are skipped; the enclosing function is the last
     /// `fn <name>` seen above the use.
     fn scan_pin_readers() -> std::collections::BTreeSet<String> {
         let root = src_root();
@@ -1105,30 +1108,64 @@ mod tests {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let src = std::fs::read_to_string(&path).unwrap();
-                let lines: Vec<&str> = src.lines().collect();
-                let mut current_fn = String::from("<none>");
-                let mut i = 0;
-                while i < lines.len() {
-                    let line = lines[i];
-                    if let Some(resume) = test_mod_skip_end(&lines, i) {
-                        i = resume;
-                        continue;
-                    }
-                    if line.trim_start().starts_with("//") {
-                        i += 1;
-                        continue;
-                    }
-                    if let Some(name) = fn_name_on(line) {
-                        current_fn = name;
-                    }
-                    if PIN_READER_TOKENS.iter().any(|t| uses_token(line, t)) {
-                        out.insert(format!("{rel}::{current_fn}"));
-                    }
-                    i += 1;
-                }
+                out.extend(pin_readers_in(&rel, &src));
             }
         }
         out
+    }
+
+    /// The `rel::fn` pin readers in ONE file's text, by the heuristics
+    /// [`scan_pin_readers`] states. A file opening `#![cfg(test)]` reports
+    /// none: an extracted test module carries no in-file span.
+    fn pin_readers_in(rel: &str, src: &str) -> Vec<String> {
+        if crate::source_lex::is_test_only_file(src) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut current_fn = String::from("<none>");
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if let Some(resume) = test_mod_skip_end(&lines, i) {
+                i = resume;
+                continue;
+            }
+            if line.trim_start().starts_with("//") {
+                i += 1;
+                continue;
+            }
+            if let Some(name) = fn_name_on(line) {
+                current_fn = name;
+            }
+            if PIN_READER_TOKENS.iter().any(|t| uses_token(line, t)) {
+                let reader = format!("{rel}::{current_fn}");
+                if !out.contains(&reader) {
+                    out.push(reader);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// An extracted test module is test code end to end; the same read in a
+    /// production file is still reported (the control).
+    #[test]
+    fn an_extracted_test_only_file_is_not_scanned_for_pin_readers() {
+        let tok = PIN_READER_TOKENS[0];
+        let body = format!("fn reads_it() {{\n    let _ = {tok}();\n}}\n");
+        let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+        assert_eq!(
+            pin_readers_in("foo/extracted.rs", &extracted),
+            Vec::<String>::new(),
+            "a `#![cfg(test)]` file's pin read was reported as a production reader"
+        );
+        assert_eq!(
+            pin_readers_in("foo.rs", &body),
+            vec!["foo.rs::reads_it".to_string()],
+            "control: the scan sees the same read in a production file"
+        );
     }
 
     #[test]

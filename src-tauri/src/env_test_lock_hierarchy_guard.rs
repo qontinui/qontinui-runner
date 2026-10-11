@@ -483,12 +483,19 @@ impl<'ast> Visit<'ast> for FnCollector<'_> {
 /// Parse one file's facts. `Err` only when it does not parse.
 fn scan_source(src: &str) -> syn::Result<Vec<FnFacts>> {
     let file = syn::parse_file(src)?;
-    let mut decls = DeclCollector::default();
+    // A file opening `#![cfg(test)]` (an extracted test module) is test scope
+    // end to end; it carries no in-file `#[cfg(test)]` item to push it. Plan
+    // `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b.
+    let file_is_test = crate::source_lex::is_test_only_file(src) || attrs_are_test(&file.attrs);
+    let mut decls = DeclCollector {
+        test_scope: vec![file_is_test],
+        ..DeclCollector::default()
+    };
     decls.visit_file(&file);
     let mut fns = FnCollector {
         lines: src.lines().collect(),
         decls: &decls,
-        test_scope: Vec::new(),
+        test_scope: vec![file_is_test],
         impl_ty: Vec::new(),
         fns: Vec::new(),
     };
@@ -975,4 +982,32 @@ mod tests {
 #[test]
 fn the_guard_refuses_source_it_cannot_parse() {
     assert!(scan_source("static L: Mutex<()> = Mutex::new(()); fn broken( {").is_err());
+}
+
+/// An extracted `#![cfg(test)]` file is test scope end to end: its top-level
+/// test static and lock fn are seen (and here flagged, being inverted). The
+/// same body without the header is production and is not a test lock at all.
+#[test]
+fn an_extracted_test_only_file_is_test_scope() {
+    const BODY: &str = "use std::sync::{Mutex, MutexGuard};\n\
+        static SERIAL: Mutex<()> = Mutex::new(());\n\
+        fn serial() -> MutexGuard<'static, ()> {\n    SERIAL.lock().unwrap()\n}\n";
+    let extracted = format!("#![cfg(test)]\n\nuse super::*;\n{BODY}");
+
+    let fns = scan_source(&extracted).expect("fixture parses");
+    let report = evaluate(&[("foo/tests.rs".to_string(), fns)]);
+    let flagged: Vec<&str> = report.findings.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        flagged,
+        ["serial"],
+        "a `#![cfg(test)]` file's top-level test lock was not seen as test scope"
+    );
+
+    let fns = scan_source(BODY).expect("fixture parses");
+    let report = evaluate(&[("foo.rs".to_string(), fns)]);
+    assert!(
+        report.constructors.is_empty() && report.findings.is_empty(),
+        "control: without the header the same static is production, not a test lock: {:?}",
+        report.findings
+    );
 }

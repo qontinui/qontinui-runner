@@ -57,6 +57,11 @@ pub mod profiles;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
+// The `is_test_only_file` predicate the source-scanning guards share. Owned
+// here, unconditionally and `pub`, so the bin's guards re-export it rather than
+// compiling a second copy (`crate_roots_ratchet`). See the module doc.
+#[doc(hidden)]
+pub mod source_lex;
 pub mod tauri_event_payloads;
 
 // Temp-file-then-rename writer. Owned by the lib and imported by the runner
