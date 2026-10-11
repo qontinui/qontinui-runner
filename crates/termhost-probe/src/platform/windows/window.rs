@@ -27,14 +27,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetLayeredWindowAttributes, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible,
     SetForegroundWindow, ShowWindow, SwitchToThisWindow, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-    GW_HWNDPREV, GW_OWNER, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY, SW_RESTORE,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    GW_HWNDPREV, GW_OWNER, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
+    MONITORINFOF_PRIMARY, SW_RESTORE, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use super::{handle_of, hwnd};
 use crate::clock::qpc_ticks_to_ns;
 use crate::model::WindowSample;
-use crate::platform::common::occlusion;
+use crate::platform::common::{occlusion, pick_by_title};
 use crate::platform::{Refresh, TargetSpec, WindowHandle, WindowInspector};
 use crate::raster::Rect;
 use crate::records::OccluderInfo;
@@ -315,65 +315,88 @@ pub fn resolve(spec: &TargetSpec) -> Result<WindowHandle, String> {
             .max_by_key(|&(_, a)| a)
             .map(|(h, _)| handle_of(h))
             .ok_or_else(|| format!("process {pid} has no visible top-level window")),
-        TargetSpec::Title(t) => top_level_windows()
-            .into_iter()
-            .filter(|&h| title(h).contains(t.as_str()))
-            .filter_map(|h| candidate(h).map(|r| (h, r.area())))
-            .max_by_key(|&(_, a)| a)
-            .map(|(h, _)| handle_of(h))
-            .ok_or_else(|| format!("no visible top-level window title contains {t:?}")),
+        TargetSpec::Title { text, unique } => {
+            if text.trim().is_empty() {
+                return Err("an empty title would match every window".into());
+            }
+            let matches: Vec<(isize, u64)> = top_level_windows()
+                .into_iter()
+                .filter(|&h| title(h).contains(text.as_str()))
+                .filter_map(|h| candidate(h).map(|r| (h.0 as isize, r.area())))
+                .collect();
+            pick_by_title(&matches, text, *unique)
+                .map(|h| handle_of(HWND(h as *mut core::ffi::c_void)))
+        }
     }
 }
 
-/// The refresh interval of the display the window is on: DWM's composition
-/// period, else the monitor's display settings, else an assumed 60 Hz (and
-/// the source says which).
-pub fn refresh(target: WindowHandle) -> Refresh {
+/// DWM's composition period. Since Windows 8.1 the call takes no window and
+/// reports the PRIMARY display, so it is used only for a window on it.
+fn dwm_refresh() -> Option<Refresh> {
     let mut timing = DWM_TIMING_INFO {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
         ..Default::default()
     };
     // SAFETY: cbSize is set; the call writes one struct.
-    if unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing) }.is_ok()
-        && timing.qpcRefreshPeriod > 0
+    if unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing) }.is_err()
+        || timing.qpcRefreshPeriod == 0
     {
-        let ns = qpc_ticks_to_ns(timing.qpcRefreshPeriod as i64);
-        let hz = 1e9 / ns as f64;
-        if (20.0..=500.0).contains(&hz) {
-            return Refresh {
-                hz,
-                ns,
-                source: "DwmGetCompositionTimingInfo".into(),
-            };
-        }
+        return None;
     }
+    let ns = qpc_ticks_to_ns(timing.qpcRefreshPeriod as i64);
+    let hz = 1e9 / ns as f64;
+    (20.0..=500.0).contains(&hz).then(|| Refresh {
+        hz,
+        ns,
+        source: "DwmGetCompositionTimingInfo (primary display)".into(),
+        assumed: false,
+    })
+}
+
+/// The refresh interval of the display the WINDOW is on: its monitor's
+/// display settings — or DWM's precise composition period when that monitor
+/// is the primary one — else an assumed 60 Hz, marked as assumed (KPIs
+/// counted in refresh intervals are then unknown).
+pub fn refresh(target: WindowHandle) -> Refresh {
     // SAFETY: MonitorFromWindow never fails with DEFAULTTONEAREST; the info
-    // and mode structs carry their sizes.
-    unsafe {
+    // struct carries its size.
+    let monitor = unsafe {
         let mon = MonitorFromWindow(hwnd(target), MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        if GetMonitorInfoW(mon, &mut info.monitorInfo).as_bool() {
-            let mut mode = DEVMODEW {
-                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-                ..Default::default()
-            };
-            if EnumDisplaySettingsW(
-                windows::core::PCWSTR(info.szDevice.as_ptr()),
-                ENUM_CURRENT_SETTINGS,
-                &mut mode,
-            )
+        GetMonitorInfoW(mon, &mut info.monitorInfo)
             .as_bool()
-                && mode.dmDisplayFrequency > 1
-            {
-                return Refresh::from_hz(
-                    f64::from(mode.dmDisplayFrequency),
-                    "EnumDisplaySettingsW",
-                );
-            }
+            .then_some(info)
+    };
+    let Some(info) = monitor else {
+        return Refresh::assumed_60("the window's monitor could not be read");
+    };
+    if info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0 {
+        if let Some(r) = dwm_refresh() {
+            return r;
         }
     }
-    Refresh::from_hz(60.0, "assumed (no composition timing or display frequency)")
+    let mut mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: the device name is the NUL-terminated buffer GetMonitorInfoW
+    // filled; the mode struct carries its size.
+    let read = unsafe {
+        EnumDisplaySettingsW(
+            windows::core::PCWSTR(info.szDevice.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut mode,
+        )
+    }
+    .as_bool();
+    if read && mode.dmDisplayFrequency > 1 {
+        return Refresh::from_hz(
+            f64::from(mode.dmDisplayFrequency),
+            "EnumDisplaySettingsW (the window's monitor)",
+        );
+    }
+    Refresh::assumed_60("the window's monitor reports no display frequency")
 }
 
 /// Make `h` the foreground window: the documented route first, then the

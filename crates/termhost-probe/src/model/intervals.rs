@@ -10,6 +10,14 @@
 //! applied to a validity flag. Plan Phase 2: "In every arm, per sample
 //! interval, record whether the measured window is foreground, uncloaked and
 //! unoccluded ... failing intervals are excluded".
+//!
+//! An excluded interval counts toward one catalog reason, in this precedence:
+//! `operator_activity` (real or foreign input — usually WHY focus moved),
+//! then `occluded` (the window was shown not foreground, hidden, cloaked,
+//! minimized or covered), then `harness_error` (the probe could not establish
+//! the window's state or the operator's absence: no sample, a failed query, a
+//! listener that is down or absent). A failure of the probe is never reported
+//! as something the operator or another window did.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,6 +27,7 @@ use crate::records::{InputCounts, IntervalRecord, Ns, OccluderInfo};
 /// The catalog reason an excluded interval counts toward.
 pub const CLASS_OCCLUDED: &str = "occluded";
 pub const CLASS_OPERATOR: &str = "operator_activity";
+pub const CLASS_HARNESS: &str = "harness_error";
 
 /// Whether a real-input monitor is configured for the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,22 +58,15 @@ impl Acc {
     fn add_sample(&mut self, s: &WindowSample) {
         self.samples += 1;
         let mut unknown = false;
-        match s.foreground {
-            Some(true) => {}
-            Some(false) => self.not_foreground += 1,
+        let mut tally = |state: Option<bool>, bad_when: bool, counter: &mut u32| match state {
+            Some(v) if v == bad_when => *counter += 1,
+            Some(_) => {}
             None => unknown = true,
-        }
-        match s.visible {
-            Some(true) => {}
-            Some(false) => self.not_visible += 1,
-            None => unknown = true,
-        }
-        if s.cloaked == Some(true) {
-            self.cloaked += 1;
-        }
-        if s.minimized == Some(true) {
-            self.minimized += 1;
-        }
+        };
+        tally(s.foreground, false, &mut self.not_foreground);
+        tally(s.visible, false, &mut self.not_visible);
+        tally(s.cloaked, true, &mut self.cloaked);
+        tally(s.minimized, true, &mut self.minimized);
         match s.occluded_fraction {
             Some(f) if f > 0.0 => {
                 self.occluded += 1;
@@ -99,6 +101,46 @@ impl Acc {
                 super::InputDevice::Other => self.real_input.other += 1,
             },
         }
+    }
+}
+
+/// The validity verdict over the full intervals of a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub valid: u64,
+    pub occluded: u64,
+    pub operator: u64,
+    pub harness: u64,
+}
+
+impl Tally {
+    pub fn total(&self) -> u64 {
+        self.valid + self.excluded()
+    }
+
+    pub fn excluded(&self) -> u64 {
+        self.occluded + self.operator + self.harness
+    }
+
+    /// The reason the most excluded intervals count toward (ties go to the
+    /// earlier class in the module's precedence); `None` when none was
+    /// excluded.
+    pub fn dominant_class(&self) -> Option<&'static str> {
+        [
+            (self.operator, CLASS_OPERATOR),
+            (self.occluded, CLASS_OCCLUDED),
+            (self.harness, CLASS_HARNESS),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .fold(
+            None,
+            |best: Option<(u64, &'static str)>, (n, c)| match best {
+                Some((m, _)) if m >= n => best,
+                _ => Some((n, c)),
+            },
+        )
+        .map(|(_, c)| c)
     }
 }
 
@@ -155,25 +197,44 @@ impl Intervals {
         }
     }
 
-    pub fn add_input(&mut self, e: &InputObs) {
+    /// Count an input event. Non-probe input that arrives after its interval
+    /// closed still taints it: the closed record is changed, and returned
+    /// (marked `amended`) when its verdict changed, for the caller to re-emit.
+    pub fn add_input(&mut self, e: &InputObs) -> Option<IntervalRecord> {
         if let Some(i) = self.index_of(e.t_ns) {
             self.open.entry(i).or_default().add_input(e);
-        } else if e.origin != InputOrigin::Probe {
-            // Real input that arrives after its interval closed still taints
-            // it: invalidate the closed record rather than drop the event.
-            if let Some(rec) = self.closed_at_mut(e.t_ns) {
+            return None;
+        }
+        if e.origin == InputOrigin::Probe {
+            return None;
+        }
+        let rec = self.closed_at_mut(e.t_ns)?;
+        let before = (rec.valid, rec.exclusion_class);
+        match e.origin {
+            InputOrigin::ForeignInjected => {
+                rec.foreign_injected += 1;
+                if !rec.excluded.contains(&"foreign_injection") {
+                    rec.excluded.push("foreign_injection");
+                }
+            }
+            _ => {
                 match e.device {
                     super::InputDevice::Keyboard => rec.real_input.keyboard += 1,
                     super::InputDevice::Pointer => rec.real_input.pointer += 1,
                     super::InputDevice::Other => rec.real_input.other += 1,
                 }
-                rec.valid = false;
                 if !rec.excluded.contains(&"operator_input") {
                     rec.excluded.push("operator_input");
                 }
-                rec.exclusion_class = Some(CLASS_OPERATOR);
             }
         }
+        rec.valid = false;
+        rec.exclusion_class = Some(CLASS_OPERATOR);
+        if (rec.valid, rec.exclusion_class) == before {
+            return None;
+        }
+        rec.amended = true;
+        Some(rec.clone())
     }
 
     fn closed_at_mut(&mut self, t_ns: u64) -> Option<&mut IntervalRecord> {
@@ -220,22 +281,28 @@ impl Intervals {
         let b = partial_end.unwrap_or(full_b);
         let monitor = self.monitor_state(a, b);
         let mut excluded = Vec::new();
+        let mut harness_failed = false;
         if acc.samples == 0 {
             excluded.push("no_samples");
+            harness_failed = true;
         }
+        let mut visibility_failed = false;
         for (n, why) in [
             (acc.not_foreground, "not_foreground"),
             (acc.not_visible, "not_visible"),
             (acc.cloaked, "cloaked"),
             (acc.minimized, "minimized"),
             (acc.occluded, "occluded"),
-            (acc.state_unknown, "state_unknown"),
         ] {
             if n > 0 {
                 excluded.push(why);
+                visibility_failed = true;
             }
         }
-        let visibility_failed = !excluded.is_empty();
+        if acc.state_unknown > 0 {
+            excluded.push("state_unknown");
+            harness_failed = true;
+        }
         let mut operator_failed = false;
         if acc.real_input.total() > 0 {
             excluded.push("operator_input");
@@ -248,20 +315,20 @@ impl Intervals {
         match monitor {
             "down" => {
                 excluded.push("monitor_down");
-                operator_failed = true;
+                harness_failed = true;
             }
             "absent" => {
                 excluded.push("monitor_absent");
-                operator_failed = true;
+                harness_failed = true;
             }
             _ => {}
         }
-        // Operator activity takes precedence: an operator using the machine is
-        // usually WHY the window lost focus or was covered.
         let exclusion_class = if operator_failed {
             Some(CLASS_OPERATOR)
         } else if visibility_failed {
             Some(CLASS_OCCLUDED)
+        } else if harness_failed {
+            Some(CLASS_HARNESS)
         } else {
             None
         };
@@ -288,6 +355,7 @@ impl Intervals {
             valid: exclusion_class.is_none(),
             excluded,
             exclusion_class,
+            amended: false,
         }
     }
 
@@ -335,6 +403,11 @@ impl Intervals {
         self.closed.iter().filter(|r| !r.partial)
     }
 
+    /// The end of the last closed full interval, if any.
+    pub fn last_full_end(&self) -> Option<u64> {
+        self.full().map(|r| r.t_end_ns.0).max()
+    }
+
     /// True when every closed interval overlapping `[a, b]` is valid and not
     /// partial; false when any is invalid or the span is not fully closed.
     pub fn span_valid(&self, a: u64, b: u64) -> bool {
@@ -351,20 +424,18 @@ impl Intervals {
         })
     }
 
-    /// The validity verdict over the run: (valid, excluded-for-occlusion,
-    /// excluded-for-operator-activity) among full intervals.
-    pub fn tally(&self) -> (u64, u64, u64) {
-        let mut valid = 0;
-        let mut occluded = 0;
-        let mut operator = 0;
+    /// The validity verdict over the run's full intervals.
+    pub fn tally(&self) -> Tally {
+        let mut t = Tally::default();
         for r in self.full() {
             match r.exclusion_class {
-                None => valid += 1,
-                Some(CLASS_OCCLUDED) => occluded += 1,
-                Some(_) => operator += 1,
+                None => t.valid += 1,
+                Some(CLASS_OCCLUDED) => t.occluded += 1,
+                Some(CLASS_OPERATOR) => t.operator += 1,
+                Some(_) => t.harness += 1,
             }
         }
-        (valid, occluded, operator)
+        t
     }
 }
 
@@ -403,7 +474,8 @@ mod tests {
         let recs = iv.close_until(2000 * MS);
         assert_eq!(recs.len(), 4);
         assert!(recs.iter().all(|r| r.valid), "{recs:?}");
-        assert_eq!(iv.tally(), (4, 0, 0));
+        assert_eq!(iv.tally().valid, 4);
+        assert_eq!(iv.tally().excluded(), 0);
     }
 
     #[test]
@@ -429,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_state_is_never_valid() {
+    fn unknown_state_is_never_valid_and_blames_the_harness() {
         let mut iv = Intervals::new(0, 500 * MS, MonitorPresence::Configured);
         feed(&mut iv, 0, 500 * MS, |t| WindowSample {
             occluded_fraction: None,
@@ -438,9 +510,32 @@ mod tests {
         let recs = iv.close_until(1000 * MS);
         assert!(!recs[0].valid);
         assert!(recs[0].excluded.contains(&"state_unknown"));
-        // No samples at all is invalid too.
+        assert_eq!(recs[0].exclusion_class, Some(CLASS_HARNESS));
+        // No samples at all is invalid too — the probe could not look.
         assert!(!recs[1].valid);
         assert!(recs[1].excluded.contains(&"no_samples"));
+        assert_eq!(recs[1].exclusion_class, Some(CLASS_HARNESS));
+    }
+
+    #[test]
+    fn an_unestablished_cloak_or_minimize_state_counts_against_the_interval() {
+        for sample in [
+            |t| WindowSample {
+                cloaked: None,
+                ..good(t)
+            },
+            |t| WindowSample {
+                minimized: None,
+                ..good(t)
+            },
+        ] as [fn(u64) -> WindowSample; 2]
+        {
+            let mut iv = Intervals::new(0, 500 * MS, MonitorPresence::Configured);
+            feed(&mut iv, 0, 500 * MS, sample);
+            let recs = iv.close_until(500 * MS);
+            assert!(!recs[0].valid, "{:?}", recs[0]);
+            assert!(recs[0].excluded.contains(&"state_unknown"));
+        }
     }
 
     #[test]
@@ -465,26 +560,38 @@ mod tests {
     }
 
     #[test]
-    fn late_real_input_invalidates_a_closed_interval() {
+    fn late_real_input_invalidates_a_closed_interval_and_says_so() {
         let mut iv = Intervals::new(0, 500 * MS, MonitorPresence::Configured);
         feed(&mut iv, 0, 500 * MS, good);
         assert!(iv.close_until(500 * MS)[0].valid);
-        iv.add_input(&InputObs {
-            t_ns: 200 * MS,
-            device: InputDevice::Keyboard,
-            origin: InputOrigin::Real,
-        });
+        let amended = iv
+            .add_input(&InputObs {
+                t_ns: 200 * MS,
+                device: InputDevice::Keyboard,
+                origin: InputOrigin::Real,
+            })
+            .expect("the verdict changed, so an amended record is returned");
+        assert!(amended.amended && !amended.valid);
+        assert_eq!(amended.exclusion_class, Some(CLASS_OPERATOR));
         assert!(!iv.closed()[0].valid);
-        assert_eq!(iv.tally(), (0, 0, 1));
+        assert_eq!(iv.tally().operator, 1);
+        // More late input of the same kind changes nothing further.
+        assert!(iv
+            .add_input(&InputObs {
+                t_ns: 300 * MS,
+                device: InputDevice::Keyboard,
+                origin: InputOrigin::Real,
+            })
+            .is_none());
     }
 
     #[test]
-    fn an_absent_or_failed_monitor_cannot_vouch_for_an_interval() {
+    fn an_absent_or_failed_monitor_is_a_harness_failure_not_the_operator() {
         let mut iv = Intervals::new(0, 500 * MS, MonitorPresence::Absent);
         feed(&mut iv, 0, 500 * MS, good);
         let recs = iv.close_until(500 * MS);
         assert_eq!(recs[0].monitor, "absent");
-        assert_eq!(recs[0].exclusion_class, Some(CLASS_OPERATOR));
+        assert_eq!(recs[0].exclusion_class, Some(CLASS_HARNESS));
 
         let mut iv = Intervals::new(0, 500 * MS, MonitorPresence::Configured);
         feed(&mut iv, 0, 1500 * MS, good);
@@ -493,6 +600,7 @@ mod tests {
         let recs = iv.close_until(1500 * MS);
         assert!(recs[0].valid);
         assert_eq!(recs[1].monitor, "down");
+        assert_eq!(recs[1].exclusion_class, Some(CLASS_HARNESS));
         assert!(recs[2].valid);
     }
 
@@ -503,7 +611,8 @@ mod tests {
         let recs = iv.finish(700 * MS);
         assert_eq!(recs.len(), 2);
         assert!(recs[1].partial);
-        assert_eq!(iv.tally(), (1, 0, 0));
+        assert_eq!(iv.tally().valid, 1);
+        assert_eq!(iv.last_full_end(), Some(500 * MS));
     }
 
     #[test]
@@ -521,5 +630,24 @@ mod tests {
         assert!(!iv.span_valid(400 * MS, 1100 * MS));
         assert!(iv.span_valid(1000 * MS, 1400 * MS));
         assert!(!iv.span_valid(1000 * MS, 1600 * MS), "not yet closed");
+    }
+
+    #[test]
+    fn the_dominant_exclusion_class_follows_counts_then_precedence() {
+        let t = Tally {
+            valid: 1,
+            occluded: 2,
+            operator: 2,
+            harness: 9,
+        };
+        assert_eq!(t.dominant_class(), Some(CLASS_HARNESS));
+        let t = Tally {
+            valid: 1,
+            occluded: 2,
+            operator: 2,
+            harness: 0,
+        };
+        assert_eq!(t.dominant_class(), Some(CLASS_OPERATOR));
+        assert_eq!(Tally::default().dominant_class(), None);
     }
 }

@@ -210,7 +210,8 @@ impl X11Source {
                     t_ns,
                     view,
                     origin,
-                    missed: 0,
+                    // X11 damage cannot say how many frames were skipped.
+                    missed: None,
                     window_size,
                 });
             }
@@ -236,7 +237,8 @@ impl X11Source {
                     t_ns,
                     view,
                     origin,
-                    missed: 0,
+                    // X11 damage cannot say how many frames were skipped.
+                    missed: None,
                     window_size,
                 });
             }

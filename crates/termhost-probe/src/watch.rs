@@ -9,6 +9,11 @@
 //! (`<run-dir>/stop`, the same file that stops the generators), on Ctrl+C, on
 //! stdin EOF (`--stdin-stop`), or when the window closes — and always writes
 //! its summary.
+//!
+//! The run directory is also where `watch` reads the generators'
+//! `gen-<k>.jsonl` (emitted markers and schedules) and `slot-<k>` files
+//! (workload membership), and a co-running `inject`'s `inject.jsonl` (the keys
+//! it announces before sending them, so they count as the probe's own).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,12 +28,14 @@ use crate::feed::GenFeed;
 use crate::model::{FramesMode, ModelConfig, MonitorPresence};
 use crate::platform::{stop_requested, Host, Tagging, TargetSpec};
 use crate::records::{
-    CaptureRecord, EndRecord, IncidentRecord, Ns, Record, Sink, SourceId, StartRecord,
+    CaptureRecord, EndRecord, FileMode, IncidentRecord, Ns, Record, Sink, SourceId, StartRecord,
 };
 use crate::sampler::{Sampler, SamplerConfig};
 
 /// The stop file the generators also watch.
 pub const STOP_FILE: &str = "stop";
+/// The file `inject` writes in the same run directory.
+pub const INJECT_LOG: &str = "inject.jsonl";
 
 #[derive(Clone, Debug)]
 pub struct WatchConfig {
@@ -66,19 +73,14 @@ pub fn start_record(subcommand: &'static str, args: &[String], tag: Option<u32>)
     })
 }
 
-fn incident(
-    kind: &'static str,
-    detail: String,
-    stops_run: bool,
-    source: Option<SourceId>,
-) -> Record {
-    Record::Incident(IncidentRecord {
-        kind,
-        at: wall_rfc3339(),
-        detail,
-        stops_run,
-        source,
-    })
+/// The primary source: the first opened source that can be primary (never
+/// Desktop Duplication, which sees the whole desktop's updates, not the
+/// window's), and the secondary: DDA cross-checking a WGC primary.
+pub fn choose_sources(opened: &[SourceId]) -> (Option<SourceId>, Option<SourceId>) {
+    let primary = opened.iter().copied().find(|s| s.can_be_primary());
+    let secondary = (primary == Some(SourceId::Wgc) && opened.contains(&SourceId::Dda))
+        .then_some(SourceId::Dda);
+    (primary, secondary)
 }
 
 fn stdin_eof_flag() -> Arc<AtomicBool> {
@@ -97,19 +99,18 @@ pub fn run(host: &mut dyn Host, cfg: &WatchConfig) -> Result<i32> {
     std::fs::create_dir_all(&cfg.run_dir)
         .with_context(|| format!("creating {}", cfg.run_dir.display()))?;
     let path = cfg.run_dir.join("probe.jsonl");
-    let mut sink = Sink::to_file(&path, cfg.echo_stdout)
+    let mut sink = Sink::create(&path, cfg.echo_stdout, FileMode::New)
         .with_context(|| format!("opening {}", path.display()))?;
     sink.emit(&start_record("watch", &cfg.args, cfg.tag));
 
     let target = match host.resolve_target(&cfg.target) {
         Ok(t) => t,
         Err(why) => {
-            sink.emit(&incident(
+            sink.emit(&Record::Incident(IncidentRecord::new(
                 "harness_error",
                 format!("target window not found: {why}"),
                 true,
-                None,
-            ));
+            )));
             sink.emit(&Record::End(EndRecord {
                 t_ns: Ns(now_ns()),
                 exit_code: 1,
@@ -127,72 +128,72 @@ pub fn run(host: &mut dyn Host, cfg: &WatchConfig) -> Result<i32> {
     };
     let mut sources = Vec::new();
     for &kind in &kinds {
-        match host.open_source(kind, target) {
+        let (state, detail) = match host.open_source(kind, target) {
             Ok(s) => {
-                sink.emit(&Record::Capture(CaptureRecord {
-                    source: kind,
-                    state: "started",
-                    target: target.to_string(),
-                    detail: s.describe(),
-                    refresh_hz: refresh.hz,
-                    refresh_source: refresh.source.clone(),
-                }));
+                let d = s.describe();
                 sources.push(s);
+                ("started", d)
             }
-            Err(why) => sink.emit(&Record::Capture(CaptureRecord {
-                source: kind,
-                state: "failed",
-                target: target.to_string(),
-                detail: why,
-                refresh_hz: refresh.hz,
-                refresh_source: refresh.source.clone(),
-            })),
-        }
+            Err(why) => ("failed", why),
+        };
+        sink.emit(&Record::Capture(CaptureRecord {
+            source: kind,
+            state,
+            target: target.to_string(),
+            detail,
+            refresh_hz: refresh.hz,
+            refresh_source: refresh.source.clone(),
+            refresh_assumed: refresh.assumed,
+        }));
     }
     let opened: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
-    let primary = opened
-        .first()
-        .copied()
-        .or(kinds.first().copied())
-        .unwrap_or(SourceId::Synthetic);
-    let secondary =
-        (primary == SourceId::Wgc && opened.contains(&SourceId::Dda)).then_some(SourceId::Dda);
-    if opened.is_empty() {
-        sink.emit(&incident(
+    let (primary, secondary) = choose_sources(&opened);
+    if primary.is_none() {
+        sink.emit(&Record::Incident(IncidentRecord::new(
             "capture_lost",
-            "no capture source could be opened; capture KPIs will be unknown".into(),
+            if opened.contains(&SourceId::Dda) {
+                "only Desktop Duplication opened: it reports the whole desktop's updates, not the window's, so it is never the primary source; capture KPIs are unknown(capture_unavailable)".to_string()
+            } else {
+                "no capture source could be opened; capture KPIs are unknown(capture_unavailable)"
+                    .to_string()
+            },
             false,
-            None,
-        ));
+        )));
     }
 
     let mut tagging = Tagging::new();
     if let Some(t) = cfg.tag {
         tagging.tag = t;
     }
+    // Keys a co-running `inject` announces before sending them.
+    tagging.ledger_file(&cfg.run_dir.join(INJECT_LOG));
     let monitor = host.input_monitor(&tagging);
     if let Err(why) = &monitor {
-        sink.emit(&incident(
+        sink.emit(&Record::Incident(IncidentRecord::new(
             "harness_error",
             format!("the real-input listener could not start, so no interval can be shown free of operator input: {why}"),
             false,
-            None,
-        ));
+        )));
     }
     let inspector = match host.inspector(target) {
         Ok(i) => Some(i),
         Err(why) => {
-            sink.emit(&incident(
+            sink.emit(&Record::Incident(IncidentRecord::new(
                 "harness_error",
                 format!("no window inspector: {why}"),
                 false,
-                None,
-            ));
+            )));
             None
         }
     };
 
-    let mut mc = ModelConfig::new(primary, secondary, refresh.ns);
+    let mut mc = ModelConfig::new(
+        primary.unwrap_or(SourceId::Synthetic),
+        secondary,
+        refresh.ns,
+    );
+    mc.refresh_assumed = refresh.assumed;
+    mc.capture_available = primary.is_some();
     mc.min_valid_intervals = cfg.min_valid_intervals;
     mc.frames = cfg.frames;
     mc.monitor = if monitor.is_ok() {
@@ -208,17 +209,17 @@ pub fn run(host: &mut dyn Host, cfg: &WatchConfig) -> Result<i32> {
     setup.inspector = inspector;
     setup.input = monitor.as_ref().ok().map(|m| m.bus.subscribe());
     setup.feeds = vec![Box::new(GenFeed::new(&cfg.run_dir))];
-    if !cfg.host_pids.is_empty() || cfg.compositor || cfg.run_id.is_some() {
-        setup.sampler = Some(Sampler::new(
-            SamplerConfig {
-                host_pids: cfg.host_pids.clone(),
-                run_id: cfg.run_id.clone(),
-                compositor: cfg.compositor,
-                display: std::env::var("DISPLAY").ok(),
-            },
-            host.process_reader(),
-        ));
-    }
+    setup.sampler = Some(Sampler::new(
+        SamplerConfig {
+            host_pids: cfg.host_pids.clone(),
+            run_id: cfg.run_id.clone(),
+            compositor: cfg.compositor,
+            display: std::env::var("DISPLAY").ok(),
+            run_dir: Some(cfg.run_dir.clone()),
+            probe_pid: Some(std::process::id()),
+        },
+        host.process_reader(),
+    ));
 
     let t_start = now_ns();
     let deadline = cfg.duration.map(|d| t_start + d.as_nanos() as u64);
@@ -242,7 +243,7 @@ pub fn run(host: &mut dyn Host, cfg: &WatchConfig) -> Result<i32> {
         {
             break "stdin closed".to_string();
         }
-        if let Some(why) = engine.ended_sources().get(&primary) {
+        if let Some(why) = primary.and_then(|p| engine.ended_sources().get(&p)) {
             break format!("the primary capture source ended: {why}");
         }
     };
@@ -265,4 +266,20 @@ pub fn run(host: &mut dyn Host, cfg: &WatchConfig) -> Result<i32> {
 
 fn stop_file_present(p: &Path) -> bool {
     p.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_duplication_is_never_promoted_to_primary() {
+        use SourceId::{Dda, Wgc, X11};
+        assert_eq!(choose_sources(&[Wgc, Dda]), (Some(Wgc), Some(Dda)));
+        assert_eq!(choose_sources(&[Wgc]), (Some(Wgc), None));
+        assert_eq!(choose_sources(&[X11]), (Some(X11), None));
+        // WGC failed to open: DDA would measure the desktop, not the window.
+        assert_eq!(choose_sources(&[Dda]), (None, None));
+        assert_eq!(choose_sources(&[]), (None, None));
+    }
 }

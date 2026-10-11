@@ -96,7 +96,7 @@ impl Host for RealHost {
         Err(WHY.into())
     }
     fn refresh(&mut self, _target: WindowHandle) -> Refresh {
-        Refresh::from_hz(60.0, "assumed (unsupported platform)")
+        Refresh::assumed_60("unsupported platform")
     }
     fn process_reader(&mut self) -> Box<dyn ProcessReader> {
         Box::new(NoProcesses)

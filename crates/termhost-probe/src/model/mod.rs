@@ -4,9 +4,10 @@
 //!
 //! Inputs: frames (with decoded markers) from capture sources, window-state
 //! samples, real-input observations, the markers the workload emitted (from
-//! the generators' `gen-<k>.jsonl`, or the selftest's own schedule), and
-//! process samples. Outputs: `frame` / `first_seen` / `interval` / `hang` /
-//! `crosscheck` records as they become final, and a [`WatchSummary`].
+//! the generators' `gen-<k>.jsonl`, or the selftest's own schedule) and the
+//! generators' schedules, and process samples. Outputs: `frame` / `first_seen`
+//! / `interval` / `hang` / `crosscheck` records as they become final (and
+//! amended records when late input changes a verdict), and a [`WatchSummary`].
 
 pub mod analysis;
 pub mod intervals;
@@ -14,14 +15,18 @@ pub mod intervals;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::codec::{marker_seq, Marker, MarkerKind};
+use crate::raster::Rect;
 use crate::records::{
-    FirstSeenRecord, FrameRecord, HangRecord, MarkerObs, Ns, OccluderInfo, ProcessSummary, Record,
-    SampleRecord, SourceId, WatchSummary,
+    FirstSeenRecord, FrameRecord, HangRecord, MarkerObs, Ns, OccluderInfo, ProbeHealth,
+    ProcessSummary, Record, SampleRecord, SourceId, WatchSummary,
 };
+use crate::sampler::{GROUP_HOST, NOTE_EMPTY, NOTE_UNREADABLE};
 use crate::stats::{self, KpiValue};
 
 pub use analysis::FirstSeen;
-pub use intervals::{Intervals, MonitorPresence, CLASS_OCCLUDED, CLASS_OPERATOR};
+pub use intervals::{
+    Intervals, MonitorPresence, Tally, CLASS_HARNESS, CLASS_OCCLUDED, CLASS_OPERATOR,
+};
 
 /// One captured frame, already scanned.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,9 +36,18 @@ pub struct FrameObs {
     pub t_ns: u64,
     pub width: u32,
     pub height: u32,
+    /// The part of the window this frame shows, in window pixels: the whole
+    /// window for WGC and Desktop Duplication, the damaged band for X11.
+    pub region: Rect,
     pub markers: Vec<MarkerObs>,
     pub rejected: u32,
-    pub missed: u32,
+    /// Frames the source coalesced into this one; `None` for a source that
+    /// cannot tell.
+    pub missed: Option<u32>,
+    /// How long the probe took to scan the frame.
+    pub scan_ns: u64,
+    /// How long after `t_ns` the probe received the frame.
+    pub lag_ns: u64,
 }
 
 /// The measured window's state at one instant. `None` = could not be
@@ -101,6 +115,28 @@ pub struct Emitted {
     pub source: EmitSource,
 }
 
+/// A generator's marker schedule, from its `start` record: marker tick k is
+/// due at `t0 + floor(k * 1e6 / marker_hz)` us (Phase 1's `schedule.mjs`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenSchedule {
+    pub session: u16,
+    pub t0_ns: u64,
+    pub marker_hz: f64,
+    /// A load run (markers tick); a calibration run paints one static marker.
+    pub load: bool,
+}
+
+impl GenSchedule {
+    /// When marker tick `k` is due.
+    pub fn due_ns(&self, k: u64) -> Option<u64> {
+        if !self.load || self.marker_hz.is_nan() || self.marker_hz <= 0.0 {
+            return None;
+        }
+        let us = (k as f64 * 1e6 / self.marker_hz).floor();
+        (us.is_finite() && us >= 0.0).then(|| self.t0_ns.saturating_add(us as u64 * 1000))
+    }
+}
+
 /// Which frames get a `frame` record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FramesMode {
@@ -116,6 +152,14 @@ pub struct ModelConfig {
     pub primary: SourceId,
     pub secondary: Option<SourceId>,
     pub refresh_ns: u64,
+    /// The display reported no refresh rate; `refresh_ns` is an assumption.
+    pub refresh_assumed: bool,
+    /// A source able to be primary was opened; without one every capture KPI
+    /// is unknown(capture_unavailable).
+    pub capture_available: bool,
+    /// The run receives injection times (the selftest); `watch` does not, so
+    /// its `input_latency_ms` is unknown(not_instrumented).
+    pub input_instrumented: bool,
     pub interval_ns: u64,
     /// How long after an interval ends it stays open for late samples.
     pub interval_grace_ns: u64,
@@ -125,14 +169,22 @@ pub struct ModelConfig {
     pub expect_visible: Option<BTreeSet<u16>>,
     pub frames: FramesMode,
     pub monitor: MonitorPresence,
+    /// A primary frame received later than this after its time means the
+    /// probe was not keeping up (WGC's three-buffer pool is full after about
+    /// three refresh intervals, and then drops frames).
+    pub lag_bound_ns: u64,
 }
 
 impl ModelConfig {
     pub fn new(primary: SourceId, secondary: Option<SourceId>, refresh_ns: u64) -> Self {
+        let refresh_ns = refresh_ns.max(1);
         ModelConfig {
             primary,
             secondary,
-            refresh_ns: refresh_ns.max(1),
+            refresh_ns,
+            refresh_assumed: false,
+            capture_available: true,
+            input_instrumented: false,
             interval_ns: 500_000_000,
             interval_grace_ns: 150_000_000,
             hang_after_ns: 2_000_000_000,
@@ -140,6 +192,7 @@ impl ModelConfig {
             expect_visible: None,
             frames: FramesMode::All,
             monitor: MonitorPresence::Configured,
+            lag_bound_ns: (3 * refresh_ns).max(50_000_000),
         }
     }
 }
@@ -152,6 +205,8 @@ struct Episode {
     last_stalled_ns: u64,
     no_update: bool,
     os_hung: bool,
+    /// Still in progress when the run ended.
+    open_at_end: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,6 +215,8 @@ struct GroupAcc {
     gpu: Vec<f64>,
     memory_end: Option<f64>,
     samples: u64,
+    empty: u64,
+    unreadable: u64,
 }
 
 /// The engine state.
@@ -171,15 +228,33 @@ pub struct Model {
     frame_counts: BTreeMap<SourceId, u64>,
     primary_frames: Vec<u64>,
     last_markers: HashMap<SourceId, Vec<Marker>>,
+    /// Per source: each session's displayed output marker rectangle.
+    displayed: HashMap<SourceId, BTreeMap<u16, Rect>>,
     v_samples: Vec<u32>,
     sessions_seen: BTreeSet<u16>,
     emitted: BTreeMap<(EmitSource, u16, MarkerKind), Vec<Emitted>>,
+    schedules: BTreeMap<u16, (GenSchedule, Option<u64>)>,
+    /// The highest output sequence each generator session has logged.
+    last_logged: BTreeMap<u16, u64>,
     intervals: Intervals,
     active_hang: Option<Episode>,
     hangs: Vec<(Episode, bool)>,
     groups: BTreeMap<&'static str, GroupAcc>,
+    host_sampled: bool,
     crashes: u64,
+    lags: Vec<u64>,
+    scans: Vec<u64>,
     finished: bool,
+}
+
+/// `inner` lies wholly inside `outer`.
+fn contains(outer: &Rect, inner: &Rect) -> bool {
+    outer.intersect(inner).as_ref() == Some(inner)
+}
+
+/// A nearest-rank percentile of nanosecond samples, in milliseconds.
+fn pct_ms(sorted: &[u64], p: u32) -> Option<f64> {
+    (!sorted.is_empty()).then(|| sorted[stats::nearest_rank(p, sorted.len()) - 1] as f64 / 1e6)
 }
 
 impl Model {
@@ -193,14 +268,20 @@ impl Model {
             frame_counts: BTreeMap::new(),
             primary_frames: Vec::new(),
             last_markers: HashMap::new(),
+            displayed: HashMap::new(),
             v_samples: Vec::new(),
             sessions_seen: BTreeSet::new(),
             emitted: BTreeMap::new(),
+            schedules: BTreeMap::new(),
+            last_logged: BTreeMap::new(),
             intervals,
             active_hang: None,
             hangs: Vec::new(),
             groups: BTreeMap::new(),
+            host_sampled: false,
             crashes: 0,
+            lags: Vec::new(),
+            scans: Vec::new(),
             finished: false,
         }
     }
@@ -230,7 +311,7 @@ impl Model {
         &self.sessions_seen
     }
 
-    /// Hang episodes so far: (start, end, kinds, valid).
+    /// Hang episodes so far: (start, end, no_update, os_hung, valid).
     pub fn hang_episodes(&self) -> Vec<(u64, u64, bool, bool, bool)> {
         self.hangs
             .iter()
@@ -242,18 +323,28 @@ impl Model {
     pub fn on_frame(&mut self, f: FrameObs) -> Vec<Record> {
         let mut out = Vec::new();
         *self.frame_counts.entry(f.source).or_default() += 1;
-        let distinct: BTreeSet<u16> = f
-            .markers
-            .iter()
-            .filter(|m| m.kind == MarkerKind::Output)
-            .map(|m| m.session)
-            .collect();
-        if f.source == self.cfg.primary {
+        // V: sessions displayed now. A frame re-reads its region, so markers
+        // known inside it are replaced by what it shows; markers elsewhere
+        // (outside an X11 damage band) are still on screen.
+        let shown = self.displayed.entry(f.source).or_default();
+        shown.retain(|_, r| !contains(&f.region, r));
+        for m in f.markers.iter().filter(|m| m.kind == MarkerKind::Output) {
+            shown.insert(m.session, m.rect);
+        }
+        let v = shown.len() as u32;
+        if f.source == self.cfg.primary && self.cfg.capture_available {
             let at = self.primary_frames.partition_point(|&t| t <= f.t_ns);
             self.primary_frames.insert(at, f.t_ns);
             self.intervals.note_frame(f.t_ns);
-            self.v_samples.push(distinct.len() as u32);
-            self.sessions_seen.extend(distinct.iter().copied());
+            self.v_samples.push(v);
+            self.sessions_seen.extend(
+                f.markers
+                    .iter()
+                    .filter(|m| m.kind == MarkerKind::Output)
+                    .map(|m| m.session),
+            );
+            self.lags.push(f.lag_ns);
+            self.scans.push(f.scan_ns);
         }
         for m in &f.markers {
             let key = (f.source, m.marker());
@@ -301,9 +392,11 @@ impl Model {
                     w: f.width,
                     h: f.height,
                     missed: f.missed,
-                    v: distinct.len() as u32,
+                    v,
                     markers: f.markers,
                     rejected: f.rejected,
+                    scan_ms: f.scan_ns as f64 / 1e6,
+                    lag_ms: f.lag_ns as f64 / 1e6,
                 }),
             );
         }
@@ -314,8 +407,23 @@ impl Model {
         self.intervals.add_sample(s);
     }
 
-    pub fn on_input(&mut self, e: &InputObs) {
-        self.intervals.add_input(e);
+    /// An input event. Returns the records it amends: an interval that closed
+    /// before the event arrived and is now invalid, and any hang episode that
+    /// interval had let count.
+    pub fn on_input(&mut self, e: &InputObs) -> Vec<Record> {
+        let Some(amended) = self.intervals.add_input(e) else {
+            return Vec::new();
+        };
+        let (a, b) = (amended.t_start_ns.0, amended.t_end_ns.0);
+        let mut out = vec![Record::Interval(amended)];
+        for i in 0..self.hangs.len() {
+            let (ep, valid) = self.hangs[i];
+            if valid && ep.start_ns < b && ep.end_ns >= a && !self.judge(&ep) {
+                self.hangs[i].1 = false;
+                out.push(Record::Hang(Self::hang_record(&ep, false, true)));
+            }
+        }
+        out
     }
 
     pub fn on_monitor_health(&mut self, t_ns: u64, healthy: bool) {
@@ -323,6 +431,10 @@ impl Model {
     }
 
     pub fn on_emitted(&mut self, e: Emitted) {
+        if e.source == EmitSource::Generator && e.kind == MarkerKind::Output {
+            let last = self.last_logged.entry(e.session).or_insert(e.seq_full);
+            *last = (*last).max(e.seq_full);
+        }
         let list = self
             .emitted
             .entry((e.source, e.session, e.kind))
@@ -331,11 +443,31 @@ impl Model {
         list.insert(at, e);
     }
 
+    /// A generator started (its `start` record).
+    pub fn on_gen_start(&mut self, s: GenSchedule) {
+        self.schedules.insert(s.session, (s, None));
+    }
+
+    /// A generator exited (its `exit` record).
+    pub fn on_gen_exit(&mut self, session: u16, t_ns: u64) {
+        if let Some((_, exit)) = self.schedules.get_mut(&session) {
+            *exit = Some(t_ns);
+        }
+    }
+
     /// A process sample was taken (the record is written by the caller).
     pub fn on_process_sample(&mut self, s: &SampleRecord) {
         for (&name, g) in &s.groups {
+            if name == GROUP_HOST {
+                self.host_sampled = true;
+            }
             let acc = self.groups.entry(name).or_default();
             acc.samples += 1;
+            match g.note {
+                Some(NOTE_EMPTY) => acc.empty += 1,
+                Some(NOTE_UNREADABLE) => acc.unreadable += 1,
+                _ => {}
+            }
             if let Some(c) = g.cpu_pct {
                 acc.cpu.push(c);
             }
@@ -346,7 +478,7 @@ impl Model {
                 acc.memory_end = g.memory_mb;
             }
         }
-        self.crashes += s.exited.iter().filter(|e| e.group == "host").count() as u64;
+        self.crashes += s.exited.iter().filter(|e| e.group == GROUP_HOST).count() as u64;
     }
 
     /// Visible sessions: the declared set, else every session the primary
@@ -364,12 +496,25 @@ impl Model {
             .is_some_and(|fs| fs.t_ns <= t)
     }
 
+    /// When the marker a generator's schedule says is next became due, if
+    /// that was at or before `cutoff` and the generator had not exited by
+    /// then. A generator blocked INSIDE its PTY write (a host that stopped
+    /// draining) logs nothing at all, so only its schedule shows it pending.
+    fn overdue_marker(&self, session: u16, cutoff: u64) -> Option<u64> {
+        let (sched, exit) = self.schedules.get(&session)?;
+        let next = self.last_logged.get(&session).map_or(0, |s| s + 1);
+        let due = sched.due_ns(next)?;
+        (due <= cutoff && exit.is_none_or(|x| x > due)).then_some(due)
+    }
+
     /// The earliest emission among visible sessions' output markers that have
     /// been waiting at least `hang_after` at time `t` with nothing at least as
-    /// new shown. `None` = no session had content pending that long.
+    /// new shown — including a marker a generator's schedule says is overdue.
+    /// `None` = no session had content pending that long.
     fn pending_since(&self, t: u64) -> Option<u64> {
         let cutoff = t.checked_sub(self.cfg.hang_after_ns)?;
         let mut earliest: Option<u64> = None;
+        let mut note = |since: u64| earliest = Some(earliest.map_or(since, |x| x.min(since)));
         for session in self.visible_sessions() {
             for src in [EmitSource::Generator, EmitSource::Schedule] {
                 let Some(list) = self.emitted.get(&(src, session, MarkerKind::Output)) else {
@@ -384,9 +529,11 @@ impl Model {
                     .iter()
                     .any(|e| self.primary_seen_by(analysis::marker_of(e), t));
                 if !shown {
-                    let since = tail[0].t_emit_ns;
-                    earliest = Some(earliest.map_or(since, |x| x.min(since)));
+                    note(tail[0].t_emit_ns);
                 }
+            }
+            if let Some(due) = self.overdue_marker(session, cutoff) {
+                note(due);
             }
         }
         earliest
@@ -404,13 +551,19 @@ impl Model {
 
     /// Evaluate the hang rule at the end of a closed interval.
     fn evaluate_hang(&mut self, t_start: u64, t_end: u64, os_hung: bool) -> Option<Record> {
-        let last = self.last_frame_at_or_before(t_end);
-        let updated_recently = last.is_some_and(|f| f + self.cfg.hang_after_ns > t_end);
-        let stall_since = if updated_recently {
-            None
+        // Without a primary source there are no frames to miss: the rule
+        // would call every interval a hang.
+        let stall_since = if self.cfg.capture_available {
+            let last = self.last_frame_at_or_before(t_end);
+            let updated_recently = last.is_some_and(|f| f + self.cfg.hang_after_ns > t_end);
+            if updated_recently {
+                None
+            } else {
+                self.pending_since(t_end)
+                    .map(|p| p.max(last.unwrap_or(self.t_start)))
+            }
         } else {
-            self.pending_since(t_end)
-                .map(|p| p.max(last.unwrap_or(self.t_start)))
+            None
         };
         if stall_since.is_some() || os_hung {
             match self.active_hang.as_mut() {
@@ -427,6 +580,7 @@ impl Model {
                         last_stalled_ns: t_end,
                         no_update: stall_since.is_some(),
                         os_hung,
+                        open_at_end: false,
                     });
                 }
             }
@@ -441,9 +595,21 @@ impl Model {
         }
     }
 
-    fn complete_hang(&mut self, ep: Episode) -> Record {
-        let valid = self.intervals.span_valid(ep.start_ns, ep.end_ns);
-        self.hangs.push((ep, valid));
+    /// An episode counts when every closed FULL interval it touches is valid.
+    /// The span is clipped to the end of the last full interval: an episode
+    /// still open when the run ends (a wedge that never recovered) reaches
+    /// into the trailing partial interval, which is never valid, and would
+    /// otherwise always be excluded.
+    fn judge(&self, ep: &Episode) -> bool {
+        match self.intervals.last_full_end() {
+            Some(e) if ep.start_ns < e => self
+                .intervals
+                .span_valid(ep.start_ns, ep.end_ns.min(e.saturating_sub(1))),
+            _ => false,
+        }
+    }
+
+    fn hang_record(ep: &Episode, valid: bool, amended: bool) -> HangRecord {
         let mut kinds = Vec::new();
         if ep.no_update {
             kinds.push("no_update_with_pending");
@@ -451,13 +617,21 @@ impl Model {
         if ep.os_hung {
             kinds.push("os_not_responding");
         }
-        Record::Hang(HangRecord {
+        HangRecord {
             t_start_ns: Ns(ep.start_ns),
             t_end_ns: Ns(ep.end_ns),
             duration_ms: (ep.end_ns.saturating_sub(ep.start_ns)) as f64 / 1e6,
             kinds,
             valid,
-        })
+            open_at_end: ep.open_at_end,
+            amended,
+        }
+    }
+
+    fn complete_hang(&mut self, ep: Episode) -> Record {
+        let valid = self.judge(&ep);
+        self.hangs.push((ep, valid));
+        Record::Hang(Self::hang_record(&ep, valid, false))
     }
 
     /// Close intervals that are final at `now` and evaluate hangs on them.
@@ -483,15 +657,23 @@ impl Model {
         out
     }
 
-    fn latency_kpi(
-        &self,
-        spec: stats::KpiSpec,
-        kind: MarkerKind,
-        sources: &[EmitSource],
-        disagreement: Option<&str>,
-    ) -> (KpiValue, u64) {
+    /// Emissions the run could observe: from the first primary frame on.
+    /// Before it the probe was not watching, so an earlier marker's "latency"
+    /// would include the probe's own start-up.
+    fn observable(&self, list: &[Emitted]) -> Vec<Emitted> {
+        match self.primary_frames.first() {
+            Some(&first) => list
+                .iter()
+                .filter(|e| e.t_emit_ns >= first)
+                .copied()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn latency_samples(&self, kind: MarkerKind, sources: &[EmitSource]) -> analysis::Latencies {
         let visible = self.visible_sessions();
-        let emitted = self
+        let emitted: Vec<Emitted> = self
             .emitted
             .iter()
             .filter(|((src, session, k), _)| {
@@ -499,30 +681,44 @@ impl Model {
                     && sources.contains(src)
                     && (kind == MarkerKind::Echo || visible.contains(session))
             })
-            .flat_map(|(_, list)| list.iter());
-        let l = analysis::latencies(emitted, |m| self.first_seen(self.cfg.primary, m));
-        let kpi = match disagreement {
-            Some(detail) if !l.samples_ms.is_empty() => KpiValue::unknown(
-                spec,
-                "capture_disagreement",
-                l.samples_ms.len() as u64,
-                detail.to_string(),
-            ),
-            _ => KpiValue::percentiles(spec, &l.samples_ms, &[50, 95, 99]),
-        };
-        (kpi, l.negative)
+            .flat_map(|(_, list)| self.observable(list))
+            .collect();
+        analysis::latencies(&emitted, |m| self.first_seen(self.cfg.primary, m))
     }
 
-    /// Why too few valid units remain, when exclusion caused it.
+    /// Why too few valid units remain: insufficient samples, unless an
+    /// interval was actually excluded — then the class most exclusions count
+    /// toward.
     fn exclusion_reason(&self, excluded_units: u64, valid_units: u64, min_n: u64) -> &'static str {
-        if valid_units + excluded_units < min_n {
+        if excluded_units == 0 || valid_units + excluded_units < min_n {
             return "insufficient_samples";
         }
-        let (_, occluded, operator) = self.intervals.tally();
-        if operator > occluded {
-            CLASS_OPERATOR
+        self.intervals
+            .tally()
+            .dominant_class()
+            .unwrap_or("insufficient_samples")
+    }
+
+    fn probe_health(&self) -> ProbeHealth {
+        let mut lags = self.lags.clone();
+        lags.sort_unstable();
+        let mut scans = self.scans.clone();
+        scans.sort_unstable();
+        let judged = if lags.len() >= 100 {
+            pct_ms(&lags, 99)
         } else {
-            CLASS_OCCLUDED
+            lags.last().map(|&l| l as f64 / 1e6)
+        };
+        let bound_ms = self.cfg.lag_bound_ns as f64 / 1e6;
+        ProbeHealth {
+            frames: lags.len() as u64,
+            scan_ms_p50: pct_ms(&scans, 50),
+            scan_ms_max: scans.last().map(|&s| s as f64 / 1e6),
+            lag_ms_p50: pct_ms(&lags, 50),
+            lag_ms_judged: judged,
+            lag_ms_max: lags.last().map(|&l| l as f64 / 1e6),
+            lag_bound_ms: bound_ms,
+            behind: judged.is_some_and(|j| j > bound_ms),
         }
     }
 
@@ -535,37 +731,112 @@ impl Model {
         if let Some(ep) = self.active_hang.take() {
             out.push(self.complete_hang(Episode {
                 end_ns: t_end.max(ep.last_stalled_ns),
+                open_at_end: true,
                 ..ep
             }));
         }
 
         let refresh_ns = self.cfg.refresh_ns;
+        let probe = self.probe_health();
+        // What makes capture-derived KPIs unknown, in precedence order.
+        let blocked: Option<(&'static str, String)> = if !self.cfg.capture_available {
+            Some((
+                "capture_unavailable",
+                "no capture source able to be primary was opened (Desktop Duplication is the cross-check only)".into(),
+            ))
+        } else if probe.behind {
+            Some((
+                "harness_error",
+                format!(
+                    "the probe fell behind: frames reached it up to {:.1} ms after presentation (bound {:.1} ms), so markers may have appeared only in later frames",
+                    probe.lag_ms_judged.unwrap_or_default(),
+                    probe.lag_bound_ms
+                ),
+            ))
+        } else {
+            None
+        };
+        let refresh_unknown = self.cfg.refresh_assumed.then(|| {
+            format!(
+                "the display reported no refresh rate ({:.2} ms assumed), so intervals of it cannot be counted",
+                refresh_ns as f64 / 1e6
+            )
+        });
+        let gate = |spec: stats::KpiSpec, refresh_dependent: bool, kpi: KpiValue| -> KpiValue {
+            if let Some((reason, detail)) = &blocked {
+                return KpiValue::unknown(spec, reason, kpi.n, detail.clone());
+            }
+            match &refresh_unknown {
+                Some(detail) if refresh_dependent => {
+                    KpiValue::unknown(spec, "refresh_rate_unknown", kpi.n, detail.clone())
+                }
+                _ => kpi,
+            }
+        };
+
         let deltas: Vec<f64> = self
             .primary_frames
             .windows(2)
             .map(|w| (w[1] - w[0]) as f64 / 1e6)
             .collect();
-        let frame_interval_ms = KpiValue::percentiles(stats::FRAME_INTERVAL, &deltas, &[50, 95]);
+        let frame_interval_ms = gate(
+            stats::FRAME_INTERVAL,
+            false,
+            KpiValue::percentiles(stats::FRAME_INTERVAL, &deltas, &[50, 95]),
+        );
         let jank_hits = deltas
             .iter()
             .filter(|&&d| d > 2.0 * refresh_ns as f64 / 1e6)
             .count() as u64;
-        let jank_share = KpiValue::share(stats::JANK_SHARE, jank_hits, deltas.len() as u64);
+        let jank_share = gate(
+            stats::JANK_SHARE,
+            true,
+            KpiValue::share(stats::JANK_SHARE, jank_hits, deltas.len() as u64),
+        );
 
-        let (valid, occluded, operator) = self.intervals.tally();
-        let total = valid + occluded + operator;
+        let tally = self.intervals.tally();
         let min_valid = self.cfg.min_valid_intervals;
         let valid_hangs = self.hangs.iter().filter(|(_, v)| *v).count() as u64;
         let excluded_hangs = self.hangs.len() as u64 - valid_hangs;
-        let hangs = if valid >= min_valid {
-            KpiValue::measured_value(stats::HANGS, valid_hangs as f64, valid)
+        let hang_lag_limit = self
+            .cfg
+            .hang_after_ns
+            .saturating_sub(self.cfg.interval_grace_ns) as f64
+            / 1e6;
+        let hangs = if !self.cfg.capture_available {
+            KpiValue::unknown(
+                stats::HANGS,
+                "capture_unavailable",
+                tally.valid,
+                "no primary capture source, so a window that stopped updating cannot be seen"
+                    .to_string(),
+            )
+        } else if probe.lag_ms_max.is_some_and(|m| m > hang_lag_limit) {
+            KpiValue::unknown(
+                stats::HANGS,
+                "harness_error",
+                tally.valid,
+                format!(
+                    "a frame reached the probe {:.0} ms late: past {hang_lag_limit:.0} ms an interval can close before its frames arrive, which fabricates hangs",
+                    probe.lag_ms_max.unwrap_or_default()
+                ),
+            )
+        } else if tally.valid >= min_valid {
+            KpiValue::measured_value(stats::HANGS, valid_hangs as f64, tally.valid)
         } else {
-            let reason = self.exclusion_reason(total - valid, valid, min_valid);
+            let reason = self.exclusion_reason(tally.excluded(), tally.valid, min_valid);
             KpiValue::unknown(
                 stats::HANGS,
                 reason,
-                valid,
-                format!("{valid} valid of {total} intervals (need {min_valid}); excluded: {occluded} occluded-class, {operator} operator-activity"),
+                tally.valid,
+                format!(
+                    "{} valid of {} intervals (need {min_valid}); excluded: {} occluded-class, {} operator-activity, {} harness-error",
+                    tally.valid,
+                    tally.total(),
+                    tally.occluded,
+                    tally.operator,
+                    tally.harness
+                ),
             )
         };
 
@@ -575,8 +846,14 @@ impl Model {
             .get(&self.cfg.primary)
             .cloned()
             .unwrap_or_default();
-        let (crosscheck, cc_records) = match self.cfg.secondary {
-            Some(sec) => {
+        let (crosscheck, cc_records) = match (self.cfg.secondary, &refresh_unknown) {
+            (Some(_), Some(detail)) => {
+                let (mut s, _) =
+                    analysis::crosscheck(&primary_list, |_| None, &[], |_| None, refresh_ns, false);
+                s.detail = format!("not performed: {detail}");
+                (s, Vec::new())
+            }
+            (Some(sec), None) => {
                 let sec_list = self.seen_order.get(&sec).cloned().unwrap_or_default();
                 analysis::crosscheck(
                     &primary_list,
@@ -587,35 +864,49 @@ impl Model {
                     true,
                 )
             }
-            None => analysis::crosscheck(&primary_list, |_| None, &[], |_| None, refresh_ns, false),
+            (None, _) => {
+                analysis::crosscheck(&primary_list, |_| None, &[], |_| None, refresh_ns, false)
+            }
         };
         out.extend(cc_records.into_iter().map(Record::Crosscheck));
         let disagreement = (crosscheck.verdict == "disagree").then(|| crosscheck.detail.clone());
-        let (output_latency_ms, neg_out) = self.latency_kpi(
-            stats::OUTPUT_LATENCY,
+        let latency = |spec: stats::KpiSpec, l: &analysis::Latencies| -> KpiValue {
+            let kpi = match &disagreement {
+                Some(detail) if !l.samples_ms.is_empty() => KpiValue::unknown(
+                    spec,
+                    "capture_disagreement",
+                    l.samples_ms.len() as u64,
+                    detail.clone(),
+                ),
+                _ => KpiValue::percentiles(spec, &l.samples_ms, &[50, 95, 99]),
+            };
+            gate(spec, false, kpi)
+        };
+        let out_l = self.latency_samples(
             MarkerKind::Output,
             &[EmitSource::Generator, EmitSource::Schedule],
-            disagreement.as_deref(),
         );
-        let (echo_latency_ms, neg_echo) = self.latency_kpi(
-            stats::OUTPUT_LATENCY,
-            MarkerKind::Echo,
-            &[EmitSource::Generator],
-            disagreement.as_deref(),
-        );
-        let (input_latency_ms, neg_in) = self.latency_kpi(
-            stats::INPUT_LATENCY,
-            MarkerKind::Echo,
-            &[EmitSource::Injector],
-            disagreement.as_deref(),
-        );
+        let echo_l = self.latency_samples(MarkerKind::Echo, &[EmitSource::Generator]);
+        let in_l = self.latency_samples(MarkerKind::Echo, &[EmitSource::Injector]);
+        let output_latency_ms = latency(stats::OUTPUT_LATENCY, &out_l);
+        let echo_latency_ms = latency(stats::OUTPUT_LATENCY, &echo_l);
+        let input_latency_ms = if self.cfg.input_instrumented {
+            latency(stats::INPUT_LATENCY, &in_l)
+        } else {
+            KpiValue::unknown(
+                stats::INPUT_LATENCY,
+                "not_instrumented",
+                0,
+                "watch receives no injection times; pair inject.jsonl t_inject_ns with the echo markers' first_seen records".to_string(),
+            )
+        };
 
         let mut loss = analysis::LossTally::default();
         for session in self.visible_sessions() {
             for src in [EmitSource::Generator, EmitSource::Schedule] {
                 if let Some(list) = self.emitted.get(&(src, session, MarkerKind::Output)) {
                     loss += analysis::loss(
-                        list,
+                        &self.observable(list),
                         |m| self.first_seen(self.cfg.primary, m),
                         refresh_ns,
                         t_end,
@@ -624,29 +915,37 @@ impl Model {
                 }
             }
         }
-        let marker_loss = if loss.eligible >= stats::MARKER_LOSS.min_n {
-            KpiValue::share(stats::MARKER_LOSS, loss.lost, loss.eligible)
-        } else {
-            KpiValue::unknown(
-                stats::MARKER_LOSS,
-                self.exclusion_reason(loss.excluded, loss.eligible, stats::MARKER_LOSS.min_n),
-                loss.eligible,
-                format!(
-                    "{} eligible sequences, {} excluded by invalid intervals",
-                    loss.eligible, loss.excluded
-                ),
-            )
-        };
-        let marker_skipped = if loss.counted >= stats::MARKER_SKIPPED.min_n {
-            KpiValue::share(stats::MARKER_SKIPPED, loss.skipped, loss.counted)
-        } else {
-            KpiValue::unknown(
-                stats::MARKER_SKIPPED,
-                self.exclusion_reason(loss.excluded, loss.counted, stats::MARKER_SKIPPED.min_n),
-                loss.counted,
-                None,
-            )
-        };
+        let marker_loss = gate(
+            stats::MARKER_LOSS,
+            true,
+            if loss.eligible >= stats::MARKER_LOSS.min_n {
+                KpiValue::share(stats::MARKER_LOSS, loss.lost, loss.eligible)
+            } else {
+                KpiValue::unknown(
+                    stats::MARKER_LOSS,
+                    self.exclusion_reason(loss.excluded, loss.eligible, stats::MARKER_LOSS.min_n),
+                    loss.eligible,
+                    format!(
+                        "{} eligible sequences, {} outside valid full intervals",
+                        loss.eligible, loss.excluded
+                    ),
+                )
+            },
+        );
+        let marker_skipped = gate(
+            stats::MARKER_SKIPPED,
+            true,
+            if loss.counted >= stats::MARKER_SKIPPED.min_n {
+                KpiValue::share(stats::MARKER_SKIPPED, loss.skipped, loss.counted)
+            } else {
+                KpiValue::unknown(
+                    stats::MARKER_SKIPPED,
+                    self.exclusion_reason(loss.excluded, loss.counted, stats::MARKER_SKIPPED.min_n),
+                    loss.counted,
+                    None,
+                )
+            },
+        );
 
         let mut v_sorted = self.v_samples.clone();
         v_sorted.sort_unstable();
@@ -655,21 +954,7 @@ impl Model {
         let processes = self
             .groups
             .iter()
-            .map(|(&name, g)| {
-                (
-                    name,
-                    ProcessSummary {
-                        cpu_pct: KpiValue::mean_p95(stats::CPU_PCT, &g.cpu),
-                        gpu_pct: if g.gpu.is_empty() {
-                            KpiValue::unknown(stats::GPU_PCT, "gpu_counters_unavailable", 0, None)
-                        } else {
-                            KpiValue::mean_p95(stats::GPU_PCT, &g.gpu)
-                        },
-                        memory_mb_end: g.memory_end,
-                        samples: g.samples,
-                    },
-                )
-            })
+            .map(|(&name, g)| (name, Self::process_summary(g)))
             .collect();
 
         let summary = WatchSummary {
@@ -678,6 +963,7 @@ impl Model {
             primary: self.cfg.primary,
             secondary: self.cfg.secondary,
             refresh_ms: refresh_ns as f64 / 1e6,
+            refresh_assumed: self.cfg.refresh_assumed,
             frames: self
                 .frame_counts
                 .iter()
@@ -685,13 +971,14 @@ impl Model {
                 .collect(),
             frame_interval_ms,
             jank_share,
-            v_actual_max: v_sorted.last().copied().unwrap_or(0),
+            v_actual_max: v_sorted.last().copied(),
             v_actual_p50,
             sessions_seen: self.sessions_seen.iter().copied().collect(),
-            intervals_total: total,
-            intervals_valid: valid,
-            intervals_excluded_occluded: occluded,
-            intervals_excluded_operator_activity: operator,
+            intervals_total: tally.total(),
+            intervals_valid: tally.valid,
+            intervals_excluded_occluded: tally.occluded,
+            intervals_excluded_operator_activity: tally.operator,
+            intervals_excluded_harness_error: tally.harness,
             hangs,
             hang_episodes_excluded: excluded_hangs,
             emitted_markers: self.emitted.values().map(|l| l.len() as u64).sum(),
@@ -701,11 +988,52 @@ impl Model {
             marker_loss,
             marker_skipped,
             crosscheck,
-            negative_latencies: neg_out + neg_echo + neg_in,
-            crashes: self.crashes,
+            negative_latencies: out_l.negative + echo_l.negative + in_l.negative,
+            crashes: self.host_sampled.then_some(self.crashes),
             processes,
+            probe,
         };
         (out, summary)
+    }
+
+    fn process_summary(g: &GroupAcc) -> ProcessSummary {
+        // No sample was readable whole: the group's number was never known.
+        let none_whole = g.samples > 0 && g.empty + g.unreadable == g.samples;
+        let withheld = |spec: stats::KpiSpec| -> Option<KpiValue> {
+            none_whole.then(|| {
+                let detail = if g.empty == g.samples {
+                    format!(
+                        "the group had no live process in any of {} samples",
+                        g.samples
+                    )
+                } else {
+                    format!(
+                        "no sample of {} was readable whole ({} empty, {} with unreadable members)",
+                        g.samples, g.empty, g.unreadable
+                    )
+                };
+                KpiValue::unknown(spec, "harness_error", 0, detail)
+            })
+        };
+        ProcessSummary {
+            cpu_pct: if g.cpu.is_empty() {
+                withheld(stats::CPU_PCT)
+                    .unwrap_or_else(|| KpiValue::mean_p95(stats::CPU_PCT, &g.cpu))
+            } else {
+                KpiValue::mean_p95(stats::CPU_PCT, &g.cpu)
+            },
+            gpu_pct: if g.gpu.is_empty() {
+                withheld(stats::GPU_PCT).unwrap_or_else(|| {
+                    KpiValue::unknown(stats::GPU_PCT, "gpu_counters_unavailable", 0, None)
+                })
+            } else {
+                KpiValue::mean_p95(stats::GPU_PCT, &g.gpu)
+            },
+            memory_mb_end: g.memory_end,
+            samples: g.samples,
+            samples_empty: g.empty,
+            samples_unreadable: g.unreadable,
+        }
     }
 }
 

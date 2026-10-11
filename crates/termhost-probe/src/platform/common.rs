@@ -1,6 +1,7 @@
 //! Platform-independent helpers the Windows and X11 layers share: occlusion
-//! geometry, the GPU counter instance-name parser, and the doctor's capture
-//! probe. All pure or trait-generic, so they are tested on every platform.
+//! geometry, target selection by title, X11's foreground rule, the GPU counter
+//! instance-name parser, and the doctor's capture probe. All pure or
+//! trait-generic, so they are tested on every platform.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -62,6 +63,50 @@ pub fn occlusion(target: &Rect, above: &[Rect]) -> (f64, Vec<usize>) {
         }
     }
     (union_area(&parts) as f64 / target.area() as f64, who)
+}
+
+/// Pick the target among the windows whose title contains `text` (with
+/// their visible areas): the largest — or, with `unique`, the only one. An
+/// empty title is refused: it would match every window, the operator's
+/// editor included.
+pub fn pick_by_title<H: Copy>(matches: &[(H, u64)], text: &str, unique: bool) -> Result<H, String> {
+    if text.trim().is_empty() {
+        return Err("an empty title would match every window".into());
+    }
+    if unique && matches.len() > 1 {
+        return Err(format!(
+            "{} windows' titles contain {text:?}; name the window with --hwnd or --pid",
+            matches.len()
+        ));
+    }
+    matches
+        .iter()
+        .max_by_key(|(_, area)| *area)
+        .map(|(h, _)| *h)
+        .ok_or_else(|| format!("no visible top-level window title contains {text:?}"))
+}
+
+/// X11's foreground rule. The keyboard focus is the authority — XTEST
+/// delivers keys to it — so it must be the target or a descendant of the
+/// target (`focus_chain`: the focused window, then its ancestors below the
+/// root). A window manager's `_NET_ACTIVE_WINDOW`, when it names a window,
+/// must agree as well (`active_top` against `target_top`, both top-level
+/// windows); it is never enough on its own, because it goes stale when focus
+/// moves to an override-redirect popup or a client sets the focus itself.
+pub fn x11_focus_verdict(
+    focus_chain: &[u32],
+    target: u32,
+    active_top: Option<u32>,
+    target_top: u32,
+) -> bool {
+    // PointerRoot (1) and None (0) name no window.
+    let Some(&focus) = focus_chain.first() else {
+        return false;
+    };
+    if focus <= 1 || !focus_chain.contains(&target) {
+        return false;
+    }
+    active_top.is_none_or(|a| a == target_top)
 }
 
 /// Parse a `\GPU Engine(*)` instance name —
@@ -179,6 +224,41 @@ mod tests {
 
     fn r(x: i32, y: i32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn a_title_target_is_never_empty_and_inject_needs_a_unique_match() {
+        let two = [(1u32, 100u64), (2, 900)];
+        assert_eq!(pick_by_title(&two, "Terminal", false), Ok(2), "the largest");
+        assert!(
+            pick_by_title(&two, "Terminal", true).is_err(),
+            "ambiguous for inject"
+        );
+        assert_eq!(pick_by_title(&two[..1], "Terminal", true), Ok(1));
+        assert!(pick_by_title(&two, "", false).is_err());
+        assert!(pick_by_title(&two, "  ", false).is_err());
+        assert!(pick_by_title::<u32>(&[], "x", false).is_err());
+    }
+
+    #[test]
+    fn x11_focus_is_the_authority_and_the_wm_hint_only_a_constraint() {
+        // Focus on the target's own child widget, the WM agreeing: foreground.
+        assert!(x11_focus_verdict(
+            &[0x51, 0x50, 0x40],
+            0x50,
+            Some(0x40),
+            0x40
+        ));
+        // Bare server (no WM hint): the focus alone decides.
+        assert!(x11_focus_verdict(&[0x50], 0x50, None, 0x50));
+        // The WM's hint is stale — it names the target — but the focus moved
+        // to a popup: keys would go to the popup.
+        assert!(!x11_focus_verdict(&[0x90], 0x50, Some(0x40), 0x40));
+        // Focus inside the target, but the WM says another window is active.
+        assert!(!x11_focus_verdict(&[0x50, 0x40], 0x50, Some(0x70), 0x40));
+        // PointerRoot / None, or no focus reply at all.
+        assert!(!x11_focus_verdict(&[1], 0x50, None, 0x50));
+        assert!(!x11_focus_verdict(&[], 0x50, None, 0x50));
     }
 
     #[test]

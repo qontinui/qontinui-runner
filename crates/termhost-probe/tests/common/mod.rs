@@ -45,6 +45,8 @@ pub struct Faults {
     pub occlusion_blind: bool,
     /// Every third key never reaches the window.
     pub drop_keys: bool,
+    /// The compositor never presents a frame.
+    pub capture_dead: bool,
 }
 
 struct State {
@@ -117,6 +119,17 @@ impl Desktop {
             });
         }
     }
+
+    /// An input event, as the desktop's listener would report it (a test's
+    /// "operator").
+    pub fn publish_input(&self, origin: InputOrigin) {
+        self.publish(origin);
+    }
+
+    /// Keys the window has received.
+    pub fn keys_seen(&self) -> u32 {
+        self.state.lock().expect("state").keys_seen
+    }
 }
 
 /// The compositor: presents the window on the vsync grid when it changed.
@@ -136,7 +149,7 @@ impl CaptureSource for FakeCapture {
         let deadline = now_ns() + timeout.as_nanos() as u64;
         loop {
             let generation = self.desk.generation.load(Ordering::SeqCst);
-            if generation != self.last {
+            if generation != self.last && !self.desk.faults.capture_dead {
                 let changed = self.desk.last_change_ns.load(Ordering::SeqCst);
                 let frozen_until = self.desk.state.lock().expect("state").frozen_until;
                 let present_at = changed.max(frozen_until).div_ceil(REFRESH_NS) * REFRESH_NS;
@@ -148,7 +161,7 @@ impl CaptureSource for FakeCapture {
                         t_ns: present_at + self.desk.faults.capture_lag_ms * 1_000_000,
                         view,
                         origin: (0, 0),
-                        missed: 0,
+                        missed: None,
                         window_size: (c.width() as u32, c.height() as u32),
                     });
                     return CaptureStatus::Frame;
@@ -191,6 +204,7 @@ impl WindowInspector for FakeInspector {
 struct FakeInjector {
     desk: Arc<Desktop>,
     tagging: Tagging,
+    activations: Arc<AtomicU64>,
 }
 
 impl KeyInjector for FakeInjector {
@@ -200,6 +214,15 @@ impl KeyInjector for FakeInjector {
         } else {
             Err(InjectBlock::NotForeground("fake: another window".into()))
         }
+    }
+    fn can_send(&self, ch: char) -> bool {
+        ch.is_ascii_lowercase() || ch.is_ascii_digit()
+    }
+    fn ledger_ids(&self, _ch: char) -> Vec<u32> {
+        Vec::new()
+    }
+    fn heard(&self) -> u64 {
+        self.tagging.recognised.load(Ordering::Relaxed)
     }
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {
         // The listener hears both events of the key press.
@@ -242,6 +265,7 @@ impl KeyInjector for FakeInjector {
         Ok(())
     }
     fn activate(&mut self) -> Result<(), String> {
+        self.activations.fetch_add(1, Ordering::SeqCst);
         self.desk.state.lock().expect("state").foreground = true;
         Ok(())
     }
@@ -302,12 +326,22 @@ impl ProcessReader for OwnProcess {
 
 pub struct FakeHost {
     pub desk: Arc<Desktop>,
+    /// What the doctor's WGC proof reports (a decoded frame by default).
+    pub wgc_facts: CaptureFacts,
+    /// Times `activate` was called on the injector.
+    pub activations: Arc<AtomicU64>,
 }
 
 impl FakeHost {
     pub fn new(faults: Faults) -> FakeHost {
         FakeHost {
             desk: Desktop::new(faults),
+            wgc_facts: CaptureFacts::Frame {
+                decoded: Ok(Marker::new(MarkerKind::Calibration, 0, 0)),
+                degraded: None,
+                detail: "fake".into(),
+            },
+            activations: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -321,11 +355,7 @@ impl Host for FakeHost {
                 supported: Ok(()),
                 state: Ok("fake interactive desktop".into()),
             },
-            wgc: CaptureFacts::Frame {
-                decoded: Ok(Marker::new(MarkerKind::Calibration, 0, 0)),
-                degraded: None,
-                detail: "fake".into(),
-            },
+            wgc: self.wgc_facts.clone(),
             dda: CaptureFacts::NotApplicable("fake desktop has one source".into()),
             x11: CaptureFacts::NotApplicable("fake".into()),
             input: InputFacts {
@@ -372,6 +402,7 @@ impl Host for FakeHost {
         Ok(Box::new(FakeInjector {
             desk: self.desk.clone(),
             tagging: tagging.clone(),
+            activations: self.activations.clone(),
         }))
     }
     fn create_test_window(
@@ -387,6 +418,7 @@ impl Host for FakeHost {
             hz: 60.0,
             ns: REFRESH_NS,
             source: "fake".into(),
+            assumed: false,
         }
     }
     fn process_reader(&mut self) -> Box<dyn ProcessReader> {

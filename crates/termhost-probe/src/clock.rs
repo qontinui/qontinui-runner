@@ -164,11 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn sleep_until_lands_on_time() {
-        let target = now_ns() + 30_000_000;
-        sleep_until_ns(target);
-        let late = now_ns() - target;
-        assert!(late < 5_000_000, "late by {late} ns");
+    fn sleep_until_never_returns_early_and_can_land_on_time() {
+        // Never early, every time. Precision is judged on the best of several
+        // attempts: on a loaded 4-vCPU runner (the synthetic and differential
+        // tests run beside this one) a single attempt can be descheduled in
+        // its final spin, which says nothing about the function.
+        let mut best = u64::MAX;
+        for _ in 0..7 {
+            let target = now_ns() + 10_000_000;
+            sleep_until_ns(target);
+            let now = now_ns();
+            assert!(now >= target, "returned {} ns early", target - now);
+            best = best.min(now - target);
+        }
+        assert!(best < 3_000_000, "best of 7 attempts was {best} ns late");
     }
 
     #[test]

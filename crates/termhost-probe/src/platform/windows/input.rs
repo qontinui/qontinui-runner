@@ -96,7 +96,7 @@ unsafe extern "system" fn listener_proc(
             let hraw = HRAWINPUT(lparam.0 as *mut core::ffi::c_void);
             GetRawInputData(hraw, RID_INPUT, None, &mut size, header);
             if size > 0 && size as usize <= 4096 {
-                let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+                let mut buf = vec![0u64; raw_input_words(size)];
                 let got = GetRawInputData(
                     hraw,
                     RID_INPUT,
@@ -126,6 +126,16 @@ unsafe extern "system" fn listener_proc(
     }
     // SAFETY: default processing (required for WM_INPUT cleanup).
     unsafe { DefWindowProcW(h, msg, wparam, lparam) }
+}
+
+/// The buffer (in 8-byte words, so it is aligned) for a raw input record of
+/// `size` bytes. A keyboard record is SHORTER than `RAWINPUT` (whose union is
+/// sized by `RAWMOUSE`), and a `&RAWINPUT` must never cover unallocated bytes,
+/// so the buffer is at least `size_of::<RAWINPUT>()`.
+fn raw_input_words(size: u32) -> usize {
+    (size as usize)
+        .max(std::mem::size_of::<RAWINPUT>())
+        .div_ceil(8)
 }
 
 static CLASS_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -372,6 +382,21 @@ impl KeyInjector for Injector {
         }
     }
 
+    fn can_send(&self, ch: char) -> bool {
+        // KEYEVENTF_UNICODE types any character of the Basic Multilingual
+        // Plane as one key press.
+        ch.len_utf16() == 1
+    }
+
+    fn ledger_ids(&self, _ch: char) -> Vec<u32> {
+        // Each event carries the run's tag in dwExtraInfo: no ledger needed.
+        Vec::new()
+    }
+
+    fn heard(&self) -> u64 {
+        self.tagging.recognised.load(Ordering::Relaxed)
+    }
+
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {
         let mut units = [0u16; 2];
         let encoded = ch.encode_utf16(&mut units);
@@ -411,5 +436,31 @@ impl KeyInjector for Injector {
             WindowHandle(self.target),
             self.tagging.tag
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_raw_input_buffer_always_covers_a_whole_rawinput() {
+        let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+        // A keyboard record: the header plus RAWKEYBOARD, shorter than RAWINPUT.
+        let keyboard = header + 16;
+        assert!(keyboard < std::mem::size_of::<RAWINPUT>() as u32);
+        for size in [
+            keyboard,
+            header,
+            1,
+            std::mem::size_of::<RAWINPUT>() as u32,
+            4096,
+        ] {
+            assert!(
+                raw_input_words(size) * 8 >= std::mem::size_of::<RAWINPUT>(),
+                "size {size}"
+            );
+            assert!(raw_input_words(size) * 8 >= size as usize);
+        }
     }
 }

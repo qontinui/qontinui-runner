@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::clock::{now_ns, wall_rfc3339};
-use crate::feed::EmitFeed;
+use crate::clock::now_ns;
+use crate::feed::{EmitFeed, FeedEvent};
 use crate::model::{FrameObs, Model, ModelConfig};
 use crate::platform::{CaptureSource, CaptureStatus, RawFrame, Subscription, WindowInspector};
-use crate::raster::{self, ScanOptions};
+use crate::raster::{self, Rect, ScanOptions};
 use crate::records::{IncidentRecord, MarkerObs, Record, Sink, SourceId, WatchSummary};
 use crate::sampler::Sampler;
 
@@ -64,7 +64,11 @@ fn capture_loop(
     while !stop.load(Ordering::Relaxed) {
         let status = src.next_frame(Duration::from_millis(50), &mut |raw: RawFrame<'_>| {
             index += 1;
+            // The probe's own health: how late the frame reached it, and how
+            // long scanning took (a probe that falls behind inflates latency).
+            let received = now_ns();
             let result = raster::scan(&raw.view, &scan);
+            let scan_ns = now_ns().saturating_sub(received);
             let markers = result
                 .markers
                 .iter()
@@ -81,9 +85,17 @@ fn capture_loop(
                 t_ns: raw.t_ns,
                 width: raw.window_size.0,
                 height: raw.window_size.1,
+                region: Rect {
+                    x: raw.origin.0,
+                    y: raw.origin.1,
+                    w: raw.view.width() as u32,
+                    h: raw.view.height() as u32,
+                },
                 markers,
                 rejected: result.rejected.len() as u32,
                 missed: raw.missed,
+                scan_ns,
+                lag_ns: received.saturating_sub(raw.t_ns),
             }));
         });
         match status {
@@ -178,25 +190,27 @@ impl Engine {
                 }
             }
             CaptureMsg::Status(source, CaptureStatus::Lost(detail)) => {
-                self.sink.emit(&Record::Incident(IncidentRecord {
-                    kind: "capture_lost",
-                    at: wall_rfc3339(),
-                    detail: format!(
-                        "{} capture lost (re-establishing): {detail}",
-                        source.as_str()
-                    ),
-                    stops_run: false,
-                    source: Some(source),
-                }))
+                self.sink.emit(&Record::Incident(
+                    IncidentRecord::new(
+                        "capture_lost",
+                        format!(
+                            "{} capture lost (re-establishing): {detail}",
+                            source.as_str()
+                        ),
+                        false,
+                    )
+                    .about_source(source),
+                ))
             }
             CaptureMsg::Status(source, CaptureStatus::Ended(detail)) => {
-                self.sink.emit(&Record::Incident(IncidentRecord {
-                    kind: "capture_lost",
-                    at: wall_rfc3339(),
-                    detail: format!("{} capture ended: {detail}", source.as_str()),
-                    stops_run: source == self.model.config().primary,
-                    source: Some(source),
-                }));
+                self.sink.emit(&Record::Incident(
+                    IncidentRecord::new(
+                        "capture_lost",
+                        format!("{} capture ended: {detail}", source.as_str()),
+                        source == self.model.config().primary,
+                    )
+                    .about_source(source),
+                ));
                 self.ended.insert(source, detail);
             }
             CaptureMsg::Status(_, _) => {}
@@ -213,21 +227,22 @@ impl Engine {
                 (self.next_window + self.window_every).max(now + self.window_every / 2);
         }
         if let Some(sub) = self.input.as_mut() {
-            for e in sub.drain() {
-                self.model.on_input(&e);
-            }
+            let events = sub.drain();
             let healthy = sub.health();
+            for e in events {
+                for r in self.model.on_input(&e) {
+                    self.sink.emit(&r);
+                }
+            }
             let ok = healthy.is_ok();
             if self.monitor_healthy != Some(ok) {
                 self.model.on_monitor_health(now, ok);
                 if let Err(why) = healthy {
-                    self.sink.emit(&Record::Incident(IncidentRecord {
-                        kind: "harness_error",
-                        at: wall_rfc3339(),
-                        detail: format!("the real-input listener failed; intervals cannot be shown free of operator input: {why}"),
-                        stops_run: false,
-                        source: None,
-                    }));
+                    self.sink.emit(&Record::Incident(IncidentRecord::new(
+                        "harness_error",
+                        format!("the real-input listener failed; intervals cannot be shown free of operator input: {why}"),
+                        false,
+                    )));
                 }
                 self.monitor_healthy = Some(ok);
             }
@@ -235,7 +250,13 @@ impl Engine {
         if now >= self.next_feed {
             for f in self.feeds.iter_mut() {
                 for e in f.poll() {
-                    self.model.on_emitted(e);
+                    match e {
+                        FeedEvent::Emitted(e) => self.model.on_emitted(e),
+                        FeedEvent::Started(s) => self.model.on_gen_start(s),
+                        FeedEvent::Exited { session, t_ns } => {
+                            self.model.on_gen_exit(session, t_ns)
+                        }
+                    }
                 }
             }
             self.next_feed = now + 50_000_000;
@@ -249,16 +270,11 @@ impl Engine {
                     .iter()
                     .filter(|e| e.group == crate::sampler::GROUP_HOST)
                 {
-                    self.sink.emit(&Record::Incident(IncidentRecord {
-                        kind: "host_crashed",
-                        at: wall_rfc3339(),
-                        detail: format!(
-                            "host process {} ({}) exited during the run",
-                            e.pid, e.name
-                        ),
-                        stops_run: false,
-                        source: None,
-                    }));
+                    self.sink.emit(&Record::Incident(IncidentRecord::new(
+                        "host_crashed",
+                        format!("host process {} ({}) exited during the run", e.pid, e.name),
+                        false,
+                    )));
                 }
                 self.sink.emit(&Record::Sample(rec));
             }

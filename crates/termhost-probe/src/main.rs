@@ -1,6 +1,7 @@
 //! termhost-probe — see `termhost-probe --help` and the crate docs
 //! (`src/lib.rs`).
 
+use std::io::Write;
 use std::time::Duration;
 
 use clap::Parser;
@@ -29,7 +30,7 @@ fn main() {
         Cmd::Watch(a) => {
             let cfg = watch::WatchConfig {
                 run_dir: a.run_dir.clone(),
-                target: a.target.spec(),
+                target: a.target.spec(false),
                 sources: a.sources.iter().map(|&s| s.into()).collect(),
                 host_pids: a.host_pid.clone(),
                 run_id: a.run_id.clone(),
@@ -53,13 +54,15 @@ fn main() {
             Ok(keys) => {
                 let cmd = inject::InjectCmd {
                     run_dir: a.run_dir.clone(),
-                    target: a.target.spec(),
+                    // A title must name exactly one window before keys go to it.
+                    target: a.target.spec(true),
                     keys,
                     interval: a.interval(),
                     start_delay: Duration::from_millis(a.start_delay_ms),
                     settle: Duration::from_millis(a.settle_ms),
                     tag: a.tag,
                     activate: a.activate,
+                    quiet: Duration::from_millis(a.quiet_ms),
                     echo_stdout: a.stdout,
                     args,
                 };
@@ -99,11 +102,34 @@ fn main() {
                 if !a.json {
                     print!("{}", selftest::render_human(&outcome));
                 }
+                if let Some(path) = &a.summary_md {
+                    if let Err(e) = append_summary(path, &outcome) {
+                        eprintln!(
+                            "termhost-probe selftest: cannot write {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
                 outcome.exit_code
             }
         },
     };
     std::process::exit(code);
+}
+
+/// Append the selftest's Markdown summary (e.g. to `$GITHUB_STEP_SUMMARY`).
+fn append_summary(path: &std::path::Path, o: &selftest::SelftestOutcome) -> std::io::Result<()> {
+    let title = format!(
+        "termhost-probe selftest ({} {})",
+        std::env::consts::OS,
+        o.doctor.host
+    );
+    let md = selftest::render_markdown(o, &title);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{md}")
 }
 
 fn run_or_report(what: &str, r: anyhow::Result<i32>) -> i32 {
