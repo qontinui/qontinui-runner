@@ -1094,7 +1094,209 @@
       "provenance": {
         "source": "ai-generated"
       }
+    },
+    {
+      "id": "tmux-one-session-on-screen",
+      "name": "tmux Work Mode: One Session On Screen",
+      "description": "The Terminal page's tmux work mode (plan 2026-10-11-runner-terminal-tmux-work-mode, D1-D4): exactly ONE session is on screen, full size, in a single viewport (`TmuxViewport`, terminal/zone-grid/TmuxViewport.tsx) and every other live session stays mounted off-screen at the `background` visibility tier, still running and still producing output. The layout is pinned to `single` (`get-zone-view-state` reads `{layoutId: \"single\", zoneCount: 1}`), so the page has exactly one zone header (`terminal-zone-header-0`) and no `terminal-zone-header-1`; only the shown tab's `terminal-input-<tabId>` and `terminal.close-session-<tabId>` have a non-zero rect. The viewport header carries the session name (full value in the title span's `title`) and its position `k / n` (`data-tmux-position=\"k/n\"`, title `<name> — session k of n`). The CommandBar work-mode toggle (`terminal.work-mode-toggle`) reads `tmux` with `data-terminal-work-mode=\"tmux\"` and `aria-pressed=true`. Read the mode without inferring it from the DOM through the `terminal-page` component action `get-terminal-work-mode` → `{mode: \"tmux\", shownTabId, sidebarOpen}`. The mode is entered/left by the toggle, Ctrl+Shift+Y, `/terminal.mode [grid|tmux]` (alias `/work-mode`) and the `set-terminal-work-mode` action (`{mode?: \"grid\"|\"tmux\"}`, omitted toggles; returns `{previousMode, mode, changed, sidebarOpened, message}`), and survives a page reload together with the session-manager sidebar. A newly created session is shown immediately; when the shown session closes, the most recently shown survivor replaces it (MRU, falling back to creation order). Ctrl+Tab / Ctrl+Shift+Tab cycle the shown session. Picking a layout preset (Ctrl+Shift+1..8, the layout picker, `terminal.layout`) is an explicit grid request: it exits to grid mode, restoring the grid the operator left with the preset applied over it, so every live session is placed in a zone.",
+      "precondition": "tmux work mode is active on the Terminal page with at least one live session",
+      "assertions": [
+        {
+          "id": "tmux-one-session-on-screen-elem-0",
+          "description": "The work-mode toggle reads tmux.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.work-mode-toggle",
+              "attributes": {
+                "data-terminal-work-mode": "tmux"
+              }
+            },
+            "label": "Work mode toggle (tmux)"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tmux-one-session-on-screen-elem-1",
+          "description": "The single viewport's header (zone 0) is shown; it carries the session name and its k / n position.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal-zone-header-0"
+            },
+            "label": "tmux viewport header"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "tmux-session-manager-navigator",
+      "name": "tmux Session Manager Lists Every Live Session",
+      "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their state chips so a hidden session needing input is visible from the list. Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
+      "precondition": "tmux work mode is active (entering it opens the session manager)",
+      "assertions": [
+        {
+          "id": "tmux-session-manager-navigator-elem-0",
+          "description": "The session manager's Live view is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.session-manager-view-live"
+            },
+            "label": "Session manager Live view"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tmux-session-manager-navigator-elem-1",
+          "description": "One session row is marked as the session on screen.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-session-on-screen": "true"
+              }
+            },
+            "label": "On-screen session row"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tmux-session-manager-navigator-elem-2",
+          "description": "A live tab with no transcript (e.g. a plain shell) is listed as a tab-sourced row.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "data-session-source": "tab"
+              }
+            },
+            "label": "Tab-sourced live session row"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
     }
   ],
-  "transitions": []
+  "transitions": [
+    {
+      "id": "enter-tmux-work-mode",
+      "name": "Enter tmux work mode",
+      "description": "Clicking the work-mode toggle while it reads Grid enters tmux mode: the focused zone's session (or the MRU head) is shown, every other session moves off-screen without being closed, and the session manager opens. The grid arrangement is saved and restored on exit.",
+      "fromStates": [
+        "term-multi-tab"
+      ],
+      "activateStates": [
+        "tmux-one-session-on-screen",
+        "tmux-session-manager-navigator"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.work-mode-toggle",
+            "attributes": {
+              "data-terminal-work-mode": "grid"
+            }
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "tmux-swap-session",
+      "name": "Swap the on-screen session from the session manager",
+      "description": "Clicking an off-screen session row swaps that session into the single viewport. The previously shown session stays alive and mounted (no remount), moves to the `background` tier and is pushed onto the MRU list; the revealed pane resyncs the output it missed while hidden, so its latest output is current.",
+      "fromStates": [
+        "tmux-session-manager-navigator"
+      ],
+      "activateStates": [
+        "tmux-one-session-on-screen"
+      ],
+      "exitStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "attributes": {
+              "data-session-on-screen": "false"
+            }
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "exit-tmux-work-mode",
+      "name": "Leave tmux work mode",
+      "description": "Clicking the work-mode toggle while it reads tmux returns to grid mode, restoring the saved grid reconciled against the live tabs; every live session is placed in a zone. The session manager stays open.",
+      "fromStates": [
+        "tmux-one-session-on-screen"
+      ],
+      "activateStates": [
+        "term-multi-tab"
+      ],
+      "exitStates": [
+        "tmux-one-session-on-screen"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "id": "terminal.work-mode-toggle",
+            "attributes": {
+              "data-terminal-work-mode": "tmux"
+            }
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "effect": "write"
+    }
+  ]
 }
