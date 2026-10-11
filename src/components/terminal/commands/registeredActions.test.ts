@@ -8,7 +8,7 @@
  * `resolveCount` had a floor but no ceiling. A fixture registry cannot see
  * either, because a fixture declares whatever the test needs.
  *
- * So this file registers the ACTUAL 40 actions. `useTerminalCommands` is a
+ * So this file registers the ACTUAL 41 actions. `useTerminalCommands` is a
  * hook only in the sense that it calls context hooks and `useCommandAction`;
  * with those mocked it is an ordinary function, which is why this runs under
  * vitest's `environment: "node"` with no React renderer.
@@ -67,6 +67,9 @@ vi.mock("../contexts", () => ({
       toggleMaximize: () => {},
       setLayoutId: () => {},
       assignTabToZone: () => {},
+      workMode: "grid",
+      enterTmuxMode: () => {},
+      exitTmuxMode: () => {},
     },
     workflowGen: {
       generatedWorkflow: null,
@@ -205,6 +208,7 @@ describe("registered actions — the cost/destruction declarations are not empty
       "terminal.toggle-focus-mode",
       "terminal.maximize",
       "terminal.layout",
+      "terminal.mode",
       "terminal.swap",
       "terminal.tag-toggle",
       "terminal.plan-verify",

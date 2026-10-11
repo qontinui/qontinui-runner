@@ -49,6 +49,7 @@ import {
   planToggleMaximizeZone,
   buildMaximizeResult,
 } from "./zone-grid/maximizeActions";
+import { applyWorkModeRequest, parseWorkModeRequest } from "./terminalWorkModeControl";
 import { pickSpawnTenant } from "./SpawnTenantPicker";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
@@ -126,6 +127,11 @@ const MOVE_TERMINAL_SCHEMA = {
 
 const ZONE_INDEX_SCHEMA = {
   zoneIndex: "number (0-based; must be < the layout's zone count)",
+} as const;
+
+/** `set-terminal-work-mode` — the mode to switch to; omitted toggles. */
+const WORK_MODE_SCHEMA = {
+  mode: "string (optional) — 'grid' | 'tmux'; omitted toggles",
 } as const;
 
 interface TerminalPageProps {
@@ -234,6 +240,36 @@ function TerminalPageInner({
     zoneLayout.layout.zones.length,
     zoneLayout.setMaximizedZone,
     zoneLayout.layoutId,
+  ]);
+
+  // Plan `2026-10-11-runner-terminal-tmux-work-mode`, Phase 4 — the work-mode
+  // actions below read the mode and the sidebar AT INVOCATION TIME for the
+  // same reason `zoneMaximizeRef` exists: an envelope reporting a stale
+  // `previousMode` would be a false one.
+  const workModeRef = useRef({
+    workMode: zoneLayout.workMode,
+    shownTabId: zoneLayout.shownTabId,
+    enterTmuxMode: zoneLayout.enterTmuxMode,
+    exitTmuxMode: zoneLayout.exitTmuxMode,
+    showSidebar: session.workflowGen.showSidebar,
+    setShowSidebar: session.workflowGen.setShowSidebar,
+  });
+  useEffect(() => {
+    workModeRef.current = {
+      workMode: zoneLayout.workMode,
+      shownTabId: zoneLayout.shownTabId,
+      enterTmuxMode: zoneLayout.enterTmuxMode,
+      exitTmuxMode: zoneLayout.exitTmuxMode,
+      showSidebar: session.workflowGen.showSidebar,
+      setShowSidebar: session.workflowGen.setShowSidebar,
+    };
+  }, [
+    zoneLayout.workMode,
+    zoneLayout.shownTabId,
+    zoneLayout.enterTmuxMode,
+    zoneLayout.exitTmuxMode,
+    session.workflowGen.showSidebar,
+    session.workflowGen.setShowSidebar,
   ]);
 
   // Register page-level UI Bridge actions so AI agents can discover
@@ -442,6 +478,54 @@ function TerminalPageInner({
           maximizedZone: zoneMaximizeRef.current.maximizedZone,
           zoneCount: zoneMaximizeRef.current.zoneCount,
           layoutId: zoneMaximizeRef.current.layoutId,
+        }),
+      },
+      // ── tmux work mode, drivable and assertable ──
+      //
+      // The same rule as the CommandBar toggle, Ctrl+Shift+Y and
+      // `/terminal.mode` (`applyWorkModeRequest`): entering tmux opens the
+      // Session Manager, and the envelope says what changed.
+      {
+        id: "set-terminal-work-mode",
+        label: "Set Terminal Work Mode",
+        description:
+          "Switch the terminal page between grid mode (every session in a zone) and tmux mode (one session on screen, the rest live off-screen; entering it opens the session manager). Params: { mode?: 'grid' | 'tmux' } — omitted toggles. Returns { previousMode, mode, changed, sidebarOpened, message }.",
+        paramSchema: WORK_MODE_SCHEMA,
+        // `write` — the mode and the sidebar flag are persisted per page/window
+        // and survive reload, unlike the in-memory maximize state; the inverse
+        // request restores the grid the operator left (`gridSnapshot`).
+        effect: "write",
+        // The ref is read when the ACTION is invoked, never during render:
+        // `guardedHandler` only stores `run`. The compiler cannot see through
+        // the call, so it reports the closure as a render-time ref read.
+        // eslint-disable-next-line react-hooks/refs
+        handler: guardedHandler("set-terminal-work-mode", WORK_MODE_SCHEMA, async (args) => {
+          const { mode } = args as { mode?: unknown };
+          const parsed = parseWorkModeRequest(mode);
+          if (!parsed.ok) throw new Error(`set-terminal-work-mode: ${parsed.error}`);
+          const change = applyWorkModeRequest(workModeRef.current, parsed.request);
+          // Carry the result into the ref now rather than at the next commit, so
+          // a second call made before React re-renders reports the mode this
+          // one left behind, not the one it started from.
+          workModeRef.current = {
+            ...workModeRef.current,
+            workMode: change.mode,
+            showSidebar: workModeRef.current.showSidebar || change.sidebarOpened,
+          };
+          return change;
+        }),
+      },
+      {
+        id: "get-terminal-work-mode",
+        label: "Get Terminal Work Mode",
+        description:
+          "Return { mode, shownTabId, sidebarOpen } — the read that lets a caller assert the work mode without inferring it from a DOM snapshot. The CommandBar's `terminal.work-mode-toggle` element shows the same mode by name.",
+        // `read` — a query.
+        effect: "read",
+        handler: () => ({
+          mode: workModeRef.current.workMode,
+          shownTabId: workModeRef.current.shownTabId,
+          sidebarOpen: workModeRef.current.showSidebar,
         }),
       },
       {
