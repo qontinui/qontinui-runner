@@ -25,6 +25,8 @@ interface TerminalPageTabBarProps {
   onReorganize?: () => void;
   /** Close every page that hosts no terminals. Resolves to how many were closed. */
   onCloseEmptyPages?: () => Promise<number>;
+  /** Last-known count of tabs the button would close; 0 disables it. Omitted = unknown, stays enabled. */
+  emptyPageCount?: number;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
   /** Detach an entire page (all its terminals + layout) into its own window. */
@@ -46,6 +48,7 @@ export function TerminalPageTabBar({
   onReorderPage,
   onReorganize,
   onCloseEmptyPages,
+  emptyPageCount,
   onPopOut,
   onPopOutPage,
   isPinned,
@@ -302,10 +305,16 @@ export function TerminalPageTabBar({
       {pages.length >= 2 && onCloseEmptyPages && (
         <button
           onClick={() => void handleCloseEmpty()}
-          disabled={closingEmpty}
+          disabled={closingEmpty || emptyPageCount === 0}
           aria-label="Close empty tabs"
           className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50"
-          title="Close empty tabs (tabs that have no terminals open)"
+          title={
+            emptyPageCount === 0
+              ? "No empty tabs to close"
+              : emptyPageCount === undefined
+                ? "Close empty tabs (tabs that have no terminals open)"
+                : `Close ${emptyPageCount} empty tab${emptyPageCount === 1 ? "" : "s"} (no terminals open)`
+          }
         >
           <BrushCleaning className="w-3 h-3" />
         </button>
