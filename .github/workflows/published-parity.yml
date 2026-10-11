@@ -3,8 +3,11 @@ name: published-build parity
 # Phase 7 of plan 2026-08-31-published-build-parity-check.
 #
 # Runs the DEVELOPMENT build and the INSTALLED PUBLISHED build side by side on a
-# clean GitHub-hosted windows-latest box and reports where they differ, on two
-# axes:
+# clean GitHub-hosted windows-latest box -- and, since Phase 6B of plan
+# 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# on ubuntu-22.04 against the published .deb/AppImage (job
+# `published-parity-linux`, both axes) -- and reports where
+# they differ, on two axes:
 #
 #   1. CAPABILITY MANIFEST (Phase 5) — scripts/published-parity.ps1 diffs which
 #      rung answered for each capability in each build.
@@ -65,6 +68,13 @@ name: published-build parity
 #             carrying the full row-level diff — the input any future coord
 #             parity label would consume.
 #
+# Every emission states WHAT was compared: the artifact's `provenance` block
+# (dev_sha, published_tag/published_sha, skew_commits, run_id/run_event, the
+# per-axis observed|unknown(<reason>) and the sibling SHAs) and the summary's
+# `skew_commits: <n>` line. A nightly compares main with the latest release, so
+# its row differences are confounded with that many commits; the same-SHA run
+# release.yml dispatches reads 0.
+#
 # =============================================================================
 # WHAT A GREEN RUN DOES *NOT* MEAN
 # =============================================================================
@@ -86,12 +96,26 @@ on:
     # Nightly, 07:00 UTC. Off the merge train's busy window and after the
     # nightly release cadence, so the newest published artifact is available.
     - cron: "0 7 * * *"
+  # THE SAME-SHA LEG. release.yml's `dispatch-parity` job, which runs once
+  # publish-update-json has published, dispatches this workflow at that tag:
+  #   gh workflow run published-parity.yml --ref refs/tags/v<ver> -f release_tag=v<ver>
+  # (falling back to the bare `--ref v<ver>`, the documented form).
+  # so the dev leg builds the tag (the checkout below takes the event's ref) and
+  # installs the release made from it -- skew_commits 0. That dispatch, not the
+  # `release` trigger, is what fires for our own releases: release.yml un-drafts
+  # with GITHUB_TOKEN, and GitHub starts no workflow run from an event raised by
+  # GITHUB_TOKEN (workflow_dispatch and repository_dispatch are the exemptions;
+  # docs.github.com/en/actions/concepts/security/github_token, "When
+  # GITHUB_TOKEN triggers workflow runs").
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to install (e.g. v1.0.10). Empty = latest."
+        description: "Release tag to install (e.g. v1.0.10). Empty = latest. Dispatch with --ref refs/tags/<the same tag> for a same-SHA reading; a branch ref compares that branch against this release. Refused: a different tag ref, or a branch named exactly like the tag."
         required: false
         default: ""
+  # Kept: a release published BY HAND (a person's token, not GITHUB_TOKEN) still
+  # raises this event, and on it GITHUB_SHA is the tag commit -- the same
+  # same-SHA reading as the dispatch above.
   release:
     types: [published]
   # The NEGATIVE CONTROL only (see the `negative-control` job). A PR that
@@ -169,9 +193,83 @@ jobs:
     # still cannot sit past 150m; what changes is that a cold night reports
     # instead of dying.
     timeout-minutes: 150
+    # The tag this leg compared against, so the cross-platform job can name the
+    # artifact it reads (Phase 6B). Empty when the job died before resolving it,
+    # which the cross-platform job reads as a missing report, never as 0.
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
 
     steps:
+      # NO `ref:` -- deliberately. The ref is the event's: on a `release` event
+      # GITHUB_SHA is the tag commit, and on the `workflow_dispatch` release.yml
+      # sends after every publish (`--ref refs/tags/v<ver>`) it is
+      # the tag too. Either way the dev leg builds THE TAG and compares it with
+      # the release made from it: one SHA, two build shapes. The nightly
+      # `schedule` run builds main and compares against the latest release, and
+      # says how far apart those are (skew_commits).
+      #
+      # Full history, blobless. skew_commits is `git rev-list --count
+      # <tag>..HEAD`, and the default fetch-depth 1 cannot answer it: the tag is
+      # not fetched, or a shallow walk counts only what happens to be present
+      # -- an undercount with exit 0. published-parity.ps1 refuses a shallow
+      # count and reports unknown(shallow_clone) rather than a number, so this
+      # is what turns that unknown into a reading. `filter: blob:none` keeps it
+      # cheap: every commit and tag, file contents only for the tree checked
+      # out (fetched on demand otherwise).
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      # FIRST, before the hour-long build: refuse the two dispatch shapes that
+      # would MISLABEL a run, and nothing else. release.yml's dispatch-parity
+      # falls back from `--ref refs/tags/v<ver>` to the bare `--ref v<ver>`,
+      # and GitHub resolves a bare name itself -- possibly to a BRANCH of the
+      # same name. Refused, naming both values:
+      #   (a) GITHUB_REF is a tag, but not refs/tags/<release_tag>: the run
+      #       would build one release's tag and install another's.
+      #   (b) GITHUB_REF is refs/heads/<release_tag>: a branch shadowing the
+      #       tag name -- the fallback-resolution case. It would build the
+      #       branch while reading as the release's own tag.
+      # Any OTHER branch with release_tag set PASSES: comparing a branch (main,
+      # say) against an older release is a capability this workflow keeps, and
+      # the provenance block labels it honestly -- dev_sha, published_sha, and
+      # skew_commits, which is a count only when the tag is an ancestor of the
+      # branch and unknown(<reason>) otherwise.
+      - name: A dispatched release_tag cannot be mislabelled by the ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          # Bound through env, not spliced into the script text: a tag name
+          # may carry shell metacharacters (see "Resolve the release" below).
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -z "$INPUT_TAG" ]; then
+            echo "No release_tag supplied -- this run compares against the latest release."
+            exit 0
+          fi
+          # Charset gate BEFORE the value is echoed anywhere. A dispatched input
+          # is caller-supplied text: a newline in it would put a line starting
+          # `::` on stdout, which the runner reads as a WORKFLOW COMMAND. A
+          # release tag here is vX.Y.Z[-pre][+build], so [0-9A-Za-z.+-] is the
+          # whole alphabet. The refusal prints the value %q-escaped (a newline
+          # renders as $'\n'), never raw.
+          if [[ ! "$INPUT_TAG" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            printf '::error::release_tag_invalid_charset: release_tag=%q contains a character outside [0-9A-Za-z.+-]. Refusing before it is used anywhere.\n' "$INPUT_TAG"
+            exit 1
+          fi
+          case "$GITHUB_REF" in
+            "refs/tags/${INPUT_TAG}")
+              echo "GITHUB_REF is refs/tags/${INPUT_TAG}: a same-SHA reading of the release's own tag." ;;
+            refs/tags/*)
+              echo "::error::release_tag/ref mismatch: release_tag='${INPUT_TAG}' but GITHUB_REF='${GITHUB_REF}' is a DIFFERENT tag. This run would build one release and install another. Re-dispatch with --ref refs/tags/${INPUT_TAG}."
+              exit 1 ;;
+            "refs/heads/${INPUT_TAG}")
+              echo "::error::release_tag/ref mismatch: release_tag='${INPUT_TAG}' but GITHUB_REF='${GITHUB_REF}' is a BRANCH shadowing that tag name -- the bare-name ref resolved to the branch. This run would build the branch while reading as the release's own tag. Re-dispatch with --ref refs/tags/${INPUT_TAG}."
+              exit 1 ;;
+            *)
+              echo "Building ${GITHUB_REF} against release ${INPUT_TAG}: a cross-version comparison. skew_commits in the provenance block states the distance (unknown when the tag is not an ancestor)." ;;
+          esac
+        shell: bash
 
       # FIRST, before any compile: the rust-cache `shared-key` coupling this
       # job depends on for its warmth. The `Swatinem/rust-cache@v2` step below
@@ -495,16 +593,20 @@ jobs:
       # file is unparseable and we REFUSE — an unverifiable checksum is not a
       # pass.
       - name: Verify the installer against the release checksums
+        env:
+          # Bound through env, not spliced into the script text: same tag-name
+          # hygiene as the "Resolve the release" step above.
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           setup=$(ls published-artifact/Qontinui.Runner_*_x64-setup.exe 2>/dev/null | head -1)
           if [ -z "$setup" ]; then
-            echo "::error::No Qontinui.Runner_*_x64-setup.exe on release ${{ steps.release.outputs.tag }}. Nothing to compare against."
+            echo "::error::No Qontinui.Runner_*_x64-setup.exe on release ${TAG}. Nothing to compare against."
             exit 1
           fi
           sums="published-artifact/checksums-windows-x64.txt"
           if [ ! -f "$sums" ]; then
-            echo "::error::Release ${{ steps.release.outputs.tag }} carries no checksums-windows-x64.txt. Refusing to run an unverified installer."
+            echo "::error::Release ${TAG} carries no checksums-windows-x64.txt. Refusing to run an unverified installer."
             exit 1
           fi
 
@@ -691,6 +793,10 @@ jobs:
           # Same degraded-boot flag ci.yml's contract-smoke step uses: the
           # manifest door needs no database rows.
           QONTINUI_ALLOW_NO_DB: "1"
+          # The release the installed build came from, for the provenance block
+          # and skew_commits. Bound through env, not spliced into the command
+          # line: same tag-name hygiene as the "Resolve the release" step.
+          PARITY_RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
             -ScriptPath scripts/published-parity.ps1 -LogPath parity-report/published-parity.log -TimeoutSec 1500 `
@@ -781,95 +887,51 @@ jobs:
       # (unlike a plain `success()`/no-condition step) -- so even the
       # cancel-the-job reading still lets this job report.
       - name: Behavioural axis — diff the two pass/fail sets
+        # always(): an earlier failed step must still leave its UNKNOWN line in
+        # the summary rather than no line at all.
+        if: always()
         continue-on-error: true
         timeout-minutes: 5
         run: |
-          # contract-smoke's Record emits "STATUS  METHOD  PATH  DETAIL" and only
-          # ever PASS / FAIL / SKIP. A handful of synthetic rows reuse a path
-          # that a real route also probes (e.g. "/control/elements (probe)"), so
-          # collapse to ONE row per METHOD+PATH keeping the worst status --
-          # FAIL > SKIP > PASS. Keeping duplicates would make the join below a
-          # cross product and invent differences that are not there.
-          extract() {
-            grep -aoE '^(PASS|FAIL|SKIP)[[:space:]]+[A-Z]+[[:space:]]+[^[:space:]]+' "$1" \
-              | awk '{
-                  key = $2 " " $3
-                  rank = ($1 == "FAIL" ? 3 : ($1 == "SKIP" ? 2 : 1))
-                  if (!(key in best) || rank > bestrank[key]) { best[key] = $1; bestrank[key] = rank }
-                }
-                END { for (k in best) print k " " best[k] }' \
-              | sort
-          }
-
-          {
-            echo ""
-            echo "### Behavioural axis — contract smoke, development vs published"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          dev_ok=1; pub_ok=1
-          [ -s smoke-dev.log ] || dev_ok=0
-          [ -s smoke-published.log ] || pub_ok=0
-          extract smoke-dev.log > dev-routes.txt 2>/dev/null || true
-          extract smoke-published.log > pub-routes.txt 2>/dev/null || true
-          [ -s dev-routes.txt ] || dev_ok=0
-          [ -s pub-routes.txt ] || pub_ok=0
-
-          if [ "$dev_ok" = "0" ] || [ "$pub_ok" = "0" ]; then
-            echo "::warning::Behavioural axis UNKNOWN — one or both contract-smoke legs produced no probe lines (dev=$dev_ok published=$pub_ok). This is NOT a statement that the two builds behave the same; the measurement did not happen."
-            {
-              echo "**UNKNOWN** — one or both legs produced no probe lines (dev parsed: \`$dev_ok\`, published parsed: \`$pub_ok\`)."
-              echo ""
-              echo "This is not evidence of agreement. A leg that was never measured is unknown, never clean."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          join -j 1 -o 0,1.2,2.2 \
-            <(awk '{print $1"|"$2" "$3}' dev-routes.txt | sort) \
-            <(awk '{print $1"|"$2" "$3}' pub-routes.txt | sort) > joined.txt || true
-
-          differing=$(awk '$2 != $3 {print}' joined.txt | wc -l | tr -d ' ')
-          only_dev=$(comm -23 <(cut -d' ' -f1,2 dev-routes.txt | sort -u) <(cut -d' ' -f1,2 pub-routes.txt | sort -u) | wc -l | tr -d ' ')
-          only_pub=$(comm -13 <(cut -d' ' -f1,2 dev-routes.txt | sort -u) <(cut -d' ' -f1,2 pub-routes.txt | sort -u) | wc -l | tr -d ' ')
-
-          {
-            echo "Routes whose outcome differs between the two builds: **${differing}**"
-            echo ""
-            echo "Probed only on the development leg: **${only_dev}** · only on the published leg: **${only_pub}**"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$differing" != "0" ]; then
-            {
-              echo "| Route | Development build | Published build |"
-              echo "|---|---|---|"
-              awk '$2 != $3 {gsub(/\|/, " ", $1); print "| `" $1 "` | " $2 " | " $3 " |"}' joined.txt
-              echo ""
-            } >> "$GITHUB_STEP_SUMMARY"
-            awk '$2 != $3 {print "::warning::Behavioural parity difference - " $1 ": development build " $2 ", published build " $3}' joined.txt
-          fi
-
-          {
-            echo "Where this axis and the capability-manifest axis disagree, the disagreement is a **finding about the roster** — the manifest can only see capabilities somebody enumerated in \`CAPABILITY_SPECS\`, and this axis is what notices the ones nobody did. It is not reconciled toward either side."
-            echo ""
-            echo "_This report gates nothing._"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash scripts/behavioural-diff.sh smoke-dev.log smoke-published.log windows
         shell: bash
 
       # -----------------------------------------------------------------------
       # The machine-readable half.
       # -----------------------------------------------------------------------
+      # The manifest step writes the artifact BEFORE the contract-smoke legs
+      # run, so its provenance block can only say the behavioural axis is
+      # unknown(not_yet_measured). This stamps the answer in once there is one.
+      # Set-ParityBehaviouralAxis touches that one field and nothing else --
+      # skew_commits above all -- and records a malformed value as unknown.
+      # `shell: powershell` (5.1), not pwsh: pwsh 7's ConvertFrom-Json turns the
+      # ISO `generated_at` strings into DateTime and would re-serialize them in
+      # another format on the way back out. Reports, never fails the job. The
+      # logic lives in lib/parity-diff.ps1 (Update-ParityReportBehaviouralAxis),
+      # where the ASCII/parse step and scripts/tests/test-parity-diff.ps1 reach
+      # it; the inline part is one call.
+      - name: Stamp the behavioural axis into the provenance block
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          . ./scripts/lib/parity-diff.ps1
+          Update-ParityReportBehaviouralAxis -JsonPath 'parity-report/published-parity.json' -AxisPath 'parity-report/behavioural-axis.txt'
+        shell: powershell
+
       - name: Upload the row-level parity diff
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: published-parity-${{ steps.release.outputs.tag }}
+          # Per-platform since Phase 6B: the Linux leg uploads
+          # published-parity-<tag>-linux beside this one.
+          name: published-parity-${{ steps.release.outputs.tag }}-windows
           if-no-files-found: warn
           retention-days: 30
           path: |
             parity-report/published-parity.json
             parity-report/published-parity.log
+            parity-report/behavioural-axis.txt
             smoke-dev.log
             smoke-published.log
             dev-routes.txt
@@ -890,16 +952,556 @@ jobs:
           UNOBSERVED_COUNT: ${{ steps.parity.outputs.unobserved-count }}
           EXPECTED_DIFF_COUNT: ${{ steps.parity.outputs.expected-difference-count }}
           SCHEMA_REFUSED: ${{ steps.parity.outputs.schema-refused }}
+          SKEW_COMMITS: ${{ steps.parity.outputs.skew-commits }}
         run: |
           echo "parity-count              = '${PARITY_COUNT:-}'"
           echo "comparable-count          = '${COMPARABLE_COUNT:-}'"
           echo "unobserved-count          = '${UNOBSERVED_COUNT:-}'"
           echo "expected-difference-count = '${EXPECTED_DIFF_COUNT:-}'"
           echo "schema-refused            = '${SCHEMA_REFUSED:-}'"
+          echo "skew-commits              = '${SKEW_COMMITS:-}'"
           if [ -z "${PARITY_COUNT:-}" ]; then
             echo "::warning::No parity count was produced. The comparison refused (schema mismatch) or could not run. This is UNKNOWN, not zero."
           fi
         shell: bash
+
+  # ===========================================================================
+  # THE LINUX PUBLISHED LEG -- Phase 6B of plan
+  # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports.
+  # ===========================================================================
+  #
+  # Same question as the job above, asked of the Linux artifact: build the
+  # DEVELOPMENT runner from this commit on ubuntu-22.04 (the release leg's own
+  # image), unpack the PUBLISHED .deb (else AppImage) without root, boot both
+  # under Xvfb, drive provisioning through each one's own doors and diff the two
+  # capability manifests. Same posture: it gates nothing, every reporting step
+  # is continue-on-error, and an empty count is UNKNOWN, never 0.
+  #
+  # PROVENANCE BEFORE UNPACKING. The release's checksums-linux-x64.txt names
+  # PRE-UPLOAD paths ("deb/Qontinui Runner_1.0.11_amd64.deb", with a space)
+  # while the asset is "Qontinui.Runner_1.0.11_amd64.deb", so the asset is
+  # matched by sha256, never by name (Confirm-PublishedLinuxAssetHash in
+  # scripts/lib/installed-runner.ps1). A hash that matches no line REFUSES the
+  # run, as the Windows leg refuses an unverified installer: nothing unpacked
+  # from an unproven file may stand for the published build.
+  #
+  # A RELEASE WITH NO LINUX ASSET IS UNKNOWN, NOT RED. The Linux release leg is
+  # continue-on-error and v1.0.6 / v1.0.7 shipped none. That is decided from the
+  # release's asset LIST, as one of the enumerated reasons in
+  # $LinuxUnknownReasons, and reported -- never a 0 and never a failed run.
+  #
+  # BOTH AXES. The behavioural axis runs here as on Windows: contract-smoke.ps1
+  # walks the same routes against both builds (its process-tree teardown reads
+  # /proc on Linux), and scripts/behavioural-diff.sh -- the one implementation
+  # both legs share -- diffs the two pass/fail sets. An unpacked AppImage is
+  # booted through its AppRun on both axes, never its inner binary.
+  published-parity-linux:
+    name: Published-build parity (linux)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    # Ladder: apt 10 + build 60 + unpack 10 + parity 30 + smoke 25 + 25 +
+    # diff 5 + stamp 2 = 167 of step budget, plus checkout, the siblings, setup,
+    # `pnpm install` and the unit tests (~10). A JOB timeout cancels rather than
+    # reports (the #1511 shape the Windows job's comment records), so the job
+    # bound sits above the ladder.
+    timeout-minutes: 185
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      # A typed UNKNOWN from the asset step (no Linux asset / checksums on the
+      # release, or the locator's own reasons), so the cross-platform job can
+      # name the release fact instead of a generic missing report.
+      linux_unknown: ${{ steps.linux_asset.outputs.linux-unknown || steps.parity.outputs.linux-unknown-reason }}
+
+    steps:
+      # Full history, as on the Windows job: skew_commits is `git rev-list
+      # --count <tag>..HEAD`, which a depth-1 clone can only answer as
+      # unknown(shallow_clone). blob:none keeps it cheap.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      # The Windows job's guard, verbatim: a dispatch whose ref would mislabel
+      # the run is refused here too, before the build.
+      # FIRST, before the hour-long build: refuse the two dispatch shapes that
+      # would MISLABEL a run, and nothing else. release.yml's dispatch-parity
+      # falls back from `--ref refs/tags/v<ver>` to the bare `--ref v<ver>`,
+      # and GitHub resolves a bare name itself -- possibly to a BRANCH of the
+      # same name. Refused, naming both values:
+      #   (a) GITHUB_REF is a tag, but not refs/tags/<release_tag>: the run
+      #       would build one release's tag and install another's.
+      #   (b) GITHUB_REF is refs/heads/<release_tag>: a branch shadowing the
+      #       tag name -- the fallback-resolution case. It would build the
+      #       branch while reading as the release's own tag.
+      # Any OTHER branch with release_tag set PASSES: comparing a branch (main,
+      # say) against an older release is a capability this workflow keeps, and
+      # the provenance block labels it honestly -- dev_sha, published_sha, and
+      # skew_commits, which is a count only when the tag is an ancestor of the
+      # branch and unknown(<reason>) otherwise.
+      - name: A dispatched release_tag cannot be mislabelled by the ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          # Bound through env, not spliced into the script text: a tag name
+          # may carry shell metacharacters (see "Resolve the release" below).
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -z "$INPUT_TAG" ]; then
+            echo "No release_tag supplied -- this run compares against the latest release."
+            exit 0
+          fi
+          # Charset gate BEFORE the value is echoed anywhere. A dispatched input
+          # is caller-supplied text: a newline in it would put a line starting
+          # `::` on stdout, which the runner reads as a WORKFLOW COMMAND. A
+          # release tag here is vX.Y.Z[-pre][+build], so [0-9A-Za-z.+-] is the
+          # whole alphabet. The refusal prints the value %q-escaped (a newline
+          # renders as $'\n'), never raw.
+          if [[ ! "$INPUT_TAG" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            printf '::error::release_tag_invalid_charset: release_tag=%q contains a character outside [0-9A-Za-z.+-]. Refusing before it is used anywhere.\n' "$INPUT_TAG"
+            exit 1
+          fi
+          case "$GITHUB_REF" in
+            "refs/tags/${INPUT_TAG}")
+              echo "GITHUB_REF is refs/tags/${INPUT_TAG}: a same-SHA reading of the release's own tag." ;;
+            refs/tags/*)
+              echo "::error::release_tag/ref mismatch: release_tag='${INPUT_TAG}' but GITHUB_REF='${GITHUB_REF}' is a DIFFERENT tag. This run would build one release and install another. Re-dispatch with --ref refs/tags/${INPUT_TAG}."
+              exit 1 ;;
+            "refs/heads/${INPUT_TAG}")
+              echo "::error::release_tag/ref mismatch: release_tag='${INPUT_TAG}' but GITHUB_REF='${GITHUB_REF}' is a BRANCH shadowing that tag name -- the bare-name ref resolved to the branch. This run would build the branch while reading as the release's own tag. Re-dispatch with --ref refs/tags/${INPUT_TAG}."
+              exit 1 ;;
+            *)
+              echo "Building ${GITHUB_REF} against release ${INPUT_TAG}: a cross-version comparison. skew_commits in the provenance block states the distance (unknown when the tag is not an ancestor)." ;;
+          esac
+        shell: bash
+
+      # Same coupling, same reason as the Windows job: the rust-cache step below
+      # reads ci.yml's `test` job cache (its ubuntu-22.04 leg, by OS key).
+      - name: Assert ci.yml still has a job named "test" (the rust-cache shared-key)
+        shell: bash
+        run: |
+          if ! grep -qE '^  test:' .github/workflows/ci.yml; then
+            echo "::error::ci.yml no longer declares a job named 'test'. This job's Swatinem/rust-cache step reads shared-key: \"test\" -- ci.yml's job id -- to get main's warm cache. If that job was renamed, rename the shared-key here to match, or this workflow silently runs cold every night."
+            exit 1
+          fi
+          echo "ci.yml still declares job 'test' -- shared-key coupling holds."
+
+      # FIRST, before any compile, and the one step here that is not
+      # continue-on-error: the classifier and the Linux locator, under the
+      # interpreter that will run them on this leg (pwsh 7; there is no 5.1 on
+      # Linux). test-installed-runner.ps1 carries the Linux fixtures -- the
+      # never-the-dev-binary guard on usr/bin layouts -- which until this job
+      # existed only ever ran on Windows, where they are skipped.
+      - name: Parity comparator and Linux locator unit tests (pwsh)
+        shell: bash
+        run: |
+          pwsh -NoProfile -File scripts/tests/test-parity-diff.ps1
+          pwsh -NoProfile -File scripts/tests/test-installed-runner.ps1
+
+      # qontinui-schemas is a hard compile dependency; ui-bridge carries the
+      # UI_BRIDGE_ROUTES source contract-smoke parses (-SdkTypesPath below).
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
+
+      # ci.yml's package list (it builds the same workspace on this image), plus
+      # xvfb for xvfb-run: both artifacts are GUI processes and WebKitGTK needs a
+      # display even when nothing is drawn. Bounded for the same apt-hang reason
+      # ci.yml records on its identical step.
+      - name: Install dependencies (Ubuntu)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core \
+            xvfb
+
+      # Same reclaim and the same exclusions as ci.yml's step of this name --
+      # `large-packages: true` would cascade-remove the GTK/GDK libs just
+      # installed. Read ci.yml's comment before changing either side.
+      - name: Free disk space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      # The link-time OOM guard ci.yml's ubuntu leg carries, for the same
+      # workspace on the same 16 GB image.
+      - name: Add swapfile (guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        # Pin matches rust-toolchain.toml (channel = "1.95.0").
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # Read-only, shared with ci.yml's `test` job -- see the Windows job's
+      # step for the full reasoning; it applies here unchanged.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: "test"
+          save-if: "false"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The DEVELOPMENT leg's artifact: target/debug/qontinui-runner. Not
+      # continue-on-error, for the reason the Windows job gives: a build that
+      # genuinely fails is a real signal.
+      - name: Build Tauri app (development)
+        timeout-minutes: 60
+        run: pnpm run tauri build --debug --no-bundle
+
+      # Identical to the Windows job's resolution. Each leg resolves "latest"
+      # on its own, so a release published between the two could put different
+      # versions on the two platforms; the cross-platform job refuses that pair
+      # (published_versions_differ) rather than reporting skew as a difference.
+      - name: Resolve the release to compare against
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag="$EVENT_TAG"
+          if [ -z "$tag" ]; then tag="$INPUT_TAG"; fi
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName) || tag=""
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::Could not resolve a release tag to compare against. This is NOT a parity result — the comparison did not run."
+            exit 1
+          fi
+          echo "Comparing against release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # Select from the asset LIST, download, prove by sha256, THEN unpack into
+      # a prefix under RUNNER_TEMP -- outside this checkout, which the locator's
+      # guard refuses. Outputs exactly one of:
+      #   prefix=<dir>          the unpacked published build, located and guarded
+      #   linux-unknown=<why>   a typed UNKNOWN from $LinuxUnknownReasons
+      # Anything else (the asset list could not be read, a download failed, the
+      # hash matched no line, the guard fired) throws and fails the step: that
+      # is a refusal to measure, not a parity verdict.
+      - name: Download, verify and unpack the published Linux build
+        id: linux_asset
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . ./scripts/lib/installed-runner.ps1
+          $unknown = {
+            param([string]$Reason, [string]$Detail)
+            Write-Host "::warning::Published Linux build UNKNOWN($Reason) -- no Linux parity number for $env:TAG. Not a 0. $Detail"
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "linux-unknown=$Reason"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("### Published-build capability parity (linux)`n`n**UNKNOWN** -- ``$Reason``. No Linux parity count for $env:TAG; this is not a 0.`n")
+            exit 0
+          }
+
+          $names = @(& gh release view $env:TAG --repo $env:REPO --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0) { throw "could not list the assets of release $env:TAG (gh exit $LASTEXITCODE) -- a harness fault, not a release fact." }
+          try {
+            $asset = Select-PublishedLinuxAsset -AssetNames $names -Version $env:TAG
+            $sums = Select-PublishedLinuxChecksums -AssetNames $names
+          } catch {
+            $r = Get-LinuxUnknownReason -Message $_.Exception.Message
+            if ($r) { & $unknown $r $_.Exception.Message }
+            throw
+          }
+          Write-Host "Selected $($asset.Kind) asset: $($asset.Name); checksums: $sums"
+
+          $dl = Join-Path $env:RUNNER_TEMP 'published-linux-download'
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          & gh release download $env:TAG --repo $env:REPO --dir $dl --pattern $asset.Name --pattern $sums
+          if ($LASTEXITCODE -ne 0) { throw "gh release download exited $LASTEXITCODE -- a harness fault, not a release fact." }
+          $assetPath = Join-Path $dl $asset.Name
+          $line = Confirm-PublishedLinuxAssetHash -AssetPath $assetPath -ChecksumsPath (Join-Path $dl $sums)
+          Write-Host "Provenance proven by sha256: $line"
+
+          $prefix = Join-Path $env:RUNNER_TEMP 'published-linux-prefix'
+          New-Item -ItemType Directory -Force -Path $prefix | Out-Null
+          if ($asset.Kind -eq 'deb') {
+            & dpkg -x $assetPath $prefix
+            if ($LASTEXITCODE -ne 0) { throw "dpkg -x exited $LASTEXITCODE" }
+          } else {
+            & chmod +x $assetPath
+            if ($LASTEXITCODE -ne 0) { throw "chmod +x exited $LASTEXITCODE" }
+            Push-Location $prefix
+            try { & $assetPath --appimage-extract | Out-Null } finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "--appimage-extract exited $LASTEXITCODE" }
+          }
+
+          try {
+            $exe = Find-InstalledRunnerExe -InstallRoot $prefix -Platform linux
+          } catch {
+            $r = Get-LinuxUnknownReason -Message $_.Exception.Message
+            if ($r) { & $unknown $r $_.Exception.Message }
+            throw
+          }
+          Write-Host "Published Linux runner: $exe"
+          # An AppImage boots through its AppRun (the bundle's own runtime
+          # environment), never its inner binary -- resolved here so a broken
+          # extract refuses before the parity step boots anything.
+          $launch = Get-PublishedLinuxLaunchPath -BinaryPath $exe
+          Write-Host "Published Linux launch: $launch"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "prefix=$prefix"
+
+      # AXIS 1 on Linux. pwsh directly (there is no 5.1 here, and the 5.1
+      # detached-host wrapper exists for a Windows pipe-inheritance hang), under
+      # xvfb-run so both booted artifacts get a display, under `timeout` so the
+      # inner bound fires before the step's. The harness picks the Linux branch
+      # of every platform choice from the host and records `platform: linux` in
+      # its JSON report; -InstallRoot is required here because a Linux install
+      # has no default location to probe.
+      - name: Capability-manifest parity (development vs published)
+        id: parity
+        if: steps.linux_asset.outputs.prefix != ''
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+          PREFIX: ${{ steps.linux_asset.outputs.prefix }}
+          # The provenance block's published_tag / skew_commits, bound through
+          # env as on the Windows job.
+          PARITY_RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p parity-report
+          set -o pipefail
+          timeout 1500 xvfb-run -a pwsh -NoProfile -File scripts/published-parity.ps1 \
+            -InstallRoot "$PREFIX" \
+            -JsonOut parity-report/published-parity.json \
+            -SummaryOut "$GITHUB_STEP_SUMMARY" \
+            -Annotate 2>&1 | tee parity-report/published-parity.log
+
+      # AXIS 2 on Linux -- behaviour. The same exerciser and the same contract
+      # (-SdkTypesPath) as the Windows job, run with pwsh directly under
+      # xvfb-run and `timeout`, as AXIS 1 above is. -UseInstalledExe locates the
+      # published build in the verified prefix and boots an AppImage through
+      # its AppRun. SENTRY_DSN stays unset on both legs, as on Windows.
+      - name: Contract smoke -- development build
+        id: smoke_dev
+        if: steps.linux_asset.outputs.prefix != ''
+        continue-on-error: true
+        timeout-minutes: 25
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1 \
+            -DirectExe target/debug/qontinui-runner \
+            -Profile ci \
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-dev.log
+
+      - name: Contract smoke -- published build
+        id: smoke_published
+        if: steps.linux_asset.outputs.prefix != ''
+        continue-on-error: true
+        timeout-minutes: 25
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+          PREFIX: ${{ steps.linux_asset.outputs.prefix }}
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1 \
+            -UseInstalledExe -InstallRoot "$PREFIX" \
+            -Profile ci \
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-published.log
+
+      # The same diff the Windows job runs. always(): a leg that wrote no probe
+      # lines (or never ran) is stated as UNKNOWN in the summary, never as
+      # agreement.
+      - name: Behavioural axis -- diff the two pass/fail sets
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: bash scripts/behavioural-diff.sh smoke-dev.log smoke-published.log linux
+
+      # The Windows job's stamp step, under pwsh (the only PowerShell here).
+      # Update-ParityReportBehaviouralAxis reads the JSON with -DateKind String
+      # where pwsh offers it, so generated_at survives the round trip.
+      - name: Stamp the behavioural axis into the provenance block
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          . ./scripts/lib/parity-diff.ps1
+          Update-ParityReportBehaviouralAxis -JsonPath 'parity-report/published-parity.json' -AxisPath 'parity-report/behavioural-axis.txt'
+
+      - name: Upload the row-level parity diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-${{ steps.release.outputs.tag }}-linux
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            parity-report/published-parity.json
+            parity-report/published-parity.log
+            parity-report/behavioural-axis.txt
+            smoke-dev.log
+            smoke-published.log
+            dev-routes.txt
+            pub-routes.txt
+
+      - name: Report the count
+        if: always()
+        env:
+          PARITY_COUNT: ${{ steps.parity.outputs.parity-count }}
+          COMPARABLE_COUNT: ${{ steps.parity.outputs.comparable-count }}
+          UNOBSERVED_COUNT: ${{ steps.parity.outputs.unobserved-count }}
+          SCHEMA_REFUSED: ${{ steps.parity.outputs.schema-refused }}
+          SKEW_COMMITS: ${{ steps.parity.outputs.skew-commits }}
+          PLATFORM: ${{ steps.parity.outputs.platform }}
+          LINUX_UNKNOWN: ${{ steps.linux_asset.outputs.linux-unknown }}
+          LOCATOR_UNKNOWN: ${{ steps.parity.outputs.linux-unknown-reason }}
+        run: |
+          echo "platform                  = '${PLATFORM:-}'"
+          echo "parity-count              = '${PARITY_COUNT:-}'"
+          echo "comparable-count          = '${COMPARABLE_COUNT:-}'"
+          echo "unobserved-count          = '${UNOBSERVED_COUNT:-}'"
+          echo "schema-refused            = '${SCHEMA_REFUSED:-}'"
+          echo "skew-commits              = '${SKEW_COMMITS:-}'"
+          echo "linux-unknown             = '${LINUX_UNKNOWN:-${LOCATOR_UNKNOWN:-}}'"
+          if [ -z "${PARITY_COUNT:-}" ]; then
+            echo "::warning::No Linux parity count was produced (unknown reason: '${LINUX_UNKNOWN:-${LOCATOR_UNKNOWN:-none recorded}}'). This is UNKNOWN, not zero."
+          fi
+        shell: bash
+
+  # ===========================================================================
+  # THE CROSS-PLATFORM LIST -- Phase 6B's third number.
+  # ===========================================================================
+  #
+  # Reads the two JSON reports the legs above uploaded and lists the capability
+  # rows whose PUBLISHED rung differs between windows and linux. Its own list,
+  # never added to parity_defects (that unit is dev-vs-published on one
+  # platform). Boots nothing, so it is cheap; `if: always()` so a failed leg
+  # still produces an explicit UNKNOWN rather than no line at all.
+  cross-platform:
+    name: Published build, windows vs linux
+    needs: [published-parity, published-parity-linux]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the windows report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: published-parity-${{ needs.published-parity.outputs.tag }}-windows
+          path: cross-platform/windows
+
+      - name: Download the linux report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: published-parity-${{ needs.published-parity-linux.outputs.tag }}-linux
+          path: cross-platform/linux
+
+      # The artifact's internal layout depends on upload-artifact's common-root
+      # rule, so find the report by name rather than assuming a path. A missing
+      # file reaches the harness as an empty argument, which it reports as
+      # <platform>_report_missing -- UNKNOWN, exit 2, never a 0.
+      - name: Compare the published side across platforms
+        id: compare
+        continue-on-error: true
+        shell: bash
+        env:
+          LINUX_UNKNOWN: ${{ needs.published-parity-linux.outputs.linux_unknown }}
+        run: |
+          # GitHub runs bash with -eo pipefail, and `find` on a directory a
+          # failed download never created exits 1 -- which would stop this step
+          # before the harness could name the reason. Make both directories
+          # exist so a missing report reaches the harness as *_report_missing.
+          mkdir -p cross-platform/windows cross-platform/linux
+          win=$(find cross-platform/windows -name published-parity.json -type f | head -1 || true)
+          lin=$(find cross-platform/linux -name published-parity.json -type f | head -1 || true)
+          echo "windows report: '${win}'"
+          echo "linux report  : '${lin}'"
+          echo "linux unknown : '${LINUX_UNKNOWN:-}'"
+          # Each flag only when it has a value: an empty argv element must never
+          # be able to shift -LinuxReport into -WindowsReport's value. An absent
+          # path binds the script's $null default -> <platform>_report_missing.
+          args=()
+          [ -n "$win" ] && args+=(-WindowsReport "$win")
+          [ -n "$lin" ] && args+=(-LinuxReport "$lin")
+          [ -n "${LINUX_UNKNOWN:-}" ] && args+=(-LinuxUnknown "$LINUX_UNKNOWN")
+          pwsh -NoProfile -File scripts/published-parity.ps1 -CrossPlatform "${args[@]}" \
+            -JsonOut cross-platform/published-cross-platform.json \
+            -SummaryOut "$GITHUB_STEP_SUMMARY" -Annotate
+
+      # Restated on the run, as the per-platform legs do. EMPTY means no list
+      # was produced (the reason says why) -- never read it as 0.
+      - name: Report the cross-platform count
+        if: always()
+        shell: bash
+        env:
+          DIFFER: ${{ steps.compare.outputs.cross-platform-differ-count }}
+          REASON: ${{ steps.compare.outputs.cross-platform-reason }}
+        run: |
+          echo "cross-platform-differ-count = '${DIFFER:-}'"
+          echo "cross-platform-reason       = '${REASON:-}'"
+          if [ -z "${DIFFER:-}" ]; then
+            echo "::warning::No cross-platform list was produced (reason: '${REASON:-none recorded}'). This is UNKNOWN, not zero."
+          fi
+
+      - name: Upload the cross-platform list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-cross-platform-${{ needs.published-parity.outputs.tag || needs.published-parity-linux.outputs.tag || 'unresolved' }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: cross-platform/published-cross-platform.json
 
   # ===========================================================================
   # THE NEGATIVE CONTROL -- the one check that can falsify the instrument.

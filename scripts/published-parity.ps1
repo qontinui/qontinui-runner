@@ -152,6 +152,15 @@
 #   powershell -File scripts/published-parity.ps1 -InstallRoot 'C:\...\Qontinui Runner'
 #   powershell -File scripts/published-parity.ps1 -JsonOut parity.json -Annotate
 #   powershell -File scripts/published-parity.ps1 -Door cli    # cold door; observes ~1 row
+#   powershell -File scripts/published-parity.ps1 -PublishedTag v1.0.12 -JsonOut parity.json
+#   pwsh -File scripts/published-parity.ps1 -InstallRoot <prefix>   # Linux: the dpkg -x prefix
+#   pwsh -File scripts/published-parity.ps1 -CrossPlatform -WindowsReport w.json -LinuxReport l.json
+#
+# PROVENANCE (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 2): the JSON artifact and the summary state WHICH two artifacts were
+# compared -- dev_sha, published_tag/published_sha, and skew_commits, the number
+# of commits between them. Without it a nightly's row difference cannot be told
+# apart from version skew. See "PROVENANCE" in lib/parity-diff.ps1.
 
 param(
     # The development build. Default: probe target/debug then target/release.
@@ -189,7 +198,26 @@ param(
     # see a missing-checkout difference and every 0 it has ever printed was
     # worthless. Needs no release and no installed exe, so it runs on a PR.
     # Exit 1 means BLIND; exit 0 means the instrument demonstrably sees the class.
-    [switch]$NegativeControl
+    [switch]$NegativeControl,
+    # The release tag the installed build came from. Recorded in the provenance
+    # block and used to compute skew_commits against this checkout's HEAD. The
+    # workflow binds it through the environment (PARITY_RELEASE_TAG) rather than
+    # the command line, the same hygiene it applies to every tag value. Empty
+    # leaves published_sha and skew_commits unknown(no_published_tag) -- never 0.
+    [string]$PublishedTag = $env:PARITY_RELEASE_TAG,
+    # CROSS-PLATFORM READ, not a parity run (Phase 6B of plan
+    # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports).
+    # Boots nothing. Reads the JSON report the Windows leg wrote and the one the
+    # Linux leg wrote, and lists the capability rows whose PUBLISHED rung differs
+    # between the two platforms. That list is its own number and is never added
+    # to parity_defects. Exit 0 = a list was produced (whatever it says);
+    # exit 2 = it could not be (a report missing, refused, mislabelled, or the
+    # two published builds are different versions), which is UNKNOWN.
+    [switch]$CrossPlatform,
+    [string]$WindowsReport = $null,
+    [string]$LinuxReport = $null,
+    # The Linux leg's typed UNKNOWN reason, when it produced no report.
+    [string]$LinuxUnknown = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -218,7 +246,21 @@ $RepoRoot = (Get-Item $PSScriptRoot).Parent.FullName
 # must carry the cargo package name. The two accept-sets are disjoint by
 # construction, so no input can satisfy both.
 # ---------------------------------------------------------------------------
-$DevExeName = 'qontinui-runner.exe'
+# The platform this run measures, decided once. Every platform-shaped choice
+# below (the dev binary's name, the process table the teardown walks, the
+# published locator's branch) reads it, and the report records it, so a Windows
+# artifact and a Linux artifact can never be mistaken for one another.
+$ParityPlatform = Get-ParityHostPlatform
+$DevExeName = Get-ParityDevExeName -Platform $ParityPlatform
+# There is no macOS leg: the published locator knows a Windows install dir and a
+# Linux unpacked prefix, nothing else. Refuse up front (harness, exit 2) rather
+# than let a macOS run fail later with a Windows-locator message. -CrossPlatform
+# boots nothing and -NegativeControl never calls the published locator, so both
+# are exempt.
+if ($ParityPlatform -eq 'macos' -and -not $CrossPlatform -and -not $NegativeControl) {
+    Write-Host "PARITY-UNAVAILABLE platform: no macOS published leg exists (windows and linux only)." -ForegroundColor Red
+    exit 2
+}
 
 function Assert-DevRunnerExe {
     param([string]$Path)
@@ -226,10 +268,9 @@ function Assert-DevRunnerExe {
     if ($leaf -ne $DevExeName) {
         throw "Refusing '$Path' as the development build: expected '$DevExeName', got '$leaf'."
     }
-    $norm = ($Path -replace '/', '\')
-    if ($norm -notmatch '(?i)\\target\\(debug|release)\\') {
+    if (-not (Test-ParityDevBuildPath -Path $Path)) {
         throw ("Refusing '$Path' as the development build: it does not live under a cargo " +
-               "build directory (target\debug or target\release). This leg must be the build " +
+               "build directory (target/debug or target/release). This leg must be the build " +
                "made from THIS checkout, not an installed artifact.")
     }
 }
@@ -243,10 +284,13 @@ function Find-DevRunnerExe {
     } else {
         # debug first: that is what ci.yml builds and what the dev leg of the
         # behavioural axis (contract-smoke) runs against.
-        $candidates.Add((Join-Path $RepoRoot ("target\debug\" + $DevExeName)))
-        $candidates.Add((Join-Path $RepoRoot ("target\release\" + $DevExeName)))
-        $candidates.Add((Join-Path $RepoRoot ("src-tauri\target\debug\" + $DevExeName)))
-        $candidates.Add((Join-Path $RepoRoot ("src-tauri\target\release\" + $DevExeName)))
+        # Built segment by segment so the separator is the host's: a literal
+        # `target\debug\` is a FILE NAME containing backslashes on Linux.
+        foreach ($base in @($RepoRoot, (Join-Path $RepoRoot 'src-tauri'))) {
+            foreach ($buildProfile in @('debug', 'release')) {
+                $candidates.Add((Join-Path (Join-Path (Join-Path $base 'target') $buildProfile) $DevExeName))
+            }
+        }
     }
 
     foreach ($c in $candidates) {
@@ -293,12 +337,36 @@ function Get-FreeParityPort {
 # Never a tree-kill FLAG: a mis-aimed `taskkill /T` on this fleet would take out
 # live agent sessions. Visited-set + creation-time guard so a recycled PID can
 # never pull an unrelated process in.
+#
+# On Linux there is no Win32_Process; the same four fields come from
+# /proc/<pid>/stat (ConvertFrom-ParityProcStat, lib/parity-diff.ps1), with the
+# kernel's starttime standing in for CreationDate. WebKitGTK spawns its web and
+# network processes as children of the runner, so the walk is just as needed
+# there: a surviving WebKitNetworkProcess holds the temp profile open.
+function Get-ParityProcessTable {
+    if ($ParityPlatform -eq 'linux') {
+        return @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+$' } |
+            ForEach-Object {
+                $line = Get-Content -LiteralPath (Join-Path $_.FullName 'stat') -Raw -ErrorAction SilentlyContinue
+                ConvertFrom-ParityProcStat -Line $line
+            } |
+            Where-Object { $null -ne $_ })
+    }
+    return @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+}
+
 function Stop-ParityProcessTree {
     param([int]$RootPid)
 
-    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-        Select-Object ProcessId, ParentProcessId, Name, CreationDate)
-    if ($all.Count -eq 0) { return }
+    $all = @(Get-ParityProcessTable)
+    if ($all.Count -eq 0) {
+        # The table read nothing: never kill LESS than the root.
+        Write-Host "  WARNING: read no process table -- stopping only the root pid $RootPid; its children were NOT walked."
+        try { Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue } catch { }
+        return
+    }
 
     $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
     if (-not $root) { return }
@@ -378,7 +446,10 @@ function Start-ParityRunner {
     # for both legs. The difference the report measures must come from the
     # ARTIFACT, not from an environment this script arranged. Whatever
     # QONTINUI_ROOT happens to be is recorded in the report's observability
-    # block so a reader can see what the two legs were measured under.
+    # block so a reader can see what the two legs were measured under. An
+    # unpacked AppImage is launched through its own AppRun, which sets its own
+    # environment before exec'ing the binary; that comes from the artifact's
+    # launcher, not from this table, so the invariant holds.
     #
     # $EnvOverrides is the ONE exception and it exists for exactly one caller:
     # -NegativeControl, whose whole purpose is to vary the environment on
@@ -401,6 +472,18 @@ function Start-ParityRunner {
         # `blank_data_root_override_is_treated_as_unset`), so this must carry a
         # real path -- which $pgDir always does, having just been created.
         "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
+    }
+    # WEBVIEW2_USER_DATA_FOLDER isolates nothing on Linux: WebKitGTK and every
+    # dirs::data_local_dir()/cache_dir()/config_dir() path resolve under XDG, so
+    # each leg gets its own data, cache and config homes there. Identical for
+    # both legs, like the rest of this table.
+    if ($ParityPlatform -eq 'linux') {
+        $toSet["XDG_CONFIG_HOME"] = (Join-Path $tmpRoot "xdg-config")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CONFIG_HOME"] | Out-Null
+        $toSet["XDG_DATA_HOME"] = (Join-Path $tmpRoot "xdg-data")
+        $toSet["XDG_CACHE_HOME"] = (Join-Path $tmpRoot "xdg-cache")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_DATA_HOME"]  | Out-Null
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CACHE_HOME"] | Out-Null
     }
     if ($EnvOverrides) {
         foreach ($k in $EnvOverrides.Keys) { $toSet[$k] = $EnvOverrides[$k] }
@@ -811,15 +894,193 @@ function Get-Manifest {
 # ===========================================================================
 # Run.
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# -CrossPlatform: the published-windows vs published-linux list. Runs instead of
+# a parity comparison and needs no binary at all, so it is decided before the
+# dev locator is ever called.
+# ---------------------------------------------------------------------------
+if ($CrossPlatform) {
+    Write-Host ""
+    Write-Host "published-parity -CrossPlatform: the published build, windows vs linux (no binary is booted)"
+    Write-Host ""
+    $readReport = {
+        param([string]$Path, [string]$Expected)
+        if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return [PSCustomObject]@{ Report = $null; Problem = $null }
+        }
+        try {
+            $obj = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_unparseable" }
+        }
+        # A report that names the WRONG platform was passed in the wrong slot,
+        # and comparing it would report a platform difference that is really no
+        # difference at all. One with NO provenance.platform predates Phase 6B
+        # (or recorded it as unknown), so it is accepted in neither slot, not
+        # guessed at.
+        $plat = $null
+        if ($null -ne $obj.provenance -and $obj.provenance.platform -and -not ([string]$obj.provenance.platform -match '^unknown\(')) {
+            $plat = [string]$obj.provenance.platform
+        }
+        if ($plat -ne $Expected) {
+            $label = $(if ($plat) { $plat } else { 'unlabelled' })
+            return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_is_$label" }
+        }
+        # A leg that could not compare (exit 2) still writes a provenance-only
+        # artifact; name ITS reason rather than letting the comparison refuse
+        # it later as published_version_unknown.
+        if ($obj.unavailable) {
+            return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_unavailable($($obj.unavailable))" }
+        }
+        return [PSCustomObject]@{ Report = $obj; Problem = $null }
+    }
+    $w = & $readReport $WindowsReport 'windows'
+    $l = & $readReport $LinuxReport 'linux'
+    # A leg that reported a typed UNKNOWN uploads no report; carry its reason
+    # so the refusal names the release fact instead of a generic "missing".
+    # Only when the Windows report IS present: otherwise the missing Windows
+    # report is the first thing to say, and Compare- says it.
+    if ($null -ne $w.Report -and $null -eq $l.Report -and -not $l.Problem -and $LinuxUnknown) {
+        $l.Problem = "linux_report_missing($LinuxUnknown)"
+    }
+    if ($w.Problem) {
+        $cp = New-ParityCrossPlatformRefusal $w.Problem
+    } elseif ($l.Problem) {
+        $cp = New-ParityCrossPlatformRefusal $l.Problem
+    } else {
+        $cp = Compare-ParityPublishedAcrossPlatforms -WindowsReport $w.Report -LinuxReport $l.Report
+    }
+
+    $md = New-Object System.Collections.Generic.List[string]
+    $md.Add("### Published build, windows vs linux")
+    $md.Add("")
+    if (-not $cp.Available) {
+        Write-Host "CROSS-PLATFORM-UNAVAILABLE $($cp.Reason)" -ForegroundColor Yellow
+        if ($cp.WindowsVersion -or $cp.LinuxVersion) {
+            Write-Host "  published windows: $($cp.WindowsVersion)   published linux: $($cp.LinuxVersion)"
+        }
+        $md.Add("**UNKNOWN** -- ``$($cp.Reason)``. No cross-platform list was produced; this is not a statement that the two published builds agree.")
+    } else {
+        Write-Host ("cross-platform (published {0}): differs {1}, same {2}, unobserved {3}, roster-only {4}" -f `
+            $cp.WindowsVersion, $cp.DifferCount, $cp.SameCount, $cp.UnobservedCount, $cp.OnlyOnOneCount)
+        $md.Add("Published ``$($cp.WindowsVersion)`` on both platforms. Rows whose published rung differs: **$($cp.DifferCount)** (same: $($cp.SameCount), unobserved on at least one platform: $($cp.UnobservedCount), in one platform's roster only: $($cp.OnlyOnOneCount)).")
+        $md.Add("")
+        $md.Add("This list is NOT part of ``parity_defects``: that number is development-vs-published on one platform. ``unobserved`` is the absence of a reading on a platform, never agreement.")
+        $md.Add("")
+        $md.Add("| Capability | Published (windows) | Published (linux) | Disposition |")
+        $md.Add("|---|---|---|---|")
+        foreach ($r in @($cp.Rows)) {
+            $wc = $(if ($null -eq $r.windows_published_rung) { "_(no row)_" } else { "``$($r.windows_published_rung)``" })
+            $lc = $(if ($null -eq $r.linux_published_rung) { "_(no row)_" } else { "``$($r.linux_published_rung)``" })
+            $md.Add("| ``$($r.id)`` | $wc | $lc | $($r.disposition) |")
+            if ($r.disposition -eq 'differs') {
+                Write-Host "  differs: $($r.id)  windows '$($r.windows_published_rung)'  linux '$($r.linux_published_rung)'"
+                if ($Annotate) {
+                    Write-Host "::warning::Cross-platform difference (published) - $($r.id): windows '$($r.windows_published_rung)', linux '$($r.linux_published_rung)'. Not a parity defect; a fact about one platform's artifact."
+                }
+            }
+        }
+    }
+    $md.Add("")
+    $md.Add("_This report gates nothing._")
+    if ($SummaryOut) {
+        [System.IO.File]::AppendAllText($SummaryOut, (($md -join [Environment]::NewLine) + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($JsonOut) {
+        $dir = Split-Path -Parent $JsonOut
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $cpObj = [PSCustomObject]@{
+            report_kind      = 'published-build-cross-platform'
+            report_version   = 1
+            generated_at     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            available        = $cp.Available
+            reason           = $cp.Reason
+            windows_version  = $cp.WindowsVersion
+            linux_version    = $cp.LinuxVersion
+            counts           = [PSCustomObject]@{ differs = $cp.DifferCount; same = $cp.SameCount; unobserved = $cp.UnobservedCount; only_on_one = $cp.OnlyOnOneCount }
+            rows             = @($cp.Rows)
+        }
+        [System.IO.File]::WriteAllText($JsonOut, ($cpObj | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($env:GITHUB_OUTPUT) {
+        # EMPTY, never 0, when no list was produced.
+        $out = $(if ($cp.Available) { "$($cp.DifferCount)" } else { "" })
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "cross-platform-differ-count=$out"
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "cross-platform-reason=$($cp.Reason)"
+    }
+    if (-not $cp.Available) { exit 2 }
+    exit 0
+}
+
 Write-Host ""
-Write-Host "published-parity: capability-manifest parity, development build vs installed published build"
+Write-Host "published-parity: capability-manifest parity, development build vs installed published build ($ParityPlatform)"
 Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Provenance inputs, read once before either leg boots: they describe the
+# checkout and the run, not anything a leg answers. The block itself is
+# assembled at emission time, when the manifest axis has an answer.
+# ---------------------------------------------------------------------------
+$skewProvenance = Get-ParitySkewProvenance -RepoDir $RepoRoot -Tag $PublishedTag
+$siblingProvenance = @(Get-ParitySiblingProvenance -RepoRoot $RepoRoot)
+Write-Host "  provenance        : dev $($skewProvenance.dev_sha) vs published '$PublishedTag' ($($skewProvenance.published_sha))"
+Write-Host "  skew_commits      : $($skewProvenance.skew_commits)"
+foreach ($sib in $siblingProvenance) { Write-Host "  sibling           : $($sib.repo) @ $($sib.sha) (recorded, not same-SHA)" }
+Write-Host ""
+
+function New-ParityRunProvenance {
+    param([string]$GeneratedAt, [string]$ManifestAxis)
+    return (New-ParityProvenance -DevSha $skewProvenance.dev_sha -PublishedTag $PublishedTag `
+        -PublishedSha $skewProvenance.published_sha -SkewCommits $skewProvenance.skew_commits -Divergence $skewProvenance.divergence `
+        -RunId $env:GITHUB_RUN_ID -RunEvent $env:GITHUB_EVENT_NAME -GeneratedAt $GeneratedAt `
+        -ManifestAxis $ManifestAxis `
+        -BehaviouralAxis (Format-ParityUnknown 'not_yet_measured: the contract-smoke legs run after this step') `
+        -Siblings $siblingProvenance -Platform $ParityPlatform)
+}
+
+# A comparison that could not happen still reports. Before this, exit 2 left
+# NO artifact, NO summary line and NO skew-commits output, so "the manifest axis
+# failed" and "the step never ran" were the same absence, and the workflow's
+# report step printed ''. Now each exit-2 path writes a provenance-only
+# artifact (counts null, never 0), one summary line stating that every row is
+# UNOBSERVED, and the skew-commits output (its unknown value included).
+# Never on -NegativeControl: that mode makes no parity claim at all.
+function Write-ParityUnavailableReport {
+    param([string]$Reason)
+    if ($NegativeControl) { return }
+    $at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $prov = New-ParityRunProvenance -GeneratedAt $at -ManifestAxis (Format-ParityUnknown $Reason)
+    if ($JsonOut) {
+        $obj = [PSCustomObject]@{
+            report_kind    = 'published-build-capability-parity'
+            report_version = $script:ParityReportVersion
+            generated_at   = $at
+            provenance     = $prov
+            unavailable    = $Reason
+            counts         = $null
+            rows           = @()
+        }
+        $dir = Split-Path -Parent $JsonOut
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        [System.IO.File]::WriteAllText($JsonOut, ($obj | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "Wrote provenance-only artifact (comparison unavailable): $JsonOut"
+    }
+    if ($SummaryOut) {
+        $line = Format-ParityUnavailableSummaryLine -Reason $Reason -Provenance $prov
+        [System.IO.File]::AppendAllText($SummaryOut, ($line + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($env:GITHUB_OUTPUT) {
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "skew-commits=$($prov.skew_commits)"
+    }
+}
 
 try {
     $devPath = Find-DevRunnerExe -Explicit $DevExe
 } catch {
     Write-Host "PARITY-UNAVAILABLE dev_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
+    Write-ParityUnavailableReport -Reason 'dev_leg_not_located'
     exit 2
 }
 
@@ -979,15 +1240,32 @@ if ($NegativeControl) {
 }
 
 try {
-    $pubPath = Find-InstalledRunnerExe -InstallRoot $InstallRoot
+    $pubPath = Find-InstalledRunnerExe -InstallRoot $InstallRoot -Platform $ParityPlatform
+    # What is LAUNCHED can differ from what was located: an unpacked AppImage
+    # boots through its AppRun (lib/installed-runner.ps1
+    # Get-PublishedLinuxLaunchPath), the way a user's launch does. The located
+    # binary is still the one the never-the-dev-binary guard checked.
+    $pubLaunch = $pubPath
+    if ($ParityPlatform -eq 'linux') { $pubLaunch = Get-PublishedLinuxLaunchPath -BinaryPath $pubPath }
 } catch {
     Write-Host "PARITY-UNAVAILABLE published_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
+    # A Linux locator throw that starts `unknown(<reason>)` is a typed UNKNOWN
+    # from an enumerated set (lib/installed-runner.ps1 $LinuxUnknownReasons),
+    # not a harness fault -- surface the reason as its own output so the
+    # workflow can print it without parsing prose. Any other throw (a refusal,
+    # an environment fault) has no reason and the output stays absent.
+    $linuxReason = Get-LinuxUnknownReason -Message $_.Exception.Message
+    if ($linuxReason -and $env:GITHUB_OUTPUT) {
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "linux-unknown-reason=$linuxReason"
+    }
+    Write-ParityUnavailableReport -Reason 'published_leg_not_located'
     exit 2
 }
 
 Write-Host "  development build : $devPath"
 Write-Host "  published build   : $pubPath"
+if ($pubLaunch -ne $pubPath) { Write-Host "  published launch  : $pubLaunch (AppImage AppRun)" }
 Write-Host "  door              : $Door"
 Write-Host ""
 
@@ -998,7 +1276,7 @@ if ($Door -eq 'cli') {
 }
 
 $devRead = Get-Manifest -ExePath $devPath -Label "dev" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
-$pubRead = Get-Manifest -ExePath $pubPath -Label "published" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
+$pubRead = Get-Manifest -ExePath $pubLaunch -Label "published" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
 
 $failed = @()
 if ($null -eq $devRead.Manifest) { $failed += "development ($($devRead.Door)): $($devRead.Error)" }
@@ -1009,6 +1287,7 @@ if ($failed.Count -gt 0) {
     foreach ($f in $failed) { Write-Host "  $f" }
     Write-Host ""
     Write-Host "  No defect count is reported. A leg that could not be read is UNKNOWN, never 0."
+    Write-ParityUnavailableReport -Reason 'manifest_read_failed'
     exit 2
 }
 
@@ -1108,7 +1387,8 @@ Write-Host ""
 # Emission 1 of 3 -- the machine artifact.
 # ---------------------------------------------------------------------------
 $generatedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$reportObj = ConvertTo-ParityReportObject -Result $result -GeneratedAt $generatedAt -Observability $observability
+$provenance = New-ParityRunProvenance -GeneratedAt $generatedAt -ManifestAxis (Get-ParityManifestAxis -Result $result)
+$reportObj = ConvertTo-ParityReportObject -Result $result -GeneratedAt $generatedAt -Observability $observability -Provenance $provenance
 if ($JsonOut) {
     $dir = Split-Path -Parent $JsonOut
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
@@ -1123,57 +1403,12 @@ if ($JsonOut) {
 # Emission 2 of 3 -- the job-summary table.
 # ---------------------------------------------------------------------------
 if ($SummaryOut) {
-    $md = New-Object System.Collections.Generic.List[string]
-    $md.Add("### Published-build capability parity")
-    $md.Add("")
-    if ($result.SchemaRefusal) {
-        $md.Add("**Refused -- schema version mismatch.** $($result.SchemaRefusalReason)")
-        $md.Add("")
-        $md.Add("No defect count is reported. A row diff across two manifest formats is meaningless, and ``0`` would be a claim this run did not earn.")
-    } else {
-        $md.Add("**parity_defects = $($result.ParityDefectCount)** (rung_differs $($result.RungDifferCount) + only_in_dev $($result.OnlyInDevCount)) -- out of **$($result.ComparableCount) comparable** rows.")
-        $md.Add("")
-        $md.Add("**$($result.UnobservedCount) rows were unobserved** on at least one leg, so no comparison was possible for them. ``unknown`` is the absence of a reading, never agreement -- read ``parity_defects`` as a floor over the comparable set, not a verdict on the roster.")
-        $md.Add("")
-        $md.Add("| Capability | Development build | Published build | Disposition |")
-        $md.Add("|---|---|---|---|")
-        foreach ($r in @($result.Rows)) {
-            $devCell = $(if ($null -eq $r.DevRung) { "_(no row)_" } else { "``$($r.DevRung)``" })
-            $pubCell = $(if ($null -eq $r.PublishedRung) { "_(no row)_" } else { "``$($r.PublishedRung)``" })
-            $disp = switch ($r.Disposition) {
-                'defect'                { "**DEFECT**" }
-                'only_in_dev'           { "**DEFECT** (absent from published roster)" }
-                'only_in_dev_unobserved' { "roster difference, unobserved" }
-                'only_in_published'     { "only in published roster" }
-                'expected_difference'   { "expected (allowlisted)" }
-                'unobserved'            { "unobserved" }
-                default                 { "in parity" }
-            }
-            $md.Add("| ``$($r.Id)`` | $devCell | $pubCell | $disp |")
-        }
-        $md.Add("")
-        $md.Add("Allowlisted expected differences: **$(@($result.Allowlist).Count)** entries" + $(if (@($result.Allowlist).Count -eq 0) { " -- the allowlist is empty; nothing was excused." } else { ":" }))
-        foreach ($e in @($result.Allowlist)) {
-            $md.Add("- ``$($e.Id)`` (dev ``$($e.DevRung)`` / published ``$($e.PublishedRung)``): $($e.Reason)")
-        }
-        $md.Add("")
-        $md.Add("**slash_commands_status = ``" + $slashCommandsStatus + "``** (from the filesystem witness, not the manifest's self-report).")
-        $md.Add("")
-        if (@($selfReportDisagreements).Count -gt 0) {
-            $md.Add("**Self-report disagrees with the filesystem on " + @($selfReportDisagreements).Count + " row(s).** A finding about the INSTRUMENT, counted separately from both numbers:")
-            foreach ($d in @($selfReportDisagreements)) {
-                $md.Add("- ``" + $d.id + "`` (" + $d.leg + "): " + $d.kind + " -- " + $d.note)
-            }
-            $md.Add("")
-        }
-        $md.Add("Provisioning rows, driven through the artifact's own doors before the manifest read: " +
-                (($sessionLedgerRows | ForEach-Object { "``$_``" }) -join ", ") + ". A row still reading ``unknown`` means the door it needed refused -- see ``provisioning_drive`` in the JSON artifact for which one and why. Nothing here fabricates a spawn.")
-    }
-    $md.Add("")
-    $md.Add("Development build: ``$($result.Identity.DevAppVersion)`` / ``$($result.Identity.DevGitSha)`` via ``$($result.Identity.DevDoor)``  ")
-    $md.Add("Published build: ``$($result.Identity.PublishedAppVersion)`` / ``$($result.Identity.PublishedGitSha)`` via ``$($result.Identity.PublishedDoor)``")
-    $md.Add("")
-    $md.Add("_This report gates nothing._")
+    # Built in lib/parity-diff.ps1 (Format-ParitySummaryMarkdown) so the unit
+    # tests pin what a human reads first: the headline carries the unobserved
+    # count, and skew_commits is stated beside the numbers.
+    $md = Format-ParitySummaryMarkdown -Result $result -Provenance $provenance `
+        -SlashCommandsStatus $slashCommandsStatus -SelfReportDisagreements $selfReportDisagreements `
+        -SessionLedgerRows $sessionLedgerRows
     # UTF8 WITHOUT a BOM, via .NET: PS 5.1's `Add-Content -Encoding UTF8` writes a
     # BOM, and $GITHUB_STEP_SUMMARY is appended to -- a BOM landing mid-file renders
     # as literal garbage in the rendered summary.
@@ -1215,6 +1450,9 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "schema-refused=$($result.SchemaRefusal.ToString().ToLower())"
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "slash-commands-status=$slashCommandsStatus"
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "self-report-disagreements=$(@($selfReportDisagreements).Count)"
+    # Verbatim from the provenance block: an integer, or unknown(<reason>).
+    Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "skew-commits=$($provenance.skew_commits)"
+    Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "platform=$ParityPlatform"
 }
 
 # Report mode: a parity outcome NEVER sets the exit code.

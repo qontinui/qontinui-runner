@@ -143,6 +143,16 @@ if (-not (Test-Path $InstalledRunnerLib)) {
 }
 . $InstalledRunnerLib
 
+# ConvertFrom-ParityProcStat: the /proc/<pid>/stat parser Stop-ProcessTree uses
+# on Linux, shared with published-parity.ps1 so both harnesses read the process
+# table the same way.
+$ParityDiffLib = Join-Path $PSScriptRoot "lib/parity-diff.ps1"
+if (-not (Test-Path $ParityDiffLib)) {
+    Write-Host "ERROR: missing $ParityDiffLib -- contract-smoke cannot walk the Linux process table." -ForegroundColor Red
+    exit 1
+}
+. $ParityDiffLib
+
 # ---------------------------------------------------------------------------
 # Resolve the exe under test, BEFORE anything boots.
 #   -UseInstalledExe : locate the published install (never a fallback).
@@ -157,6 +167,10 @@ if ($UseInstalledExe) {
     }
     try {
         $DirectExe = Find-InstalledRunnerExe -InstallRoot $InstallRoot
+        # On Linux an unpacked AppImage is LAUNCHED through its AppRun, the way
+        # a user's launch is; the located binary is still the one the guard
+        # checked (lib/installed-runner.ps1 Get-PublishedLinuxLaunchPath).
+        if ($IsLinux) { $DirectExe = Get-PublishedLinuxLaunchPath -BinaryPath $DirectExe }
     } catch {
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
@@ -616,6 +630,12 @@ function Start-DirectRunner {
     New-Item -ItemType Directory -Force -Path $configDir  | Out-Null
     New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
     New-Item -ItemType Directory -Force -Path $logDir     | Out-Null
+    # Per-leg embedded-PostgreSQL root: without it the runner provisions or
+    # ATTACHES to the machine-shared cluster under dirs::data_local_dir(), and a
+    # second leg on the same box would read the first leg's database --
+    # published-parity.ps1's Start-ParityRunner records the measured incident.
+    $pgDir = Join-Path $tmpRoot "embedded-pg"
+    New-Item -ItemType Directory -Force -Path $pgDir      | Out-Null
 
     # Capture the runner's own stdout/stderr so an early hard-exit isn't a
     # black box. Start-Process needs distinct files for each stream.
@@ -641,6 +661,19 @@ function Start-DirectRunner {
         # log lands in %LOCALAPPDATA%\qontinui-runner\dev-logs -- outside the
         # temp dir we dump on failure -- so the crash cause stays invisible.
         "QONTINUI_RUNNER_LOG_DIR"     = $logDir
+        "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
+    }
+    # WEBVIEW2_USER_DATA_FOLDER isolates nothing on Linux: WebKitGTK and every
+    # dirs::data_local_dir()/cache_dir()/config_dir() path resolve under XDG, so
+    # each leg gets its own data, cache and config homes there. (config_dir()
+    # call sites such as claude_accounts.rs ignore QONTINUI_CONFIG_DIR.)
+    if ($IsLinux) {
+        $toSet["XDG_CONFIG_HOME"] = (Join-Path $tmpRoot "xdg-config")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CONFIG_HOME"] | Out-Null
+        $toSet["XDG_DATA_HOME"] = (Join-Path $tmpRoot "xdg-data")
+        $toSet["XDG_CACHE_HOME"] = (Join-Path $tmpRoot "xdg-cache")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_DATA_HOME"]  | Out-Null
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CACHE_HOME"] | Out-Null
     }
     foreach ($k in $toSet.Keys) {
         $prev[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
@@ -686,6 +719,11 @@ function Start-DirectRunner {
 # processes and embedded CLI outlive the run and keep the temp WebView2 profile
 # locked. We therefore walk Win32_Process.ParentProcessId ourselves.
 #
+# On Linux the same four fields come from /proc/<pid>/stat
+# (ConvertFrom-ParityProcStat, lib/parity-diff.ps1), with the kernel's starttime
+# standing in for CreationDate. WebKitGTK spawns its web and network processes
+# as children of the runner, so the downward walk is needed there too.
+#
 # The walk is strictly DOWNWARD from $RootPid -- it can never climb to an
 # ancestor, which is why this does not use a tree-kill flag (`taskkill /T`):
 # on this box a mis-aimed tree kill would take out live editor/agent sessions.
@@ -696,8 +734,22 @@ function Start-DirectRunner {
 function Stop-ProcessTree {
     param([int]$RootPid)
 
-    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
-        Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+    if ($IsLinux) {
+        $all = @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+$' } |
+            ForEach-Object {
+                $line = Get-Content -LiteralPath (Join-Path $_.FullName 'stat') -Raw -ErrorAction SilentlyContinue
+                ConvertFrom-ParityProcStat -Line $line
+            } |
+            Where-Object { $null -ne $_ })
+        if ($all.Count -eq 0) {
+            Write-Host "  WARNING: read no processes from /proc -- stopping only the root pid $RootPid; its children were NOT walked."
+            try { Stop-Process -Id $RootPid -Force -ErrorAction Stop; return 1 } catch { return 0 }
+        }
+    } else {
+        $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+            Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+    }
 
     $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
     if (-not $root) { return 0 }
@@ -941,8 +993,13 @@ if ($DirectExe) {
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         # Stop the process FIRST so its redirected stdout/stderr handles are
         # released and fully flushed before we read them back.
+        # The whole tree, not just the root: an orphaned WebView/WebKit child
+        # would otherwise outlive this leg into the next one.
         if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
-            try { Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
+            try { $null = Stop-ProcessTree -RootPid $directRunner.Process.Id } catch {
+                # The table read failed: never kill LESS than the root.
+                try { Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
+            }
         }
         # Dump captured output + any panic/log files so the failure (early-exit
         # OR ready-timeout) is diagnosable in CI logs instead of a bare
