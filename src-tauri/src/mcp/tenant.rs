@@ -89,9 +89,10 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 /// A write failure after the checks passed is 500 `MACHINE_JSON_WRITE_FAILED`.
 ///
 /// On success `data.takes_effect` is `"mixed"`: `data.surfaces` lists each pin
-/// consumer with `timing` `live` or `next_start`. Three surfaces are
-/// `next_start`, read once at startup: the dual-write gate, the coord-mcp
-/// nonce restore and the boot reconcile's on-disk nonce adoption.
+/// consumer with `timing` `live` or `next_start`. Two surfaces are
+/// `next_start`, read once at startup: the coord-mcp nonce restore and the
+/// boot reconcile's on-disk nonce adoption. The dual-write gate is `live`: its
+/// flag poll re-reads the pin each tick.
 /// `data.existing_sessions` counts this process's device coord-mcp keys, live
 /// AND graced (an evicted key keeps serving for the grace TTL): those pinned
 /// at creation keep their tenant, and those that were unpinned follow the new
@@ -303,7 +304,8 @@ mod tests {
 
     /// The per-surface effect report: every surface names a timing of `live`
     /// or `next_start` and a non-empty evidence locator, both timings occur,
-    /// the two startup readers are the ones classified `next_start`, and the
+    /// the two startup readers are the ones classified `next_start` (the
+    /// dual-write gate is `live`), and the
     /// running-session census carries both counts.
     #[tokio::test]
     async fn put_reports_per_surface_effect_timing_and_a_session_census() {
@@ -340,10 +342,23 @@ mod tests {
             next_start,
             [
                 "coord_mcp_nonce_restore",
-                "coord_mcp_on_disk_nonce_adoption",
-                "session_coordination_dual_write_gate"
+                "coord_mcp_on_disk_nonce_adoption"
             ],
             "exactly the startup readers are next_start"
+        );
+        let gate = surfaces
+            .iter()
+            .find(|s| s["surface"] == "session_coordination_dual_write_gate")
+            .expect("the dual-write gate is a reported surface");
+        assert_eq!(
+            gate["timing"], "live",
+            "the dual-write flag poll re-reads the pin each tick, so a PUT reaches it live"
+        );
+        assert!(
+            gate["evidence"].as_array().is_some_and(|e| e
+                .iter()
+                .any(|r| r == "session/coord_sync.rs::run_flag_poll_loop")),
+            "the gate's reader is the flag poll loop: {gate}"
         );
 
         let existing = &data["existing_sessions"];
