@@ -1898,7 +1898,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   //
   // Written for the rebuild loop: write the open sessions down, rebuild the
   // primary runner, resume them. That loop needs the name Claude Code shows in
-  // its `/resume` picker plus the `clX --resume <id>` command — NOT the tab
+  // its `/resume` picker plus its account-pinned `--resume <id>` command — NOT the tab
   // title, which is what this command originally copied.
   //
   // Source: Claude Code's OWN live-session registry, via
@@ -1926,7 +1926,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     label: "Copy live sessions + resume commands",
     description:
       "Copy every LIVE Claude Code session's real name (the one shown in the " +
-      "session window and in /resume) plus its ready-to-run `clX --resume <id>` " +
+      "session window and in /resume) plus its ready-to-run, account-pinned `--resume <id>` " +
       "command, grouped by account. Save this before a restart so the sessions " +
       "can be resumed afterwards.",
     paramSchema: SCHEMA.empty,

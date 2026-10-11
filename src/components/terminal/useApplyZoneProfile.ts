@@ -13,11 +13,11 @@
  *
  * Behaviour is unchanged from the inline version: set the layout, replace
  * labels / notes / pins / auto-approve patterns, then — when the profile
- * pinned Claude sessions to zones — park them on
- * `pendingProfileSessionsRef` (the `PageSessionScope` effect types the
- * `--resume` command once each zone has an assignment) and spawn just enough
- * blank terminals to fill the profile's zones, or, when there are already
- * enough tabs, assign the existing ones.
+ * pinned Claude sessions to zones — resolve each session's account
+ * (`resumeAccount.ts`), park them on `pendingProfileSessionsRef` (the
+ * `PageSessionScope` effect types the `--resume` command once each zone has
+ * an assignment), and give each session a tab: existing tabs first, then a
+ * freshly spawned pane pinned to the session's account.
  */
 
 import { useCallback, useEffect, useRef } from "react";
@@ -25,6 +25,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { useTransitionEffects } from "./contexts";
 import type { ZoneProfile } from "./zoneProfileStorage";
+import { planProfileTabs, withResolvedResumeAccounts } from "./resumeAccount";
 
 export interface ApplyZoneProfileDeps {
   /**
@@ -35,6 +36,7 @@ export interface ApplyZoneProfileDeps {
     title?: string,
     workingDir?: string,
     tenantId?: string,
+    claudeConfigDir?: string,
   ) => Promise<string | null>;
   /** `TerminalPage`'s spawn-tenant precedence resolver. */
   resolveTenantForSpawn: (explicit?: string) => string | undefined;
@@ -80,10 +82,12 @@ export function useApplyZoneProfile(
     };
   });
 
+  // Monotonic apply counter — see the supersede check inside the callback.
+  const generationRef = useRef(0);
+
   return useCallback(async (profile: ZoneProfile) => {
     const {
-      deps: { createAndAssignTerminal, resolveTenantForSpawn },
-      tabs: liveTabs,
+      deps: { resolveTenantForSpawn },
       zoneLayout: zl,
       labelsAndTags: lt,
       transitionEffects: te,
@@ -96,24 +100,69 @@ export function useApplyZoneProfile(
     lt.setPinnedZones(new Set(profile.pins));
     te.setAutoApprovePatterns(profile.autoApprovePatterns);
 
+    // EVERY apply — a layout-only one included — supersedes any earlier apply
+    // still awaiting below: the earlier call parks no more sessions and
+    // spawns no further panes into this profile's grid (a pane whose spawn
+    // was already in flight still opens, blank, with nothing typed into it).
+    // Sessions an earlier apply parked are dropped too — except any the
+    // resume effect has already taken and is typing (it cannot be recalled).
+    const generation = ++generationRef.current;
+    pendingRef.current = null;
+
     if (!profile.sessions || profile.sessions.length === 0) return;
 
-    pendingRef.current = profile.sessions;
-    const toCreate = Math.max(0, profile.sessions.length - liveTabs.length);
-    for (let i = 0; i < toCreate; i++) {
-      // Brand-new blank terminals spawned NOW to fill the profile's zones (not
-      // restored sessions carrying a stored tenant), so they record the current
-      // acting tenant like any other new spawn.
-      await createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn());
-    }
-    if (toCreate === 0) {
-      const assignedTabs = new Set<string>();
-      for (const s of profile.sessions) {
-        const candidate = liveTabs.find((t) => !assignedTabs.has(t.id));
-        if (!candidate) break;
-        assignedTabs.add(candidate.id);
-        zl.assignTabToZone(s.zoneIndex, candidate.id);
+    // Resolve every session's account BEFORE parking it: the resume typed
+    // for it (and the pin on a pane spawned for it) must name the account its
+    // transcript is under. A profile saved without an account (null/undefined
+    // `claudeConfigDir`) otherwise resumed under the spawn picker's account
+    // and answered "No conversation found".
+    const sessions = await withResolvedResumeAccounts(profile.sessions);
+    if (generation !== generationRef.current) return;
+
+    // Existing tabs are reused first, in order; every remaining session gets a
+    // freshly spawned pane PINNED to its resolved account, placed in its own
+    // zone explicitly. A session is parked only AFTER its own tab is placed,
+    // bound to that tab (`expectedTabId`): a freshly spawned pane can be
+    // auto-filled into ANOTHER session's zone before its explicit placement
+    // lands, and a session parked earlier would have its resume typed into it
+    // — then the pane's own session typed on top, into a live Claude.
+    // The tab list as it stands NOW, after the await — not the one captured
+    // when the apply began: a tab closed meanwhile must not be reused (its
+    // session would park bound to a dead tab and never resume).
+    for (const step of planProfileTabs(
+      sessions,
+      // Terminal panes only: a plan (markdown) tab has no PTY, so a resume
+      // "typed" into it would be silently lost.
+      latest.current.tabs.filter((t) => t.type !== "plan").map((t) => t.id),
+    )) {
+      let tabId: string | null | undefined = step.reuseTabId;
+      if (!tabId) {
+        // A new pane spawned NOW (not a restored session carrying a stored
+        // tenant), so it records the current acting tenant like any other
+        // new spawn.
+        // The CURRENT closure (refreshed every render), not the one captured
+        // before the profile's layout was set: its grow-only layout decision
+        // reads the live layout, zones and tab count.
+        tabId = await latest.current.deps.createAndAssignTerminal(
+          undefined,
+          undefined,
+          resolveTenantForSpawn(),
+          step.pin,
+        );
+        if (generation !== generationRef.current) return;
+        if (!tabId) {
+          console.warn(
+            `[applyZoneProfile] no pane spawned for session ${step.session.claudeSessionId} ` +
+              `(zone ${step.session.zoneIndex}) — its resume is skipped`,
+          );
+          continue;
+        }
       }
+      zl.assignTabToZone(step.session.zoneIndex, tabId);
+      pendingRef.current = [
+        ...(pendingRef.current ?? []),
+        { ...step.session, expectedTabId: tabId },
+      ];
     }
   }, []);
 }

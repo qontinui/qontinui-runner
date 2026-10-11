@@ -8,6 +8,7 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { Metrics } from "./useEventHistory";
 import { getTerminalHotStore } from "./terminalHotStore";
 import { describeThrown } from "@/lib/utils";
+import type { ResourceGuardSource } from "@/lib/resourceGuard";
 
 interface UseZoneActionsParams {
   /** Terminal page whose hot store the export/sort actions read output from. */
@@ -38,6 +39,8 @@ interface UseZoneActionsParams {
     title?: string,
     workingDir?: string,
     tenantId?: string,
+    spawnSource?: ResourceGuardSource,
+    claudeConfigDir?: string,
   ) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
   incrementMetric: (key: keyof Metrics, amount?: number) => void;
@@ -118,9 +121,11 @@ export function useZoneActions({
   );
 
   const createAndAssignTerminal = useCallback(
-    async (title?: string, workingDir?: string, tenantId?: string) => {
+    async (title?: string, workingDir?: string, tenantId?: string, claudeConfigDir?: string) => {
       incrementMetric("sessionsCreated");
-      const tabId = await createTerminal(title, workingDir, tenantId);
+      // `claudeConfigDir` pins the PTY's account (a zone-profile pane spawned
+      // for a session to resume); absent → the spawn-time picker decides.
+      const tabId = await createTerminal(title, workingDir, tenantId, undefined, claudeConfigDir);
       if (!tabId) return tabId;
 
       const totalTabs = tabs.length + 1;

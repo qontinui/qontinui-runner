@@ -1707,6 +1707,114 @@ pub fn terminal_session_list_open(
     })
 }
 
+/// The account ONE session's `claude --resume` must run under, for every resume
+/// path outside the boot restore (zone-profile resume, transcript / Past
+/// Sessions resume). The same answer `terminal_session_list_open`'s
+/// `resumeConfigDir` gives a restore row, from the same resolver
+/// ([`crate::session::past_sessions::resolve_resume_config_dir_in`]).
+#[derive(Debug, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ResumeAccount {
+    /// See `RestoreCandidate::resume_config_dir`. Absent only when no dir can
+    /// be named at all (no record dir, no transcript, no home).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_config_dir: Option<String>,
+    /// Whether the account search found the transcript.
+    transcript_exists: bool,
+}
+
+/// [`terminal_resolve_resume_account`] over an explicit search set, so it is
+/// testable without the machine's real account homes.
+///
+/// A caller that knows the session's `config_dir` / `working_dir` passes them
+/// and they win; whichever it does not know is filled from the lifecycle
+/// record for that id. That fill is what lets a zone-profile session — saved
+/// as `{zoneIndex, claudeSessionId, claudeConfigDir?}`, no working dir — be
+/// located at all: the transcript path is `<dir>/projects/<encoded wd>/<id>`.
+fn resolve_resume_account_in(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    candidates: &[std::path::PathBuf],
+    ambient: Option<&std::path::Path>,
+) -> ResumeAccount {
+    let nonblank = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    // An id that is not a plain token is never looked up or spliced into a
+    // path: the account then comes from the caller / ambient default alone.
+    if !crate::agent_worktree::custody::is_shell_safe_token(claude_session_id) {
+        let (resume_config_dir, _) = crate::session::past_sessions::resolve_resume_config_dir_in(
+            nonblank(config_dir).as_deref(),
+            None,
+            claude_session_id,
+            &[],
+            ambient,
+        );
+        return ResumeAccount {
+            resume_config_dir,
+            transcript_exists: false,
+        };
+    }
+    let rec = store.get(claude_session_id);
+    let config_dir = nonblank(config_dir)
+        .or_else(|| rec.as_ref().and_then(|r| nonblank(r.config_dir.as_deref())));
+    let working_dir = nonblank(working_dir).or_else(|| {
+        rec.as_ref()
+            .and_then(|r| nonblank(r.working_dir.as_deref()))
+    });
+    let (resume_config_dir, transcript_exists) =
+        crate::session::past_sessions::resolve_resume_config_dir_in(
+            config_dir.as_deref(),
+            working_dir.as_deref(),
+            claude_session_id,
+            candidates,
+            ambient,
+        );
+    ResumeAccount {
+        resume_config_dir,
+        transcript_exists,
+    }
+}
+
+/// Resolve the account one session's resume must run under — see
+/// [`ResumeAccount`]. Read-only: it stats transcript paths and reads the
+/// lifecycle record; it never writes the record (the caller's subsequent
+/// `terminal_session_record_open` with the resolved dir is what heals a
+/// `configDir: null` row).
+#[tauri::command]
+pub async fn terminal_resolve_resume_account(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    config_dir: Option<String>,
+    working_dir: Option<String>,
+) -> Result<CommandResponse, String> {
+    // Off the main thread: the account search walks every discovered account
+    // home (the roster, the `C:\claude` sweep) and stats a path in each, and a
+    // zone-profile apply fans out one call per session.
+    let store = store.inner().clone();
+    let account = spawn_blocking_tracked(move || {
+        resolve_resume_account_in(
+            &store,
+            &claude_session_id,
+            config_dir.as_deref(),
+            working_dir.as_deref(),
+            &crate::session::past_sessions::transcript_search_dirs(),
+            crate::terminal::transcript::ambient_claude_config_dir().as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("terminal_resolve_resume_account: resolver task failed: {e}"))?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: serde_json::to_value(account).ok(),
+    })
+}
+
 /// One row of [`terminal_session_list_open`]'s response: the registry record
 /// flattened, plus the DERIVED `transcriptExists` bit. Kept out of
 /// [`TerminalSessionRecord`] itself so the persisted registry stays free of
@@ -3065,6 +3173,104 @@ mod tests {
             serde_json::Value::Bool(true),
             "found by the account search ⇒ exists, whatever the (unattached) probe says"
         );
+    }
+
+    /// The zone-profile / transcript resume shape: a session known only by
+    /// id (a profile saves no working dir and here no account either) whose
+    /// lifecycle record says `configDir: null` and whose transcript lives ONLY
+    /// under the default dir, with the picker's home searched first. The
+    /// resolved account must be the default dir — explicit — and the working
+    /// dir must come from the record, or the transcript cannot be located.
+    #[test]
+    fn resolve_resume_account_names_the_default_dir_for_a_null_config_profile_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let picker = tmp.path().join(".claude-iris");
+        let default = tmp.path().join(".claude");
+        std::fs::create_dir_all(picker.join("projects")).unwrap();
+        let rec = restore_candidate_record("sess-profile");
+        let wd = rec.working_dir.clone().unwrap();
+        let tpath =
+            crate::terminal::transcript::session_transcript_path(&default, &wd, "sess-profile");
+        std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+        std::fs::write(&tpath, "{}\n").unwrap();
+        let store = SessionLifecycleStore::open(tmp.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        assert!(
+            rec.config_dir.is_none(),
+            "fixture is the null-configDir shape"
+        );
+        store.record_open(rec);
+
+        let got = resolve_resume_account_in(
+            &store,
+            "sess-profile",
+            None,
+            None,
+            &[picker.clone(), default.clone()],
+            Some(&picker),
+        );
+        assert_eq!(
+            got,
+            ResumeAccount {
+                resume_config_dir: Some(default.to_string_lossy().into_owned()),
+                transcript_exists: true,
+            },
+            "the resume must name the transcript's account, not the picker's"
+        );
+        // A blank caller-supplied dir is no dir (the profile's `""`).
+        let blank = resolve_resume_account_in(
+            &store,
+            "sess-profile",
+            Some("  "),
+            Some(""),
+            &[picker.clone(), default.clone()],
+            Some(&picker),
+        );
+        assert_eq!(blank, got);
+        // An id with no record and no transcript still names an account: the
+        // ambient default a null-account launch ran under.
+        let unknown = resolve_resume_account_in(&store, "nope", None, None, &[], Some(&default));
+        assert_eq!(
+            unknown,
+            ResumeAccount {
+                resume_config_dir: Some(default.to_string_lossy().into_owned()),
+                transcript_exists: false,
+            }
+        );
+    }
+
+    /// A caller-supplied account outranks the record's: a record naming an
+    /// account that holds no transcript must not shadow the dir the caller
+    /// (a transcript row) knows the conversation is under.
+    #[test]
+    fn resolve_resume_account_caller_dir_outranks_the_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorded = tmp.path().join(".claude-rec");
+        let caller = tmp.path().join(".claude-caller");
+        let mut rec = restore_candidate_record("sess-caller");
+        rec.config_dir = Some(recorded.to_string_lossy().into_owned());
+        let wd = rec.working_dir.clone().unwrap();
+        let tpath =
+            crate::terminal::transcript::session_transcript_path(&caller, &wd, "sess-caller");
+        std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+        std::fs::write(&tpath, "{}\n").unwrap();
+        let store = SessionLifecycleStore::open(tmp.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        store.record_open(rec);
+
+        let got = resolve_resume_account_in(
+            &store,
+            "sess-caller",
+            Some(caller.to_str().unwrap()),
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(
+            got.resume_config_dir.as_deref(),
+            Some(caller.to_string_lossy().as_ref())
+        );
+        assert!(got.transcript_exists);
     }
 
     /// The restore pane's PTY account: a caller-supplied dir replaces any pin

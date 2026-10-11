@@ -20,7 +20,23 @@ import { invoke } from "@tauri-apps/api/core";
 export interface ZoneSessionInfo {
   zoneIndex: number;
   claudeSessionId: string;
+  /** The account the tab carried when the profile was SAVED — may be absent. */
   claudeConfigDir?: string;
+  /**
+   * DERIVED at apply time (never meaningful in a saved profile): the account
+   * the resume must run under, resolved by the backend from where the
+   * session's transcript actually lives (`resumeAccount.ts`). A profile saved
+   * without an account otherwise typed a bare `claude --resume` into a pane
+   * on the spawn picker's account and found no conversation.
+   */
+  resumeConfigDir?: string;
+  /**
+   * DERIVED at apply time: the tab the profile placed for this session. The
+   * resume is typed only into THAT tab once it holds the session's zone —
+   * never into whatever pane an auto-fill dropped there first (which may
+   * already be running another resumed session).
+   */
+  expectedTabId?: string;
 }
 
 export interface ZoneProfile {

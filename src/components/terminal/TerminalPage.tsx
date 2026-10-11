@@ -936,7 +936,10 @@ function TerminalPageInner({
       shellIntegration.handleResumeSession({
         session_id: ps.claudeSessionId,
         project_path: ps.workingDir ?? "",
-        config_dir: ps.configDir ?? "",
+        // The backend-resolved account, never "" for a null-account row (a
+        // blank dir typed a bare `claude --resume` into a pane on the
+        // spawn picker's account). `handleResumeSession` re-resolves anyway.
+        config_dir: ps.resumeConfigDir ?? ps.configDir ?? "",
         message_count: 0,
         last_modified: "",
         started_at: null,
