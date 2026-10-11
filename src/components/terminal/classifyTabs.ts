@@ -9,8 +9,8 @@ import type { TerminalWorkMode } from "./terminalWorkMode";
  * Preset (non-flow) layouts use the two-way vocabulary — exactly one owner
  * per tab:
  *  - `"assigned"` — the tab owns a zone → mount the inline `TerminalInstance`.
- *  - `"hidden"`   — transient unassigned tab → `HiddenTerminal` keeps the PTY
- *                   session alive off-grid.
+ *  - `"hidden"`   — transient unassigned tab → a parked zone cell
+ *                   (`buildZoneCells`) keeps the PTY session alive off-grid.
  *
  * Flow mode (`FLOW_GRID_ID`, the synthesized scrolling grid) splits the
  * assigned case in two so offscreen zones don't each keep a live xterm parser
@@ -27,9 +27,8 @@ import type { TerminalWorkMode } from "./terminalWorkMode";
  *                           and the grid-snapshot + PTY-ring scrollback replay
  *                           repaints full history for free.
  *
- * tmux work mode (plan `2026-10-11-runner-terminal-tmux-work-mode` D2) has ONE
- * mount owner for every tab — `TmuxViewport` — and no `HiddenTerminal`
- * parking at all:
+ * tmux work mode (plan `2026-10-11-runner-terminal-tmux-work-mode` D2) zones
+ * only the shown tab, and nothing is `hidden`:
  *  - `"assigned"`            — the shown tab (zone 0) → its visible cell.
  *  - `"offscreen"`           — any other PTY tab → a parked cell that keeps
  *                              its `TerminalInstance` mounted with

@@ -18,12 +18,13 @@ import {
   FolderGit2,
   Monitor,
 } from "lucide-react";
-import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
+import type { UnifiedSession } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
 import { describeThrown } from "@/lib/utils";
+import { sessionCardStatus, type SessionCardStatus } from "./sessionManagerLiveRows";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -81,10 +82,17 @@ interface SessionCardProps {
    * state chips stay as they are (plan `2026-10-11-runner-terminal-tmux-work-mode`).
    */
   isOnScreen?: boolean;
+  /**
+   * tmux work mode: this row's session is open in this window but not the one
+   * on screen. A running one reads "Active, off screen", not "Active in zone"
+   * — tmux zones only the shown session.
+   */
+  isOffScreen?: boolean;
 }
 
-const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; label: string }> = {
+const STATUS_DOT: Record<SessionCardStatus, { color: string; pulse: boolean; label: string }> = {
   "active-in-zone": { color: "#9ece6a", pulse: true, label: "Active in zone" },
+  "active-off-screen": { color: "#9ece6a", pulse: true, label: "Active, off screen" },
   "active-external": { color: "#73daca", pulse: true, label: "Active externally" },
   frozen: { color: "#f7768e", pulse: false, label: "Frozen" },
   "needs-input": { color: "#e0af68", pulse: true, label: "Needs input" },
@@ -92,6 +100,25 @@ const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; lab
   error: { color: "#f7768e", pulse: false, label: "Error" },
   dormant: { color: "#414868", pulse: false, label: "Dormant" },
 };
+
+/**
+ * The status chip a card shows: its key (`data-session-status`), dot color,
+ * pulse and label. `isOffScreen` is tmux mode's "open here, not on screen"
+ * (`isRowOffScreen`), which turns "Active in zone" into "Active, off screen".
+ * An orphaned "frozen" session has no live PTY in this window — it's simply
+ * not running here, so its chip is relabelled away from the alarming "Frozen"
+ * to a neutral, resumable read (color muted to match).
+ */
+export function sessionCardStatusInfo(
+  session: Pick<UnifiedSession, "liveStatus" | "isOrphaned">,
+  isOffScreen: boolean,
+): { status: SessionCardStatus; color: string; pulse: boolean; label: string } {
+  const status = sessionCardStatus(session.liveStatus, isOffScreen);
+  if (session.liveStatus === "frozen" && session.isOrphaned) {
+    return { status, color: "#565f89", pulse: false, label: "Not running" };
+  }
+  return { status, ...STATUS_DOT[status] };
+}
 
 const ACCOUNT_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
   gmail: { bg: "bg-[#7aa2f7]/10", text: "text-[#7aa2f7]" },
@@ -282,16 +309,11 @@ function SessionCardInner({
   onAfterPromote,
   onOpenWorktrees,
   isOnScreen = false,
+  isOffScreen = false,
 }: SessionCardProps) {
   const actions = sessionCardActions(session);
-  const baseStatusInfo = STATUS_DOT[session.liveStatus];
-  // An orphaned "frozen" session has no live PTY in this window — it's simply
-  // not running here, so relabel the chip away from the alarming "Frozen" to a
-  // neutral, resumable read (color stays muted to match).
-  const statusInfo =
-    session.liveStatus === "frozen" && session.isOrphaned
-      ? { color: "#565f89", pulse: false, label: "Not running" }
-      : baseStatusInfo;
+  const statusInfo = sessionCardStatusInfo(session, isOffScreen);
+  const cardStatus = statusInfo.status;
   const accountBadge = ACCOUNT_BADGE_COLORS[session.accountLabel];
   const durationLabel = formatDuration(session.durationMs);
 
@@ -515,7 +537,7 @@ function SessionCardInner({
         // its rendered text.
         data-session-id={session.sessionId}
         data-session-title={cardName}
-        data-session-status={session.liveStatus}
+        data-session-status={cardStatus}
         data-session-account={session.accountLabel}
         data-session-source={session.source}
         data-session-on-screen={isOnScreen ? "true" : "false"}

@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 /**
- * `TmuxViewport` — tmux work mode's single-viewport renderer (plan
+ * `buildZoneCells` in tmux work mode — the single-viewport cell list (plan
  * `2026-10-11-runner-terminal-tmux-work-mode` Phase 2).
  *
- * The REAL viewport and the REAL `ZoneCell` it wraps every tab in are rendered
+ * The REAL cell list and the REAL `ZoneCell` it wraps every tab in are rendered
  * (React 19 `createRoot` + `act`, no Testing Library), with
  * `classifyTabs(…, "tmux")` deciding the mounts exactly as `ZoneGrid` does.
  *
@@ -33,7 +33,7 @@ import {
   __webglSlotKeys,
 } from "../backends/webglContextLru";
 import type { ZoneCellSharedProps } from "./ZoneCell";
-import { TmuxViewport } from "./TmuxViewport";
+import { buildZoneCells } from "./zoneCells";
 
 /** What the stand-in panes and viewers record. Hoisted: the mocks write it. */
 const rec = vi.hoisted(() => ({
@@ -218,19 +218,29 @@ function cellPropsFor(tabs: TerminalTab[], shown: string): ZoneCellSharedProps {
 let container: HTMLDivElement;
 let root: Root;
 
-function show(tabs: TerminalTab[], shown: string) {
+/** Render the tmux viewport — `ZoneGrid`'s root element around the cell list. */
+function renderViewport(tabs: TerminalTab[], assigned: string, shownTabId: string | null) {
   act(() => {
     root.render(
-      createElement(TmuxViewport, {
-        cellProps: cellPropsFor(tabs, shown),
-        shownTabId: shown,
-        zone: { col: "1", row: "1" },
-        promptTabs: new Set<string>(),
-        reviewTabs: new Set<string>(),
-        isDropTarget: false,
-      }),
+      createElement(
+        "div",
+        { "data-terminal-work-mode": "tmux" },
+        buildZoneCells({
+          workMode: "tmux",
+          zones: [{ col: "1", row: "1" }],
+          cellProps: cellPropsFor(tabs, assigned),
+          shownTabId,
+          promptTabs: new Set<string>(),
+          reviewTabs: new Set<string>(),
+          dropTargetZone: null,
+        }),
+      ),
     );
   });
+}
+
+function show(tabs: TerminalTab[], shown: string) {
+  renderViewport(tabs, shown, shown);
 }
 
 /** Viewport cells not parked behind the shown one. */
@@ -265,7 +275,7 @@ afterEach(() => {
   container.remove();
 });
 
-describe("TmuxViewport — keep-mounted swap", () => {
+describe("tmux cells — keep-mounted swap", () => {
   const tabs = [pty("a"), pty("b"), pty("c")];
 
   it("mounts every PTY tab once and keeps each instance across a swap", () => {
@@ -327,18 +337,7 @@ describe("TmuxViewport — keep-mounted swap", () => {
   });
 
   it("renders the empty zone, and still parks every tab, while no tab is shown", () => {
-    act(() => {
-      root.render(
-        createElement(TmuxViewport, {
-          cellProps: cellPropsFor(tabs, "missing"),
-          shownTabId: null,
-          zone: { col: "1", row: "1" },
-          promptTabs: new Set<string>(),
-          reviewTabs: new Set<string>(),
-          isDropTarget: false,
-        }),
-      );
-    });
+    renderViewport(tabs, "missing", null);
     expect(rec.mounts).toEqual(["a", "b", "c"]);
     expect(visiblePanes()).toEqual([]);
     expect(visibleCells()).toHaveLength(1);
@@ -346,7 +345,7 @@ describe("TmuxViewport — keep-mounted swap", () => {
   });
 });
 
-describe("TmuxViewport — plan and Conductor worker tabs", () => {
+describe("tmux cells — plan and Conductor worker tabs", () => {
   const tabs = [pty("a"), planTab, workerTab, pty("b")];
 
   it("never mounts a parked plan or worker tab", () => {
@@ -375,7 +374,65 @@ describe("TmuxViewport — plan and Conductor worker tabs", () => {
   });
 });
 
-describe("TmuxViewport — WebGL context cap", () => {
+describe("grid cells — one mount per tab", () => {
+  /** Render the grid's cell list for `assignments` over a 1 × 2 layout. */
+  function renderGrid(tabs: TerminalTab[], assignments: ZoneAssignments) {
+    act(() => {
+      root.render(
+        createElement(
+          "div",
+          { "data-terminal-work-mode": "grid" },
+          buildZoneCells({
+            workMode: "grid",
+            zones: [
+              { col: "1", row: "1" },
+              { col: "2", row: "1" },
+            ],
+            cellProps: {
+              ...cellPropsFor(tabs, "unused"),
+              assignments,
+              tabClassification: classifyTabs(tabs, assignments, false, new Set(), "grid"),
+              isMultiZone: true,
+              showLabels: true,
+              isSingleView: false,
+            },
+            shownTabId: null,
+            promptTabs: new Set<string>(),
+            reviewTabs: new Set<string>(),
+            dropTargetZone: null,
+          }),
+        ),
+      );
+    });
+  }
+
+  it("parks an unzoned PTY tab, mounted and not visible, and never a plan or worker tab", () => {
+    renderGrid([pty("a"), planTab, workerTab, pty("b"), pty("c")], { 0: "a", 1: "b" });
+    expect(rec.mounts).toEqual(["a", "b", "c"]);
+    expect(visiblePanes()).toEqual(["a", "b"]);
+    expect(rec.visible.get("c")).toBe(false);
+    expect([...rec.plans]).toEqual([]);
+    expect([...rec.workers]).toEqual([]);
+  });
+
+  it("mounts a tab two zones name once, in the first, and leaves the second empty", () => {
+    renderGrid([pty("a")], { 0: "a", 1: "a" });
+    expect(rec.mounts).toEqual(["a"]);
+    expect(container.textContent).toContain("Zone 2");
+  });
+
+  it("moves a tab between zones without remounting it", () => {
+    const tabs = [pty("a"), pty("b")];
+    renderGrid(tabs, { 0: "a", 1: "b" });
+    const before = new Map(rec.instances);
+    renderGrid(tabs, { 0: "b", 1: "a" });
+    expect(rec.mounts).toEqual(["a", "b"]);
+    expect(rec.unmounts).toEqual([]);
+    for (const id of ["a", "b"]) expect(rec.instances.get(id)).toBe(before.get(id));
+  });
+});
+
+describe("tmux cells — WebGL context cap", () => {
   // Two more PTY panes than the cap: mounting them evicts the two oldest
   // parked panes (t1, t2) to Canvas.
   const ids = Array.from({ length: MAX_WEBGL_PANES + 2 }, (_, i) => `t${i}`);

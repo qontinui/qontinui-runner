@@ -2,7 +2,6 @@ export { CompactZoneCard } from "./CompactZoneCard";
 export { ZoneContextMenu } from "./ZoneContextMenu";
 export { ZoneQuickActions } from "./ZoneQuickActions";
 export { ZoneLabel } from "./ZoneLabel";
-export { HiddenTerminal } from "./HiddenTerminal";
 export { ActivitySparkline } from "./ActivitySparkline";
 export { HighlightedText } from "./HighlightedText";
 export {
@@ -18,5 +17,5 @@ export {
 export { formatUptime, countMatches, showSoloSessionInfo } from "./utils";
 export { ZoneCell, reviewPanelAvailable } from "./ZoneCell";
 export type { ZoneCellProps, ZoneCellSharedProps } from "./ZoneCell";
-export { TmuxViewport } from "./TmuxViewport";
-export type { TmuxViewportProps } from "./TmuxViewport";
+export { buildZoneCells, buildParkedCells, tabCellKey } from "./zoneCells";
+export type { ZoneCellsInput } from "./zoneCells";

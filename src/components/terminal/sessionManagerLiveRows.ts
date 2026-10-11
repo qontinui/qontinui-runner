@@ -21,6 +21,7 @@
 
 import { resolveDisplayTitle } from "./displayTitle";
 import { isSyntheticTab } from "./syntheticTabs";
+import type { TerminalWorkMode } from "./terminalWorkMode";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";
 import type { SessionLiveStatus, TabSessionRow, UnifiedSession } from "./useSessionManager";
@@ -41,21 +42,38 @@ export function extractProjectLabel(projectPath: string): string {
 }
 
 /**
- * The live status of a session that HAS a tab in this window — the same chip
- * for a transcript row joined to the tab and for a tab-sourced row, so a
- * hidden session that needs input reads the same wherever it is listed.
+ * The status a tab's tracked state alone gives it — the same chip for a
+ * transcript row joined to the tab and for a tab-sourced row, so a hidden
+ * session that needs input reads the same wherever it is listed.
+ */
+export function tabStateStatus(
+  tabId: string,
+  sessionStates: Readonly<Record<string, SessionState>>,
+): SessionLiveStatus {
+  const state = sessionStates[tabId];
+  if (state === "needs-input") return "needs-input";
+  if (state === "error") return "error";
+  if (state === "completed") return "completed";
+  return "active-in-zone";
+}
+
+/**
+ * The live status of a TRANSCRIPT row whose session has a tab in this window:
+ * its tracked state, else `frozen` when the tab has gone silent (`staleTabs`,
+ * no output for 60 s). A Claude conversation that has written messages and
+ * then stops producing output mid-run is the case that heuristic was built
+ * for, and the card reads it as "appears stuck — may need resume".
+ *
+ * Tab-sourced rows do NOT take the staleness arm (see {@link buildTabRows}).
  */
 export function tabLiveStatus(
   tabId: string,
   sessionStates: Readonly<Record<string, SessionState>>,
   staleTabs: ReadonlySet<string>,
 ): SessionLiveStatus {
-  const state = sessionStates[tabId];
-  if (state === "needs-input") return "needs-input";
-  if (state === "error") return "error";
-  if (state === "completed") return "completed";
-  if (staleTabs.has(tabId)) return "frozen";
-  return "active-in-zone";
+  const status = tabStateStatus(tabId, sessionStates);
+  if (status === "active-in-zone" && staleTabs.has(tabId)) return "frozen";
+  return status;
 }
 
 export type LiveRowTab = Pick<
@@ -78,7 +96,6 @@ export interface BuildTabRowsInput {
   /** Tab ids already represented by a transcript row (their `zoneTabId`s). */
   representedTabIds: ReadonlySet<string>;
   sessionStates: Readonly<Record<string, SessionState>>;
-  staleTabs: ReadonlySet<string>;
   /** Live Claude Code window names, `sessionId → name` (the titlebar's source). */
   registryNames?: ReadonlyMap<string, string>;
 }
@@ -88,12 +105,18 @@ export interface BuildTabRowsInput {
  * order. Exited tabs are left out (the list is of live sessions; an exited
  * Claude session keeps its transcript row), and so are synthetic test-fixture
  * tabs, which back no pane and are already listed through their transcript.
+ *
+ * A tab row is never `frozen`. Staleness is "no PTY output for 60 s", and for
+ * what a tab row lists — a plain shell, a Claude session that has not written
+ * its first message, a remote tab — silence is the idle state, not a stuck
+ * run: an idle shell at its prompt would otherwise read "appears stuck — may
+ * need resume", and there is nothing to resume. Its status is its tracked
+ * state alone, so a row that needs input or errored still says so.
  */
 export function buildTabRows({
   tabs,
   representedTabIds,
   sessionStates,
-  staleTabs,
   registryNames,
 }: BuildTabRowsInput): TabSessionRow[] {
   const rows: TabSessionRow[] = [];
@@ -119,7 +142,7 @@ export function buildTabRows({
       messageCount: 0,
       lastModified: opened,
       hasPlans: false,
-      liveStatus: tabLiveStatus(tab.id, sessionStates, staleTabs),
+      liveStatus: tabStateStatus(tab.id, sessionStates),
       zoneTabId: tab.id,
       zoneIndex: null,
       remoteDeviceLabel: tab.remote?.deviceLabel ?? null,
@@ -160,6 +183,37 @@ export function isRowOnScreen(
   onScreenTabId: string | null,
 ): boolean {
   return onScreenTabId !== null && session.zoneTabId === onScreenTabId;
+}
+
+/**
+ * tmux mode: is this row a session of this window that is NOT the one on
+ * screen? Such a session sits in no zone — tmux zones only the shown tab — so
+ * a row for it must not claim "in zone". Always `false` in grid mode, where
+ * the card wording is unchanged.
+ */
+export function isRowOffScreen(
+  session: Pick<UnifiedSession, "zoneTabId">,
+  workMode: TerminalWorkMode,
+  onScreenTabId: string | null,
+): boolean {
+  return workMode === "tmux" && session.zoneTabId !== null && session.zoneTabId !== onScreenTabId;
+}
+
+/**
+ * The status a session card SHOWS (its dot, its label, its
+ * `data-session-status`). The same as the row's `liveStatus`, except a running
+ * session that tmux mode keeps off screen reads `active-off-screen` instead of
+ * `active-in-zone`: it is in no zone. The other chips (needs input, error, …)
+ * describe the session, not where it is, so they stay as they are. Counts and
+ * filters keep reading `liveStatus` — an off-screen session is still active.
+ */
+export type SessionCardStatus = SessionLiveStatus | "active-off-screen";
+
+export function sessionCardStatus(
+  liveStatus: SessionLiveStatus,
+  isOffScreen: boolean,
+): SessionCardStatus {
+  return isOffScreen && liveStatus === "active-in-zone" ? "active-off-screen" : liveStatus;
 }
 
 /**

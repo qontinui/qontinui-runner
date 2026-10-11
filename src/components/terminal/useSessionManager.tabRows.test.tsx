@@ -86,4 +86,39 @@ describe("useSessionManager — live tabs with no transcript", () => {
     expect(onFocusSessionTab).toHaveBeenCalledWith("tab-shell", "tab-shell", "tab");
     expect(onSelectSession).not.toHaveBeenCalled();
   });
+
+  it("does not report an idle, silent plain shell as stuck", () => {
+    // Never typed into, off screen, and silent past the 60 s staleness sweep:
+    // the page puts it in `staleTabs`. The live check showed this row as
+    // `frozen` — "Session appears stuck — may need resume".
+    const shell: TerminalTab = {
+      id: "tab-idle-shell",
+      title: "bash",
+      pid: 8,
+      isAlive: true,
+      exitCode: null,
+    };
+    let manager: UseSessionManagerReturn | null = null;
+    function Page() {
+      manager = useSessionManager({
+        tabs: [shell],
+        sessionStates: { "tab-idle-shell": "idle" },
+        staleTabs: new Set<string>(["tab-idle-shell"]),
+        transcriptSessions: [],
+        sessionsLoading: false,
+        desktopNotify: false,
+        onRefreshSessions: () => {},
+        onResumeSession: () => {},
+        onSelectSession: () => {},
+        onFocusSessionTab: () => {},
+      });
+      return null;
+    }
+    act(() => root.render(createElement(Page)));
+
+    const row = manager!.sessions.find((s) => s.zoneTabId === "tab-idle-shell");
+    expect(row?.source).toBe("tab");
+    expect(row?.liveStatus).not.toBe("frozen");
+    expect(manager!.frozenCount).toBe(0);
+  });
 });
