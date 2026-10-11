@@ -144,3 +144,41 @@ fn fails_when_keys_are_lost() {
         "input_round_trip",
     );
 }
+
+fn no_frame() -> termhost_probe::doctor::CaptureFacts {
+    termhost_probe::doctor::CaptureFacts::NoFrame("no frame within 2000 ms".into())
+}
+
+#[test]
+fn an_unknown_capture_mechanism_gates_its_checks_and_fails_when_broken() {
+    // The doctor's own capture proof got no frame (UNKNOWN) and capture
+    // really is broken: the selftest must go red, not quietly un-gate the
+    // checks that would have caught the regression.
+    let mut host = FakeHost::new(Faults {
+        capture_dead: true,
+        ..Faults::default()
+    });
+    host.wgc_facts = no_frame();
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "capture_visible.wgc");
+    assert!(c.gated, "an UNKNOWN mechanism must gate:\n{}", report(&o));
+    assert_eq!(c.passed, Some(false), "{}", report(&o));
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
+}
+
+#[test]
+fn an_unknown_capture_mechanism_that_works_passes() {
+    let mut host = FakeHost::new(Faults::default());
+    host.wgc_facts = no_frame();
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "capture_visible.wgc");
+    assert!(c.gated && c.passed == Some(true), "{}", report(&o));
+    assert_eq!(o.exit_code, 0, "{}\n{}", o.summary, report(&o));
+    // The Markdown summary names every check and the mechanisms.
+    let md = termhost_probe::selftest::render_markdown(&o, "selftest");
+    assert!(
+        md.contains("| capture_visible.wgc | gated | pass |"),
+        "{md}"
+    );
+    assert!(md.contains("| capture.wgc | UNKNOWN |"), "{md}");
+}

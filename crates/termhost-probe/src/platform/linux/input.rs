@@ -37,21 +37,6 @@ fn ledger_id(keycode: u32, release: bool) -> u32 {
     keycode | if release { 0x100 } else { 0 }
 }
 
-/// Remove and report a matching ledger entry (in order, tolerating reordering).
-fn take_ledger(tagging: &Tagging, id: u32) -> bool {
-    let mut ledger = match tagging.ledger.lock() {
-        Ok(l) => l,
-        Err(_) => return false,
-    };
-    match ledger.iter().position(|&e| e == id) {
-        Some(i) => {
-            ledger.remove(i);
-            true
-        }
-        None => false,
-    }
-}
-
 /// The XTEST slave devices' ids.
 fn xtest_devices(d: &Display) -> Result<BTreeSet<u16>, String> {
     let reply = d
@@ -77,7 +62,7 @@ fn classify(
 ) -> InputObs {
     let origin = if xtest.contains(&source) {
         match ledger {
-            Some(id) if take_ledger(tagging, id) => InputOrigin::Probe,
+            Some(id) if tagging.match_ledger(id) => InputOrigin::Probe,
             _ => InputOrigin::ForeignInjected,
         }
     } else {
@@ -296,9 +281,26 @@ impl KeyInjector for Injector {
             Ok(())
         } else {
             Err(InjectBlock::NotForeground(
-                "another window holds the X input focus".into(),
+                "the X keyboard focus is not inside the target (or the window manager says another window is active)".into(),
             ))
         }
+    }
+
+    fn can_send(&self, ch: char) -> bool {
+        self.keys.contains_key(&ch)
+    }
+
+    fn ledger_ids(&self, ch: char) -> Vec<u32> {
+        self.keys.get(&ch).map_or_else(Vec::new, |&code| {
+            vec![
+                ledger_id(u32::from(code), false),
+                ledger_id(u32::from(code), true),
+            ]
+        })
+    }
+
+    fn heard(&self) -> u64 {
+        self.tagging.recognised.load(Ordering::Relaxed)
     }
 
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {

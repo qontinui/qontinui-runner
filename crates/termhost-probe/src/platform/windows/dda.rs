@@ -318,7 +318,7 @@ impl CaptureSource for DdaSource {
                                 t_ns,
                                 view,
                                 origin,
-                                missed,
+                                missed: Some(missed),
                                 window_size: (win.w, win.h),
                             })
                         }) {

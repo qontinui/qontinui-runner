@@ -9,6 +9,8 @@
 //! doctor reports as INOPERATIVE-ON-THIS-MACHINE.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -49,8 +51,13 @@ pub enum TargetSpec {
     Handle(u64),
     /// The largest visible top-level window owned by this process.
     Pid(u32),
-    /// The first visible top-level window whose title contains this.
-    Title(String),
+    /// The largest visible top-level window whose title contains `text`;
+    /// with `unique`, exactly one window may match (`inject`: a title is not
+    /// enough to be sure keys go where they should).
+    Title {
+        text: String,
+        unique: bool,
+    },
 }
 
 /// One captured frame, borrowed for the duration of the callback.
@@ -61,8 +68,9 @@ pub struct RawFrame<'a> {
     /// Where `view`'s (0, 0) sits in window coordinates, so marker rects are
     /// reported window-relative for every source.
     pub origin: (i32, i32),
-    /// Frames the source coalesced into this one.
-    pub missed: u32,
+    /// Frames the source coalesced into this one; `None` for a source that
+    /// cannot detect skipped frames (WGC, X11).
+    pub missed: Option<u32>,
     /// The full window size this frame belongs to.
     pub window_size: (u32, u32),
 }
@@ -103,7 +111,9 @@ pub trait WindowInspector: Send {
 /// - X11: XTEST events carry no payload, so the injector records each key it
 ///   is about to send in `ledger` and the listener matches XTEST-sourced raw
 ///   events against it; an unmatched event — a physical device, or another
-///   XTEST client — is not ours.
+///   XTEST client — is not ours. A listener in ANOTHER process (`watch`)
+///   reads the keys `inject` announces in its `inject.jsonl` before sending
+///   them ([`Tagging::ledger_file`]).
 #[derive(Clone, Debug)]
 pub struct Tagging {
     pub tag: u32,
@@ -112,6 +122,61 @@ pub struct Tagging {
     pub sent: Arc<AtomicU64>,
     /// Tagged events the listener has recognised.
     pub recognised: Arc<AtomicU64>,
+    /// Another process's announced keys.
+    ledger_log: Option<Arc<Mutex<LedgerLog>>>,
+}
+
+/// Tails an `inject.jsonl` for `inject_intent` records.
+#[derive(Debug)]
+struct LedgerLog {
+    path: PathBuf,
+    offset: u64,
+    partial: Vec<u8>,
+}
+
+impl LedgerLog {
+    /// Append the ledger ids of every intent written since the last read.
+    fn refresh(&mut self, ledger: &mut VecDeque<u32>) {
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return;
+        };
+        if f.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        let Ok(n) = f.read_to_end(&mut buf) else {
+            return;
+        };
+        self.offset += n as u64;
+        self.partial.extend_from_slice(&buf);
+        while let Some(nl) = self.partial.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=nl).collect();
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("inject_intent") {
+                continue;
+            }
+            if let Some(ids) = v.get("ledger").and_then(|l| l.as_array()) {
+                ledger.extend(
+                    ids.iter()
+                        .filter_map(|i| i.as_u64())
+                        .filter_map(|i| u32::try_from(i).ok()),
+                );
+            }
+        }
+    }
+}
+
+/// Remove `id` from the ledger if present (in order, tolerating reordering).
+fn take_entry(ledger: &mut VecDeque<u32>, id: u32) -> bool {
+    match ledger.iter().position(|&e| e == id) {
+        Some(i) => {
+            ledger.remove(i);
+            true
+        }
+        None => false,
+    }
 }
 
 impl Tagging {
@@ -132,6 +197,40 @@ impl Tagging {
             ledger: Arc::new(Mutex::new(VecDeque::new())),
             sent: Arc::new(AtomicU64::new(0)),
             recognised: Arc::new(AtomicU64::new(0)),
+            ledger_log: None,
+        }
+    }
+
+    /// Also recognise the keys announced in `path` (another process's
+    /// `inject.jsonl`; it need not exist yet).
+    pub fn ledger_file(&mut self, path: &Path) {
+        self.ledger_log = Some(Arc::new(Mutex::new(LedgerLog {
+            path: path.to_path_buf(),
+            offset: 0,
+            partial: Vec::new(),
+        })));
+    }
+
+    /// Is `id` one of this run's announced events? Consumes the matching
+    /// entry. When the in-memory ledger has none, newly announced keys are
+    /// read from the ledger file first: `inject` writes and flushes each key's
+    /// intent BEFORE sending it, so by the time its event arrives the intent
+    /// is on disk.
+    pub fn match_ledger(&self, id: u32) -> bool {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            return false;
+        };
+        if take_entry(&mut ledger, id) {
+            return true;
+        }
+        match &self.ledger_log {
+            Some(log) => {
+                if let Ok(mut log) = log.lock() {
+                    log.refresh(&mut ledger);
+                }
+                take_entry(&mut ledger, id)
+            }
+            None => false,
         }
     }
 }
@@ -250,9 +349,18 @@ pub trait KeyInjector: Send {
     /// Is it safe to send a key to the target right now? (Foreground, and an
     /// interactive, unlocked input desktop.)
     fn check_target(&mut self) -> Result<(), InjectBlock>;
+    /// Whether `ch` can be typed at all — checked for EVERY key of an arm
+    /// before the first is sent, so an arm never stops half-typed.
+    fn can_send(&self, ch: char) -> bool;
+    /// The ids the listener will match `ch`'s press and release against (X11
+    /// ledger ids); empty where each event carries the run's tag itself.
+    fn ledger_ids(&self, ch: char) -> Vec<u32>;
     /// Send one character as a key press and release. `tagged` marks it as
     /// this run's; untagged exists for the selftest's must-abort proof.
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String>;
+    /// Tagged events this run's listener has recognised so far: a listener
+    /// that stops hearing the probe's own keys would not hear an operator's.
+    fn heard(&self) -> u64;
     /// Try once to make the target foreground (`--activate`).
     fn activate(&mut self) -> Result<(), String>;
     fn describe(&self) -> String;
@@ -351,6 +459,9 @@ pub struct Refresh {
     pub hz: f64,
     pub ns: u64,
     pub source: String,
+    /// Nothing reported a rate; `hz` is an assumed 60. KPIs counted in refresh
+    /// intervals are then unknown(refresh_rate_unknown).
+    pub assumed: bool,
 }
 
 impl Refresh {
@@ -359,6 +470,15 @@ impl Refresh {
             hz,
             ns: (1e9 / hz).round() as u64,
             source: source.into(),
+            assumed: false,
+        }
+    }
+
+    /// 60 Hz, assumed because no rate could be read (`why`).
+    pub fn assumed_60(why: impl Into<String>) -> Refresh {
+        Refresh {
+            assumed: true,
+            ..Refresh::from_hz(60.0, format!("assumed: {}", why.into()))
         }
     }
 }
@@ -396,4 +516,41 @@ pub static STOP: AtomicBool = AtomicBool::new(false);
 
 pub fn stop_requested() -> bool {
     STOP.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_announced_by_another_process_are_recognised_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "termhost-probe-ledger-{}-{}",
+            std::process::id(),
+            crate::clock::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let log = dir.join("inject.jsonl");
+        let mut t = Tagging::new();
+        t.ledger_file(&log);
+        // Nothing announced yet (the file does not even exist).
+        assert!(!t.match_ledger(38));
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"schema":"termhost-probe/v1","type":"start","tool":"termhost-probe"}"#,
+                "\n",
+                r#"{"schema":"termhost-probe/v1","type":"inject_intent","index":0,"key":"a","ledger":[38,294],"t_ns":"5"}"#,
+                "\n"
+            ),
+        )
+        .expect("write");
+        assert!(t.match_ledger(38), "the announced press");
+        assert!(t.match_ledger(294), "the announced release");
+        assert!(!t.match_ledger(38), "each announced event is matched once");
+        // Without a ledger file only the in-process ledger counts.
+        let plain = Tagging::new();
+        assert!(!plain.match_ledger(38));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

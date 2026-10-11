@@ -16,9 +16,10 @@
 //! GitHub-hosted runner), where a missing node fails it rather than letting
 //! the comparison silently not happen.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -183,10 +184,11 @@ fn marker(rng: &mut Rng, spans: &mut Vec<SpanJson>) -> bool {
     keep == CELLS
 }
 
-/// Rows no golden row pins, run first: rule 6's `min(k, need)` (Phase 1
-/// round-3 review finding R3-1) — an impure stretch running past the marker's
-/// last cell is `off_palette`, never `wrong_length`. The same rows are asserted
-/// without node in `tests/golden.rs`.
+/// Rows no golden row pins, run first: rule 6's `min(k, need)` (found by the
+/// qontinui-runner#2154 pre-PR review, round 3 finding 1) — an impure stretch
+/// running past the marker's last cell is `off_palette`, never
+/// `wrong_length`. The same rows are asserted without node in
+/// `tests/golden.rs`.
 fn pinned_cases() -> Vec<Case> {
     let mid = Marker::new(MarkerKind::Output, 14, 1234);
     let cells = |n: usize| -> Vec<SpanJson> {
@@ -271,6 +273,77 @@ fn env_u64(name: &str) -> Option<u64> {
     }
 }
 
+/// How long the reference may take (it needs about a second).
+const NODE_LIMIT: Duration = Duration::from_secs(120);
+
+/// Wait for `child` at most `limit`, reading its output meanwhile, and kill
+/// it on timeout: a node that never exits must not hold the test until the
+/// CI job's own timeout.
+fn wait_with_deadline(mut child: Child, limit: Duration) -> Result<Output, String> {
+    let deadline = Instant::now() + limit;
+    let mut out = child.stdout.take().ok_or("stdout was not captured")?;
+    let mut err = child.stderr.take().ok_or("stderr was not captured")?;
+    let out_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(Output {
+                    status,
+                    stdout: out_reader.join().unwrap_or_default(),
+                    stderr: err_reader.join().unwrap_or_default(),
+                })
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the child did not finish within {} s and was killed",
+                    limit.as_secs()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for the child: {e}"));
+            }
+        }
+    }
+}
+
+/// `node` started with `args`, or `None` (with the skip rule) when node
+/// cannot be run here.
+fn spawn_node(args: &[&str], envs: &[(&str, &std::path::Path)]) -> Option<Child> {
+    let mut cmd = Command::new("node");
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    match cmd.spawn() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "node is required for the differential test under CI, and did not start: {e}"
+            );
+            eprintln!("SKIPPED: node did not start ({e}); the decoder was NOT compared with the reference here");
+            None
+        }
+    }
+}
+
 /// Run the reference on `cases`; `None` when node cannot be run here.
 fn reference(cases: &[Case]) -> Option<Vec<Value>> {
     let module = std::path::absolute(
@@ -279,24 +352,10 @@ fn reference(cases: &[Case]) -> Option<Vec<Value>> {
     )
     .expect("an absolute path to marker-raster.mjs");
     assert!(module.is_file(), "{} is missing", module.display());
-    let mut child = match Command::new("node")
-        .args(["--input-type=module", "-e", NODE_SCRIPT])
-        .env("TERMHOST_RASTER_MJS", &module)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "node is required for the differential test under CI, and did not start: {e}"
-            );
-            eprintln!("SKIPPED: node did not start ({e}); the decoder was NOT compared with the reference here");
-            return None;
-        }
-    };
+    let mut child = spawn_node(
+        &["--input-type=module", "-e", NODE_SCRIPT],
+        &[("TERMHOST_RASTER_MJS", module.as_path())],
+    )?;
     let mut input = String::new();
     for c in cases {
         input.push_str(&serde_json::to_string(c).expect("case JSON"));
@@ -304,7 +363,7 @@ fn reference(cases: &[Case]) -> Option<Vec<Value>> {
     }
     let mut stdin = child.stdin.take().expect("node stdin");
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-    let output = child.wait_with_output().expect("node ran");
+    let output = wait_with_deadline(child, NODE_LIMIT).expect("the reference finished");
     writer
         .join()
         .expect("the stdin writer")
@@ -323,6 +382,21 @@ fn reference(cases: &[Case]) -> Option<Vec<Value>> {
         .collect();
     assert_eq!(lines.len(), cases.len(), "one answer per case");
     Some(lines)
+}
+
+#[test]
+fn a_child_that_never_exits_is_killed_at_the_deadline() {
+    let Some(child) = spawn_node(&["-e", "setInterval(() => {}, 1000)"], &[]) else {
+        return;
+    };
+    let started = Instant::now();
+    let r = wait_with_deadline(child, Duration::from_millis(500));
+    assert!(r.is_err(), "{r:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "returned after {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

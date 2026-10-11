@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::raster::Rect;
-use crate::records::Record;
+use crate::records::{GroupSample, Record};
 use crate::stats::KpiState;
 
 const MS: u64 = 1_000_000;
@@ -29,6 +29,13 @@ fn obs(kind: MarkerKind, session: u16, seq: u32) -> MarkerObs {
     }
 }
 
+const WINDOW: Rect = Rect {
+    x: 0,
+    y: 0,
+    w: 800,
+    h: 600,
+};
+
 fn frame(source: SourceId, index: u64, t_ms: u64, markers: Vec<MarkerObs>) -> FrameObs {
     FrameObs {
         source,
@@ -36,9 +43,12 @@ fn frame(source: SourceId, index: u64, t_ms: u64, markers: Vec<MarkerObs>) -> Fr
         t_ns: t_ms * MS,
         width: 800,
         height: 600,
+        region: WINDOW,
         markers,
         rejected: 0,
-        missed: 0,
+        missed: None,
+        scan_ns: 0,
+        lag_ns: 0,
     }
 }
 
@@ -65,9 +75,57 @@ fn emitted(session: u16, seq: u64, t_ms: u64) -> Emitted {
     }
 }
 
-/// Drive a timeline: a generator on session 0 emitting at 10 Hz from 0 to
-/// `end_ms`, the window showing each marker 12 ms later unless `frozen(t)`,
-/// good window samples every 100 ms (or `sample(t)`), and ticks.
+/// How a timeline is driven.
+struct Timeline<F: Fn(u64) -> bool, S: Fn(u64) -> WindowSample> {
+    /// A generator on session 0 emits at 10 Hz while this holds.
+    emit: fn(u64) -> bool,
+    /// The window shows each marker 12 ms after it is emitted unless frozen.
+    frozen: F,
+    sample: S,
+    /// How late each frame reaches the probe.
+    lag_ms: u64,
+}
+
+/// Feed `[from_ms, to_ms)` of a timeline into `m`: emissions, frames, good
+/// window samples every 100 ms (or `sample(t)`), and ticks.
+fn drive<F: Fn(u64) -> bool, S: Fn(u64) -> WindowSample>(
+    m: &mut Model,
+    from_ms: u64,
+    to_ms: u64,
+    tl: &Timeline<F, S>,
+) -> Vec<Record> {
+    let mut out = Vec::new();
+    for t_ms in from_ms..to_ms {
+        let seq = t_ms / 100;
+        if t_ms % 100 == 0 && (tl.emit)(t_ms) {
+            m.on_emitted(emitted(0, seq, t_ms));
+        }
+        if t_ms % 100 == 12 && (tl.emit)(t_ms - 12) && !(tl.frozen)(t_ms) {
+            let mut f = frame(
+                SourceId::Wgc,
+                seq + 1,
+                t_ms,
+                vec![obs(MarkerKind::Output, 0, seq as u32)],
+            );
+            f.lag_ns = tl.lag_ms * MS;
+            out.extend(m.on_frame(f));
+        }
+        if t_ms % 100 == 50 {
+            m.on_window_sample(&(tl.sample)(t_ms * MS));
+        }
+        if t_ms % 50 == 0 {
+            out.extend(m.tick(t_ms * MS));
+        }
+    }
+    out
+}
+
+fn always(_: u64) -> bool {
+    true
+}
+
+/// A generator on session 0 emitting at 10 Hz from 0 to `end_ms`, the window
+/// showing each marker 12 ms later unless `frozen(t)`, then finish.
 fn run(
     end_ms: u64,
     frozen: impl Fn(u64) -> bool,
@@ -75,32 +133,13 @@ fn run(
     cfg: ModelConfig,
 ) -> (Model, Vec<Record>, WatchSummary) {
     let mut m = Model::new(cfg, 0);
-    let mut out = Vec::new();
-    let mut index = 0;
-    let mut current: Option<u32> = None;
-    for t_ms in 0..end_ms {
-        if t_ms % 100 == 0 {
-            m.on_emitted(emitted(0, t_ms / 100, t_ms));
-            current = Some((t_ms / 100) as u32);
-        }
-        if t_ms % 100 == 12 && !frozen(t_ms) {
-            if let Some(seq) = current {
-                index += 1;
-                out.extend(m.on_frame(frame(
-                    SourceId::Wgc,
-                    index,
-                    t_ms,
-                    vec![obs(MarkerKind::Output, 0, seq)],
-                )));
-            }
-        }
-        if t_ms % 100 == 50 {
-            m.on_window_sample(&sample(t_ms * MS));
-        }
-        if t_ms % 50 == 0 {
-            out.extend(m.tick(t_ms * MS));
-        }
-    }
+    let tl = Timeline {
+        emit: always,
+        frozen,
+        sample,
+        lag_ms: 0,
+    };
+    let mut out = drive(&mut m, 0, end_ms, &tl);
     let (rest, summary) = m.finish(end_ms * MS);
     out.extend(rest);
     (m, out, summary)
@@ -174,8 +213,9 @@ fn a_steady_run_has_no_hangs_and_measures_latency() {
     assert_eq!(s.output_latency_ms.state, KpiState::Measured);
     assert_eq!(s.output_latency_ms.stat("p50"), Some(12.0));
     assert_eq!(s.marker_loss.value, Some(0.0));
-    assert_eq!(s.v_actual_max, 1);
+    assert_eq!(s.v_actual_max, Some(1));
     assert_eq!(s.sessions_seen, vec![0]);
+    assert!(!s.probe.behind);
 }
 
 #[test]
@@ -199,9 +239,75 @@ fn no_update_for_two_seconds_with_markers_pending_is_one_hang() {
 }
 
 #[test]
+fn a_wedge_that_never_recovers_is_a_counted_hang() {
+    // The host wedges at 5 s and never recovers; the window stays
+    // foreground and unoccluded. Ending on an interval boundary and inside
+    // one must both count it.
+    for end_ms in [20_000, 20_250] {
+        let (_, out, s) = run(end_ms, |t| t >= 5_000, good_sample, cfg());
+        let hangs = hang_records(&out);
+        assert_eq!(hangs.len(), 1, "{end_ms}: {hangs:?}");
+        assert!(hangs[0].open_at_end, "{end_ms}: {:?}", hangs[0]);
+        assert!(hangs[0].valid, "{end_ms}: {:?}", hangs[0]);
+        assert_eq!(s.hangs.value, Some(1.0), "{end_ms}: {:?}", s.hangs);
+        assert_eq!(s.hang_episodes_excluded, 0, "{end_ms}");
+    }
+}
+
+#[test]
 fn a_shorter_freeze_is_not_a_hang() {
     let (_, out, _) = run(20_000, |t| (5_000..6_500).contains(&t), good_sample, cfg());
     assert!(hang_records(&out).is_empty());
+}
+
+#[test]
+fn a_generator_blocked_inside_its_write_is_seen_as_pending() {
+    // The host stops draining the PTY at 5 s: the generator blocks inside a
+    // write, so it logs nothing more, and the window stops updating. Only its
+    // schedule (10 Hz from t0) shows a marker overdue.
+    let mut m = Model::new(cfg(), 0);
+    m.on_gen_start(GenSchedule {
+        session: 0,
+        t0_ns: 0,
+        marker_hz: 10.0,
+        load: true,
+    });
+    let tl = Timeline {
+        emit: |t| t < 5_000,
+        frozen: |_| false,
+        sample: good_sample,
+        lag_ms: 0,
+    };
+    let mut out = drive(&mut m, 0, 20_000, &tl);
+    let (rest, s) = m.finish(20_000 * MS);
+    out.extend(rest);
+    let hangs = hang_records(&out);
+    assert_eq!(hangs.len(), 1, "{hangs:?}");
+    assert_eq!(hangs[0].kinds, vec!["no_update_with_pending"]);
+    // Sequence 50 was due at 5.0 s and never written.
+    assert_eq!(hangs[0].t_start_ns, Ns(5_000 * MS));
+    assert_eq!(s.hangs.value, Some(1.0));
+}
+
+#[test]
+fn an_exited_generator_has_nothing_overdue() {
+    let mut m = Model::new(cfg(), 0);
+    m.on_gen_start(GenSchedule {
+        session: 0,
+        t0_ns: 0,
+        marker_hz: 10.0,
+        load: true,
+    });
+    m.on_gen_exit(0, 4_950 * MS);
+    let tl = Timeline {
+        emit: |t| t < 5_000,
+        frozen: |_| false,
+        sample: good_sample,
+        lag_ms: 0,
+    };
+    let mut out = drive(&mut m, 0, 20_000, &tl);
+    out.extend(m.finish(20_000 * MS).0);
+    assert!(hang_records(&out).is_empty(), "{:?}", hang_records(&out));
 }
 
 #[test]
@@ -283,11 +389,80 @@ fn operator_activity_reports_unknown_operator_activity() {
 }
 
 #[test]
+fn a_listener_that_never_started_is_a_harness_error_not_the_operator() {
+    let mut c = cfg();
+    c.min_valid_intervals = 30;
+    c.monitor = MonitorPresence::Absent;
+    let (_, _, s) = run(20_000, |_| false, good_sample, c);
+    assert_eq!(s.hangs.reason, Some("harness_error"), "{:?}", s.hangs);
+    assert!(s.intervals_excluded_harness_error > 30);
+    assert_eq!(s.intervals_excluded_operator_activity, 0);
+}
+
+#[test]
+fn no_window_samples_is_a_harness_error_not_occlusion() {
+    // No inspector: nothing was ever sampled.
+    let mut c = cfg();
+    c.min_valid_intervals = 30;
+    let mut m = Model::new(c, 0);
+    for t in (0..20_000u64).step_by(50) {
+        m.tick(t * MS);
+    }
+    let (_, s) = m.finish(20_000 * MS);
+    assert_eq!(s.hangs.reason, Some("harness_error"), "{:?}", s.hangs);
+}
+
+#[test]
 fn a_short_clean_run_is_insufficient_not_occluded() {
     let mut c = cfg();
     c.min_valid_intervals = 60;
     let (_, _, s) = run(5_000, |_| false, good_sample, c);
     assert_eq!(s.hangs.reason, Some("insufficient_samples"));
+}
+
+#[test]
+fn sequences_outside_closed_intervals_are_not_blamed_on_occlusion() {
+    // A clean run ending mid-interval: the last sequences overlap the
+    // trailing partial interval, so they cannot be judged — but no interval
+    // was excluded, so the reason is too few samples, not occlusion.
+    let (_, _, s) = run(10_250, |_| false, good_sample, cfg());
+    assert_eq!(
+        s.marker_loss.state,
+        KpiState::Unknown,
+        "{:?}",
+        s.marker_loss
+    );
+    assert_eq!(s.marker_loss.reason, Some("insufficient_samples"));
+}
+
+#[test]
+fn markers_emitted_before_the_probe_was_watching_are_not_measured() {
+    // The generator started 5 s before `watch`, which starts at 5.05 s. The
+    // marker on screen then (emitted at 5.0 s) appears in the first frame at
+    // 5.062 s: 62 ms of "latency" that is really the probe starting up.
+    let mut m = Model::new(cfg(), 5_050 * MS);
+    for seq in 0..200u64 {
+        m.on_emitted(emitted(0, seq, seq * 100));
+    }
+    m.on_frame(frame(
+        SourceId::Wgc,
+        1,
+        5_062,
+        vec![obs(MarkerKind::Output, 0, 50)],
+    ));
+    for seq in 51..200u64 {
+        m.on_frame(frame(
+            SourceId::Wgc,
+            seq,
+            seq * 100 + 12,
+            vec![obs(MarkerKind::Output, 0, seq as u32)],
+        ));
+    }
+    let samples = m
+        .latency_samples(MarkerKind::Output, &[EmitSource::Generator])
+        .samples_ms;
+    assert_eq!(samples.len(), 149, "seq 51..199");
+    assert!(samples.iter().all(|&l| l == 12.0), "{samples:?}");
 }
 
 #[test]
@@ -300,6 +475,46 @@ fn hangs_inside_excluded_intervals_are_not_counted() {
     let hangs = hang_records(&out);
     assert_eq!(hangs.len(), 1);
     assert!(!hangs[0].valid);
+    assert_eq!(s.hangs.value, Some(0.0));
+    assert_eq!(s.hang_episodes_excluded, 1);
+}
+
+#[test]
+fn late_real_input_amends_the_interval_and_the_hang_it_let_count() {
+    let mut m = Model::new(cfg(), 0);
+    let tl = Timeline {
+        emit: always,
+        frozen: |t| (5_000..8_000).contains(&t),
+        sample: good_sample,
+        lag_ms: 0,
+    };
+    let out = drive(&mut m, 0, 10_000, &tl);
+    let hangs = hang_records(&out);
+    assert_eq!(hangs.len(), 1);
+    assert!(hangs[0].valid, "valid when it completed");
+    // Real input at 6.0 s, delivered after its interval had closed.
+    let amended = m.on_input(&InputObs {
+        t_ns: 6_000 * MS,
+        device: InputDevice::Keyboard,
+        origin: InputOrigin::Real,
+    });
+    let interval = amended
+        .iter()
+        .find_map(|r| match r {
+            Record::Interval(i) => Some(i),
+            _ => None,
+        })
+        .expect("the interval is re-emitted");
+    assert!(interval.amended && !interval.valid && interval.index == 12);
+    let hang = amended
+        .iter()
+        .find_map(|r| match r {
+            Record::Hang(h) => Some(h),
+            _ => None,
+        })
+        .expect("the hang is re-emitted");
+    assert!(hang.amended && !hang.valid);
+    let (_, s) = m.finish(10_000 * MS);
     assert_eq!(s.hangs.value, Some(0.0));
     assert_eq!(s.hang_episodes_excluded, 1);
 }
@@ -335,10 +550,7 @@ fn a_capture_disagreement_makes_latency_unknown() {
     assert!(recs.iter().any(|r| matches!(r, Record::Crosscheck(_))));
 }
 
-#[test]
-fn agreeing_sources_keep_the_primary_latency() {
-    let mut c = cfg();
-    c.secondary = Some(SourceId::Dda);
+fn agreeing_run(c: ModelConfig) -> WatchSummary {
     let mut m = Model::new(c, 0);
     for seq in 0..150u32 {
         let t = u64::from(seq) * 100;
@@ -356,10 +568,137 @@ fn agreeing_sources_keep_the_primary_latency() {
             vec![obs(MarkerKind::Output, 0, seq)],
         ));
     }
-    let (_, s) = m.finish(15_100 * MS);
+    m.finish(15_100 * MS).1
+}
+
+#[test]
+fn agreeing_sources_keep_the_primary_latency() {
+    let mut c = cfg();
+    c.secondary = Some(SourceId::Dda);
+    let s = agreeing_run(c);
     assert_eq!(s.crosscheck.verdict, "agree");
     // The primary's 10 ms, not an average with the secondary's 18 ms.
     assert_eq!(s.output_latency_ms.stat("p50"), Some(10.0));
+}
+
+#[test]
+fn an_assumed_refresh_rate_makes_refresh_counted_kpis_unknown() {
+    let mut c = cfg();
+    c.secondary = Some(SourceId::Dda);
+    c.refresh_assumed = true;
+    let s = agreeing_run(c);
+    assert!(s.refresh_assumed);
+    for k in [&s.jank_share, &s.marker_loss, &s.marker_skipped] {
+        assert_eq!(k.state, KpiState::Unknown, "{k:?}");
+        assert_eq!(k.reason, Some("refresh_rate_unknown"), "{k:?}");
+    }
+    assert_eq!(s.crosscheck.verdict, "not_performed");
+    assert!(
+        s.crosscheck.detail.contains("refresh"),
+        "{}",
+        s.crosscheck.detail
+    );
+    // What is not counted in refresh intervals stays measured.
+    assert_eq!(s.output_latency_ms.state, KpiState::Measured);
+    assert_eq!(s.frame_interval_ms.state, KpiState::Measured);
+}
+
+#[test]
+fn without_a_primary_source_capture_kpis_are_unavailable() {
+    let mut c = cfg();
+    c.capture_available = false;
+    let (_, out, s) = run(20_000, |t| t >= 5_000, good_sample, c);
+    assert!(hang_records(&out).is_empty(), "no frames to miss: no hangs");
+    for k in [
+        &s.output_latency_ms,
+        &s.frame_interval_ms,
+        &s.jank_share,
+        &s.marker_loss,
+        &s.marker_skipped,
+        &s.hangs,
+    ] {
+        assert_eq!(k.state, KpiState::Unknown, "{k:?}");
+        assert_eq!(k.reason, Some("capture_unavailable"), "{k:?}");
+    }
+}
+
+#[test]
+fn a_probe_that_falls_behind_reports_harness_error() {
+    for (lag_ms, hangs_unknown) in [(400, false), (2_000, true)] {
+        let mut m = Model::new(cfg(), 0);
+        let tl = Timeline {
+            emit: always,
+            frozen: |_| false,
+            sample: good_sample,
+            lag_ms,
+        };
+        drive(&mut m, 0, 20_000, &tl);
+        let (_, s) = m.finish(20_000 * MS);
+        assert!(s.probe.behind, "{lag_ms}: {:?}", s.probe);
+        for k in [&s.output_latency_ms, &s.frame_interval_ms, &s.marker_loss] {
+            assert_eq!(k.reason, Some("harness_error"), "{lag_ms}: {k:?}");
+        }
+        assert_eq!(
+            s.hangs.reason == Some("harness_error"),
+            hangs_unknown,
+            "{lag_ms}: {:?}",
+            s.hangs
+        );
+    }
+}
+
+#[test]
+fn input_latency_is_not_instrumented_in_watch() {
+    let (_, _, s) = run(2_000, |_| false, good_sample, cfg());
+    assert_eq!(s.input_latency_ms.reason, Some("not_instrumented"));
+    let mut c = cfg();
+    c.input_instrumented = true;
+    let (_, _, s) = run(2_000, |_| false, good_sample, c);
+    assert_eq!(s.input_latency_ms.reason, Some("insufficient_samples"));
+}
+
+#[test]
+fn v_counts_sessions_displayed_across_partial_reads() {
+    let mut m = Model::new(cfg(), 0);
+    let at = |session: u16, seq: u32| MarkerObs {
+        kind: MarkerKind::Output,
+        session,
+        seq,
+        rect: Rect {
+            x: 0,
+            y: i32::from(session) * 100,
+            w: 240,
+            h: 24,
+        },
+    };
+    let v_of = |rs: &[Record]| {
+        rs.iter().find_map(|r| match r {
+            Record::Frame(f) => Some(f.v),
+            _ => None,
+        })
+    };
+    // A full read shows four panes' markers.
+    let mut f = frame(SourceId::X11, 1, 10, (0..4).map(|s| at(s, 1)).collect());
+    assert_eq!(v_of(&m.on_frame(f.clone())), Some(4));
+    // A damage band over pane 1 only: its marker repainted, the others still
+    // on screen although outside the band.
+    f = frame(SourceId::X11, 2, 20, vec![at(1, 2)]);
+    f.region = Rect {
+        x: 0,
+        y: 36,
+        w: 800,
+        h: 152,
+    };
+    assert_eq!(v_of(&m.on_frame(f.clone())), Some(4));
+    // A band over pane 2 whose marker is gone.
+    f = frame(SourceId::X11, 3, 30, vec![]);
+    f.region = Rect {
+        x: 0,
+        y: 136,
+        w: 800,
+        h: 152,
+    };
+    assert_eq!(v_of(&m.on_frame(f)), Some(3));
 }
 
 #[test]
@@ -383,19 +722,55 @@ fn v_actual_counts_distinct_visible_sessions_per_frame() {
         vec![obs(MarkerKind::Output, 0, 2)],
     ));
     let (_, s) = m.finish(1_000 * MS);
-    assert_eq!(s.v_actual_max, 3);
+    assert_eq!(s.v_actual_max, Some(3));
     assert_eq!(s.sessions_seen, vec![0, 1, 2]);
+}
+
+#[test]
+fn what_was_never_measured_is_null_not_zero() {
+    let m = Model::new(cfg(), 0);
+    let mut m = m;
+    let (_, s) = m.finish(1_000 * MS);
+    assert_eq!(s.v_actual_max, None, "no frames: no V");
+    assert_eq!(s.v_actual_p50, None);
+    assert_eq!(s.crashes, None, "no host group was sampled");
+}
+
+fn host_sample(
+    exited: Vec<crate::records::ExitedProcess>,
+    empty: bool,
+) -> crate::records::SampleRecord {
+    let mut groups = std::collections::BTreeMap::new();
+    groups.insert(
+        crate::sampler::GROUP_HOST,
+        if empty {
+            GroupSample {
+                note: Some(crate::sampler::NOTE_EMPTY),
+                ..GroupSample::default()
+            }
+        } else {
+            GroupSample {
+                pids: vec![4],
+                cpu_pct: Some(10.0),
+                memory_mb: Some(50.0),
+                ..GroupSample::default()
+            }
+        },
+    );
+    crate::records::SampleRecord {
+        t_ns: Ns(0),
+        dt_ms: Some(500.0),
+        groups,
+        gpu: "measured".into(),
+        exited,
+    }
 }
 
 #[test]
 fn host_process_exits_count_as_crashes() {
     let mut m = Model::new(cfg(), 0);
-    m.on_process_sample(&crate::records::SampleRecord {
-        t_ns: Ns(0),
-        dt_ms: 500.0,
-        groups: Default::default(),
-        gpu: "measured".into(),
-        exited: vec![
+    m.on_process_sample(&host_sample(
+        vec![
             crate::records::ExitedProcess {
                 pid: 4,
                 group: "host",
@@ -407,7 +782,27 @@ fn host_process_exits_count_as_crashes() {
                 name: "node.exe".into(),
             },
         ],
-    });
+        false,
+    ));
     let (_, s) = m.finish(1_000 * MS);
-    assert_eq!(s.crashes, 1);
+    assert_eq!(s.crashes, Some(1));
+}
+
+#[test]
+fn an_empty_host_group_is_unknown_not_zero() {
+    let mut m = Model::new(cfg(), 0);
+    for _ in 0..30 {
+        m.on_process_sample(&host_sample(vec![], true));
+    }
+    let (_, s) = m.finish(1_000 * MS);
+    let host = &s.processes["host"];
+    assert_eq!(host.cpu_pct.state, KpiState::Unknown);
+    assert_eq!(
+        host.cpu_pct.reason,
+        Some("harness_error"),
+        "{:?}",
+        host.cpu_pct
+    );
+    assert_eq!(host.memory_mb_end, None);
+    assert_eq!(host.samples_empty, 30);
 }

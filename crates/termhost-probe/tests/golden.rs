@@ -328,27 +328,9 @@ fn the_frame_scanner_agrees_with_every_golden_row() {
     for (i, row) in g["rows"].as_array().expect("rows").iter().enumerate() {
         let name = row["name"].as_str().expect("name");
         let expected = row["expected"].as_array().expect("expected");
-        let want_markers: Vec<Value> = expected
-            .iter()
-            .filter(|e| e["ok"] == json!(true))
-            .cloned()
-            .collect();
-        let want_reasons: BTreeSet<&str> = expected
-            .iter()
-            .filter_map(|e| e["reason"].as_str())
-            .collect();
         // The row repeated 16 px tall: a marker one cell high, as on screen.
         let canvas = Canvas::from_row(&row_pixels(row), 16);
         let result = scan(&canvas.view(), &ScanOptions::default());
-        let got_markers: Vec<Value> = result
-            .markers
-            .iter()
-            .map(|f| summarize(&Ok(f.marker)))
-            .collect();
-        assert_eq!(
-            got_markers, want_markers,
-            "row {i} ({name}): scanner markers"
-        );
         for f in &result.markers {
             assert_eq!(
                 (f.rect.y, f.rect.h),
@@ -356,19 +338,23 @@ fn the_frame_scanner_agrees_with_every_golden_row() {
                 "row {i} ({name}): the marker spans every row"
             );
         }
-        let got_reasons: BTreeSet<&str> =
-            result.rejected.iter().map(|r| r.reason.as_str()).collect();
-        if want_markers.is_empty() {
-            assert_eq!(
-                got_reasons, want_reasons,
-                "row {i} ({name}): scanner rejections"
-            );
-        } else {
-            assert!(
-                got_reasons.is_subset(&want_reasons),
-                "row {i} ({name}): scanner rejections {got_reasons:?}"
-            );
-        }
+        // Every result, accepted and rejected, in left-to-right order — the
+        // very list the golden row expects, so a scanner that dropped or
+        // duplicated a rejection fails here.
+        let mut got: Vec<(i32, Value)> = result
+            .markers
+            .iter()
+            .map(|f| (f.rect.x, summarize(&Ok(f.marker))))
+            .chain(
+                result
+                    .rejected
+                    .iter()
+                    .map(|r| (r.x, summarize(&Err(r.reason)))),
+            )
+            .collect();
+        got.sort_by_key(|(x, _)| *x);
+        let got: Vec<Value> = got.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(&got, expected, "row {i} ({name}): the scanner's results");
     }
 }
 
@@ -552,10 +538,10 @@ fn mid() -> Marker {
 
 /// Rule 6 appends `min(k, need)` impure cells — never past cell 19 — so an
 /// occluding toast or tooltip that runs on past the marker's last cell is
-/// `off_palette`, not `wrong_length`. No golden row pins this (Phase 1 round-3
-/// review finding R3-1); these two rows were checked against the reference to
-/// decode `off_palette`, and `tests/differential.rs` runs them through it on
-/// every run.
+/// `off_palette`, not `wrong_length`. No golden row pins this (it was found by
+/// the qontinui-runner#2154 pre-PR review, round 3 finding 1); these two rows
+/// were checked against the reference to decode `off_palette`, and
+/// `tests/differential.rs` runs them through it on every run.
 fn rule_6_overflow_rows() -> Vec<(&'static str, Vec<Span>)> {
     let cells = |n: usize| -> Vec<Span> {
         encode_rgb(mid())

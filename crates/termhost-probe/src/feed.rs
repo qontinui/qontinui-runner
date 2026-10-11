@@ -1,7 +1,10 @@
 //! Where the engine learns which markers the workload emitted, and when:
 //! the AI-session generators' `<run-dir>/gen-<k>.jsonl` (Phase 1's record
 //! format: `start`, `marker`, `echo`, `progress`, `exit`), tailed while they
-//! are written, or the selftest's own schedule.
+//! are written, or the selftest's own schedule. A generator's `start` record
+//! also gives its marker schedule (`t0_ns`, `marker_hz`) and its `exit` record
+//! when it stopped, so a generator blocked inside a write — which logs nothing
+//! — still shows as having markers due.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -12,18 +15,38 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use crate::codec::MarkerKind;
-use crate::model::{EmitSource, Emitted};
+use crate::model::{EmitSource, Emitted, GenSchedule};
+
+/// What a feed reports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FeedEvent {
+    /// A marker was emitted.
+    Emitted(Emitted),
+    /// A generator started, with its marker schedule.
+    Started(GenSchedule),
+    /// A generator exited at `t_ns`.
+    Exited { session: u16, t_ns: u64 },
+}
 
 /// A source of emitted markers.
 pub trait EmitFeed: Send {
-    /// Markers emitted since the last poll.
-    fn poll(&mut self) -> Vec<Emitted>;
+    /// What happened since the last poll.
+    fn poll(&mut self) -> Vec<FeedEvent>;
     fn describe(&self) -> String;
+}
+
+/// An absolute hrtime value: a decimal string (they exceed 2^53), or a number.
+fn ns_field(v: &Value, key: &str) -> Option<u64> {
+    match v.get(key)? {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
 }
 
 /// Parse one `gen-<k>.jsonl` line. `session` is the file's session (set by
 /// its `start` record; the slot number until then).
-pub fn parse_gen_line(line: &str, session: &mut Option<u16>) -> Option<Emitted> {
+pub fn parse_gen_line(line: &str, session: &mut Option<u16>) -> Option<FeedEvent> {
     let v: Value = serde_json::from_str(line).ok()?;
     match v.get("type")?.as_str()? {
         "start" => {
@@ -34,34 +57,36 @@ pub fn parse_gen_line(line: &str, session: &mut Option<u16>) -> Option<Emitted> 
             {
                 *session = Some(s);
             }
-            None
+            Some(FeedEvent::Started(GenSchedule {
+                session: (*session)?,
+                t0_ns: ns_field(&v, "t0_ns")?,
+                marker_hz: v.get("marker_hz").and_then(Value::as_f64).unwrap_or(0.0),
+                load: v.get("mode").and_then(Value::as_str) == Some("load"),
+            }))
         }
+        "exit" => Some(FeedEvent::Exited {
+            session: (*session)?,
+            t_ns: ns_field(&v, "t_ns")?,
+        }),
         "marker" => {
             let kind = match v.get("kind")?.as_str()? {
                 "output" => MarkerKind::Output,
                 "calibration" => MarkerKind::Calibration,
                 _ => return None,
             };
-            emitted(&v, kind, (*session)?)
+            emitted(&v, kind, (*session)?).map(FeedEvent::Emitted)
         }
-        "echo" => emitted(&v, MarkerKind::Echo, (*session)?),
+        "echo" => emitted(&v, MarkerKind::Echo, (*session)?).map(FeedEvent::Emitted),
         _ => None,
     }
 }
 
 fn emitted(v: &Value, kind: MarkerKind, session: u16) -> Option<Emitted> {
-    let seq_full = v.get("seq")?.as_u64()?;
-    // Absolute hrtime values are decimal strings (they exceed 2^53).
-    let t_emit_ns = match v.get("t_emit_ns")? {
-        Value::String(s) => s.parse().ok()?,
-        Value::Number(n) => n.as_u64()?,
-        _ => return None,
-    };
     Some(Emitted {
         session,
         kind,
-        seq_full,
-        t_emit_ns,
+        seq_full: v.get("seq")?.as_u64()?,
+        t_emit_ns: ns_field(v, "t_emit_ns")?,
         source: EmitSource::Generator,
     })
 }
@@ -125,7 +150,7 @@ impl GenFeed {
 }
 
 impl EmitFeed for GenFeed {
-    fn poll(&mut self) -> Vec<Emitted> {
+    fn poll(&mut self) -> Vec<FeedEvent> {
         self.discover();
         let mut out = Vec::new();
         for (path, tail) in self.tails.iter_mut() {
@@ -189,8 +214,11 @@ impl SharedFeed {
 }
 
 impl EmitFeed for SharedFeed {
-    fn poll(&mut self) -> Vec<Emitted> {
+    fn poll(&mut self) -> Vec<FeedEvent> {
         std::mem::take(&mut *self.0.lock().expect("shared feed"))
+            .into_iter()
+            .map(FeedEvent::Emitted)
+            .collect()
     }
 
     fn describe(&self) -> String {
@@ -203,29 +231,62 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn emitted_of(e: Option<FeedEvent>) -> Emitted {
+        match e {
+            Some(FeedEvent::Emitted(e)) => e,
+            other => panic!("not an emitted marker: {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_the_phase_1_record_shapes() {
         let mut session = Some(9);
-        assert!(
-            parse_gen_line(r#"{"type":"start","session":3,"t0_ns":"5"}"#, &mut session).is_none()
+        assert_eq!(
+            parse_gen_line(
+                r#"{"type":"start","session":3,"mode":"load","marker_hz":10,"t0_ns":"5"}"#,
+                &mut session
+            ),
+            Some(FeedEvent::Started(GenSchedule {
+                session: 3,
+                t0_ns: 5,
+                marker_hz: 10.0,
+                load: true
+            }))
         );
         assert_eq!(session, Some(3));
-        let m = parse_gen_line(
+        let m = emitted_of(parse_gen_line(
             r#"{"type":"marker","kind":"output","seq":120000,"phase":"idle","t_sched_ns":"1","t_emit_ns":"18446744073709551000","t_written_ns":"2","bytes":9}"#,
             &mut session,
-        )
-        .expect("marker");
+        ));
         assert_eq!(
             (m.session, m.kind, m.seq_full, m.t_emit_ns),
             (3, MarkerKind::Output, 120_000, 18_446_744_073_709_551_000)
         );
-        let e = parse_gen_line(
+        let e = emitted_of(parse_gen_line(
             r#"{"type":"echo","seq":4,"byte":97,"t_read_ns":"1","t_emit_ns":"77","t_written_ns":"78","bytes":10}"#,
             &mut session,
-        )
-        .expect("echo");
+        ));
         assert_eq!((e.kind, e.seq_full, e.t_emit_ns), (MarkerKind::Echo, 4, 77));
         assert!(parse_gen_line(r#"{"type":"progress","t_ns":"1"}"#, &mut session).is_none());
+        assert_eq!(
+            parse_gen_line(
+                r#"{"type":"exit","reason":"stop_file","t_ns":"900"}"#,
+                &mut session
+            ),
+            Some(FeedEvent::Exited {
+                session: 3,
+                t_ns: 900
+            })
+        );
+        // A calibration run paints a static marker: no schedule to fall behind.
+        let mut s2 = None;
+        match parse_gen_line(
+            r#"{"type":"start","session":0,"mode":"calibration","marker_hz":10,"t0_ns":"1"}"#,
+            &mut s2,
+        ) {
+            Some(FeedEvent::Started(g)) => assert!(!g.load),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -253,7 +314,14 @@ mod tests {
         )
         .expect("write");
         f0.flush().expect("flush");
-        let got = feed.poll();
+        let got: Vec<Emitted> = feed
+            .poll()
+            .into_iter()
+            .filter_map(|e| match e {
+                FeedEvent::Emitted(e) => Some(e),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
             got.iter().map(|e| e.seq_full).collect::<Vec<_>>(),
             vec![1, 2]
@@ -267,7 +335,14 @@ mod tests {
         )
         .expect("write");
         f1.flush().expect("flush");
-        let got = feed.poll();
+        let got: Vec<Emitted> = feed
+            .poll()
+            .into_iter()
+            .filter_map(|e| match e {
+                FeedEvent::Emitted(e) => Some(e),
+                _ => None,
+            })
+            .collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].session, 1);
         assert_eq!(feed.malformed(), 0);

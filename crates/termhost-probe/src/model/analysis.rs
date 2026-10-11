@@ -11,8 +11,9 @@ use super::Emitted;
 pub struct FirstSeen {
     pub t_ns: u64,
     pub frame: u64,
-    /// Frames the source coalesced into that frame (DXGI accumulation).
-    pub missed: u32,
+    /// Frames the source coalesced into that frame (DXGI accumulation);
+    /// `None` for a source that cannot tell.
+    pub missed: Option<u32>,
 }
 
 /// The marker an emitted record refers to.
@@ -156,7 +157,7 @@ pub fn crosscheck(
             s.secondary_unseen += 1;
             continue;
         };
-        if q.missed > 0 && q.t_ns > p.t_ns {
+        if q.missed.is_some_and(|m| m > 0) && q.t_ns > p.t_ns {
             s.secondary_coalesced += 1;
             continue;
         }
@@ -227,7 +228,7 @@ mod tests {
         FirstSeen {
             t_ns: t_ms * MS,
             frame: 0,
-            missed: 0,
+            missed: None,
         }
     }
 
@@ -295,7 +296,7 @@ mod tests {
             FirstSeen {
                 t_ns: 350 * MS,
                 frame: 9,
-                missed: 2,
+                missed: Some(2),
             },
         ); // coalesced: not compared
         let sec_list: Vec<(Marker, FirstSeen)> = sec.iter().map(|(k, v)| (*k, *v)).collect();

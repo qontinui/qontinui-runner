@@ -1,26 +1,40 @@
 //! The input arm (plan D9). A key is sent only while the probe ESTABLISHES,
 //! immediately before that key, that:
 //!
-//! 1. no real input has occurred since the arm began — the non-blocking
-//!    real-input listener (Raw Input / XInput2; never a low-level keyboard
-//!    hook, which would add latency to every keystroke) reports only the
-//!    probe's own tagged events;
-//! 2. the listener is healthy (an unheard operator is not an absent one);
+//! 1. no real input has occurred since the probe started listening — the
+//!    non-blocking real-input listener (Raw Input / XInput2; never a
+//!    low-level keyboard hook, which would add latency to every keystroke)
+//!    reports only the probe's own tagged events;
+//! 2. the listener is healthy AND hears: after every key it must have
+//!    recognised that key's own events (an unheard operator is not an absent
+//!    one, and a listener that stopped hearing the probe would not hear the
+//!    operator either);
 //! 3. the target window is foreground on an interactive, unlocked desktop.
+//!
+//! Before anything happens — before `--activate` moves focus, before the
+//! first key — the desktop must have been quiet for a while (`--quiet-ms`),
+//! and every key of the arm must be typeable, so an arm never starts on a
+//! desktop in use and never stops half-typed for a key it could not send.
 //!
 //! Any failure aborts the arm at once, before the key — the arm fails closed,
 //! because an injected keystroke whose target has not been established is
 //! destructive (policy operating-rules/what-makes-an-action-destructive). The
 //! foreground is checked again right after each key: a change in that window
 //! means the key may have reached another window, which is reported, never
-//! smoothed over.
+//! smoothed over. Each key is announced in an `inject_intent` record (flushed)
+//! BEFORE it is sent, so a `watch` in another process recognises it.
 
 use std::time::Duration;
 
-use crate::clock::{now_ns, sleep_until_ns, wall_rfc3339};
+use crate::clock::{now_ns, sleep_until_ns};
 use crate::model::{InputDevice, InputOrigin};
 use crate::platform::{stop_requested, InjectBlock, KeyInjector, Subscription};
-use crate::records::{IncidentRecord, InjectAbortRecord, InjectRecord, Ns, Record, Sink};
+use crate::records::{
+    IncidentRecord, InjectAbortRecord, InjectIntentRecord, InjectRecord, Ns, Record, Sink,
+};
+
+/// The listener must recognise a key's own events within this long.
+pub const HEARD_WITHIN: Duration = Duration::from_millis(250);
 
 /// One arm.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +57,10 @@ pub enum AbortReason {
     OperatorInput,
     ForeignInjection,
     MonitorDown,
+    /// The listener did not recognise the probe's own key in time.
+    MonitorDeaf,
+    /// A key of the arm cannot be typed on this platform.
+    UnsupportedKey,
     SendFailed,
     ForegroundChangedDuringInjection,
     StopRequested,
@@ -57,6 +75,8 @@ impl AbortReason {
             AbortReason::OperatorInput => "operator_input",
             AbortReason::ForeignInjection => "foreign_injection",
             AbortReason::MonitorDown => "monitor_down",
+            AbortReason::MonitorDeaf => "monitor_deaf",
+            AbortReason::UnsupportedKey => "unsupported_key",
             AbortReason::SendFailed => "send_failed",
             AbortReason::ForegroundChangedDuringInjection => "foreground_changed_during_injection",
             AbortReason::StopRequested => "stop_requested",
@@ -128,9 +148,75 @@ fn foreign(input: &mut Subscription) -> Option<(AbortReason, String)> {
         })
 }
 
-/// Run one arm. `after_key(index, t_inject_ns, injector)` runs after each key
-/// is sent and checked (the selftest uses it to expect echoes and to send its
-/// one untagged key).
+/// Require `quiet` with no real or foreign input — and a healthy listener —
+/// before anything happens on the desktop. `input` must have been subscribed
+/// before this is called; events already queued count.
+pub fn await_quiet(input: &mut Subscription, quiet: Duration) -> Result<(), (AbortReason, String)> {
+    let until = now_ns() + quiet.as_nanos() as u64;
+    loop {
+        if let Some((reason, detail)) = foreign(input) {
+            return Err((
+                reason,
+                format!(
+                    "the desktop was in use within the {} ms quiet period: {detail}",
+                    quiet.as_millis()
+                ),
+            ));
+        }
+        if let Err(why) = input.health() {
+            return Err((AbortReason::MonitorDown, why));
+        }
+        if stop_requested() {
+            return Err((AbortReason::StopRequested, "stop requested".into()));
+        }
+        let now = now_ns();
+        if now >= until {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_nanos((until - now).min(20_000_000)));
+    }
+}
+
+/// Emit the abort (and, for operator activity or a misdirected key, an
+/// incident) and build the outcome.
+fn abort(
+    sink: &mut Sink,
+    index: u32,
+    reason: AbortReason,
+    detail: String,
+    sent: u32,
+) -> ArmOutcome {
+    sink.emit(&Record::InjectAbort(InjectAbortRecord {
+        index,
+        reason: reason.as_str(),
+        detail: detail.clone(),
+        keys_sent: sent,
+    }));
+    if reason.is_operator_activity() || reason == AbortReason::ForegroundChangedDuringInjection {
+        sink.emit(&Record::Incident(IncidentRecord::new(
+            if reason.is_operator_activity() {
+                "operator_input"
+            } else {
+                "harness_error"
+            },
+            format!("input arm aborted at key {index}: {detail}"),
+            false,
+        )));
+    }
+    sink.flush();
+    ArmOutcome::Aborted {
+        index,
+        reason,
+        detail,
+        sent,
+    }
+}
+
+/// Run one arm. `input` should have been subscribed before anything that
+/// precedes the arm (activation): input queued in it aborts the arm before
+/// the first key. `after_key(index, t_inject_ns, injector)` runs after each
+/// key is sent and checked (the selftest uses it to expect echoes and to send
+/// its one untagged key).
 pub fn run_arm(
     cfg: &ArmConfig,
     inj: &mut dyn KeyInjector,
@@ -138,39 +224,18 @@ pub fn run_arm(
     sink: &mut Sink,
     mut after_key: impl FnMut(u32, u64, &mut dyn KeyInjector),
 ) -> ArmOutcome {
-    // Input before the arm is not this arm's concern.
-    let _ = input.drain();
+    if let Some((i, &ch)) = cfg.keys.iter().enumerate().find(|(_, &c)| !inj.can_send(c)) {
+        return abort(
+            sink,
+            i as u32,
+            AbortReason::UnsupportedKey,
+            format!("key {i} ({ch:?}) cannot be typed here; nothing was sent"),
+            0,
+        );
+    }
     let start = now_ns() + cfg.start_delay.as_nanos() as u64;
     let interval = cfg.interval.as_nanos() as u64;
     let mut sent = 0u32;
-    let abort = |sink: &mut Sink, index: u32, reason: AbortReason, detail: String, sent: u32| {
-        sink.emit(&Record::InjectAbort(InjectAbortRecord {
-            index,
-            reason: reason.as_str(),
-            detail: detail.clone(),
-            keys_sent: sent,
-        }));
-        if reason.is_operator_activity() || reason == AbortReason::ForegroundChangedDuringInjection
-        {
-            sink.emit(&Record::Incident(IncidentRecord {
-                kind: if reason.is_operator_activity() {
-                    "operator_input"
-                } else {
-                    "harness_error"
-                },
-                at: wall_rfc3339(),
-                detail: format!("input arm aborted at key {index}: {detail}"),
-                stops_run: false,
-                source: None,
-            }));
-        }
-        ArmOutcome::Aborted {
-            index,
-            reason,
-            detail,
-            sent,
-        }
-    };
     for (i, &ch) in cfg.keys.iter().enumerate() {
         let i = i as u32;
         sleep_until_ns(start + u64::from(i) * interval);
@@ -198,6 +263,16 @@ pub fn run_arm(
             return abort(sink, i, reason, block.to_string(), sent);
         }
         let t_check = now_ns();
+        // Announce the key first: another process's listener (`watch`) reads
+        // this to recognise the key as the probe's own when it arrives.
+        sink.emit(&Record::InjectIntent(InjectIntentRecord {
+            index: i,
+            key: ch.to_string(),
+            ledger: inj.ledger_ids(ch),
+            t_ns: Ns(now_ns()),
+        }));
+        sink.flush();
+        let heard_before = inj.heard();
         let t_inject = now_ns();
         if let Err(why) = inj.send_char(ch, true) {
             return abort(sink, i, AbortReason::SendFailed, why, sent);
@@ -211,6 +286,22 @@ pub fn run_arm(
                 format!("the foreground changed while key {i} was being sent, so it may have reached another window: {block}"),
                 sent,
             );
+        }
+        let deadline = now_ns() + HEARD_WITHIN.as_nanos() as u64;
+        while inj.heard() < heard_before + 2 {
+            if now_ns() >= deadline {
+                return abort(
+                    sink,
+                    i,
+                    AbortReason::MonitorDeaf,
+                    format!(
+                        "the real-input listener did not recognise key {i}'s own events within {} ms; a listener that cannot hear the probe would not hear an operator either",
+                        HEARD_WITHIN.as_millis()
+                    ),
+                    sent,
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
         sink.emit(&Record::Inject(InjectRecord {
             index: i,
@@ -255,6 +346,8 @@ pub struct InjectCmd {
     pub settle: Duration,
     pub tag: Option<u32>,
     pub activate: bool,
+    /// The desktop must be quiet this long before focus moves or a key goes.
+    pub quiet: Duration,
     pub echo_stdout: bool,
     pub args: Vec<String>,
 }
@@ -262,13 +355,13 @@ pub struct InjectCmd {
 /// Run `inject`: writes `<run-dir>/inject.jsonl`; exit 0 = every key sent,
 /// [`EXIT_ABORTED`] = refused or aborted for safety, 1 = setup error.
 pub fn run_cmd(host: &mut dyn crate::platform::Host, cmd: &InjectCmd) -> anyhow::Result<i32> {
-    use crate::records::{EndRecord, Ns};
+    use crate::records::{EndRecord, FileMode};
     use anyhow::Context;
 
     std::fs::create_dir_all(&cmd.run_dir)
         .with_context(|| format!("creating {}", cmd.run_dir.display()))?;
-    let path = cmd.run_dir.join("inject.jsonl");
-    let mut sink = Sink::to_file(&path, cmd.echo_stdout)
+    let path = cmd.run_dir.join(crate::watch::INJECT_LOG);
+    let mut sink = Sink::create(&path, cmd.echo_stdout, FileMode::New)
         .with_context(|| format!("opening {}", path.display()))?;
     let mut tagging = crate::platform::Tagging::new();
     if let Some(t) = cmd.tag {
@@ -306,6 +399,8 @@ pub fn run_cmd(host: &mut dyn crate::platform::Host, cmd: &InjectCmd) -> anyhow:
             )
         }
     };
+    // Listening starts before anything happens on the desktop.
+    let mut sub = monitor.bus.subscribe();
     let mut inj = match host.injector(target, &tagging) {
         Ok(i) => i,
         Err(why) => {
@@ -316,18 +411,26 @@ pub fn run_cmd(host: &mut dyn crate::platform::Host, cmd: &InjectCmd) -> anyhow:
             )
         }
     };
+    if let Err((reason, detail)) = await_quiet(&mut sub, cmd.quiet) {
+        let _refused = abort(&mut sink, 0, reason, detail.clone(), 0);
+        return finish(
+            &mut sink,
+            EXIT_ABORTED,
+            format!(
+                "refused ({}) before any focus change or key: {detail}",
+                reason.as_str()
+            ),
+        );
+    }
     if cmd.activate {
         if let Err(why) = inj.activate() {
-            sink.emit(&Record::Incident(IncidentRecord {
-                kind: "harness_error",
-                at: wall_rfc3339(),
-                detail: format!("--activate could not make the target foreground: {why}"),
-                stops_run: false,
-                source: None,
-            }));
+            sink.emit(&Record::Incident(IncidentRecord::new(
+                "harness_error",
+                format!("--activate could not make the target foreground: {why}"),
+                false,
+            )));
         }
     }
-    let mut sub = monitor.bus.subscribe();
     let arm = ArmConfig {
         keys: cmd.keys.clone(),
         interval: cmd.interval,
@@ -360,15 +463,22 @@ mod tests {
     use super::*;
     use crate::model::InputObs;
     use crate::platform::InputBus;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// An injector whose target is foreground until `lose_focus_at`, and which
     /// publishes its own (tagged or untagged) events to the bus like a real
-    /// listener would.
+    /// listener would — and counts them as heard unless `deaf`.
     struct FakeInjector {
         bus: Arc<InputBus>,
         lose_focus_at: Option<u32>,
         sent: Arc<Mutex<Vec<(char, bool)>>>,
+        heard: Arc<AtomicU64>,
+        deaf: bool,
+        unsupported: Option<char>,
+        /// The sink's lines at the moment each key was sent.
+        lines: Option<Arc<Mutex<Vec<String>>>>,
+        seen_at_send: Arc<Mutex<Vec<usize>>>,
     }
 
     impl KeyInjector for FakeInjector {
@@ -385,7 +495,22 @@ mod tests {
                 _ => Ok(()),
             }
         }
+        fn can_send(&self, ch: char) -> bool {
+            self.unsupported != Some(ch)
+        }
+        fn ledger_ids(&self, ch: char) -> Vec<u32> {
+            vec![ch as u32, ch as u32 | 0x100]
+        }
         fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {
+            if let Some(lines) = &self.lines {
+                let n = lines
+                    .lock()
+                    .expect("lines")
+                    .iter()
+                    .filter(|l| l.contains("\"type\":\"inject_intent\""))
+                    .count();
+                self.seen_at_send.lock().expect("seen").push(n);
+            }
             self.sent.lock().expect("sent").push((ch, tagged));
             for _ in 0..2 {
                 self.bus.publish(InputObs {
@@ -397,8 +522,14 @@ mod tests {
                         InputOrigin::ForeignInjected
                     },
                 });
+                if tagged && !self.deaf {
+                    self.heard.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Ok(())
+        }
+        fn heard(&self) -> u64 {
+            self.heard.load(Ordering::Relaxed)
         }
         fn activate(&mut self) -> Result<(), String> {
             Ok(())
@@ -427,6 +558,11 @@ mod tests {
             bus: bus.clone(),
             lose_focus_at,
             sent: sent.clone(),
+            heard: Arc::new(AtomicU64::new(0)),
+            deaf: false,
+            unsupported: None,
+            lines: None,
+            seen_at_send: Arc::new(Mutex::new(Vec::new())),
         };
         let sub = bus.subscribe();
         (inj, sub, bus, sent)
@@ -453,7 +589,32 @@ mod tests {
                 .count(),
             6
         );
-        assert!(lines[0].contains("\"t_inject_ns\":\""));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("\"type\":\"inject\"") && l.contains("\"t_inject_ns\":\"")));
+    }
+
+    #[test]
+    fn every_key_is_announced_before_it_is_sent() {
+        let (mut inj, mut sub, _bus, _) = setup(None);
+        let (mut sink, lines) = Sink::memory();
+        inj.lines = Some(lines.clone());
+        let seen = inj.seen_at_send.clone();
+        let out = run_arm(&cfg(4), &mut inj, &mut sub, &mut sink, |_, _, _| {});
+        assert!(
+            matches!(out, ArmOutcome::Completed { sent: 4, .. }),
+            "{out:?}"
+        );
+        // When key k was sent, k + 1 intents were already written.
+        assert_eq!(*seen.lock().expect("seen"), vec![1, 2, 3, 4]);
+        let first = lines
+            .lock()
+            .expect("lines")
+            .iter()
+            .find(|l| l.contains("inject_intent"))
+            .cloned()
+            .expect("an intent");
+        assert!(first.contains("\"ledger\":[97,353]"), "{first}");
     }
 
     #[test]
@@ -486,6 +647,102 @@ mod tests {
             .expect("lines")
             .iter()
             .any(|l| l.contains("\"kind\":\"operator_input\"")));
+    }
+
+    #[test]
+    fn input_queued_before_the_arm_aborts_it_before_the_first_key() {
+        // E.g. the operator typed while `--activate` moved focus: the
+        // subscription was already listening, and the arm must not discard it.
+        let (mut inj, mut sub, bus, sent) = setup(None);
+        bus.publish(InputObs {
+            t_ns: now_ns(),
+            device: InputDevice::Keyboard,
+            origin: InputOrigin::Real,
+        });
+        let (mut sink, _) = Sink::memory();
+        let out = run_arm(&cfg(4), &mut inj, &mut sub, &mut sink, |_, _, _| {});
+        assert!(
+            matches!(
+                out,
+                ArmOutcome::Aborted {
+                    index: 0,
+                    reason: AbortReason::OperatorInput,
+                    sent: 0,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(sent.lock().expect("sent").is_empty());
+    }
+
+    #[test]
+    fn the_quiet_period_refuses_a_desktop_in_use() {
+        let (_, mut sub, bus, _) = setup(None);
+        let b = bus.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            b.publish(InputObs {
+                t_ns: now_ns(),
+                device: InputDevice::Pointer,
+                origin: InputOrigin::Real,
+            });
+        });
+        let r = await_quiet(&mut sub, Duration::from_millis(300));
+        t.join().expect("publisher");
+        assert!(matches!(r, Err((AbortReason::OperatorInput, _))), "{r:?}");
+        // A quiet desktop passes.
+        let (_, mut quiet_sub, _bus2, _) = setup(None);
+        assert_eq!(
+            await_quiet(&mut quiet_sub, Duration::from_millis(60)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_deaf_listener_aborts_after_the_first_key() {
+        let (mut inj, mut sub, _bus, sent) = setup(None);
+        inj.deaf = true;
+        let (mut sink, _) = Sink::memory();
+        let out = run_arm(&cfg(5), &mut inj, &mut sub, &mut sink, |_, _, _| {});
+        assert!(
+            matches!(
+                out,
+                ArmOutcome::Aborted {
+                    index: 0,
+                    reason: AbortReason::MonitorDeaf,
+                    sent: 1,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            sent.lock().expect("sent").len(),
+            1,
+            "no key after the deaf one"
+        );
+    }
+
+    #[test]
+    fn an_untypeable_key_refuses_the_arm_before_any_key() {
+        let (mut inj, mut sub, _bus, sent) = setup(None);
+        inj.unsupported = Some('d');
+        let (mut sink, _) = Sink::memory();
+        let out = run_arm(&cfg(6), &mut inj, &mut sub, &mut sink, |_, _, _| {});
+        assert!(
+            matches!(
+                out,
+                ArmOutcome::Aborted {
+                    index: 3,
+                    reason: AbortReason::UnsupportedKey,
+                    sent: 0,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(sent.lock().expect("sent").is_empty(), "nothing was typed");
     }
 
     #[test]

@@ -216,8 +216,12 @@ pub fn capture_verdict(id: &'static str, f: &CaptureFacts, at: &str) -> Mechanis
         CaptureFacts::NotApplicable(d) => v(id, State::Inoperative, d.clone(), at),
         CaptureFacts::NoSession(d) => v(id, State::Inoperative, format!("no interactive session to capture: {d}"), at),
         CaptureFacts::Unavailable(d) => v(id, State::Inoperative, d.clone(), at),
-        CaptureFacts::Failed(d) => v(id, State::Inoperative, format!("capture failed before a frame: {d}"), at),
-        CaptureFacts::NoFrame(d) => v(id, State::Inoperative, format!("capture started but delivered no frame: {d}"), at),
+        // A probe that got no readable answer decides nothing: the mechanism
+        // may be broken here, or the probe may be. UNKNOWN keeps the
+        // selftest's checks on it gated, so a regression cannot hide as an
+        // "environment limit".
+        CaptureFacts::Failed(d) => v(id, State::Unknown, format!("capture failed before a frame: {d}"), at),
+        CaptureFacts::NoFrame(d) => v(id, State::Unknown, format!("capture started but delivered no frame: {d}"), at),
         CaptureFacts::Frame {
             decoded: Ok(m),
             degraded: None,
@@ -495,16 +499,26 @@ mod tests {
             capture_verdict(CAPTURE_X11, &no_shm, AT).state,
             State::Degraded
         );
+        // A hard dependency absent: inoperative here.
         for f in [
             CaptureFacts::NotApplicable("linux".into()),
             CaptureFacts::NoSession("x".into()),
             CaptureFacts::Unavailable("IsSupported false".into()),
+        ] {
+            assert_eq!(
+                capture_verdict(CAPTURE_DDA, &f, AT).state,
+                State::Inoperative,
+                "{f:?}"
+            );
+        }
+        // The probe got no readable answer: unknown, never inoperative.
+        for f in [
             CaptureFacts::Failed("0x887A0004".into()),
             CaptureFacts::NoFrame("2000 ms".into()),
         ] {
             assert_eq!(
                 capture_verdict(CAPTURE_DDA, &f, AT).state,
-                State::Inoperative,
+                State::Unknown,
                 "{f:?}"
             );
         }
@@ -592,7 +606,7 @@ mod tests {
                 r.summary.unknown,
                 r.summary.degraded
             ),
-            (3, 3, 1, 0)
+            (3, 2, 2, 0)
         );
         let line = crate::records::to_line(&crate::records::Record::Doctor(r));
         assert!(line.contains("\"INOPERATIVE-ON-THIS-MACHINE\""));

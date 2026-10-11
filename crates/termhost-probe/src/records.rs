@@ -6,6 +6,53 @@
 //! ([`crate::clock`]), the timebase of Node's `process.hrtime`. Durations are
 //! numbers in milliseconds (`*_ms`). Raw frames are never written anywhere:
 //! a frame record carries only its time, size and the markers decoded from it.
+//!
+//! # What an orchestrator must know (Phase 3 builds against this)
+//!
+//! - **A value the probe cannot measure is `null` or an unknown KPI, never 0.**
+//!   `frame.missed` is `null` for sources that cannot detect skipped frames
+//!   (WGC, X11) and a count only for Desktop Duplication; `sample.dt_ms` is
+//!   `null` on the first sample; `summary.v_actual_max` is `null` with no
+//!   frames; `summary.crashes` is `null` when no host group was sampled; an
+//!   empty or partly unreadable process group reports `null` values and a
+//!   `note`.
+//! - **Files are per run.** `watch` refuses a run directory whose `probe.jsonl`
+//!   already holds records, and `inject` one whose `inject.jsonl` does, so two
+//!   runs can never interleave in one file: one `watch` and at most one
+//!   `inject` per run directory.
+//! - **Late input amends earlier records.** Real input that arrives after its
+//!   interval closed re-emits that `interval` record with `amended: true` (and
+//!   any `hang` it invalidates); the LAST record per interval `index` / per
+//!   hang start is the verdict.
+//! - **Workload membership is fixed for the whole run.** `watch --run-dir`
+//!   reads the generators' `<run-dir>/slot-<k>` files (Phase 1's
+//!   `termhost-bench/slot/v1`: `pid`, `ppid`, `run_id`) as well as generator
+//!   command lines; a generator and its session shell are workload from the
+//!   first sample that sees them, keyed by (pid, start time), and never move
+//!   into the host group — not after the generator exits either.
+//! - **`inject` announces each key before sending it.** An `inject_intent`
+//!   record (index, key, and on X11 the XTEST ledger ids) is written and
+//!   flushed to `inject.jsonl` immediately before the key is sent; `watch`
+//!   reads `<run-dir>/inject.jsonl` to recognise those keys as the probe's
+//!   own, so run `watch` and `inject` with the same `--run-dir` (and, on
+//!   Windows, the same `--tag`).
+//! - **`watch` does not pair keys with echoes.** Its `input_latency_ms` is
+//!   `unknown(not_instrumented)`; the orchestrator pairs `inject.jsonl`
+//!   `t_inject_ns` with the echo markers' `first_seen` records.
+//! - **Incidents follow the results schema's incident shape** (`kind`, `at`,
+//!   `detail`, `stops_run`, optional `data`); the capture source an incident
+//!   is about is `data.source`.
+//! - **The frame `v`** is the number of sessions whose output marker is
+//!   currently displayed, accumulated across partial reads (X11 delivers only
+//!   the damaged band of a window), not the count inside one band.
+//! - **The probe's own health is recorded**: each frame carries `scan_ms` (time
+//!   to scan it) and `lag_ms` (how long after its presentation the probe
+//!   received it); the summary's `probe` block says whether the probe fell
+//!   behind, in which case the KPIs it could have inflated are
+//!   `unknown(harness_error)`; the sampler has a `probe` group.
+//! - **An assumed refresh rate is marked** (`capture.refresh_assumed`,
+//!   `summary.refresh_assumed`), and every KPI counted in refresh intervals is
+//!   then `unknown(refresh_rate_unknown)`.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -40,7 +87,7 @@ impl Serialize for Ns {
 pub enum SourceId {
     /// Windows.Graphics.Capture, one window (the primary Windows source).
     Wgc,
-    /// DXGI Desktop Duplication (the Windows cross-check).
+    /// DXGI Desktop Duplication (the Windows cross-check; never primary).
     Dda,
     /// X11 damage + shm read of the damaged rows.
     X11,
@@ -56,6 +103,14 @@ impl SourceId {
             SourceId::X11 => "x11",
             SourceId::Synthetic => "synthetic",
         }
+    }
+
+    /// Whether this source can be the primary one. Desktop Duplication
+    /// delivers a frame for ANY change on its output (a clock, another window),
+    /// so its cadence is the desktop's, not the window's: it is the
+    /// cross-check only.
+    pub fn can_be_primary(self) -> bool {
+        !matches!(self, SourceId::Dda)
     }
 }
 
@@ -105,6 +160,9 @@ pub struct CaptureRecord {
     pub detail: String,
     pub refresh_hz: f64,
     pub refresh_source: String,
+    /// The display reported no refresh rate and 60 Hz was assumed: every KPI
+    /// counted in refresh intervals is then unknown(refresh_rate_unknown).
+    pub refresh_assumed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,13 +172,19 @@ pub struct FrameRecord {
     pub t_ns: Ns,
     pub w: u32,
     pub h: u32,
-    /// Frames the source coalesced into this one (DXGI `AccumulatedFrames - 1`).
-    pub missed: u32,
-    /// Distinct sessions with an output marker in this frame (V, measured).
+    /// Frames the source coalesced into this one (DXGI `AccumulatedFrames - 1`);
+    /// `null` for a source that cannot detect skipped frames (WGC, X11).
+    pub missed: Option<u32>,
+    /// Sessions whose output marker is currently displayed — accumulated over
+    /// partial reads (an X11 frame is only the damaged band), measured.
     pub v: u32,
     pub markers: Vec<MarkerObs>,
     /// Red-cyan starts that did not decode.
     pub rejected: u32,
+    /// How long the probe took to scan this frame.
+    pub scan_ms: f64,
+    /// How long after the frame's time the probe received it.
+    pub lag_ms: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,6 +221,10 @@ pub struct OccluderInfo {
     pub pid: u32,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct IntervalRecord {
     pub index: u64,
@@ -185,9 +253,13 @@ pub struct IntervalRecord {
     pub frames: u32,
     pub valid: bool,
     pub excluded: Vec<&'static str>,
-    /// `occluded` or `operator_activity` — the catalog reason this interval
-    /// counts toward.
+    /// `occluded`, `operator_activity` or `harness_error` — the catalog
+    /// reason this interval counts toward.
     pub exclusion_class: Option<&'static str>,
+    /// Re-emitted because input that arrived after the interval closed
+    /// changed its verdict; the last record per `index` wins.
+    #[serde(skip_serializing_if = "is_false")]
+    pub amended: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -204,6 +276,10 @@ pub struct GroupSample {
     pub gpu_pct: Option<f64>,
     /// PIDs whose CPU or memory could not be read this sample.
     pub unreadable: u32,
+    /// Why the values are `null`: `no_live_process` (the group is empty) or
+    /// `unreadable_members` (a partial sum is not the group's number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -216,7 +292,8 @@ pub struct ExitedProcess {
 #[derive(Clone, Debug, Serialize)]
 pub struct SampleRecord {
     pub t_ns: Ns,
-    pub dt_ms: f64,
+    /// Since the previous sample; `null` on the first.
+    pub dt_ms: Option<f64>,
     pub groups: BTreeMap<&'static str, GroupSample>,
     /// `measured`, or why GPU counters are absent this sample.
     pub gpu: String,
@@ -230,8 +307,15 @@ pub struct HangRecord {
     pub duration_ms: f64,
     /// `no_update_with_pending` and/or `os_not_responding`.
     pub kinds: Vec<&'static str>,
-    /// Counted only when every interval it touches is valid.
+    /// Counted only when every full interval it touches is valid.
     pub valid: bool,
+    /// The episode was still open when the run ended (judged over the full
+    /// intervals before the end).
+    #[serde(skip_serializing_if = "is_false")]
+    pub open_at_end: bool,
+    /// Re-emitted because late input invalidated an interval it touches.
+    #[serde(skip_serializing_if = "is_false")]
+    pub amended: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -246,6 +330,8 @@ pub struct CrosscheckRecord {
     pub verdict: &'static str,
 }
 
+/// The results schema's incident shape: `kind`, `at`, `detail`, `stops_run`
+/// and an optional free-form `data`.
 #[derive(Clone, Debug, Serialize)]
 pub struct IncidentRecord {
     /// A results-schema incident kind (`capture_lost`, `operator_input`,
@@ -254,7 +340,39 @@ pub struct IncidentRecord {
     pub at: String,
     pub detail: String,
     pub stops_run: bool,
-    pub source: Option<SourceId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+impl IncidentRecord {
+    pub fn new(kind: &'static str, detail: impl Into<String>, stops_run: bool) -> Self {
+        IncidentRecord {
+            kind,
+            at: crate::clock::wall_rfc3339(),
+            detail: detail.into(),
+            stops_run,
+            data: None,
+        }
+    }
+
+    /// The incident concerns this capture source (`data.source`).
+    pub fn about_source(mut self, source: SourceId) -> Self {
+        self.data = Some(serde_json::json!({ "source": source.as_str() }));
+        self
+    }
+}
+
+/// Written and flushed immediately BEFORE a key is sent, so another process
+/// (`watch`) can recognise the key as the probe's own when it arrives.
+#[derive(Clone, Debug, Serialize)]
+pub struct InjectIntentRecord {
+    pub index: u32,
+    pub key: String,
+    /// Platform event ids a listener matches the key's events against (X11:
+    /// keycode, plus 0x100 for the release); empty where a tag in the event
+    /// itself identifies it (Windows `dwExtraInfo`).
+    pub ledger: Vec<u32>,
+    pub t_ns: Ns,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -310,8 +428,9 @@ pub struct DoctorRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct CheckRecord {
     pub check: String,
-    /// Gated: every mechanism it depends on is OPERATIVE (or required), so a
-    /// failure fails the selftest.
+    /// Gated: no mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE (or it
+    /// is `--require`d), so a failure — or a check that could not run — fails
+    /// the selftest.
     pub gated: bool,
     /// `None` when the check could not run.
     pub passed: Option<bool>,
@@ -327,6 +446,24 @@ pub struct EndRecord {
     pub reason: String,
 }
 
+/// The probe's own health over a run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ProbeHealth {
+    /// Primary frames processed.
+    pub frames: u64,
+    pub scan_ms_p50: Option<f64>,
+    pub scan_ms_max: Option<f64>,
+    pub lag_ms_p50: Option<f64>,
+    /// The p99 frame lag (the maximum below 100 frames): what `behind` judges.
+    pub lag_ms_judged: Option<f64>,
+    pub lag_ms_max: Option<f64>,
+    /// Above this the probe was not keeping up with the source.
+    pub lag_bound_ms: f64,
+    /// The probe fell behind: latency, loss and cadence are
+    /// unknown(harness_error).
+    pub behind: bool,
+}
+
 /// The summary `watch` writes last.
 #[derive(Clone, Debug, Serialize)]
 pub struct WatchSummary {
@@ -335,16 +472,18 @@ pub struct WatchSummary {
     pub primary: SourceId,
     pub secondary: Option<SourceId>,
     pub refresh_ms: f64,
+    pub refresh_assumed: bool,
     pub frames: BTreeMap<&'static str, u64>,
     pub frame_interval_ms: KpiValue,
     pub jank_share: KpiValue,
-    pub v_actual_max: u32,
+    pub v_actual_max: Option<u32>,
     pub v_actual_p50: Option<u32>,
     pub sessions_seen: Vec<u16>,
     pub intervals_total: u64,
     pub intervals_valid: u64,
     pub intervals_excluded_occluded: u64,
     pub intervals_excluded_operator_activity: u64,
+    pub intervals_excluded_harness_error: u64,
     pub hangs: KpiValue,
     pub hang_episodes_excluded: u64,
     pub emitted_markers: u64,
@@ -355,8 +494,11 @@ pub struct WatchSummary {
     pub marker_skipped: KpiValue,
     pub crosscheck: CrosscheckSummary,
     pub negative_latencies: u64,
-    pub crashes: u64,
+    /// Host processes that exited during the run; `null` when no host group
+    /// was sampled.
+    pub crashes: Option<u64>,
     pub processes: BTreeMap<&'static str, ProcessSummary>,
+    pub probe: ProbeHealth,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -382,6 +524,10 @@ pub struct ProcessSummary {
     pub gpu_pct: KpiValue,
     pub memory_mb_end: Option<f64>,
     pub samples: u64,
+    /// Samples in which the group had no live process.
+    pub samples_empty: u64,
+    /// Samples in which a member could not be read (values withheld).
+    pub samples_unreadable: u64,
 }
 
 /// Every record type.
@@ -397,6 +543,7 @@ pub enum Record {
     Hang(HangRecord),
     Crosscheck(CrosscheckRecord),
     Incident(IncidentRecord),
+    InjectIntent(InjectIntentRecord),
     Inject(InjectRecord),
     InjectAbort(InjectAbortRecord),
     Doctor(DoctorRecord),
@@ -414,6 +561,16 @@ pub fn to_line(r: &Record) -> String {
     format!("{{\"schema\":\"{SCHEMA}\",{rest}")
 }
 
+/// How [`Sink::create`] treats an existing file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileMode {
+    /// Refuse a file that already holds anything: a run's records never mix
+    /// with another run's (`watch`, `inject`).
+    New,
+    /// Start the file afresh (the selftest's own diagnostic files).
+    Truncate,
+}
+
 /// Where records go: a file, stdout, and/or memory (tests).
 pub struct Sink {
     file: Option<BufWriter<File>>,
@@ -424,10 +581,27 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// A sink appending to `path` (created if absent) and optionally echoing
-    /// to stdout.
-    pub fn to_file(path: &Path, stdout: bool) -> std::io::Result<Sink> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    /// A sink writing to `path` and optionally echoing to stdout.
+    pub fn create(path: &Path, stdout: bool, mode: FileMode) -> std::io::Result<Sink> {
+        let file = match mode {
+            FileMode::Truncate => File::create(path)?,
+            FileMode::New => {
+                if std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{} already holds records from another run; use a fresh run directory",
+                            path.display()
+                        ),
+                    ));
+                }
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(path)?
+            }
+        };
         Ok(Sink {
             file: Some(BufWriter::new(file)),
             stdout,
@@ -545,5 +719,58 @@ mod tests {
         }));
         assert_eq!(lines.lock().expect("lock").len(), 1);
         assert_eq!(sink.lines(), 1);
+    }
+
+    #[test]
+    fn incidents_have_only_the_results_schema_fields() {
+        let plain = to_line(&Record::Incident(IncidentRecord::new(
+            "harness_error",
+            "x",
+            false,
+        )));
+        let v: serde_json::Value = serde_json::from_str(&plain).expect("JSON");
+        let keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["at", "detail", "kind", "schema", "stops_run", "type"]
+        );
+        let about = to_line(&Record::Incident(
+            IncidentRecord::new("capture_lost", "y", true).about_source(SourceId::Wgc),
+        ));
+        let v: serde_json::Value = serde_json::from_str(&about).expect("JSON");
+        assert!(v.get("source").is_none(), "{about}");
+        assert_eq!(v["data"]["source"], "wgc");
+    }
+
+    #[test]
+    fn a_run_file_is_never_appended_to() {
+        let dir = std::env::temp_dir().join(format!(
+            "termhost-probe-sink-{}-{}",
+            std::process::id(),
+            crate::clock::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("probe.jsonl");
+        {
+            let mut s = Sink::create(&path, false, FileMode::New).expect("fresh file");
+            s.emit(&Record::End(EndRecord {
+                t_ns: Ns(1),
+                exit_code: 0,
+                reason: "first run".into(),
+            }));
+        }
+        let again = Sink::create(&path, false, FileMode::New);
+        assert!(again.is_err(), "a second run must not append to the first");
+        // The selftest's own files start afresh instead.
+        drop(Sink::create(&path, false, FileMode::Truncate).expect("truncate"));
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

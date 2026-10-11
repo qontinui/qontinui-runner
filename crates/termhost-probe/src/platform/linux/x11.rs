@@ -14,7 +14,7 @@ use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, ImageOrder, MapState
 use x11rb::rust_connection::RustConnection;
 
 use crate::model::WindowSample;
-use crate::platform::common::occlusion;
+use crate::platform::common::{occlusion, pick_by_title, x11_focus_verdict};
 use crate::platform::{Refresh, TargetSpec, WindowHandle, WindowInspector};
 use crate::raster::{PixelFormat, Rect};
 use crate::records::OccluderInfo;
@@ -187,18 +187,28 @@ impl Display {
             .unwrap_or_else(|| format!("window 0x{w:x}"))
     }
 
-    /// The focused window per `_NET_ACTIVE_WINDOW` (a window manager) or the
-    /// input focus (a bare server).
-    pub fn is_foreground(&self, target: Window) -> bool {
-        if let Some(active) = self
-            .atom("_NET_ACTIVE_WINDOW")
-            .and_then(|a| self.property32(self.root, a))
-            .and_then(|v| v.first().copied())
-        {
-            if active != x11rb::NONE {
-                return active == target || self.top_level(active) == self.top_level(target);
+    /// `w` and its ancestors below the root.
+    fn ancestry(&self, w: Window) -> Vec<Window> {
+        let mut chain = vec![w];
+        let mut cur = w;
+        for _ in 0..64 {
+            let Some(tree) = self.conn.query_tree(cur).ok().and_then(|c| c.reply().ok()) else {
+                break;
+            };
+            if tree.parent == self.root || tree.parent == x11rb::NONE {
+                break;
             }
+            chain.push(tree.parent);
+            cur = tree.parent;
         }
+        chain
+    }
+
+    /// Whether keys sent now would reach `target`: the X keyboard focus is
+    /// the target or inside it (XTEST delivers to the focus), and a window
+    /// manager's `_NET_ACTIVE_WINDOW`, when set, agrees — the hint alone goes
+    /// stale when focus moves to a popup or a client sets it itself.
+    pub fn is_foreground(&self, target: Window) -> bool {
         let Some(focus) = self
             .conn
             .get_input_focus()
@@ -208,11 +218,18 @@ impl Display {
         else {
             return false;
         };
-        // PointerRoot (1) and None (0) do not name a window.
-        if focus <= 1 {
-            return false;
-        }
-        focus == target || self.top_level(focus) == self.top_level(target)
+        let chain = if focus > 1 {
+            self.ancestry(focus)
+        } else {
+            vec![focus]
+        };
+        let active_top = self
+            .atom("_NET_ACTIVE_WINDOW")
+            .and_then(|a| self.property32(self.root, a))
+            .and_then(|v| v.first().copied())
+            .filter(|&a| a != x11rb::NONE)
+            .map(|a| self.top_level(a));
+        x11_focus_verdict(&chain, target, active_top, self.top_level(target))
     }
 
     /// Visible mapped windows above `target`'s top level, with their rects.
@@ -284,8 +301,9 @@ pub fn wait_readable(conn: &RustConnection, timeout: Duration) -> bool {
     unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
 }
 
-/// The refresh rate RandR reports, else an assumed 60 Hz (Xvfb's vsync is a
-/// fake 60 Hz timer; the source says which).
+/// The refresh rate RandR reports, else an assumed 60 Hz, marked as assumed
+/// (Xvfb has no vsync at all; KPIs counted in refresh intervals are then
+/// unknown).
 pub fn refresh() -> Refresh {
     if let Ok(d) = Display::open() {
         if d.has_extension("RANDR") {
@@ -301,10 +319,7 @@ pub fn refresh() -> Refresh {
             }
         }
     }
-    Refresh::from_hz(
-        60.0,
-        "assumed (RandR reports no rate; Xvfb's vsync is a fake 60 Hz timer)",
-    )
+    Refresh::assumed_60("RandR reports no refresh rate")
 }
 
 /// Every top-level client window (direct children of the root, and their
@@ -350,21 +365,23 @@ pub fn resolve(spec: &TargetSpec) -> Result<WindowHandle, String> {
                 .map(|(w, _)| WindowHandle(u64::from(w)))
                 .ok_or_else(|| format!("process {pid} has no viewable window with _NET_WM_PID"))
         }
-        TargetSpec::Title(t) => {
+        TargetSpec::Title { text, unique } => {
+            if text.trim().is_empty() {
+                return Err("an empty title would match every window".into());
+            }
             let net_name = d.atom("_NET_WM_NAME");
-            clients(&d)
+            let matches: Vec<(Window, u64)> = clients(&d)
                 .into_iter()
                 .filter(|&w| {
                     let titles = [
                         d.text_property(w, AtomEnum::WM_NAME.into()),
                         net_name.and_then(|a| d.text_property(w, a)),
                     ];
-                    titles.iter().flatten().any(|s| s.contains(t.as_str()))
+                    titles.iter().flatten().any(|s| s.contains(text.as_str()))
                 })
                 .filter_map(|w| viewable_area(&d, w).map(|a| (w, a)))
-                .max_by_key(|&(_, a)| a)
-                .map(|(w, _)| WindowHandle(u64::from(w)))
-                .ok_or_else(|| format!("no viewable window title contains {t:?}"))
+                .collect();
+            pick_by_title(&matches, text, *unique).map(|w| WindowHandle(u64::from(w)))
         }
     }
 }
@@ -437,8 +454,9 @@ impl WindowInspector for Inspector {
             t_ns,
             foreground: Some(self.d.is_foreground(self.target)),
             visible: Some(viewable),
-            // X11 has no cloaking; an unmapped window is `visible: false`.
-            cloaked: None,
+            // X11 has no cloaking: positively not cloaked (an unmapped window
+            // is `visible: false`).
+            cloaked: Some(false),
             minimized,
             occluded_fraction,
             occluders,

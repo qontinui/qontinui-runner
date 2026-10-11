@@ -17,29 +17,54 @@ name: termhost-bench probe
 #
 # Each job runs `doctor --json` first and writes it to the job summary, so an
 # INOPERATIVE mechanism is recorded with its reason rather than silently
-# skipped. The selftest gates every check whose mechanisms are OPERATIVE, plus
-# every mechanism named by `--require`:
+# skipped, and the selftest appends its own summary there (every check, gated
+# or not, and the mechanisms). The selftest gates every check unless a
+# mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE — an UNKNOWN one
+# (the doctor's proof got no frame) gates, so a probe regression turns the job
+# red instead of un-gating the checks — plus every mechanism named by
+# `--require`:
 #   - ubuntu: capture.x11, input.safe and clock.aligned are REQUIRED. Xvfb is a
 #     fully controlled X server, so an inoperative X11 path there is a defect in
 #     the instrument, never an environment limit — and without the requirement
 #     an inoperative mechanism would only un-gate its checks.
 #   - windows: clock.aligned is required (node ships on the image); the capture
-#     and input mechanisms are gated where the doctor finds them OPERATIVE, and
-#     recorded with their reasons where it does not — what a hosted Windows
+#     and input mechanisms are gated unless the doctor finds them INOPERATIVE,
+#     and recorded with their reasons where it does — what a hosted Windows
 #     session allows (Desktop Duplication in particular) is the image's to
-#     decide, not this repo's.
+#     decide, not this repo's. `--require` flags for it follow once a run has
+#     shown what the image supports.
 #
 # No schedule and no benchmark runs here: those are Phase 3.
 #
 # This file lives under `.github/workflows/`, so the PR that adds or edits it
 # needs `ci:gate-change=declared` (see ci-integrity.yml).
 
+# Paths: the probe, the contract it decodes, this file — and everything that
+# can change how the probe builds without touching it: the workspace manifest
+# and lock (a `windows` 0.61.x or x11rb bump), the toolchain pin, and the
+# sibling checkout action. Nothing else compiles the probe (ci.yml builds
+# src-tauri). The `push` to main runs the same paths so the cache saved
+# there (`save-if` below) exists for pull requests to restore.
 on:
   pull_request:
     paths:
       - "crates/termhost-probe/**"
       - "scripts/termhost-bench/**"
       - ".github/workflows/termhost-bench.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/checkout-sibling/**"
+  push:
+    branches: [main]
+    paths:
+      - "crates/termhost-probe/**"
+      - "scripts/termhost-bench/**"
+      - ".github/workflows/termhost-bench.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/checkout-sibling/**"
   workflow_dispatch:
 
 # `pull-requests: read` is required by ./.github/actions/checkout-sibling, which
@@ -120,7 +145,7 @@ jobs:
           xvfb-run -a -s "-screen 0 1280x1024x24"
           target/debug/termhost-probe selftest --json
           --require capture.x11 --require input.safe --require clock.aligned
-          --run-dir selftest-run
+          --run-dir selftest-run --summary-md "$GITHUB_STEP_SUMMARY"
 
       - name: Upload selftest records
         if: always()
@@ -183,7 +208,7 @@ jobs:
         run: >-
           target/debug/termhost-probe.exe selftest --json
           --require clock.aligned
-          --run-dir selftest-run
+          --run-dir selftest-run --summary-md "$GITHUB_STEP_SUMMARY"
 
       - name: Upload selftest records
         if: always()

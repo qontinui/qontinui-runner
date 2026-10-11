@@ -62,19 +62,29 @@ pub struct TargetArgs {
     /// The largest visible top-level window of this process.
     #[arg(long)]
     pub pid: Option<u32>,
-    /// The first visible top-level window whose title contains this.
-    #[arg(long)]
+    /// The largest visible top-level window whose title contains this text
+    /// (never empty). `inject` refuses a title that more than one window
+    /// matches.
+    #[arg(long, value_parser = parse_title)]
     pub title: Option<String>,
 }
 
 impl TargetArgs {
-    pub fn spec(&self) -> TargetSpec {
+    /// The target; `unique` makes a title match exactly one window.
+    pub fn spec(&self, unique: bool) -> TargetSpec {
         match (self.hwnd, self.pid, &self.title) {
             (Some(h), _, _) => TargetSpec::Handle(h),
             (_, Some(p), _) => TargetSpec::Pid(p),
-            (_, _, Some(t)) => TargetSpec::Title(t.clone()),
-            // clap's group guarantees one is set.
-            _ => TargetSpec::Title(String::new()),
+            (_, _, Some(t)) => TargetSpec::Title {
+                text: t.clone(),
+                unique,
+            },
+            // clap's group guarantees one is set; an empty title matches
+            // nothing (resolution refuses it).
+            _ => TargetSpec::Title {
+                text: String::new(),
+                unique: true,
+            },
         }
     }
 }
@@ -164,7 +174,8 @@ pub struct InjectArgs {
     /// How many keys (letters a-z, repeating).
     #[arg(long, default_value_t = 100, conflicts_with = "keys")]
     pub count: usize,
-    /// Exactly these characters (printable letters/digits only).
+    /// Exactly these characters: lowercase ASCII letters and digits, the set
+    /// every platform's injector can type with one key.
     #[arg(long)]
     pub keys: Option<String>,
     #[arg(long, default_value_t = 200)]
@@ -176,9 +187,14 @@ pub struct InjectArgs {
     /// Use this tag (0x-hex) instead of a fresh one (pass the same to `watch --tag`).
     #[arg(long, value_parser = parse_tag)]
     pub tag: Option<u32>,
-    /// Try once to make the target foreground before the first key.
+    /// Try once to make the target foreground before the first key (only
+    /// after the quiet period below).
     #[arg(long)]
     pub activate: bool,
+    /// Nobody may have used the desktop for this long before `inject` changes
+    /// focus or types anything; any real or foreign input refuses the arm.
+    #[arg(long, default_value_t = 2000)]
+    pub quiet_ms: u64,
     #[arg(long)]
     pub stdout: bool,
 }
@@ -191,9 +207,12 @@ impl InjectArgs {
                 if k.is_empty() {
                     return Err("--keys is empty".into());
                 }
-                if let Some(bad) = k.chars().find(|c| !c.is_ascii_alphanumeric()) {
+                if let Some(bad) = k
+                    .chars()
+                    .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
+                {
                     return Err(format!(
-                        "--keys may hold only ASCII letters and digits (got {bad:?})"
+                        "--keys may hold only lowercase ASCII letters and digits (got {bad:?})"
                     ));
                 }
                 Ok(k.chars().collect())
@@ -225,6 +244,10 @@ pub struct SelftestArgs {
     /// Keep the internal engines' records here.
     #[arg(long)]
     pub run_dir: Option<PathBuf>,
+    /// Also append a Markdown summary (every check, gated or not, and the
+    /// mechanisms) to this file — e.g. `$GITHUB_STEP_SUMMARY`.
+    #[arg(long)]
+    pub summary_md: Option<PathBuf>,
 }
 
 impl SelftestArgs {
@@ -259,6 +282,13 @@ fn parse_u64(s: &str) -> Result<u64, String> {
             .parse()
             .map_err(|e: std::num::ParseIntError| e.to_string()),
     }
+}
+
+fn parse_title(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("an empty title would match every window".into());
+    }
+    Ok(s.to_string())
 }
 
 fn parse_tag(s: &str) -> Result<u32, String> {
@@ -302,7 +332,7 @@ mod tests {
         let Cmd::Watch(w) = cli.cmd else {
             panic!("watch")
         };
-        assert_eq!(w.target.spec(), TargetSpec::Handle(0x1a2b));
+        assert_eq!(w.target.spec(false), TargetSpec::Handle(0x1a2b));
         assert_eq!(w.sources, vec![SourceArg::Wgc, SourceArg::Dda]);
         assert_eq!(w.host_pid, vec![4, 9]);
         assert_eq!(w.min_valid_intervals, 60);
@@ -342,7 +372,61 @@ mod tests {
         };
         assert!(i.key_list().is_err());
         assert!(parse_tag("0").is_err());
+        // Uppercase would need a modifier the injectors do not send.
+        let cli = Cli::try_parse_from([
+            "termhost-probe",
+            "inject",
+            "--run-dir",
+            "r",
+            "--pid",
+            "1",
+            "--keys",
+            "aB1",
+        ])
+        .expect("parses");
+        let Cmd::Inject(i) = cli.cmd else {
+            panic!("inject")
+        };
+        assert!(i.key_list().is_err());
         assert_eq!(parse_tag("0x7b4e0001"), Ok(0x7b4e_0001));
+    }
+
+    #[test]
+    fn an_empty_title_is_refused_and_inject_titles_must_be_unique() {
+        for title in ["", "   "] {
+            assert!(
+                Cli::try_parse_from([
+                    "termhost-probe",
+                    "inject",
+                    "--run-dir",
+                    "r",
+                    "--title",
+                    title
+                ])
+                .is_err(),
+                "{title:?}"
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "termhost-probe",
+            "inject",
+            "--run-dir",
+            "r",
+            "--title",
+            "Terminal",
+        ])
+        .expect("parses");
+        let Cmd::Inject(i) = cli.cmd else {
+            panic!("inject")
+        };
+        assert_eq!(
+            i.target.spec(true),
+            TargetSpec::Title {
+                text: "Terminal".into(),
+                unique: true
+            }
+        );
+        assert_eq!(i.quiet_ms, 2000);
     }
 
     #[test]

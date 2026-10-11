@@ -154,7 +154,8 @@ impl WgcSource {
                         t_ns,
                         view,
                         origin: (0, 0),
-                        missed: 0,
+                        // WGC drops frames silently: it cannot say how many.
+                        missed: None,
                         window_size: (w, h),
                     })
                 })

@@ -4,8 +4,12 @@
 //!
 //! On a window of its own, with the same engine `watch` runs:
 //!
-//! 1. the doctor's verdicts (every check below is GATED only when the
-//!    mechanisms it depends on are OPERATIVE, or `--require`d);
+//! 1. the doctor's verdicts. Every check below is GATED — its failure, or
+//!    its failure to run, fails the selftest — unless a mechanism it depends
+//!    on is INOPERATIVE-ON-THIS-MACHINE (a hard dependency is absent). An
+//!    UNKNOWN or DEGRADED mechanism gates: a probe regression that makes the
+//!    doctor's own capture proof fail must turn the selftest red, not quietly
+//!    un-gate the checks that would have caught it;
 //! 2. clock alignment with Node's `process.hrtime` (a pipe round trip);
 //! 3. the process sampler on the probe's own process;
 //! 4. each operative capture source sees a calibration marker;
@@ -37,7 +41,7 @@ use crate::model::{EmitSource, Emitted, FramesMode, ModelConfig, MonitorPresence
 use crate::platform::{
     Host, InputMonitor, KeyInjector, PaintSlot, Tagging, TestWindow, TestWindowOptions,
 };
-use crate::records::{CheckRecord, DoctorRecord, Record, Sink, SourceId};
+use crate::records::{CheckRecord, DoctorRecord, FileMode, Record, Sink, SourceId};
 use crate::sampler::{Sampler, SamplerConfig, GROUP_HOST};
 use crate::stats;
 
@@ -100,6 +104,8 @@ pub struct SelftestOutcome {
     pub checks: Vec<CheckRecord>,
     pub exit_code: i32,
     pub summary: Value,
+    /// The doctor's verdicts the checks were gated on.
+    pub doctor: DoctorRecord,
 }
 
 /// The mechanism a capture source depends on.
@@ -143,13 +149,16 @@ struct Selftest<'a> {
 }
 
 impl Selftest<'_> {
-    fn operative(&self, id: &str) -> bool {
-        doctor::state_of(&self.doctor, id) == State::Operative
+    /// Not ruled out on this machine: OPERATIVE, DEGRADED or UNKNOWN. Only an
+    /// INOPERATIVE-ON-THIS-MACHINE mechanism (a hard dependency absent) is
+    /// skipped and un-gates the checks that depend on it.
+    fn usable(&self, id: &str) -> bool {
+        doctor::state_of(&self.doctor, id) != State::Inoperative
     }
 
     fn deps_reason(&self, deps: &[&'static str]) -> String {
         deps.iter()
-            .filter(|d| !self.operative(d))
+            .filter(|d| !self.usable(d))
             .map(|d| {
                 let m = self.doctor.mechanisms.iter().find(|m| m.id == *d);
                 format!(
@@ -170,7 +179,7 @@ impl Selftest<'_> {
         detail: impl Into<String>,
         data: Value,
     ) {
-        let gated = deps.iter().all(|d| self.operative(d));
+        let gated = deps.iter().all(|d| self.usable(d));
         let mut detail = detail.into();
         if !gated {
             detail = format!("not gated — {}. {detail}", self.deps_reason(deps));
@@ -189,7 +198,8 @@ impl Selftest<'_> {
 
     fn sink_for(&self, file: &str) -> Sink {
         match &self.cfg.run_dir {
-            Some(dir) => Sink::to_file(&dir.join(file), false).unwrap_or_else(|_| Sink::discard()),
+            Some(dir) => Sink::create(&dir.join(file), false, FileMode::Truncate)
+                .unwrap_or_else(|_| Sink::discard()),
             None => Sink::discard(),
         }
     }
@@ -322,7 +332,7 @@ impl Selftest<'_> {
         let refresh_ms = refresh.ns as f64 / 1e6;
         let mut sources = Vec::new();
         for kind in self.host.source_kinds() {
-            if !self.operative(capture_mechanism(kind)) {
+            if !self.usable(capture_mechanism(kind)) {
                 continue;
             }
             match self.host.open_source(kind, handle) {
@@ -340,9 +350,7 @@ impl Selftest<'_> {
             }
         }
         let kinds: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
-        let primary = kinds.first().copied();
-        let secondary = (primary == Some(SourceId::Wgc) && kinds.contains(&SourceId::Dda))
-            .then_some(SourceId::Dda);
+        let (primary, secondary) = crate::watch::choose_sources(&kinds);
 
         let tagging = Tagging::new();
         let monitor: Result<InputMonitor, String> = self.host.input_monitor(&tagging);
@@ -362,6 +370,9 @@ impl Selftest<'_> {
             secondary,
             refresh.ns,
         );
+        mc.refresh_assumed = refresh.assumed;
+        mc.capture_available = primary.is_some();
+        mc.input_instrumented = true;
         mc.frames = FramesMode::Changes;
         mc.monitor = if monitor.is_ok() {
             MonitorPresence::Configured
@@ -400,7 +411,7 @@ impl Selftest<'_> {
                         k.as_str()
                     )
                 },
-                json!({ "refresh_ms": refresh_ms, "refresh_source": refresh.source }),
+                json!({ "refresh_ms": refresh_ms, "refresh_source": refresh.source, "refresh_assumed": refresh.assumed }),
             );
         }
 
@@ -412,12 +423,12 @@ impl Selftest<'_> {
                 &win,
                 &feed,
                 &kinds,
-                refresh.ns,
+                &refresh,
                 &mut seq,
                 &mut latency_markers,
             );
             if let Some(sec) = secondary {
-                self.crosscheck(&engine, primary, sec, &latency_markers, refresh.ns);
+                self.crosscheck(&engine, primary, sec, &latency_markers, &refresh);
             }
             self.hang_phase(&mut engine, &win, &feed, primary, &mut seq);
         } else {
@@ -431,7 +442,7 @@ impl Selftest<'_> {
         }
 
         if let Ok(mon) = &monitor {
-            if self.operative(doctor::INPUT_SAFE) && foreground {
+            if self.usable(doctor::INPUT_SAFE) && foreground {
                 self.input_phases(&mut engine, &win, &feed, mon, &tagging, primary);
             } else {
                 self.check(
@@ -439,7 +450,7 @@ impl Selftest<'_> {
                     &[doctor::INPUT_SAFE],
                     if foreground { None } else { Some(false) },
                     if foreground {
-                        "input.safe is not operative".to_string()
+                        "input.safe is INOPERATIVE-ON-THIS-MACHINE".to_string()
                     } else {
                         "the selftest window is not foreground, so D9 forbids injecting any key"
                             .to_string()
@@ -471,11 +482,19 @@ impl Selftest<'_> {
         win: &Arc<dyn TestWindow>,
         feed: &SharedFeed,
         kinds: &[SourceId],
-        refresh_ns: u64,
+        refresh: &crate::platform::Refresh,
         seq: &mut u64,
         all: &mut Vec<Marker>,
     ) {
-        let refresh_ms = refresh_ns as f64 / 1e6;
+        // The tolerance is one refresh interval. When the display reports no
+        // rate it is the assumed 60 Hz interval, and the check says so: a
+        // selftest tolerance, not a KPI.
+        let refresh_ms = refresh.ns as f64 / 1e6;
+        let tolerance = if refresh.assumed {
+            format!("{refresh_ms:.2} ms, ASSUMED: the display reports no refresh rate")
+        } else {
+            format!("one refresh interval, {refresh_ms:.2} ms")
+        };
         let period = self.cfg.marker_period_ms * MS;
         let k = self.cfg.markers_per_delay;
         for &d in &self.cfg.delays_ms.clone() {
@@ -535,7 +554,7 @@ impl Selftest<'_> {
                     &[capture_mechanism(kind)],
                     Some(ok),
                     format!(
-                        "delay {d} ms: observed {observed}/{k}, median {} ms, min {} ms, max {} ms; must be within one refresh interval ({refresh_ms:.2} ms) of {d} ms and never before the paint",
+                        "delay {d} ms: observed {observed}/{k}, median {} ms, min {} ms, max {} ms; must be within {tolerance} of {d} ms and never before the paint",
                         med.map_or("-".into(), |m| format!("{m:.2}")),
                         if observed > 0 { format!("{min:.2}") } else { "-".into() },
                         if observed > 0 { format!("{max:.2}") } else { "-".into() },
@@ -548,6 +567,7 @@ impl Selftest<'_> {
                         "min_ms": (observed > 0).then_some(min),
                         "max_ms": (observed > 0).then_some(max),
                         "refresh_ms": refresh_ms,
+                        "refresh_assumed": refresh.assumed,
                         "painter_late_max_ms": lateness.iter().copied().fold(0.0, f64::max),
                         "paint_errors": paint_errors,
                     }),
@@ -562,9 +582,19 @@ impl Selftest<'_> {
         primary: SourceId,
         secondary: SourceId,
         markers: &[Marker],
-        refresh_ns: u64,
+        refresh: &crate::platform::Refresh,
     ) {
-        let refresh_ms = refresh_ns as f64 / 1e6;
+        let refresh_ms = refresh.ns as f64 / 1e6;
+        if refresh.assumed {
+            self.check(
+                "capture_crosscheck",
+                &[capture_mechanism(primary), capture_mechanism(secondary)],
+                None,
+                "not performed: the display reports no refresh rate, so agreement within one refresh interval cannot be judged",
+                json!({ "refresh_assumed": true }),
+            );
+            return;
+        }
         let (mut compared, mut disagreed, mut coalesced) = (0u32, 0u32, 0u32);
         let mut max_abs: f64 = 0.0;
         for &m in markers {
@@ -574,7 +604,7 @@ impl Selftest<'_> {
             ) else {
                 continue;
             };
-            if q.missed > 0 && q.t_ns > p.t_ns {
+            if q.missed.is_some_and(|m| m > 0) && q.t_ns > p.t_ns {
                 coalesced += 1;
                 continue;
             }
@@ -943,8 +973,8 @@ pub fn run(host: &mut dyn Host, cfg: &SelftestConfig, out: &mut Sink) -> Selftes
         doctor::CAPTURE_X11,
     ]
     .iter()
-    .any(|m| st.operative(m));
-    if st.operative(doctor::SESSION_INTERACTIVE) || any_capture {
+    .any(|m| st.usable(m));
+    if st.usable(doctor::SESSION_INTERACTIVE) || any_capture {
         st.run_window_phases();
     } else {
         let why = st.deps_reason(&[doctor::SESSION_INTERACTIVE]);
@@ -963,6 +993,12 @@ pub fn run(host: &mut dyn Host, cfg: &SelftestConfig, out: &mut Sink) -> Selftes
         .filter(|c| c.passed != Some(true))
         .map(|c| c.check.clone())
         .collect();
+    let not_gated: Vec<String> = st
+        .checks
+        .iter()
+        .filter(|c| !c.gated)
+        .map(|c| c.check.clone())
+        .collect();
     let passed = gated.len() - failed.len();
     let exit_code = i32::from(!failed.is_empty());
     let mechanisms: serde_json::Map<String, Value> = st
@@ -978,6 +1014,7 @@ pub fn run(host: &mut dyn Host, cfg: &SelftestConfig, out: &mut Sink) -> Selftes
         "failed": failed.len(),
         "not_gated": st.checks.len() - gated.len(),
         "failed_checks": failed,
+        "not_gated_checks": not_gated,
         "exit_code": exit_code,
         "mechanisms": mechanisms,
         "codec": crate::spec::spec(),
@@ -987,7 +1024,50 @@ pub fn run(host: &mut dyn Host, cfg: &SelftestConfig, out: &mut Sink) -> Selftes
         checks: st.checks,
         exit_code,
         summary,
+        doctor: st.doctor,
     }
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// A Markdown rendering for a CI job summary: the verdict, every check
+/// (gated or not, with why), and the mechanisms the doctor found.
+pub fn render_markdown(o: &SelftestOutcome, title: &str) -> String {
+    let mut s = format!(
+        "### {}\n\n**{}** — {} gated check(s), {} failed; {} not gated (a mechanism they depend on is INOPERATIVE-ON-THIS-MACHINE).\n\n",
+        md_cell(title),
+        if o.exit_code == 0 { "PASS" } else { "FAIL" },
+        o.summary["gated"],
+        o.summary["failed"],
+        o.summary["not_gated"]
+    );
+    s.push_str("| check | gated | result | detail |\n|---|---|---|---|\n");
+    for c in &o.checks {
+        let result = match c.passed {
+            Some(true) => "pass",
+            Some(false) => "FAIL",
+            None => "could not run",
+        };
+        s.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            md_cell(&c.check),
+            if c.gated { "gated" } else { "not gated" },
+            result,
+            md_cell(&c.detail)
+        ));
+    }
+    s.push_str("\n| mechanism | state | reason |\n|---|---|---|\n");
+    for m in &o.doctor.mechanisms {
+        s.push_str(&format!(
+            "| {} | {} | {} |\n",
+            m.id,
+            m.state.as_str(),
+            md_cell(&m.reason)
+        ));
+    }
+    s
 }
 
 /// A human rendering of the checks (without `--json`).
@@ -1004,7 +1084,7 @@ pub fn render_human(o: &SelftestOutcome) -> String {
         s.push_str(&format!("  {tag}  {:<34} {}\n", c.check, c.detail));
     }
     s.push_str(&format!(
-        "\n{} gated check(s), {} failed — exit {}\n(lower-case = not gated: a mechanism it depends on is not OPERATIVE here)\n",
+        "\n{} gated check(s), {} failed — exit {}\n(lower-case = not gated: a mechanism it depends on is INOPERATIVE-ON-THIS-MACHINE)\n",
         o.summary["gated"], o.summary["failed"], o.exit_code
     ));
     s
