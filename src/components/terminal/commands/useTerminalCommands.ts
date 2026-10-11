@@ -1017,9 +1017,17 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // `useZoneLayout` rather than re-derived here for the obvious reason: a
       // second copy of the capacity rule would drift from the first, which is
       // the shape of this defect one level up.
-      const grown = computeAutoGrowLayoutId(normalized, tabs.length);
+      //
+      // `/layout` is an operator request, so in tmux mode it EXITS to the grid
+      // (`useZoneLayout::setLayoutId`) — the grid it lands in is a grid-mode
+      // one, and auto-grow is predicted for grid mode accordingly. Leaving the
+      // mode is itself a change, so it never reports the noop arm, and the
+      // detail says the mode was left rather than letting the swap to a grid
+      // pass as a plain preset change.
+      const leftTmux = zoneLayout.workMode === "tmux";
+      const grown = computeAutoGrowLayoutId(normalized, tabs.length, "grid");
       const effective = grown ?? normalized;
-      const wasAlready = zoneLayout.layoutId === effective;
+      const wasAlready = !leftTmux && zoneLayout.layoutId === effective;
       // The call is UNCONDITIONAL, and deliberately so. `setLayoutId`
       // delegates to `applyLayout`, which does three things besides writing
       // the id: it clears the maximized zone, re-flows unassigned tabs into
@@ -1031,13 +1039,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
-      zoneLayout.setLayoutId(normalized);
-      const detail =
+      zoneLayout.setLayoutId(normalized, { source: "operator" });
+      const layoutDetail =
         grown !== null
           ? `grew to ${grown} — ${tabs.length} sessions do not fit ${normalized}`
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
+      const detail = leftTmux ? `left tmux mode — ${layoutDetail}` : layoutDetail;
       return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
     },
   });
