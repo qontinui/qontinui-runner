@@ -1,10 +1,10 @@
 /**
  * Phase 5 — Per-zone hover controls.
  *
- * Five-button cluster pinned to a zone cell's top-right corner that
+ * Six-button cluster pinned to a zone cell's top-right corner that
  * fades in on cell hover (with a 150ms enter delay to avoid flicker on
  * mouse-pass-through). Buttons: maximize/restore, restart, label,
- * export, close.
+ * export, send-to-window, close (roster: `ZONE_HOVER_ACTIONS`).
  *
  * Wired DIRECTLY to context handlers (`zoneLayout.toggleMaximize`,
  * `transitionEffects.handleRestartInZone`, `labelsAndTags.setZoneLabel`,
@@ -15,10 +15,10 @@
  * latency + error-handling without changing the source of truth.
  *
  * State-gated restart (per plan's audit §"Per-action success criterion
- * checks" + `TransitionEffectsContext.tsx:44`): button is greyed +
- * tooltip switches when `sessionStates[tabId] ∉ {completed, error}` so
- * the affordance reflects the underlying handler's silent no-op gate
- * rather than appearing broken on a `working` session.
+ * checks"): button is greyed + tooltip switches when
+ * `sessionStates[tabId] ∉ {completed, error}`, or when the tab is remote, so
+ * the affordance reflects the handler's refusal (`handleRestartInZone`
+ * returns a typed `RestartOutcome`) rather than appearing broken.
  *
  * Coexists with `SuggestionChip` (Phase 4) in the same corner — both
  * render at `z-30`. When a chip is present its rule was specifically
@@ -43,6 +43,27 @@ import {
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
+import { REMOTE_RESTART_REFUSAL } from "./remoteParity";
+
+/**
+ * The action roster of this cluster — one id per top-level button, rendered as
+ * `data-zone-action` on that button. The local-vs-remote parity matrix
+ * (`remoteParity.ts`) is pinned against this roster, so a button added here
+ * without a matrix row fails `remoteParity.test.ts` (plan
+ * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+ * Phase C). The ids are affordances, not copy: a label rewording changes
+ * nothing here.
+ */
+export const ZONE_HOVER_ACTIONS = {
+  maximize: "zone.maximize",
+  restart: "zone.restart",
+  label: "zone.label",
+  export: "zone.export",
+  sendToWindow: "zone.send-to-window",
+  close: "zone.close",
+} as const;
+
+export type ZoneHoverActionId = (typeof ZONE_HOVER_ACTIONS)[keyof typeof ZONE_HOVER_ACTIONS];
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
@@ -57,7 +78,7 @@ type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
 export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProps) {
   const session = useTerminalSession();
-  const { zoneLayout, closeTerminal, sessionStates } = session;
+  const { zoneLayout, closeTerminal, sessionStates, tabs } = session;
   const transitionEffects = useTransitionEffects();
   const { labelsAndTags } = useZoneMetadata();
   const { ownerOf } = useWindowAssignments();
@@ -66,7 +87,13 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
   const tabId = zoneLayout.assignments[zoneIdx];
   const isMaximized = zoneLayout.maximizedZone === zoneIdx;
   const state = tabId ? sessionStates[tabId] ?? "idle" : "idle";
-  const canRestart = !!tabId && (state === "completed" || state === "error");
+  // A remote tab is never restartable from here: a restart spawns a LOCAL
+  // terminal in the zone and retires the tab, which for a remote pane only
+  // detaches it (the remote session keeps running) and leaves a local shell in
+  // its place. `handleRestartInZone` refuses it too; this greys the button and
+  // says why instead of offering a click that does nothing.
+  const isRemote = !!tabId && tabs.some((t) => t.id === tabId && t.remote != null);
+  const canRestart = !!tabId && !isRemote && (state === "completed" || state === "error");
   const hasTab = !!tabId;
 
   const [showExportMenu, setShowExportMenu] = useState(false);
@@ -234,6 +261,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
           className="p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60 transition-colors"
           title={isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"}
           aria-label={isMaximized ? "Restore zone" : "Maximize zone"}
+          data-zone-action={ZONE_HOVER_ACTIONS.maximize}
         >
           {isMaximized ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
         </button>
@@ -249,11 +277,14 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
               : "text-[#414868] cursor-not-allowed"
           }`}
           title={
-            canRestart
-              ? "Restart session (Ctrl+Shift+R)"
-              : `Restart available only when session is completed or errored (currently: ${state})`
+            isRemote
+              ? REMOTE_RESTART_REFUSAL
+              : canRestart
+                ? "Restart session (Ctrl+Shift+R)"
+                : `Restart available only when session is completed or errored (currently: ${state})`
           }
           aria-label="Restart session"
+          data-zone-action={ZONE_HOVER_ACTIONS.restart}
           aria-disabled={!canRestart}
         >
           <RefreshCw className="w-3 h-3" />
@@ -270,6 +301,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
           }`}
           title="Edit zone label"
           aria-label="Edit zone label"
+          data-zone-action={ZONE_HOVER_ACTIONS.label}
           aria-expanded={showLabelInput}
         >
           <Tag className="w-3 h-3" />
@@ -288,6 +320,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
             }`}
             title={onExportZone ? "Export zone output" : "Export not available"}
             aria-label="Export zone output"
+            data-zone-action={ZONE_HOVER_ACTIONS.export}
             aria-expanded={showExportMenu}
           >
             <Download className="w-3 h-3" />
@@ -298,6 +331,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
                 <button
                   key={format}
                   type="button"
+                  data-zone-submenu="export-format"
                   onClick={(e) => handleExport(e, format)}
                   className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
                 >
@@ -321,6 +355,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
             }`}
             title="Send this terminal to a window (or drag its header out)"
             aria-label="Send terminal to a window"
+            data-zone-action={ZONE_HOVER_ACTIONS.sendToWindow}
             aria-expanded={showWindowMenu}
           >
             <AppWindow className="w-3 h-3" />
@@ -329,6 +364,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
             <div className="absolute top-full right-0 mt-1 w-40 bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl z-50 overflow-hidden">
               <button
                 type="button"
+                data-zone-submenu="window-new"
                 onClick={handlePopOutNew}
                 className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
               >
@@ -340,6 +376,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
                   <button
                     key={w.label}
                     type="button"
+                    data-zone-submenu="window-target"
                     onClick={(e) => handleMoveTo(e, w.label)}
                     className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
                   >
@@ -361,6 +398,7 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
           className="p-1 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           title="Close session (Ctrl+Shift+W)"
           aria-label="Close session"
+          data-zone-action={ZONE_HOVER_ACTIONS.close}
         >
           <X className="w-3 h-3" />
         </button>
