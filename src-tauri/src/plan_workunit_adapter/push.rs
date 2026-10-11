@@ -355,13 +355,15 @@ pub struct TransitionBody {
 
 /// Build the `metadata` JSON pushed alongside the work-unit: the enrichment
 /// coord's old slug+status projection discarded — phase sub-units, dependency
-/// edges, the source-file back-link, and the plan's `area`.
+/// edges, the source-file back-link, the plan's `area` and its
+/// `initiative_item`.
 ///
 /// `area` is emitted only when the status block declares a kebab-case one
 /// ([`super::parser::extract_area`]); otherwise the KEY IS OMITTED, never sent
 /// as `null` or `""`. coord's upsert replaces `metadata` wholesale, so for a
 /// plan-backed unit the plan file is the single author of its area: a plan
-/// that declares none sends none.
+/// that declares none sends none. `initiative_item`
+/// ([`super::parser::extract_initiative_item`]) follows the identical rule.
 pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     let mut m = serde_json::json!({
         "depends_on": u.depends_on,
@@ -375,6 +377,9 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     if let Some(area) = &u.area {
         m["area"] = serde_json::Value::String(area.clone());
     }
+    if let Some(item) = &u.initiative_item {
+        m["initiative_item"] = serde_json::Value::String(item.clone());
+    }
     m
 }
 
@@ -385,10 +390,13 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
 ///   `metadata` replace (attestations are carried forward by coord).
 /// * NO phases detected: a scan that found none has no information about the
 ///   stored list, so sending `phases: []` would erase a good one (the
-///   2026-09-16 wipe). Send a `metadata_patch` that omits `phases`. `area` is
-///   sent as `null` when the plan declares none, which RFC 7396 reads as
-///   "delete the key" — preserving the plan-is-sole-author-of-area rule that
-///   the wholesale replace gave. `archive_path` is likewise sent as `null`, so
+///   2026-09-16 wipe). Send a `metadata_patch` that omits `phases`. `area` and
+///   `initiative_item` are each sent as `null` when the plan declares none,
+///   which RFC 7396 reads as "delete the key" — preserving the
+///   plan-is-sole-author rule that the wholesale replace gave. (So any OTHER
+///   writer of `metadata.initiative_item` — e.g. a `coord_work_unit_upsert`
+///   from `/chart` — is overwritten on the next scan; the plan header is the
+///   one author by design.) `archive_path` is likewise sent as `null`, so
 ///   a phase-less plan restored from the archive dir clears a stale one.
 ///
 ///   Accepted trade-off: a plan whose phases are removed on purpose (or whose
@@ -404,6 +412,8 @@ pub fn metadata_arms(u: &ParsedWorkUnit) -> (Option<serde_json::Value>, Option<s
     if let Some(obj) = patch.as_object_mut() {
         obj.remove("phases");
         obj.entry("area").or_insert(serde_json::Value::Null);
+        obj.entry("initiative_item")
+            .or_insert(serde_json::Value::Null);
         obj.insert("archive_path".to_string(), serde_json::Value::Null);
     }
     (None, Some(patch))
@@ -1101,14 +1111,16 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
 }
 
 /// The archive stamp as an RFC 7396 `metadata_patch`: `archive_path`, plus the
-/// plan's `area` — `null` (delete) when its status block declares none, so the
-/// plan file stays the sole author of `area`. A patch, never a wholesale
-/// `metadata` replace: a replace would drop the stored `phases`, `source_path`
-/// and `depends_on` of a plan found in the archive directory.
+/// plan's `area` and `initiative_item` — each `null` (delete) when its status
+/// block declares none, so the plan file stays the sole author of both. A
+/// patch, never a wholesale `metadata` replace: a replace would drop the stored
+/// `phases`, `source_path` and `depends_on` of a plan found in the archive
+/// directory.
 fn archive_metadata_patch(u: &ParsedWorkUnit) -> serde_json::Value {
     serde_json::json!({
         "archive_path": u.source_path,
         "area": u.area,
+        "initiative_item": u.initiative_item,
     })
 }
 
@@ -1526,6 +1538,8 @@ mod tests {
             depends_on: vec!["2026-01-01-dep".to_string()],
             area: None,
             area_rejected: None,
+            initiative_item: None,
+            initiative_item_rejected: None,
             phases: vec![ParsedPhase {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
@@ -1734,8 +1748,29 @@ mod tests {
         assert_eq!(m["source_path"], "plans/s.md");
     }
 
-    /// The archive stamp is a wholesale `metadata` replacement too, so it must
-    /// carry a declared area rather than erase it — and omit it when `None`.
+    /// `initiative_item` follows `area`'s rule exactly: present when the plan
+    /// declares one, the KEY absent — not `null`, not `""` — when it does not.
+    #[test]
+    fn build_metadata_initiative_item_present_when_some_absent_when_none() {
+        let with = ParsedWorkUnit {
+            initiative_item: Some("one-screen-project-state".to_string()),
+            ..unit("s", "vetted")
+        };
+        let m = build_metadata(&with);
+        assert_eq!(
+            m["initiative_item"],
+            serde_json::json!("one-screen-project-state")
+        );
+
+        let m = build_metadata(&unit("s", "vetted"));
+        assert!(
+            !m.as_object().unwrap().contains_key("initiative_item"),
+            "a None initiative_item must omit the key entirely: {m}"
+        );
+    }
+
+    /// The archive stamp is an RFC 7396 `metadata_patch`, so it must carry a
+    /// declared area rather than erase it — and send `null` when `None`.
     #[tokio::test]
     async fn archive_stamp_keeps_a_declared_area() {
         let sink = FakeSink::default();
@@ -1777,6 +1812,36 @@ mod tests {
         for k in ["phases", "source_path", "depends_on"] {
             assert!(!p.contains_key(k), "{k} must not be in the archive patch");
         }
+    }
+
+    /// The archive stamp must not erase a declared initiative item either.
+    #[tokio::test]
+    async fn archive_stamp_keeps_a_declared_initiative_item() {
+        let sink = FakeSink::default();
+        let u = ParsedWorkUnit {
+            initiative_item: Some("one-screen-project-state".to_string()),
+            ..unit("2026-01-01-archived", "shipped")
+        };
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
+        push_archive_metadata(
+            &sink,
+            &unit("2026-01-01-archived-2", "shipped"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
+
+        let ups = sink.upserts.lock().unwrap();
+        let first = ups[0].metadata_patch.as_ref().unwrap();
+        assert_eq!(
+            first["initiative_item"],
+            serde_json::json!("one-screen-project-state")
+        );
+        // Undeclared initiative item is an explicit null (RFC 7396 delete).
+        let second = ups[1].metadata_patch.as_ref().unwrap();
+        assert!(second["initiative_item"].is_null());
     }
 
     #[tokio::test]
@@ -2237,6 +2302,11 @@ mod tests {
                 assert_eq!(p["source_path"], "plans/s.md");
                 assert_eq!(p["depends_on"][0], "2026-01-01-dep");
                 assert!(p["area"].is_null());
+                assert!(
+                    p.as_object().unwrap().contains_key("initiative_item")
+                        && p["initiative_item"].is_null(),
+                    "an undeclared initiative item is an explicit null: {p}"
+                );
                 assert!(
                     p.as_object().unwrap().contains_key("archive_path")
                         && p["archive_path"].is_null(),

@@ -5655,6 +5655,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_primary_tree_branch_status",
+    // The one-screen project-state read (plan
+    // 2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen,
+    // Phase 3) — read-only; without it a runner-proxied session is refused it.
+    "coord_project_state",
     // Plan 2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously
     // Phase 4: the post-land re-verification lane's three coord tools. This one
     // is also covered by the `coord_query_` read-family prefix; it is named here
@@ -5708,6 +5712,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_work_unit_attest_phase",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
+    // Read-only; the project-state door's `row_count` is checked against it
+    // (same plan, Phase 1 acceptance (d)).
     "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
