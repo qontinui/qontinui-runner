@@ -12,14 +12,14 @@ import {
   structuredLaunchTitle,
   type CliAvailability,
   type LaunchMenuProfile,
-} from "./providerLaunchMenu";
+} from "./providerLaunchModel";
 
 /**
  * The Terminal page's provider launch menu: one row per served CLI profile,
  * each with its availability (plan
  * `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
  * Phase 6). The roster comes from the runner (`terminal_cli_profiles`), never
- * from this file; the row verdicts are `providerLaunchMenu.ts`'s. A row's
+ * from this file; the row verdicts are `providerLaunchModel.ts`'s. A row's
  * main button is the default, a PTY session; a provider whose structured lane
  * the runner implements also gets an explicit "structured" choice (plan Phase
  * 9) — a stream-json session in which a tool call the CLI's own permission
