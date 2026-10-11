@@ -441,7 +441,9 @@ async fn web_integration_status_bounded(
             return Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(api_error(format!(
-                    "invoke proxy: in-process invoke of '{}' did not answer within {}ms —                      the runner's own status read is blocked (settings read or the                      server-mode lock), not the webview",
+                    "invoke proxy: in-process invoke of '{}' did not answer within {}ms — \
+                     the runner's own status read is blocked (settings read or the \
+                     server-mode lock), not the webview",
                     COMMAND,
                     bound.as_millis()
                 ))),
@@ -1500,6 +1502,10 @@ mod in_process_dispatch_tests {
         let error = body.0.error.unwrap_or_default();
         assert!(error.contains("get_web_integration_status"), "{error}");
         assert!(error.contains("did not answer within 200ms"), "{error}");
+        assert!(
+            !error.contains("  "),
+            "the message must not carry whitespace runs from a lost line continuation: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1523,7 +1529,8 @@ mod in_process_dispatch_tests {
                     decide_invoke("get_web_integration_status", server_mode),
                     InvokeDecision::InProcess
                 ),
-                "get_web_integration_status must not depend on the webview                  (server_mode={server_mode})"
+                "get_web_integration_status must not depend on the webview \
+                 (server_mode={server_mode})"
             );
         }
     }

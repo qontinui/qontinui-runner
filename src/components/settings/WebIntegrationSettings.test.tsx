@@ -16,8 +16,28 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/** When set, the NEXT status invoke resolves with this value (once). */
+let nextStatusReply: unknown = null;
+
+const STATUS_B = {
+  enabled: true,
+  backendUrl: "https://api.example.test",
+  webBaseUrl: "",
+  runnerTokenMasked: "",
+  runnerId: "runner-b",
+  lastHeartbeatAt: null,
+  registrationError: null,
+  wsConnected: true,
+  settingsFault: null,
+};
+
 const invokeMock = vi.fn((command: string): Promise<unknown> => {
   if (command === "get_web_integration_status") {
+    if (nextStatusReply !== null) {
+      const reply = nextStatusReply;
+      nextStatusReply = null;
+      return Promise.resolve(reply);
+    }
     // Never settles — the wedged-webview shape.
     return new Promise<unknown>(() => {});
   }
@@ -46,6 +66,7 @@ describe("WebIntegrationSettings status load", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
     invokeMock.mockClear();
+    nextStatusReply = null;
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -57,6 +78,7 @@ describe("WebIntegrationSettings status load", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    vi.clearAllTimers();
     vi.useRealTimers();
   });
 
@@ -77,8 +99,11 @@ describe("WebIntegrationSettings status load", () => {
 
     const banner = container.querySelector("#banner-web-integration-status-error");
     expect(banner).not.toBeNull();
-    expect(banner?.textContent).toContain("get_web_integration_status");
-    expect(banner?.textContent).toContain("did not answer within 10s");
+    expect(banner?.textContent).toContain(
+      "get_web_integration_status failed: did not answer within 10s",
+    );
+    // The command is named once, by the banner — not repeated inside the error.
+    expect(banner?.textContent).not.toContain("get_web_integration_status did not answer");
 
     const retry = container.querySelector<HTMLButtonElement>("#web-integration-status-retry");
     expect(retry).not.toBeNull();
@@ -109,5 +134,31 @@ describe("WebIntegrationSettings status load", () => {
     expect(
       container.querySelector<HTMLButtonElement>("#web-integration-status-retry")?.textContent,
     ).toBe("Retry");
+  });
+
+  it("an older load timing out cannot overwrite a newer success", async () => {
+    // t=10 s: the initial load times out (banner up) and poll A starts; A
+    // never settles.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(container.querySelector("#banner-web-integration-status-error")).not.toBeNull();
+
+    // Retry B answers immediately with a connected status.
+    nextStatusReply = STATUS_B;
+    const retry = container.querySelector<HTMLButtonElement>("#web-integration-status-retry");
+    await act(async () => {
+      retry?.click();
+    });
+    expect(container.querySelector("#banner-web-integration-status-error")).toBeNull();
+    expect(container.textContent).toContain("runner-b");
+
+    // t=20 s: A's timeout fires AFTER B succeeded. It is stale and must not
+    // bring the error banner back over B's status.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(container.querySelector("#banner-web-integration-status-error")).toBeNull();
+    expect(container.textContent).toContain("runner-b");
   });
 });

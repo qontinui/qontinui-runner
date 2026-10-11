@@ -262,15 +262,16 @@ const STATUS_COMMAND = "get_web_integration_status";
 const STATUS_LOAD_TIMEOUT_MS = 10_000;
 
 /**
- * Race `invoke(command)` against a timeout. Rejects with an error naming the
- * command when it does not settle within `timeoutMs`; the timer is always
- * cleared so a settled invoke leaves nothing scheduled.
+ * Race `invoke(command)` against a timeout. Rejects with "did not answer
+ * within Ns" when it does not settle within `timeoutMs` (the caller renders
+ * the command name beside it); the timer is always cleared so a settled
+ * invoke leaves nothing scheduled.
  */
 async function invokeWithTimeout<T>(command: string, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(new Error(`${command} did not answer within ${Math.round(timeoutMs / 1000)}s`));
+      reject(new Error(`did not answer within ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs);
   });
   try {
@@ -378,23 +379,39 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     setWebBaseUrlError(null);
   }, []);
 
+  // Status loads overlap (the 10 s poll, the change event, Retry), and with a
+  // wedged IPC each one can take the full timeout. Only the LATEST call may
+  // write status/statusError, so an older call timing out cannot overwrite a
+  // newer success with a stale error.
+  const statusGenerationRef = useRef(0);
+  // Last error text sent to onLog, so a wedge polled every 10 s logs once.
+  const lastLoggedStatusErrorRef = useRef<string | null>(null);
+
   const refreshStatus = useCallback(async (): Promise<WebIntegrationStatus | null> => {
+    const generation = ++statusGenerationRef.current;
     try {
       const next = await invokeWithTimeout<WebIntegrationStatus>(
         STATUS_COMMAND,
         STATUS_LOAD_TIMEOUT_MS,
       );
+      if (generation !== statusGenerationRef.current) return next;
       setStatus(next);
       setStatusError(null);
+      lastLoggedStatusErrorRef.current = null;
       if (!seededRef.current) {
         applyStatusToForm(next);
         seededRef.current = true;
       }
       return next;
     } catch (err) {
-      console.error("Failed to load web integration status:", err);
-      onLog("error", `Failed to load web integration status: ${err}`);
-      setStatusError(describeThrown(err, "status load failed"));
+      if (generation !== statusGenerationRef.current) return null;
+      const message = describeThrown(err, "status load failed");
+      if (message !== lastLoggedStatusErrorRef.current) {
+        lastLoggedStatusErrorRef.current = message;
+        console.error("Failed to load web integration status:", err);
+        onLog("error", `Failed to load web integration status: ${STATUS_COMMAND} ${message}`);
+      }
+      setStatusError(message);
       return null;
     }
   }, [applyStatusToForm, onLog]);
@@ -1174,7 +1191,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               Could not load web integration status
             </div>
             <div className="text-muted-foreground break-all" title={statusError}>
-              <code className="font-mono">{STATUS_COMMAND}</code> did not answer:{" "}
+              <code className="font-mono">{STATUS_COMMAND}</code> failed:{" "}
               {truncate(statusError, 160)}
             </div>
             <div className="text-muted-foreground">
