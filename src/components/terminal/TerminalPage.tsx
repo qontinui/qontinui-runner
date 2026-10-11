@@ -62,7 +62,7 @@ import { useTerminalInitialization, runVerifiedResume } from "./useTerminalIniti
 import { SessionFailureBanner } from "./SessionFailureBanner";
 import { RestoreTerminalOnlyNote } from "./RestoreTerminalOnlyNote";
 import { dismissSessionFailure, useSessionFailures } from "./useSessionFailures";
-import { structuredLaunchCwd } from "./providerLaunchMenu";
+import { structuredLaunchCwd } from "./providerLaunchModel";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";

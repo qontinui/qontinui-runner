@@ -22,7 +22,7 @@
  * already allow asks the operator through a permission card.
  *
  * Kept free of React and Tauri so the runner's node-environment vitest can
- * cover it (`providerLaunchMenu.test.ts`).
+ * cover it (`providerLaunchModel.test.ts`).
  */
 
 /** The fields of a served `CliProfile` the menu reads. */

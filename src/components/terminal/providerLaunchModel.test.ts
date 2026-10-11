@@ -1,5 +1,5 @@
 /**
- * The provider launch menu's row verdicts (`providerLaunchMenu.ts`): every
+ * The provider launch menu's row verdicts (`providerLaunchModel.ts`): every
  * served profile is listed, an absent CLI is disabled with its install
  * command, and a probe that could not decide reads UNKNOWN, never absent.
  */
@@ -16,7 +16,7 @@ import {
   structuredLaunchOffer,
   type CliAvailability,
   type LaunchMenuProfile,
-} from "./providerLaunchMenu";
+} from "./providerLaunchModel";
 
 const profiles = served as LaunchMenuProfile[];
 const codex = (): LaunchMenuProfile => {
