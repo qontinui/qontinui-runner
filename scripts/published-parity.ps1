@@ -468,6 +468,16 @@ function Start-ParityRunner {
         # real path -- which $pgDir always does, having just been created.
         "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
     }
+    # WEBVIEW2_USER_DATA_FOLDER isolates nothing on Linux: WebKitGTK and every
+    # dirs::data_local_dir()/cache_dir() path resolve under XDG, so each leg gets
+    # its own data and cache homes there. Identical for both legs, like the rest
+    # of this table.
+    if ($ParityPlatform -eq 'linux') {
+        $toSet["XDG_DATA_HOME"] = (Join-Path $tmpRoot "xdg-data")
+        $toSet["XDG_CACHE_HOME"] = (Join-Path $tmpRoot "xdg-cache")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_DATA_HOME"]  | Out-Null
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CACHE_HOME"] | Out-Null
+    }
     if ($EnvOverrides) {
         foreach ($k in $EnvOverrides.Keys) { $toSet[$k] = $EnvOverrides[$k] }
     }

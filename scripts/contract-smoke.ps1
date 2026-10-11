@@ -630,6 +630,12 @@ function Start-DirectRunner {
     New-Item -ItemType Directory -Force -Path $configDir  | Out-Null
     New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
     New-Item -ItemType Directory -Force -Path $logDir     | Out-Null
+    # Per-leg embedded-PostgreSQL root: without it the runner provisions or
+    # ATTACHES to the machine-shared cluster under dirs::data_local_dir(), and a
+    # second leg on the same box would read the first leg's database --
+    # published-parity.ps1's Start-ParityRunner records the measured incident.
+    $pgDir = Join-Path $tmpRoot "embedded-pg"
+    New-Item -ItemType Directory -Force -Path $pgDir      | Out-Null
 
     # Capture the runner's own stdout/stderr so an early hard-exit isn't a
     # black box. Start-Process needs distinct files for each stream.
@@ -655,6 +661,16 @@ function Start-DirectRunner {
         # log lands in %LOCALAPPDATA%\qontinui-runner\dev-logs -- outside the
         # temp dir we dump on failure -- so the crash cause stays invisible.
         "QONTINUI_RUNNER_LOG_DIR"     = $logDir
+        "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
+    }
+    # WEBVIEW2_USER_DATA_FOLDER isolates nothing on Linux: WebKitGTK and every
+    # dirs::data_local_dir()/cache_dir() path resolve under XDG, so each leg
+    # gets its own data and cache homes there.
+    if ($IsLinux) {
+        $toSet["XDG_DATA_HOME"] = (Join-Path $tmpRoot "xdg-data")
+        $toSet["XDG_CACHE_HOME"] = (Join-Path $tmpRoot "xdg-cache")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_DATA_HOME"]  | Out-Null
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CACHE_HOME"] | Out-Null
     }
     foreach ($k in $toSet.Keys) {
         $prev[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
@@ -723,6 +739,10 @@ function Stop-ProcessTree {
                 ConvertFrom-ParityProcStat -Line $line
             } |
             Where-Object { $null -ne $_ })
+        if ($all.Count -eq 0) {
+            Write-Host "  WARNING: read no processes from /proc -- the runner tree (root pid $RootPid) was NOT stopped."
+            return 0
+        }
     } else {
         $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
             Select-Object ProcessId, ParentProcessId, Name, CreationDate)
@@ -970,8 +990,10 @@ if ($DirectExe) {
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         # Stop the process FIRST so its redirected stdout/stderr handles are
         # released and fully flushed before we read them back.
+        # The whole tree, not just the root: an orphaned WebView/WebKit child
+        # would otherwise outlive this leg into the next one.
         if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
-            try { Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
+            try { $null = Stop-ProcessTree -RootPid $directRunner.Process.Id } catch { }
         }
         # Dump captured output + any panic/log files so the failure (early-exit
         # OR ready-timeout) is diagnosable in CI logs instead of a bare

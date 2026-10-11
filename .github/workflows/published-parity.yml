@@ -887,6 +887,9 @@ jobs:
       # (unlike a plain `success()`/no-condition step) -- so even the
       # cancel-the-job reading still lets this job report.
       - name: Behavioural axis — diff the two pass/fail sets
+        # always(): an earlier failed step must still leave its UNKNOWN line in
+        # the summary rather than no line at all.
+        if: always()
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -1268,7 +1271,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1             -DirectExe target/debug/qontinui-runner             -Profile ci             -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-dev.log
+          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1 \
+            -DirectExe target/debug/qontinui-runner \
+            -Profile ci \
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-dev.log
 
       - name: Contract smoke -- published build
         id: smoke_published
@@ -1281,7 +1287,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1             -UseInstalledExe -InstallRoot "$PREFIX"             -Profile ci             -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-published.log
+          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1 \
+            -UseInstalledExe -InstallRoot "$PREFIX" \
+            -Profile ci \
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-published.log
 
       # The same diff the Windows job runs. always(): a leg that wrote no probe
       # lines (or never ran) is stated as UNKNOWN in the summary, never as
