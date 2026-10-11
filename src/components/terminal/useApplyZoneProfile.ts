@@ -101,9 +101,10 @@ export function useApplyZoneProfile(
     te.setAutoApprovePatterns(profile.autoApprovePatterns);
 
     // EVERY apply — a layout-only one included — supersedes any earlier apply
-    // still awaiting below: the earlier call must not park its sessions (or
-    // spawn its panes) into this profile's grid. Sessions an earlier apply
-    // parked but never typed are dropped for the same reason.
+    // still awaiting below: the earlier call parks no more sessions and
+    // spawns no further panes into this profile's grid (a pane whose spawn
+    // was already in flight still opens, blank, with nothing typed into it).
+    // Sessions an earlier apply parked but never typed are dropped too.
     const generation = ++generationRef.current;
     pendingRef.current = null;
 
@@ -129,7 +130,9 @@ export function useApplyZoneProfile(
     // session would park bound to a dead tab and never resume).
     for (const step of planProfileTabs(
       sessions,
-      latest.current.tabs.map((t) => t.id),
+      // Terminal panes only: a plan (markdown) tab has no PTY, so a resume
+      // "typed" into it would be silently lost.
+      latest.current.tabs.filter((t) => t.type !== "plan").map((t) => t.id),
     )) {
       let tabId: string | null | undefined = step.reuseTabId;
       if (!tabId) {

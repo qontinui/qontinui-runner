@@ -385,11 +385,17 @@ fn resume_line_for(config_dir: Option<&str>, session_id: &str, windows: bool) ->
 /// `;` on Windows, whose runner panes are Windows PowerShell 5.1 — which has
 /// no `&&` at all.
 ///
-/// `None` when the dir cannot sit inside single quotes safely (a `'` would
-/// close them and run the rest of the name as commands; a control character
-/// would end the line) — no line beats a broken one.
+/// `None` when the dir cannot sit inside single quotes safely (a `'` — or, for
+/// PowerShell, a typographic single quote — would close them and run the rest
+/// of the name as commands; a control character would end the line) — no line
+/// beats a broken one.
 pub(crate) fn cd_then_resume(working_dir: &str, resume: &str, windows: bool) -> Option<String> {
-    if working_dir.contains('\'') || working_dir.chars().any(char::is_control) {
+    // PowerShell also closes a single-quoted string at the typographic single
+    // quotes U+2018..=U+201B, so those are as unsafe as `'` itself.
+    if working_dir
+        .chars()
+        .any(|c| c == '\'' || ('\u{2018}'..='\u{201B}').contains(&c) || c.is_control())
+    {
         return None;
     }
     Some(if windows {
@@ -871,6 +877,13 @@ mod tests {
                 "a quote in the project dir must not break out of the cd"
             );
             assert_eq!(cd_then_resume("/x\ny", "R", windows), None);
+            for curly in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+                assert_eq!(
+                    cd_then_resume(&format!("C:/Users/Jo{curly}s work"), "R", windows),
+                    None,
+                    "PowerShell closes a single-quoted string at {curly:?}"
+                );
+            }
         }
     }
 
