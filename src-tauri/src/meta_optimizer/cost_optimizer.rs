@@ -424,7 +424,7 @@ impl AgentCostStats {
 /// Query per-agent token/cost averages over the last 30 days (non-zero tokens only).
 fn query_agent_cost_stats(pg_db: &Arc<PgDb>) -> Result<Vec<AgentCostStats>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    let tuples = tokio::task::block_in_place(|| {
+    let tuples = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.query_agent_cost_stats(&since))
     })?;
     Ok(tuples
@@ -447,7 +447,7 @@ fn query_agent_cost_stats(pg_db: &Arc<PgDb>) -> Result<Vec<AgentCostStats>, Stri
 /// Query agents that have traces but zero tokens (instrumentation gap).
 fn query_zero_token_agents(pg_db: &Arc<PgDb>) -> Result<Vec<(String, i64)>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.query_zero_token_agents(&since))
     })
 }
@@ -458,7 +458,7 @@ fn query_zero_token_agents(pg_db: &Arc<PgDb>) -> Result<Vec<(String, i64)>, Stri
 /// provider. Returns (agent_type, cli_runs, total_runs, avg_cli_cost, avg_api_cost).
 fn query_cli_heavy_agents(pg_db: &Arc<PgDb>) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.query_cli_heavy_agents(&since))
     })
 }
@@ -469,9 +469,10 @@ fn compute_cost_trend(pg_db: &Arc<PgDb>) -> Result<String, String> {
     let mid = (now - chrono::Duration::days(15)).to_rfc3339();
     let start = (now - chrono::Duration::days(30)).to_rfc3339();
 
-    let (recent_cost, previous_cost) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(pg_db.compute_cost_trend(&mid, &start))
-    })?;
+    let (recent_cost, previous_cost) =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.compute_cost_trend(&mid, &start))
+        })?;
 
     if previous_cost == 0.0 && recent_cost == 0.0 {
         Ok("no_data".to_string())
@@ -840,7 +841,7 @@ pub fn detect_model_downgrade_opportunities(pg_db: &Arc<PgDb>) -> Vec<Recommenda
     let has_recent = |title: &str| recent_titles.iter().any(|t| t == title);
 
     // Load Q-routing table entries: (state_key, action, q_value, visit_count)
-    let q_entries = match tokio::task::block_in_place(|| {
+    let q_entries = match qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.get_all_q_entries())
     }) {
         Ok(entries) => entries,
@@ -998,7 +999,7 @@ struct PhaseCacheStats {
 )]
 fn query_phase_cache_stats(pg_db: &Arc<PgDb>) -> Result<Vec<PhaseCacheStats>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             let conn = pg_db
                 .pool()
@@ -1054,7 +1055,7 @@ struct PhaseModelTokenStats {
 )]
 fn query_phase_model_token_stats(pg_db: &Arc<PgDb>) -> Result<Vec<PhaseModelTokenStats>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             let conn = pg_db
                 .pool()

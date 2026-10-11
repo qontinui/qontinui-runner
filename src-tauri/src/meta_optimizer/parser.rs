@@ -452,7 +452,7 @@ fn is_duplicate_recommendation(
         return true;
     }
     // Fallback: title match for rejected recs (rejected can't be re-created with same title)
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.count_rejected_by_title(title))
     })
     .map(|c| c > 0)
@@ -1034,11 +1034,12 @@ pub fn save_parsed_recommendations(
 ///   (more conservative since config changes affect global behavior).
 pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&str>) {
     // Auto-reject findings — they are diagnostic observations, not actionable changes
-    let findings_rejected: i64 = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(pg_db.reject_finding_recommendations(optimizer_run_id))
-    })
-    .unwrap_or(0);
+    let findings_rejected: i64 =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current()
+                .block_on(pg_db.reject_finding_recommendations(optimizer_run_id))
+        })
+        .unwrap_or(0);
 
     if findings_rejected > 0 {
         info!(
@@ -1048,14 +1049,15 @@ pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&s
     }
 
     // Auto-apply rule changes (safest, most reversible)
-    let rule_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
-            &["rule_create", "rule_update"],
-            0.85,
-            optimizer_run_id,
-        ))
-    })
-    .unwrap_or_default();
+    let rule_candidates: Vec<(String, f64)> =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
+                &["rule_create", "rule_update"],
+                0.85,
+                optimizer_run_id,
+            ))
+        })
+        .unwrap_or_default();
 
     for (rec_id, confidence) in &rule_candidates {
         match super::recommendations::apply_recommendation_with_side_effects(pg_db, rec_id) {
@@ -1082,14 +1084,15 @@ pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&s
     // Auto-canary prompt rewrites with high confidence (>= 0.85)
     // These are started as canary rollouts at 20% rather than applied directly,
     // since prompt changes have broader impact and benefit from A/B evaluation.
-    let prompt_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
-            &["prompt_rewrite"],
-            0.75,
-            optimizer_run_id,
-        ))
-    })
-    .unwrap_or_default();
+    let prompt_candidates: Vec<(String, f64)> =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
+                &["prompt_rewrite"],
+                0.75,
+                optimizer_run_id,
+            ))
+        })
+        .unwrap_or_default();
 
     for (rec_id, confidence) in &prompt_candidates {
         match super::canary::start_canary(pg_db, rec_id, 20) {
@@ -1117,14 +1120,15 @@ pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&s
 
     // Auto-canary config changes with high confidence (>= 0.85) at conservative 10% rollout.
     // Config changes affect global behavior, so use lower rollout than prompt rewrites.
-    let config_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
-            &["config_change"],
-            0.75,
-            optimizer_run_id,
-        ))
-    })
-    .unwrap_or_default();
+    let config_candidates: Vec<(String, f64)> =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
+                &["config_change"],
+                0.75,
+                optimizer_run_id,
+            ))
+        })
+        .unwrap_or_default();
 
     for (rec_id, confidence) in &config_candidates {
         match super::canary::start_canary(pg_db, rec_id, 10) {
@@ -1162,7 +1166,7 @@ fn save_rule_examples(pg_db: &Arc<PgDb>, examples: &[ParsedRuleExample]) {
 
         let result: Result<(), String> = (|| {
             // Check rule exists
-            let exists = tokio::task::block_in_place(|| {
+            let exists = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 Handle::current().block_on(pg_db.rule_exists(rule_id))
             })?;
 
@@ -1189,9 +1193,10 @@ fn save_rule_examples(pg_db: &Arc<PgDb>, examples: &[ParsedRuleExample]) {
             }
 
             // Merge with existing examples (if any), capping at 4 total
-            let existing_json = tokio::task::block_in_place(|| {
-                Handle::current().block_on(pg_db.get_rule_examples_json(rule_id))
-            })?;
+            let existing_json =
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+                    Handle::current().block_on(pg_db.get_rule_examples_json(rule_id))
+                })?;
 
             let mut all_examples: Vec<serde_json::Value> = existing_json
                 .and_then(|j| serde_json::from_str(&j).ok())
@@ -1203,7 +1208,7 @@ fn save_rule_examples(pg_db: &Arc<PgDb>, examples: &[ParsedRuleExample]) {
             let merged_json = serde_json::to_string(&all_examples)
                 .map_err(|e| format!("JSON serialization error: {}", e))?;
 
-            tokio::task::block_in_place(|| {
+            qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 Handle::current().block_on(pg_db.update_rule_examples(rule_id, &merged_json))
             })?;
 

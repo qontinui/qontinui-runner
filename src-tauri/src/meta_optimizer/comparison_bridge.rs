@@ -45,7 +45,7 @@ pub fn comparison_to_recommendation(
     let comp_id = comparison_id.to_string();
 
     let (entries_json, report, status, workflow_name, variation_type) =
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             tokio::runtime::Handle::current()
                 .block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
         })?
@@ -242,7 +242,7 @@ pub fn build_validation_comparison(
     recommendation_id: &str,
 ) -> Result<Option<crate::comparison::ComparisonConfig>, String> {
     // Look up the recommendation from PG
-    let rec = tokio::task::block_in_place(|| {
+    let rec = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.get_recommendation(recommendation_id))
     })?
     .ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))?;
@@ -300,11 +300,12 @@ pub fn build_validation_comparison(
     }
 
     // Find a recent workflow to use as benchmark
-    let workflow_id: Option<String> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(pg_db.get_most_recent_workflow_id())
-    })
-    .ok()
-    .flatten();
+    let workflow_id: Option<String> =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.get_most_recent_workflow_id())
+        })
+        .ok()
+        .flatten();
 
     let workflow_id = match workflow_id {
         Some(id) => id,

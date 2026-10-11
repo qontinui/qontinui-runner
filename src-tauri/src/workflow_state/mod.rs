@@ -227,7 +227,7 @@ impl<S: WorkflowState> StateMachine<S> {
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| {
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                     handle.block_on(async move {
                         pg.save_workflow_execution_state(
                             &exec_id,
@@ -264,7 +264,7 @@ impl<S: WorkflowState> StateMachine<S> {
             let eid = execution_id.to_string();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio::task::block_in_place(|| {
+                    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                         handle.block_on(async move { pg.get_workflow_execution_state(&eid).await })
                     })
                 }));

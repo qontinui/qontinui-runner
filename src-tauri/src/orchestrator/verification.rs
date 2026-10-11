@@ -299,7 +299,7 @@ impl DeterministicVerifier {
         let sid = script_id.to_string();
         let test_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| {
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                     handle.block_on(async move { pg.get_verification_test(&sid).await })
                 })
             }))

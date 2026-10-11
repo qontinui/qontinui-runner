@@ -34,7 +34,7 @@ pub fn compute_content_hash(
 /// Check if a recommendation with the same content hash already exists
 /// in a non-terminal state (pending, canary, applied).
 pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.is_content_duplicate(content_hash))
     })
     .unwrap_or(false)
@@ -119,7 +119,7 @@ pub fn create_recommendation(
         eval_status: None,
     };
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.create_recommendation(
             &rec.id,
             optimizer_type,
@@ -146,7 +146,7 @@ pub fn list_recommendations(
     optimizer_type: Option<&str>,
     status: Option<&str>,
 ) -> Result<Vec<Recommendation>, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.list_recommendations(optimizer_type, status))
     })
 }
@@ -165,7 +165,7 @@ pub async fn list_recommendations_async(
 /// Apply a recommendation (updates status to 'applied').
 /// This is the simple status-only flip — prefer `apply_recommendation_with_side_effects`.
 pub fn apply_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "applied"))
     })?;
     info!("Applied recommendation {}", recommendation_id);
@@ -177,7 +177,7 @@ fn get_recommendation(
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Recommendation, String> {
-    let result = tokio::task::block_in_place(|| {
+    let result = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.get_recommendation(recommendation_id))
     })?;
     result.ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))
@@ -383,9 +383,10 @@ pub fn apply_recommendation_with_side_effects(
     recommendation_id: &str,
 ) -> Result<(), String> {
     let id = recommendation_id.to_string();
-    let rec =
-        tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_recommendation(&id)))?
-            .ok_or_else(|| format!("Recommendation not found: {}", id))?;
+    let rec = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.get_recommendation(&id))
+    })?
+    .ok_or_else(|| format!("Recommendation not found: {}", id))?;
 
     if rec.status != "pending" && rec.status != "canary" {
         return Err(format!(
@@ -413,7 +414,7 @@ pub fn apply_recommendation_with_side_effects(
     }
 
     // Side-effect succeeded — now flip the status via PG
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.apply_recommendation_with_timestamp(&id))
     })?;
 
@@ -466,7 +467,7 @@ fn apply_config_change(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(),
         .map_err(|e| format!("Invalid config_change payload: {}", e))?;
 
     // Config changes now go through PG settings
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.set_setting(&payload.key, &payload.value))
     })?;
 
@@ -489,7 +490,7 @@ fn apply_rule_create(
 
     let rule_number = match payload.rule_number {
         Some(n) => n,
-        None => tokio::task::block_in_place(|| {
+        None => qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             Handle::current().block_on(pg_db.next_rule_number(&payload.agent, &payload.section))
         })?,
     };
@@ -507,8 +508,9 @@ fn apply_rule_create(
         examples_json: payload.examples_json.clone(),
     };
 
-    let rule =
-        tokio::task::block_in_place(|| Handle::current().block_on(pg_db.insert_rule(&input)))?;
+    let rule = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.insert_rule(&input))
+    })?;
     info!(
         "Applied rule_create recommendation {}: created rule {}",
         rec_id, rule.id
@@ -534,7 +536,7 @@ fn apply_rule_update(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), S
         examples_json: payload.examples_json,
     };
 
-    let rule = tokio::task::block_in_place(|| {
+    let rule = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.update_rule(&rule_id, &input))
     })?;
     info!(
@@ -546,7 +548,7 @@ fn apply_rule_update(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), S
 
 /// Reject a recommendation.
 pub fn reject_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current()
             .block_on(pg_db.update_recommendation_status(recommendation_id, "rejected"))
     })?;
@@ -574,7 +576,7 @@ pub async fn reject_recommendation_async(
 /// (they represent active rollouts or already-applied changes). Also backfills
 /// content_hash for older rows that lack it.
 pub fn dedup_pending_recommendations(pg_db: &Arc<PgDb>) -> usize {
-    let superseded = tokio::task::block_in_place(|| {
+    let superseded = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(async {
             let conn = pg_db
                 .pool()
@@ -769,7 +771,7 @@ pub fn rollback_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Re
     }
 
     // Flip the status to rolled_back
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current()
             .block_on(pg_db.update_recommendation_status(recommendation_id, "rolled_back"))
     })?;
@@ -793,7 +795,7 @@ fn rollback_rule(
     let target_rule_id = if let Some(id) = rule_id_from_payload {
         id
     } else {
-        tokio::task::block_in_place(|| {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
             Handle::current().block_on(pg_db.find_rule_by_source_fix_id(recommendation_id))
         })?
         .ok_or_else(|| {
@@ -814,7 +816,7 @@ fn rollback_rule(
         examples_json: None,
     };
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.update_rule(&target_rule_id, &input))
     })?;
     info!("Rollback: disabled rule {}", target_rule_id);
@@ -826,7 +828,7 @@ fn rollback_config_change(pg_db: &Arc<PgDb>, current_value: &str) -> Result<(), 
     let payload: ConfigChangePayload = serde_json::from_str(current_value)
         .map_err(|e| format!("Invalid current_value payload for config rollback: {}", e))?;
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.set_setting(&payload.key, &payload.value))
     })?;
     info!(
@@ -845,7 +847,7 @@ pub fn create_optimizer_run(
     trigger_type: &str,
     task_run_id: Option<&str>,
 ) -> Result<String, String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.create_optimizer_run(
             optimizer_type,
             trigger_type,
@@ -861,7 +863,7 @@ pub fn complete_optimizer_run(
     runs_analyzed: i64,
     recommendations_produced: i64,
 ) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.complete_optimizer_run(
             run_id,
             runs_analyzed,
@@ -872,7 +874,9 @@ pub fn complete_optimizer_run(
 
 /// List optimizer runs.
 pub fn list_optimizer_runs(pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
-    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.list_optimizer_runs()))
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+        Handle::current().block_on(pg_db.list_optimizer_runs())
+    })
 }
 
 /// Async variant of [`list_optimizer_runs`].
@@ -901,7 +905,7 @@ pub fn auto_evaluate_with_agentic_scores(pg_db: &Arc<PgDb>) {
 
         // Query pre/post agentic scores from PG (learning_outcomes is also in PG)
         let result: Result<Option<(String, f64)>, String> = (|| {
-            let eval = tokio::task::block_in_place(|| {
+            let eval = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                 Handle::current().block_on(pg_db.get_agentic_score_evaluation(&applied_at))
             })?;
 
@@ -927,7 +931,7 @@ pub fn auto_evaluate_with_agentic_scores(pg_db: &Arc<PgDb>) {
                         "evaluated_by": "agentic_metrics",
                     });
 
-                    tokio::task::block_in_place(|| {
+                    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                         Handle::current().block_on(
                             pg_db.update_recommendation_outcome_json(&rec.id, &outcome.to_string()),
                         )

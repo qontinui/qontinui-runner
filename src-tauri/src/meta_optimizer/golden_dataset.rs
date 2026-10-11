@@ -61,7 +61,7 @@ pub fn save_golden_dataset(pg_db: &Arc<PgDb>, dataset: &GoldenDataset) -> Result
         .map_err(|e| format!("Failed to serialize entries: {}", e))?;
     let entry_count = dataset.entries.len() as i64;
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.save_golden_dataset(
             &id,
             &agent_type,
@@ -79,7 +79,7 @@ pub fn list_golden_datasets(
     pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<GoldenDataset>, String> {
-    let tuples = tokio::task::block_in_place(|| {
+    let tuples = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.list_golden_datasets(agent_type))
     })?;
     let datasets: Vec<GoldenDataset> = tuples
@@ -104,7 +104,7 @@ pub fn list_golden_datasets(
 
 /// Delete a golden dataset.
 pub fn delete_golden_dataset(pg_db: &Arc<PgDb>, dataset_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.delete_golden_dataset(dataset_id))
     })
 }
@@ -120,7 +120,7 @@ pub fn build_from_history(
 ) -> Result<GoldenDataset, String> {
     let limit = max_entries as i64;
 
-    let raw_entries = tokio::task::block_in_place(|| {
+    let raw_entries = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         Handle::current().block_on(pg_db.build_golden_entries_from_history(agent_type, limit))
     })?;
 

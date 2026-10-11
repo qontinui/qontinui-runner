@@ -631,12 +631,13 @@ impl SessionOpenWatch {
     pub async fn run(mut self, input_slots: impl Fn() -> Option<PtyInputSlots>) -> Verdict {
         loop {
             let mut tails = std::mem::take(&mut self.tails);
-            let Ok((tails, lines)) = tokio::task::spawn_blocking(move || {
-                let lines: Vec<String> =
-                    tails.iter_mut().flat_map(|t| t.read_new_lines()).collect();
-                (tails, lines)
-            })
-            .await
+            let Ok((tails, lines)) =
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    let lines: Vec<String> =
+                        tails.iter_mut().flat_map(|t| t.read_new_lines()).collect();
+                    (tails, lines)
+                })
+                .await
             else {
                 lock_state(&self.timing).ending = true;
                 return Verdict::Undecided;
@@ -883,13 +884,14 @@ pub fn spawn_watch(
         // conversation instead.
         None => {
             tokio::spawn(async move {
-                let Ok(watch) = tokio::task::spawn_blocking(move || {
-                    build(
-                        super::transcript::find_claude_config_dirs(),
-                        TailStart::RecentTail,
-                    )
-                })
-                .await
+                let Ok(watch) =
+                    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                        build(
+                            super::transcript::find_claude_config_dirs(),
+                            TailStart::RecentTail,
+                        )
+                    })
+                    .await
                 else {
                     lock_state(&claim.timing()).ending = true;
                     return Verdict::Undecided;

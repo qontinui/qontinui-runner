@@ -3914,7 +3914,7 @@ impl LoopState {
         // goes to the blocking pool, off the single `fleet-publishers` worker.
         let posture = {
             let read = std::sync::Arc::clone(&self.binding_count);
-            match tokio::task::spawn_blocking(move || read()).await {
+            match crate::wedge_diagnostics::spawn_blocking_tracked(move || read()).await {
                 Ok(reading) => work_unit_write_posture(reading),
                 // Could not read the bindings at all: UNKNOWN, which withholds.
                 Err(_) => WorkUnitWritePosture::WithheldBindingsUnknown,
@@ -4001,7 +4001,7 @@ impl LoopState {
             let git = std::sync::Arc::clone(&self.git);
             let probe_dir = dir.clone();
             let pin = std::sync::Arc::clone(&pin);
-            match tokio::task::spawn_blocking(move || {
+            match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
                 // The clock is read on the blocking thread AFTER the pin has
                 // resolved the ref — so after the fetch on a writing pin, which
                 // can run up to `SCAN_FETCH_TIMEOUT`. Read before it, the
@@ -4056,7 +4056,7 @@ impl LoopState {
                 let scan_dir = dir.clone();
                 let git = std::sync::Arc::clone(&self.git);
                 let pin = std::sync::Arc::clone(&pin);
-                match tokio::task::spawn_blocking(move || {
+                match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
                     ref_census_only(&scan_dir, git.as_ref(), pin.as_ref())
                 })
                 .await
@@ -4145,7 +4145,7 @@ impl LoopState {
             // is a reading of nothing. It is also the only thing that makes
             // the publish-nothing arm reachable from a test.
             let git = std::sync::Arc::clone(&self.git);
-            match tokio::task::spawn_blocking(move || {
+            match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
                 read_plans_for_cycle(&scan_dir, &conv, git.as_ref(), &pin)
             })
             .await
@@ -4321,7 +4321,11 @@ impl LoopState {
         let archive_scan = match archive_dir.clone() {
             Some(a) => {
                 let conv = self.conv.clone();
-                match tokio::task::spawn_blocking(move || scan_plan_dir(&a, &conv)).await {
+                match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    scan_plan_dir(&a, &conv)
+                })
+                .await
+                {
                     Ok(u) => u,
                     Err(e) => {
                         tracing::warn!(

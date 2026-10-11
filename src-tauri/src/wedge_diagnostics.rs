@@ -202,6 +202,30 @@ impl LaneTable {
         self.counts.iter().map(|c| c.load(Ordering::SeqCst)).sum()
     }
 
+    /// Tracked bodies executing right now on lanes whose name is in `names`,
+    /// PLUS the overflow lane (and any lane counted before its name was
+    /// published, which [`Self::by_thread`] also folds into overflow).
+    ///
+    /// The overflow lane is counted STRICT: a body charged there could belong to
+    /// any runtime, and a reader subtracting this number from one runtime's pool
+    /// must treat an unattributable body as that runtime's load rather than as
+    /// idle — served policy `verification-and-evidence`
+    /// `unknown-must-not-render-as-a-default`.
+    fn in_flight_for(&self, names: &[&str]) -> usize {
+        let mut total = 0usize;
+        for (i, slot) in self.names.iter().enumerate().take(MAX_BLOCKING_LANES) {
+            let n = self.counts[i].load(Ordering::SeqCst);
+            if n == 0 {
+                continue;
+            }
+            match slot.get() {
+                Some(name) if !names.contains(&name.as_str()) => {}
+                _ => total = total.saturating_add(n),
+            }
+        }
+        total.saturating_add(self.counts[OVERFLOW_LANE].load(Ordering::SeqCst))
+    }
+
     /// Tracked bodies executing right now, keyed by the thread that charged
     /// them. Empty lanes are omitted: a zero carries no information and every
     /// byte on this line is a byte a human reads during an incident.
@@ -437,6 +461,29 @@ where
     })
 }
 
+/// Drop-in replacement for [`tokio::task::block_in_place`] that counts the
+/// blocked worker while it blocks, charged to the calling thread's lane.
+///
+/// `block_in_place` parks the calling runtime worker inside a blocking call and
+/// hands its core to a replacement thread drawn from the blocking pool, so every
+/// concurrent call adds one runtime-named thread that is doing blocking work.
+/// Untracked, that thread is indistinguishable from an idle pool thread to
+/// `resource_guard::graded_thread_reading`, which would grade it out as idle.
+/// Holding a [`BlockingSlot`] for the duration keeps it counted. Plan
+/// `2026-09-22-runner-untracked-blocking-bodies-are-invisible-to-the-idle-pool-
+/// grading`, Phase 2.
+///
+/// Same panics as `block_in_place` (a `current_thread` runtime, or no runtime),
+/// and `#[track_caller]` for the same reason as [`spawn_blocking_tracked`].
+#[track_caller]
+pub fn block_in_place_tracked<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let _slot = BlockingSlot::enter();
+    tokio::task::block_in_place(f)
+}
+
 /// The calling thread's lane in `table`.
 ///
 /// [`current_thread_lane`]'s memo caches an answer about ONE table, so it may be
@@ -469,6 +516,18 @@ pub fn tracked_blocking_in_flight() -> usize {
 /// line is a byte a human reads during an incident.
 pub fn tracked_blocking_by_thread() -> BTreeMap<String, usize> {
     LANES.by_thread()
+}
+
+/// Tracked bodies executing right now on the lanes named in `names`, plus the
+/// overflow lane (counted strict — its runtime is unknown).
+///
+/// This is the in-flight figure a reader must use when it subtracts from ONE
+/// runtime's thread census: [`tracked_blocking_in_flight`] sums every lane, so a
+/// body tracked on `mcp-api-rt` would otherwise make an idle `app-rt` thread
+/// read as load. Plan `2026-09-22-runner-untracked-blocking-bodies-are-invisible-
+/// to-the-idle-pool-grading`, Phase 2.
+pub fn tracked_blocking_in_flight_for(names: &[&str]) -> usize {
+    LANES.in_flight_for(names)
 }
 
 /// The PER-RUNTIME blocking-pool slot ceiling. See
@@ -2091,6 +2150,417 @@ mod tests {
         );
     }
 
+    /// **The untracked-blocking RATCHET — may only shrink.**
+    ///
+    /// Every entry is `(path relative to src/, spelling, count)` of production
+    /// call sites that enter a blocking pool WITHOUT a [`BlockingSlot`]. Such a
+    /// body is invisible to `resource_guard::graded_thread_reading`, which
+    /// grades a pool thread inside it out as IDLE — so 512 threads stuck in
+    /// untracked calls read as a quiet process (plan `2026-09-22-runner-
+    /// untracked-blocking-bodies-are-invisible-to-the-idle-pool-grading`).
+    ///
+    /// Empty is the end state, and the constant stays as the ratchet: a new
+    /// untracked site fails [`no_untracked_blocking_site_outside_the_allowlist`]
+    /// naming its file. An entry may be removed or its count lowered; adding
+    /// one, or raising a count, is re-opening the blind spot and needs the
+    /// argument made in review.
+    ///
+    /// Keyed by a PER-FILE COUNT, not a line number, deliberately: a line key
+    /// churns on every unrelated edit above the site and trains people to
+    /// regenerate the list blindly, while a per-file count still fails on any
+    /// new site in that file.
+    const UNTRACKED_BLOCKING_ALLOWLIST: &[(&str, &str, usize)] = &[];
+
+    /// The spellings that enter a blocking pool (or, for `block_in_place`,
+    /// turn the calling worker into a blocking thread) and so must hold a slot.
+    ///
+    /// Matched as a SUFFIX of the squeezed code, whatever precedes it, so every
+    /// spelling is caught: `tokio::task::spawn_blocking(`, a bare
+    /// `spawn_blocking(` after a `use`, `tauri::async_runtime::spawn_blocking(`,
+    /// the method forms `handle.spawn_blocking(` / `set.spawn_blocking(`, and
+    /// `block_in_place(` however it is qualified. The tracked wrappers do not
+    /// match: `spawn_blocking_tracked(` does not contain `spawn_blocking(`.
+    const BLOCKING_ENTRY_SPELLINGS: &[&str] = &["spawn_blocking(", "block_in_place("];
+
+    /// `code` (already squeezed by `squeezed_code`) with every
+    /// `#[cfg(test)] mod NAME { … }` span removed, plus the NAMES of the
+    /// out-of-line `#[cfg(test)] mod NAME;` declarations it found, each with the
+    /// `#[path = "…"]` it carried when it carried one.
+    ///
+    /// This is NOT `prod_part`, which cuts at the FIRST test module and drops
+    /// everything after it — production code included. A file with a test
+    /// module near its top (`mcp_api.rs` has one at line ~430, ahead of
+    /// ~22 000 production lines) would then scan almost nothing, and that is
+    /// exactly how five raw production sites survived the first version of
+    /// this ratchet. Only the test-module SPANS go.
+    ///
+    /// A span whose braces never balance (a brace inside a string literal —
+    /// the squeezed scan has no tokenizer) is KEPT rather than dropped to EOF:
+    /// over-scanning test code can only add a false offender, while dropping
+    /// to EOF would hide production code, which is the failure this replaces.
+    fn without_test_modules(code: &str) -> (String, Vec<(String, Option<String>)>) {
+        const CFG: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(code.len());
+        let mut decls = Vec::new();
+        let mut rest = code;
+        while let Some(i) = rest.find(CFG) {
+            out.push_str(rest.get(..i).unwrap_or(""));
+            // Where scanning resumes when this turns out NOT to be a test
+            // module: right after `#[cfg(test)]`, so the attributes and the
+            // item that follow are scanned like any other code, never dropped.
+            let after_cfg = rest.get(i + CFG.len()..).unwrap_or("");
+            let mut after = after_cfg;
+            // Further attributes between `#[cfg(test)]` and the item.
+            let mut path_attr = None;
+            while after.starts_with("#[") {
+                let Some(end) = after.find(']') else { break };
+                let attr = after.get(2..end).unwrap_or("");
+                if let Some(v) = attr.strip_prefix("path=") {
+                    path_attr = Some(v.trim_matches('"').to_string());
+                }
+                after = after.get(end + 1..).unwrap_or("");
+            }
+            let item = after
+                .strip_prefix("pub(crate)")
+                .or_else(|| after.strip_prefix("pub"))
+                .unwrap_or(after);
+            let Some(m) = item.strip_prefix("mod") else {
+                // Not a module (a `#[cfg(test)]` fn or use): keep it scanned.
+                out.push_str(CFG);
+                rest = after_cfg;
+                continue;
+            };
+            let name_len = m
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(m.len());
+            let name = m.get(..name_len).unwrap_or("");
+            let tail = m.get(name_len..).unwrap_or("");
+            if let Some(after_decl) = tail.strip_prefix(';') {
+                decls.push((name.to_string(), path_attr));
+                rest = after_decl;
+                continue;
+            }
+            if let Some(body) = tail.strip_prefix('{') {
+                let mut depth = 1usize;
+                let mut close = None;
+                for (j, c) in body.char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(j) = close {
+                    rest = body.get(j + 1..).unwrap_or("");
+                    continue;
+                }
+            }
+            // Unbalanced, or a shape this scan does not know: keep scanning it.
+            out.push_str(CFG);
+            rest = after_cfg;
+        }
+        out.push_str(rest);
+        (out, decls)
+    }
+
+    /// The files an out-of-line `#[cfg(test)] mod NAME;` in `path` resolves
+    /// to — `NAME.rs` and `NAME/mod.rs` in the declaring module's directory,
+    /// or the `#[path]` it named. Those files are test code in their entirety.
+    fn test_module_files(
+        path: &std::path::Path,
+        decls: &[(String, Option<String>)],
+    ) -> Vec<std::path::PathBuf> {
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+        let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let module_dir = if matches!(file, "mod.rs" | "lib.rs" | "main.rs") {
+            parent.to_path_buf()
+        } else {
+            parent.join(path.file_stem().unwrap_or_default())
+        };
+        let mut out = Vec::new();
+        for (name, path_attr) in decls {
+            match path_attr {
+                Some(p) => out.push(parent.join(p)),
+                None => {
+                    out.push(module_dir.join(format!("{name}.rs")));
+                    out.push(module_dir.join(name).join("mod.rs"));
+                }
+            }
+        }
+        out
+    }
+
+    /// The paren-balanced argument of a call whose `(` ends at `open_end`, or
+    /// the rest of `code` when it never balances — which cannot happen in a
+    /// file that compiles, short of a paren inside a string literal. Parens in
+    /// literals are not special-cased: the squeezed scan has no tokenizer, and
+    /// no call site of these spellings carries one today.
+    fn balanced_argument(code: &str, open_end: usize) -> &str {
+        let mut depth = 1usize;
+        for (i, c) in code.get(open_end..).unwrap_or("").char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return code.get(open_end..open_end + i).unwrap_or("");
+                    }
+                }
+                _ => {}
+            }
+        }
+        code.get(open_end..).unwrap_or("")
+    }
+
+    /// **No blocking body may run untracked outside the ratchet above.**
+    ///
+    /// Scans every source file except this one — which holds the wrappers
+    /// themselves — and except the files only a `#[cfg(test)] mod x;` reaches,
+    /// with comments and whitespace squeezed out (`squeezed_code`) and every
+    /// test-module span removed (`without_test_modules`), for the
+    /// [`BLOCKING_ENTRY_SPELLINGS`]. A
+    /// site is TRACKED when `BlockingSlot::enter` occurs inside its
+    /// paren-balanced argument (the `let _slot = BlockingSlot::enter();` first
+    /// statement of the closure). The untracked remainder, per file and
+    /// spelling, must EQUAL [`UNTRACKED_BLOCKING_ALLOWLIST`].
+    #[test]
+    fn no_untracked_blocking_site_outside_the_allowlist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut tracked_wrapper_calls = 0usize;
+        let mut block_in_place_wrapper_calls = 0usize;
+        let sources: Vec<_> = all_sources()
+            .into_iter()
+            .map(|(path, text)| {
+                let (code, decls) = without_test_modules(&squeezed_code(&text));
+                (path, code, decls)
+            })
+            .collect();
+        let test_only: std::collections::BTreeSet<std::path::PathBuf> = sources
+            .iter()
+            .flat_map(|(path, _, decls)| test_module_files(path, decls))
+            .collect();
+        for (path, code, _) in &sources {
+            if path.file_name().and_then(|n| n.to_str()) == Some("wedge_diagnostics.rs")
+                || test_only.contains(path)
+            {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            tracked_wrapper_calls += code.matches("spawn_blocking_tracked(").count();
+            block_in_place_wrapper_calls += code.matches("block_in_place_tracked(").count();
+            for spelling in BLOCKING_ENTRY_SPELLINGS {
+                for (idx, _) in code.match_indices(spelling) {
+                    let arg = balanced_argument(code, idx + spelling.len());
+                    if !arg.contains("BlockingSlot::enter") {
+                        *found
+                            .entry((rel.clone(), (*spelling).to_string()))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            !test_only.is_empty(),
+            "no out-of-line `#[cfg(test)] mod x;` file was resolved — the test-file \
+             exclusion has stopped matching the tree and would now scan test files"
+        );
+
+        let allowed: BTreeMap<(String, String), usize> = UNTRACKED_BLOCKING_ALLOWLIST
+            .iter()
+            .map(|(p, s, n)| (((*p).to_string(), (*s).to_string()), *n))
+            .collect();
+        let mismatches: Vec<String> = found
+            .keys()
+            .chain(allowed.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|key| {
+                let got = found.get(key).copied().unwrap_or(0);
+                let want = allowed.get(key).copied().unwrap_or(0);
+                (got != want)
+                    .then(|| format!("{} `{}`: found {got}, allowlist {want}", key.0, key.1))
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "untracked blocking call sites disagree with UNTRACKED_BLOCKING_ALLOWLIST:\n  {}\n\
+             A body entered this way holds no BlockingSlot, so a pool thread inside it \
+             reads as IDLE to resource_guard's graded thread reading. Fix the site: use \
+             `crate::wedge_diagnostics::spawn_blocking_tracked` / `block_in_place_tracked` \
+             (bin-crate files: `qontinui_runner_lib::wedge_diagnostics::…`), or bind \
+             `let _slot = BlockingSlot::enter();` as the first statement inside the \
+             closure. If a count went DOWN, shrink the allowlist to match — it is a \
+             ratchet and may only shrink.",
+            mismatches.join("\n  ")
+        );
+        // Positive floors, so a renamed wrapper or a scan of the wrong tree
+        // cannot make the negative assertion above pass vacuously.
+        assert!(
+            tracked_wrapper_calls >= 300,
+            "the scan found only {tracked_wrapper_calls} `spawn_blocking_tracked(` call \
+             sites (≈389 when this floor was set); it has stopped seeing the real tree"
+        );
+        assert!(
+            block_in_place_wrapper_calls >= 100,
+            "the scan found only {block_in_place_wrapper_calls} `block_in_place_tracked(` \
+             call sites (≈160 when this floor was set); it has stopped seeing the real tree"
+        );
+    }
+
+    /// The scan's own classifier, on fixtures: a slot bound inside the argument
+    /// is tracked, one bound OUTSIDE it (after the call) is not, and nested
+    /// parens inside the argument do not end it early.
+    #[test]
+    fn the_balanced_argument_scan_classifies_tracked_and_untracked_sites() {
+        let spelling = "tokio::task::spawn_blocking(";
+        let tracked = squeezed_code(
+            "tokio::task::spawn_blocking(move || { let _slot = BlockingSlot::enter(); f(g(1)) });",
+        );
+        let untracked = squeezed_code(
+            "tokio::task::spawn_blocking(move || f(g(1))); let _slot = BlockingSlot::enter();",
+        );
+        let arg = |code: &str| {
+            let idx = code.find(spelling).expect("fixture holds the spelling");
+            balanced_argument(code, idx + spelling.len()).to_string()
+        };
+        assert!(arg(&tracked).contains("BlockingSlot::enter"));
+        assert_eq!(arg(&untracked), "move||f(g(1))");
+    }
+
+    /// The test-module stripper removes test SPANS only: a production site
+    /// placed AFTER an inline test module, and one after an out-of-line
+    /// `mod tests;`, both stay in the scanned code — the shape `prod_part`'s
+    /// cut-at-first-module hid in `mcp_api.rs`, `coord_mcp.rs`,
+    /// `peer_user_guard/mod.rs` and `task_run_workflow_state.rs`.
+    #[test]
+    fn the_test_module_stripper_keeps_production_after_a_test_module() {
+        let src = "fn a() {}\n\
+                   #[cfg(test)]\nmod tests;\n\
+                   #[cfg(test)]\nmod inline_tests {\n    fn t() { tokio::task::spawn_blocking(|| {}); }\n}\n\
+                   #[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod pathed;\n\
+                   fn prod() { tokio::task::spawn_blocking(|| { g({1}) }); }\n";
+        let (code, decls) = without_test_modules(&squeezed_code(src));
+        assert_eq!(
+            code.matches("spawn_blocking(").count(),
+            1,
+            "exactly the production site after the test modules survives: {code}"
+        );
+        assert!(code.contains("fnprod()"), "{code}");
+        let (kept, _) = without_test_modules(&squeezed_code(
+            "#[cfg(test)]\n#[derive(Default)]\nstruct S;\n#[cfg(test)]\nmod open {\n",
+        ));
+        assert!(
+            kept.contains("#[derive(Default)]structS;"),
+            "a non-module test item keeps its attributes: {kept}"
+        );
+        assert!(
+            kept.contains("modopen{"),
+            "an unbalanced test module is KEPT, never dropped to EOF: {kept}"
+        );
+        assert!(!code.contains("inline_tests"), "{code}");
+        assert_eq!(
+            decls,
+            vec![
+                ("tests".to_string(), None),
+                ("pathed".to_string(), Some("x_tests.rs".to_string())),
+            ]
+        );
+        let files = test_module_files(std::path::Path::new("/s/peer/mod.rs"), &decls);
+        assert!(files.contains(&std::path::PathBuf::from("/s/peer/tests.rs")));
+        assert!(files.contains(&std::path::PathBuf::from("/s/peer/x_tests.rs")));
+        let files = test_module_files(std::path::Path::new("/s/foo.rs"), &decls[..1]);
+        assert!(files.contains(&std::path::PathBuf::from("/s/foo/tests.rs")));
+    }
+
+    /// The lane table has [`MAX_BLOCKING_LANES`] named lanes, and a lane is a
+    /// spawning thread's NAME. The named-runtime count is a PROXY for the lane
+    /// population, not a measurement of it: a `new_current_thread` runtime
+    /// driven by `block_on` on a std thread charges that std thread's name
+    /// (e.g. `agent-commands-fetch`, not `agentcmd-rt`), so the real
+    /// population can exceed what this counts. It still catches the common
+    /// way the table fills — another named runtime. A runtime
+    /// past the cap shares the overflow lane, which the graded thread reading
+    /// counts as APPLICATION-runtime load (strict, because its runtime is
+    /// unknown), so a sixteenth named runtime would silently re-introduce the
+    /// cross-runtime over-count `tracked_blocking_in_flight_for` removed. Raise
+    /// the cap with the runtime count; this pin is what says so.
+    #[test]
+    fn every_named_runtime_fits_the_lane_table() {
+        let mut names = std::collections::BTreeSet::new();
+        for (_, text) in all_sources() {
+            let (code, _) = without_test_modules(&squeezed_code(&text));
+            for (idx, _) in code.match_indices(".thread_name(\"") {
+                let start = idx + ".thread_name(\"".len();
+                if let Some(name) = code.get(start..).and_then(|r| r.split('"').next()) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        assert!(
+            names.len() >= 5,
+            "found only {} `.thread_name(\"…\")` runtimes; the scan stopped seeing the tree",
+            names.len()
+        );
+        // +1 for `tokio-rt-worker`, the default name of every unnamed runtime.
+        assert!(
+            names.len() + 1 <= MAX_BLOCKING_LANES,
+            "{} named runtimes ({names:?}) plus `tokio-rt-worker` exceed \
+             MAX_BLOCKING_LANES ({MAX_BLOCKING_LANES}); raise the cap",
+            names.len()
+        );
+    }
+
+    /// `block_in_place_tracked` must HOLD a slot across the
+    /// `tokio::task::block_in_place` call — bound, and bound before it. Same
+    /// `include_str!` technique as `the_public_spawn_wrapper_only_delegates`, so
+    /// the compiler resolves the file and the pin cannot scan the wrong tree.
+    #[test]
+    fn block_in_place_tracked_holds_a_slot_across_the_block() {
+        const SRC: &str = include_str!("wedge_diagnostics.rs");
+        const SIGNATURE: &str = "pub fn block_in_place_tracked<F, R>(f: F) -> R";
+        let src = prod_part(SRC);
+        let start = src.find(SIGNATURE).unwrap_or_else(|| {
+            panic!(
+                "this pin could not find `{SIGNATURE}` in the production half of this \
+                 module; if the wrapper was renamed, update this pin in the same change"
+            )
+        });
+        let rest = src.get(start..).unwrap_or("");
+        let body_end = rest
+            .find("\n}\n")
+            .expect("the wrapper's body must be closed at column 0");
+        let body = squeezed_code(rest.get(..body_end).unwrap_or(""));
+        assert!(
+            (20..300).contains(&body.len()),
+            "mis-parsed a {}-char wrapper: {body}",
+            body.len()
+        );
+        let slot = body
+            .find("let_slot=BlockingSlot::enter();")
+            .unwrap_or_else(|| panic!("block_in_place_tracked binds no slot: {body}"));
+        let call = body
+            .find("tokio::task::block_in_place(f)")
+            .unwrap_or_else(|| panic!("block_in_place_tracked no longer blocks in place: {body}"));
+        assert!(
+            slot < call,
+            "the slot must be taken BEFORE the block, or the blocked worker runs \
+             untracked: {body}"
+        );
+    }
+
     // ---- blocking-pool counter ----
 
     /// [`LANES`] is a PROCESS-GLOBAL static, so two of these tests running in
@@ -2397,6 +2867,58 @@ mod tests {
             "the first name resolved against an EMPTY private table must take lane \
              0, not {lane} (this thread's GLOBAL lane is {global_lane}) — the \
              routing has leaked the global memo across tables"
+        );
+    }
+
+    /// `in_flight_for` counts the NAMED lanes plus overflow and nothing else:
+    /// a body on `mcp-api-rt` must not make an idle `app-rt` thread read as
+    /// load in `resource_guard`'s grading, while an overflowed body — whose
+    /// runtime is unknown — is counted strict. Private table, named threads, so
+    /// no other test's population can move the answer.
+    #[test]
+    fn in_flight_for_counts_named_lanes_and_overflow_only() {
+        let table = fresh_lane_table();
+        let hold_on = |name: &str| {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    let _slot = enter_in(table);
+                    ready_tx.send(()).expect("test harness alive");
+                    let _ = rx.recv();
+                })
+                .expect("spawn fixture thread");
+            ready_rx.recv().expect("fixture took its slot");
+            (tx, handle)
+        };
+        let app = hold_on("app-rt");
+        let mcp = hold_on("mcp-api-rt");
+        let _overflow = BlockingSlot::enter_lane_in(table, OVERFLOW_LANE);
+
+        let names = &["app-rt", "tokio-rt-worker"];
+        assert_eq!(table.in_flight(), 3, "all three bodies are in flight");
+        assert_eq!(
+            table.in_flight_for(names),
+            2,
+            "app-rt (named) + overflow (strict) count; mcp-api-rt does not. lanes: {:?}",
+            table.by_thread()
+        );
+        assert_eq!(table.in_flight_for(&["mcp-api-rt"]), 2);
+        assert_eq!(
+            table.in_flight_for(&[]),
+            1,
+            "overflow alone is always counted"
+        );
+
+        for (tx, handle) in [app, mcp] {
+            tx.send(()).expect("fixture alive");
+            handle.join().expect("fixture thread");
+        }
+        assert_eq!(
+            table.in_flight_for(names),
+            1,
+            "only the overflow slot remains"
         );
     }
 

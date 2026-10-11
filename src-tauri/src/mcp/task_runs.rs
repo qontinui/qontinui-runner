@@ -615,7 +615,7 @@ pub async fn resume_task_run(
                     .strip_prefix("Project Reflection: ")
                     .or_else(|| wf_name.strip_prefix("Reflection: "));
                 stripped.and_then(|name| {
-                    tokio::task::block_in_place(|| {
+                    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                         tokio::runtime::Handle::current()
                             .block_on(state.app_state.pg_db.get_unified_workflow_by_name(name))
                     })

@@ -35,7 +35,7 @@ pub struct ReflectionDeps {
 pub fn should_launch_reflection(source_task_run_id: &str) -> Result<bool, String> {
     // PG-primary: sync function context, use block_in_place
     let pg = crate::database::pg::PgDb::global();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg.should_launch_reflection(source_task_run_id).await })
     })
@@ -82,7 +82,7 @@ pub fn launch_reflection(
 
     // Get source task run details via PG
     let pg = crate::database::pg::PgDb::global();
-    let workflow_name = tokio::task::block_in_place(|| {
+    let workflow_name = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg.get_workflow_name_for_task_run(&source_task_run_id).await })
     })?;
@@ -111,7 +111,7 @@ pub fn launch_reflection(
         .with_reflection_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg.create_task_run(&input))
     })?;
 
@@ -180,7 +180,7 @@ pub fn launch_reflection(
     let exec_id_restate = exec_id.clone();
     let restate_workflow_input =
         crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
@@ -263,7 +263,7 @@ pub fn launch_reflection(
 pub fn should_launch_project_reflection(source_task_run_id: &str) -> Result<bool, String> {
     // PG-primary: sync function context, use block_in_place
     let pg = crate::database::pg::PgDb::global();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             pg.should_launch_project_reflection(source_task_run_id)
                 .await
@@ -285,12 +285,13 @@ pub fn launch_project_reflection(
 
     // Get source task run details via PG
     let pg = crate::database::pg::PgDb::global();
-    let (workflow_name, project_path) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg.get_workflow_name_and_project_path(&source_task_run_id)
-                .await
-        })
-    })?;
+    let (workflow_name, project_path) =
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                pg.get_workflow_name_and_project_path(&source_task_run_id)
+                    .await
+            })
+        })?;
 
     let reflection_id = uuid::Uuid::new_v4().to_string();
     let reflection_name = format!("Project Reflection: {}", workflow_name);
@@ -315,7 +316,7 @@ pub fn launch_project_reflection(
         .with_reflection_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg.create_task_run(&input))
     })?;
 
@@ -378,7 +379,7 @@ pub fn launch_project_reflection(
     let exec_id_restate = exec_id.clone();
     let restate_workflow_input =
         crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
@@ -461,7 +462,7 @@ pub fn launch_project_reflection(
 pub fn should_launch_ui_bridge_reflection(source_task_run_id: &str) -> Result<bool, String> {
     // PG-primary: sync function context, use block_in_place
     let pg = crate::database::pg::PgDb::global();
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             pg.should_launch_ui_bridge_reflection(source_task_run_id)
                 .await
@@ -483,7 +484,7 @@ pub fn launch_ui_bridge_reflection(
 
     // Get source task run details via PG
     let pg = crate::database::pg::PgDb::global();
-    let workflow_name = tokio::task::block_in_place(|| {
+    let workflow_name = qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current()
             .block_on(async { pg.get_workflow_name_for_task_run(&source_task_run_id).await })
     })?;
@@ -511,7 +512,7 @@ pub fn launch_ui_bridge_reflection(
         .with_reflection_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg.create_task_run(&input))
     })?;
 
@@ -573,7 +574,7 @@ pub fn launch_ui_bridge_reflection(
     let exec_id_restate = exec_id.clone();
     let restate_workflow_input =
         crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {

@@ -731,7 +731,7 @@ pub async fn gather_activity_evidence(
         HashMap::new()
     } else {
         let guard = InFlightRead(in_flight);
-        let read = tokio::task::spawn_blocking(move || {
+        let read = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
             // Released when the read ENDS (or unwinds), not when the caller
             // stops waiting for it.
             let _guard = guard;

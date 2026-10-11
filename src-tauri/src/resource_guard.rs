@@ -624,16 +624,7 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
     // feeding the window the raw count again; that re-creates the permanent
     // double subtraction this comment exists to forbid.
     let census = crate::health_monitor::thread_name_census_memoized();
-    let total_threads = total_threads.map(|total| {
-        graded_thread_reading(
-            total,
-            census.as_ref(),
-            qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
-            RUNTIME_NAMES,
-            runtime_worker_threads(),
-        )
-        .graded
-    });
+    let total_threads = total_threads.map(|total| grade_live(total, census.as_ref()).graded);
     // The session subtraction is taken from the SAME census the idle pool was
     // graded out of, so the two subtractions are over one snapshot of names
     // and are disjoint by construction: the pool rows are `app-rt` /
@@ -2178,18 +2169,28 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
 /// keeps a saturated pool counted.
 ///
 /// **What this grading cannot see, stated so nobody reads the clamp as
-/// cover.** A pool thread inside an UNTRACKED body — `tokio::fs`,
-/// `tokio::process`, and every raw `tokio::task::spawn_blocking` site that
-/// does not take a `BlockingSlot` — is indistinguishable from an idle one
-/// here, because `in_flight` counts tracked bodies only. 512 pool threads
-/// all stuck in untracked `CreateProcess` calls (the 2026-08-29 wedge shape)
-/// would therefore grade out entirely and the lane would read `Proceed`.
-/// The guard is strict against TRACKED bodies (they stay counted); the
-/// untracked residue is closed only by coverage — converting raw
-/// `spawn_blocking` sites to `spawn_blocking_tracked` — which is the recorded
-/// follow-up on plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-
-/// because-transcript-tails-rotate-every-idle-thread`, not by any number
-/// here.
+/// cover.** A pool thread inside an UNTRACKED body is indistinguishable from
+/// an idle one here, because `in_flight` counts tracked bodies only. 512 pool
+/// threads all stuck in untracked `CreateProcess` calls (the 2026-08-29 wedge
+/// shape) would grade out entirely and the lane would read `Proceed`. The
+/// guard is strict against TRACKED bodies (they stay counted), and the
+/// untracked set is closed by coverage rather than by any number here (plan
+/// `2026-09-22-runner-untracked-blocking-bodies-are-invisible-to-the-idle-
+/// pool-grading`):
+///
+/// - every first-party `tokio::task::spawn_blocking`,
+///   `tauri::async_runtime::spawn_blocking` and `tokio::task::block_in_place`
+///   site takes a `BlockingSlot` (through `spawn_blocking_tracked` /
+///   `block_in_place_tracked`, or one bound inside the closure), and the
+///   source ratchet `wedge_diagnostics::tests::
+///   no_untracked_blocking_site_outside_the_allowlist` fails any new raw site;
+/// - what REMAINS is tokio-internal — `tokio::fs`, `tokio::process`,
+///   `tokio::io::blocking` enter the pool below any seam this crate owns and
+///   cannot be tracked from here. That residue is not claimed away: `/health`
+///   serves it as `threadCensus.untrackedBodiesUpperBound` (the `idle_pool` of
+///   the very reading this lane grades on, via [`live_thread_grading`]), so a
+///   `Proceed` beside a large bound shows the blind spot rather than a clean
+///   guard.
 pub(crate) const IDLE_POOL_SUBTRAHEND_CAP: usize = 512;
 
 /// The thread names the application runtime's scheduler workers and blocking
@@ -2307,38 +2308,102 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
     )
 }
 
-/// The thread lane's live verdict, folded and evaluated. Shared by
-/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+/// The in-flight input the grading subtracts, for ONE runtime: tracked bodies
+/// on the [`RUNTIME_NAMES`] lanes plus the overflow lane (strict — an
+/// overflowed lane's runtime is unknown).
+///
+/// NOT [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight`],
+/// which sums every lane: [`graded_thread_reading`] subtracts from the
+/// [`RUNTIME_NAMES`] census rows only, so a body tracked on `mcp-api-rt`,
+/// `agentcmd-rt`, `cognito-rt`, … would make an idle `app-rt` thread count as
+/// load. Plan `2026-09-22-runner-untracked-blocking-bodies-are-invisible-to-
+/// the-idle-pool-grading`, Phase 2.
+fn app_runtime_in_flight() -> usize {
+    qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight_for(RUNTIME_NAMES)
+}
+
+/// Grade a LIVE total against a census, with the live in-flight input and the
+/// live worker count. The one place the grading's inputs are gathered, so the
+/// lane, the at-rest window and `/health` can never feed it differently.
+fn grade_live(total: usize, census: Option<&ThreadNameCensus>) -> GradedThreadReading {
+    graded_thread_reading(
+        total,
+        census,
+        app_runtime_in_flight(),
+        RUNTIME_NAMES,
+        runtime_worker_threads(),
+    )
+}
+
+/// One live grading: the memoized census it was taken against, and the graded
+/// reading (`None` when the thread count is UNKNOWN).
+#[derive(Debug, Clone)]
+pub(crate) struct LiveThreadGrading {
+    /// The memoized thread-name census, `None` when UNKNOWN.
+    pub(crate) census: Option<ThreadNameCensus>,
+    /// The graded reading, `None` when the memoized thread count is UNKNOWN.
+    pub(crate) reading: Option<GradedThreadReading>,
+}
+
+impl LiveThreadGrading {
+    /// Pool threads whose state this process cannot attribute: the `idle_pool`
+    /// this reading graded out. After the coverage in plan `2026-09-22-runner-
+    /// untracked-blocking-bodies-are-invisible-to-the-idle-pool-grading` that is
+    /// genuinely idle threads plus tokio-internal (`tokio::fs`,
+    /// `tokio::process`) bodies — an UPPER bound on the untracked ones.
+    ///
+    /// `None` — never `0` — when the census is UNKNOWN: [`graded_thread_reading`]
+    /// maps a `None` census to `named = 0`, so `idle_pool` reads 0 there, and
+    /// serving that would print a confident "no blind spot" off a census nobody
+    /// took (served policy `verification-and-evidence`
+    /// `unknown-must-not-render-as-a-default`). Also `None` when the total is
+    /// UNKNOWN, since there is then no reading to quote.
+    pub(crate) fn untracked_bodies_upper_bound(&self) -> Option<usize> {
+        self.census.as_ref()?;
+        self.reading.map(|r| r.idle_pool)
+    }
+}
+
+/// The thread lane's live grading — **the one function every consumer of the
+/// graded reading calls**: [`thread_lane_verdict`] grades on its `reading`,
+/// and `/health` (`crate::health_monitor::thread_name_census_json`) serves its
+/// `census` and [`LiveThreadGrading::untracked_bodies_upper_bound`] from the
+/// SAME value, so the served bound is the `idle_pool` the lane subtracted and
+/// never a second derivation that could drift from it.
 ///
 /// **The single call site of
 /// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
 /// keeps the whole lane — the continuation guard, [`precheck_spawn`] and
-/// [`admit_spawn`] alike — behind one system-wide thread snapshot per 250 ms
-/// window. Reaching past it to `thread_count_reading` from a second site would
-/// silently restore the per-caller snapshot this seam exists to remove; see that
-/// constant's doc for why the staleness is free.
+/// [`admit_spawn`] alike, and now the `/health` poll — behind one system-wide
+/// thread snapshot per 250 ms window. Reaching past it to
+/// `thread_count_reading` from a second site would silently restore the
+/// per-caller snapshot this seam exists to remove; see that constant's doc for
+/// why the staleness is free.
+pub(crate) fn live_thread_grading() -> LiveThreadGrading {
+    let total = crate::health_monitor::thread_count_reading_memoized();
+    let census = crate::health_monitor::thread_name_census_memoized();
+    let reading = total.map(|t| grade_live(t, census.as_ref()));
+    LiveThreadGrading { census, reading }
+}
+
+/// The thread lane's live verdict, folded and evaluated. Shared by
+/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
 ///
-/// The reading handed to [`evaluate_threads`] is the GRADED one
-/// ([`graded_thread_reading`]): the raw count minus the runtime's idle
+/// The reading handed to [`evaluate_threads`] is the GRADED one from
+/// [`live_thread_grading`]: the raw count minus the application runtime's idle
 /// blocking pool, which the 30 s thread-name census
 /// ([`crate::health_monitor::thread_name_census_memoized`]) makes visible and
-/// [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight`] keeps
-/// honest. `evaluate_threads` and the ceilings it compares against are
+/// [`app_runtime_in_flight`] keeps honest — tracked bodies on the
+/// [`RUNTIME_NAMES`] lanes plus the overflow lane, never the sum over every
+/// runtime. `evaluate_threads` and the ceilings it compares against are
 /// untouched; the `GateObservation.observed` every refusal quotes is the
 /// graded number, and [`note_graded_trip`] logs the raw one beside it.
 fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
-    let census = crate::health_monitor::thread_name_census_memoized();
+    let LiveThreadGrading { census, reading } = live_thread_grading();
     let ceilings = effective_thread_ceilings_given(local, census.as_ref()).ceilings;
-    let Some(total) = crate::health_monitor::thread_count_reading_memoized() else {
+    let Some(reading) = reading else {
         return evaluate_threads(None, local.enabled, ceilings);
     };
-    let reading = graded_thread_reading(
-        total,
-        census.as_ref(),
-        qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
-        RUNTIME_NAMES,
-        runtime_worker_threads(),
-    );
     let verdict = evaluate_threads(Some(reading.graded), local.enabled, ceilings);
     note_graded_trip(&verdict, &reading);
     verdict
@@ -3655,6 +3720,81 @@ mod tests {
         let r = graded_thread_reading(100, Some(&small), 0, RUNTIME_NAMES, 32);
         assert_eq!(r.idle_pool, 0);
         assert_eq!(r.graded, 100);
+    }
+
+    /// `/health`'s `untrackedBodiesUpperBound` is `null`, never `0`, when the
+    /// census is UNKNOWN: [`graded_thread_reading`] maps a `None` census to
+    /// `named = 0`, so the reading's own `idle_pool` IS 0 there — and serving
+    /// it would print a confident "no blind spot" off a census nobody took.
+    /// Likewise `null` when the total is UNKNOWN; the known arm quotes the
+    /// reading's `idle_pool` exactly, never a re-derivation.
+    #[test]
+    fn the_untracked_bound_is_null_not_zero_when_unknown() {
+        let unknown_census = LiveThreadGrading {
+            census: None,
+            reading: Some(graded_thread_reading(440, None, 3, RUNTIME_NAMES, 32)),
+        };
+        assert_eq!(
+            unknown_census.reading.map(|r| r.idle_pool),
+            Some(0),
+            "the precondition this arm exists for: the reading itself says 0"
+        );
+        assert_eq!(unknown_census.untracked_bodies_upper_bound(), None);
+
+        let census = name_census(&[("tokio-rt-worker", 325)]);
+        let unknown_total = LiveThreadGrading {
+            census: Some(census.clone()),
+            reading: None,
+        };
+        assert_eq!(unknown_total.untracked_bodies_upper_bound(), None);
+
+        let reading = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        let known = LiveThreadGrading {
+            census: Some(census),
+            reading: Some(reading),
+        };
+        assert_eq!(known.untracked_bodies_upper_bound(), Some(290));
+        assert_eq!(
+            known.untracked_bodies_upper_bound(),
+            Some(reading.idle_pool)
+        );
+    }
+
+    /// **The grading subtracts the APPLICATION runtime's in-flight bodies
+    /// only.** A body tracked on `mcp-api-rt` is not an `app-rt` pool thread,
+    /// so counting it would make an idle `app-rt` thread read as load — the
+    /// all-lanes sum `tracked_blocking_in_flight()` did exactly that. The lane
+    /// selection itself is pinned behaviourally against a private table in
+    /// `wedge_diagnostics::tests::in_flight_for_counts_named_lanes_and_overflow_only`
+    /// (the global table is saturated by test-thread names in this binary, so
+    /// a behavioural test here could not tell a named lane from overflow). This
+    /// pins that the live seam READS that selection, and that no production
+    /// line in this module falls back to the all-lanes sum.
+    #[test]
+    fn the_grading_reads_in_flight_for_the_app_runtime_lanes_only() {
+        const SRC: &str = include_str!("resource_guard.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]\nmod ")
+            .map_or(SRC, |(before, _)| before);
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            code.contains("wedge_diagnostics::tracked_blocking_in_flight_for(RUNTIME_NAMES)"),
+            "the graded reading's in-flight input must be the RUNTIME_NAMES lanes \
+             (plus overflow), via tracked_blocking_in_flight_for(RUNTIME_NAMES)"
+        );
+        assert!(
+            !code.contains("tracked_blocking_in_flight()"),
+            "a production line in resource_guard reads the ALL-lanes in-flight sum; \
+             the grading subtracts from the app runtime's census rows only, so it \
+             must use tracked_blocking_in_flight_for(RUNTIME_NAMES)"
+        );
+        // Positive floor: the seam every consumer shares actually exists.
+        assert!(code.contains("pub(crate)fnlive_thread_grading()->LiveThreadGrading"));
     }
 
     /// The thread lane names itself through the shared lane vocabulary, never a

@@ -211,7 +211,7 @@ pub async fn get_prepaid_balances() -> Vec<PrepaidBalanceInfo> {
     let clear = ClearInFlight;
     let api_key = match tokio::time::timeout(
         KEY_READ_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
             let _clear = clear;
             resolve_api_key()
         }),

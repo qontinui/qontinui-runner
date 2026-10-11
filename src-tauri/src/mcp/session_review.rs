@@ -679,21 +679,28 @@ impl PromptDoor for LiveDoor {
                 let text = text.to_string();
                 // `submit_prompt` sleeps between the paste and the CR; keep it
                 // off the async executor.
-                let payload = tokio::task::spawn_blocking(move || match mode {
-                    SendMode::Submit => session.submit_prompt(&text, PtyWriteCaller::ReviewNotes),
-                    SendMode::Insert => session.insert_prompt(&text, PtyWriteCaller::ReviewNotes),
-                })
-                .await
-                .map_err(|e| DeliveryError::Partial(format!("terminal write panicked: {e}")))?
-                .map_err(|e| {
-                    // The choke point tags an error raised once the paste had
-                    // started reaching the PTY; nothing else wrote a byte.
-                    if e.starts_with(crate::terminal::session::PROMPT_PARTIALLY_WRITTEN) {
-                        DeliveryError::Partial(e)
-                    } else {
-                        DeliveryError::Failed(e)
-                    }
-                })?;
+                let payload =
+                    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                        match mode {
+                            SendMode::Submit => {
+                                session.submit_prompt(&text, PtyWriteCaller::ReviewNotes)
+                            }
+                            SendMode::Insert => {
+                                session.insert_prompt(&text, PtyWriteCaller::ReviewNotes)
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(|e| DeliveryError::Partial(format!("terminal write panicked: {e}")))?
+                    .map_err(|e| {
+                        // The choke point tags an error raised once the paste had
+                        // started reaching the PTY; nothing else wrote a byte.
+                        if e.starts_with(crate::terminal::session::PROMPT_PARTIALLY_WRITTEN) {
+                            DeliveryError::Partial(e)
+                        } else {
+                            DeliveryError::Failed(e)
+                        }
+                    })?;
                 Ok(Delivered {
                     sanitized: Some(payload.sanitized),
                     bytes: Some(payload.bytes),

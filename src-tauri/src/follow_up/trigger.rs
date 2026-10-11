@@ -55,7 +55,7 @@ pub fn should_launch_follow_up(
 ) -> Result<bool, String> {
     let pg = pg_db.clone();
     let src_id = source_task_run_id.to_string();
-    tokio::task::block_in_place(move || {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(move || {
         tokio::runtime::Handle::current()
             .block_on(async { should_launch_follow_up_pg(&pg, &src_id).await })
     })
@@ -194,7 +194,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let workflow_name = {
         let pg = pg_db.clone();
         let src_id = source_task_run_id.clone();
-        tokio::task::block_in_place(move || {
+        qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(move || {
             tokio::runtime::Handle::current()
                 .block_on(async { pg.get_task_run_workflow_name(&src_id).await })
         })?
@@ -224,7 +224,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
         .with_follow_up_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
 
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(pg_db.create_task_run(&input))
     })?;
 
@@ -275,7 +275,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let exec_id_restate = exec_id.clone();
     let restate_workflow_input =
         crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
-    tokio::task::block_in_place(|| {
+    qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {

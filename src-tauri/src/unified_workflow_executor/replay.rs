@@ -51,7 +51,7 @@ impl ReplayManager {
         let eid = execution_id.to_string();
         let verification_results = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| {
+                qontinui_runner_lib::wedge_diagnostics::block_in_place_tracked(|| {
                     handle.block_on(async move { pg.get_workflow_verification_results(&eid).await })
                 })
             }));

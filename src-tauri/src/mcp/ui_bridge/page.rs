@@ -830,7 +830,9 @@ async fn event_loop_verdict() -> EventLoopVerdict {
     // ceiling at all — on the one route an operator reaches for when the
     // window will not close. The ceiling sits just above the probe's own so a
     // healthy-but-slow sample still lands.
-    let probe = tokio::task::spawn_blocking(crate::health_monitor::ui_thread_pumping);
+    let probe = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+        crate::health_monitor::ui_thread_pumping,
+    );
     match tokio::time::timeout(EVENT_LOOP_PROBE_CEILING, probe).await {
         Ok(Ok(Some(sample))) if sample.pumping => EventLoopVerdict::Pumping,
         Ok(Ok(Some(_))) => EventLoopVerdict::Wedged("probe_no_round_trip"),

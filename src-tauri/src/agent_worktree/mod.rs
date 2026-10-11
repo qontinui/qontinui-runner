@@ -2052,8 +2052,10 @@ pub async fn allocate_and_materialize_with_claim(
         {
             let sources = sibling_sources;
             if let Err(e) =
-                tokio::task::spawn_blocking(move || fill_sibling_store(&worktree_root, &sources))
-                    .await
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    fill_sibling_store(&worktree_root, &sources)
+                })
+                .await
             {
                 warn!("sibling store: fill task failed: {e}");
             }
