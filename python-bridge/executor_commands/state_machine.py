@@ -364,17 +364,19 @@ class StateMachineCommands(ExecutorHost):
             # not by raising; reporting that as success made every caller read
             # a failed transition as passed.
             if isinstance(result, dict):
-                ok = bool(result.get("success", True))
+                ok = result.get("success") is True
                 error = result.get("error")
                 payload: Any = result
             else:
-                ok = bool(getattr(result, "success", True))
+                ok = getattr(result, "success", None) is True
                 error = getattr(result, "error", None)
                 payload = (
                     dataclasses.asdict(result)
                     if dataclasses.is_dataclass(result) and not isinstance(result, type)
                     else {"completed": ok}
                 )
+                if result is None:
+                    error = "runtime returned no result"
             if not ok:
                 return {
                     "success": False,
