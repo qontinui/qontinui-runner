@@ -16,6 +16,7 @@ import {
   Lock,
   RotateCcw,
   FolderGit2,
+  Monitor,
 } from "lucide-react";
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
@@ -74,6 +75,12 @@ interface SessionCardProps {
    * runner, so it is where the link belongs.
    */
   onOpenWorktrees?: (worktreePath: string) => void;
+  /**
+   * tmux work mode: this row's session is the one on screen. Marked distinctly
+   * so the operator can tell the shown session from the hidden ones, whose
+   * state chips stay as they are (plan `2026-10-11-runner-terminal-tmux-work-mode`).
+   */
+  isOnScreen?: boolean;
 }
 
 const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; label: string }> = {
@@ -182,15 +189,57 @@ export function sessionCardTooltip(
   session: Pick<
     UnifiedSession,
     "sessionId" | "registryName" | "resumeName" | "workSummaryHint" | "displayName"
-  >,
+  > &
+    Partial<Pick<UnifiedSession, "source">>,
 ): string {
   const headline = sessionCardName(session);
-  const base = `Session ${session.sessionId}\n${headline}`;
+  // A tab-sourced row is keyed by its tab id — calling that a session id would
+  // invite pasting it into `claude --resume`.
+  const base =
+    session.source === "tab"
+      ? `Terminal ${session.sessionId}\n${headline}`
+      : `Session ${session.sessionId}\n${headline}`;
   const transcriptName = session.resumeName || session.workSummaryHint || session.displayName;
   if (transcriptName && transcriptName !== headline) {
     return `${base}\ntranscript name: ${transcriptName}`;
   }
   return base;
+}
+
+/** Which of a card's actions apply to its row. */
+export interface SessionCardActions {
+  resume: boolean;
+  viewTranscript: boolean;
+  copySessionId: boolean;
+  promote: boolean;
+  commit: boolean;
+  /** Selecting for bulk resume (checkbox + "Select for Bulk"). */
+  bulkSelect: boolean;
+}
+
+/**
+ * The card's action set. A tab-sourced row (a plain shell, a session before its
+ * first message, a remote session tab) has no transcript, so view transcript,
+ * copy session id, resume and bulk select do not apply, and nothing backs
+ * promote or commit (both key on a Claude session id the row does not carry).
+ * Promote and commit additionally need a session that is live in this runner.
+ */
+export function sessionCardActions(
+  session: Pick<UnifiedSession, "source" | "liveStatus">,
+): SessionCardActions {
+  const transcript = session.source === "transcript";
+  const liveHere =
+    session.liveStatus === "active-in-zone" ||
+    session.liveStatus === "needs-input" ||
+    session.liveStatus === "frozen";
+  return {
+    resume: transcript,
+    viewTranscript: transcript,
+    copySessionId: transcript,
+    promote: transcript && liveHere,
+    commit: transcript && liveHere,
+    bulkSelect: transcript,
+  };
 }
 
 /**
@@ -232,7 +281,9 @@ function SessionCardInner({
   onSetLabel,
   onAfterPromote,
   onOpenWorktrees,
+  isOnScreen = false,
 }: SessionCardProps) {
+  const actions = sessionCardActions(session);
   const baseStatusInfo = STATUS_DOT[session.liveStatus];
   // An orphaned "frozen" session has no live PTY in this window — it's simply
   // not running here, so relabel the chip away from the alarming "Frozen" to a
@@ -266,10 +317,7 @@ function SessionCardInner({
   // SessionManager by task_run_id, which equals the claude session id for
   // this runner's live PTYs. External / dormant / completed sessions can't
   // be promoted from this UI (the backend would just 404).
-  const canPromote =
-    session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
-    session.liveStatus === "frozen";
+  const canPromote = actions.promote;
 
   // Hide the button entirely once the promotion has succeeded — the parent
   // refreshes session state and the next render will reflect the new
@@ -349,10 +397,7 @@ function SessionCardInner({
   // Same predicate as canPromote: committing requires a live session in this
   // runner. A non-promoted session committing to the user's current branch is
   // the explicit, correct behavior.
-  const canCommit =
-    session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
-    session.liveStatus === "frozen";
+  const canCommit = actions.commit;
 
   const handleCommit = useCallback(
     async (e: React.MouseEvent) => {
@@ -446,17 +491,19 @@ function SessionCardInner({
       className={`
         group relative border-l-2 transition-colors
         ${
-          isSelected
-            ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
-            : session.liveStatus === "frozen"
-              ? "border-l-[#f7768e]/50 hover:bg-[#1a1b26]"
-              : session.liveStatus === "needs-input"
-                ? "border-l-[#e0af68]/50 hover:bg-[#1a1b26]"
-                : session.liveStatus === "active-in-zone"
-                  ? "border-l-[#9ece6a]/50 hover:bg-[#1a1b26]"
-                  : session.liveStatus === "active-external"
-                    ? "border-l-[#73daca]/50 hover:bg-[#1a1b26]"
-                    : "border-l-transparent hover:bg-[#1a1b26]"
+          isOnScreen
+            ? "border-l-brand-primary bg-brand-primary/10"
+            : isSelected
+              ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
+              : session.liveStatus === "frozen"
+                ? "border-l-[#f7768e]/50 hover:bg-[#1a1b26]"
+                : session.liveStatus === "needs-input"
+                  ? "border-l-[#e0af68]/50 hover:bg-[#1a1b26]"
+                  : session.liveStatus === "active-in-zone"
+                    ? "border-l-[#9ece6a]/50 hover:bg-[#1a1b26]"
+                    : session.liveStatus === "active-external"
+                      ? "border-l-[#73daca]/50 hover:bg-[#1a1b26]"
+                      : "border-l-transparent hover:bg-[#1a1b26]"
         }
       `}
     >
@@ -470,6 +517,9 @@ function SessionCardInner({
         data-session-title={cardName}
         data-session-status={session.liveStatus}
         data-session-account={session.accountLabel}
+        data-session-source={session.source}
+        data-session-on-screen={isOnScreen ? "true" : "false"}
+        aria-current={isOnScreen ? "true" : undefined}
         // `accessibleName` and `ai/find` resolve on this. `title` carries the
         // rich multi-line tooltip, which makes a poor name, so the headline is
         // stated separately here; the tooltip is unchanged visually.
@@ -480,7 +530,7 @@ function SessionCardInner({
       >
         {/* Row 1: Status dot + Name + Account badge */}
         <div className="flex items-center gap-1.5 mb-0.5">
-          {selectionMode && (
+          {selectionMode && actions.bulkSelect && (
             <input
               type="checkbox"
               checked={isChecked}
@@ -498,6 +548,24 @@ function SessionCardInner({
             title={statusInfo.label}
           />
           <span className="text-xs text-[#a9b1d6] truncate flex-1">{sessionCardName(session)}</span>
+          {isOnScreen && (
+            <span
+              data-testid="session-card-on-screen"
+              className="flex items-center gap-0.5 px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-brand-primary/15 text-brand-primary"
+              title="This session is the one on screen"
+            >
+              <Monitor className="w-2.5 h-2.5" />
+              on screen
+            </span>
+          )}
+          {session.remoteDeviceLabel && (
+            <span
+              className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-surface-raised text-text-muted truncate max-w-[80px]"
+              title={`Remote session on ${session.remoteDeviceLabel}`}
+            >
+              {session.remoteDeviceLabel}
+            </span>
+          )}
           {accountBadge && (
             <span
               className={`px-1 py-0 rounded text-[9px] font-medium shrink-0 ${accountBadge.bg} ${accountBadge.text}`}
@@ -519,23 +587,26 @@ function SessionCardInner({
               <span className="text-[9px] text-[#e0af68]/80">{fileConflictCount}</span>
             </span>
           )}
-          {/* Durable AI-session affordance (Phase 5 honesty label). Every
-              SessionCard renders a transcript-backed AI/chat session, which
+          {/* Durable AI-session affordance (Phase 5 honesty label). A
+              transcript row is a transcript-backed AI/chat session, which
               resumes automatically on a runner restart (and is listed by the
               startup recovery banner). We surface a subtle, calm cue ONLY for
               live sessions — historical dormant/completed transcripts don't
               need the reassurance and it would clutter the long list. This is
               the deliberate counterpart to the "ephemeral" marker on
-              non-durable interactive PTY tabs. */}
-          {session.liveStatus !== "dormant" && session.liveStatus !== "completed" && (
-            <span
-              className="shrink-0 inline-flex"
-              title={DURABLE_TOOLTIP}
-              aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
-            >
-              <RotateCcw className="w-3 h-3 text-[#565f89]" />
-            </span>
-          )}
+              non-durable interactive PTY tabs — which is why a tab-sourced
+              row (a plain shell, nothing to resume) never carries it. */}
+          {actions.resume &&
+            session.liveStatus !== "dormant" &&
+            session.liveStatus !== "completed" && (
+              <span
+                className="shrink-0 inline-flex"
+                title={DURABLE_TOOLTIP}
+                aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
+              >
+                <RotateCcw className="w-3 h-3 text-[#565f89]" />
+              </span>
+            )}
           {isPinned && <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />}
           {sessionLabel && (
             <span className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]">
@@ -548,7 +619,8 @@ function SessionCardInner({
         <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
           <span>{formatTimeAgo(session.lastModified)}</span>
           <span>&middot;</span>
-          <span>{session.messageCount} msgs</span>
+          {/* A tab-sourced row has no transcript, so no message count. */}
+          <span>{session.source === "tab" ? "terminal" : `${session.messageCount} msgs`}</span>
           {durationLabel && (
             <>
               <span>&middot;</span>
@@ -682,16 +754,18 @@ function SessionCardInner({
 
       {/* Quick action buttons — visible on hover */}
       <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onResume(session);
-          }}
-          className="p-1 rounded text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-colors"
-          title={`Resume: claude --resume ${session.sessionId.slice(0, 8)}...`}
-        >
-          <TerminalSquare className="w-3.5 h-3.5" />
-        </button>
+        {actions.resume && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onResume(session);
+            }}
+            className="p-1 rounded text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-colors"
+            title={`Resume: claude --resume ${session.sessionId.slice(0, 8)}...`}
+          >
+            <TerminalSquare className="w-3.5 h-3.5" />
+          </button>
+        )}
         {/*
           Cross-link into the Worktrees cleanup panel for a session that is
           ALREADY running in an isolated worktree (the promote affordance
@@ -738,26 +812,30 @@ function SessionCardInner({
             )}
           </button>
         )}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onViewTranscript(session);
-          }}
-          className="p-1 rounded text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
-          title="View transcript"
-        >
-          <Eye className="w-3.5 h-3.5" />
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onCopyId(session);
-          }}
-          className="p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
-          title={`Copy session ID: ${session.sessionId}`}
-        >
-          <Copy className="w-3 h-3" />
-        </button>
+        {actions.viewTranscript && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onViewTranscript(session);
+            }}
+            className="p-1 rounded text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
+            title="View transcript"
+          >
+            <Eye className="w-3.5 h-3.5" />
+          </button>
+        )}
+        {actions.copySessionId && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onCopyId(session);
+            }}
+            className="p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
+            title={`Copy session ID: ${session.sessionId}`}
+          >
+            <Copy className="w-3 h-3" />
+          </button>
+        )}
       </div>
 
       {/* Context menu */}
@@ -790,33 +868,39 @@ function SessionCardInner({
             </div>
           ) : (
             <>
-              <button
-                onClick={() => {
-                  onResume(session);
-                  setContextMenu(null);
-                }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-              >
-                <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
-              </button>
-              <button
-                onClick={() => {
-                  onViewTranscript(session);
-                  setContextMenu(null);
-                }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-              >
-                <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
-              </button>
-              <button
-                onClick={() => {
-                  onCopyId(session);
-                  setContextMenu(null);
-                }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-              >
-                <Copy className="w-3 h-3" /> Copy Session ID
-              </button>
+              {actions.resume && (
+                <button
+                  onClick={() => {
+                    onResume(session);
+                    setContextMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+                >
+                  <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
+                </button>
+              )}
+              {actions.viewTranscript && (
+                <button
+                  onClick={() => {
+                    onViewTranscript(session);
+                    setContextMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+                >
+                  <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
+                </button>
+              )}
+              {actions.copySessionId && (
+                <button
+                  onClick={() => {
+                    onCopyId(session);
+                    setContextMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+                >
+                  <Copy className="w-3 h-3" /> Copy Session ID
+                </button>
+              )}
               {canPromote && !promoted && (
                 <button
                   onClick={(e) => {
@@ -851,7 +935,7 @@ function SessionCardInner({
                   Commit Progress
                 </button>
               )}
-              <div className="my-1 h-px bg-[#2a2d3d]" />
+              {actions.resume && <div className="my-1 h-px bg-[#2a2d3d]" />}
               <button
                 onClick={() => {
                   onTogglePin(session.sessionId);
@@ -872,7 +956,7 @@ function SessionCardInner({
                 <Tag className="w-3 h-3 text-[#73daca]" />
                 {sessionLabel ? "Edit Label" : "Add Label"}
               </button>
-              {!selectionMode && (
+              {!selectionMode && actions.bulkSelect && (
                 <button
                   onClick={() => {
                     onToggleSelect(session.sessionId);

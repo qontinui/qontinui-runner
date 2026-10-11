@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout";
-import type { LayoutRequestSource } from "./terminalWorkMode";
+import { stepShownTab, type LayoutRequestSource, type TerminalWorkMode } from "./terminalWorkMode";
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { deliverApprovals } from "./approveAll";
@@ -16,7 +16,7 @@ import { isSurfaceVisible } from "@/lib/surfaceVisible";
 
 interface UseKeyboardShortcutsParams {
   activeId: string | null;
-  tabs: Array<{ id: string }>;
+  tabs: Array<{ id: string; isAlive?: boolean }>;
   dispatch: React.Dispatch<UIAction>;
   swapSource: number | null;
   selectedZones: Set<number>;
@@ -38,6 +38,10 @@ interface UseKeyboardShortcutsParams {
     setMaximizedZone: (idx: number | null) => void;
     setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
     assignTabToZone: (idx: number, tabId: string) => void;
+    /** tmux mode shows one session (zone 0); the cyclers swap it. */
+    workMode: TerminalWorkMode;
+    shownTabId: string | null;
+    requestReveal: (tabId: string) => void;
   };
   sessionStates: Record<string, SessionState>;
   handleRestartInZone: (zoneIdx: number) => void;
@@ -121,6 +125,15 @@ export function useKeyboardShortcuts({
   surfaceRef,
 }: UseKeyboardShortcutsParams) {
   useEffect(() => {
+    // tmux mode's swap: the same assignment a session-manager click makes
+    // (`planTabReveal` → zone 0 under the pinned `single` layout), so the
+    // MRU bookkeeping in `useZoneLayout` sees it, plus the keyboard handoff.
+    const swapTo = (tabId: string | null) => {
+      if (!tabId) return;
+      zoneLayout.assignTabToZone(0, tabId);
+      zoneLayout.requestReveal(tabId);
+    };
+
     // Every `Ctrl+Shift+<key>` test below goes through `isCtrlShiftChord`,
     // which lowercases both sides. A literal `e.key === "T"` is a CapsLock
     // trap: with CapsLock on, Shift INVERTS the case, so the browser
@@ -151,7 +164,10 @@ export function useKeyboardShortcuts({
       const cyclePrev = matchesChord(e, GLOBAL_CHORDS.cyclePrev);
       if (matchesChord(e, GLOBAL_CHORDS.cycleNext) || cyclePrev) {
         e.preventDefault();
-        if (zoneLayout.isMultiZone) {
+        if (zoneLayout.workMode === "tmux") {
+          // One session on screen: cycling swaps the next live tab in, wrapping.
+          swapTo(stepShownTab(tabs, zoneLayout.shownTabId, cyclePrev ? -1 : 1));
+        } else if (zoneLayout.isMultiZone) {
           if (cyclePrev) {
             zoneLayout.focusPrevZone();
           } else {
@@ -166,6 +182,21 @@ export function useKeyboardShortcuts({
       }
       if (isCtrlShiftChord(e, "n")) {
         e.preventDefault();
+        if (zoneLayout.workMode === "tmux") {
+          // The off-screen tabs are in no zone, so the zone walk cannot reach
+          // them: walk the tab list instead, needs-input first, then error —
+          // the same fallback `focusNextNeedsInput` applies in grid mode.
+          swapTo(
+            stepShownTab(
+              tabs,
+              zoneLayout.shownTabId,
+              1,
+              (id) => sessionStates[id] === "needs-input",
+            ) ??
+              stepShownTab(tabs, zoneLayout.shownTabId, 1, (id) => sessionStates[id] === "error"),
+          );
+          return;
+        }
         zoneLayout.focusNextNeedsInput(sessionStates);
         return;
       }
@@ -376,8 +407,11 @@ export function useKeyboardShortcuts({
       if (isCtrlShiftChord(e, "j")) {
         e.preventDefault();
         if (sessionManager) {
+          // Transcript rows only: a tab-sourced row is a live tab with
+          // nothing to resume (`sessionManagerLiveRows.ts`).
           const frozen = sessionManager.sessions.find(
-            (s: { liveStatus: string }) => s.liveStatus === "frozen",
+            (s: { liveStatus: string; source: string }) =>
+              s.source === "transcript" && s.liveStatus === "frozen",
           );
           if (frozen) {
             // Pass the full session object (includes _transcript) to resumeSession

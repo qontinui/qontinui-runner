@@ -121,6 +121,32 @@ export function reconcileTmuxAssignments(
   return { 0: next };
 }
 
+/**
+ * tmux mode's cycler: the next live tab after `shownTabId` in `tabs` order
+ * (`direction` 1) or before it (-1), wrapping, that satisfies `matches` — the
+ * tab list counterpart of `findNextZone`, since in tmux mode only zone 0
+ * exists and the off-screen tabs are in no zone at all. The shown tab itself
+ * is never the answer: `null` means there is nowhere to swap to. With no shown
+ * tab the walk starts before the first tab (or after the last, going back).
+ */
+export function stepShownTab(
+  tabs: readonly { id: string; isAlive?: boolean }[],
+  shownTabId: string | null,
+  direction: 1 | -1 = 1,
+  matches: (tabId: string) => boolean = () => true,
+): string | null {
+  const n = tabs.length;
+  if (n === 0) return null;
+  const found = shownTabId === null ? -1 : tabs.findIndex((t) => t.id === shownTabId);
+  const start = found >= 0 ? found : direction === 1 ? -1 : n;
+  for (let i = 1; i <= n; i++) {
+    const tab = tabs[(((start + direction * i) % n) + n) % n];
+    if (tab.id === shownTabId || tab.isAlive === false) continue;
+    if (matches(tab.id)) return tab.id;
+  }
+  return null;
+}
+
 /** The grid the operator left when entering tmux mode. */
 export interface GridSnapshot {
   layoutId: string;
