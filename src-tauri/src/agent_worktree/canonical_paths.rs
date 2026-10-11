@@ -630,7 +630,7 @@ pub fn allocated_worktree_for_path(path: &Path) -> Option<PathBuf> {
 /// Pure core of [`allocated_worktree_for_path`], with the worktree root and the
 /// liveness probe injected so it is unit-testable without touching the
 /// environment or the filesystem.
-fn allocated_worktree_for_path_in(worktree_root: &Path, path: &Path) -> Option<PathBuf> {
+pub(crate) fn allocated_worktree_for_path_in(worktree_root: &Path, path: &Path) -> Option<PathBuf> {
     allocated_worktree_for_path_with(worktree_root, path, |p| p.join(".git").exists())
 }
 
