@@ -1604,3 +1604,114 @@ mod stack_reserve_tests {
         assert!(stack_values("no reserve here").is_empty());
     }
 }
+
+/// `scripts/dev-tokio-console.{sh,ps1}` re-state the `[target.*] rustflags` of
+/// `.cargo/config.toml`, because the `CARGO_ENCODED_RUSTFLAGS` they set replaces
+/// them. `stack_reserve_tests` pins only the `/STACK` value; this pins every
+/// flag, so a flag added to or removed from the config (the Windows remap pair
+/// moving to the per-machine `$CARGO_HOME/config.toml` was one) cannot leave the
+/// scripts building with a different set.
+#[cfg(test)]
+mod tokio_console_rustflags_tests {
+    const CONFIG: &str = include_str!(".cargo/config.toml");
+    const SH: &str = include_str!("../scripts/dev-tokio-console.sh");
+    const PS1: &str = include_str!("../scripts/dev-tokio-console.ps1");
+
+    /// `[target.<triple>] rustflags` from `.cargo/config.toml`.
+    fn config_rustflags(triple: &str) -> Vec<String> {
+        let config: toml::Value = toml::from_str(CONFIG).expect(".cargo/config.toml parses");
+        config["target"][triple]["rustflags"]
+            .as_array()
+            .unwrap_or_else(|| panic!("config.toml has no [target.{triple}] rustflags"))
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("rustflags entries are strings")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The `quote`-delimited tokens of the list that opens with `open` after
+    /// `branch` and closes on the first line that is only `)`.
+    fn script_branch_flags(script: &str, branch: &str, open: &str, quote: char) -> Vec<String> {
+        let after_branch = &script[script
+            .find(branch)
+            .unwrap_or_else(|| panic!("script has no `{branch}` branch"))..];
+        let list = &after_branch[after_branch
+            .find(open)
+            .unwrap_or_else(|| panic!("`{branch}` branch has no `{open}`"))
+            + open.len()..];
+        let body: String = list
+            .lines()
+            .take_while(|line| line.trim() != ")")
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Anything outside the quotes must be separators, or an unquoted flag
+        // would slip past the comparison unread.
+        for gap in body.split(quote).step_by(2) {
+            assert!(
+                gap.chars().all(|c| c.is_whitespace() || c == ','),
+                "`{branch}` list has unquoted text {gap:?}"
+            );
+        }
+        body.split(quote)
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn sh(branch: &str) -> Vec<String> {
+        script_branch_flags(SH, branch, "FLAGS=(", '"')
+    }
+
+    fn ps1(branch: &str) -> Vec<String> {
+        script_branch_flags(PS1, branch, "$flags = @(", '\'')
+    }
+
+    #[test]
+    fn windows_branches_restate_the_msvc_rustflags() {
+        let config = config_rustflags("x86_64-pc-windows-msvc");
+        assert_eq!(sh("*windows-msvc*)"), config, "dev-tokio-console.sh");
+        assert_eq!(
+            ps1("-like '*windows-msvc*'"),
+            config,
+            "dev-tokio-console.ps1"
+        );
+    }
+
+    #[test]
+    fn linux_branches_restate_the_linux_gnu_rustflags() {
+        let config = config_rustflags("x86_64-unknown-linux-gnu");
+        assert_eq!(sh("*linux-gnu*)"), config, "dev-tokio-console.sh");
+        assert_eq!(ps1("-like '*linux-gnu*'"), config, "dev-tokio-console.ps1");
+    }
+
+    /// The scripts' one `*linux-gnu*` branch serves both Linux triples, which is
+    /// only right while the config gives them the same flags.
+    #[test]
+    fn both_linux_triples_share_one_flag_set() {
+        assert_eq!(
+            config_rustflags("aarch64-unknown-linux-gnu"),
+            config_rustflags("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn script_branch_flags_reads_one_branch_only() {
+        let script = "a)\n  L=(\n    \"x\" \"y z\"\n  )\nb)\n  L=(\n    \"w\"\n  )\n";
+        assert_eq!(
+            script_branch_flags(script, "a)", "L=(", '"'),
+            vec!["x", "y z"]
+        );
+        assert_eq!(script_branch_flags(script, "b)", "L=(", '"'), vec!["w"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unquoted text")]
+    fn script_branch_flags_refuses_an_unquoted_flag() {
+        let script = "a)\n  L=(\n    \"x\" --cfg foo\n  )\n";
+        script_branch_flags(script, "a)", "L=(", '"');
+    }
+}

@@ -55,13 +55,15 @@ $srcTauri = Join-Path (Split-Path -Parent $scriptDir) 'src-tauri'
 
 $hostTriple = (& rustc -vV | Select-String -Pattern '^host: ').ToString() -replace '^host: ', ''
 
-# Keep in sync with src-tauri/.cargo/config.toml [target.*] rustflags. The
-# /STACK value is pinned by build.rs `stack_reserve_tests`.
+# Each branch is exactly the matching src-tauri/.cargo/config.toml
+# [target.*] rustflags; build.rs `tokio_console_rustflags_tests` fails
+# `cargo test` when they drift. The Windows workspace-root remap lives in each
+# machine's $CARGO_HOME/config.toml, which CARGO_ENCODED_RUSTFLAGS also
+# replaces -- so it is absent here, costing only sccache path reuse on a build
+# that already invalidates the cache.
 if ($hostTriple -like '*windows-msvc*') {
     $flags = @(
-        '-C', 'link-args=/STACK:8388608 /Brepro',
-        '--remap-path-prefix=D:/qontinui-root.wt=/qontinui',
-        '--remap-path-prefix=D:/qontinui-root=/qontinui'
+        '-C', 'link-args=/STACK:8388608 /Brepro'
     )
 } elseif ($hostTriple -like '*linux-gnu*') {
     $flags = @(
