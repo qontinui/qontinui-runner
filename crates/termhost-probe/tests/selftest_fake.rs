@@ -1,0 +1,146 @@
+//! The selftest's gates against an in-memory desktop (`common`): every check
+//! passes when the desktop behaves, and each fault the selftest exists to
+//! catch fails exactly the gate that watches for it. The selftest on a real
+//! display runs in CI (Xvfb and windows-latest); this proves its verdict logic
+//! everywhere, without a display, and proves each gate CAN fail (policy
+//! testing/a-test-must-be-able-to-fail).
+
+mod common;
+
+use common::{FakeHost, Faults};
+use termhost_probe::records::{CheckRecord, Sink};
+use termhost_probe::selftest::{run, SelftestConfig, SelftestOutcome};
+
+/// The default configuration shortened to what the fake needs: two delays,
+/// five markers each, five keys; the hang freeze still exceeds the 2 s hang
+/// threshold and the occlusion still spans enough 500 ms intervals.
+fn quick() -> SelftestConfig {
+    SelftestConfig {
+        delays_ms: vec![0, 50],
+        markers_per_delay: 5,
+        keys: 5,
+        key_interval_ms: 60,
+        hang_freeze_ms: 2600,
+        occlusion_ms: 4500,
+        os_hung_freeze_ms: 1200,
+        ..SelftestConfig::default()
+    }
+}
+
+fn run_with(faults: Faults) -> SelftestOutcome {
+    let mut host = FakeHost::new(faults);
+    run(&mut host, &quick(), &mut Sink::discard())
+}
+
+fn find<'a>(o: &'a SelftestOutcome, name: &str) -> &'a CheckRecord {
+    o.checks
+        .iter()
+        .find(|c| c.check == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "no check {name}; checks: {:?}",
+                o.checks.iter().map(|c| &c.check).collect::<Vec<_>>()
+            )
+        })
+}
+
+fn report(o: &SelftestOutcome) -> String {
+    o.checks
+        .iter()
+        .map(|c| {
+            format!(
+                "{} gated={} passed={:?}: {}",
+                c.check, c.gated, c.passed, c.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The gates a working desktop must pass — one per phase, so a selftest that
+/// silently skipped a phase cannot pass this test. (`selftest_window` and
+/// `input_listener` are recorded only when they fail, so they are not here.)
+const KEY_CHECKS: [&str; 11] = [
+    "clock_aligned",
+    "process_sampler",
+    "selftest_window_foreground",
+    "capture_visible.wgc",
+    "output_latency.wgc.d0",
+    "output_latency.wgc.d50",
+    "hang_detected",
+    "input_round_trip",
+    "untagged_injection_aborts",
+    "occlusion_reported",
+    "os_not_responding_detected",
+];
+
+#[test]
+fn passes_on_a_well_behaved_desktop() {
+    let o = run_with(Faults::default());
+    for name in KEY_CHECKS {
+        let c = find(&o, name);
+        assert!(c.gated, "{name} is not gated:\n{}", report(&o));
+        assert_eq!(c.passed, Some(true), "{name} failed:\n{}", report(&o));
+    }
+    assert_eq!(o.exit_code, 0, "{}\n{}", o.summary, report(&o));
+}
+
+/// Run with `faults` and require the selftest to fail, with `gate` among the
+/// failed gated checks.
+fn must_fail(faults: Faults, gate: &str) {
+    let o = run_with(faults);
+    let c = find(&o, gate);
+    assert!(c.gated, "{gate} is not gated:\n{}", report(&o));
+    assert_eq!(
+        c.passed,
+        Some(false),
+        "{gate} passed under {faults:?}:\n{}",
+        report(&o)
+    );
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
+}
+
+#[test]
+fn fails_when_capture_lags_the_paint() {
+    // Every frame stamped 40 ms late: more than one 16.7 ms refresh interval.
+    must_fail(
+        Faults {
+            capture_lag_ms: 40,
+            ..Faults::default()
+        },
+        "output_latency.wgc.d0",
+    );
+}
+
+#[test]
+fn fails_when_the_listener_misses_an_untagged_injection() {
+    must_fail(
+        Faults {
+            deaf_to_foreign: true,
+            ..Faults::default()
+        },
+        "untagged_injection_aborts",
+    );
+}
+
+#[test]
+fn fails_when_occlusion_goes_unreported() {
+    must_fail(
+        Faults {
+            occlusion_blind: true,
+            ..Faults::default()
+        },
+        "occlusion_reported",
+    );
+}
+
+#[test]
+fn fails_when_keys_are_lost() {
+    must_fail(
+        Faults {
+            drop_keys: true,
+            ..Faults::default()
+        },
+        "input_round_trip",
+    );
+}
