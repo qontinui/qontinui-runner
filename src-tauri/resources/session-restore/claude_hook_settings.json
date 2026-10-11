@@ -33,6 +33,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(*rm *)",
+            "command": "bash '@@BASH_GUARD_HOOK_SCRIPT@@'"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
