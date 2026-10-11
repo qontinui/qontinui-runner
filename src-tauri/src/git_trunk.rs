@@ -51,7 +51,7 @@ pub(crate) const TRUNK_GIT_SUBCOMMANDS: &[&str] = &["symbolic-ref", "rev-parse"]
 
 // The ONE repository-local list and scrub — lib-side in
 // `qontinui_runner_lib::git_posture`, because `process_helpers::no_window`
-// (compiled into both crates) applies the same scrub to every git the runner
+// (owned by the lib, re-exported to the bin) applies the same scrub to every git the runner
 // starts.
 use qontinui_runner_lib::git_posture::scrub_repo_local_git_env;
 

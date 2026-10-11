@@ -168,8 +168,8 @@ pub fn prompt_proof_git_env() -> Vec<(String, String)> {
 ///
 /// Lives here, beside the credential posture, because it has consumers on both
 /// sides of the lib/bin split: [`crate::process_helpers::no_window`] /
-/// [`crate::process_helpers::tokio_no_window`] (compiled into BOTH crates)
-/// apply it to every git subprocess the runner starts, and the bin-only
+/// [`crate::process_helpers::tokio_no_window`] (owned by the lib and
+/// re-exported to the bin) apply it to every git subprocess the runner starts, and the bin-only
 /// `git_trunk` resolver applies it to the commands its seam tests hand it.
 pub const REPO_LOCAL_GIT_ENV: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",

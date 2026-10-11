@@ -56,25 +56,19 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
 /// A git command that can only ever address the repository its caller names
 /// and whose messages are the untranslated C-locale text.
 ///
-/// The caller's repository environment (`GIT_DIR`, `GIT_WORK_TREE`,
-/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-/// `GIT_COMMON_DIR`) is removed, so an inherited value can never redirect a
+/// The caller's whole repository-local environment
+/// ([`qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV`] — `GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`, the object-store variables and the rest)
+/// is removed through the ONE scrub, so an inherited value can never redirect a
 /// read or a fetch at some other repository — or borrow its object store —
 /// and `LC_ALL` / `LANGUAGE` are `C`, so a stderr match is never defeated by a
 /// translation. [`no_window`] also applies the prompt-proof git posture, so a
 /// credential prompt fails instead of blocking.
 pub fn scrubbed_git(program: &std::ffi::OsStr) -> std::process::Command {
     let mut cmd = no_window(program);
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-    ] {
-        cmd.env_remove(var);
-    }
+    // Unconditional (no_window scrubs only when `program` is git): the same
+    // single list, so this constructor cannot drift from it.
+    qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
     cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
     cmd
 }
