@@ -514,6 +514,10 @@ export function useTerminalPages() {
   );
   // The keep-one-page rule in `closeEmptyPages` must run against what the strip
   // actually shows, not `pages` (which includes the hidden empty "default").
+  const emptyPageCount = useMemo(
+    () => emptyPageIds(visiblePages, occupiedPageIds).length,
+    [visiblePages, occupiedPageIds],
+  );
   const visiblePagesRef = useRef(visiblePages);
   useEffect(() => {
     visiblePagesRef.current = visiblePages;
@@ -848,6 +852,8 @@ export function useTerminalPages() {
     openPage,
     removePage,
     closeEmptyPages,
+    /** Tabs the Close-empty button would close, per the last-known occupancy (a hint; the click re-reads). */
+    emptyPageCount,
     renamePage,
     reorderPage,
     setPageDefaultWorkingDir,
