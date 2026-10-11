@@ -64,6 +64,7 @@ import {
   PROMPTS_PANEL_GEOMETRY,
   REVIEW_PANEL_GEOMETRY,
   toggleZonePanel,
+  type ZonePanelKind,
   promptsPanelAvailable,
   promptsPanelOrientation,
   promptsStripHeight,
@@ -80,6 +81,12 @@ import {
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
 import { useTabHotSlice } from "./useTerminalHotStore";
+import {
+  decodePromptOverrides,
+  getPromptsViewGlobal,
+  usePromptsViewGlobal,
+  type StoredPromptOverrides,
+} from "./promptsViewGlobal";
 
 export type ViewMode = "auto" | "full" | "compact";
 
@@ -88,8 +95,12 @@ export function promptTabsStorageKey(pageId: string): string {
   return pageKey(pageId, "zone-prompt-tabs");
 }
 
-function loadPromptTabs(pageId: string): Set<string> {
-  return new Set(instanceStorage.getJSON<string[]>(promptTabsStorageKey(pageId), []));
+/** A page's per-session overrides of the global prompts-view default. */
+function loadPromptOverrides(pageId: string, epoch: number): Set<string> {
+  return decodePromptOverrides(
+    instanceStorage.getJSON<unknown>(promptTabsStorageKey(pageId), null),
+    epoch,
+  );
 }
 
 /** Per-page storage key for the set of tabs showing their review panel. */
@@ -98,13 +109,19 @@ export function reviewTabsStorageKey(pageId: string): string {
 }
 
 interface PanelTabs {
+  /** The global prompts-view epoch `prompts` was loaded or written under. */
+  epoch: number;
+  /** Tabs whose prompts panel differs from the global default. */
   prompts: ReadonlySet<string>;
   review: ReadonlySet<string>;
 }
 
-function loadPanelTabs(pageId: string): PanelTabs {
+const NO_PROMPT_OVERRIDES: ReadonlySet<string> = new Set();
+
+function loadPanelTabs(pageId: string, epoch: number): PanelTabs {
   return {
-    prompts: loadPromptTabs(pageId),
+    epoch,
+    prompts: loadPromptOverrides(pageId, epoch),
     review: new Set(instanceStorage.getJSON<string[]>(reviewTabsStorageKey(pageId), [])),
   };
 }
@@ -335,13 +352,26 @@ function ZoneGridInner({
   // the zone and gets migrated on layout change). Persisted per page so a
   // reopened window comes back with the same panels showing.
   //
+  // What is stored for prompts is the set of tabs that DIFFER from the global
+  // prompts-view default (`promptsViewGlobal.ts`), tagged with the epoch it
+  // was written under: flipping the global switch bumps the epoch, which voids
+  // every page's prompts overrides at once (review state is untouched).
+  //
   // The review panel (`SessionReviewPanel`) shares the same overlay slot, so
-  // both open-sets live in one state and `toggleZonePanel` keeps them
-  // mutually exclusive per tab.
-  const [panelTabs, setPanelTabs] = useState<PanelTabs>(() => loadPanelTabs(pageId));
-  const promptTabs = panelTabs.prompts;
+  // both sets live in one state and `toggleZonePanel` keeps them mutually
+  // exclusive per tab.
+  const promptsGlobal = usePromptsViewGlobal();
+  const [panelTabs, setPanelTabs] = useState<PanelTabs>(() =>
+    loadPanelTabs(pageId, promptsGlobal.epoch),
+  );
+  // Read through the epoch check so the render right after a global flip
+  // already shows the new default, rather than one frame of stale overrides.
+  const liveOverrides =
+    panelTabs.epoch === promptsGlobal.epoch ? panelTabs.prompts : NO_PROMPT_OVERRIDES;
+  const isPromptsOpenForTab = (tabId: string | undefined) =>
+    !!tabId && promptsGlobal.enabled !== liveOverrides.has(tabId);
   const reviewTabs = panelTabs.review;
-  // Which page the state in `promptTabs` actually belongs to.
+  // Which page the state in `panelTabs` actually belongs to.
   //
   // ZoneGrid does NOT remount on a page switch (App.tsx dropped the
   // `key={activePageId}` remount), so `pageId` changes underneath live state:
@@ -355,18 +385,49 @@ function ZoneGridInner({
       // Adopting the new page's persisted state IS the effect; the write
       // below is skipped this pass, so the old page's Set is never persisted
       // under the new page's key.
-      setPanelTabs(loadPanelTabs(pageId));
+      setPanelTabs(loadPanelTabs(pageId, promptsGlobal.epoch));
       return;
     }
-    instanceStorage.setJSON(promptTabsStorageKey(pageId), [...panelTabs.prompts]);
+    if (panelTabs.epoch !== promptsGlobal.epoch) {
+      // A global flip voided the prompts overrides; drop them (keeping review)
+      // and let the next pass persist the empty set under the new epoch.
+      setPanelTabs((prev) => ({
+        ...prev,
+        epoch: promptsGlobal.epoch,
+        prompts: NO_PROMPT_OVERRIDES,
+      }));
+      return;
+    }
+    const stored: StoredPromptOverrides = {
+      epoch: panelTabs.epoch,
+      tabs: [...panelTabs.prompts],
+    };
+    instanceStorage.setJSON(promptTabsStorageKey(pageId), stored);
     instanceStorage.setJSON(reviewTabsStorageKey(pageId), [...panelTabs.review]);
-  }, [panelTabs, pageId]);
-  const togglePromptsForTab = useCallback((tabId: string) => {
-    setPanelTabs((prev) => toggleZonePanel(prev, tabId, "prompts"));
+  }, [panelTabs, pageId, promptsGlobal.epoch]);
+  const toggleForTab = useCallback((tabId: string, kind: ZonePanelKind, reviewAvailable = true) => {
+    setPanelTabs((prev) => {
+      // Read the global value live: a flip may not have re-rendered us yet.
+      const global = getPromptsViewGlobal();
+      const prompts = prev.epoch === global.epoch ? prev.prompts : NO_PROMPT_OVERRIDES;
+      const next = toggleZonePanel(
+        { prompts, review: prev.review },
+        tabId,
+        kind,
+        global.enabled,
+        reviewAvailable,
+      );
+      return { epoch: global.epoch, ...next };
+    });
   }, []);
-  const toggleReviewForTab = useCallback((tabId: string) => {
-    setPanelTabs((prev) => toggleZonePanel(prev, tabId, "review"));
-  }, []);
+  const togglePromptsForTab = useCallback(
+    (tabId: string, reviewAvailable: boolean) => toggleForTab(tabId, "prompts", reviewAvailable),
+    [toggleForTab],
+  );
+  const toggleReviewForTab = useCallback(
+    (tabId: string) => toggleForTab(tabId, "review"),
+    [toggleForTab],
+  );
 
   const gridRef = useRef<HTMLDivElement>(null);
   const prevLayoutIdRef = useRef(layout.id);
@@ -717,10 +778,13 @@ function ZoneGridInner({
     const tab = maximizedTab;
     // A maximized zone owns the page, so its prompts go in the full-height
     // right-hand column rather than the short strip a tiled zone gets.
-    const maximizedPromptsOpen = !!tab?.claudeSessionId && promptTabs.has(tab.id);
     const prevZone = maximizedNeighbour(-1);
     const nextZone = maximizedNeighbour(1);
     const maximizedReviewOpen = maximizedReviewAvailable && !!tab && reviewTabs.has(tab.id);
+    // Review wins the shared slot: a global "show prompts" flip can leave both
+    // nominally open for a tab that had review showing.
+    const maximizedPromptsOpen =
+      !!tab?.claudeSessionId && isPromptsOpenForTab(tab.id) && !maximizedReviewOpen;
     const maximizedPanelWidth = maximizedReviewOpen
       ? REVIEW_PANEL_GEOMETRY.rightWidthPx
       : maximizedPromptsOpen
@@ -746,7 +810,7 @@ function ZoneGridInner({
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  togglePromptsForTab(tab.id);
+                  togglePromptsForTab(tab.id, maximizedReviewAvailable);
                 }}
                 onMouseDown={(e) => e.stopPropagation()}
                 onDoubleClick={(e) => e.stopPropagation()}
@@ -825,7 +889,7 @@ function ZoneGridInner({
               projectPath={tab.workingDir}
               orientation="right"
               topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
-              onClose={() => togglePromptsForTab(tab.id)}
+              onClose={() => togglePromptsForTab(tab.id, maximizedReviewAvailable)}
             />
           )}
 
@@ -994,7 +1058,7 @@ function ZoneGridInner({
           onToggleFilterInput={toggleFilterInput}
           onSetZoneFilter={setZoneFilter}
           onClearZoneFilter={clearZoneFilter}
-          promptsOpen={promptTabs.has(assignments[zoneIdx] ?? "")}
+          promptsOpen={isPromptsOpenForTab(assignments[zoneIdx])}
           onTogglePromptsForTab={togglePromptsForTab}
           reviewOpen={reviewTabs.has(assignments[zoneIdx] ?? "")}
           onToggleReviewForTab={toggleReviewForTab}
@@ -1295,7 +1359,7 @@ function ZoneCellInner({
   onClearZoneFilter: (zoneIndex: number) => void;
   /** Is the operator's prompts panel showing for this zone's tab? */
   promptsOpen: boolean;
-  onTogglePromptsForTab: (tabId: string) => void;
+  onTogglePromptsForTab: (tabId: string, reviewAvailable: boolean) => void;
   /** Is the review panel showing for this zone's tab? (Exclusive with prompts.) */
   reviewOpen: boolean;
   onToggleReviewForTab: (tabId: string) => void;
@@ -1333,12 +1397,6 @@ function ZoneCellInner({
     [onToggleFilterInput, zoneIdx],
   );
 
-  // Same shape for the prompts toggle. `tabId` (not zoneIdx) is the key — the
-  // panel belongs to the conversation, not the tile.
-  const handleTogglePrompts = useCallback(
-    () => (tabId ? onTogglePromptsForTab(tabId) : undefined),
-    [onTogglePromptsForTab, tabId],
-  );
   const handleToggleReview = useCallback(
     () => (tabId ? onToggleReviewForTab(tabId) : undefined),
     [onToggleReviewForTab, tabId],
@@ -1416,6 +1474,13 @@ function ZoneCellInner({
     showCompactCard,
   });
   const reviewAvailable = reviewPanelAvailable(tab, promptsAvailable);
+  // Same shape for the prompts toggle. `tabId` (not zoneIdx) is the key — the
+  // panel belongs to the conversation, not the tile. `reviewAvailable` lets the
+  // toggle tell whether a review entry is actually holding the shared slot.
+  const handleTogglePrompts = useCallback(
+    () => (tabId ? onTogglePromptsForTab(tabId, reviewAvailable) : undefined),
+    [onTogglePromptsForTab, tabId, reviewAvailable],
+  );
   // The review panel and the prompts panel share one overlay slot.
   const showReviewPanel = reviewAvailable && reviewOpen;
   const showPromptsPanel = promptsAvailable && promptsOpen && !showReviewPanel;

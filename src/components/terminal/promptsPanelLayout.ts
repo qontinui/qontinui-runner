@@ -162,27 +162,48 @@ export function zoneBodyPadding(opts: {
 export type ZonePanelKind = "prompts" | "review";
 
 /**
- * Toggle `kind` for `tabId` across the two per-page open sets. Pure: returns
- * new sets (or the same set when it is unchanged), so React state can hold them.
+ * Toggle `kind` for `tabId` across the two per-page sets. Pure: returns new
+ * sets (or the same set when it is unchanged), so React state can hold them.
+ *
+ * `review` is the set of tabs showing the review panel. `prompts` is the set
+ * of tabs whose prompts panel DIFFERS from `promptsDefault` (the global
+ * prompts-view switch, `promptsViewGlobal.ts`): with the default off it is
+ * simply the open set; with it on it is the set of tabs closed by hand.
+ *
+ * Opening and closing go by what is SHOWING, not what is stored: a global
+ * "show prompts" flip can leave a tab nominally prompts-open while its review
+ * panel holds the slot. `reviewAvailable` is false where the zone cannot show
+ * review at all, so a stale review entry never hides prompts there.
  */
 export function toggleZonePanel(
   sets: { prompts: ReadonlySet<string>; review: ReadonlySet<string> },
   tabId: string,
   kind: ZonePanelKind,
+  promptsDefault = false,
+  reviewAvailable = true,
 ): { prompts: ReadonlySet<string>; review: ReadonlySet<string> } {
-  const own = sets[kind];
-  const other: ZonePanelKind = kind === "prompts" ? "review" : "prompts";
-  const opening = !own.has(tabId);
-  const nextOwn = new Set(own);
-  if (opening) nextOwn.add(tabId);
-  else nextOwn.delete(tabId);
-  let nextOther = sets[other];
-  if (opening && nextOther.has(tabId)) {
-    const copy = new Set(nextOther);
-    copy.delete(tabId);
-    nextOther = copy;
+  const flip = (set: ReadonlySet<string>): ReadonlySet<string> => {
+    const next = new Set(set);
+    if (next.has(tabId)) next.delete(tabId);
+    else next.add(tabId);
+    return next;
+  };
+  const promptsOpen = promptsDefault !== sets.prompts.has(tabId);
+  const reviewShowing = reviewAvailable && sets.review.has(tabId);
+  if (kind === "review") {
+    const opening = !sets.review.has(tabId);
+    return {
+      prompts: opening && promptsOpen ? flip(sets.prompts) : sets.prompts,
+      review: flip(sets.review),
+    };
   }
-  return kind === "prompts"
-    ? { prompts: nextOwn, review: nextOther }
-    : { prompts: nextOther, review: nextOwn };
+  if (promptsOpen && reviewShowing) {
+    // Nominally open but hidden behind review: showing it means closing review.
+    return { prompts: sets.prompts, review: flip(sets.review) };
+  }
+  const opening = !promptsOpen;
+  return {
+    prompts: flip(sets.prompts),
+    review: opening && sets.review.has(tabId) ? flip(sets.review) : sets.review,
+  };
 }
