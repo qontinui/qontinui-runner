@@ -1040,6 +1040,71 @@ impl PgDb {
         .await
         .map_err(|e| format!("scheduled_tasks.conditions self-heal failed: {}", e))?;
 
+        // project.phase_token_usage.cost_source / .cost_microusd — the
+        // sub-cent cost of an AI call and where it came from (reported by the
+        // provider vs estimated from the price table). AUTHORED by qontinui-web
+        // alembic revision `kpi_01_phase_token_usage_cost_precision` (plan
+        // 2026-10-09-kpi-telemetry-and-dashboards, Phase 0); mirrored here as a
+        // gated `ADD COLUMN IF NOT EXISTS` for the same reason as
+        // `scheduled_tasks.conditions` above — an embedded Postgres has no
+        // alembic, and `create_phase_token_usage_with_cache` writes both
+        // columns on every AI call. The alembic revision is itself
+        // `IF NOT EXISTS` and guards its two CHECKs on `pg_constraint`, as this
+        // does with the SAME constraint names, so whichever runs first the other is
+        // a no-op. Gated on the table existing and on a column being absent, so
+        // the ACCESS EXCLUSIVE `ALTER TABLE` does not run on every boot.
+        conn.batch_execute(
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'phase_token_usage'
+               ) AND (
+                 NOT EXISTS (
+                   SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'project' AND table_name = 'phase_token_usage'
+                     AND column_name = 'cost_source'
+                 ) OR NOT EXISTS (
+                   SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'project' AND table_name = 'phase_token_usage'
+                     AND column_name = 'cost_microusd'
+                 )
+               ) THEN
+                 ALTER TABLE project.phase_token_usage
+                     ADD COLUMN IF NOT EXISTS cost_source TEXT NULL,
+                     ADD COLUMN IF NOT EXISTS cost_microusd BIGINT NULL;
+               END IF;
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'project' AND table_name = 'phase_token_usage'
+                   AND column_name = 'cost_source'
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM pg_constraint
+                 WHERE conname = 'ck_phase_token_usage_cost_source'
+                   AND conrelid = to_regclass('project.phase_token_usage')
+               ) THEN
+                 ALTER TABLE project.phase_token_usage
+                     ADD CONSTRAINT ck_phase_token_usage_cost_source
+                     CHECK (cost_source IN ('reported', 'estimated'));
+               END IF;
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'project' AND table_name = 'phase_token_usage'
+                   AND column_name = 'cost_microusd'
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM pg_constraint
+                 WHERE conname = 'ck_phase_token_usage_cost_microusd_nonneg'
+                   AND conrelid = to_regclass('project.phase_token_usage')
+               ) THEN
+                 ALTER TABLE project.phase_token_usage
+                     ADD CONSTRAINT ck_phase_token_usage_cost_microusd_nonneg
+                     CHECK (cost_microusd IS NULL OR cost_microusd >= 0);
+               END IF;
+             END $$;",
+        )
+        .await
+        .map_err(|e| format!("phase_token_usage cost columns self-heal failed: {}", e))?;
+
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // atlas_managed.proposal_events. The table predates the multi-tenant
         // model, so existing rows are migrated under the bootstrap app_id

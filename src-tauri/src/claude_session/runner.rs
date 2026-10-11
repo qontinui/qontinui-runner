@@ -40,6 +40,14 @@ pub struct CliSessionOutput {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (extracted from stream-json result message).
     pub output_tokens: Option<u64>,
+    /// Prompt-cache write tokens (stream-json `usage.cache_creation_input_tokens`).
+    pub cache_creation_tokens: Option<u64>,
+    /// Prompt-cache read tokens (stream-json `usage.cache_read_input_tokens`).
+    pub cache_read_tokens: Option<u64>,
+    /// Cost the CLI itself reported for the session (stream-json `result`
+    /// event's `total_cost_usd`). `None` when the CLI did not report one —
+    /// callers then fall back to a price-table estimate.
+    pub total_cost_usd: Option<f64>,
     /// Blueprint telemetry (Phase 4): de-duplicated, order-preserving list of
     /// tool names the agentic session actually used.
     pub tools_used: Vec<String>,
@@ -58,6 +66,12 @@ pub struct CliSessionRetryOutput {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (extracted from stream-json result message).
     pub output_tokens: Option<u64>,
+    /// Prompt-cache write tokens (see [`CliSessionOutput::cache_creation_tokens`]).
+    pub cache_creation_tokens: Option<u64>,
+    /// Prompt-cache read tokens (see [`CliSessionOutput::cache_read_tokens`]).
+    pub cache_read_tokens: Option<u64>,
+    /// CLI-reported session cost (see [`CliSessionOutput::total_cost_usd`]).
+    pub total_cost_usd: Option<f64>,
     /// Blueprint telemetry (Phase 4): de-duplicated tool names used.
     pub tools_used: Vec<String>,
     /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
@@ -194,21 +208,55 @@ fn push_tool_used(acc: &mut Vec<String>, tool_name: &str) {
     }
 }
 
-/// Extract token usage from a Claude CLI stream-json result message.
-/// The result message contains `usage.input_tokens` and `usage.output_tokens`.
-fn extract_usage_from_stream_json(json_line: &str) -> Option<(u64, u64)> {
+/// Token usage and reported cost carried by a Claude CLI stream-json
+/// `result` event — the end-of-session summary line.
+///
+/// The token counts are the `usage` object, read through the one stream-json
+/// usage shape ([`crate::claude_protocol::types::UsageInfo`]); the cost is the
+/// event's own `total_cost_usd`, which is what the CLI bills the session at.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StreamJsonUsage {
+    pub input: u64,
+    pub output: u64,
+    /// `usage.cache_creation_input_tokens` (0 when absent).
+    pub cache_creation: u64,
+    /// `usage.cache_read_input_tokens` (0 when absent).
+    pub cache_read: u64,
+    /// `total_cost_usd`, when the CLI reported a finite, non-negative value.
+    /// `None` is "not reported", never "free".
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Extract token usage (all four counters) and the reported session cost from
+/// a Claude CLI stream-json `result` message.
+///
+/// Returns `None` for any other line, and for a `result` line that carries no
+/// `usage.input_tokens` / `usage.output_tokens` (the two counters every
+/// result reports — without them there is nothing to record).
+fn extract_usage_from_stream_json(json_line: &str) -> Option<StreamJsonUsage> {
     let parsed: serde_json::Value = serde_json::from_str(json_line).ok()?;
     if parsed.get("type")?.as_str()? != "result" {
         return None;
     }
     // Usage can be at result.usage (object result) or top-level usage
-    let usage = parsed
-        .get("result")
+    let nested_result = parsed.get("result").filter(|r| r.is_object());
+    let usage_value = nested_result
         .and_then(|r| r.get("usage"))
         .or_else(|| parsed.get("usage"))?;
-    let input = usage.get("input_tokens")?.as_u64()?;
-    let output = usage.get("output_tokens")?.as_u64()?;
-    Some((input, output))
+    let usage: crate::claude_protocol::types::UsageInfo =
+        serde_json::from_value(usage_value.clone()).ok()?;
+    let total_cost_usd = parsed
+        .get("total_cost_usd")
+        .or_else(|| nested_result.and_then(|r| r.get("total_cost_usd")))
+        .and_then(|v| v.as_f64())
+        .filter(|c| c.is_finite() && *c >= 0.0);
+    Some(StreamJsonUsage {
+        input: usage.input_tokens?,
+        output: usage.output_tokens?,
+        cache_creation: usage.cache_creation_input_tokens.unwrap_or(0),
+        cache_read: usage.cache_read_input_tokens.unwrap_or(0),
+        total_cost_usd,
+    })
 }
 
 /// Extract text from Claude CLI stream-json output line
@@ -863,7 +911,7 @@ fn run_claude_session_inline(
     };
 
     // Shared token usage buffer — survives stdout thread join timeout
-    let shared_usage: Arc<std::sync::Mutex<Option<(u64, u64)>>> =
+    let shared_usage: Arc<std::sync::Mutex<Option<StreamJsonUsage>>> =
         Arc::new(std::sync::Mutex::new(None));
     let shared_usage_for_thread = shared_usage.clone();
 
@@ -899,7 +947,7 @@ fn run_claude_session_inline(
         };
 
         // Track token usage from the CLI result message
-        let mut session_usage: Option<(u64, u64)> = None;
+        let mut session_usage: Option<StreamJsonUsage> = None;
 
         // Buffer to accumulate text until we have complete lines for finding/progress parsing.
         // Stream-json sends partial text chunks (content_block_delta), so markers like
@@ -2008,7 +2056,7 @@ fn run_claude_session_inline(
     // On Windows the handle close above should make this return immediately, but
     // the timeout acts as a safety net.
     let (all_output, cli_token_usage) = {
-        let (join_tx, join_rx) = mpsc::channel::<(String, Option<(u64, u64)>)>();
+        let (join_tx, join_rx) = mpsc::channel::<(String, Option<StreamJsonUsage>)>();
         let _ = thread::spawn(move || {
             let result = stdout_handle
                 .join()
@@ -2198,19 +2246,18 @@ fn run_claude_session_inline(
         }));
     }
 
-    let (cli_input_tokens, cli_output_tokens) = match cli_token_usage {
-        Some((input, output)) => {
-            info!(
-                "Session {} token usage: input={}, output={}, total={}",
-                session_id,
-                input,
-                output,
-                input + output
-            );
-            (Some(input), Some(output))
-        }
-        None => (None, None),
-    };
+    if let Some(usage) = cli_token_usage {
+        info!(
+            "Session {} token usage: input={}, output={}, cache_create={}, cache_read={}, total={}, reported_cost_usd={:?}",
+            session_id,
+            usage.input,
+            usage.output,
+            usage.cache_creation,
+            usage.cache_read,
+            usage.input + usage.output,
+            usage.total_cost_usd
+        );
+    }
 
     info!(
         "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}, reflection_fixes={}, injected_steps={}",
@@ -2248,8 +2295,11 @@ fn run_claude_session_inline(
         success,
         output: all_output,
         injected_steps,
-        input_tokens: cli_input_tokens,
-        output_tokens: cli_output_tokens,
+        input_tokens: cli_token_usage.map(|u| u.input),
+        output_tokens: cli_token_usage.map(|u| u.output),
+        cache_creation_tokens: cli_token_usage.map(|u| u.cache_creation),
+        cache_read_tokens: cli_token_usage.map(|u| u.cache_read),
+        total_cost_usd: cli_token_usage.and_then(|u| u.total_cost_usd),
         tools_used: tools_used_final,
         tools_rejected,
     })
@@ -2320,6 +2370,9 @@ pub fn run_claude_session_with_retry(
                 injected_steps: result.injected_steps,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_read_tokens: result.cache_read_tokens,
+                total_cost_usd: result.total_cost_usd,
                 tools_used: result.tools_used,
                 tools_rejected: result.tools_rejected,
             });
@@ -2386,6 +2439,9 @@ pub fn run_claude_session_with_retry(
                     injected_steps: cli_output.injected_steps,
                     input_tokens: cli_output.input_tokens,
                     output_tokens: cli_output.output_tokens,
+                    cache_creation_tokens: cli_output.cache_creation_tokens,
+                    cache_read_tokens: cli_output.cache_read_tokens,
+                    total_cost_usd: cli_output.total_cost_usd,
                     tools_used: cli_output.tools_used,
                     tools_rejected: cli_output.tools_rejected,
                 });
@@ -2589,6 +2645,9 @@ pub fn run_claude_session_interactive(
         injected_steps: Vec::new(),
         input_tokens: None,
         output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+        total_cost_usd: None,
         tools_used: Vec::new(),
         tools_rejected: Vec::new(),
     })
@@ -2648,6 +2707,9 @@ pub fn run_claude_session_interactive_with_retry(
                 injected_steps: result.injected_steps,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_read_tokens: result.cache_read_tokens,
+                total_cost_usd: result.total_cost_usd,
                 tools_used: result.tools_used,
                 tools_rejected: result.tools_rejected,
             });
@@ -2707,6 +2769,9 @@ pub fn run_claude_session_interactive_with_retry(
                     injected_steps: cli_output.injected_steps,
                     input_tokens: cli_output.input_tokens,
                     output_tokens: cli_output.output_tokens,
+                    cache_creation_tokens: cli_output.cache_creation_tokens,
+                    cache_read_tokens: cli_output.cache_read_tokens,
+                    total_cost_usd: cli_output.total_cost_usd,
                     tools_used: cli_output.tools_used,
                     tools_rejected: cli_output.tools_rejected,
                 });
@@ -2768,6 +2833,96 @@ pub fn run_claude_session_interactive_with_retry(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_extraction_tests {
+    use super::{extract_usage_from_stream_json, StreamJsonUsage};
+
+    /// A recorded `claude -p --output-format stream-json --verbose` session:
+    /// init, three assistant messages (two sharing one API message id, as the
+    /// CLI emits them per content block), a tool result, and the terminal
+    /// `result` event that carries the session totals.
+    const RECORDED_SESSION: &str = include_str!("fixtures/stream_json_session_with_cache.jsonl");
+
+    /// What the stdout loop in `run_claude_session_inline` does: the first
+    /// line that yields usage wins.
+    fn first_usage(transcript: &str) -> Option<StreamJsonUsage> {
+        transcript.lines().find_map(extract_usage_from_stream_json)
+    }
+
+    #[test]
+    fn recorded_session_yields_all_four_counts_and_reported_cost() {
+        let usage = first_usage(RECORDED_SESSION).expect("the result event carries usage");
+        assert_eq!(
+            usage,
+            StreamJsonUsage {
+                input: 11,
+                output: 397,
+                cache_creation: 6402,
+                cache_read: 31002,
+                total_cost_usd: Some(0.03689355),
+            }
+        );
+    }
+
+    #[test]
+    fn only_the_result_event_is_read() {
+        // Assistant lines carry per-message `usage` too; reading one of those
+        // would record a single turn as the whole session.
+        for line in RECORDED_SESSION
+            .lines()
+            .filter(|l| !l.contains(r#""type":"result""#))
+        {
+            assert_eq!(extract_usage_from_stream_json(line), None, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn missing_cache_counters_read_as_zero_and_missing_cost_as_none() {
+        let line = r#"{"type":"result","subtype":"success","usage":{"input_tokens":120,"output_tokens":30}}"#;
+        assert_eq!(
+            extract_usage_from_stream_json(line),
+            Some(StreamJsonUsage {
+                input: 120,
+                output: 30,
+                cache_creation: 0,
+                cache_read: 0,
+                total_cost_usd: None,
+            })
+        );
+    }
+
+    #[test]
+    fn nested_object_result_usage_and_cost_are_read() {
+        let line = r#"{"type":"result","result":{"usage":{"input_tokens":5,"output_tokens":6,"cache_read_input_tokens":7},"total_cost_usd":0.0002}}"#;
+        assert_eq!(
+            extract_usage_from_stream_json(line),
+            Some(StreamJsonUsage {
+                input: 5,
+                output: 6,
+                cache_creation: 0,
+                cache_read: 7,
+                total_cost_usd: Some(0.0002),
+            })
+        );
+    }
+
+    #[test]
+    fn a_negative_reported_cost_is_not_a_cost() {
+        let line = r#"{"type":"result","total_cost_usd":-1.0,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        assert_eq!(
+            extract_usage_from_stream_json(line).and_then(|u| u.total_cost_usd),
+            None
+        );
+    }
+
+    #[test]
+    fn a_result_without_token_counts_yields_nothing() {
+        let line =
+            r#"{"type":"result","total_cost_usd":0.5,"usage":{"cache_read_input_tokens":9}}"#;
+        assert_eq!(extract_usage_from_stream_json(line), None);
     }
 }
 

@@ -970,6 +970,13 @@ pub enum AgenticOutcome {
         input_tokens: Option<u64>,
         /// Output tokens generated (available for API providers only).
         output_tokens: Option<u64>,
+        /// Prompt-cache write tokens, when the provider reported them.
+        cache_creation_tokens: Option<u64>,
+        /// Prompt-cache read tokens, when the provider reported them.
+        cache_read_tokens: Option<u64>,
+        /// Cost the provider itself reported (Claude CLI `total_cost_usd`).
+        /// `None` = not reported; the recorder estimates instead.
+        reported_cost_usd: Option<f64>,
         /// Blueprint telemetry (Phase 4): de-duplicated tool names used.
         tools_used: Vec<String>,
         /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
@@ -984,6 +991,13 @@ pub enum AgenticOutcome {
         input_tokens: Option<u64>,
         /// Output tokens generated (available for API providers only).
         output_tokens: Option<u64>,
+        /// Prompt-cache write tokens, when the provider reported them.
+        cache_creation_tokens: Option<u64>,
+        /// Prompt-cache read tokens, when the provider reported them.
+        cache_read_tokens: Option<u64>,
+        /// Cost the provider itself reported (Claude CLI `total_cost_usd`).
+        /// `None` = not reported; the recorder estimates instead.
+        reported_cost_usd: Option<f64>,
         /// Blueprint telemetry (Phase 4): de-duplicated tool names used.
         tools_used: Vec<String>,
         /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
@@ -1029,6 +1043,32 @@ impl AgenticOutcome {
             AgenticOutcome::Error { .. }
             | AgenticOutcome::BudgetExceeded { .. }
             | AgenticOutcome::Skipped => (None, None),
+        }
+    }
+
+    /// Prompt-cache token counts and the provider-reported cost from the AI
+    /// session: `(cache_creation_tokens, cache_read_tokens, reported_cost_usd)`.
+    pub fn cache_usage_and_reported_cost(&self) -> (Option<u64>, Option<u64>, Option<f64>) {
+        match self {
+            AgenticOutcome::Success {
+                cache_creation_tokens,
+                cache_read_tokens,
+                reported_cost_usd,
+                ..
+            }
+            | AgenticOutcome::Failed {
+                cache_creation_tokens,
+                cache_read_tokens,
+                reported_cost_usd,
+                ..
+            } => (
+                *cache_creation_tokens,
+                *cache_read_tokens,
+                *reported_cost_usd,
+            ),
+            AgenticOutcome::Error { .. }
+            | AgenticOutcome::BudgetExceeded { .. }
+            | AgenticOutcome::Skipped => (None, None, None),
         }
     }
 

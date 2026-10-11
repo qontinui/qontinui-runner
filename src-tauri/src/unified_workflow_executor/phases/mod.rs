@@ -34,8 +34,8 @@ use crate::str_utils::truncate_str_ellipsis;
 pub(super) use super::phase_helpers::{
     build_llm_metrics, check_environment_readiness, compute_embedding_sync, estimate_tokens,
     execute_prompt_response_mode, get_active_sdk_app_name, record_phase_token_usage,
-    record_phase_token_usage_with_cache, record_phase_token_usage_with_target,
-    try_auto_connect_sdk_for_ui_workflow, workflow_uses_sdk_endpoints, REFLECTION_MODE_PREAMBLE,
+    record_phase_token_usage_with_cache, try_auto_connect_sdk_for_ui_workflow,
+    workflow_uses_sdk_endpoints, REFLECTION_MODE_PREAMBLE,
 };
 
 // Phase executor submodules (extracted from this file)

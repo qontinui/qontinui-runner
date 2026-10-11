@@ -3113,6 +3113,9 @@ impl LoopController {
                 parsed: None,
                 input_tokens: None,
                 output_tokens: None,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+                reported_cost_usd: None,
                 tools_used: Vec::new(),
                 tools_rejected: Vec::new(),
             }
