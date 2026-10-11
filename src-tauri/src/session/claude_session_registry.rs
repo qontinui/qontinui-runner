@@ -131,7 +131,7 @@ pub struct LiveClaudeSession {
     pub started_at: i64,
     pub updated_at: i64,
     /// Ready-to-run in the runner pane's shell: `cd '<dir>' && <resume>`
-    /// (PowerShell `;` form on Windows), where `<resume>` names the account
+    /// (PowerShell `Set-Location -LiteralPath '<dir>'; <resume>` on Windows), where `<resume>` names the account
     /// dir explicitly (`super::past_sessions::account_resume_command`). Empty
     /// when the id or the dir cannot be rendered safely.
     ///
@@ -609,7 +609,7 @@ mod tests {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n","cwd":"/w"}"#;
         let s = parse_registry_file(json, Path::new("/home/u/.claude")).unwrap();
         let expected = if cfg!(windows) {
-            "cd '/w'; $env:CLAUDE_CONFIG_DIR=\"/home/u/.claude\"; claude --permission-mode bypassPermissions --resume abc"
+            "Set-Location -LiteralPath '/w'; $env:CLAUDE_CONFIG_DIR=\"/home/u/.claude\"; claude --permission-mode bypassPermissions --resume abc"
         } else {
             "cd '/w' && CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --permission-mode bypassPermissions --resume abc"
         };

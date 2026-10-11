@@ -58,7 +58,8 @@ export interface LiveClaudeSession {
   updatedAt: number;
   /**
    * Ready-to-run `cd '<dir>' && CLAUDE_CONFIG_DIR="<account dir>" claude --resume <id>`
-   * (PowerShell `;` / `$env:` form on a Windows runner).
+   * (PowerShell `Set-Location -LiteralPath '<dir>'; $env:CLAUDE_CONFIG_DIR=…; …` on a
+   * Windows runner).
    */
   resumeCommand: string;
 }

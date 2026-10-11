@@ -117,19 +117,29 @@ describe("resolveResumeAccount (transcript / Past Sessions resume)", () => {
       throw new Error("ipc down");
     };
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    await expect(
-      resolveResumeAccount({ claudeSessionId: "s", configDir: "/acct/x" }, failing),
-    ).resolves.toBe("/acct/x");
-    warn.mockRestore();
+    try {
+      await expect(
+        resolveResumeAccount({ claudeSessionId: "s", configDir: "/acct/x" }, failing),
+      ).resolves.toBe("/acct/x");
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("never splices an unsafe dir into the typed command", async () => {
-    await expect(
-      resolveResumeAccount(
-        { claudeSessionId: "s", configDir: "/acct/x" },
-        backendResolving('/bad";rm -rf ~'),
-      ),
-    ).resolves.toBe("/acct/x");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(
+        resolveResumeAccount(
+          { claudeSessionId: "s", configDir: "/acct/x" },
+          backendResolving('/bad";rm -rf ~'),
+        ),
+      ).resolves.toBe("/acct/x");
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

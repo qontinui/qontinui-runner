@@ -104,7 +104,8 @@ export function useApplyZoneProfile(
     // still awaiting below: the earlier call parks no more sessions and
     // spawns no further panes into this profile's grid (a pane whose spawn
     // was already in flight still opens, blank, with nothing typed into it).
-    // Sessions an earlier apply parked but never typed are dropped too.
+    // Sessions an earlier apply parked are dropped too — except any the
+    // resume effect has already taken and is typing (it cannot be recalled).
     const generation = ++generationRef.current;
     pendingRef.current = null;
 

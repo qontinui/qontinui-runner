@@ -381,9 +381,9 @@ fn resume_line_for(config_dir: Option<&str>, session_id: &str, windows: bool) ->
 }
 
 /// Join a `cd` into the session's project dir with its resume line, in the
-/// host shell's syntax: `&&` (skip the resume when the `cd` fails) on POSIX,
-/// `;` on Windows, whose runner panes are Windows PowerShell 5.1 — which has
-/// no `&&` at all.
+/// host shell's syntax: `cd '<dir>' && …` (skip the resume when the `cd`
+/// fails) on POSIX; `Set-Location -LiteralPath '<dir>'; …` on Windows, whose
+/// runner panes are Windows PowerShell 5.1 — which has no `&&` at all.
 ///
 /// `None` when the dir cannot sit inside single quotes safely (a `'` — or, for
 /// PowerShell, a typographic single quote — would close them and run the rest
@@ -399,7 +399,10 @@ pub(crate) fn cd_then_resume(working_dir: &str, resume: &str, windows: bool) -> 
         return None;
     }
     Some(if windows {
-        format!("cd '{working_dir}'; {resume}")
+        // `-LiteralPath`: a plain `cd 'X'` is `Set-Location -Path`, which reads
+        // `[...]` in the dir name as a wildcard, fails, and the `;` then runs
+        // the resume from the wrong dir.
+        format!("Set-Location -LiteralPath '{working_dir}'; {resume}")
     } else {
         format!("cd '{working_dir}' && {resume}")
     })
@@ -868,7 +871,7 @@ mod tests {
         );
         assert_eq!(
             cd_then_resume("/w", "R", true).as_deref(),
-            Some("cd '/w'; R")
+            Some("Set-Location -LiteralPath '/w'; R")
         );
         for windows in [false, true] {
             assert_eq!(
