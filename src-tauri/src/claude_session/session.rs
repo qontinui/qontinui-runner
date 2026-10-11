@@ -1431,6 +1431,23 @@ impl ClaudeSession {
         self.worktree.as_ref()
     }
 
+    /// The worktree paths of the `IsolatedEditContext` parked on this session
+    /// by [`Self::set_isolated_edit_ctx`], or empty when none is parked.
+    ///
+    /// Distinct from [`Self::worktree`]: an orchestration worker
+    /// (`dispatch_subtask`) and a resumed chat session are SPAWNED in their
+    /// allocated worktree rather than promoted into it, so the path lives only
+    /// on the parked context. A `shared_branch` row also names the canonical
+    /// checkout here, so a caller that needs "this session's own allocation"
+    /// must filter — see `SessionManager::task_run_id_for_workdir`.
+    pub fn isolated_worktree_paths(&self) -> Vec<PathBuf> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(parked_worktree_paths))
+            .unwrap_or_default()
+    }
+
     /// Send the initial prompt to start the first turn.
     /// Transitions from Ready to Processing.
     pub fn send_initial_prompt(&self, prompt: &str) -> Result<(), String> {
@@ -2198,6 +2215,19 @@ impl std::fmt::Debug for ClaudeSession {
             .field("user_interacted", &self.has_user_interacted())
             .finish()
     }
+}
+
+/// The projection [`ClaudeSession::isolated_worktree_paths`] applies to a parked
+/// context: every materialized worktree path, in order. A free function so the
+/// snapshot loop in `SessionManager::task_run_id_for_workdir` can be tested
+/// against real contexts without a live `ClaudeSession`.
+pub(crate) fn parked_worktree_paths(
+    ctx: &crate::agent_worktree::isolated_edit::IsolatedEditContext,
+) -> Vec<PathBuf> {
+    ctx.worktrees
+        .iter()
+        .map(|w| w.worktree_path.clone())
+        .collect()
 }
 
 #[cfg(test)]

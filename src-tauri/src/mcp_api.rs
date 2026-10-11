@@ -3130,6 +3130,14 @@ pub(crate) enum SelfIdOutcome {
     /// registers before it can proxy. Kept because that is a property of the
     /// spawn ordering, not a guarantee.
     NoSession,
+    /// Primary chain: SEVERAL runner-managed task runs claim the nonce's
+    /// workdir (`WorkdirTaskRun::Ambiguous`, which also covers an unreadable
+    /// session table). Refused with no header rather than handed to the
+    /// lifecycle fallback: the task runs own that workdir's calls, and the
+    /// lifecycle store holds interactive terminals, so a single admitted record
+    /// there would name a SIBLING terminal, not the caller. See
+    /// [`caller_chain_after_workdir_lookup`].
+    AmbiguousTaskRunWorkdir,
 }
 
 impl SelfIdOutcome {
@@ -3164,6 +3172,7 @@ impl SelfIdOutcome {
             Self::InjectedViaClientAssertionOverSingleCandidate => {
                 "injected_via_client_assertion_over_single_candidate"
             }
+            Self::AmbiguousTaskRunWorkdir => "ambiguous_task_run_workdir",
         }
     }
 
@@ -3209,12 +3218,13 @@ impl SelfIdOutcome {
             Self::InjectedViaClientAssertionUnrecordedTerminal => 20,
             Self::InjectedViaClientAssertionUnrecordedWorkdir => 21,
             Self::InjectedViaClientAssertionOverSingleCandidate => 22,
+            Self::AmbiguousTaskRunWorkdir => 23,
         }
     }
 
     /// Every outcome, in counter-slot order — `ALL[i].index() == i`, asserted
     /// in the tests so the two orderings cannot drift.
-    pub(crate) const ALL: [Self; 23] = [
+    pub(crate) const ALL: [Self; 24] = [
         Self::Injected,
         Self::InjectedViaTerminal,
         Self::InjectedViaLifecycle,
@@ -3238,13 +3248,14 @@ impl SelfIdOutcome {
         Self::InjectedViaClientAssertionUnrecordedTerminal,
         Self::InjectedViaClientAssertionUnrecordedWorkdir,
         Self::InjectedViaClientAssertionOverSingleCandidate,
+        Self::AmbiguousTaskRunWorkdir,
     ];
 }
 
 /// Per-outcome counters, indexed by [`SelfIdOutcome::index`] (which is the
 /// declaration order of [`SelfIdOutcome::ALL`]).
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 23] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 23]> =
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 24] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 24]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
@@ -3627,9 +3638,14 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
-    let task_run_id = app
+    let found = app
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
+        .map(|sm| sm.task_run_id_for_workdir(&workdir));
+    let task_run_id = match caller_chain_after_workdir_lookup(found) {
+        CallerWorkdirNext::TaskRun(id) => Some(id),
+        CallerWorkdirNext::TryLifecycle => None,
+        CallerWorkdirNext::Refuse(outcome) => return (None, outcome),
+    };
     match task_run_id {
         // Primary chain hit.
         Some(task_run_id) => {
@@ -3657,6 +3673,35 @@ fn resolve_caller_session_id(
         // store instead: workdir → the single admitted open record → its own
         // anchor. Every miss arrives already typed as the gate that rejected.
         None => resolve_caller_via_lifecycle(app, &workdir, client_asserted),
+    }
+}
+
+/// What the caller-identity chain does after the primary chain's workdir
+/// lookup — the pure decision, so the refusal is unit-testable without a Tauri
+/// app (the twin of the event lane's `event_lane_after_workdir_lookup`).
+///
+/// - `Found` -> the primary chain (registrar filter, then the anchor).
+/// - `NoCandidate`, or no `SessionManager` installed -> the lifecycle fallback.
+/// - `Ambiguous` -> REFUSED as [`SelfIdOutcome::AmbiguousTaskRunWorkdir`]. The
+///   task runs own that workdir's calls; the lifecycle fallback could name a
+///   sibling interactive terminal. No header beats a wrong one.
+#[derive(Debug, PartialEq, Eq)]
+enum CallerWorkdirNext {
+    TaskRun(String),
+    TryLifecycle,
+    Refuse(SelfIdOutcome),
+}
+
+fn caller_chain_after_workdir_lookup(
+    found: Option<crate::claude_session::WorkdirTaskRun>,
+) -> CallerWorkdirNext {
+    use crate::claude_session::WorkdirTaskRun;
+    match found {
+        Some(WorkdirTaskRun::Found(id)) => CallerWorkdirNext::TaskRun(id),
+        Some(WorkdirTaskRun::NoCandidate) | None => CallerWorkdirNext::TryLifecycle,
+        Some(WorkdirTaskRun::Ambiguous) => {
+            CallerWorkdirNext::Refuse(SelfIdOutcome::AmbiguousTaskRunWorkdir)
+        }
     }
 }
 
@@ -4525,11 +4570,19 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let task_run_id = app
+    let task_run_id = match app
         .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .task_run_id_for_workdir(&workdir)
-        .ok_or(EventLaneMiss::NoTaskRun)?;
+    {
+        crate::claude_session::WorkdirTaskRun::Found(id) => id,
+        crate::claude_session::WorkdirTaskRun::NoCandidate => return Err(EventLaneMiss::NoTaskRun),
+        // Several sessions claim this workdir: a task run owns its calls, so
+        // refuse rather than file one under any lane.
+        crate::claude_session::WorkdirTaskRun::Ambiguous => {
+            return Err(EventLaneMiss::AiAmbiguousWorkdir)
+        }
+    };
     app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
@@ -4567,6 +4620,10 @@ enum EventLaneMiss {
     /// The task run exists but never registered with coord, so it holds no
     /// `coord.sessions.id`.
     AiSessionUnregistered,
+    /// Terminal-less binding whose workdir is claimed by SEVERAL runner-managed
+    /// sessions (or whose session table could not be read). REFUSED: the task
+    /// run owns that workdir's calls, so no lane is guessed.
+    AiAmbiguousWorkdir,
 }
 
 impl EventLaneMiss {
@@ -4581,6 +4638,7 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => "ai_plane_state_missing",
             Self::NoTaskRun => "no_task_run",
             Self::AiSessionUnregistered => "ai_session_unregistered",
+            Self::AiAmbiguousWorkdir => "ai_ambiguous_workdir",
         }
     }
 
@@ -4595,7 +4653,8 @@ impl EventLaneMiss {
             Self::NoWorkdir
             | Self::AiPlaneStateMissing
             | Self::NoTaskRun
-            | Self::AiSessionUnregistered => "ai_plane",
+            | Self::AiSessionUnregistered
+            | Self::AiAmbiguousWorkdir => "ai_plane",
         }
     }
 
@@ -4612,12 +4671,13 @@ impl EventLaneMiss {
             Self::AiPlaneStateMissing => 5,
             Self::NoTaskRun => 6,
             Self::AiSessionUnregistered => 7,
+            Self::AiAmbiguousWorkdir => 8,
         }
     }
 
     /// Every miss, in counter-slot order — `ALL[i].index() == i`, asserted in
     /// the tests so the two orderings cannot drift.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::NoNonce,
         Self::NoTerminalManager,
         Self::TerminalGone,
@@ -4626,6 +4686,7 @@ impl EventLaneMiss {
         Self::AiPlaneStateMissing,
         Self::NoTaskRun,
         Self::AiSessionUnregistered,
+        Self::AiAmbiguousWorkdir,
     ];
 }
 
@@ -14289,6 +14350,7 @@ mod transport_rung_counter_tests {
     #[test]
     fn lane_miss_ai_session_unregistered_moves_only_its_series() {
         assert_only_this_series_moves(EventLaneMiss::AiSessionUnregistered);
+        assert_only_this_series_moves(EventLaneMiss::AiAmbiguousWorkdir);
     }
 
     /// `ALL[i].index() == i`, and every label is distinct — the two orderings
@@ -14810,6 +14872,39 @@ mod self_id_chain_tests {
         TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED,
     };
 
+    /// The caller chain's twin of the event lane's leg-3 guard: only a workdir
+    /// NO task run claims (or a host with no `SessionManager`) may reach the
+    /// lifecycle fallback. An ambiguous one is refused with its own outcome —
+    /// if `Ambiguous` ever falls through to `resolve_caller_via_lifecycle`,
+    /// this fails.
+    #[test]
+    fn an_ambiguous_task_run_workdir_never_reaches_the_lifecycle_fallback() {
+        use super::{caller_chain_after_workdir_lookup, CallerWorkdirNext};
+        use crate::claude_session::WorkdirTaskRun;
+        assert_eq!(
+            caller_chain_after_workdir_lookup(Some(WorkdirTaskRun::Ambiguous)),
+            CallerWorkdirNext::Refuse(SelfIdOutcome::AmbiguousTaskRunWorkdir)
+        );
+        assert_eq!(
+            caller_chain_after_workdir_lookup(Some(WorkdirTaskRun::NoCandidate)),
+            CallerWorkdirNext::TryLifecycle
+        );
+        assert_eq!(
+            caller_chain_after_workdir_lookup(None),
+            CallerWorkdirNext::TryLifecycle
+        );
+        assert_eq!(
+            caller_chain_after_workdir_lookup(Some(WorkdirTaskRun::Found("t".to_string()))),
+            CallerWorkdirNext::TaskRun("t".to_string())
+        );
+        // Its own /health series, distinct from the transient `no_session`.
+        assert_ne!(
+            SelfIdOutcome::AmbiguousTaskRunWorkdir.label(),
+            SelfIdOutcome::NoSession.label()
+        );
+        assert!(!TERMINAL_LEG_OUTCOMES.contains(&SelfIdOutcome::AmbiguousTaskRunWorkdir));
+    }
+
     #[test]
     fn every_outcome_has_a_distinct_label() {
         let labels: Vec<&str> = SelfIdOutcome::ALL.iter().map(|o| o.label()).collect();
@@ -14827,8 +14922,9 @@ mod self_id_chain_tests {
         // client-pick arm, two per leg (`injected_via_client_pick_*`,
         // `client_pick_not_candidate_*`); +2 for the uncontradicted-assertion
         // arm, one per leg (`injected_via_client_assertion_unrecorded_*`); +1
-        // for the single-candidate override split out of the workdir one.
-        assert_eq!(SelfIdOutcome::ALL.len(), 23);
+        // for the single-candidate override split out of the workdir one; +1
+        // for the primary chain's ambiguous task-run workdir.
+        assert_eq!(SelfIdOutcome::ALL.len(), 24);
     }
 
     /// FIX 5: the counter slot is a compiler-checked `match`, not a search of
@@ -15501,6 +15597,7 @@ mod self_id_chain_tests {
             EventLaneMiss::AiPlaneStateMissing,
             EventLaneMiss::NoTaskRun,
             EventLaneMiss::AiSessionUnregistered,
+            EventLaneMiss::AiAmbiguousWorkdir,
         ];
         let mut labels: Vec<&str> = all.iter().map(|m| m.as_str()).collect();
         labels.sort_unstable();
