@@ -1273,6 +1273,144 @@ pub fn promote_for_surface(
     }
 }
 
+/// Whether this spawn must ALSO mint trust on the target's primary checkout.
+///
+/// The CLI keeps two trust readings for a linked worktree. Plain trust (hooks,
+/// `.mcp.json`) accepts an entry at the worktree root. **Explicit** trust, which
+/// gates the project-scoped grants in `.claude/settings.json` (permission
+/// `allow` rules, `additionalDirectories`), is keyed on the worktree's
+/// *canonical* root: the CLI follows `.git` → `gitdir` → `commondir` back to
+/// the primary checkout and reads `projects[<primary>]` only. Trust found at the
+/// worktree key alone counts as "through a parent directory's grant", so the
+/// CLI raises its backstop trust dialog ("This folder pre-approves N tool
+/// permissions … No, continue without these permissions") on every interactive
+/// spawn, and a `--print` child silently runs without the grants. Read out of
+/// the CLI 2.1.285 bundle on 2026-09-30 (the explicit-trust check resolves its
+/// key through the worktree's `.git` → `gitdir` → `commondir`, and the backstop
+/// dialog's decline arm is `gated_grants_backstop_declined`). Observed the same
+/// day in the runner log: spawns whose worktree key was written `true` under an
+/// account that did not trust the primary still raised the dialog; spawns under
+/// an account that did, did not.
+///
+/// So the worktree-key write alone cannot clear that dialog. It is cleared only
+/// by the primary checkout's key, which is exactly conjunct 2's subject:
+///
+/// - conjunct 2 **satisfied** → the key the CLI reads is already `true`;
+///   nothing to mint.
+/// - conjunct 2 not satisfied → minting it creates trust, which only
+///   [`EnforcementPosture::Report`] authorises (the same dial arm that already
+///   mints the underived worktree key). `Withhold` and `Block` leave it, so a
+///   stricter tenant still gets the dialog it asked for.
+///
+/// Conjuncts 1 and 3 must also hold. Conjunct 1 is often decided by its LOCAL
+/// arm (a linked worktree under an agent-worktree root) because the
+/// already-trusted and PTY paths do not read coord's ledger, so it scopes the
+/// mint to that layout rather than proving a coord row. Conjunct 3 keeps the
+/// write in the account the child will actually read.
+///
+/// **Accepted scope.** The primary's key is broader than the worktree's: it
+/// covers every CLI session later opened in the primary checkout, it is the
+/// explicit-trust key of EVERY linked worktree of that repo (including ones
+/// outside the agent roots, where conjunct 1 would fail), and a spawn straight
+/// into the primary reads it as already trusted at any dial. The
+/// stamp stops it from counting as a derivation source (conjunct 2) only.
+/// Two further guards live outside this pure
+/// predicate, in [`finish`]: the primary is re-verified from both ends of git's
+/// worktree link ([`verified_primary_checkout`]) before anything is written,
+/// and the entry is stamped [`workspace_trust::RUNNER_MINTED_FLAG`] so a later
+/// spawn under a stricter dial cannot read it back as a derivation source.
+///
+/// Pure over its inputs; a target that is not a linked worktree has no primary
+/// checkout distinct from itself and never mints here.
+pub fn mints_primary_checkout_trust(
+    decision: &TrustGateDecision,
+    conjuncts: &Conjuncts,
+    posture: EnforcementPosture,
+    is_linked_worktree: bool,
+) -> bool {
+    is_linked_worktree
+        && posture == EnforcementPosture::Report
+        && conjuncts.coord_worktree_row.is_satisfied()
+        && conjuncts.config_dir_pinned.is_satisfied()
+        && matches!(
+            decision,
+            TrustGateDecision::AlreadyTrusted | TrustGateDecision::Grant { .. }
+        )
+        && !conjuncts.parent_repo_trusted.is_satisfied()
+}
+
+/// Resolve and verify the PRIMARY checkout of the linked worktree enclosing
+/// `cwd`, returning it with the `projects` key to write for it.
+///
+/// The primary is derived the way the CLI derives it — from the worktree's
+/// admin dir (`.git` file → `gitdir` → `commondir`) — and NOT from the path
+/// parsed off the `.git` line, which anything able to write the worktree can
+/// edit (a `gitdir: /home/u/.git/worktrees/x` line would otherwise name `$HOME`).
+/// The link is checked from both ends before anything is written:
+///
+/// - the admin dir sits directly under `<common>/worktrees`, where `<common>`
+///   is the admin dir's own `commondir` and is named `.git`;
+/// - the admin dir's `gitdir` back-pointer resolves to THIS worktree's `.git`;
+/// - the primary (`<common>`'s parent) holds `.git` as a directory.
+///
+/// Relative `gitdir`/`commondir` lines (git >= 2.48 `worktree.useRelativePaths`)
+/// resolve against the file that holds them. `Err` carries the reason, for the
+/// audit line.
+pub fn verified_primary_checkout(cwd: &Path) -> Result<(PathBuf, String), String> {
+    let canon = |p: &Path| {
+        std::fs::canonicalize(p).map_err(|e| format!("could not resolve {}: {e}", p.display()))
+    };
+    let read_line = |file: &Path, prefix: Option<&str>| -> Result<String, String> {
+        let raw = std::fs::read_to_string(file)
+            .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+        raw.lines()
+            .find_map(|l| match prefix {
+                Some(p) => l.trim().strip_prefix(p).map(str::trim),
+                None => Some(l.trim()),
+            })
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{} carries no usable line", file.display()))
+    };
+    let cwd = canon(cwd)?;
+    let worktree = workspace_trust::git_root(&cwd)
+        .ok_or_else(|| format!("{} is in no git repository", cwd.display()))?;
+    let dot_git = worktree.join(".git");
+    if !dot_git.is_file() {
+        return Err(format!(
+            "{} is not a linked worktree's .git file",
+            dot_git.display()
+        ));
+    }
+    let admin = canon(&worktree.join(read_line(&dot_git, Some("gitdir:"))?))?;
+    let common = canon(&admin.join(read_line(&admin.join("commondir"), None)?))?;
+    if common.file_name().and_then(|n| n.to_str()) != Some(".git")
+        || admin.parent() != Some(common.join("worktrees").as_path())
+    {
+        return Err(format!(
+            "{} is not a worktree admin dir of a primary checkout's .git ({})",
+            admin.display(),
+            common.display()
+        ));
+    }
+    let back = canon(&admin.join(read_line(&admin.join("gitdir"), None)?))?;
+    if back != canon(&dot_git)? {
+        return Err(format!(
+            "{}/gitdir points at {}, not at this worktree",
+            admin.display(),
+            back.display()
+        ));
+    }
+    let primary = common
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("{} has no parent", common.display()))?;
+    if !primary.join(".git").is_dir() {
+        return Err(format!("{}/.git is not a directory", primary.display()));
+    }
+    Ok((primary.clone(), workspace_trust::to_key_string(&primary)))
+}
+
 /// Everything the gate derived for one spawn, flat enough to log and to POST.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrustGateReport {
@@ -1290,6 +1428,9 @@ pub struct TrustGateReport {
     /// The [`TrustOutcome`] of the write, when one was made. `None` when the
     /// decision withheld it or the target was already trusted.
     pub write_outcome: Option<String>,
+    /// The [`TrustOutcome`] of the primary-checkout write, when
+    /// [`mints_primary_checkout_trust`] called for one.
+    pub primary_checkout_write_outcome: Option<String>,
 }
 
 // =============================================================================
@@ -1548,10 +1689,11 @@ pub async fn pre_accept_for_spawn(
     config_dir: Option<&str>,
     child_config_dir: Option<&str>,
 ) -> TrustGateReport {
-    // Nothing will be minted for an already-trusted target, so pay for NEITHER
-    // coord read to justify a write that is not going to happen. This is the
-    // common path once a repo has been spawned into once, and it must not put
-    // two HTTP requests in front of every spawn.
+    // No worktree key will be minted for an already-trusted target, so skip the
+    // coord LEDGER read that would justify one — this is the common path once a
+    // repo has been spawned into, and it must not put a fleet-wide fetch in
+    // front of every spawn. The dial IS resolved (TTL-cached), because this path
+    // may still mint the primary checkout's key and that write is dial-gated.
     if matches!(trust, TrustVerdict::Trusted) {
         return finish(
             cwd,
@@ -1561,7 +1703,7 @@ pub async fn pre_accept_for_spawn(
             CoordRowLookup::Unavailable {
                 reason: "already trusted; ledger not consulted".to_string(),
             },
-            peek_dial(),
+            resolve_dial().await,
             SpawnSurface::NonInteractive,
         );
     }
@@ -1644,10 +1786,31 @@ fn finish(
     let child_reads = config_file_for(child_config_dir);
     let roots = agent_worktree_roots();
     let project_key = workspace_trust::project_key(Path::new(cwd));
+    // The primary checkout verified from both ends of git's worktree link. The
+    // `parent` that conjunct 2 is asked about was parsed off the worktree's
+    // editable `.git` line, so it only counts when it IS this verified primary.
+    let verified_primary = verified_primary_checkout(Path::new(cwd));
 
-    let read_parent = |key: &str| match &write_target {
-        Some(file) => super::spawn_preconditions::trust_verdict_in(file, key),
-        None => TrustVerdict::Unknown {
+    let read_parent = |key: &str| match (&write_target, &verified_primary) {
+        (_, Err(reason)) => TrustVerdict::Unknown {
+            reason: format!("the primary checkout could not be verified: {reason}"),
+        },
+        (_, Ok((_, verified))) if verified.as_str() != key => TrustVerdict::Unknown {
+            reason: format!(
+                "the `.git` line names {key}, but the worktree's admin dir belongs to {verified}"
+            ),
+        },
+        // Trust the runner stamped as its own mint is never a derivation
+        // source: counting it would let a mint made under a permissive dial
+        // satisfy conjunct 2 — and so bypass Withhold/Block — under a stricter
+        // one. Unstamped writes from builds predating the stamp still count.
+        (Some(file), _) if workspace_trust::is_runner_minted(file, key) => {
+            TrustVerdict::Untrusted {
+                reason: "runner-minted trust (qontinuiRunnerMintedTrust) is not a human grant",
+            }
+        }
+        (Some(file), _) => super::spawn_preconditions::trust_verdict_in(file, key),
+        (None, _) => TrustVerdict::Unknown {
             reason: "no account config file resolved".to_string(),
         },
     };
@@ -1664,7 +1827,13 @@ fn finish(
     let mut write_outcome = None;
     if decision.writes_trust() {
         if let (Some(file), Some(key)) = (&write_target, &project_key) {
-            let outcome = workspace_trust::ensure_trusted_in(file, key);
+            // A derived grant projects a human's trust; an underived one is the
+            // runner's own and is stamped so it can never be derived FROM.
+            let outcome = if conjuncts.all_satisfied() {
+                workspace_trust::ensure_trusted_in(file, key)
+            } else {
+                workspace_trust::ensure_runner_minted_trust_in(file, key)
+            };
             // The one line that answers "why is this directory trusted?".
             // `info!`, not `debug!`: this is the record that a live,
             // credential-bearing account file was rewritten to grant a
@@ -1692,11 +1861,65 @@ fn finish(
         }
     }
 
+    let mut primary_checkout_write_outcome = None;
+    if mints_primary_checkout_trust(&decision, &conjuncts, posture, parent.is_some()) {
+        let verified = match (&write_target, &verified_primary) {
+            (Some(file), Ok((_, key))) => Ok((file, key.clone())),
+            (Some(_), Err(reason)) => Err(reason.clone()),
+            (None, _) => Err("no account config file resolved".to_string()),
+        };
+        match verified {
+            Ok((file, key)) => {
+                let outcome = workspace_trust::ensure_runner_minted_trust_in(file, &key);
+                match &outcome {
+                    TrustOutcome::Trusted => info!(
+                        primary_key = %key,
+                        worktree = %cwd,
+                        config_file = %file.display(),
+                        rule = "dial-permits-underived-primary-checkout-mint",
+                        dial = ?dial,
+                        posture = ?posture,
+                        posture_rule,
+                        derivation = %conjuncts.derivation(),
+                        "trust gate: GRANTED primary-checkout trust (underived, stamped \
+                         runner-minted) — the CLI keys a linked worktree's explicit trust, which \
+                         gates its project permission grants, on the primary checkout"
+                    ),
+                    TrustOutcome::Failed(e) => warn!(
+                        primary_key = %key,
+                        config_file = %file.display(),
+                        error = %e,
+                        "trust gate: primary-checkout trust write FAILED — the spawn may raise \
+                         the CLI's backstop trust dialog"
+                    ),
+                    other => debug!(
+                        primary_key = %key,
+                        config_file = %file.display(),
+                        outcome = ?other,
+                        "trust gate: primary-checkout grant made no change"
+                    ),
+                }
+                primary_checkout_write_outcome = Some(format!("{outcome:?}"));
+            }
+            Err(reason) => {
+                warn!(
+                    worktree = %cwd,
+                    parent_repo = parent.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
+                    reason = %reason,
+                    "trust gate: primary-checkout trust NOT minted — the primary could not be \
+                     verified; the spawn may raise the CLI's backstop trust dialog"
+                );
+                primary_checkout_write_outcome = Some(format!("Unverified({reason})"));
+            }
+        }
+    }
+
     match &decision {
         TrustGateDecision::AlreadyTrusted => debug!(
             cwd = %cwd,
             project_key = project_key.as_deref().unwrap_or("<underivable>"),
-            "trust gate: already trusted — nothing minted, nothing gated"
+            primary_checkout = primary_checkout_write_outcome.as_deref().unwrap_or("<not called for>"),
+            "trust gate: target already trusted — no worktree key minted, nothing gated"
         ),
         TrustGateDecision::Grant { .. } => {}
         TrustGateDecision::Withhold { rule, failed } => warn!(
@@ -1736,6 +1959,7 @@ fn finish(
         surface,
         decision,
         write_outcome,
+        primary_checkout_write_outcome,
     }
 }
 
@@ -2271,6 +2495,363 @@ THE AUTONOMY DIAL. One of:
                 TrustGateDecision::AlreadyTrusted
             );
         }
+    }
+
+    // ------------------------------------- the primary-checkout (explicit) key
+
+    /// The defect this closes: the worktree key already reads trusted, the
+    /// primary checkout does not, and the CLI's explicit-trust reading keys on
+    /// the primary — so it must be minted, on the `Report` arm only.
+    #[test]
+    fn primary_checkout_is_minted_when_only_the_worktree_key_is_trusted() {
+        let d = decide(
+            &TrustVerdict::Trusted,
+            &conj(true, false, true),
+            EnforcementPosture::Report,
+        );
+        assert!(mints_primary_checkout_trust(
+            &d,
+            &conj(true, false, true),
+            EnforcementPosture::Report,
+            true
+        ));
+    }
+
+    #[test]
+    fn primary_checkout_is_minted_alongside_an_underived_worktree_grant() {
+        let c = conj(true, false, true);
+        let d = decide(&untrusted(), &c, EnforcementPosture::Report);
+        assert_eq!(d.rule(), "dial-permits-underived-mint");
+        assert!(mints_primary_checkout_trust(
+            &d,
+            &c,
+            EnforcementPosture::Report,
+            true
+        ));
+    }
+
+    /// Nothing to mint when the primary already reads trusted.
+    #[test]
+    fn primary_checkout_is_not_minted_when_already_trusted() {
+        let c = conj(true, true, true);
+        let d = decide(&untrusted(), &c, EnforcementPosture::Report);
+        assert!(!mints_primary_checkout_trust(
+            &d,
+            &c,
+            EnforcementPosture::Report,
+            true
+        ));
+    }
+
+    /// A stricter dial still gets the dialog it asked for: the primary's trust is
+    /// created, never derived, so only `Report` may mint it — even when the
+    /// worktree key itself already reads trusted.
+    #[test]
+    fn primary_checkout_is_never_minted_off_the_report_arm() {
+        let c = conj(true, false, true);
+        for posture in [EnforcementPosture::Withhold, EnforcementPosture::Block] {
+            for trust in [TrustVerdict::Trusted, untrusted()] {
+                let d = decide(&trust, &c, posture);
+                assert!(
+                    !mints_primary_checkout_trust(&d, &c, posture, true),
+                    "{posture:?} {trust:?}"
+                );
+            }
+        }
+    }
+
+    /// Conjunct 1 gates the mint: a hand-rolled linked worktree is not coord's.
+    #[test]
+    fn primary_checkout_is_not_minted_without_the_coord_worktree_conjunct() {
+        let c = conj(false, false, true);
+        let d = decide(&untrusted(), &c, EnforcementPosture::Report);
+        assert!(!mints_primary_checkout_trust(
+            &d,
+            &c,
+            EnforcementPosture::Report,
+            true
+        ));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A real primary + `git worktree add` fixture: `(tempdir, primary, worktree)`.
+    fn linked_worktree_fixture(extra: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        git(&primary, &["init", "-q"]);
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let wt = tmp.path().join("wt");
+        let mut args: Vec<&str> = extra.to_vec();
+        args.extend(["worktree", "add", "-q", wt.to_str().unwrap()]);
+        git(&primary, &args);
+        (tmp, primary, wt)
+    }
+
+    #[test]
+    fn verified_primary_checkout_accepts_a_real_linked_worktree() {
+        let (_tmp, primary, wt) = linked_worktree_fixture(&[]);
+        let (resolved, key) = verified_primary_checkout(&wt.join(".")).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&primary).unwrap());
+        assert_eq!(key, workspace_trust::project_key(&primary).unwrap());
+    }
+
+    /// git >= 2.48 can write RELATIVE gitdir lines (`worktree.useRelativePaths`);
+    /// they resolve against the file holding them, never the runner's cwd. The
+    /// links are rewritten by hand so this runs on any git version.
+    #[test]
+    fn verified_primary_checkout_accepts_a_relative_path_worktree() {
+        let (_tmp, primary, wt) = linked_worktree_fixture(&[]);
+        let admin = primary.join(".git/worktrees/wt");
+        std::fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+        std::fs::write(admin.join("gitdir"), "../../../../wt/.git\n").unwrap();
+        let (_, key) = verified_primary_checkout(&wt).unwrap();
+        assert_eq!(key, workspace_trust::project_key(&primary).unwrap());
+    }
+
+    /// A `.git` file edited to point at ANOTHER repo's worktree admin dir must
+    /// not get that repo trusted: the admin dir's back-pointer names its own
+    /// worktree, not ours.
+    #[test]
+    fn verified_primary_checkout_refuses_a_forged_gitdir_line() {
+        let (_tmp, _primary, wt) = linked_worktree_fixture(&[]);
+        let (_tmp2, victim, _victim_wt) = linked_worktree_fixture(&[]);
+        let admin = std::fs::read_dir(victim.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let err = verified_primary_checkout(&wt).unwrap_err();
+        assert!(err.contains("not at this worktree"), "{err}");
+    }
+
+    /// The `$HOME` shape: a hand-made "admin dir" that is not under any
+    /// `<primary>/.git/worktrees` is refused before its commondir is believed.
+    #[test]
+    fn verified_primary_checkout_refuses_a_fake_admin_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let fake_admin = home.join("admin");
+        std::fs::create_dir_all(&fake_admin).unwrap();
+        std::fs::create_dir(home.join(".git")).unwrap();
+        std::fs::write(fake_admin.join("commondir"), "..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", fake_admin.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            fake_admin.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        let err = verified_primary_checkout(&wt).unwrap_err();
+        assert!(err.contains("is not a worktree admin dir"), "{err}");
+    }
+
+    #[test]
+    fn verified_primary_checkout_refuses_a_non_worktree_target() {
+        let (_tmp, primary, _wt) = linked_worktree_fixture(&[]);
+        let err = verified_primary_checkout(&primary).unwrap_err();
+        assert!(err.contains("not a linked worktree"), "{err}");
+    }
+
+    /// Conjunct 3 gates the mint: a write into an account the child will not
+    /// read would create trust for nothing.
+    #[test]
+    fn primary_checkout_is_not_minted_when_the_config_dir_is_not_pinned() {
+        let c = conj(true, false, false);
+        let d = decide(&TrustVerdict::Trusted, &c, EnforcementPosture::Report);
+        assert!(!mints_primary_checkout_trust(
+            &d,
+            &c,
+            EnforcementPosture::Report,
+            true
+        ));
+    }
+
+    /// A fixture worktree plus an account config, for driving [`finish`].
+    fn finish_fixture(
+        projects: serde_json::Value,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, String) {
+        let (tmp, primary, wt) = linked_worktree_fixture(&[]);
+        let acct = tmp.path().join("acct");
+        std::fs::create_dir(&acct).unwrap();
+        let cfg = acct.join(workspace_trust::CONFIG_FILE);
+        std::fs::write(
+            &cfg,
+            serde_json::json!({ "projects": projects }).to_string(),
+        )
+        .unwrap();
+        let acct = acct.to_string_lossy().into_owned();
+        (tmp, primary, wt, cfg, acct)
+    }
+
+    fn run_finish(wt: &Path, acct: &str, tier: AutonomyTier) -> TrustGateReport {
+        let cwd = wt.to_string_lossy().into_owned();
+        let trust =
+            crate::claude_session::spawn_preconditions::trust_precondition(&cwd, Some(acct));
+        finish(
+            &cwd,
+            &trust.verdict,
+            Some(acct),
+            Some(acct),
+            CoordRowLookup::Matched {
+                session_id: "test".to_string(),
+            },
+            DialResolution::Override { tier },
+            SpawnSurface::NonInteractive,
+        )
+    }
+
+    /// Under the permissive dial the worktree key AND the primary key are
+    /// minted, both stamped as the runner's own.
+    #[test]
+    fn finish_mints_and_stamps_the_primary_under_report() {
+        let (_tmp, primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let r = run_finish(&wt, &acct, AutonomyTier::Proceed);
+        assert_eq!(r.decision.rule(), "dial-permits-underived-mint");
+        let pk = workspace_trust::project_key(&primary).unwrap();
+        let wk = workspace_trust::project_key(&wt).unwrap();
+        assert_eq!(
+            crate::claude_session::spawn_preconditions::trust_verdict_in(&cfg, &pk),
+            TrustVerdict::Trusted
+        );
+        assert!(workspace_trust::is_runner_minted(&cfg, &pk));
+        assert!(workspace_trust::is_runner_minted(&cfg, &wk));
+    }
+
+    /// The laundering sequence: a stamped primary does not satisfy conjunct 2
+    /// under a stricter dial, so nothing is written.
+    #[test]
+    fn finish_does_not_derive_from_a_stamped_primary_under_withhold() {
+        let (_tmp, primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let pk = workspace_trust::project_key(&primary).unwrap();
+        workspace_trust::ensure_runner_minted_trust_in(&cfg, &pk);
+        let before = std::fs::read(&cfg).unwrap();
+        let r = run_finish(&wt, &acct, AutonomyTier::DraftRequired);
+        assert!(!r.conjuncts.parent_repo_trusted.is_satisfied());
+        assert!(
+            matches!(r.decision, TrustGateDecision::Withhold { .. }),
+            "{:?}",
+            r.decision
+        );
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+
+    /// A human-trusted primary IS a derivation source: the worktree grant is
+    /// derived, left unstamped, and no primary mint is needed.
+    #[test]
+    fn finish_derives_from_a_human_trusted_primary_without_stamping() {
+        let (_tmp, primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let pk = workspace_trust::project_key(&primary).unwrap();
+        workspace_trust::ensure_trusted_in(&cfg, &pk);
+        let r = run_finish(&wt, &acct, AutonomyTier::DraftRequired);
+        assert_eq!(r.decision.rule(), "derived-from-parent-repo-trust");
+        assert!(r.primary_checkout_write_outcome.is_none());
+        let wk = workspace_trust::project_key(&wt).unwrap();
+        assert!(!workspace_trust::is_runner_minted(&cfg, &wk));
+    }
+
+    /// Conjunct 2 cannot be satisfied by pointing the `.git` line at some OTHER
+    /// repo a human trusted: the parsed parent must be the verified primary.
+    #[test]
+    fn finish_ignores_a_forged_parent_for_conjunct_two() {
+        let (_tmp, _primary, wt, cfg, acct) = finish_fixture(serde_json::json!({}));
+        let (_tmp2, victim, _vwt) = linked_worktree_fixture(&[]);
+        let vk = workspace_trust::project_key(&victim).unwrap();
+        workspace_trust::ensure_trusted_in(&cfg, &vk);
+        // Keep the admin link intact but make the `.git` line NAME the victim.
+        let raw = std::fs::read_to_string(wt.join(".git")).unwrap();
+        let admin = raw
+            .trim()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim()
+            .to_string();
+        let name = Path::new(&admin)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}/.git/worktrees/{name}\n", victim.display()),
+        )
+        .unwrap();
+        let r = run_finish(&wt, &acct, AutonomyTier::DraftRequired);
+        assert!(
+            !r.conjuncts.parent_repo_trusted.is_satisfied(),
+            "{:?}",
+            r.conjuncts
+        );
+        assert!(!matches!(r.decision, TrustGateDecision::Grant { .. }));
+    }
+
+    /// The anti-laundering half: a runner-minted entry reads as trusted to the
+    /// CLI but is recognisably the runner's, and a pre-existing human grant is
+    /// never re-stamped.
+    #[test]
+    fn runner_minted_trust_is_stamped_and_human_trust_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(workspace_trust::CONFIG_FILE);
+        std::fs::write(
+            &cfg,
+            r#"{"projects":{"/human":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_trust::ensure_runner_minted_trust_in(&cfg, "/minted"),
+            TrustOutcome::Trusted
+        );
+        assert_eq!(
+            workspace_trust::ensure_runner_minted_trust_in(&cfg, "/human"),
+            TrustOutcome::AlreadyTrusted
+        );
+        assert!(workspace_trust::is_runner_minted(&cfg, "/minted"));
+        assert!(!workspace_trust::is_runner_minted(&cfg, "/human"));
+        assert_eq!(
+            crate::claude_session::spawn_preconditions::trust_verdict_in(&cfg, "/minted"),
+            TrustVerdict::Trusted
+        );
+    }
+
+    /// A target that is not a linked worktree IS its own primary checkout.
+    #[test]
+    fn primary_checkout_is_not_minted_for_a_non_worktree_target() {
+        let c = conj(true, false, true);
+        let d = decide(&untrusted(), &c, EnforcementPosture::Report);
+        assert!(!mints_primary_checkout_trust(
+            &d,
+            &c,
+            EnforcementPosture::Report,
+            false
+        ));
     }
 
     #[test]
