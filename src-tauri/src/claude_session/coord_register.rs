@@ -998,6 +998,18 @@ impl AiCoordRegistrar {
         payload
     }
 
+    /// The tenant the coord session `session_id` was recorded under at
+    /// registration, or `None` when this process did not register it (or no
+    /// tenant resolved). The by-coord-id twin of [`Self::recorded_tenant`],
+    /// for the enqueue-time stamp in `session::session_tenant_stamp`.
+    pub(crate) fn tenant_of_session(&self, session_id: Uuid) -> Option<Uuid> {
+        self.inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied())
+    }
+
     /// The tenant `session_key`'s coord session was recorded under at
     /// registration (see [`Inner::tenants`]), or `None` when this process has
     /// not registered it or no tenant resolved. `session_key` is the R4 index

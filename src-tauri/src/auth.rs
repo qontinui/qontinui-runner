@@ -2418,6 +2418,44 @@ pub(crate) fn device_binding_count() -> usize {
     }
 }
 
+/// The tenants this device is currently BOUND to, read from
+/// `paired_user.json` (every `bindings[].tenant_id`, plus `default_tenant_id`
+/// and the legacy v1 `tenant_id`). `None` is UNKNOWN — the file cannot be
+/// read, OR it states no binding at all (an unpaired or half-written file) —
+/// never "bound to nothing", so a caller must not refuse or age anything out
+/// on it. The same rule [`MeasuredBindingCount`] applies: a file that states
+/// no binding is not a statement that the device holds none.
+///
+/// A binding is not a credential: see [`device_holds_usable_binding`] for
+/// "can present one". This answers the other question — whether a tenant a
+/// row names is one this device belongs to at all, or a stale/foreign one no
+/// credential will ever be issued for.
+pub(crate) fn device_bound_tenants() -> Option<std::collections::BTreeSet<Uuid>> {
+    read_paired_user_value()
+        .map(|v| bound_tenants_from_value(&v))
+        .filter(|bound| !bound.is_empty())
+}
+
+/// The parse half of [`device_bound_tenants`].
+pub(crate) fn bound_tenants_from_value(
+    value: &serde_json::Value,
+) -> std::collections::BTreeSet<Uuid> {
+    let parse = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s.trim()).ok())
+    };
+    let mut out: std::collections::BTreeSet<Uuid> = value
+        .get("bindings")
+        .and_then(|b| b.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| parse(e.get("tenant_id")))
+        .collect();
+    out.extend(parse(value.get("default_tenant_id")));
+    out.extend(parse(value.get("tenant_id")));
+    out
+}
+
 /// `paired_user.json` as JSON, or `None` when there is no storage dir, no file,
 /// or the file does not parse. The one file read both binding-count parsers
 /// share; each classifies the absence its own way.
@@ -3011,6 +3049,31 @@ pub fn attach_device_auth_for(
     }
 }
 
+/// The FAIL-CLOSED form of [`attach_device_auth_for`]: `Err` instead of an
+/// unauthenticated builder whenever no usable credential resolves for `scope`.
+///
+/// For writes that coord admits only from the OWNING device's credential
+/// (`POST /sessions/:id/output` and `/events`, plan
+/// `2026-09-28-anyone-holding-a-session-uuid-can-write-its-transcript-because-session-output-and-event-writes-are-anonymous`
+/// Phase 2). Sending such a write anonymously can only be refused, so the
+/// caller is told BEFORE the request exists and holds the row instead. The
+/// `Err` carries the selector's own cause — an absent slot, a
+/// [`SlotRead::PresentButDead`] one, or [`TenantScope::Unresolved`] on a
+/// multi-bound device ([`NoCredential::UnresolvedOnMultiBound`]) — so the
+/// caller can tell a credential that will recover from a scope that never
+/// will.
+///
+/// Same resolver and same coverage counters as [`attach_device_auth_for`]
+/// ([`count_and_resolve_bearer_result`]), so a held write is counted as the
+/// unauthenticated call it would otherwise have been.
+pub fn try_attach_device_auth_for(
+    rb: reqwest::RequestBuilder,
+    scope: TenantScope,
+) -> Result<reqwest::RequestBuilder, NoCredential> {
+    count_and_resolve_bearer_result(scope)
+        .map(|token| rb.header("Authorization", format!("Bearer {token}")))
+}
+
 /// Blocking-client sibling of [`attach_device_auth_for`], for the targets that
 /// run without a tokio runtime (`qontinui_profile device init` →
 /// `register_with_coord`, and the blocking session/log registrars).
@@ -3057,9 +3120,21 @@ pub fn attach_device_auth_blocking(
 /// The returned token is only ever moved into a request header; it must never
 /// reach a log line or a process argument.
 fn count_and_resolve_bearer(scope: TenantScope) -> Option<String> {
+    count_and_resolve_bearer_result(scope).ok()
+}
+
+/// [`count_and_resolve_bearer`], keeping the CAUSE of a miss for
+/// [`try_attach_device_auth_for`]. The one body both share, so the fail-soft
+/// and fail-closed forms can never count or resolve differently.
+fn count_and_resolve_bearer_result(scope: TenantScope) -> Result<String, NoCredential> {
     let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let bearer = device_bearer_scoped(scope);
-    if bearer.is_some() {
+    let bearer = select_scoped_bearer_lazy_result(
+        &AuthManager::new(),
+        scope,
+        default_binding_tenant(),
+        device_binding_count,
+    );
+    if bearer.is_ok() {
         DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if total.is_multiple_of(25) && coverage_log_due() {

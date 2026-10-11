@@ -338,6 +338,7 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
         timing: PinTiming::Live,
         readers: &[
             "session/coord_sync.rs::push_record",
+            "session/coord_sync.rs::push_record_with_scope",
             "session/coord_sync.rs::rebuild_create_body",
         ],
         detail: "fills the tenant only for records that carry none, read per record",
