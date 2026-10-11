@@ -170,7 +170,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "capability-token", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
-    ("ci_node/reporting.rs", "device-jwt-required", 2),
+    // The progress flusher, `post_result`, and the queued-lease heartbeat
+    // (`post_queued_heartbeat`): all three send the device JWT from the
+    // remint-awaiting resolver, and coord authorises each against the
+    // dispatch's assignee, so none may go anonymous.
+    ("ci_node/reporting.rs", "device-jwt-required", 3),
     ("commands/ai_settings.rs", "not-coord", 3),
     ("coord_doctor.rs", "diagnostic", 1),
     ("coord_mcp.rs", "not-coord", 1),
