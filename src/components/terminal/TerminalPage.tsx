@@ -1512,6 +1512,7 @@ function TerminalPageInner({
             chip that opens the ZoneControlPanel's Unassigned (N) list. */}
         <UnzonedChip
           unassignedCount={zoneLayout.unassignedTabIds.length}
+          workMode={zoneLayout.workMode}
           onOpen={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: true })}
         />
         {/* The way back from closing a Conductor worker's cell. Renders
@@ -1608,6 +1609,7 @@ function TerminalPageInner({
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
               onScreenTabId={zoneLayout.shownTabId}
+              workMode={zoneLayout.workMode}
             />
           )}
 

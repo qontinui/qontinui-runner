@@ -1035,9 +1035,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   // D5): its transcript row when it has one, else a tab-sourced row. In tmux
   // mode the panel is the only way to reach an off-screen session.
   const allSessions = useMemo(
-    (): UnifiedSession[] =>
-      mergeLiveRows(transcriptRows, { tabs, sessionStates, staleTabs, registryNames }),
-    [transcriptRows, tabs, sessionStates, staleTabs, registryNames],
+    (): UnifiedSession[] => mergeLiveRows(transcriptRows, { tabs, sessionStates, registryNames }),
+    [transcriptRows, tabs, sessionStates, registryNames],
   );
 
   // ── Filter and sort ────────────────────────────────────────────────────────
