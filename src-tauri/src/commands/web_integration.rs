@@ -859,7 +859,8 @@ pub async fn redeem_pair_code(
     // The post-pairing steps both redeem doors share; see
     // [`complete_pairing_after_redeem`]. This interactive door adds only the
     // sign-out-marker clear below.
-    complete_pairing_after_redeem(&resp, tenant_id, "redeem_pair_code", || Ok(())).await?;
+    complete_pairing_after_redeem(&resp, tenant_id, &web_base, "redeem_pair_code", || Ok(()))
+        .await?;
 
     // Redeeming a pair code IS an explicit interactive credential acquisition —
     // the operator typed a code that a signed-in web session minted — so it ends
@@ -908,9 +909,14 @@ pub async fn redeem_pair_code(
 /// the meantime); an `Err` from it aborts with nothing persisted. Door-specific
 /// effects AFTER the core (the interactive door's sign-out-marker clear) stay
 /// with the door.
+///
+/// `web_base` is the base the door redeemed against. Unused today; it is the
+/// argument the post-persist slot below hands qontinui-runner#1770's
+/// `enrol_machine_key_after_pairing`, so the core never re-resolves the base.
 pub(crate) async fn complete_pairing_after_redeem(
     resp: &qontinui_runner_lib::pair::PairCompleteResponse,
     tenant_id: uuid::Uuid,
+    web_base: &str,
     caller: &str,
     before_persist: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
@@ -924,8 +930,9 @@ pub(crate) async fn complete_pairing_after_redeem(
     .map_err(|e| format!("persist pairing task panicked: {e}"))?
     .map_err(|e| format!("persist pairing: {e}"))?;
 
-    // Post-persist credential steps (e.g. device-machine-key enrolment) belong
-    // HERE, so both doors run them.
+    // Post-persist credential steps (e.g. device-machine-key enrolment, which
+    // takes `web_base`) belong HERE, so both doors run them.
+    let _ = web_base;
 
     // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
     // tenant is the default), so every rejection coord recorded against the OLD

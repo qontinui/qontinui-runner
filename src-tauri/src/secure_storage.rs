@@ -1897,11 +1897,16 @@ impl SecureStorage {
     /// redeem. The save re-seeds it from the device JWTs the store holds NOW
     /// (the one the redeem just persisted), so the spent token is gone and the
     /// next dark episode still has an anchor.
+    ///
+    /// A mutator like every other: one [`Self::locked_rmw`], so a concurrent
+    /// locked writer (the CLI, an instance runner, a reconcile) cannot land
+    /// between this load and save and lose its slot. May wait up to
+    /// [`STORE_LOCK_TIMEOUT`] for the lock — callers on an async runtime run
+    /// it on the blocking pool.
     pub fn reset_redeem_anchor(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.redeem_anchor_jwt = None;
-        self.save_tokens(&tokens)?;
-        Ok(())
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.redeem_anchor_jwt = None;
+        })
     }
 
     /// Deletes the storage file entirely.
@@ -2570,6 +2575,33 @@ mod tests {
         b.join().unwrap();
         let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
         assert_eq!(slots.len() as u128, 2 * N, "a concurrent writer lost slots");
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// `reset_redeem_anchor` is a LOCKED mutator: while another handle holds
+    /// the store lock it waits, and it completes once the holder releases.
+    #[test]
+    fn test_reset_redeem_anchor_waits_for_the_store_lock() {
+        let storage = create_test_storage("reset_redeem_anchor_locked");
+        storage.store_tokens("seed", "").unwrap();
+        let guard = storage.lock_store().unwrap();
+        let path = storage.storage_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let other = SecureStorage::with_path(path).unwrap();
+            tx.send(other.reset_redeem_anchor().is_ok()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "reset_redeem_anchor saved while another handle held the store lock"
+        );
+        drop(guard);
+        assert!(
+            rx.recv_timeout(STORE_LOCK_TIMEOUT).unwrap(),
+            "reset_redeem_anchor failed once the lock was released"
+        );
+        worker.join().unwrap();
         let _ = fs::remove_file(&storage.storage_path);
     }
 
