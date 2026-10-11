@@ -886,8 +886,12 @@ mod tests {
     ///   `include_bytes!("x.rs")` (only `include_str!` is scanned); a
     ///   statement with no `;` before the next item (a tail expression), whose
     ///   `.join` chain can run on into the next function; and a `.join` after a
-    ///   `concat!(…)` root. None has a site today; widen the scan before
-    ///   introducing one.
+    ///   `concat!(…)` root. Two live sites read `mcp_api.rs` this way and are
+    ///   NOT seen by this scan: `mcp_api_sources()` (`mcp_api.rs`, a tail
+    ///   expression over `CARGO_MANIFEST_DIR/src`, which returns the WHOLE
+    ///   module, tests included) and `working_tree_tool_policy()` (a `..`
+    ///   join to a path held in a const, deliberately whole-file like the
+    ///   production drift parser). Widen the scan before adding another.
     fn scan_self_reads(
         path: &std::path::Path,
         text: &str,
@@ -1111,7 +1115,9 @@ mod tests {
         // nothing. Baseline 2026-09-30 at qontinui-runner 514447a5f + review
         // fixes: 1,576 `.rs` files under src/; 71 own-basename includes, 1
         // concat!(env!(..)) include and 6 runtime self-reads (all `read_own`),
-        // 78 wrapped in all.
+        // 78 wrapped in all. Re-counted 2026-10-11 after main replaced the
+        // mcp_api.rs self-reads with its own module helpers: 86 `of`/`whole`
+        // sites and 3 `read_own` reads.
         assert!(
             files_scanned >= 1_400,
             "the meta-pin scanned only {files_scanned} .rs files — it is walking the \
