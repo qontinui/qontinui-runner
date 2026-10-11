@@ -94,13 +94,34 @@ export function recordedChunks(events = sessionEvents()) {
 const fmt = (d) => d.toFixed(6);
 
 /** The typescript: util-linux's header line, the output, and its trailer. */
+export const SCRIPT_HEADER_LINE = `Script started on 2026-10-11 12:00:00+00:00 [TERM="xterm-256color" TTY="/dev/pts/3" COLUMNS="80" LINES="24"]\n`;
+export const SCRIPT_TRAILER_LINE = `\nScript done on 2026-10-11 12:00:10+00:00 [COMMAND_EXIT_CODE="0"]\n`;
+
+/** The keystrokes the advanced timing's two I entries log (1 and 3 bytes); a canary. */
+export const INPUT_EVENTS = Object.freeze([
+  Object.freeze({ t: 0.7, bytes: "y" }),
+  Object.freeze({ t: 7.25, bytes: "K3y" }),
+]);
+
+/** The typescript: util-linux's header line, the output, and its trailer (`--log-out`). */
 export function renderTypescript(chunks = recordedChunks()) {
   return Buffer.concat([
-    Buffer.from(
-      `Script started on 2026-10-11 12:00:00+00:00 [TERM="xterm-256color" TTY="/dev/pts/3" COLUMNS="80" LINES="24"]\n`,
-    ),
+    Buffer.from(SCRIPT_HEADER_LINE),
     ...chunks.map((c) => c.bytes),
-    Buffer.from(`\nScript done on 2026-10-11 12:00:10+00:00 [COMMAND_EXIT_CODE="0"]\n`),
+    Buffer.from(SCRIPT_TRAILER_LINE),
+  ]);
+}
+
+/** A `--log-io` typescript: output and input interleaved in timing order, in one file. */
+export function renderCombinedTypescript(chunks = recordedChunks()) {
+  const parts = [
+    ...chunks.map((c) => ({ t: c.t, bytes: c.bytes })),
+    ...INPUT_EVENTS.map((e) => ({ t: e.t, bytes: Buffer.from(e.bytes) })),
+  ].sort((a, b) => a.t - b.t);
+  return Buffer.concat([
+    Buffer.from(SCRIPT_HEADER_LINE),
+    ...parts.map((p) => p.bytes),
+    Buffer.from(SCRIPT_TRAILER_LINE),
   ]);
 }
 
@@ -125,8 +146,7 @@ export function renderAdvancedTiming(chunks = recordedChunks(), { resize = false
     { t: 0, line: `H COLUMNS ${GEOMETRY.cols}` },
     { t: 0, line: `H LINES ${GEOMETRY.rows}` },
     { t: 0, line: "H SHELL /bin/bash" },
-    { t: 0.7, line: "I 1" },
-    { t: 7.25, line: "I 3" },
+    ...INPUT_EVENTS.map((e) => ({ t: e.t, line: `I ${Buffer.byteLength(e.bytes)}` })),
     ...chunks.map((c) => ({ t: c.t, line: `O ${c.bytes.length}` })),
   ];
   if (resize) entries.push({ t: 7.5, line: "S SIGWINCH ROWS=30 COLS=100" });

@@ -34,14 +34,16 @@ import {
 } from "./content.mjs";
 
 /**
- * Pick a key from `{key: weight}` (insertion order) with u in [0, 1).
+ * Pick a key from `{key: weight}` with u in [0, 1), walking the keys in SORTED order:
+ * the stream then depends only on a profile's content (its canonical digest), never
+ * on the key order of its JSON.
  *
  * @param {Record<string, number>} weights
  * @param {number} u
  * @returns {string}
  */
 export function pickWeighted(weights, u) {
-  const entries = Object.entries(weights);
+  const entries = Object.entries(weights).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   let total = 0;
   for (const [, w] of entries) total += w;
   const target = u * total;

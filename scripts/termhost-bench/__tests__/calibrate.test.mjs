@@ -22,6 +22,7 @@ import {
   buildRuns,
   calibrateFiles,
   classifyFrames,
+  detectLayout,
   fitProfile,
   parseCalibrateArgs,
   parseTiming,
@@ -29,6 +30,7 @@ import {
   reconstructChunks,
   segmentFrames,
   stripScriptHeader,
+  stripScriptTrailer,
 } from "../calibrate.mjs";
 import { validateProfile } from "../profile.mjs";
 import { stripOverlays } from "../marker.mjs";
@@ -37,9 +39,12 @@ import {
   CANARY,
   EXPECTED,
   GEOMETRY,
+  INPUT_EVENTS,
+  SCRIPT_TRAILER_LINE,
   recordedChunks,
   renderAdvancedTiming,
   renderClassicTiming,
+  renderCombinedTypescript,
   renderTypescript,
   sessionEvents,
 } from "./fixtures/calibration-session.mjs";
@@ -47,7 +52,7 @@ import {
 const CALIBRATE = join(dirname(fileURLToPath(import.meta.url)), "..", "calibrate.mjs");
 const CALIBRATED_AT = "2026-10-11T12:00:00.000Z";
 
-function withRecording(fn, { advanced = false, resize = false } = {}) {
+function withRecording(fn, { advanced = false, resize = false, combined = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "termhost-calibrate-"));
   try {
     const timing = join(dir, "s1.tm");
@@ -56,7 +61,7 @@ function withRecording(fn, { advanced = false, resize = false } = {}) {
       timing,
       advanced ? renderAdvancedTiming(undefined, { resize }) : renderClassicTiming(),
     );
-    writeFileSync(typescript, renderTypescript());
+    writeFileSync(typescript, combined ? renderCombinedTypescript() : renderTypescript());
     return fn({ dir, timing, typescript });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -106,7 +111,10 @@ test("the typescript header line is skipped; output bytes pair with timing entri
       assert.ok(close(c.t, want[i].t), `chunk ${i} at ${c.t}, want ${want[i].t}`);
     });
   }
-  assert.throws(() => reconstructChunks(parseTiming("0 999999\n"), ts), /typescript holds/);
+  assert.throws(
+    () => reconstructChunks(parseTiming("0 999999\n"), ts),
+    /the timing does not describe this typescript/,
+  );
 });
 
 test("segmentFrames: a synchronized block is one frame even when split across 8 KiB reads", () => {
@@ -371,4 +379,64 @@ test("round trip: re-calibrating the generator's output reproduces the fitted pr
       `${cls} share ${got.phase_share[cls]} vs ${share}`,
     );
   }
+});
+
+test("the typescript layout is detected from byte totals: --log-out or --log-io", () => {
+  const advanced = parseTiming(renderAdvancedTiming());
+  assert.equal(detectLayout(advanced, renderTypescript()).layout, "output_only");
+  assert.equal(detectLayout(advanced, renderCombinedTypescript()).layout, "combined");
+  assert.equal(
+    detectLayout(parseTiming(renderClassicTiming()), renderTypescript()).layout,
+    "output_only",
+  );
+  const chunks = reconstructChunks(advanced, renderCombinedTypescript());
+  const want = recordedChunks();
+  assert.equal(chunks.length, want.length);
+  chunks.forEach((c, i) => assert.ok(c.bytes.equals(want[i].bytes), `chunk ${i}: input skipped`));
+  const trailer = Buffer.from(SCRIPT_TRAILER_LINE);
+  assert.ok(
+    stripScriptTrailer(Buffer.concat([Buffer.from("body"), trailer])).equals(Buffer.from("body")),
+  );
+  assert.ok(
+    stripScriptTrailer(Buffer.from("body")).equals(Buffer.from("body")),
+    "no trailer, no cut",
+  );
+});
+
+test("a typescript that matches neither layout, or both, is refused rather than guessed", () => {
+  const advanced = parseTiming(renderAdvancedTiming());
+  const extra = Buffer.concat([renderTypescript(), Buffer.from("stray")]);
+  assert.throws(() => detectLayout(advanced, extra), /does not describe this typescript/);
+  // Input totalling exactly the trailer's length: "output only, trailer stripped" and
+  // "output plus input, trailer kept" both fit, so the layout is ambiguous.
+  const trailerLength = Buffer.byteLength(SCRIPT_TRAILER_LINE);
+  const outputLines = recordedChunks()
+    .map((c) => `O 0.000000 ${c.bytes.length}`)
+    .join("\n");
+  const ambiguous = parseTiming(`${outputLines}\nI 0.000000 ${trailerLength}\n`);
+  assert.throws(() => detectLayout(ambiguous, renderTypescript()), /ambiguous/);
+});
+
+test("a --log-io recording calibrates exactly like the --log-out one, input never analysed", () => {
+  const calibrate = (combined) =>
+    withRecording(
+      ({ timing, typescript }) =>
+        calibrateFiles([{ timing, typescript }], { calibratedAt: CALIBRATED_AT }),
+      { advanced: true, combined },
+    );
+  const combined = calibrate(true);
+  assert.deepEqual(combined, calibrate(false));
+  assert.ok(!JSON.stringify(combined).includes(INPUT_EVENTS[1].bytes), "typed input never leaks");
+});
+
+test("a recording with no usable data is refused, never written as zeros", () => {
+  assert.throws(
+    () => fitProfile([analyzeChunks([])], { geometry: GEOMETRY }),
+    /no output to calibrate from/,
+  );
+  const untimed = analyzeChunks([{ t: 0, bytes: Buffer.from("hello") }]);
+  assert.throws(
+    () => fitProfile([untimed], { geometry: GEOMETRY, calibratedAt: CALIBRATED_AT }),
+    /no timed output: refusing to write 0 B\/s/,
+  );
 });

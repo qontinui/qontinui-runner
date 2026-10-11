@@ -230,22 +230,22 @@
           "detail": "the window lost the foreground for most of the soak"
         },
         "degradation_output_latency_ms": {
-          "state": "measured",
+          "state": "unknown",
           "unit": "ratio",
-          "n": 2,
-          "value": 1.8
+          "n": 1,
+          "reason": "no_baseline_level"
         },
         "degradation_input_latency_ms": {
           "state": "unknown",
           "unit": "ratio",
-          "reason": "insufficient_samples",
-          "n": 1
+          "n": 0,
+          "reason": "insufficient_samples"
         },
         "degradation_cpu_pct": {
-          "state": "measured",
+          "state": "unknown",
           "unit": "ratio",
-          "n": 2,
-          "value": 6.2
+          "n": 1,
+          "reason": "no_baseline_level"
         },
         "workload_cpu_pct": {
           "state": "measured",
@@ -464,22 +464,22 @@
           "value": 3.1
         },
         "degradation_output_latency_ms": {
-          "state": "measured",
+          "state": "unknown",
           "unit": "ratio",
-          "n": 2,
-          "value": 1.8
+          "n": 1,
+          "reason": "no_baseline_level"
         },
         "degradation_input_latency_ms": {
-          "state": "measured",
+          "state": "unknown",
           "unit": "ratio",
-          "n": 2,
-          "value": 1.4
+          "n": 1,
+          "reason": "no_baseline_level"
         },
         "degradation_cpu_pct": {
-          "state": "measured",
+          "state": "unknown",
           "unit": "ratio",
-          "n": 2,
-          "value": 6.2
+          "n": 1,
+          "reason": "no_baseline_level"
         },
         "workload_cpu_pct": {
           "state": "measured",

@@ -255,3 +255,21 @@ test("result-schema.json is byte-identical to what the catalog generates", () =>
     "run: node scripts/termhost-bench/build-schema.mjs --write",
   );
 });
+
+test("KPIs counted in refresh intervals need a known refresh rate, with a reason when unknown", () => {
+  assert.ok("refresh_rate_unknown" in REASON_CODES);
+  assert.ok("refresh_rate" in NEEDS);
+  for (const id of ["jank_share", "marker_loss", "marker_skipped"]) {
+    assert.ok(getKpi(id).needs.includes("refresh_rate"), `${id} needs the refresh rate`);
+  }
+});
+
+test("marker_skipped is neutral: coalescing is neither loss nor a gain", () => {
+  assert.equal(getKpi("marker_skipped").direction, "neutral");
+});
+
+test("a degradation ratio of 0 is a valid measurement (minimum 0, not exclusive)", () => {
+  for (const row of KPI_CATALOG.filter((r) => r.degradation_of)) {
+    assert.deepEqual({ ...row.value_range }, { minimum: 0 }, row.id);
+  }
+});
