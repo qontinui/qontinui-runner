@@ -4,10 +4,13 @@
  * the quick and hover actions, and the terminal body — a `TerminalInstance`,
  * a `PlanViewer` or a Conductor `WorkerSessionCell`.
  *
- * Two renderers mount it: `ZoneGrid`'s grid (one cell per zone, keyed by zone
- * index) and `TmuxViewport` in tmux work mode (one cell per live tab, keyed by
- * tab id, the shown one visible and the rest parked). Both hand it the same
- * {@link ZoneCellSharedProps}, so a zone looks and behaves the same in either.
+ * `buildZoneCells` (`zoneCells.tsx`) mounts it for both work modes: one cell
+ * per tab that owns a mount, keyed by tab id in either mode so a grid ⇄ tmux
+ * switch re-renders a terminal rather than remounting it, plus one cell per
+ * empty zone. A tab with no zone on screen — unzoned in the grid, off screen
+ * in tmux — gets a PARKED cell: its terminal body alone, `display: none`.
+ * Every cell gets the same {@link ZoneCellSharedProps}, so a zone looks and
+ * behaves the same in either mode.
  */
 import { memo, useCallback, useMemo, useRef, type RefObject } from "react";
 import { Terminal, Filter, RefreshCw, MessageSquare } from "lucide-react";
@@ -148,10 +151,10 @@ export interface ZoneCellProps {
    */
   isSingleView: boolean;
   /**
-   * tmux work mode only (`TmuxViewport`): the tab this cell renders, in place
-   * of `assignments[zoneIdx]`. The viewport mounts one cell per live tab, keyed
-   * by tab id, and every one of them sits in zone 0 — so the zone's assignment
-   * names only the SHOWN tab, and an off-screen cell needs its tab named here.
+   * The tab this cell renders; absent for an empty zone. Named explicitly
+   * rather than read from `assignments[zoneIdx]` because a parked cell has no
+   * zone of its own (every one of them sits in zone 0), and because the cell
+   * list — not the cell — decides which tab owns which mount.
    */
   paneTabId?: string;
   /**
@@ -163,8 +166,8 @@ export interface ZoneCellProps {
 
 /**
  * The props every cell of one render pass shares. `ZoneGrid` builds this bag
- * once and hands it to each grid cell and to `TmuxViewport`, so the two
- * renderers cannot drift apart in what a zone is given.
+ * once and `buildZoneCells` hands it to every cell of either work mode, so the
+ * two modes cannot drift apart in what a zone is given.
  */
 export type ZoneCellSharedProps = Omit<
   ZoneCellProps,
@@ -234,21 +237,22 @@ function ZoneCellInner({
   paneTabId,
   panePosition,
 }: ZoneCellProps) {
-  const tabId = paneTabId ?? assignments[zoneIdx];
+  const tabId = paneTabId;
   const tab = tabs.find((t) => t.id === tabId);
   const classification = tab ? tabClassification.get(tab.id) : undefined;
-  // tmux work mode: a live tab parked behind the shown one. Its cell renders
+  // A live tab with no zone on screen: parked behind the shown one in tmux
+  // mode (`offscreen`), or unzoned in the grid (`hidden`). Its cell renders
   // the terminal body alone, `display: none` — no header, no panels, no
   // overlays. Every piece of chrome registers UI Bridge ids keyed by zone
-  // index, and every viewport cell is zone 0, so chrome on a parked cell would
-  // collide with the shown cell's registrations.
-  const isOffscreen = classification === "offscreen";
-  const showLabels = showLabelsProp && !isOffscreen;
+  // index, and every parked cell is zone 0, so chrome on a parked cell would
+  // collide with zone 0's own registrations.
+  const isParked = classification === "offscreen" || classification === "hidden";
+  const showLabels = showLabelsProp && !isParked;
   // Per-tab subscription — THIS is what stops one pane's output frame from
   // re-rendering the other 39 zones (plan §0 A1). Only the cell whose tab
   // produced output (or whose duration/sparkline/lock state moved) re-renders.
   // A parked tmux cell shows none of the hot data, so it does not subscribe.
-  const hot = useTabHotSlice(pageId, isOffscreen ? undefined : tabId);
+  const hot = useTabHotSlice(pageId, isParked ? undefined : tabId);
   const lastLines = hot.lastOutputLines;
   // A far-offscreen assigned zone in flow mode: render only the CompactZoneCard,
   // NO TerminalInstance. Plan tabs are never virtualized (PlanViewer is already
@@ -256,14 +260,15 @@ function ZoneCellInner({
   const isVirtual = classification === "assigned-virtual" && tab?.type !== "plan";
   // Mount the inline TerminalInstance only for a non-plan tab the classifier
   // owns as live (`assigned` in preset mode, `assigned-live` near the viewport
-  // in flow mode, `assigned` or `offscreen` in tmux mode). Virtual + hidden
-  // mount zero instances here.
+  // in flow mode, `assigned` in tmux mode) or as parked (`hidden` in the grid,
+  // `offscreen` in tmux). A virtual zone mounts zero instances.
   const shouldMountInstance =
     !!tab &&
     tab.type !== "plan" &&
     (classification === "assigned" ||
       classification === "assigned-live" ||
-      classification === "offscreen");
+      classification === "offscreen" ||
+      classification === "hidden");
 
   // Zero-arg wrapper for ZoneLabel's `onToggleFilter` slot; stable so the
   // label doesn't get a fresh prop on every cell render.
@@ -320,11 +325,12 @@ function ZoneCellInner({
   const cellRef = useCallback(
     (el: HTMLDivElement | null) => {
       zoneElRef.current = el;
-      if (!isFlowMode || !tabId) return;
+      // A parked cell is no zone the flow grid could scroll to.
+      if (!isFlowMode || !tabId || isParked) return;
       if (el) registerCell(tabId, el);
       else unregisterCell(tabId);
     },
-    [isFlowMode, tabId, registerCell, unregisterCell],
+    [isFlowMode, tabId, isParked, registerCell, unregisterCell],
   );
 
   const isFocused = zoneIdx === focusedZone;
@@ -337,7 +343,12 @@ function ZoneCellInner({
 
   const isPinned = pinnedZones?.has(zoneIdx);
   const useCompact =
-    tab && tab.type !== "plan" && !isFocused && !isPinned && (autoCompact || forceCompact);
+    !isParked &&
+    tab &&
+    tab.type !== "plan" &&
+    !isFocused &&
+    !isPinned &&
+    (autoCompact || forceCompact);
   // The card overlays the instance region whenever we render CompactZoneCard —
   // either the operator forced compact/auto-compact (instance stays mounted but
   // hidden) OR the zone is virtualized (no instance at all this render).
@@ -346,7 +357,7 @@ function ZoneCellInner({
   // the strip and the terminal body's top padding have to agree, or the strip
   // covers the first output line.
   const soloSessionInfo =
-    !isOffscreen &&
+    !isParked &&
     showSoloSessionInfo({
       showLabels,
       showCompactCard,
@@ -354,7 +365,7 @@ function ZoneCellInner({
     });
   // A parked tmux cell offers no prompts/review panel, so it reads no review.
   const promptsAvailable =
-    !isOffscreen &&
+    !isParked &&
     promptsPanelAvailable({
       claudeSessionId: tab?.claudeSessionId,
       showCompactCard,
@@ -362,9 +373,9 @@ function ZoneCellInner({
   // Whether the terminal body is on screen: not behind a compact card and not
   // parked behind the shown tmux pane. The instance's `visible` prop — and with
   // it the pane's `focused`/`background` tier — follows this alone.
-  const paneVisible = !showCompactCard && !isOffscreen;
+  const paneVisible = !showCompactCard && !isParked;
   // The filter bar is keyed by zone index, and every tmux cell is zone 0.
-  const showFilterBar = !showCompactCard && !isOffscreen && showFilterInput === zoneIdx;
+  const showFilterBar = !showCompactCard && !isParked && showFilterInput === zoneIdx;
   const reviewAvailable = reviewPanelAvailable(tab, promptsAvailable);
   // The review panel and the prompts panel share one overlay slot.
   const showReviewPanel = reviewAvailable && reviewOpen;
@@ -447,7 +458,7 @@ function ZoneCellInner({
   return (
     <div
       ref={cellRef}
-      className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${isOffscreen ? "hidden" : ""}`}
+      className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${isParked ? "hidden" : ""}`}
       // Ground truth for the tag filter, readable through the UI Bridge
       // without inferring anything from a computed opacity.
       data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
@@ -559,18 +570,19 @@ function ZoneCellInner({
         }
       }}
     >
-      {(() => {
-        const label = zoneLabels?.[zoneIdx];
-        const groupColor = label && labelColorMap?.[label];
-        return groupColor ? (
-          <div
-            className="absolute left-0 top-0 bottom-0 w-[3px] z-10 rounded-l"
-            style={{ backgroundColor: groupColor, opacity: 0.6 }}
-          />
-        ) : null;
-      })()}
+      {!isParked &&
+        (() => {
+          const label = zoneLabels?.[zoneIdx];
+          const groupColor = label && labelColorMap?.[label];
+          return groupColor ? (
+            <div
+              className="absolute left-0 top-0 bottom-0 w-[3px] z-10 rounded-l"
+              style={{ backgroundColor: groupColor, opacity: 0.6 }}
+            />
+          ) : null;
+        })()}
 
-      {pendingRestarts?.[zoneIdx] && (
+      {!isParked && pendingRestarts?.[zoneIdx] && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 rounded">
           <div className="flex items-center gap-2 bg-[#1a1b26] border border-[#7dcfff]/30 rounded-lg px-3 py-1.5">
             <RefreshCw className="w-3 h-3 text-[#7dcfff] animate-spin" />
@@ -757,7 +769,7 @@ function ZoneCellInner({
               onClose={handleToggleReview}
             />
           )}
-          {!showCompactCard && isMultiZone && (
+          {!showCompactCard && !isParked && isMultiZone && (
             <ZoneQuickActions
               zoneIndex={zoneIdx}
               isPinned={isPinned}
@@ -790,14 +802,13 @@ function ZoneCellInner({
                   showCompactCard || bodyPad.right === 0 ? undefined : `${bodyPad.right}px`,
               }}
             >
-              {/* Layer 1 invariant: mount the inline visible TerminalInstance
-                  only when the centralized classification owns this tab as live
-                  (`assigned` in preset mode, `assigned-live` near the viewport in
-                  flow mode). A virtualized (`assigned-virtual`) zone mounts ZERO
-                  instances — its CompactZoneCard above is the sole renderer, and
-                  the hidden mount (renderHiddenTabs) owns unassigned tabs. This
-                  keeps the dual-mount race impossible (exactly-one-or-zero owner
-                  per tab) that would otherwise evict UI Bridge registrations. */}
+              {/* Layer 1 invariant: mount the TerminalInstance only when the
+                  centralized classification owns this tab as live or parked
+                  (`shouldMountInstance`). A virtualized (`assigned-virtual`)
+                  zone mounts ZERO instances — its CompactZoneCard above is the
+                  sole renderer. `buildZoneCells` gives each tab ONE cell, keyed
+                  by its id, so the dual-mount race (two owners evicting each
+                  other's UI Bridge registrations) stays impossible. */}
               {shouldMountInstance && tab.sessionBacked && tab.taskRunId && (
                 <WorkerSessionCell tab={tab} taskRunId={tab.taskRunId} visible={!showCompactCard} />
               )}
@@ -844,12 +855,12 @@ function ZoneCellInner({
       {/* Phase 4 — per-zone suggestion chip overlay. Renders nothing
           when the engine has no chip for this zone, keeping cell
           chrome quiet by default. */}
-      {!isOffscreen && <SuggestionChip zoneIdx={zoneIdx} />}
+      {!isParked && <SuggestionChip zoneIdx={zoneIdx} />}
 
       {/* Phase 5 — per-zone hover-revealed action cluster (maximize /
           restart / label / export / close). Fades in on cell hover
           via group-hover from the cell's outer div. */}
-      {!isOffscreen && <ZoneHoverActions zoneIdx={zoneIdx} onExportZone={onExportZone} />}
+      {!isParked && <ZoneHoverActions zoneIdx={zoneIdx} onExportZone={onExportZone} />}
     </div>
   );
 }

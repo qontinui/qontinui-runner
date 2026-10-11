@@ -696,7 +696,11 @@ describe("ZoneGrid wiring", () => {
   });
 
   it("never gives a worker tab the hidden TerminalInstance mount", () => {
-    expect(source).toContain("!t.sessionBacked");
+    // The parked (hidden / off-screen) mount is decided in the cell list.
+    const cells = readFileSync(resolve(__dirname, "./zone-grid/zoneCells.tsx"), "utf8");
+    expect(cells).toContain(
+      'return classification === "hidden" && tab.type !== "plan" && !tab.sessionBacked;',
+    );
   });
 
   it("passes the zone's visibility through to every WorkerSessionCell mount", () => {

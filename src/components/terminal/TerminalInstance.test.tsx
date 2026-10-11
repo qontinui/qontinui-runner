@@ -165,16 +165,9 @@ describe("stdin ownership gate", () => {
 
   it("passes pageId at every <TerminalInstance> mount site", () => {
     const sites = terminalInstanceMountSites();
-    // ZoneGrid's single-view + zoned mounts, plus the hidden mount.
-    expect(sites.length).toBeGreaterThanOrEqual(3);
+    // ZoneGrid's maximized-view mount and ZoneCell's (zoned AND parked) mount.
+    expect(sites.length).toBeGreaterThanOrEqual(2);
     const missing = sites.filter((s) => !/\bpageId=/.test(s.props)).map((s) => s.file);
     expect(missing).toEqual([]);
-  });
-
-  it("forwards pageId from every HiddenTerminal mount site", () => {
-    const source = readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8");
-    for (const match of source.matchAll(/<HiddenTerminal\s[\s\S]*?\/>/g)) {
-      expect(match[0]).toMatch(/\bpageId=/);
-    }
   });
 });

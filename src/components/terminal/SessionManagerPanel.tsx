@@ -6,7 +6,8 @@ import { SessionCard } from "./SessionCard";
 import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import { PastSessionsView } from "./PastSessionsView";
 import { FleetSessionPicker } from "./FleetSessionPicker";
-import { isRowOnScreen } from "./sessionManagerLiveRows";
+import { isRowOffScreen, isRowOnScreen } from "./sessionManagerLiveRows";
+import type { TerminalWorkMode } from "./terminalWorkMode";
 import type { PastSession } from "./usePastSessions";
 import type {
   UseSessionManagerReturn,
@@ -43,6 +44,11 @@ interface SessionManagerPanelProps {
    * shown session from the hidden ones at a glance.
    */
   onScreenTabId?: string | null;
+  /**
+   * The page's work mode. In tmux mode every other row of this window is off
+   * screen, and its card says so rather than "in zone".
+   */
+  workMode?: TerminalWorkMode;
 }
 
 /** Human-readable status group labels. */
@@ -118,6 +124,7 @@ export function SessionManagerPanel({
   sessionLockStates,
   onResumePastSession,
   onScreenTabId = null,
+  workMode = "grid",
 }: SessionManagerPanelProps) {
   const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
@@ -340,6 +347,7 @@ export function SessionManagerPanel({
                   onAfterPromote={refresh}
                   onOpenWorktrees={setWorktreeFocus}
                   isOnScreen={isRowOnScreen(session, onScreenTabId)}
+                  isOffScreen={isRowOffScreen(session, workMode, onScreenTabId)}
                 />
               ))}
             </div>
