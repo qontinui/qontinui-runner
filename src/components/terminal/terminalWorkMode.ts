@@ -90,9 +90,9 @@ export function nextShownAfterClose(
 ): string | null {
   const present = new Set(tabIds);
   if (closedId !== null) present.delete(closedId);
-  const isAlive = (id: string) => alive === null || alive.has(id);
-  for (const id of mru) if (present.has(id) && isAlive(id)) return id;
-  for (const id of tabIds) if (present.has(id) && isAlive(id)) return id;
+  const liveTab = (id: string) => alive === null || alive.has(id);
+  for (const id of mru) if (present.has(id) && liveTab(id)) return id;
+  for (const id of tabIds) if (present.has(id) && liveTab(id)) return id;
   for (const id of mru) if (present.has(id)) return id;
   for (const id of tabIds) if (present.has(id)) return id;
   return null;
