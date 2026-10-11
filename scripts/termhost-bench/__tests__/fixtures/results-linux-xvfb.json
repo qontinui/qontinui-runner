@@ -1,0 +1,541 @@
+{
+  "schema": "termhost-bench/v1",
+  "run": {
+    "id": "2026-10-11T13-00-00Z-xvfb",
+    "started_at": "2026-10-11T12:00:00Z",
+    "finished_at": "2026-10-11T12:42:10.500Z",
+    "harness_commit": "94d141a980a349c97b5f679e1f4745a2a9b9d919",
+    "node_version": "v22.20.0",
+    "command": [
+      "node",
+      "scripts/termhost-bench/cli.mjs",
+      "run",
+      "--env",
+      "linux-xvfb"
+    ]
+  },
+  "machine": {
+    "name": "github-hosted-ubuntu-22.04",
+    "environment": "linux-xvfb",
+    "os": {
+      "platform": "linux",
+      "release": "6.5.0-1025-azure",
+      "build": {
+        "state": "not_applicable",
+        "reason": "not_applicable_to_environment"
+      }
+    },
+    "cpu": {
+      "model": "AMD EPYC 7763 64-Core Processor",
+      "logical_cores": 4
+    },
+    "ram_mb": 16384,
+    "gpu": {
+      "state": "not_applicable",
+      "reason": "not_applicable_to_environment"
+    },
+    "display": {
+      "width_px": 1920,
+      "height_px": 1080,
+      "refresh_hz": 60,
+      "scale_pct": 100
+    },
+    "background_load": {
+      "state": "unknown",
+      "reason": "not_instrumented"
+    }
+  },
+  "capabilities": {
+    "capture.x11": {
+      "state": "OPERATIVE",
+      "reason": "damage + shm on :99"
+    },
+    "input.safe": {
+      "state": "OPERATIVE",
+      "reason": "private Xvfb display"
+    },
+    "counters.gpu": {
+      "state": "INOPERATIVE-ON-THIS-MACHINE",
+      "reason": "no GPU (llvmpipe)"
+    }
+  },
+  "rows": [
+    {
+      "setup": {
+        "id": "runner",
+        "variant": "default",
+        "app_version": "0.1.0",
+        "build": {
+          "commit": "94d141a980a349c97b5f679e1f4745a2a9b9d919",
+          "source": "artifact",
+          "role": "head"
+        },
+        "settings_digest": {
+          "state": "unknown",
+          "reason": "not_instrumented"
+        },
+        "pty_host_impl": "unix_pty",
+        "render_backend": "xterm",
+        "pty_holder": false,
+        "launch_mode": "subject_instance_root",
+        "session_shell": "bash",
+        "shell_integration": "injected"
+      },
+      "scenario": {
+        "profile": "claude-tui",
+        "profile_calibrated": false,
+        "profile_provenance": "assumption",
+        "profile_digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        "n": 5,
+        "arm": "focus",
+        "v_target": 1,
+        "v_actual": {
+          "state": "unknown",
+          "reason": "sessions_not_rendered"
+        },
+        "warmup_ms": 10000,
+        "soak_ms": 60000,
+        "seed": 1,
+        "run_index": 0,
+        "run_count": 2
+      },
+      "kpis": {
+        "output_latency_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 600,
+          "stats": {
+            "p50": 38.94824707846411,
+            "p95": 66.89482470784641,
+            "p99": 69.37896494156928
+          }
+        },
+        "input_latency_ms": {
+          "state": "unknown",
+          "unit": "ms",
+          "reason": "insufficient_samples",
+          "n": 40
+        },
+        "frame_interval_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 1800,
+          "stats": {
+            "p50": 27.493051695386328,
+            "p95": 38.74930516953863
+          }
+        },
+        "jank_share": {
+          "state": "measured",
+          "unit": "%",
+          "n": 1800,
+          "value": 1.5
+        },
+        "switch_latency_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 30,
+          "stats": {
+            "p50": 97.93103448275862,
+            "p95": 155.86206896551724
+          }
+        },
+        "spawn_latency_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 25,
+          "stats": {
+            "p50": 1750,
+            "p95": 2529.166666666667
+          }
+        },
+        "cpu_pct": {
+          "state": "measured",
+          "unit": "% of one logical core",
+          "n": 120,
+          "stats": {
+            "mean": 57.50000000000001,
+            "p95": 91.21848739495799
+          }
+        },
+        "cpu_ms_per_mb": {
+          "state": "measured",
+          "unit": "ms/MB",
+          "n": 120,
+          "value": 41.2
+        },
+        "memory_mb": {
+          "state": "measured",
+          "unit": "MB",
+          "n": 120,
+          "value": 812.4
+        },
+        "memory_growth_mb_per_min": {
+          "state": "measured",
+          "unit": "MB/min",
+          "n": 120,
+          "value": 0.8
+        },
+        "memory_mb_per_session": {
+          "state": "unknown",
+          "unit": "MB/session",
+          "reason": "too_few_levels",
+          "n": 2
+        },
+        "gpu_pct": {
+          "state": "not_applicable",
+          "unit": "%",
+          "reason": "gpu_counters_unavailable"
+        },
+        "producer_stall_pct": {
+          "state": "measured",
+          "unit": "%",
+          "n": 15,
+          "stats": {
+            "mean": 2,
+            "max": 4
+          }
+        },
+        "delivered_ratio": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 15,
+          "value": 0.998
+        },
+        "hangs": {
+          "state": "unknown",
+          "unit": "count",
+          "reason": "occluded",
+          "n": 12,
+          "detail": "the window lost the foreground for most of the soak"
+        },
+        "crashes": {
+          "state": "measured",
+          "unit": "count",
+          "n": 6,
+          "value": 0
+        },
+        "marker_loss": {
+          "state": "unknown",
+          "unit": "%",
+          "reason": "occluded",
+          "n": 12,
+          "detail": "the window lost the foreground for most of the soak"
+        },
+        "marker_skipped": {
+          "state": "unknown",
+          "unit": "%",
+          "reason": "occluded",
+          "n": 12,
+          "detail": "the window lost the foreground for most of the soak"
+        },
+        "degradation_output_latency_ms": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 2,
+          "value": 1.8
+        },
+        "degradation_input_latency_ms": {
+          "state": "unknown",
+          "unit": "ratio",
+          "reason": "insufficient_samples",
+          "n": 1
+        },
+        "degradation_cpu_pct": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 2,
+          "value": 6.2
+        },
+        "workload_cpu_pct": {
+          "state": "measured",
+          "unit": "% of one logical core",
+          "n": 120,
+          "stats": {
+            "mean": 100.00000000000001,
+            "p95": 135.96638655462186
+          }
+        },
+        "workload_memory_mb": {
+          "state": "measured",
+          "unit": "MB",
+          "n": 120,
+          "value": 1450
+        },
+        "compositor_cpu_pct": {
+          "state": "measured",
+          "unit": "% of one logical core",
+          "n": 120,
+          "stats": {
+            "mean": 7.5,
+            "p95": 11.546218487394958
+          }
+        },
+        "compositor_memory_mb": {
+          "state": "measured",
+          "unit": "MB",
+          "n": 120,
+          "value": 210
+        },
+        "wsl_vm_cpu_pct": {
+          "state": "not_applicable",
+          "unit": "% of one logical core",
+          "reason": "not_applicable_to_setup"
+        },
+        "wsl_vm_memory_mb": {
+          "state": "not_applicable",
+          "unit": "MB",
+          "reason": "not_applicable_to_setup"
+        }
+      },
+      "diagnostics": {},
+      "labels": [
+        "software_rendered"
+      ],
+      "incidents": []
+    },
+    {
+      "setup": {
+        "id": "tmux",
+        "variant": "default",
+        "app_version": "3.2a",
+        "build": {
+          "state": "not_applicable",
+          "reason": "not_applicable_to_setup"
+        },
+        "settings_digest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "pty_host_impl": "unix_pty",
+        "render_backend": {
+          "state": "not_applicable",
+          "reason": "not_applicable_to_setup"
+        },
+        "pty_holder": {
+          "state": "not_applicable",
+          "reason": "not_applicable_to_setup"
+        },
+        "launch_mode": "private_server",
+        "session_shell": "bash",
+        "shell_integration": {
+          "state": "unknown",
+          "reason": "not_instrumented"
+        }
+      },
+      "scenario": {
+        "profile": "claude-tui",
+        "profile_calibrated": false,
+        "profile_provenance": "assumption",
+        "profile_digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        "n": 5,
+        "arm": "focus",
+        "v_target": 1,
+        "v_actual": 1,
+        "warmup_ms": 10000,
+        "soak_ms": 60000,
+        "seed": 1,
+        "run_index": 0,
+        "run_count": 2
+      },
+      "kpis": {
+        "output_latency_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 600,
+          "stats": {
+            "p50": 38.94824707846411,
+            "p95": 66.89482470784641,
+            "p99": 69.37896494156928
+          }
+        },
+        "input_latency_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 200,
+          "stats": {
+            "p50": 50.80402010050251,
+            "p95": 86.08040201005025,
+            "p99": 89.21608040201005
+          }
+        },
+        "frame_interval_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 1800,
+          "stats": {
+            "p50": 27.493051695386328,
+            "p95": 38.74930516953863
+          }
+        },
+        "jank_share": {
+          "state": "measured",
+          "unit": "%",
+          "n": 1800,
+          "value": 1.5
+        },
+        "switch_latency_ms": {
+          "state": "unknown",
+          "unit": "ms",
+          "reason": "harness_error",
+          "detail": "select-window timed out"
+        },
+        "spawn_latency_ms": {
+          "state": "measured",
+          "unit": "ms",
+          "n": 25,
+          "stats": {
+            "p50": 1750,
+            "p95": 2529.166666666667
+          }
+        },
+        "cpu_pct": {
+          "state": "measured",
+          "unit": "% of one logical core",
+          "n": 120,
+          "stats": {
+            "mean": 57.50000000000001,
+            "p95": 91.21848739495799
+          }
+        },
+        "cpu_ms_per_mb": {
+          "state": "measured",
+          "unit": "ms/MB",
+          "n": 120,
+          "value": 41.2
+        },
+        "memory_mb": {
+          "state": "measured",
+          "unit": "MB",
+          "n": 120,
+          "value": 812.4
+        },
+        "memory_growth_mb_per_min": {
+          "state": "measured",
+          "unit": "MB/min",
+          "n": 120,
+          "value": 0.8
+        },
+        "memory_mb_per_session": {
+          "state": "measured",
+          "unit": "MB/session",
+          "n": 4,
+          "value": 22.5
+        },
+        "gpu_pct": {
+          "state": "not_applicable",
+          "unit": "%",
+          "reason": "gpu_counters_unavailable"
+        },
+        "producer_stall_pct": {
+          "state": "measured",
+          "unit": "%",
+          "n": 15,
+          "stats": {
+            "mean": 2,
+            "max": 4
+          }
+        },
+        "delivered_ratio": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 15,
+          "value": 0.998
+        },
+        "hangs": {
+          "state": "measured",
+          "unit": "count",
+          "n": 116,
+          "value": 0
+        },
+        "crashes": {
+          "state": "measured",
+          "unit": "count",
+          "n": 6,
+          "value": 0
+        },
+        "marker_loss": {
+          "state": "measured",
+          "unit": "%",
+          "n": 9000,
+          "value": 0.2
+        },
+        "marker_skipped": {
+          "state": "measured",
+          "unit": "%",
+          "n": 9000,
+          "value": 3.1
+        },
+        "degradation_output_latency_ms": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 2,
+          "value": 1.8
+        },
+        "degradation_input_latency_ms": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 2,
+          "value": 1.4
+        },
+        "degradation_cpu_pct": {
+          "state": "measured",
+          "unit": "ratio",
+          "n": 2,
+          "value": 6.2
+        },
+        "workload_cpu_pct": {
+          "state": "measured",
+          "unit": "% of one logical core",
+          "n": 120,
+          "stats": {
+            "mean": 100.00000000000001,
+            "p95": 135.96638655462186
+          }
+        },
+        "workload_memory_mb": {
+          "state": "measured",
+          "unit": "MB",
+          "n": 120,
+          "value": 1450
+        },
+        "compositor_cpu_pct": {
+          "state": "measured",
+          "unit": "% of one logical core",
+          "n": 120,
+          "stats": {
+            "mean": 7.5,
+            "p95": 11.546218487394958
+          }
+        },
+        "compositor_memory_mb": {
+          "state": "measured",
+          "unit": "MB",
+          "n": 120,
+          "value": 210
+        },
+        "wsl_vm_cpu_pct": {
+          "state": "not_applicable",
+          "unit": "% of one logical core",
+          "reason": "not_applicable_to_setup"
+        },
+        "wsl_vm_memory_mb": {
+          "state": "not_applicable",
+          "unit": "MB",
+          "reason": "not_applicable_to_setup"
+        }
+      },
+      "diagnostics": {},
+      "labels": [
+        "software_rendered",
+        "assert_only_smoke"
+      ],
+      "incidents": [
+        {
+          "kind": "harness_error",
+          "at": "2026-10-11T13:05:00Z",
+          "detail": "select-window timed out once",
+          "stops_run": false
+        }
+      ]
+    }
+  ],
+  "incidents": []
+}
