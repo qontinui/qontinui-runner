@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { deliverApprovals } from "./approveAll";
@@ -35,7 +36,7 @@ interface UseKeyboardShortcutsParams {
     focusNextNeedsInput: (states: Record<string, SessionState>) => void;
     toggleMaximize: (idx: number) => void;
     setMaximizedZone: (idx: number | null) => void;
-    setLayoutId: (id: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
     assignTabToZone: (idx: number, tabId: string) => void;
   };
   sessionStates: Record<string, SessionState>;
@@ -232,7 +233,7 @@ export function useKeyboardShortcuts({
         e.preventDefault();
         const preset = LAYOUT_PRESETS.find((l) => l.shortcutKey === presetDigit);
         if (preset) {
-          zoneLayout.setLayoutId(preset.id);
+          zoneLayout.setLayoutId(preset.id, { source: "operator" });
         }
         return;
       }
@@ -291,7 +292,7 @@ export function useKeyboardShortcuts({
         if (zoneLayout.layoutId === FLOW_GRID_ID) return;
         const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === zoneLayout.layoutId);
         const nextIdx = (currentIdx + 1) % LAYOUT_PRESETS.length;
-        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
+        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id, { source: "operator" });
         return;
       }
       // Ctrl+Shift+K — command palette. The chord comes from the shared
