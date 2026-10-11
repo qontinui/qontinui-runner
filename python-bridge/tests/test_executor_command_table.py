@@ -578,14 +578,44 @@ class _StubEvents:
         pass
 
 
-def _sm_handler(result: object):
-    sys.path.insert(0, str(BRIDGE_DIR))
-    from executor_commands.state_machine import StateMachineCommands
+def _load_state_machine_mixin():
+    """``executor_commands/state_machine.py`` without running the package ``__init__``.
 
-    host = object.__new__(StateMachineCommands)
+    The package ``__init__`` imports every mixin, and those pull in cv2, numpy,
+    PIL and ``qontinui_schemas``; this file promises to run without any of them.
+    A stub package holds only ``_host`` (whose non-stdlib imports sit under
+    ``TYPE_CHECKING``) so the mixin's one relative import resolves.
+    """
+    import types
+
+    pkg_name = "_isolated_executor_commands"
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [str(PACKAGE_DIR)]
+    sys.modules[pkg_name] = pkg
+    for leaf in ("_host", "state_machine"):
+        spec = importlib.util.spec_from_file_location(
+            f"{pkg_name}.{leaf}", PACKAGE_DIR / f"{leaf}.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[f"{pkg_name}.{leaf}"] = module
+        spec.loader.exec_module(module)
+    return sys.modules[f"{pkg_name}.state_machine"]
+
+
+def _sm_handler(result: object):
+    mixin = _load_state_machine_mixin()
+    host = object.__new__(mixin.StateMachineCommands)
     host._ui_bridge_runtime = _StubRuntime(result)  # type: ignore[attr-defined]
     host.event_manager = _StubEvents()  # type: ignore[attr-defined]
     return host._handle_sm_execute_transition
+
+
+def test_state_machine_mixin_loads_without_heavy_dependencies():
+    before = set(sys.modules)
+    _load_state_machine_mixin()
+    pulled = {m.split(".")[0] for m in set(sys.modules) - before}
+    assert not pulled & {"cv2", "numpy", "PIL", "qontinui", "qontinui_schemas"}
 
 
 @pytest.mark.parametrize(
@@ -605,3 +635,14 @@ def test_sm_execute_transition_reports_a_successful_result_as_success():
     response = _sm_handler(_StubTransitionResult(success=True))({"transition_id": "t1"})
     assert response["success"] is True
     assert response["result"] == {"success": True, "error": None}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [_StubTransitionResult(success=False, error=None), None, {"error": "boom"}],
+)
+def test_sm_execute_transition_never_reports_an_unstated_success(result):
+    """A result that does not SAY it succeeded is a failure, with a named error."""
+    response = _sm_handler(result)({"transition_id": "t1"})
+    assert response["success"] is False
+    assert response["error"]

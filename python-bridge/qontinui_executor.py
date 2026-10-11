@@ -1604,7 +1604,10 @@ def main():
                         )
 
                 with executor.event_manager._output_lock:
-                    sys.stdout.write(json.dumps(response) + "\n")
+                    # default=str: a non-JSON value in a handler's payload must still
+                    # produce a response line; a dropped line becomes a 30 s
+                    # caller timeout instead of an error.
+                    sys.stdout.write(json.dumps(response, default=str) + "\n")
                     sys.stdout.flush()
 
         except json.JSONDecodeError as e:
