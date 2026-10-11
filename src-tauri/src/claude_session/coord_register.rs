@@ -199,6 +199,20 @@ struct Inner {
     /// constructible without one (tests, ephemeral registrars). Unattached →
     /// the arm misses.
     terminal_coord_lookup: OnceLock<TerminalCoordLookup>,
+    /// The live `SessionRegistry`'s tenant stamp for a coord row — the second
+    /// tenant carrier [`AiCoordRegistrar::owning_tenant`] reads, for terminal-
+    /// plane rows this registrar never registered. Unattached (production)
+    /// it reads the registry through [`crate::session::session_tenant_scope`];
+    /// tests inject an answer ([`AiCoordRegistrar::attach_registry_tenant_lookup`]).
+    registry_tenant_lookup: OnceLock<RegistryTenantLookup>,
+    /// Tenants of sessions [`AiCoordRegistrar::close_session`] closed
+    /// recently, by harness id — `(session_key, tenant, closed_at)`, newest
+    /// last, at most [`RECENTLY_CLOSED_CAP`] entries and only consulted for
+    /// [`RECENTLY_CLOSED_TTL`]. A closeout push is usually a session's last act,
+    /// so its transcript line can reach the tail AFTER the close evicted the
+    /// session's index entry; this keeps that push attributable for a bounded
+    /// grace window instead of filing it `Unresolved`.
+    recently_closed: Mutex<std::collections::VecDeque<(String, Uuid, std::time::Instant)>>,
     /// Test-only observability for the Phase-1 handle hook: counts every
     /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
     /// incremented BEFORE the attached-store gate — so unit tests (which
@@ -211,6 +225,16 @@ struct Inner {
 /// See [`Inner::terminal_coord_lookup`]. Argument: a harness id; answers the
 /// coord row of the live terminal PINNED to it.
 type TerminalCoordLookup = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
+
+/// See [`Inner::registry_tenant_lookup`]. Argument: a coord session id;
+/// answers the tenant the live `SessionRegistry` stamped on it.
+type RegistryTenantLookup = Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>;
+
+/// Bound on [`Inner::recently_closed`]'s entry count.
+const RECENTLY_CLOSED_CAP: usize = 256;
+/// How long a closed session's tenant stays resolvable through
+/// [`Inner::recently_closed`].
+const RECENTLY_CLOSED_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// How many predecessors [`resolve_adoption_chain`] follows before giving up —
 /// each hop is one `/clear` inside the same provider process.
@@ -278,6 +302,8 @@ impl AiCoordRegistrar {
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
+                registry_tenant_lookup: OnceLock::new(),
+                recently_closed: Mutex::new(std::collections::VecDeque::new()),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -306,6 +332,19 @@ impl AiCoordRegistrar {
     ) {
         if self.inner.terminal_coord_lookup.set(Box::new(f)).is_err() {
             warn!("ai_coord_register: terminal coord lookup already attached — ignoring");
+        }
+    }
+
+    /// Replace the `SessionRegistry` tenant read (see
+    /// [`Inner::registry_tenant_lookup`]). Test seam: production leaves it
+    /// unattached and reads the live registry.
+    #[cfg(test)]
+    pub(crate) fn attach_registry_tenant_lookup(
+        &self,
+        f: impl Fn(Uuid) -> Option<Uuid> + Send + Sync + 'static,
+    ) {
+        if self.inner.registry_tenant_lookup.set(Box::new(f)).is_err() {
+            warn!("ai_coord_register: registry tenant lookup already attached — ignoring");
         }
     }
 
@@ -877,10 +916,30 @@ impl AiCoordRegistrar {
 
     /// Commit ↔ session lineage push-report (plan
     /// `2026-06-07-coord-commit-session-lineage.md`, Population path 2). Enqueue
-    /// a `commit_report` outbox row carrying `{repo, branch, shas}`. The drain
-    /// loop POSTs it to `POST /coord/commits/report`; coord resolves the
-    /// session server-side from `(repo, branch)`, so the body carries NO session
-    /// id.
+    /// a `commit_report` outbox row carrying `{repo, branch, shas}` plus, when
+    /// one resolves, the pushing session's owning `tenant_id`. The drain loop
+    /// POSTs it to `POST /coord/commits/report`; coord resolves the session
+    /// server-side from `(repo, branch)`, so the body carries NO session id.
+    ///
+    /// `session_key` is the harness id of the Claude session whose transcript
+    /// showed the push. Its owning tenant is stamped as a top-level
+    /// `tenant_id` — the carrier the drain's
+    /// `record_session_tenant` reads first — so the row resolves
+    /// `TenantScope::Owned` and presents that tenant's credential slot, on a
+    /// multi-bound device too (plan
+    /// `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`,
+    /// Phase 0). The row's own outbox `session_id` is synthetic (below), so
+    /// without the stamp the drain could only answer `Unresolved`. When no
+    /// tenant resolves the field is OMITTED, never guessed from the device
+    /// default: the row stays `Unresolved` and the D2 degrade decides.
+    ///
+    /// `dispatch_tenant` is the tenant the CALLER resolved
+    /// ([`Self::owning_tenant`]) when the push was observed. It wins, because a
+    /// closeout push is usually the session's last act: by the time a backed-up
+    /// git worker reaches this call, `close_session` may already have evicted
+    /// the session's recorded tenant. Only when it is `None` is the session
+    /// re-resolved here, which catches a registration that landed after the
+    /// push was observed.
     ///
     /// The outbox keys its monotonic `seq` on `(machine_id, session_id)`, but
     /// commit reports have no real session — we mint a **deterministic** UUIDv5
@@ -891,7 +950,14 @@ impl AiCoordRegistrar {
     /// Best-effort and gated on `QONTINUI_COMMIT_LINEAGE_REPORT` (default ON);
     /// a disabled gate, empty `shas`, or an outbox write error is a silent
     /// no-op that never disturbs the live session.
-    pub fn report_commits(&self, repo: &str, branch: &str, shas: Vec<String>) {
+    pub fn report_commits(
+        &self,
+        session_key: &str,
+        dispatch_tenant: Option<Uuid>,
+        repo: &str,
+        branch: &str,
+        shas: Vec<String>,
+    ) {
         if !crate::terminal::commit_report::report_enabled() {
             return;
         }
@@ -906,11 +972,23 @@ impl AiCoordRegistrar {
             &Uuid::NAMESPACE_URL,
             format!("commit-report:{repo}:{branch}").as_bytes(),
         );
-        let payload = json!({
+        let mut payload = json!({
             "repo": repo,
             "branch": branch,
             "shas": shas,
         });
+        let tenant = dispatch_tenant.or_else(|| self.owning_tenant(session_key));
+        if let Some(t) = tenant {
+            payload["tenant_id"] = json!(t);
+        } else {
+            debug!(
+                session_key,
+                "ai_coord_register: commit report for {}@{} carries no tenant — \
+                 no owning tenant resolved for the pushing session",
+                repo,
+                branch
+            );
+        }
 
         match self.inner.outbox.record(
             self.inner.machine_id,
@@ -1009,6 +1087,68 @@ impl AiCoordRegistrar {
             .lock()
             .ok()
             .and_then(|g| g.get(&session_id).copied())
+    }
+
+    /// The tenant that OWNS the Claude session `claude_session_id` (a harness
+    /// id — a transcript's `.jsonl` stem), or `None` when nothing resolves it.
+    ///
+    /// The session's coord row is found by [`Self::resolve_record`] — this
+    /// registrar's own index (the AI/task-run plane and sniffed or
+    /// transcript-bound sessions), else the `/clear` predecessor chain, else
+    /// the terminal plane's pinned-id lookup. Its tenant is then the one
+    /// recorded here at registration ([`Inner::tenants`]), else the live
+    /// `SessionRegistry`'s stamp for that row
+    /// ([`Inner::registry_tenant_lookup`]) — the same two carriers the drain
+    /// reads for the session's own rows. When no row resolves, a session this
+    /// registrar CLOSED within [`RECENTLY_CLOSED_TTL`] answers the tenant it
+    /// was recorded under ([`Inner::recently_closed`]; checked for the id and
+    /// its direct `/clear` predecessor ONLY — deliberately not the whole
+    /// adoption chain: past one hop the attribution is a guess, and a missing
+    /// stamp is better than a guessed one). There is deliberately NO
+    /// fallback to the device's default binding at report time (the default
+    /// may still be what the session was REGISTERED under — that is a recorded
+    /// fact, not a guess): a guessed tenant on a
+    /// multi-bound device would file the row under the wrong tenant, which is
+    /// what `TenantScope::Unresolved` exists to refuse.
+    pub(crate) fn owning_tenant(&self, claude_session_id: &str) -> Option<Uuid> {
+        let adopted_from = self
+            .inner
+            .lifecycle_store
+            .get()
+            .and_then(|s| s.get(claude_session_id))
+            .and_then(|r| r.adopted_from);
+        let Some(coord_id) = self.resolve_record(claude_session_id, adopted_from.as_deref(), None)
+        else {
+            return self.recently_closed_tenant(claude_session_id).or_else(|| {
+                adopted_from
+                    .as_deref()
+                    .and_then(|pred| self.recently_closed_tenant(pred))
+            });
+        };
+        self.inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&coord_id).copied())
+            .or_else(|| match self.inner.registry_tenant_lookup.get() {
+                Some(lookup) => lookup(coord_id),
+                None => crate::session::session_tenant_scope(Some(coord_id)).declared_tenant(),
+            })
+    }
+
+    /// The tenant `session_key` was recorded under when this registrar closed
+    /// it, if that was within [`RECENTLY_CLOSED_TTL`] (see
+    /// [`Inner::recently_closed`]).
+    fn recently_closed_tenant(&self, session_key: &str) -> Option<Uuid> {
+        let now = std::time::Instant::now();
+        self.inner.recently_closed.lock().ok().and_then(|g| {
+            g.iter()
+                .rev()
+                .find(|(k, _, at)| {
+                    k == session_key && now.duration_since(*at) < RECENTLY_CLOSED_TTL
+                })
+                .map(|(_, t, _)| *t)
+        })
     }
 
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
@@ -1327,6 +1467,18 @@ impl AiCoordRegistrar {
     /// `claude_session_id`. A key from neither plane is an index miss, which is
     /// the documented no-op.
     pub fn close_session(&self, session_key: &str) {
+        // The recently-closed grace lock is taken FIRST and held across the
+        // whole eviction, so `owning_tenant` (which consults the grace only
+        // after its index lookups missed, and takes no other lock while
+        // holding the grace lock) can never observe the key gone from
+        // `reverse` while a stale grace entry for it is still in place.
+        // Nothing takes `recently_closed` while holding `reverse`, `forward`
+        // or `tenants`, so this order cannot invert.
+        let mut recent = self
+            .inner
+            .recently_closed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session_id = {
             // Evict reverse first, capturing the coord id.
             let Some(id) = self
@@ -1346,9 +1498,27 @@ impl AiCoordRegistrar {
         // Read the tenant for the `Closed` row, then evict it with the rest of
         // the R4 index.
         let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
-        if let Ok(mut tenants) = self.inner.tenants.lock() {
-            tenants.remove(&session_id);
+        let closed_tenant = self
+            .inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|mut g| g.remove(&session_id));
+        // Keep the tenant resolvable by harness id for a bounded grace window:
+        // a closeout push's transcript line can reach the tail after this.
+        // Every close purges this key's older entry (and expired ones) FIRST,
+        // even one that recorded no tenant: a stale entry from an earlier
+        // incarnation of the key must never outlive the latest close.
+        let now = std::time::Instant::now();
+        recent
+            .retain(|(k, _, at)| k != session_key && now.duration_since(*at) < RECENTLY_CLOSED_TTL);
+        if let Some(t) = closed_tenant {
+            recent.push_back((session_key.to_string(), t, now));
         }
+        while recent.len() > RECENTLY_CLOSED_CAP {
+            recent.pop_front();
+        }
+        drop(recent);
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
@@ -3426,6 +3596,8 @@ mod tests {
         let (reg, _dir) = registrar();
 
         reg.report_commits(
+            "unregistered-harness-session",
+            None,
             "qontinui/qontinui-runner",
             "feat/x",
             vec!["sha1".into(), "sha2".into()],
@@ -3440,6 +3612,272 @@ mod tests {
         assert_eq!(row.payload["shas"], json!(["sha1", "sha2"]));
         // No session id is carried in the body — coord resolves it server-side.
         assert!(row.payload.get("agent_session_id").is_none());
+        // The pushing session is unknown to this registrar, so no tenant is
+        // stamped (the row stays `Unresolved` at the drain, today's shape).
+        assert!(row.payload.get("tenant_id").is_none());
+    }
+
+    /// Plan `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`
+    /// Phase 0: a push seen in a registered session's transcript is stamped
+    /// with THAT session's recorded tenant — not what the device resolver
+    /// answers now (it is re-pinned after registration below) — and an
+    /// unknown session gets no stamp at all rather than the resolver's guess.
+    #[test]
+    fn report_commits_stamps_the_pushing_sessions_owning_tenant() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REPINNED_NOW: AtomicBool = AtomicBool::new(false);
+        const REPINNED: Uuid = Uuid::from_u128(0x0e0e_0000_0000_4000_8000_0000_0000_0001);
+        fn resolver() -> Option<Uuid> {
+            Some(if REPINNED_NOW.load(Ordering::SeqCst) {
+                REPINNED
+            } else {
+                OWNING_TENANT
+            })
+        }
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        REPINNED_NOW.store(false, Ordering::SeqCst);
+        let (reg, _dir) = registrar_with_tenant(resolver);
+        let harness = Uuid::new_v4().to_string();
+        reg.register_session(&harness, "push work", None).unwrap();
+        // The device is re-pinned after the session registered.
+        REPINNED_NOW.store(true, Ordering::SeqCst);
+
+        reg.report_commits(&harness, None, "o/r", "feat/x", vec!["a".into()]);
+        reg.report_commits("never-registered", None, "o/r", "feat/y", vec!["b".into()]);
+
+        let reports: Vec<_> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::CommitReport.as_str())
+            .collect();
+        assert_eq!(reports.len(), 2);
+        // Two branches → two synthetic lanes, so pending() order is not
+        // insertion order; address each row by its branch.
+        let on = |branch: &str| {
+            reports
+                .iter()
+                .find(|r| r.payload["branch"] == json!(branch))
+                .expect("a report for the branch")
+                .payload
+                .clone()
+        };
+        assert_eq!(on("feat/x")["tenant_id"], json!(OWNING_TENANT));
+        assert!(
+            on("feat/y").get("tenant_id").is_none(),
+            "an unresolvable pushing session must not be stamped with the device default"
+        );
+    }
+
+    /// The commit-report rows in `reg`'s outbox, by branch.
+    fn commit_report_payload(reg: &AiCoordRegistrar, branch: &str) -> serde_json::Value {
+        reg.inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| {
+                r.event_kind == SessionEventKind::CommitReport.as_str()
+                    && r.payload["branch"] == json!(branch)
+            })
+            .expect("a commit report for the branch")
+            .payload
+    }
+
+    /// A closeout push whose transcript line reaches the tail only AFTER the
+    /// registrar closed the session still resolves the tenant the session was
+    /// recorded under, through the bounded recently-closed grace — and the
+    /// grace answers only for the closed session's own key.
+    #[test]
+    fn a_closed_sessions_tenant_stays_resolvable_for_the_grace_window() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let harness = Uuid::new_v4().to_string();
+        reg.register_session(&harness, "closeout push", None)
+            .unwrap();
+        reg.close_session(&harness);
+        assert!(
+            reg.session_id_for(&harness).is_none(),
+            "the index entry is gone"
+        );
+
+        assert_eq!(reg.owning_tenant(&harness), Some(OWNING_TENANT));
+        assert_eq!(reg.owning_tenant("some-other-session"), None);
+        reg.report_commits(&harness, None, "o/r", "closeout", vec!["a".into()]);
+        assert_eq!(
+            commit_report_payload(&reg, "closeout")["tenant_id"],
+            json!(OWNING_TENANT)
+        );
+    }
+
+    /// A later close of the same key that recorded NO tenant purges the
+    /// earlier close's grace entry: the key must not keep answering a tenant
+    /// from an incarnation that is no longer the latest.
+    #[test]
+    fn a_tenantless_close_purges_the_keys_older_grace_entry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static NO_TENANT_NOW: AtomicBool = AtomicBool::new(false);
+        fn resolver() -> Option<Uuid> {
+            (!NO_TENANT_NOW.load(Ordering::SeqCst)).then_some(OWNING_TENANT)
+        }
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        NO_TENANT_NOW.store(false, Ordering::SeqCst);
+        let (reg, _dir) = registrar_with_tenant(resolver);
+        let key = Uuid::new_v4().to_string();
+        reg.register_session(&key, "first", None).unwrap();
+        reg.close_session(&key);
+        assert_eq!(reg.owning_tenant(&key), Some(OWNING_TENANT), "precondition");
+
+        NO_TENANT_NOW.store(true, Ordering::SeqCst);
+        reg.register_session(&key, "second", None).unwrap();
+        reg.close_session(&key);
+        assert_eq!(reg.owning_tenant(&key), None);
+    }
+
+    /// `/clear` in a registered X adopts Y; X is then closed. A push in Y's
+    /// transcript resolves X's tenant through the predecessor arm of the
+    /// recently-closed grace.
+    #[test]
+    fn a_push_after_clear_resolves_a_closed_predecessors_tenant() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (store, _sdir) = attach_store(&reg);
+        // Non-uuid ids keep the attached store's handle hook network-silent.
+        let x = "registered-x-then-closed";
+        reg.register_sniffed_session(x, "typed resume", None)
+            .expect("registered");
+        open_on(&store, x, "term-x", None);
+        open_on(&store, "cleared-y-of-closed-x", "term-x", Some(x));
+        reg.close_session(x);
+        assert!(reg.session_id_for(x).is_none(), "X's index entry is gone");
+
+        assert_eq!(
+            reg.owning_tenant("cleared-y-of-closed-x"),
+            Some(OWNING_TENANT)
+        );
+    }
+
+    /// The grace list is bounded: after `RECENTLY_CLOSED_CAP + 1` closes the
+    /// oldest is gone, and the newest still answers.
+    #[test]
+    fn the_recently_closed_grace_is_capped() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let keys: Vec<String> = (0..=RECENTLY_CLOSED_CAP)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect();
+        for k in &keys {
+            reg.register_session(k, "cap", None).unwrap();
+            reg.close_session(k);
+        }
+        assert_eq!(reg.owning_tenant(&keys[0]), None, "the oldest was evicted");
+        assert_eq!(reg.owning_tenant(&keys[1]), Some(OWNING_TENANT));
+        assert_eq!(reg.owning_tenant(keys.last().unwrap()), Some(OWNING_TENANT));
+    }
+
+    /// Review (round 2) MINOR 3: a terminal-plane hit whose coord row the live
+    /// `SessionRegistry` stamps with T is stamped T.
+    #[test]
+    fn a_terminal_lookup_hit_takes_the_registry_stamped_tenant() {
+        const T: Uuid = Uuid::from_u128(0x0f0f_0000_0000_4000_8000_0000_0000_0002);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let terminal_coord = Uuid::new_v4();
+        attach_one_terminal(&reg, "pinned-terminal", terminal_coord);
+        reg.attach_registry_tenant_lookup(move |id| (id == terminal_coord).then_some(T));
+
+        assert_eq!(reg.owning_tenant("pinned-terminal"), Some(T));
+        reg.report_commits("pinned-terminal", None, "o/r", "registry", vec!["a".into()]);
+        assert_eq!(
+            commit_report_payload(&reg, "registry")["tenant_id"],
+            json!(T)
+        );
+    }
+
+    /// `/clear` in a registered session X adopts Y from X: a push in Y's
+    /// transcript is stamped with X's tenant (Y is unknown by its own id).
+    #[test]
+    fn a_push_after_clear_carries_the_predecessors_tenant() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (store, _sdir) = attach_store(&reg);
+        // Non-uuid ids keep the attached store's handle hook network-silent.
+        let x = "registered-x";
+        reg.register_sniffed_session(x, "typed resume", None)
+            .expect("registered");
+        open_on(&store, x, "term-x", None);
+        open_on(&store, "cleared-y", "term-x", Some(x));
+        assert!(
+            reg.session_id_for("cleared-y").is_none(),
+            "precondition: Y is unknown by its own id"
+        );
+
+        assert_eq!(reg.owning_tenant("cleared-y"), Some(OWNING_TENANT));
+        reg.report_commits("cleared-y", None, "o/r", "after-clear", vec!["a".into()]);
+        assert_eq!(
+            commit_report_payload(&reg, "after-clear")["tenant_id"],
+            json!(OWNING_TENANT)
+        );
+    }
+
+    /// A typed `claude --resume X` in a pane pinned to P: a push in X's
+    /// transcript must never borrow P's tenant. While X is unregistered it
+    /// carries no stamp at all.
+    #[test]
+    fn a_resumed_session_in_a_pane_never_borrows_the_panes_tenant() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let (store, _sdir) = attach_store(&reg);
+        let pinned = "pane-p";
+        let terminal = "term-pane";
+        // P is registered here, so P's coord row HAS a recorded tenant.
+        let pane_coord = reg
+            .register_sniffed_session(pinned, "pane", None)
+            .expect("registered");
+        attach_one_terminal(&reg, pinned, pane_coord);
+        let x = "typed-resume-x";
+        open_on(&store, pinned, terminal, None);
+        open_on(&store, x, terminal, None);
+        assert_eq!(reg.owning_tenant(pinned), Some(OWNING_TENANT));
+
+        assert_eq!(reg.owning_tenant(x), None);
+        reg.report_commits(x, None, "o/r", "resumed", vec!["a".into()]);
+        assert!(commit_report_payload(&reg, "resumed")
+            .get("tenant_id")
+            .is_none());
+    }
+
+    /// A terminal-plane hit whose coord row this registrar recorded no tenant
+    /// for (and, in a unit test, no live registry to read) is not stamped.
+    #[test]
+    fn a_terminal_lookup_hit_without_a_recorded_tenant_is_not_stamped() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let terminal_coord = Uuid::new_v4();
+        attach_one_terminal(&reg, "pinned-terminal", terminal_coord);
+        reg.attach_registry_tenant_lookup(|_| None);
+        assert!(reg.session_id_for("pinned-terminal").is_none());
+
+        assert_eq!(reg.owning_tenant("pinned-terminal"), None);
+        reg.report_commits("pinned-terminal", None, "o/r", "terminal", vec!["a".into()]);
+        assert!(commit_report_payload(&reg, "terminal")
+            .get("tenant_id")
+            .is_none());
     }
 
     #[test]
@@ -3448,8 +3886,20 @@ mod tests {
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
         let (reg, _dir) = registrar();
 
-        reg.report_commits("o/r", "main", vec!["a".into()]);
-        reg.report_commits("o/r", "main", vec!["b".into()]);
+        reg.report_commits(
+            "unregistered-harness-session",
+            None,
+            "o/r",
+            "main",
+            vec!["a".into()],
+        );
+        reg.report_commits(
+            "unregistered-harness-session",
+            None,
+            "o/r",
+            "main",
+            vec!["b".into()],
+        );
         let pending = reg.inner.outbox.pending().unwrap();
         // Both reports for the same (repo, branch) share one seq lane (same
         // synthetic session id), so seqs are 1 then 2.
@@ -3464,8 +3914,14 @@ mod tests {
         let _env = env_lock();
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
         let (reg, _dir) = registrar();
-        reg.report_commits("o/r", "main", vec![]);
-        reg.report_commits("o/r", "main", vec!["   ".into()]);
+        reg.report_commits("unregistered-harness-session", None, "o/r", "main", vec![]);
+        reg.report_commits(
+            "unregistered-harness-session",
+            None,
+            "o/r",
+            "main",
+            vec!["   ".into()],
+        );
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
     }
 
@@ -3474,7 +3930,13 @@ mod tests {
         let _env = env_lock();
         std::env::set_var("QONTINUI_COMMIT_LINEAGE_REPORT", "0");
         let (reg, _dir) = registrar();
-        reg.report_commits("o/r", "main", vec!["a".into()]);
+        reg.report_commits(
+            "unregistered-harness-session",
+            None,
+            "o/r",
+            "main",
+            vec!["a".into()],
+        );
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
     }

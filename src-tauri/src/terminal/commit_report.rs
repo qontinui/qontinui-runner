@@ -23,9 +23,14 @@
 //! [`crate::session::local_store::OutboxWriter`] (via
 //! [`crate::claude_session::coord_register::AiCoordRegistrar::report_commits`]).
 //! The existing `CoordSync` drain loop POSTs it to
-//! `POST /coord/commits/report {repo, branch, shas[]}`. Coord resolves the
-//! session **server-side** from `(repo, branch)`; the body carries NO session
-//! id (plan §Population path 2).
+//! `POST /coord/commits/report {repo, branch, shas[], tenant_id?}`. Coord
+//! resolves the session **server-side** from `(repo, branch)`; the body carries
+//! NO session id (plan §Population path 2). It does carry the pushing session's
+//! owning `tenant_id` whenever the registrar can resolve one from the
+//! transcript's session id — the field the drain reads to pick that tenant's
+//! credential slot (plan
+//! `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`,
+//! Phase 0).
 //!
 //! ## Dedup
 //!
@@ -421,15 +426,26 @@ pub fn reset_dedup_for_test() {
 
 /// Full pipeline for one push observation: resolve git facts, apply dedup, and
 /// (when warranted) report via the registrar. Best-effort — logs and returns on
-/// any miss. Synchronous git calls are cheap and run on the tail task's thread.
-pub fn handle_push_observation(
+/// any miss. Runs on the bounded git worker thread, as the body of the job
+/// [`push_job`] builds.
+///
+/// `session_key` is the harness id of the transcript the push was seen in.
+/// `dispatch_tenant` is its owning tenant as resolved when the push was
+/// observed; the registrar re-resolves from `session_key` only when that is
+/// `None` (see `AiCoordRegistrar::report_commits`).
+/// `resolve` is the git resolution ([`resolve_push`] in production; tests
+/// inject it).
+fn handle_push_observation_with(
     obs: &PushObservation,
+    session_key: &str,
+    dispatch_tenant: Option<uuid::Uuid>,
     registrar: &crate::claude_session::coord_register::AiCoordRegistrar,
+    resolve: fn(&str) -> Option<ResolvedPush>,
 ) {
     if !report_enabled() {
         return;
     }
-    let Some(resolved) = resolve_push(&obs.working_dir) else {
+    let Some(resolved) = resolve(&obs.working_dir) else {
         debug!(
             "commit_report: could not resolve git push in {} — skipping",
             obs.working_dir
@@ -444,13 +460,19 @@ pub fn handle_push_observation(
         );
         return;
     }
-    registrar.report_commits(&resolved.repo, &resolved.branch, resolved.shas);
+    registrar.report_commits(
+        session_key,
+        dispatch_tenant,
+        &resolved.repo,
+        &resolved.branch,
+        resolved.shas,
+    );
 }
 
 // ── Bounded fan-out ──────────────────────────────────────────────────────────
 //
 // **The problem.** The transcript tail loop used to do
-// `for obs in pushes { spawn_blocking(|| handle_push_observation(..)) }` — one
+// `for obs in pushes { spawn_blocking(|| /* handle one push */) }` — one
 // blocking-pool task per transcript line, with no cap of any kind. The bound
 // was the transcript's line rate, i.e. none. Combined with an untimed `git`
 // (fixed above) that is a direct route to blocking-pool exhaustion, which is
@@ -473,6 +495,9 @@ pub fn handle_push_observation(
 //     is safe here: `report_commits` is best-effort and coord dedups, so a
 //     dropped observation costs at most one lineage row that the next push
 //     re-reports. Drops are counted and WARNed, never silent.
+//
+// The job each observation becomes is built by [`push_job`], which also
+// resolves the pushing session's tenant before the hand-off.
 
 /// Queue depth for pending git enumerations. Small on purpose: a backlog this
 /// deep already means git is pathological, and queueing more just delays the
@@ -552,13 +577,14 @@ static PUSH_DISPATCHER: Lazy<PushDispatcher> =
 ///
 /// This is what the transcript tail loop calls, in place of an unbounded
 /// `spawn_blocking` per line. Returns whether the observation was queued.
+/// `session_key` is the transcript's harness session id; see [`push_job`]
+/// for when its owning tenant is resolved and the window that remains.
 pub fn dispatch_push_observation(
     obs: PushObservation,
+    session_key: String,
     registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
 ) -> bool {
-    let accepted = PUSH_DISPATCHER.try_dispatch(move || {
-        handle_push_observation(&obs, &registrar);
-    });
+    let accepted = PUSH_DISPATCHER.try_dispatch(push_job(obs, session_key, registrar));
     if !accepted {
         warn!(
             queue_capacity = PUSH_QUEUE_CAPACITY,
@@ -568,6 +594,45 @@ pub fn dispatch_push_observation(
         );
     }
     accepted
+}
+
+/// Build the git-worker job for one push observation.
+///
+/// The pushing session's owning tenant is resolved HERE, EAGERLY, on the
+/// caller's thread (in-memory map reads only, no I/O) — not inside the
+/// returned closure. A closeout push usually comes right before the session
+/// ends, and the session's index entry (registrar close, or the terminal going
+/// away) can be gone by the time a worker backed up behind a slow git runs the
+/// job; resolving then would find nothing and file the report `Unresolved`.
+/// The job re-resolves only when this answers `None`, which still catches a
+/// registration that lands just after the push.
+///
+/// **The window that remains.** If the session's index entry is gone BEFORE
+/// the tail even reads the push line, dispatch resolves nothing either. For a
+/// session the registrar closed, its bounded recently-closed grace
+/// (`AiCoordRegistrar::owning_tenant`; 256 entries / 10 minutes) still
+/// answers. Otherwise — a terminal-plane session whose terminal and registry
+/// row are already gone, or a registrar close past the grace — the report is
+/// filed `Unresolved`, exactly as before Phase 0.
+pub(crate) fn push_job(
+    obs: PushObservation,
+    session_key: String,
+    registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+) -> impl FnOnce() + Send + 'static {
+    push_job_with(obs, session_key, registrar, resolve_push)
+}
+
+/// [`push_job`] with the git resolution injected (tests).
+fn push_job_with(
+    obs: PushObservation,
+    session_key: String,
+    registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    resolve: fn(&str) -> Option<ResolvedPush>,
+) -> impl FnOnce() + Send + 'static {
+    let dispatch_tenant = registrar.owning_tenant(&session_key);
+    move || {
+        handle_push_observation_with(&obs, &session_key, dispatch_tenant, &registrar, resolve);
+    }
 }
 
 /// Observability for the process-wide dispatcher.
@@ -3219,6 +3284,123 @@ pub fn agent_notification_lane(transcript_session_id: &str) -> uuid::Uuid {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Arming test for Phase 0 of plan
+    /// `2026-10-10-coord-commits-report-is-anonymous-and-trusts-a-tenant-header`.
+    /// It enters ONLY through the dispatch seam (`push_job_with`) and uses only
+    /// pre-existing APIs to set up: the production registrar constructor, and a
+    /// transcript bind that records the session's tenant through the normal
+    /// registration path. The commit report the job writes must carry that
+    /// tenant as its top-level `tenant_id`; before Phase 0 it carried none.
+    #[test]
+    fn a_dispatched_push_report_carries_the_sessions_tenant() {
+        const TENANT: uuid::Uuid = uuid::Uuid::from_u128(0x0a1b_0000_0000_4000_8000_0000_0000_0001);
+        fn pushed(_dir: &str) -> Option<ResolvedPush> {
+            Some(ResolvedPush {
+                repo: "o/r".into(),
+                branch: "arming-dispatched-push-carries-tenant".into(),
+                shas: vec!["arming-dispatched-push-carries-tenant-sha".into()],
+            })
+        }
+        let _env = crate::test_env::env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let registrar = Arc::new(
+            crate::claude_session::coord_register::AiCoordRegistrar::new(
+                outbox.clone(),
+                uuid::Uuid::new_v4(),
+            ),
+        );
+        let session = uuid::Uuid::new_v4().to_string();
+        registrar
+            .bind_transcript_session(&session, None, Some(TENANT))
+            .expect("transcript bind registers the session");
+
+        let job = push_job_with(
+            PushObservation {
+                working_dir: "/unused".into(),
+            },
+            session,
+            registrar,
+            pushed,
+        );
+        job();
+
+        let report = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event_kind == "commit_report")
+            .expect("the job wrote a commit report");
+        assert_eq!(report.payload["tenant_id"], json!(TENANT));
+    }
+
+    /// Review (round 2) MINOR 1: the job resolves the pushing session's tenant
+    /// when it is BUILT. Here a terminal-plane session (its tenant stamped by
+    /// the registry) goes away between dispatch and the worker running the
+    /// job; the report must still carry the tenant. Resolving lazily inside
+    /// the closure turns this red.
+    #[test]
+    fn a_push_job_keeps_the_tenant_resolved_when_it_was_built() {
+        use std::sync::atomic::AtomicBool;
+        const T: uuid::Uuid = uuid::Uuid::from_u128(0x0f0f_0000_0000_4000_8000_0000_0000_0001);
+        fn fixed_push(_dir: &str) -> Option<ResolvedPush> {
+            Some(ResolvedPush {
+                repo: "o/r".into(),
+                branch: "push-job-eager-tenant".into(),
+                shas: vec!["a1b2c3-push-job-eager-tenant".into()],
+            })
+        }
+        let _env = crate::test_env::env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg = Arc::new(
+            crate::claude_session::coord_register::AiCoordRegistrar::with_tenant_resolver(
+                outbox.clone(),
+                uuid::Uuid::new_v4(),
+                || None,
+            ),
+        );
+        let terminal_coord = uuid::Uuid::new_v4();
+        let alive = Arc::new(AtomicBool::new(true));
+        {
+            let alive = alive.clone();
+            reg.attach_terminal_coord_lookup(move |csid| {
+                (csid == "pinned-pusher" && alive.load(Ordering::SeqCst)).then_some(terminal_coord)
+            });
+        }
+        reg.attach_registry_tenant_lookup(move |id| (id == terminal_coord).then_some(T));
+
+        let job = push_job_with(
+            PushObservation {
+                working_dir: "/unused".into(),
+            },
+            "pinned-pusher".into(),
+            reg.clone(),
+            fixed_push,
+        );
+        // The session ends before the worker reaches the job.
+        alive.store(false, Ordering::SeqCst);
+        assert_eq!(reg.owning_tenant("pinned-pusher"), None, "precondition");
+        job();
+
+        let row = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event_kind == "commit_report")
+            .expect("a commit report");
+        assert_eq!(row.payload["tenant_id"], json!(T));
+    }
 
     #[test]
     fn detects_plain_git_push() {
