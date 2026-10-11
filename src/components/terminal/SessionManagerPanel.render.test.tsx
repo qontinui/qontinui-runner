@@ -23,7 +23,6 @@ vi.mock("./FleetSessionPicker", () => ({ FleetSessionPicker: () => null }));
 vi.mock("./PastSessionsView", () => ({ PastSessionsView: () => null }));
 
 import { SessionManagerPanel } from "./SessionManagerPanel";
-import { sessionCardCloseElementId } from "./SessionCard";
 import type { UnifiedSession, UseSessionManagerReturn } from "./useSessionManager";
 
 let container: HTMLDivElement;
@@ -195,12 +194,13 @@ describe("SessionManagerPanel — closing a session from its row", () => {
     }
     act(() => root.render(createElement(Page)));
 
+    // The UI Bridge id is spelled out: it is the contract an agent drives.
     const close = container.querySelector(
-      `[data-ui-bridge-id='${sessionCardCloseElementId("tab-a")}']`,
+      "[data-ui-bridge-id='terminal.session-card-close-tab-a']",
     ) as HTMLElement | null;
     expect(close).not.toBeNull();
     expect(
-      container.querySelector(`[data-ui-bridge-id='${sessionCardCloseElementId("tab-b")}']`),
+      container.querySelector("[data-ui-bridge-id='terminal.session-card-close-tab-b']"),
     ).toBeNull();
     act(() => close!.click());
     expect(closeSession).toHaveBeenCalledTimes(1);
