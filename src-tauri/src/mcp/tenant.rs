@@ -340,7 +340,10 @@ mod tests {
         next_start.sort();
         assert_eq!(
             next_start,
-            ["coord_mcp_nonce_restore", "coord_mcp_on_disk_nonce_adoption"],
+            [
+                "coord_mcp_nonce_restore",
+                "coord_mcp_on_disk_nonce_adoption"
+            ],
             "exactly the startup readers are next_start"
         );
         let gate = surfaces
@@ -352,9 +355,9 @@ mod tests {
             "the dual-write flag poll re-reads the pin each tick, so a PUT reaches it live"
         );
         assert!(
-            gate["evidence"]
-                .as_array()
-                .is_some_and(|e| e.iter().any(|r| r == "session/coord_sync.rs::run_flag_poll_loop")),
+            gate["evidence"].as_array().is_some_and(|e| e
+                .iter()
+                .any(|r| r == "session/coord_sync.rs::run_flag_poll_loop")),
             "the gate's reader is the flag poll loop: {gate}"
         );
 
