@@ -101,6 +101,7 @@ export function applyCredentialDarkSignal(
  * recovery has already been tried and refused outranks one that has not.
  */
 const CREDENTIAL_DARK_PRIORITY: string[] = [
+  "device_credential_revoked",
   "unrefreshable",
   "cognito_hard",
   "absent",
@@ -271,7 +272,8 @@ export type CredentialDarkCause =
   | "unrefreshable"
   | "absent"
   | "upstream_401"
-  | "no_default_binding";
+  | "no_default_binding"
+  | "device_credential_revoked";
 
 const CREDENTIAL_DARK_TITLES: Record<CredentialDarkCause, string> = {
   cognito_hard: "Autonomous sessions paused",
@@ -284,6 +286,11 @@ const CREDENTIAL_DARK_TITLES: Record<CredentialDarkCause, string> = {
   // binding (paired_user.json) that points at it. Rendering this as `absent`
   // was the 2026-09-28 misreport.
   no_default_binding: "Coord credential present, but no default binding points at it",
+  // Plan 2026-10-11-runner-coord-credential-self-renewal-…-dark-gap G1 step 4:
+  // coord answered `403 device_credential_revoked`; the runner stops retrying
+  // and the cure is an operator's Authenticate on /runners (cta
+  // `operator_authenticate`, which this banner has no in-app action for).
+  device_credential_revoked: "Coord revoked this runner — an operator must authenticate it on /runners",
 };
 
 /** Title for a cause, or `null` for one this build does not know. */

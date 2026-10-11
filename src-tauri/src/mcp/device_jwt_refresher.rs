@@ -1250,10 +1250,20 @@ pub(crate) async fn try_device_self_refresh(
     if !resp.status().is_success() {
         // 404 (route undeployed) / 401 / 5xx — all fall through to Cognito.
         // REPLACE-not-REVOKE: the existing JWT is left untouched.
+        let status = resp.status();
+        if status.as_u16() == 403 {
+            let body = resp.text().await.unwrap_or_default();
+            if is_device_credential_revoked(403, &body) {
+                // G1 step 4: the caller reads the latch and skips the Cognito
+                // and machine-key rungs, which coord refuses for a revoked
+                // device too.
+                latch_device_revocation("the device self-refresh");
+                return None;
+            }
+        }
         info!(
-            "device_jwt_refresher: device self-refresh got HTTP {} \
-             — falling back to Cognito (existing JWT preserved)",
-            resp.status()
+            "device_jwt_refresher: device self-refresh got HTTP {status} \
+             — falling back to Cognito (existing JWT preserved)"
         );
         return None;
     }
@@ -1367,17 +1377,82 @@ pub(crate) enum TenantSlotPlan {
 
 /// Pure per-slot staleness decision. `exp` is the slot JWT's decoded
 /// (unverified) `exp` claim; `now` is unix seconds.
-pub(crate) fn plan_tenant_slot(exp: Option<i64>, now: i64) -> TenantSlotPlan {
+///
+/// `forced` is whether the slot's OWN upstream evidence demands a refresh
+/// regardless of `exp` — see [`take_forced_refresh`], which is the only thing
+/// that should compute it in production (it applies the rate bound). Plan
+/// `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
+/// G1: a slot coord keeps refusing while its `exp` is comfortably in the
+/// future used to be `SkipFresh` for up to `REFRESH_BEFORE_EXPIRY_SECS` short
+/// of its whole TTL (~2 h 40 min of a 4 h token), refusing every session the
+/// whole time. A locally-dead slot still takes `ClearAndRederive` first: no
+/// streak can make an expired or opaque token presentable.
+pub(crate) fn plan_tenant_slot(exp: Option<i64>, now: i64, forced: bool) -> TenantSlotPlan {
     match exp {
         // Opaque/undecodable — cannot judge or present it for self-refresh.
         None => TenantSlotPlan::ClearAndRederive,
         // Already expired — coord would 401 the presented bearer.
         Some(e) if now >= e => TenantSlotPlan::ClearAndRederive,
+        // Coord keeps refusing a locally-valid token — refresh now, whatever
+        // `exp` says.
+        Some(_) if forced => TenantSlotPlan::Refresh,
         // Within TTL/3 of expiry — refresh now.
         Some(e) if now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS >= e => TenantSlotPlan::Refresh,
         // Comfortably fresh.
         Some(_) => TenantSlotPlan::SkipFresh,
     }
+}
+
+/// Does this slot's upstream evidence say coord is refusing it NOW? The same
+/// predicate the posture's `dark(upstream_401)` reads — at least
+/// [`UPSTREAM_DARK_THRESHOLD`] consecutive credential-attributed rejections —
+/// plus the one staleness rule every unclaimed bucket already uses
+/// ([`upstream_rejection_is_fresh`]), so a week-old streak no slot has spoken
+/// for since cannot drive network traffic.
+pub(crate) fn upstream_streak_demands_refresh(s: &UpstreamSignal, now: i64) -> bool {
+    s.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD && upstream_rejection_is_fresh(s, now)
+}
+
+/// The minimum spacing between two FORCED refreshes of one slot: one per
+/// refresher tick. A kick (the proxy heal, the dark-crossing wake) can run a
+/// pass far more often than [`REFRESH_CHECK_INTERVAL`]; without this bound a
+/// coord that answers the forced refresh with a 5xx — which keeps the slot, so
+/// the streak stands — would be asked again on every kick. Plan G1 step 4:
+/// *"a coord that rejects a device it revoked must not see a retry storm"*.
+pub(crate) const FORCED_REFRESH_MIN_SPACING_SECS: i64 = REFRESH_CHECK_INTERVAL.as_secs() as i64;
+
+/// When each slot key last had a FORCED refresh attempted (unix seconds).
+static FORCED_REFRESH_AT: std::sync::Mutex<std::collections::BTreeMap<String, i64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Pure rate gate behind [`take_forced_refresh`].
+pub(crate) fn forced_refresh_spacing_allows(last: Option<i64>, now: i64) -> bool {
+    last.is_none_or(|t| now - t >= FORCED_REFRESH_MIN_SPACING_SECS)
+}
+
+/// Should the slot filed under `key` be force-refreshed this pass? `true`
+/// iff its streak demands it AND the per-slot rate bound allows it — and a
+/// `true` RECORDS the attempt, so a second call within the spacing answers
+/// `false`. That recording is what makes "at most one forced refresh per slot
+/// per tick" hold however often the refresher is kicked.
+pub(crate) fn take_forced_refresh(key: &str, s: &UpstreamSignal, now: i64) -> bool {
+    if !upstream_streak_demands_refresh(s, now) {
+        return false;
+    }
+    let mut m = FORCED_REFRESH_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if !forced_refresh_spacing_allows(m.get(key).copied(), now) {
+        return false;
+    }
+    m.insert(key.to_string(), now);
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn reset_forced_refresh_for_test() {
+    FORCED_REFRESH_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// The ONLY two things that may ever reach a slot CLEAR.
@@ -1438,6 +1513,15 @@ pub(crate) enum TenantSlotOutcome {
     /// persist error. The existing slot value is left UNTOUCHED
     /// (REPLACE-not-REVOKE), and the pass CONTINUES with the remaining slots.
     KeptExisting,
+    /// Coord said this DEVICE is revoked (`403` with body code
+    /// [`DEVICE_CREDENTIAL_REVOKED_CODE`]) — on this pass's refresh or
+    /// machine-key exchange, or on an earlier one whose latch still stands
+    /// ([`device_revocation_latched`]). Nothing was presented this time, and
+    /// the slot is left as it is: no automatic rung can cure a revocation, so
+    /// retrying it is a retry storm against a coord that has already answered.
+    /// The cure is an operator Authenticate on `/runners`, whose pairing write
+    /// spends the latch.
+    Revoked,
 }
 
 /// Does this refresh status mean coord REJECTED the credential we presented?
@@ -1541,7 +1625,9 @@ fn publish_tenant_slot_health(rows: Vec<TenantSlotHealthRow>) {
     let degraded = rows
         .iter()
         .filter(|r| {
-            r.outcome == "kept-existing" || (r.outcome == "cleared" && r.rederived == Some(false))
+            r.outcome == "kept-existing"
+                || r.outcome == "revoked"
+                || (r.outcome == "cleared" && r.rederived == Some(false))
         })
         .count();
     let snapshot = TenantSlotHealth {
@@ -1665,6 +1751,26 @@ pub enum CoordCredentialPosture {
     Unrefreshable,
     /// The credential looks alive locally but coord will not accept it.
     Dark(DarkCause),
+    /// Coord answered a refresh or machine-key exchange for THIS device with
+    /// `403` [`DEVICE_CREDENTIAL_REVOKED_CODE`]: an operator revoked the
+    /// device. Terminal like [`Self::Unrefreshable`] — no automatic rung can
+    /// cure it, and the refresher deliberately stops asking
+    /// ([`device_revocation_latched`]) — but with a different cure: an operator
+    /// Authenticate on `/runners` (`cta: operator_authenticate`), not a
+    /// re-pair typed into the runner.
+    ///
+    /// **On the wire it is `unrefreshable`** with `cause:
+    /// device_credential_revoked`, and its local refusal code is
+    /// `runner_credential_unrefreshable`. The posture token and the refusal
+    /// codes are a cross-repo contract the fleet's readers match verbatim (see
+    /// [`DarkCause::NoDefaultBinding`] for the same reasoning); a reader that
+    /// knows only `unrefreshable` stays correct — terminal, operator action —
+    /// and one that reads `cause` learns which action.
+    ///
+    /// A separate variant rather than a field on `Unrefreshable` because the
+    /// CTA is a function of the posture alone, and reshaping the unit variant
+    /// would break every constructor of it in flight elsewhere.
+    Revoked,
 }
 
 impl CoordCredentialPosture {
@@ -1677,7 +1783,10 @@ impl CoordCredentialPosture {
             CoordCredentialPosture::Expiring => "expiring",
             CoordCredentialPosture::Expired => "expired",
             CoordCredentialPosture::Absent => "absent",
-            CoordCredentialPosture::Unrefreshable => "unrefreshable",
+            // Deliberately the SAME token — see the variant's doc.
+            CoordCredentialPosture::Unrefreshable | CoordCredentialPosture::Revoked => {
+                "unrefreshable"
+            }
             CoordCredentialPosture::Dark(_) => "dark",
         }
     }
@@ -1686,6 +1795,7 @@ impl CoordCredentialPosture {
     pub fn cause(self) -> Option<&'static str> {
         match self {
             CoordCredentialPosture::Dark(c) => Some(c.as_str()),
+            CoordCredentialPosture::Revoked => Some(DEVICE_CREDENTIAL_REVOKED_CODE),
             _ => None,
         }
     }
@@ -1713,8 +1823,12 @@ impl CoordCredentialPosture {
     /// outranks `Expired` (whose automatic re-derive is still pending) and
     /// `Absent` — the latter deliberately: an unserved-pin `absent` beside a
     /// usable slot is the very misreport this cause exists to replace.
+    ///
+    /// `Revoked` outranks everything: it is coord's explicit, final word on
+    /// the whole device, and the refresher has stopped trying.
     fn severity(self) -> u8 {
         match self {
+            CoordCredentialPosture::Revoked => 6,
             CoordCredentialPosture::Unrefreshable => 5,
             CoordCredentialPosture::Dark(_) => 4,
             CoordCredentialPosture::Expired => 3,
@@ -1744,6 +1858,9 @@ impl CoordCredentialPosture {
             CoordCredentialPosture::Unrefreshable => {
                 "the coord credential expired and automatic refresh FAILED (unrefreshable). \
                  Sessions spawned now have no coord access."
+            }
+            CoordCredentialPosture::Revoked => {
+                "coord REVOKED this runner's device credential (device_credential_revoked), so                  the refresher has stopped retrying. Sessions spawned now have no coord access                  until an operator authenticates this runner on /runners."
             }
             CoordCredentialPosture::Dark(DarkCause::UpstreamRejected) => {
                 "coord is REJECTING this runner's credential even though it has not expired \
@@ -1777,6 +1894,10 @@ impl CoordCredentialPosture {
             CoordCredentialPosture::Absent
             | CoordCredentialPosture::Unrefreshable
             | CoordCredentialPosture::Dark(_) => Some("re_pair"),
+            // A revoked device cannot re-pair itself back in: coord refuses
+            // every mint door for it. An operator's Authenticate on `/runners`
+            // authorizes the redeem the runner then collects.
+            CoordCredentialPosture::Revoked => Some("operator_authenticate"),
         }
     }
 }
@@ -2032,6 +2153,7 @@ pub fn note_coord_upstream_verdict(
     let key = upstream_key(tenant);
     let now = chrono::Utc::now().timestamp();
     let mut spent = false;
+    let mut crossed = false;
     with_upstream_signals(|m| {
         let slot = m.entry(key.clone()).or_default();
         match verdict {
@@ -2043,14 +2165,75 @@ pub fn note_coord_upstream_verdict(
                 spent = true;
             }
             UpstreamVerdict::CredentialRejected => {
+                let before = slot.consecutive_rejections;
                 slot.consecutive_rejections = slot.consecutive_rejections.saturating_add(1);
                 slot.last_rejection_at = Some(now);
+                crossed = streak_crossed_dark(before, slot.consecutive_rejections);
             }
             UpstreamVerdict::Indeterminate => unreachable!("returned above"),
         }
     });
     if spent {
         clear_orphan_warning(&key);
+    }
+    if crossed {
+        wake_refresher_on_dark_crossing(&key);
+    }
+}
+
+/// Did one rejection move a streak from below [`UPSTREAM_DARK_THRESHOLD`] to
+/// at-or-above it? The EDGE, never the level: verdict four, five and fifty of
+/// a dark streak must not each wake the refresher.
+pub(crate) fn streak_crossed_dark(before: u32, after: u32) -> bool {
+    before < UPSTREAM_DARK_THRESHOLD && after >= UPSTREAM_DARK_THRESHOLD
+}
+
+/// How many times a slot's streak has crossed into dark in this process, i.e.
+/// how many refresher wakes [`note_coord_upstream_verdict`] has issued. A
+/// counter rather than a log line so the edge-not-level rule is assertable.
+pub(crate) static DARK_CROSSING_KICKS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The same count per slot key, test-only: the process-wide total is shared
+/// with every parallel test that drives a streak, so an exact assertion needs
+/// a key no other test writes.
+#[cfg(test)]
+static DARK_CROSSINGS_BY_KEY: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn dark_crossings_for_test(key: &str) -> u64 {
+    DARK_CROSSINGS_BY_KEY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Plan G1 step 2: `dark` has no transition site INSIDE the refresher — the
+/// streak is counted here, on proxy traffic — so without this the refresher
+/// learnt of it only at its next scheduled tick, up to
+/// [`REFRESH_CHECK_INTERVAL`] later. Wake it now; its pass then plans a forced
+/// refresh for the slot ([`take_forced_refresh`]).
+///
+/// Never blocks the forwarder: the kick takes an async lock, so it is spawned
+/// onto the ambient runtime, and with no runtime (a sync caller, a unit test)
+/// the wake is simply skipped — the scheduled tick still comes.
+fn wake_refresher_on_dark_crossing(key: &str) {
+    DARK_CROSSING_KICKS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        *DARK_CROSSINGS_BY_KEY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default() += 1;
+    }
+    #[cfg(not(test))]
+    let _ = key;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(commands::kick_device_jwt_refresher());
     }
 }
 
@@ -2071,6 +2254,72 @@ pub(crate) fn reset_upstream_rejections_for(tenant: Option<uuid::Uuid>) {
         slot.consecutive_rejections = 0;
     });
     clear_orphan_warning(&key);
+    // A new credential is also the one thing that can follow a revocation:
+    // every pairing door (sign-in, pair code, the operator-authorized redeem)
+    // lands here, so the revocation verdict about the OLD credential is spent
+    // too and the refresher may ask coord again.
+    clear_device_revocation_latch();
+}
+
+// ---------------------------------------------------------------------------
+// Device revocation (plan G1 step 4).
+//
+// Coord answers `403 {"code":"device_credential_revoked"}` on its MINT doors
+// (`refresh-token`, `service-mint`, `pair-*`, `push-token`;
+// qontinui-coord `crates/coord/src/device_credential_revocation.rs`) once an
+// operator revoked the device — never on proxied MCP traffic, which is why the
+// code is deliberately NOT in [`CREDENTIAL_REJECTION_CODES`]: there it would
+// classify nothing. Revocation is device-scoped, so one such answer is a
+// verdict on every refresh this runner could attempt, and the refresher stops
+// attempting them until a new credential is persisted.
+// ---------------------------------------------------------------------------
+
+/// The coord refusal `code` that means "this device is revoked".
+pub(crate) const DEVICE_CREDENTIAL_REVOKED_CODE: &str = "device_credential_revoked";
+
+/// Does this mint-door answer say the DEVICE is revoked? `403` AND the body's
+/// own `code` field ([`upstream_refusal_code`]) — a `403` alone is the
+/// ordinary rejection class, and the code alone on another status is not
+/// coord's revocation shape.
+pub(crate) fn is_device_credential_revoked(status: u16, body: &str) -> bool {
+    status == 403 && upstream_refusal_code(body).as_deref() == Some(DEVICE_CREDENTIAL_REVOKED_CODE)
+}
+
+/// Unix seconds at which coord last said this device is revoked; `None` =
+/// no standing revocation verdict.
+static DEVICE_REVOKED_AT: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+
+/// Record coord's revocation verdict. From here on the refresher presents
+/// nothing — no refresh, no machine-key exchange, no Cognito re-pair — until
+/// [`clear_device_revocation_latch`] runs.
+pub(crate) fn latch_device_revocation(source: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let mut cell = DEVICE_REVOKED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if cell.is_none() {
+        warn!(
+            "device_jwt_refresher: coord answered {source} with 403 \
+             {DEVICE_CREDENTIAL_REVOKED_CODE} — this device is REVOKED. Not retrying any \
+             refresh until a new credential is persisted (operator: Authenticate this runner \
+             on /runners)"
+        );
+    }
+    *cell = Some(now);
+}
+
+/// Is a revocation verdict standing? Read by every automatic credential path
+/// in the refresher before it presents anything.
+pub(crate) fn device_revocation_latched() -> bool {
+    DEVICE_REVOKED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
+/// A new credential was persisted — the revocation verdict was about the old
+/// one. Called from [`reset_upstream_rejections_for`], which every pairing and
+/// mint path already runs.
+pub(crate) fn clear_device_revocation_latch() {
+    *DEVICE_REVOKED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Read one slot's aggregated upstream signal. `tenant_id` is the slot key as
@@ -3521,6 +3770,11 @@ pub(crate) fn derive_coord_credential_posture(
     if healed {
         return CoordCredentialPosture::Live;
     }
+    // Coord's explicit revocation verdict outranks everything the slot's own
+    // `exp` could say: no automatic rung remains, and the cure is an operator.
+    if matches!(obs.outcome, Some(TenantSlotOutcome::Revoked)) {
+        return CoordCredentialPosture::Revoked;
+    }
     if matches!(
         obs.outcome,
         Some(TenantSlotOutcome::Cleared {
@@ -3807,6 +4061,8 @@ pub(crate) fn reset_coord_credential_posture_for_test() {
         .unwrap_or_else(|e| e.into_inner()) = None;
     with_upstream_signals(|m| m.clear());
     with_orphan_warned(|s| s.clear());
+    clear_device_revocation_latch();
+    reset_forced_refresh_for_test();
     *DEFAULT_BINDING_VERDICT
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
@@ -4017,6 +4273,24 @@ pub(crate) fn derive_and_publish_posture(
     pins: PosturePinInputs,
     now: i64,
 ) -> Option<PostureTransition> {
+    // A standing revocation verdict is about the DEVICE, so it describes every
+    // slot the pass could read — including one it found empty (an exchange
+    // that answered `revoked` ran after the slot was cleared) and the legacy
+    // slot, whose observation carries no pass outcome. Folded in here, as an
+    // outcome, so the pure ladder stays the one place it is written down.
+    if device_revocation_latched() {
+        let revoked: Vec<SlotObservation> = observations
+            .iter()
+            .cloned()
+            .map(|mut o| {
+                if !o.unknown {
+                    o.outcome = Some(TenantSlotOutcome::Revoked);
+                }
+                o
+            })
+            .collect();
+        return derive_and_publish_posture_with(&revoked, pins, &default_binding_verdict(), now);
+    }
     derive_and_publish_posture_with(observations, pins, &default_binding_verdict(), now)
 }
 
@@ -4262,6 +4536,7 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
         TenantSlotOutcome::SkippedNoToken => "skipped-no-token",
         TenantSlotOutcome::Cleared { .. } => "cleared",
         TenantSlotOutcome::KeptExisting => "kept-existing",
+        TenantSlotOutcome::Revoked => "revoked",
     }
     .to_string()
 }
@@ -4364,6 +4639,12 @@ async fn clear_and_rederive_tenant_slot(
     let Some(jwt) =
         try_device_machine_key_exchange(auth_manager, web_base, device_id, Some(*tenant)).await
     else {
+        // The exchange latches a revocation verdict itself; name it here so
+        // the posture says `revoked` (operator Authenticate), not the generic
+        // `unrefreshable` (re-pair) — the slot is cleared either way.
+        if device_revocation_latched() {
+            return TenantSlotOutcome::Revoked;
+        }
         return TenantSlotOutcome::Cleared {
             cause,
             rederived: false,
@@ -4479,6 +4760,9 @@ pub(crate) async fn refresh_tenant_slots(
         }
     };
     let now = chrono::Utc::now().timestamp();
+    // The posture's own one-slot fold rule, so the forced refresh below reads
+    // the bucket the posture calls `dark` from.
+    let single_slot = tenants.len() == 1;
     if boot_pass {
         let boot_obs: Vec<SlotObservation> = tenants
             .iter()
@@ -4521,7 +4805,41 @@ pub(crate) async fn refresh_tenant_slots(
         };
         let exp = crate::auth::decode_jwt_exp(&token);
         slot_seen.push((tenant, exp, true, false));
-        match plan_tenant_slot(exp, now) {
+        // G1 step 4: coord has said this DEVICE is revoked. Every refresh and
+        // exchange it could attempt is refused by construction, so present
+        // nothing and keep the slot as it is — the operator's Authenticate is
+        // the cure, and its pairing write spends this latch.
+        if device_revocation_latched() {
+            let o = TenantSlotOutcome::Revoked;
+            health.push(health_row(
+                &tenant,
+                o,
+                format!(
+                    "coord answered {DEVICE_CREDENTIAL_REVOKED_CODE} for this device — not \
+                     retried; an operator must Authenticate this runner on /runners"
+                ),
+            ));
+            outcomes.push((tenant, o));
+            continue;
+        }
+        // G1 step 1: act on the slot's OWN rejection streak, not only on
+        // `exp`. Read the same bucket the posture's `dark` reads
+        // ([`upstream_signal_for_observation`]): on a one-slot box an unpinned
+        // session files its verdicts under the default key. Not the PUBLISHED
+        // posture — that is the worst slot folded across all of them and can
+        // stick through `StaleEvidence`.
+        let forced = take_forced_refresh(
+            &upstream_key(Some(tenant)),
+            &upstream_signal_for_observation(Some(&tenant.to_string()), single_slot),
+            now,
+        );
+        if forced {
+            info!(
+                "device_jwt_refresher: tenant {tenant} slot is locally fresh but coord keeps \
+                 rejecting it — forcing a refresh this pass (at most one per slot per tick)"
+            );
+        }
+        match plan_tenant_slot(exp, now, forced) {
             TenantSlotPlan::SkipFresh => {
                 let o = TenantSlotOutcome::SkippedFresh;
                 health.push(health_row(
@@ -4587,6 +4905,25 @@ pub(crate) async fn refresh_tenant_slots(
         };
         let status = resp.status();
         if !status.is_success() {
+            if status.as_u16() == 403 {
+                // Only a 403 can carry the revocation code, so only a 403's
+                // body is read; every other status keeps its existing arm.
+                let body = resp.text().await.unwrap_or_default();
+                if is_device_credential_revoked(403, &body) {
+                    latch_device_revocation("the tenant-slot refresh");
+                    let o = TenantSlotOutcome::Revoked;
+                    health.push(health_row(
+                        &tenant,
+                        o,
+                        format!(
+                            "coord answered HTTP 403 {DEVICE_CREDENTIAL_REVOKED_CODE} — slot \
+                             kept, no machine-key exchange, not retried"
+                        ),
+                    ));
+                    outcomes.push((tenant, o));
+                    continue;
+                }
+            }
             if slot_refresh_is_credential_rejection(status.as_u16()) {
                 // EVIDENCE (ii): coord ATTRIBUTED the rejection to the
                 // credential we presented. REPLACE-not-REVOKE is right for a
@@ -4826,10 +5163,17 @@ pub(crate) async fn try_device_machine_key_exchange(
         // 401/403 (revoked/expired/mismatch), 503 (web COORD_ADMIN_SECRET
         // unset), anything else → no recovery this path. REPLACE-not-REVOKE:
         // the existing JWT is left untouched.
+        let status = resp.status();
+        if status.as_u16() == 403 {
+            let body = resp.text().await.unwrap_or_default();
+            if is_device_credential_revoked(403, &body) {
+                // G1 step 4: the device is revoked — stop asking.
+                latch_device_revocation("the device-machine-key exchange");
+            }
+        }
         info!(
-            "device_jwt_refresher: dmk exchange got HTTP {} — no recovery this path \
-             (existing JWT preserved)",
-            resp.status()
+            "device_jwt_refresher: dmk exchange got HTTP {status} — no recovery this path \
+             (existing JWT preserved)"
         );
         return None;
     }
@@ -5246,7 +5590,8 @@ async fn refresher_loop(
             }
         };
 
-        let decision = next_action(settings_snapshot.tier, needs_refresh);
+        // `decision` is computed below, once the slot inputs are read: G1's
+        // forced legacy refresh needs to know how many tenant slots exist.
 
         // Session-scoped multi-tenant Phase 8a (plan 2026-07-02, D4): the
         // per-tenant device-JWT slot pass is the SHIPPED behavior (the
@@ -5304,6 +5649,31 @@ async fn refresher_loop(
             .as_ref()
             .map(|v| !v.is_empty())
             .unwrap_or(false);
+        // G1 step 1, legacy half: the default bucket's streak forces a
+        // refresh of the legacy `access_token` slot whatever its `exp` says.
+        // Not on a ONE-slot box: there the default bucket is folded into that
+        // tenant slot's verdict (the posture's own rule) and the slot pass
+        // below forces the refresh of the credential it actually describes.
+        let single_tenant_slot = sweep_inputs
+            .tenant_slots
+            .as_ref()
+            .map(|v| v.len() == 1)
+            .unwrap_or(false);
+        let legacy_forced = !single_tenant_slot
+            && !needs_refresh
+            && !device_revocation_latched()
+            && take_forced_refresh(
+                DEFAULT_SLOT_KEY,
+                &upstream_signal_for(None),
+                chrono::Utc::now().timestamp(),
+            );
+        if legacy_forced {
+            info!(
+                "device_jwt_refresher: legacy device JWT is locally fresh but coord keeps \
+                 rejecting it — forcing a refresh this tick (at most one per tick)"
+            );
+        }
+        let decision = next_action(settings_snapshot.tier, needs_refresh || legacy_forced);
         let writable = writable_slot_keys_from(&sweep_inputs);
         // D2's residual (Phase 3): the pass below walks the slots that EXIST,
         // so a tenant bound with NO slot is structurally invisible to it.
@@ -5465,6 +5835,17 @@ async fn refresher_loop(
                 }
                 continue;
             }
+            Decision::Pair if device_revocation_latched() => {
+                // G1 step 4: coord revoked this device. Self-refresh, the
+                // Cognito pair and the machine-key exchange are all mint doors
+                // coord refuses for it, so none is asked. The posture published
+                // above already says `revoked`; wait for an operator's
+                // Authenticate (its pairing write spends the latch) or a kick.
+                if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
+                    return;
+                }
+                continue;
+            }
             Decision::Pair => {
                 // Phase 4a: PREFER a login-independent DEVICE self-refresh. When
                 // the runner still holds a currently-valid device-JWT, re-mint it
@@ -5511,6 +5892,13 @@ async fn refresher_loop(
                         if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
                             return;
                         }
+                        continue;
+                    }
+                    if device_revocation_latched() {
+                        // The self-refresh just learnt the device is revoked.
+                        // Re-run the iteration at once: it publishes the
+                        // `revoked` posture and then parks in the arm above,
+                        // without knocking on another mint door.
                         continue;
                     }
                 }
@@ -7239,30 +7627,34 @@ mod tenant_slot_refresh_tests {
         let now = 1_000_000_000i64;
         // Opaque/undecodable → cannot be presented; clear and re-derive.
         assert_eq!(
-            plan_tenant_slot(None, now),
+            plan_tenant_slot(None, now, false),
             TenantSlotPlan::ClearAndRederive
         );
         // Already expired (or exactly at exp) → clear and re-derive.
         assert_eq!(
-            plan_tenant_slot(Some(now - 1), now),
+            plan_tenant_slot(Some(now - 1), now, false),
             TenantSlotPlan::ClearAndRederive
         );
         assert_eq!(
-            plan_tenant_slot(Some(now), now),
+            plan_tenant_slot(Some(now), now, false),
             TenantSlotPlan::ClearAndRederive
         );
         // Future exp within TTL/3 → refresh.
         assert_eq!(
-            plan_tenant_slot(Some(now + 30 * 60), now),
+            plan_tenant_slot(Some(now + 30 * 60), now, false),
             TenantSlotPlan::Refresh
         );
         assert_eq!(
-            plan_tenant_slot(Some(now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS), now),
+            plan_tenant_slot(
+                Some(now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS),
+                now,
+                false
+            ),
             TenantSlotPlan::Refresh
         );
         // Comfortably fresh → skip.
         assert_eq!(
-            plan_tenant_slot(Some(now + 3 * 60 * 60), now),
+            plan_tenant_slot(Some(now + 3 * 60 * 60), now, false),
             TenantSlotPlan::SkipFresh
         );
     }
@@ -11113,13 +11505,13 @@ mod tenant_slot_refresh_tests {
         let now = chrono::Utc::now().timestamp();
         let fresh = synth_jwt(now + 3 * 60 * 60, "fresh-slot");
         assert_eq!(
-            plan_tenant_slot(Some(now + 3 * 60 * 60), now),
+            plan_tenant_slot(Some(now + 3 * 60 * 60), now, false),
             TenantSlotPlan::SkipFresh,
             "precondition: the clock makes this slot comfortably fresh"
         );
         let stale = synth_jwt(now + 30 * 60, "stale-slot");
         assert_eq!(
-            plan_tenant_slot(Some(now + 30 * 60), now),
+            plan_tenant_slot(Some(now + 30 * 60), now, false),
             TenantSlotPlan::Refresh,
             "precondition: the clock puts this slot inside the refresh window"
         );
@@ -12121,6 +12513,7 @@ mod tenant_slot_refresh_tests {
             P::Unrefreshable,
             P::Dark(DarkCause::UpstreamRejected),
             P::Dark(DarkCause::NoDefaultBinding),
+            P::Revoked,
         ];
         for p in all {
             match p {
@@ -12129,6 +12522,7 @@ mod tenant_slot_refresh_tests {
                 | P::Expired
                 | P::Absent
                 | P::Unrefreshable
+                | P::Revoked
                 | P::Dark(DarkCause::UpstreamRejected)
                 | P::Dark(DarkCause::NoDefaultBinding) => {}
             }
@@ -12768,5 +13162,642 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+#[cfg(test)]
+mod dark_gap_tests {
+    //! Plan `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
+    //! Phase 4 (G1) — a dark runner heals within one tick, and a revoked one
+    //! stops asking. Verification items 1-5 (item 6, the proxy heal, lives in
+    //! `coord_mcp`). Hermetic: an in-process mock coord + web, injected tokens,
+    //! the crate-wide posture lock around every global this touches.
+
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    fn jwt(exp: i64, sub: &str, tenant: Option<&uuid::Uuid>) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let claims = match tenant {
+            Some(t) => format!("{{\"exp\":{exp},\"sub\":\"{sub}\",\"tenant_id\":\"{t}\"}}"),
+            None => format!("{{\"exp\":{exp},\"sub\":\"{sub}\"}}"),
+        };
+        format!("{header}.{}.{}", b64url(claims.as_bytes()), b64url(b"sig"))
+    }
+
+    /// Tenants no other suite uses, so a parallel test that does not hold the
+    /// posture lock can never share an upstream bucket with these.
+    fn tenant(n: u8) -> uuid::Uuid {
+        uuid::Uuid::parse_str(&format!("d4a00000-0000-4000-8000-0000000000{n:02x}")).expect("uuid")
+    }
+
+    fn manager(name: &str, dmk: Option<&str>) -> crate::auth::AuthManager {
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_dark_gap");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        if let Some(k) = dmk {
+            let seed = crate::secure_storage::SecureStorage::with_path(path.clone())
+                .expect("seed storage");
+            seed.store_device_machine_key(k).expect("seed dmk");
+        }
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    /// One coord + web mock. `refresh` maps a presented bearer to a forced
+    /// `(status, body)`; any other bearer is re-minted as `<bearer>.refreshed`.
+    /// `exchange` is the machine-key exchange's answer (a 503 when `None`).
+    #[derive(Clone)]
+    struct Mock {
+        refresh: Arc<Vec<(String, u16, String)>>,
+        exchange: Arc<Option<(u16, String)>>,
+        bearers: Arc<Mutex<Vec<String>>>,
+        exchanges: Arc<Mutex<u32>>,
+    }
+
+    async fn refresh_handler(
+        State(m): State<Mock>,
+        Path(_d): Path<String>,
+        h: HeaderMap,
+    ) -> (StatusCode, String) {
+        let bearer = h
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_string();
+        m.bearers.lock().unwrap().push(bearer.clone());
+        if let Some((_, st, body)) = m.refresh.iter().find(|(b, _, _)| *b == bearer) {
+            return (StatusCode::from_u16(*st).unwrap(), body.clone());
+        }
+        (
+            StatusCode::OK,
+            serde_json::json!({ "token": format!("{bearer}.refreshed") }).to_string(),
+        )
+    }
+
+    async fn exchange_handler(
+        State(m): State<Mock>,
+        Path(_d): Path<String>,
+    ) -> (StatusCode, String) {
+        *m.exchanges.lock().unwrap() += 1;
+        match m.exchange.as_ref() {
+            Some((st, body)) => (StatusCode::from_u16(*st).unwrap(), body.clone()),
+            None => (StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
+        }
+    }
+
+    fn spawn(
+        refresh: Vec<(String, u16, String)>,
+        exchange: Option<(u16, String)>,
+    ) -> (String, Mock, tokio::sync::oneshot::Sender<()>) {
+        let mock = Mock {
+            refresh: Arc::new(refresh),
+            exchange: Arc::new(exchange),
+            bearers: Arc::new(Mutex::new(Vec::new())),
+            exchanges: Arc::new(Mutex::new(0)),
+        };
+        let served = mock.clone();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        l.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route("/devices/{device_id}/refresh-token", post(refresh_handler))
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(exchange_handler),
+                    )
+                    .with_state(served);
+                let listener = tokio::net::TcpListener::from_std(l).expect("listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), mock, tx)
+    }
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const REVOKED_BODY: &str =
+        r#"{"error":"device credential revoked","code":"device_credential_revoked"}"#;
+
+    /// Drive `tenant`'s bucket to `n` consecutive credential rejections, the
+    /// way the proxy's forwarders do.
+    fn reject(tenant: Option<uuid::Uuid>, n: u32) {
+        for _ in 0..n {
+            note_coord_upstream_verdict(
+                tenant,
+                true,
+                401,
+                br#"{"error":"revoked","code":"token_revoked"}"#,
+            );
+        }
+    }
+
+    /// Serialise against every suite that touches the posture globals, and
+    /// leave them clean on the way out even when an assertion panics.
+    struct Clean(#[allow(dead_code)] crate::test_env::TestLockGuard);
+    impl Clean {
+        fn take() -> Self {
+            let g = posture_test_lock();
+            reset_coord_credential_posture_for_test();
+            Clean(g)
+        }
+    }
+    impl Drop for Clean {
+        fn drop(&mut self) {
+            reset_coord_credential_posture_for_test();
+        }
+    }
+
+    // ---- item 1: the slot's own streak plans a refresh, whatever `exp` says ----
+
+    #[test]
+    fn a_fresh_slot_with_a_fresh_dark_streak_is_planned_refresh() {
+        let now = 2_000_000_000i64;
+        let fresh_exp = Some(now + 3 * 60 * 60);
+        let dark = UpstreamSignal {
+            consecutive_rejections: UPSTREAM_DARK_THRESHOLD,
+            last_rejection_at: Some(now - 10),
+            last_ok_at: None,
+        };
+        assert!(upstream_streak_demands_refresh(&dark, now));
+        assert_eq!(
+            plan_tenant_slot(fresh_exp, now, true),
+            TenantSlotPlan::Refresh
+        );
+        // The same slot with no demand is left alone, exactly as before.
+        assert_eq!(
+            plan_tenant_slot(fresh_exp, now, false),
+            TenantSlotPlan::SkipFresh
+        );
+
+        // Below threshold: no demand.
+        let below = UpstreamSignal {
+            consecutive_rejections: UPSTREAM_DARK_THRESHOLD - 1,
+            ..dark
+        };
+        assert!(!upstream_streak_demands_refresh(&below, now));
+        // A STALE rejection: no demand — a week-old streak drives no traffic.
+        let stale = UpstreamSignal {
+            last_rejection_at: Some(now - UPSTREAM_ORPHAN_STALE_AFTER_SECS - 1),
+            ..dark
+        };
+        assert!(!upstream_streak_demands_refresh(&stale, now));
+        // No rejection timestamp at all is not fresh either.
+        let undated = UpstreamSignal {
+            last_rejection_at: None,
+            ..dark
+        };
+        assert!(!upstream_streak_demands_refresh(&undated, now));
+
+        // A locally-dead slot still clears first: no streak makes it presentable.
+        assert_eq!(
+            plan_tenant_slot(Some(now - 1), now, true),
+            TenantSlotPlan::ClearAndRederive
+        );
+        assert_eq!(
+            plan_tenant_slot(None, now, true),
+            TenantSlotPlan::ClearAndRederive
+        );
+    }
+
+    #[test]
+    fn a_forced_refresh_is_taken_at_most_once_per_slot_per_tick() {
+        let _clean = Clean::take();
+        let now = 2_000_000_000i64;
+        let dark = UpstreamSignal {
+            consecutive_rejections: UPSTREAM_DARK_THRESHOLD + 4,
+            last_rejection_at: Some(now),
+            last_ok_at: None,
+        };
+        let key = tenant(1).to_string();
+        assert!(
+            take_forced_refresh(&key, &dark, now),
+            "first ask is granted"
+        );
+        assert!(
+            !take_forced_refresh(&key, &dark, now + 1),
+            "a kick seconds later must not force a second refresh"
+        );
+        assert!(!take_forced_refresh(
+            &key,
+            &dark,
+            now + FORCED_REFRESH_MIN_SPACING_SECS - 1
+        ));
+        assert!(
+            take_forced_refresh(&key, &dark, now + FORCED_REFRESH_MIN_SPACING_SECS),
+            "one tick later it may be forced again"
+        );
+        // The bound is per SLOT: another slot is not starved by this one.
+        assert!(take_forced_refresh(&tenant(2).to_string(), &dark, now + 1));
+        // No demand, no grant — and no recorded attempt either.
+        let quiet = UpstreamSignal::default();
+        assert!(!take_forced_refresh(&tenant(3).to_string(), &quiet, now));
+        assert!(take_forced_refresh(&tenant(3).to_string(), &dark, now));
+    }
+
+    #[tokio::test]
+    async fn the_pass_force_refreshes_a_fresh_slot_coord_keeps_rejecting() {
+        let _clean = Clean::take();
+        let mgr = manager("forced_refresh_heals", None);
+        let (ta, tb) = (tenant(4), tenant(5));
+        let now = chrono::Utc::now().timestamp();
+        // Both comfortably fresh by `exp` — the case `exp` alone calls live.
+        let dark_jwt = jwt(now + 3 * 60 * 60, "dark", Some(&ta));
+        let healthy_jwt = jwt(now + 3 * 60 * 60, "healthy", Some(&tb));
+        mgr.store_tenant_device_jwt(&ta, &dark_jwt).expect("a");
+        mgr.store_tenant_device_jwt(&tb, &healthy_jwt).expect("b");
+        reject(Some(ta), UPSTREAM_DARK_THRESHOLD);
+        // B has a streak too, but below threshold: no forced refresh for it.
+        reject(Some(tb), UPSTREAM_DARK_THRESHOLD - 1);
+
+        let (base, mock, _stop) = spawn(vec![], None);
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                (ta, TenantSlotOutcome::Refreshed),
+                (tb, TenantSlotOutcome::SkippedFresh)
+            ]
+        );
+        assert_eq!(
+            mock.bearers.lock().unwrap().clone(),
+            vec![dark_jwt.clone()],
+            "only the dark slot is presented, and it presents ITS OWN token"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(format!("{dark_jwt}.refreshed").as_str())
+        );
+        assert_eq!(
+            upstream_signal_for(Some(&ta.to_string())).consecutive_rejections,
+            0,
+            "the new credential spends the old one's streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_streak_does_not_force_a_refresh() {
+        let _clean = Clean::take();
+        let mgr = manager("stale_streak_skips", None);
+        let ta = tenant(6);
+        let now = chrono::Utc::now().timestamp();
+        let tok = jwt(now + 3 * 60 * 60, "stale-streak", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        with_upstream_signals(|m| {
+            m.insert(
+                ta.to_string(),
+                UpstreamSignal {
+                    consecutive_rejections: UPSTREAM_DARK_THRESHOLD + 2,
+                    last_rejection_at: Some(now - UPSTREAM_ORPHAN_STALE_AFTER_SECS - 60),
+                    last_ok_at: None,
+                },
+            );
+        });
+
+        let (base, mock, _stop) = spawn(vec![], None);
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::SkippedFresh)]);
+        assert!(mock.bearers.lock().unwrap().is_empty());
+    }
+
+    // ---- item 2: a rejected forced refresh runs the clear + dmk ladder ----
+
+    #[tokio::test]
+    async fn a_rejected_forced_refresh_clears_and_rederives_through_the_machine_key() {
+        let _clean = Clean::take();
+        let mgr = manager(
+            "forced_refresh_rejected_rederives",
+            Some("dmk_dark_gap_fixture"),
+        );
+        let ta = tenant(7);
+        let now = chrono::Utc::now().timestamp();
+        let refused = jwt(now + 3 * 60 * 60, "refused", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &refused).expect("a");
+        reject(Some(ta), UPSTREAM_DARK_THRESHOLD);
+
+        let minted = jwt(now + 4 * 60 * 60, "rederived", Some(&ta));
+        let (base, mock, _stop) = spawn(
+            vec![(
+                refused.clone(),
+                401,
+                r#"{"error":"revoked","code":"token_revoked"}"#.to_string(),
+            )],
+            Some((200, serde_json::json!({ "token": minted }).to_string())),
+        );
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::Cleared {
+                    cause: SlotClearCause::CoordRejection,
+                    rederived: true,
+                }
+            )]
+        );
+        assert_eq!(mock.bearers.lock().unwrap().clone(), vec![refused.clone()]);
+        assert_eq!(*mock.exchanges.lock().unwrap(), 1, "the dmk_ rung ran");
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(minted.as_str()),
+            "the slot holds the machine-key-derived credential"
+        );
+        assert_eq!(
+            coord_credential_posture().map(|s| s.posture),
+            Some(CoordCredentialPosture::Live)
+        );
+    }
+
+    // ---- item 3: a transport error leaves the slot untouched ----
+
+    #[tokio::test]
+    async fn a_forced_refresh_that_hits_a_transport_error_keeps_the_slot() {
+        let _clean = Clean::take();
+        let mgr = manager(
+            "forced_refresh_transport_error",
+            Some("dmk_dark_gap_fixture"),
+        );
+        let ta = tenant(8);
+        let now = chrono::Utc::now().timestamp();
+        let tok = jwt(now + 3 * 60 * 60, "unreachable", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        reject(Some(ta), UPSTREAM_DARK_THRESHOLD);
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().expect("addr").port();
+            drop(l);
+            format!("http://127.0.0.1:{port}")
+        };
+        let outcomes =
+            refresh_tenant_slots(&mgr, &dead, &dead, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::KeptExisting)]);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(tok.as_str()),
+            "UNKNOWN is not a rejection: the SlotClearCause invariant holds for a forced refresh"
+        );
+        assert_eq!(
+            upstream_signal_for(Some(&ta.to_string())).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "nothing spent the streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_5xx_forced_refresh_keeps_the_slot_and_is_not_retried_within_the_tick() {
+        let _clean = Clean::take();
+        let mgr = manager("forced_refresh_503_bounded", None);
+        let ta = tenant(9);
+        let now = chrono::Utc::now().timestamp();
+        let tok = jwt(now + 3 * 60 * 60, "outage", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        reject(Some(ta), UPSTREAM_DARK_THRESHOLD);
+        let (base, mock, _stop) = spawn(vec![(tok.clone(), 503, "{}".to_string())], None);
+
+        let first =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(first, vec![(ta, TenantSlotOutcome::KeptExisting)]);
+        // A kick (the proxy heal) runs another pass at once: no second refresh.
+        let second =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(second, vec![(ta, TenantSlotOutcome::SkippedFresh)]);
+        assert_eq!(
+            mock.bearers.lock().unwrap().len(),
+            1,
+            "at most one forced refresh per slot per tick"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(tok.as_str())
+        );
+    }
+
+    // ---- item 4: device_credential_revoked is terminal and never retried ----
+
+    #[test]
+    fn only_a_403_carrying_the_revocation_code_is_a_revocation() {
+        assert!(is_device_credential_revoked(403, REVOKED_BODY));
+        assert!(!is_device_credential_revoked(401, REVOKED_BODY));
+        assert!(!is_device_credential_revoked(
+            403,
+            r#"{"code":"token_revoked"}"#
+        ));
+        assert!(!is_device_credential_revoked(
+            403,
+            r#"{"error":"forbidden"}"#
+        ));
+        // A body merely QUOTING the code is not coord's refusal shape.
+        assert!(!is_device_credential_revoked(
+            403,
+            r#"{"code":"tenant_not_resolved","error":"not device_credential_revoked"}"#
+        ));
+        // And it stays out of the proxy-traffic classifier on purpose.
+        assert!(!CREDENTIAL_REJECTION_CODES.contains(&DEVICE_CREDENTIAL_REVOKED_CODE));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_refresh_ends_terminal_and_is_never_retried() {
+        let _clean = Clean::take();
+        let mgr = manager("revoked_refresh_terminal", Some("dmk_dark_gap_fixture"));
+        let ta = tenant(10);
+        let now = chrono::Utc::now().timestamp();
+        // Inside the refresh window, so every pass would ordinarily ask again.
+        let tok = jwt(now + 30 * 60, "revoked", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        let (base, mock, _stop) = spawn(
+            vec![(tok.clone(), 403, REVOKED_BODY.to_string())],
+            Some((
+                200,
+                serde_json::json!({ "token": "must-not-mint" }).to_string(),
+            )),
+        );
+
+        let first =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(first, vec![(ta, TenantSlotOutcome::Revoked)]);
+        assert_eq!(
+            *mock.exchanges.lock().unwrap(),
+            0,
+            "a revoked device is not sent to the machine-key exchange"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(tok.as_str()),
+            "the slot is kept, not cleared"
+        );
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(status.posture, CoordCredentialPosture::Revoked);
+        assert_eq!(
+            status.posture.as_str(),
+            "unrefreshable",
+            "wire token unchanged"
+        );
+        assert_eq!(status.posture.cause(), Some(DEVICE_CREDENTIAL_REVOKED_CODE));
+        assert_eq!(status.posture.cta(), Some("operator_authenticate"));
+        assert!(!status.posture.can_answer());
+
+        // Several more passes — the 5-minute tick and every kick — present NOTHING.
+        for _ in 0..3 {
+            let again =
+                refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED)
+                    .await;
+            assert_eq!(again, vec![(ta, TenantSlotOutcome::Revoked)]);
+        }
+        assert_eq!(
+            mock.bearers.lock().unwrap().len(),
+            1,
+            "never retry a refresh coord answered device_credential_revoked"
+        );
+        assert_eq!(*mock.exchanges.lock().unwrap(), 0);
+
+        // An operator's Authenticate persists a new credential through a
+        // pairing door, which spends the verdict: the refresher may ask again.
+        retire_rejection_streaks_after_pairing(ta, None);
+        assert!(!device_revocation_latched());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_machine_key_exchange_latches_too() {
+        let _clean = Clean::take();
+        let mgr = manager("revoked_exchange_terminal", Some("dmk_dark_gap_fixture"));
+        let ta = tenant(11);
+        let now = chrono::Utc::now().timestamp();
+        // Locally EXPIRED: the pass clears and goes straight to the exchange.
+        let tok = jwt(now - 60, "expired", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        let (base, mock, _stop) = spawn(vec![], Some((403, REVOKED_BODY.to_string())));
+
+        let first =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(first, vec![(ta, TenantSlotOutcome::Revoked)]);
+        assert_eq!(*mock.exchanges.lock().unwrap(), 1);
+        assert!(device_revocation_latched());
+        assert_eq!(
+            coord_credential_posture().map(|s| s.posture),
+            Some(CoordCredentialPosture::Revoked)
+        );
+        // The slot was cleared before the exchange answered, so the next pass
+        // walks no slot at all and asks nothing.
+        let second =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(second, vec![]);
+        assert_eq!(*mock.exchanges.lock().unwrap(), 1, "not retried");
+        // The legacy arm then publishes from an EMPTY observation: while the
+        // verdict stands it says `revoked` (operator Authenticate), never
+        // `absent` (which would tell the operator to re-pair).
+        derive_and_publish_posture(
+            &[SlotObservation::observed(None, None)],
+            PosturePinInputs::UNPINNED,
+            now,
+        );
+        assert_eq!(
+            coord_credential_posture().map(|s| s.posture),
+            Some(CoordCredentialPosture::Revoked)
+        );
+    }
+
+    /// A 403 WITHOUT the revocation code keeps today's ladder exactly: clear,
+    /// then the machine-key exchange.
+    #[tokio::test]
+    async fn a_plain_403_still_clears_and_rederives() {
+        let _clean = Clean::take();
+        let mgr = manager("plain_403_ladder", Some("dmk_dark_gap_fixture"));
+        let ta = tenant(12);
+        let now = chrono::Utc::now().timestamp();
+        let tok = jwt(now + 30 * 60, "forbidden", Some(&ta));
+        mgr.store_tenant_device_jwt(&ta, &tok).expect("a");
+        let (base, mock, _stop) = spawn(
+            vec![(tok.clone(), 403, r#"{"error":"forbidden"}"#.to_string())],
+            None,
+        );
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::Cleared {
+                    cause: SlotClearCause::CoordRejection,
+                    rederived: false,
+                }
+            )]
+        );
+        assert_eq!(*mock.exchanges.lock().unwrap(), 1);
+        assert!(!device_revocation_latched());
+    }
+
+    // ---- item 5: crossing into dark wakes the refresher — once ----
+
+    #[test]
+    fn the_crossing_is_an_edge_not_a_level() {
+        let t = UPSTREAM_DARK_THRESHOLD;
+        assert!(streak_crossed_dark(t - 1, t));
+        assert!(!streak_crossed_dark(t, t + 1));
+        assert!(!streak_crossed_dark(t - 2, t - 1));
+        assert!(!streak_crossed_dark(0, 0));
+    }
+
+    #[test]
+    fn crossing_the_threshold_kicks_the_refresher_once_not_per_verdict() {
+        let _clean = Clean::take();
+        let t = tenant(13);
+        let key = t.to_string();
+        let ta = Some(t);
+        let before = dark_crossings_for_test(&key);
+        reject(ta, UPSTREAM_DARK_THRESHOLD - 1);
+        assert_eq!(
+            dark_crossings_for_test(&key),
+            before,
+            "below the threshold nothing is woken"
+        );
+        reject(ta, 1);
+        assert_eq!(
+            dark_crossings_for_test(&key),
+            before + 1,
+            "the crossing verdict wakes the refresher"
+        );
+        reject(ta, 5);
+        assert_eq!(
+            dark_crossings_for_test(&key),
+            before + 1,
+            "verdicts past the crossing do not wake it again"
+        );
+        // A non-authenticating route and an indeterminate answer move nothing.
+        note_coord_upstream_verdict(ta, false, 401, br#"{"code":"token_revoked"}"#);
+        note_coord_upstream_verdict(ta, true, 503, b"{}");
+        assert_eq!(dark_crossings_for_test(&key), before + 1);
+        // A 2xx spends the streak; a NEW crossing wakes it again.
+        note_coord_upstream_verdict(ta, true, 200, b"{}");
+        reject(ta, UPSTREAM_DARK_THRESHOLD);
+        assert_eq!(dark_crossings_for_test(&key), before + 2);
     }
 }
