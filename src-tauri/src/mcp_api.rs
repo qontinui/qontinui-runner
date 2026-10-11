@@ -3768,11 +3768,13 @@ enum ClientAssertion {
 }
 
 impl ClientAssertion {
-    /// Classify `asserted` against `records` — EVERY record the store holds,
-    /// open and closed — where `on_this_key` says whether a record sits on
-    /// the key being resolved (the nonce's terminal, or its workdir). Pure; filters on the anchor FIRST so the key test —
-    /// which may `canonicalize` a record dir on leg 3 — runs only for records
-    /// naming the asserted id.
+    /// Classify `asserted` against `records` — every record the store holds
+    /// that names `asserted`, open and closed (the resolver snapshot,
+    /// [`resolver_retains`], carries exactly those plus the open set) — where
+    /// `on_this_key` says whether a record sits on the key being resolved
+    /// (the nonce's terminal, or its workdir). Pure; filters on the anchor
+    /// FIRST so the key test — which may `canonicalize` a record dir on leg
+    /// 3 — runs only for records naming the asserted id.
     fn classify(
         records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
         asserted: Option<uuid::Uuid>,
@@ -4163,7 +4165,7 @@ fn resolve_caller_via_terminal(
     client_asserted: Option<uuid::Uuid>,
 ) -> Option<(Option<uuid::Uuid>, SelfIdOutcome)> {
     // Taken BEFORE the store fetch so the no-terminal majority never
-    // snapshots `open_records()` for nothing — and so the workdir leg's own
+    // snapshots the store for nothing — and so the workdir leg's own
     // snapshot is never a second clone of the same set.
     let terminal_id = crate::coord_mcp::terminal_id_for_nonce(nonce)?;
     let Some(store) =
@@ -4171,9 +4173,10 @@ fn resolve_caller_via_terminal(
     else {
         return Some((None, SelfIdOutcome::ResolverStateMissing));
     };
-    // EVERY record (open and closed), so the assertion can be checked against
-    // the anchor history the store still holds; selection reads the open ones.
-    let records = store.all_records(); // snapshot under the store lock
+    // The open records plus the CLOSED ones naming the asserted id — the only
+    // closed rows the assertion can be checked against; selection reads the
+    // open ones. See [`resolver_retains`].
+    let records = store.records_where(|rec| resolver_retains(rec, client_asserted));
     Some(settle_terminal_leg(&records, &terminal_id, client_asserted))
 }
 
@@ -4185,7 +4188,8 @@ fn resolve_caller_via_terminal(
 /// - several → [`settle_ambiguity`];
 /// - a typed miss → [`admit_assertion_on_miss`].
 ///
-/// `records` is EVERY record the store holds; the leg selects from the open
+/// `records` is the resolver snapshot ([`resolver_retains`]: every open
+/// record plus every closed one naming the asserted id); the leg selects from the open
 /// ones ([`open_only`]) and classifies the assertion against all of them. A
 /// record anchoring the asserted id on any other terminal contradicts it,
 /// because a PTY hosts one live session — a session on this terminal naming a
@@ -4310,8 +4314,9 @@ fn select_terminal_caller(
 /// the lifecycle store when the terminal leg and the SessionManager worktree
 /// chain both miss.
 ///
-/// Lock discipline mirrors the #841 pattern: `open_records()` clones the
-/// record set under the store's lock (a snapshot), and every path comparison
+/// Lock discipline mirrors the #841 pattern: `records_where` clones the open
+/// records (plus the assertion's closed anchors, [`resolver_retains`]) under
+/// the store's lock (a snapshot), and every path comparison
 /// runs lock-free afterwards. Cost per call: one `canonicalize` of the target
 /// workdir and a string compare per open record (with a canonicalize fallback
 /// only for records whose string form differs) — bounded by the operator's
@@ -4338,9 +4343,10 @@ fn resolve_caller_via_lifecycle(
     else {
         return (None, SelfIdOutcome::ResolverStateMissing);
     };
-    // EVERY record (open and closed) for the assertion's anchor history; the
-    // selector, the census and the miss sample read the open ones only.
-    let all = store.all_records(); // snapshot under the store lock
+    // The open records plus the assertion's CLOSED anchor history (see
+    // [`resolver_retains`]); the selector, the census and the miss sample
+    // read the open ones only.
+    let all = store.records_where(|rec| resolver_retains(rec, client_asserted));
     let records = open_only(&all);
     let target_canon = std::fs::canonicalize(workdir).ok();
     // The CENSUSED form: the selector already counts the funnel on its way to
@@ -4422,10 +4428,33 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(claude_session_id.trim()).ok()
 }
 
-/// The OPEN records of a full store snapshot — the same set
+/// Which lifecycle records the two resolver legs snapshot: every OPEN record,
+/// plus a CLOSED one only when it anchors the id the request asserted.
+///
+/// That is exactly the set the legs read. Selection ([`open_only`]) reads open
+/// records alone, and the only reader of a closed record is
+/// [`ClientAssertion::classify`], which returns `None` without looking at any
+/// record when nothing was asserted and otherwise skips every record whose
+/// anchor is not the asserted id. So the verdict on this projection is
+/// identical to the verdict on the full store, and a forward that asserted
+/// nothing — or asserted an id no closed row names — clones no closed row at
+/// all, where it used to copy all 24 h of them under the store lock on every
+/// `/coord-mcp` call.
+fn resolver_retains(
+    rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    client_asserted: Option<uuid::Uuid>,
+) -> bool {
+    rec.state == "open"
+        || client_asserted.is_some_and(|asserted| {
+            anchor_as_caller_session(&rec.claude_session_id) == Some(asserted)
+        })
+}
+
+/// The OPEN records of a resolver snapshot — the same set
 /// `SessionLifecycleStore::open_records` returns (`state == "open"`). The two
-/// resolver legs snapshot `all_records()` ONCE, so the caller's assertion can
-/// be checked against closed anchors as well, and select from this projection.
+/// resolver legs snapshot the store ONCE ([`resolver_retains`]), so the
+/// caller's assertion can be checked against closed anchors as well, and
+/// select from this projection.
 fn open_only(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
 ) -> Vec<crate::session::session_lifecycle_store::TerminalSessionRecord> {
@@ -16209,6 +16238,67 @@ mod self_id_chain_tests {
             ClientAssertion::classify(&closed_elsewhere, Some(uuid_of(ANCHOR_B)), on_root),
             elsewhere(ANCHOR_B)
         );
+    }
+
+    /// Review follow-up (runner#1914): the resolver snapshot carries a CLOSED
+    /// record only when it anchors the asserted id, so a forward that asserted
+    /// nothing clones no closed row at all — and on every leg the verdict on
+    /// that projection is identical to the verdict on the full store.
+    #[test]
+    fn the_resolver_snapshot_needs_closed_records_only_for_the_asserted_id() {
+        let root = "D:/qontinui-root";
+        let mut live = rec(ANCHOR_A, Some(root), 200);
+        live.terminal_id = "term-1".to_string();
+        let mut prev = closed(rec(ANCHOR_B, Some(root), 100));
+        prev.terminal_id = "term-1".to_string();
+        let mut elsewhere_closed = closed(rec(ANCHOR_C, Some("D:/other"), 50));
+        elsewhere_closed.terminal_id = "term-2".to_string();
+        let all = vec![live, prev, elsewhere_closed];
+
+        let project = |asserted: Option<uuid::Uuid>| -> Vec<TerminalSessionRecord> {
+            all.iter()
+                .filter(|r| super::resolver_retains(r, asserted))
+                .cloned()
+                .collect()
+        };
+
+        // No assertion: the snapshot is the open set alone.
+        let bare = project(None);
+        assert!(bare.iter().all(|r| r.state == "open"));
+        assert_eq!(bare.len(), 1);
+        // An assertion keeps only the closed rows naming that id.
+        let ids = |v: &[TerminalSessionRecord]| -> Vec<String> {
+            v.iter().map(|r| r.claude_session_id.clone()).collect()
+        };
+        assert_eq!(
+            ids(&project(Some(uuid_of(ANCHOR_B)))),
+            vec![ANCHOR_A, ANCHOR_B]
+        );
+        assert_eq!(ids(&project(Some(uuid_of(ANCHOR_D)))), vec![ANCHOR_A]);
+
+        let on_root = |r: &TerminalSessionRecord| r.working_dir.as_deref() == Some(root);
+        for asserted in [
+            None,
+            Some(uuid_of(ANCHOR_A)),
+            Some(uuid_of(ANCHOR_B)),
+            Some(uuid_of(ANCHOR_C)),
+            Some(uuid_of(ANCHOR_D)),
+        ] {
+            let snap = project(asserted);
+            assert_eq!(
+                ClientAssertion::classify(&snap, asserted, on_root),
+                ClientAssertion::classify(&all, asserted, on_root),
+                "workdir classification diverged for {asserted:?}"
+            );
+            for terminal in ["term-1", "term-2", "term-absent"] {
+                assert_eq!(
+                    settle_terminal_leg(&snap, terminal, asserted),
+                    settle_terminal_leg(&all, terminal, asserted),
+                    "terminal leg diverged on {terminal} for {asserted:?}"
+                );
+            }
+            assert_eq!(ids(&super::open_only(&snap)), ids(&super::open_only(&all)));
+        }
     }
 
     /// The same guard on leg 1: a terminal's PREVIOUS session (its closed
