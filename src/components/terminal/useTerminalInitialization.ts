@@ -3,6 +3,7 @@ import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useC
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
   typeResumeAndVerify,
@@ -790,7 +791,7 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
     assignTabToZone: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
     assignments: Record<number, string>;
@@ -1113,7 +1114,7 @@ export function useTerminalInitialization({
             saved.layoutId === FLOW_GRID_ID ||
             LAYOUT_PRESETS.some((p) => p.id === saved.layoutId)
           ) {
-            zoneLayout.setLayoutId(saved.layoutId);
+            zoneLayout.setLayoutId(saved.layoutId, { source: "restore" });
           }
         }
 
