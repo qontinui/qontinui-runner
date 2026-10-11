@@ -9582,6 +9582,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "termhost-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "windows 0.61.3",
+ "x11rb",
+]
+
+[[package]]
 name = "termios"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

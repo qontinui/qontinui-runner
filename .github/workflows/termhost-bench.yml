@@ -1,0 +1,197 @@
+name: termhost-bench probe
+
+# Phase 2 of plan `2026-10-11-terminal-page-performance-kpis-across-setups`.
+#
+# Builds and tests `crates/termhost-probe` — the outside-in measurement
+# instrument the terminal-performance KPIs are read with — and runs its
+# `selftest` against a REAL display server on both hosted platforms: Xvfb on
+# ubuntu-22.04, and the interactive desktop of windows-latest. The selftest
+# opens its own window and proves the instrument end to end there: markers
+# painted behind known delays are reported within one refresh interval, a
+# key-echo round trip completes, an UNTAGGED injection is classified as real
+# input and aborts the run, an occluded window turns its intervals unknown,
+# and node's clock reads the probe's timebase.
+#
+# Hosted runners only: the selftest steals focus and injects keystrokes, so it
+# must never run on a machine someone is using.
+#
+# Each job runs `doctor --json` first and writes it to the job summary, so an
+# INOPERATIVE mechanism is recorded with its reason rather than silently
+# skipped. The selftest gates every check whose mechanisms are OPERATIVE, plus
+# every mechanism named by `--require`:
+#   - ubuntu: capture.x11, input.safe and clock.aligned are REQUIRED. Xvfb is a
+#     fully controlled X server, so an inoperative X11 path there is a defect in
+#     the instrument, never an environment limit — and without the requirement
+#     an inoperative mechanism would only un-gate its checks.
+#   - windows: clock.aligned is required (node ships on the image); the capture
+#     and input mechanisms are gated where the doctor finds them OPERATIVE, and
+#     recorded with their reasons where it does not — what a hosted Windows
+#     session allows (Desktop Duplication in particular) is the image's to
+#     decide, not this repo's.
+#
+# No schedule and no benchmark runs here: those are Phase 3.
+#
+# This file lives under `.github/workflows/`, so the PR that adds or edits it
+# needs `ci:gate-change=declared` (see ci-integrity.yml).
+
+on:
+  pull_request:
+    paths:
+      - "crates/termhost-probe/**"
+      - "scripts/termhost-bench/**"
+      - ".github/workflows/termhost-bench.yml"
+  workflow_dispatch:
+
+# `pull-requests: read` is required by ./.github/actions/checkout-sibling, which
+# reads the PR's coord dep-edge labels; nothing here writes.
+permissions:
+  contents: read
+  pull-requests: read
+
+# Copied verbatim from ci.yml — see its header for why the group is keyed this
+# way (first-attempt PR runs supersede per PR; every other run is its own group).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: termhost-probe (ubuntu-22.04, Xvfb)
+    runs-on: ubuntu-22.04
+    # UNMEASURED at introduction: no run of this job exists yet. One small crate
+    # (cold build a few minutes) plus a selftest of about a minute; 30 minutes
+    # is a generous first bound. Tighten it once there are runs to measure.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
+      # load the workspace; same action as ci.yml's `holder-crates` job.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # x11rb speaks the X protocol in pure Rust, so the X server is the only
+      # system package the probe needs.
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Test termhost-probe
+        run: cargo test -p termhost-probe
+
+      - name: Clippy termhost-probe
+        run: cargo clippy -p termhost-probe --all-targets -- -D warnings
+
+      - name: Build termhost-probe
+        run: cargo build -p termhost-probe
+
+      - name: Doctor (Xvfb)
+        shell: bash
+        run: |
+          xvfb-run -a -s "-screen 0 1280x1024x24" target/debug/termhost-probe doctor
+          xvfb-run -a -s "-screen 0 1280x1024x24" target/debug/termhost-probe doctor --json > doctor.jsonl
+          {
+            echo "### termhost-probe doctor (ubuntu-22.04, Xvfb)"
+            echo '```json'
+            cat doctor.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Selftest (Xvfb)
+        shell: bash
+        run: >-
+          xvfb-run -a -s "-screen 0 1280x1024x24"
+          target/debug/termhost-probe selftest --json
+          --require capture.x11 --require input.safe --require clock.aligned
+          --run-dir selftest-run
+
+      - name: Upload selftest records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-probe-selftest-linux
+          path: |
+            doctor.jsonl
+            selftest-run/
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows:
+    name: termhost-probe (windows-latest)
+    runs-on: windows-latest
+    # UNMEASURED at introduction, as above; a cold Windows build is slower.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test termhost-probe
+        run: cargo test -p termhost-probe
+
+      - name: Clippy termhost-probe
+        run: cargo clippy -p termhost-probe --all-targets -- -D warnings
+
+      - name: Build termhost-probe
+        run: cargo build -p termhost-probe
+
+      - name: Doctor
+        shell: bash
+        run: |
+          target/debug/termhost-probe.exe doctor
+          target/debug/termhost-probe.exe doctor --json > doctor.jsonl
+          {
+            echo "### termhost-probe doctor (windows-latest)"
+            echo '```json'
+            cat doctor.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Selftest
+        shell: bash
+        run: >-
+          target/debug/termhost-probe.exe selftest --json
+          --require clock.aligned
+          --run-dir selftest-run
+
+      - name: Upload selftest records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhost-probe-selftest-windows
+          path: |
+            doctor.jsonl
+            selftest-run/
+          if-no-files-found: warn
+          retention-days: 14
