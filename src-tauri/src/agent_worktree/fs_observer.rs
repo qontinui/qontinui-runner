@@ -206,6 +206,26 @@ pub(crate) fn blob_sha_for_file(abs: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// The tree of the commit named by `sha` — the base a worktree's pre-images
+/// are read from.
+///
+/// `pub(crate)` so the `/sessions/{id}/file-changes` route
+/// (`mcp::snapshots::BaseBlobs`) resolves a coord-allocated worktree's
+/// recorded `parent_sha` exactly as this producer does, rather than carrying a
+/// second copy of the parse → commit → tree chain.
+pub(crate) fn commit_tree<'r>(
+    repo: &'r git2::Repository,
+    sha: &str,
+) -> Result<git2::Tree<'r>, String> {
+    let oid = git2::Oid::from_str(sha).map_err(|e| format!("parse parent_sha {sha:?}: {e}"))?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|e| format!("find base commit {sha}: {e}"))?;
+    commit
+        .tree()
+        .map_err(|e| format!("base tree for {sha}: {e}"))
+}
+
 /// Enumerate the worktree's edits against `parent_sha` and build the
 /// per-path observation list.
 ///
@@ -231,14 +251,7 @@ pub fn collect_observations(
         .map_err(|e| format!("open worktree {}: {e}", worktree_path.display()))?;
 
     // Resolve the base tree from parent_sha.
-    let base_oid = git2::Oid::from_str(parent_sha)
-        .map_err(|e| format!("parse parent_sha {parent_sha:?}: {e}"))?;
-    let base_commit = repo
-        .find_commit(base_oid)
-        .map_err(|e| format!("find base commit {parent_sha}: {e}"))?;
-    let base_tree = base_commit
-        .tree()
-        .map_err(|e| format!("base tree for {parent_sha}: {e}"))?;
+    let base_tree = commit_tree(&repo, parent_sha)?;
 
     // Diff base tree -> working directory. `include_untracked` surfaces
     // newly-created files; libgit2 honours `.gitignore` so ignored files

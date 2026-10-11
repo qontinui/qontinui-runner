@@ -768,7 +768,8 @@ enum TickOutcome {
     /// Config rewritten with a fresh token.
     Refreshed,
     /// Config file no longer exists (cleanup or the startup sweep removed
-    /// it) — the loop must exit.
+    /// it), or is the token-less tombstone a failed cleanup left — the loop
+    /// must exit.
     ConfigGone,
 }
 
@@ -787,7 +788,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    if !config_path.exists() {
+    if !config_path.exists() || is_tombstone(config_path) {
         return Ok(TickOutcome::ConfigGone);
     }
     let fresh_token = fetch().await?;
@@ -805,6 +806,11 @@ where
     };
     let mut config: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse config: {e}"))?;
+    // A file with no token is the tombstone a failed cleanup leaves for the
+    // boot sweep: the session is closed, so the loop must exit, not revive it.
+    if config.get("push_token").is_none() {
+        return Ok(TickOutcome::ConfigGone);
+    }
     config["push_token"] = json!(fresh_token);
     atomic_overwrite(config_path, &config.to_string())?;
     Ok(TickOutcome::Refreshed)
@@ -1069,6 +1075,11 @@ fn unset_orphaned_install(local_config: &Path, token_file: &Path) -> OrphanUnset
         }
     }
 
+    // Not atomic with the check below: a sibling session installing into the
+    // same shared config between the two git calls can lose its
+    // `useHttpPath`. Closing that window would take a lock git's own
+    // `config.lock` does not offer across two commands; the window is two
+    // child processes wide, and the old blanket unset lost it every time.
     let qontinui_helper_remains =
         git_config_get_all_at(Some(local_config), INSTALLED_LOCAL_KEYS[0])
             .map(|values| values.iter().any(|v| v.contains("qontinui-git-credential")))
@@ -1119,11 +1130,26 @@ fn git_local_config_file(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Tear down everything [`setup_credential_helper`] installed for a session:
-/// unset every repo-local key in [`INSTALLED_LOCAL_KEYS`] in each working dir
-/// the session registered, then remove the token config file (whose absence
-/// is also the refresh loop's exit signal). Idempotent and best-effort —
-/// every failure is debug!-logged, never propagated, because this runs inside
-/// teardown funnels which must not fail on credential hygiene.
+/// remove this session's repo-local helper keys from every git config file
+/// it wrote, then remove the token config file (whose absence is also the
+/// refresh loop's exit signal). Idempotent and best-effort — every failure is
+/// logged, never propagated, because this runs inside teardown funnels which
+/// must not fail on credential hygiene.
+///
+/// The keys are removed by [`unset_orphaned_install`], the same exact-match
+/// removal the boot sweep uses, over the config FILES the token file recorded
+/// plus those the registered dirs resolve to now. Two reasons it is not a
+/// blanket `--unset-all` per working dir:
+/// - every linked worktree of a repo writes the MAIN checkout's shared
+///   config, so a blanket unset there strips the helper a sibling session
+///   installed later, leaving its pushes with no helper ("Cannot prompt");
+/// - a worktree deleted before teardown runs has no dir to `git -C` into,
+///   while its keys still sit in the main checkout's config.
+///
+/// When a removal fails the token file is kept as a tombstone: its
+/// `git_configs` record stays for the boot sweep to retry, and its token is
+/// dropped, which the helper binary treats as "no answer" and
+/// [`refresh_tick`] treats as the loop's exit signal.
 ///
 /// `session_id` is whatever key the matching `setup_credential_helper` call
 /// used. Two disjoint key spaces exist and BOTH must be torn down:
@@ -1139,57 +1165,68 @@ pub fn cleanup_credential_helper(session_id: &str) {
         .remove(session_id)
         .map(|state| state.dirs)
         .unwrap_or_default();
+    let config_path = config_file_path(session_id);
 
-    for dir in dirs {
-        if !dir.exists() {
-            debug!(
-                "credential_helper: cleanup skipping missing dir {}",
-                dir.display()
-            );
-            continue;
-        }
-        // Unset EVERY key the install wrote. Leaving `credential.useHttpPath`
-        // behind is not cosmetic: it permanently changes credential lookup for
-        // that repo, so the next helper in the chain (GCM) starts keying its
-        // store by full path and re-prompts per path — the very prompt class
-        // this subsystem exists to eliminate.
-        for key in INSTALLED_LOCAL_KEYS {
-            let mut cmd = crate::process_helpers::no_window("git");
-            cmd.args([
-                "-C",
-                &dir.to_string_lossy(),
-                "config",
-                "--local",
-                "--unset-all",
-                key,
-            ]);
-            let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT);
-            match output {
-                // Exit code 5 = key not present — the desired end state already
-                // holds (e.g. the operator hand-cleaned the repo).
-                Ok(out) if out.status.success() || out.status.code() == Some(5) => {}
-                Ok(out) => debug!(
-                    "credential_helper: unset {key} in {} failed ({:?}): {}",
-                    dir.display(),
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-                Err(e) => debug!(
-                    "credential_helper: run git config --unset-all {key} in {}: {e}",
-                    dir.display()
-                ),
+    // Resolved outside the config lock: each is a bounded `git rev-parse`.
+    let mut targets = recorded_git_configs(&config_path);
+    let mut any_failed = false;
+    for dir in &dirs {
+        match git_local_config_file(dir) {
+            Some(path) => {
+                let path = path.to_string_lossy().to_string();
+                if !targets.contains(&path) {
+                    targets.push(path);
+                }
             }
+            // A dir that is gone wrote nothing a `git -C` could reach; its
+            // config, if recorded, is already in `targets`. A dir that still
+            // exists but did not resolve (a `rev-parse` timeout) may hold keys
+            // no one can name, so the token file must not be deleted.
+            None if dir.exists() => {
+                debug!(
+                    "credential_helper: cleanup could not resolve the git config of {}",
+                    dir.display()
+                );
+                any_failed = true;
+            }
+            None => {}
         }
     }
 
-    let config_path = config_file_path(session_id);
+    for local_config in &targets {
+        if unset_orphaned_install(Path::new(local_config), &config_path) == OrphanUnset::Failed {
+            any_failed = true;
+        }
+    }
+
     // Under the config lock, so a refresh tick that already read the file
     // cannot write it back (with a live token) after this removal.
     let _guard = config_file_lock();
-    if config_path.exists() {
-        if let Err(e) = std::fs::remove_file(&config_path) {
-            debug!("credential_helper: cleanup config file failed: {e}");
+    if !config_path.exists() {
+        return;
+    }
+    if any_failed {
+        warn!(
+            "credential_helper: cleanup could not remove every helper key naming {}; \
+             keeping it without its token so the boot sweep can retry",
+            config_path.display()
+        );
+        // Every config this cleanup tried, not just the recorded ones: a dir's
+        // config that never resolved at install time is known only here.
+        let mut git_configs = recorded_git_configs(&config_path);
+        for target in targets {
+            if !git_configs.contains(&target) {
+                git_configs.push(target);
+            }
         }
+        let tombstone = json!({ "git_configs": git_configs });
+        if let Err(e) = atomic_overwrite(&config_path, &tombstone.to_string()) {
+            debug!("credential_helper: cleanup tombstone write failed: {e}");
+        }
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&config_path) {
+        debug!("credential_helper: cleanup config file failed: {e}");
     }
 }
 
@@ -1197,7 +1234,7 @@ pub fn cleanup_credential_helper(session_id: &str) {
 /// from a `Drop` impl.
 ///
 /// Two reasons the direct call is wrong there. (1) Cleanup shells out to
-/// `git config` once per installed key per dir; running that inline blocks
+/// `git rev-parse` / `git config` several times per git config; running that inline blocks
 /// whichever thread the drop lands on, which for `IsolatedEditContext` is a
 /// Tokio worker. (2) Cleanup can panic on a poisoned registry mutex, and a
 /// panic raised while unwinding another panic aborts the process — the same
@@ -1282,6 +1319,17 @@ fn sweep_stale_cred_files(dir: &Path, max_age: Duration, now: SystemTime) -> usi
         }
     }
     deleted
+}
+
+/// Whether `config_path` parses as a token config with no `push_token`: the
+/// tombstone a failed [`cleanup_credential_helper`] leaves for the boot sweep.
+/// A file that cannot be read or parsed is NOT a tombstone, so a transient
+/// read failure never ends a live session's refresh loop.
+fn is_tombstone(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some_and(|v| v.get("push_token").is_none())
 }
 
 /// The `git_configs` a token config file recorded at install time (empty for
@@ -1712,6 +1760,55 @@ mod tests {
         filetime::set_file_mtime(path, old_mtime).unwrap();
     }
 
+    /// A repo at `main` with one commit and a linked worktree of it. Returns
+    /// the worktree's parent temp dir (keep it alive) and the worktree path.
+    fn linked_worktree(main: &Path) -> (tempfile::TempDir, PathBuf) {
+        git_init(main);
+        let git = |args: &[&str]| {
+            let status = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(main)
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            // Isolate from the machine's global git config: signing or a
+            // global hooks path must not decide whether this fixture builds.
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--no-verify",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        git(&["worktree", "add", "-q", "--detach", &wt.to_string_lossy()]);
+        (wt_parent, wt)
+    }
+
+    /// A per-run session id: cleanup resolves the token file in the real
+    /// %TEMP% (production path), so the name must not collide with parallel
+    /// test runs.
+    fn unique_session_id(tag: &str) -> String {
+        format!(
+            "test-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
     /// Install the helper keys in `dir` pointing at `token`, and record the
     /// install in `token` exactly as `setup_credential_helper` does.
     fn install_and_record(dir: &Path, token: &Path) {
@@ -1764,35 +1861,7 @@ mod tests {
     fn sweep_unsets_keys_a_deleted_linked_worktree_wrote_into_the_main_checkout() {
         let temp = tempfile::tempdir().unwrap();
         let main = tempfile::tempdir().unwrap();
-        git_init(main.path());
-        let git = |args: &[&str]| {
-            let status = crate::process_helpers::no_window("git")
-                .arg("-C")
-                .arg(main.path())
-                .args(args)
-                .status()
-                .expect("git");
-            assert!(status.success(), "git {args:?}");
-        };
-        git(&[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@example.com",
-            // Isolate from the machine's global git config: signing or a
-            // global hooks path must not decide whether this fixture builds.
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "--no-verify",
-            "--allow-empty",
-            "-m",
-            "init",
-        ]);
-        let wt_parent = tempfile::tempdir().unwrap();
-        let wt = wt_parent.path().join("wt");
-        git(&["worktree", "add", "-q", "--detach", &wt.to_string_lossy()]);
+        let (_wt_parent, wt) = linked_worktree(main.path());
 
         let stale = temp.path().join("qontinui-git-cred-worktree-session.json");
         install_and_record(&wt, &stale);
@@ -2098,41 +2167,20 @@ mod tests {
 
     #[test]
     fn cleanup_unsets_local_helper_and_removes_config() {
-        // Unique per-run session id: cleanup resolves the config file in the
-        // real %TEMP% (production path), so the name must not collide with
-        // parallel test runs.
-        let session_id = format!(
-            "test-cleanup-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let session_id = unique_session_id("cleanup");
+        let config_path = config_file_path(&session_id);
 
         let repo = tempfile::tempdir().unwrap();
-        let status = crate::process_helpers::no_window("git")
-            .args(["init", "-q", &repo.path().to_string_lossy()])
-            .status()
-            .expect("git init");
-        assert!(status.success());
-        // Install exactly what `set_git_credential_helper` writes, so the test
+        git_init(repo.path());
+        // Install exactly what `setup_credential_helper` writes, so the test
         // pins the install/teardown pair rather than just one key.
-        set_git_credential_helper(
-            repo.path(),
-            Path::new("C:\\bin\\qontinui-git-credential.exe"),
-            Path::new("C:\\tmp\\cred.json"),
-        )
-        .unwrap();
+        install_and_record(repo.path(), &config_path);
         for key in INSTALLED_LOCAL_KEYS {
             assert!(
                 git_config_get(repo.path(), key).is_some(),
                 "{key} should be installed"
             );
         }
-
-        let config_path = config_file_path(&session_id);
-        std::fs::write(&config_path, "{}").unwrap();
 
         // Register the dir the way setup_credential_helper does, plus a
         // vanished dir cleanup must skip without erroring.
@@ -2164,5 +2212,143 @@ mod tests {
         );
         // Idempotent: a second cleanup (double-close) is a no-op.
         cleanup_credential_helper(&session_id);
+    }
+
+    /// Every linked worktree of a repo writes the main checkout's shared
+    /// config, so a later session's install replaces an earlier one's helper
+    /// there. Closing the EARLIER session must not strip the later one's.
+    #[test]
+    fn cleanup_leaves_the_helper_a_sibling_session_installed_in_a_shared_config() {
+        let earlier = unique_session_id("cleanup-earlier");
+        let later_dir = tempfile::tempdir().unwrap();
+        let later = later_dir.path().join("qontinui-git-cred-later.json");
+        let main = tempfile::tempdir().unwrap();
+        let (_wt_parent, wt) = linked_worktree(main.path());
+
+        install_and_record(&wt, &config_file_path(&earlier));
+        registry()
+            .lock()
+            .unwrap()
+            .entry(earlier.clone())
+            .or_default()
+            .dirs
+            .push(wt.clone());
+        install_and_record(main.path(), &later);
+
+        cleanup_credential_helper(&earlier);
+
+        let helper = git_config_get(main.path(), INSTALLED_LOCAL_KEYS[0])
+            .expect("the later session's helper must survive");
+        assert!(helper.contains("qontinui-git-cred-later.json"));
+        assert_eq!(
+            git_config_get(main.path(), INSTALLED_LOCAL_KEYS[1]).as_deref(),
+            Some("true"),
+            "useHttpPath is still needed by the later install"
+        );
+        assert!(!config_file_path(&earlier).exists());
+    }
+
+    /// A worktree deleted before teardown runs leaves no dir to `git -C`
+    /// into, but its keys sit in the main checkout's config. The recorded
+    /// `git_configs` must reach them at teardown, not 24 h later.
+    #[test]
+    fn cleanup_unsets_keys_of_a_deleted_linked_worktree_from_the_record() {
+        let session_id = unique_session_id("cleanup-gone-wt");
+        let config_path = config_file_path(&session_id);
+        let main = tempfile::tempdir().unwrap();
+        let (_wt_parent, wt) = linked_worktree(main.path());
+
+        install_and_record(&wt, &config_path);
+        registry()
+            .lock()
+            .unwrap()
+            .entry(session_id.clone())
+            .or_default()
+            .dirs
+            .push(wt.clone());
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        cleanup_credential_helper(&session_id);
+
+        for key in INSTALLED_LOCAL_KEYS {
+            assert_eq!(
+                git_config_get(main.path(), key),
+                None,
+                "{key} must be unset from the main checkout at teardown"
+            );
+        }
+        assert!(!config_path.exists());
+    }
+
+    /// A removal that fails at teardown (a contended `config.lock`) must keep
+    /// the record without its token, so the boot sweep can retry and the
+    /// helper serves nothing meanwhile.
+    #[test]
+    fn cleanup_leaves_a_tokenless_tombstone_when_a_removal_fails() {
+        let session_id = unique_session_id("cleanup-locked");
+        let config_path = config_file_path(&session_id);
+        let repo = tempfile::tempdir().unwrap();
+        git_init(repo.path());
+        install_and_record(repo.path(), &config_path);
+        let local_config = git_local_config_file(repo.path()).unwrap();
+        let lock = local_config.with_file_name("config.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        cleanup_credential_helper(&session_id);
+
+        assert!(
+            config_path.exists(),
+            "the record must survive a failed removal"
+        );
+        assert!(is_tombstone(&config_path), "its token must be dropped");
+        assert_eq!(
+            recorded_git_configs(&config_path),
+            vec![local_config.to_string_lossy().to_string()]
+        );
+
+        // The boot sweep retries once the lock is gone. Swept from a private
+        // dir (same file name, which is all the helper value matches on) so
+        // the test never sweeps the real %TEMP%.
+        std::fs::remove_file(&lock).unwrap();
+        let sweep_dir = tempfile::tempdir().unwrap();
+        let moved = sweep_dir.path().join(config_path.file_name().unwrap());
+        std::fs::copy(&config_path, &moved).unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+        age_25h(&moved);
+        assert_eq!(
+            sweep_stale_cred_files(sweep_dir.path(), SWEEP_MAX_AGE, SystemTime::now()),
+            1
+        );
+        for key in INSTALLED_LOCAL_KEYS {
+            assert_eq!(git_config_get(repo.path(), key), None, "{key} on retry");
+        }
+    }
+
+    /// The tombstone a failed cleanup leaves has no token; the refresh loop
+    /// must exit on it rather than mint a token for a closed session.
+    #[tokio::test]
+    async fn refresh_tick_exits_on_a_cleanup_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("qontinui-git-cred-tombstone.json");
+        std::fs::write(&config_path, json!({ "git_configs": ["A"] }).to_string()).unwrap();
+
+        let fetched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fetched_flag = fetched.clone();
+        let outcome = refresh_tick(&config_path, move || {
+            fetched_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok("fresh".to_string()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TickOutcome::ConfigGone);
+        assert!(
+            !fetched.load(std::sync::atomic::Ordering::SeqCst),
+            "no token may be minted for a closed session"
+        );
+        assert_eq!(recorded_git_configs(&config_path), vec!["A"]);
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(after.get("push_token").is_none(), "no token may be revived");
     }
 }

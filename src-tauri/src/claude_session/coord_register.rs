@@ -105,13 +105,27 @@ pub fn agent_logs_from_sessions_enabled() -> bool {
 
 /// Per-call overrides for [`AiCoordRegistrar::register_inner`]; both `None`
 /// for the pinned and sniffed planes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct RegisterOverrides {
     /// Adopt this existing coord session id instead of minting one; no
     /// `Started` row is written for it.
     adopt: Option<Uuid>,
     /// Stamp this tenant instead of the resolver's answer.
     tenant: Option<Uuid>,
+    /// Resume parameters stamped on a FRESH `Started` row.
+    resume: ResumeParams,
+}
+
+/// The parameters a later `claude --resume` must be pinned to: which account's
+/// config dir holds the transcript. Sent as optional fields on the `Started`
+/// create body, which coord persists best-effort to
+/// `coord.sessions.account_label` / `config_dir` (plan
+/// `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
+/// Phase 1). Both `None` for every plane that does not know them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeParams {
+    pub account_label: Option<String>,
+    pub config_dir: Option<String>,
 }
 
 /// Why [`AiCoordRegistrar::bind_transcript_session`] declined.
@@ -426,6 +440,27 @@ impl AiCoordRegistrar {
             .and_then(|g| g.get(session_key).copied())
     }
 
+    /// The coord session id of a `Started` row for `claude_session_id` that is
+    /// still sitting UNDELIVERED in the outbox, if any. The R4 index is empty
+    /// after a restart, so a pane whose `Started` was written before the
+    /// restart and not yet drained is invisible to [`Self::session_id_for`]
+    /// while coord (which has not received it) answers `unknown` — minting then
+    /// would create a second row beside it. A caller about to mint asks this
+    /// first and ADOPTS the answer instead.
+    pub fn pending_started_session_for(&self, claude_session_id: &str) -> Option<Uuid> {
+        let pending = self.inner.outbox.pending().ok()?;
+        pending
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+            .find(|r| {
+                r.payload
+                    .get("claude_code_session_id")
+                    .and_then(|v| v.as_str())
+                    == Some(claude_session_id)
+            })
+            .map(|r| r.session_id)
+    }
+
     /// R1/R2 — register (or idempotently re-register) an authenticated AI
     /// session with coord. Mints a fresh coord `session_id` (UUIDv7), writes a
     /// `Started` outbox row carrying `task_run_id`, and records the R4 index.
@@ -540,13 +575,18 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         adopt: Option<Uuid>,
         tenant: Option<Uuid>,
+        resume: ResumeParams,
     ) -> Result<Uuid, TranscriptBindRefusal> {
         self.register_inner(
             claude_session_id,
             None,
             "Claude Code session (transcript bind)",
             None,
-            RegisterOverrides { adopt, tenant },
+            RegisterOverrides {
+                adopt,
+                tenant,
+                resume,
+            },
         )
     }
 
@@ -722,6 +762,24 @@ impl AiCoordRegistrar {
         // non-uuid anchor simply omits the field, exactly as before.
         if uuid::Uuid::parse_str(claude_session_id.trim()).is_ok() {
             payload["claude_code_session_id"] = json!(claude_session_id);
+        }
+        // Resume parameters (unfinished-resume Phase 1) — optional on the wire,
+        // so a coord that predates them ignores the keys.
+        if let Some(a) = overrides
+            .resume
+            .account_label
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            payload["account_label"] = json!(a);
+        }
+        if let Some(c) = overrides
+            .resume
+            .config_dir
+            .as_deref()
+            .filter(|c| !c.is_empty())
+        {
+            payload["config_dir"] = json!(c);
         }
 
         // An ADOPTED row already exists coord-side, so writing `Started` for

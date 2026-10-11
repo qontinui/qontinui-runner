@@ -715,6 +715,17 @@ impl IsolatedEditContext {
     pub fn claude_add_dir_args(&self) -> Vec<String> {
         claude_add_dir_args(&self.worktrees)
     }
+
+    /// `(worktree_path, parent_sha)` for every worktree this context holds —
+    /// the allocation base coord recorded for each. Read by the
+    /// `/sessions/{id}/file-changes` route (`mcp::snapshots::BaseBlobs`) as
+    /// the first rung of a snapshot-less path's "before" side.
+    pub fn allocation_bases(&self) -> Vec<(PathBuf, String)> {
+        self.worktrees
+            .iter()
+            .map(|w| (w.worktree_path.clone(), w.parent_sha.clone()))
+            .collect()
+    }
 }
 
 /// Convenience helper for the runner terminal-spawn entry points

@@ -234,7 +234,7 @@ async fn wip_orphans_handler(
 /// `building` (G6) | `not-landed` (G2) | `main-merge` (G4) | `grace` (G5) |
 /// `not-a-candidate` | `stale-census` | `undeclared-not-removable` |
 /// `landed-idle-not-removable` | `not-cleared` |
-/// `coord-unreachable` | `absent` | `not-reapable` | `error`. Every refusal is listed — never a silent drop.
+/// `coord-unreachable` | `absent` | `not-reapable` | `sibling-busy` | `error`. Every refusal is listed — never a silent drop.
 async fn reclaim_handler(
     State(_state): State<Arc<ApiState>>,
     body: Option<Json<ReclaimRequest>>,
