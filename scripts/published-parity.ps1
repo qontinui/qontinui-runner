@@ -361,7 +361,12 @@ function Stop-ParityProcessTree {
     param([int]$RootPid)
 
     $all = @(Get-ParityProcessTable)
-    if ($all.Count -eq 0) { return }
+    if ($all.Count -eq 0) {
+        # The table read nothing: never kill LESS than the root.
+        Write-Host "  WARNING: read no process table -- stopping only the root pid $RootPid; its children were NOT walked."
+        try { Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue } catch { }
+        return
+    }
 
     $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
     if (-not $root) { return }
@@ -469,10 +474,12 @@ function Start-ParityRunner {
         "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
     }
     # WEBVIEW2_USER_DATA_FOLDER isolates nothing on Linux: WebKitGTK and every
-    # dirs::data_local_dir()/cache_dir() path resolve under XDG, so each leg gets
-    # its own data and cache homes there. Identical for both legs, like the rest
-    # of this table.
+    # dirs::data_local_dir()/cache_dir()/config_dir() path resolve under XDG, so
+    # each leg gets its own data, cache and config homes there. Identical for
+    # both legs, like the rest of this table.
     if ($ParityPlatform -eq 'linux') {
+        $toSet["XDG_CONFIG_HOME"] = (Join-Path $tmpRoot "xdg-config")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CONFIG_HOME"] | Out-Null
         $toSet["XDG_DATA_HOME"] = (Join-Path $tmpRoot "xdg-data")
         $toSet["XDG_CACHE_HOME"] = (Join-Path $tmpRoot "xdg-cache")
         New-Item -ItemType Directory -Force -Path $toSet["XDG_DATA_HOME"]  | Out-Null

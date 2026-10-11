@@ -664,9 +664,12 @@ function Start-DirectRunner {
         "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
     }
     # WEBVIEW2_USER_DATA_FOLDER isolates nothing on Linux: WebKitGTK and every
-    # dirs::data_local_dir()/cache_dir() path resolve under XDG, so each leg
-    # gets its own data and cache homes there.
+    # dirs::data_local_dir()/cache_dir()/config_dir() path resolve under XDG, so
+    # each leg gets its own data, cache and config homes there. (config_dir()
+    # call sites such as claude_accounts.rs ignore QONTINUI_CONFIG_DIR.)
     if ($IsLinux) {
+        $toSet["XDG_CONFIG_HOME"] = (Join-Path $tmpRoot "xdg-config")
+        New-Item -ItemType Directory -Force -Path $toSet["XDG_CONFIG_HOME"] | Out-Null
         $toSet["XDG_DATA_HOME"] = (Join-Path $tmpRoot "xdg-data")
         $toSet["XDG_CACHE_HOME"] = (Join-Path $tmpRoot "xdg-cache")
         New-Item -ItemType Directory -Force -Path $toSet["XDG_DATA_HOME"]  | Out-Null
@@ -740,8 +743,8 @@ function Stop-ProcessTree {
             } |
             Where-Object { $null -ne $_ })
         if ($all.Count -eq 0) {
-            Write-Host "  WARNING: read no processes from /proc -- the runner tree (root pid $RootPid) was NOT stopped."
-            return 0
+            Write-Host "  WARNING: read no processes from /proc -- stopping only the root pid $RootPid; its children were NOT walked."
+            try { Stop-Process -Id $RootPid -Force -ErrorAction Stop; return 1 } catch { return 0 }
         }
     } else {
         $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
@@ -993,7 +996,10 @@ if ($DirectExe) {
         # The whole tree, not just the root: an orphaned WebView/WebKit child
         # would otherwise outlive this leg into the next one.
         if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
-            try { $null = Stop-ProcessTree -RootPid $directRunner.Process.Id } catch { }
+            try { $null = Stop-ProcessTree -RootPid $directRunner.Process.Id } catch {
+                # The table read failed: never kill LESS than the root.
+                try { Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
+            }
         }
         # Dump captured output + any panic/log files so the failure (early-exit
         # OR ready-timeout) is diagnosable in CI logs instead of a bare
