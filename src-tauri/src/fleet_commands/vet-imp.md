@@ -283,11 +283,13 @@ are not removable, so a withheld citation was recorded anyway — measured
 is the supported way to say "this PR delivered phases 2 and 3 and no more"
 *(plan `2026-09-13-coord-delivery-cannot-express-partial-delivery`)*.
 **Never `gh pr merge`, never `--admin`** — coord is the sole merge authority.
-The marker is an **indexability** claim, not a delivery one: once plan
+The marker is an **indexability** claim, not a delivery one: now that plan
 `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
-(authored 2026-09-04, not deployed as of that date), coord classifies a citation
-whose PR changed only plan documents as a *document citation*, which neither
-derives nor blocks `shipped` — so marking a plan-file-only PR cannot forge it.
+(qontinui-coord#1924, `483659578` on `origin/main`; the plan is stamped SHIPPED
+2026-09-07), coord classifies a citation whose PR changed only plan documents as
+a *document citation* (`document_citation: true` on
+`coord_work_unit_list_citations`), which neither derives nor blocks `shipped` —
+so marking a plan-file-only PR cannot forge it.
 Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
@@ -396,7 +398,7 @@ regressed: report the measured number, do not quietly raise the floor.
 takes over the first's reservation — the identical bug that plan
 `2026-06-03-coord-session-scoped-claim-owner-plan` (SHIPPED 2026-06-03; coord
 PR #271 makes `acquire` SET/compare the owner token and the heartbeat/release Lua
-match on it, qontinui-claude-config PR #49 sends it) fixed for phase claims. It is
+match on it, and the client-side config change sends it) fixed for phase claims. It is
 also what makes the nested renewals below work at all: without an owner token,
 `/vet-plan`'s own reserve would be indistinguishable from a peer's.
 
@@ -586,7 +588,8 @@ spellings.
 Read the loop at any point with `status`, which prints one line per row plus a
 verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
-`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`).
+`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`),
+`OWNER_GONE` (11 — the owning session died and the loop released every row).
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"
@@ -871,8 +874,8 @@ fresh visible session to implement the plan instead of leaving it stranded.
 > pre-2026-08-30 `/vet-plan`: the record gate came back
 > `continuation_dropped_born_cleared`, and the run finished with no net armed.
 > Staleness is the delivery risk here — this fix cannot help a session reading an
-> old checkout, so `git -C <workspace>/qontinui-claude-config status` is worth a
-> glance when a documented mechanism does not behave as written.
+> old checkout, so a `git status` in the checkout that supplies this session's
+> `.claude/` is worth a glance when a documented mechanism does not behave as written.
 
 The net's window is genuinely unsatisfied for its whole 30 minutes, which is the
 property `unit_ready` could not provide: it is false the instant it is armed and
@@ -1331,7 +1334,8 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
-  its `COORD_REVIVE_CALL_TIMEOUT` total bound; `unknown_budget_expired` — this
+  its `COORD_REVIVE_CALL_TIMEOUT` total bound, and the detail quotes the bound the
+  door named, or says UNKNOWN-bound when the door's line names none; `unknown_budget_expired` — this
   script's `REVIEW_ARM_CORROBORATE_TIMEOUT` expired before the door exited; the
   row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
@@ -1422,6 +1426,15 @@ getting this wrong ("I cannot vet my own plan"). **The release is the `finally`;
 the verdict above is the `try`** — an INCOMPLETE chain releases on exactly the
 same line a complete one does. There is no branch of Step 5 that reaches its end
 without this call having run.
+
+**Before the release, confirm the implement→ship net is withdrawn.**
+`/implement-plan` Step 0.5 arms a `claim_terminal` net on this same
+`plan:<plan-stem>` key. Its Step 6 item 4a and its stop paths withdraw it, but a
+chain that aborted between that arm and those withdrawals leaves it open. Releasing
+then CLEARS the net and dispatches a duplicate session. Read
+`coord_gate_list {work_unit_id, open_only: true}`. If an open row's `phase_name`
+begins `implement→ship safety net`, withdraw it first and name its `gate_id`
+in the report.
 
 Two things wrap that release, both specified in Step 1.1:
 
