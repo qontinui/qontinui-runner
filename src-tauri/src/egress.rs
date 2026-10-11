@@ -1148,14 +1148,31 @@ pub(crate) fn path_session_tenant(path: &str) -> SessionScope {
     // whose session has ended is still attributed to that session's tenant
     // rather than to an open session in an enclosing directory. Records that
     // disagree at the closest directory make the path unresolved.
+    // Every directory is canonicalized afresh on each call — no cache, so a
+    // recorded directory that has since been deleted or re-pointed owns
+    // nothing it no longer is. That is filesystem work, which is why async
+    // callers go through [`path_session_tenant_off_runtime`].
     let records = store.all_records();
-    scope_for_path_with(
+    scope_for_path(
         path,
         records
             .iter()
             .filter_map(|r| Some((r.working_dir.as_deref()?, r.tenant_id.as_deref()))),
-        cached_ownership_key,
     )
+}
+
+/// [`path_session_tenant`] for an async caller: the lookup (canonicalizing
+/// the target and every recorded session directory) runs on the blocking
+/// pool. A failed join is unresolved. The test fake is consulted on the
+/// CALLING thread first, because fakes are per-thread.
+pub(crate) async fn path_session_tenant_off_runtime(path: String) -> SessionScope {
+    #[cfg(test)]
+    if let Some(faked) = test_support::faked_session_tenant(&path) {
+        return faked;
+    }
+    tokio::task::spawn_blocking(move || path_session_tenant(&path))
+        .await
+        .unwrap_or(SessionScope::Unresolved)
 }
 
 /// A path in the form ownership is compared in: on Windows without the
@@ -1184,27 +1201,6 @@ fn ownership_key(path: &Path) -> Option<PathBuf> {
         &canonical.to_string_lossy(),
         cfg!(windows),
     ))
-}
-
-/// A session directory's ownership key, cached by its recorded string so a
-/// relay read does not re-canonicalize every recorded session's directory.
-/// A directory whose key could not be computed is not cached (it is retried).
-/// The cache is dropped whole once it outgrows a bound.
-fn cached_ownership_key(dir: &str) -> Option<PathBuf> {
-    use std::sync::Mutex;
-    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(dir).cloned()) {
-        return Some(hit);
-    }
-    let key = ownership_key(Path::new(dir))?;
-    if let Ok(mut c) = cache.lock() {
-        if c.len() >= 4096 {
-            c.clear();
-        }
-        c.insert(dir.to_string(), key.clone());
-    }
-    Some(key)
 }
 
 /// The rule behind [`path_session_tenant`] over `(working_dir, tenant stamp)`
