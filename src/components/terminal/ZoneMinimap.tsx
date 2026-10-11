@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from "react";
 import { RotateCcw, X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { SessionState } from "./useZoneLayout";
@@ -82,6 +82,23 @@ export function ZoneMinimap() {
     id: "terminal-zone-minimap",
     type: "generic",
     label: "Zone minimap",
+  });
+  /*
+   * Its two controls are registered too, so an automated check can reset a
+   * dragged minimap or dismiss it by id instead of hunting for an unlabelled
+   * 16px button. The reset button only renders once the minimap has been
+   * moved, so it is unregistered until the first drag; after a reset its
+   * entry lingers detached (and is skipped by lookups) until the next move.
+   */
+  const { ref: resetRef } = useUIElement({
+    id: "terminal-zone-minimap-reset",
+    type: "button",
+    label: "Reset zone minimap position",
+  });
+  const { ref: dismissRef } = useUIElement({
+    id: "terminal-zone-minimap-dismiss",
+    type: "button",
+    label: "Hide zone minimap",
   });
 
   /*
@@ -284,6 +301,8 @@ export function ZoneMinimap() {
         {/* Reset position — only offered once the minimap has been moved. */}
         {isMoved && (
           <button
+            ref={resetRef as Ref<HTMLButtonElement>}
+            type="button"
             onClick={() => {
               setDragOffset(null);
               resetMinimapOffset();
@@ -298,6 +317,8 @@ export function ZoneMinimap() {
 
         {/* Dismiss button */}
         <button
+          ref={dismissRef as Ref<HTMLButtonElement>}
+          type="button"
           onClick={toggleMinimap}
           title="Hide the zone minimap (restore it from the status strip)"
           aria-label="Hide the zone minimap"
