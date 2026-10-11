@@ -4900,7 +4900,10 @@ mod observation_tests {
         );
         assert_eq!(obs.status(), ObservationStatus::Absent, "{obs:?}");
         let coverage = &obs.provenance().coverage;
-        assert!(coverage.considered >= 1, "absent needs considered >= 1: {coverage:?}");
+        assert!(
+            coverage.considered >= 1,
+            "absent needs considered >= 1: {coverage:?}"
+        );
         assert_eq!(coverage.considered, 1);
         assert_eq!(coverage.measured, 1);
         assert!(coverage.unmeasured.is_empty());
