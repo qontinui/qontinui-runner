@@ -2667,6 +2667,16 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
             body["task_run_id"] = trid.clone();
         }
     }
+    // Unfinished-resume Phase 1 — the account / config dir a later
+    // `claude --resume` must be pinned to. Optional on coord's
+    // `CreateSessionRequest` (`#[serde(default)]`); omitted when absent/null.
+    for key in ["account_label", "config_dir"] {
+        if let Some(v) = rec.payload.get(key) {
+            if !v.is_null() {
+                body[key] = v.clone();
+            }
+        }
+    }
     body
 }
 
@@ -6409,6 +6419,45 @@ mod tests {
         };
         let body = rebuild_create_body(&without);
         assert!(body.get("claude_code_session_id").is_none());
+    }
+
+    /// Unfinished-resume Phase 1 — the resume parameters ride the create body
+    /// when the Started payload carries them, and are omitted (not null) when
+    /// it does not.
+    #[test]
+    fn rebuild_create_body_forwards_account_label_and_config_dir() {
+        let _amb = crate::test_env::isolated_ambient();
+        let with = OutboxRecord {
+            machine_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            seq: 1,
+            event_kind: "started".into(),
+            payload: json!({
+                "id": Uuid::nil(),
+                "kind": "terminal_claude",
+                "intent": { "kind": "terminal_claude", "purpose": "p" },
+                "account_label": ".claude-gmail",
+                "config_dir": "/home/u/.claude-gmail"
+            }),
+            recorded_at: Utc::now(),
+            acked_at: None,
+        };
+        let body = rebuild_create_body(&with);
+        assert_eq!(body["account_label"], ".claude-gmail");
+        assert_eq!(body["config_dir"], "/home/u/.claude-gmail");
+
+        let without = OutboxRecord {
+            payload: json!({
+                "id": Uuid::nil(),
+                "kind": "terminal_claude",
+                "intent": { "kind": "terminal_claude", "purpose": "p" },
+                "account_label": null
+            }),
+            ..with
+        };
+        let body = rebuild_create_body(&without);
+        assert!(body.get("account_label").is_none());
+        assert!(body.get("config_dir").is_none());
     }
 
     /// Session-automation Phase 0 — `rebuild_create_body` forwards the

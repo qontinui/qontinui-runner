@@ -90,6 +90,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
 pub mod tracking_health;
+pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
 pub mod transcript_emitter;
 pub mod transport;
 pub mod wind_down_executor; // The wind-down TICK — the only place a drain closes a session (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4)
