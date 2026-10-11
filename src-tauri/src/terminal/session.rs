@@ -274,12 +274,22 @@ impl EmissionGate {
 ///   the wire open: a mounted-but-hidden pane still feeds needs-input / state
 ///   tracking from its coalesced output, which a paused wire would starve.
 ///
-/// `set_paused` is issued only when the OR of the two changes, so a chatty
+/// - `held` — a DEBUG-only operator hold (`POST
+///   /__debug/terminals/{id}/wire-hold`, [`TerminalSession::set_wire_held`]),
+///   so an acceptance harness can grow a remote pane's drift behind a paused
+///   wire (plan
+///   `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+///   Phase 2). An input rather than a direct `set_paused` call, because only
+///   `sync` may put a flow frame on the wire — see the `sent` field's note.
+///   Nothing in a release build sets it.
+///
+/// `set_paused` is issued only when the OR of the inputs changes, so a chatty
 /// gate costs one frame per edge, never one per chunk.
 pub(crate) struct WireFlow {
     io: Arc<dyn PaneIo>,
     gate_paused: AtomicBool,
     hidden: AtomicBool,
+    held: AtomicBool,
     /// The wire state last SUCCESSFULLY sent, under the lock that also
     /// serialises the send itself. `Some(false)` at construction because both
     /// ends agree the wire starts open without a frame being sent.
@@ -305,6 +315,7 @@ impl WireFlow {
             io,
             gate_paused: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
+            held: AtomicBool::new(false),
             sent: Mutex::new(false),
             wire_paused: AtomicBool::new(false),
         }
@@ -322,6 +333,13 @@ impl WireFlow {
         }
     }
 
+    /// The debug wire hold — see the `held` input on [`WireFlow`].
+    pub(crate) fn set_held(&self, held: bool) {
+        if self.held.swap(held, Ordering::AcqRel) != held {
+            self.sync();
+        }
+    }
+
     /// The wire state last sent to the source.
     pub(crate) fn wire_paused(&self) -> bool {
         self.wire_paused.load(Ordering::Acquire)
@@ -330,8 +348,9 @@ impl WireFlow {
     fn sync(&self) {
         // Held across the decision AND the send — see the `sent` field's note.
         let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        let desired =
-            self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
+        let desired = self.gate_paused.load(Ordering::Acquire)
+            || self.hidden.load(Ordering::Acquire)
+            || self.held.load(Ordering::Acquire);
         if *sent == desired {
             return;
         }
@@ -4212,6 +4231,22 @@ impl TerminalSession {
         self.wire_flow.set_gate_paused(false);
     }
 
+    /// Set the DEBUG wire hold on this pane's source and return the wire
+    /// state last successfully sent (plan
+    /// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+    /// Phase 2). Goes through [`WireFlow`], never a raw `set_paused`, so the
+    /// "last sent" bookkeeping stays exact.
+    ///
+    /// For a REMOTE tab this becomes `remote_terminal_flow {paused}` and the
+    /// target withholds the tab's output while its ring keeps filling. For a
+    /// local PTY it is a documented no-op on the wire —
+    /// `LocalPaneIo::set_paused` does nothing — so the returned `wire_paused`
+    /// still reports the recorded state, but no output is actually held.
+    pub fn set_wire_held(&self, held: bool) -> bool {
+        self.wire_flow.set_held(held);
+        self.wire_flow.wire_paused()
+    }
+
     /// Subscribe to the terminal output broadcast channel.
     /// Returns a receiver that yields base64-encoded output chunks.
     pub fn subscribe_output(&self) -> broadcast::Receiver<String> {
@@ -6670,6 +6705,31 @@ pub(crate) mod tests {
         assert_eq!(*rec.0.lock().unwrap(), vec![true, false]);
     }
 
+    /// Phase 2 (A5): the debug `held` input is a third OR-term through the
+    /// same `sync`, so it sends only edges and neither masks nor is masked
+    /// out of the recorded wire state.
+    #[test]
+    fn wire_flow_held_is_a_third_input_through_the_same_edges() {
+        let rec = Arc::new(PauseRecorder(Mutex::new(Vec::new())));
+        let io: Arc<dyn PaneIo> = rec.clone();
+        let wf = WireFlow::new(io);
+        wf.set_held(false); // already open: nothing sent
+        wf.set_held(true);
+        assert!(wf.wire_paused());
+        wf.set_held(true); // same state twice: one frame
+        wf.set_gate_paused(true); // already paused by the hold: no frame
+        wf.set_hidden(true);
+        wf.set_gate_paused(false);
+        wf.set_hidden(false); // still held: stays paused, no frame
+        assert!(wf.wire_paused());
+        wf.set_hidden(true);
+        wf.set_held(false); // still hidden: releasing the hold sends nothing
+        assert!(wf.wire_paused());
+        wf.set_hidden(false); // last input clears: resume
+        assert!(!wf.wire_paused());
+        assert_eq!(*rec.0.lock().unwrap(), vec![true, false]);
+    }
+
     /// F1: the wire's last-applied state must match the true combined state
     /// even when the two inputs are driven from different threads.
     ///
@@ -6894,6 +6954,29 @@ pub(crate) mod tests {
         session.wire_flow.set_gate_paused(true);
         session.set_visibility("main", VisibilityTier::Background);
         assert!(!session.wire_flow.wire_paused());
+    }
+
+    /// Phase 2 (A5): the session's debug hold drives the wire through
+    /// `WireFlow`, reports the state last sent, and survives the paths that
+    /// lift a GATE pause (ack / reset / tier) — only releasing the hold lifts
+    /// it.
+    #[test]
+    fn session_wire_hold_pauses_until_released() {
+        let rec = Arc::new(PauseRecorder(Mutex::new(Vec::new())));
+        let io: Arc<dyn PaneIo> = rec.clone();
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.wire_flow = Arc::new(WireFlow::new(io));
+        let session = session;
+
+        assert!(session.set_wire_held(true));
+        session.reset_flow_control();
+        session.set_visibility("main", VisibilityTier::Focused);
+        assert!(
+            session.wire_flow.wire_paused(),
+            "a reset must not lift the hold"
+        );
+        assert!(!session.set_wire_held(false));
+        assert_eq!(*rec.0.lock().unwrap(), vec![true, false]);
     }
 
     #[test]

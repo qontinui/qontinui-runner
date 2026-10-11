@@ -36,6 +36,10 @@ pub const ALLOWED_PROXIED_COMMANDS: &[&str] = &[
     "terminal_write",
     "terminal_close",
     "list_terminals",
+    // Read-only: each remote tab's identity plus its last reattach arm, so an
+    // acceptance harness can assert A5 on the SOURCE (plan
+    // `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`).
+    "terminal_remote_identities",
     "get_claude_config_dirs",
     "check_accounts_usage",
     // The remote-interactivity probe sweep (plan
@@ -418,6 +422,20 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .clone();
             let terminals = tm.list();
             TauriInvokeResponse::ok(serde_json::json!({ "terminals": terminals }))
+        }
+
+        "terminal_remote_identities" => {
+            let tm: Arc<TerminalManager> = state
+                .app_handle
+                .state::<Arc<TerminalManager>>()
+                .inner()
+                .clone();
+            // The same map the Tauri command returns as its `data`: remote
+            // identities keyed by LOCAL terminal id.
+            match serde_json::to_value(tm.remote_identities()) {
+                Ok(map) => TauriInvokeResponse::ok(map),
+                Err(e) => TauriInvokeResponse::err(e.to_string()),
+            }
         }
 
         // ── config / accounts ────────────────────────────────────────────────

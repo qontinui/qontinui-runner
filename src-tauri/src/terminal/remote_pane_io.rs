@@ -224,6 +224,83 @@ struct InteractivityState {
     snapshot: RemoteInteractivity,
 }
 
+/// Which reattach path the TARGET took, derived on the source from fields
+/// already on the wire (plan
+/// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+/// Phase 3). Derived rather than echoed: qontinui-web's relay rebuilds
+/// `remote_terminal_attached` from a fixed field set, so a target-side arm
+/// field would be dropped in transit — and deriving also catches a
+/// `have_offset` that was itself dropped. See [`classify_reattach`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReattachArm {
+    /// The arm cannot be decided: the reply carried no `ring_start_offset`
+    /// (old target or relay), or the target reports FEWER bytes produced
+    /// than this pane holds (its offsets were reset, e.g. a target restart).
+    Unknown,
+    /// The drift was within the bounded attach tail, where both arms ship the
+    /// same bytes — the reattach proves nothing either way.
+    Indistinguishable,
+    /// The target's ring rolled past what this pane held: a REAL loss, which
+    /// both arms would mark.
+    RingRolled,
+    /// The target shipped from the offset this pane presented — no false loss.
+    ReattachFromHave,
+    /// The ring still held `[have, start)` but the target shipped a bounded
+    /// tail from `start` anyway: a FALSE loss (the qontinui-web#1294 defect).
+    FreshTail,
+}
+
+/// Classify a reattach reply against the `have_offset` this pane sent.
+/// Rows are decided IN ORDER; see [`ReattachArm`] for each meaning.
+///
+/// `H` = `have`, `S` = `ring.start_offset`, `R` = `ring.history_start`
+/// (`ring_start_offset` on the wire), `T` = `ring.total_bytes_produced`.
+pub fn classify_reattach(have: u64, ring: &AttachedRing, tail_bytes: u64) -> ReattachArm {
+    let Some(ring_start) = ring.history_start else {
+        return ReattachArm::Unknown;
+    };
+    // The target produced FEWER bytes than this pane holds: its offsets were
+    // reset (a target restart), so no comparison below means anything.
+    if ring.total_bytes_produced < have {
+        return ReattachArm::Unknown;
+    }
+    // A real loss is a real loss whatever the drift — decided before the
+    // "too small to tell" row, so a small ring or a reset is never
+    // reported as proving nothing.
+    if ring_start > have {
+        return ReattachArm::RingRolled;
+    }
+    if ring.total_bytes_produced - have <= tail_bytes {
+        return ReattachArm::Indistinguishable;
+    }
+    if ring.start_offset <= have {
+        return ReattachArm::ReattachFromHave;
+    }
+    ReattachArm::FreshTail
+}
+
+/// The last reattach this pane spliced — what `terminal_remote_identities`
+/// reports so an acceptance harness can assert the arm on the SOURCE.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReattachRecord {
+    /// `H` — the `have_offset` this pane presented in its reattach frame.
+    pub have_offset: u64,
+    /// `S` — the first byte of the ring the target shipped.
+    pub start_offset: u64,
+    /// `R` — the first byte the target's ring still held; `None` from a
+    /// target that predates the field.
+    pub ring_start_offset: Option<u64>,
+    /// `T` — the target's total bytes produced at reply time.
+    pub total_bytes_produced: u64,
+    pub arm: ReattachArm,
+    /// Bytes the splice reported lost with an in-band marker (`0` = none).
+    pub lost_bytes_marked: u64,
+    /// When the reply was spliced, RFC 3339 UTC.
+    pub at: String,
+}
+
 /// A [`PaneIo`] over the backend relay for one remote terminal.
 pub struct RemotePaneIo {
     grant_jti: String,
@@ -264,6 +341,20 @@ pub struct RemotePaneIo {
         crate::mcp::remote_interactivity::SourceReportContext,
         Arc<crate::mcp::remote_interactivity::Reporter>,
     )>,
+    /// The `have_offset` the last [`Self::reattach_frame`] carried — the `H`
+    /// the reply is classified against.
+    last_reattach_have: Mutex<Option<u64>>,
+    /// The last spliced reattach, see [`Self::record_reattach`].
+    last_reattach: Mutex<Option<ReattachRecord>>,
+    /// The `paused` value of the last flow frame this pane SUCCESSFULLY
+    /// queued. The target opens its per-grant flow gate on every (re)attach,
+    /// so after a reattach this is what the source still wants and must
+    /// re-assert — see [`Self::reassert_flow_after_reattach`]. A `Mutex`,
+    /// not an atomic: the read-decide-send in the re-assert and the
+    /// send-record in `set_paused` must each be one step, or a resume racing
+    /// a re-assert could put `paused: true` on the wire LAST while this side
+    /// records the wire open — a silent tab.
+    flow_paused: Mutex<bool>,
 }
 
 impl RemotePaneIo {
@@ -325,6 +416,9 @@ impl RemotePaneIo {
                 },
             })),
             report: OnceLock::new(),
+            last_reattach_have: Mutex::new(None),
+            last_reattach: Mutex::new(None),
+            flow_paused: Mutex::new(false),
         }
     }
 
@@ -728,16 +822,88 @@ impl RemotePaneIo {
     /// — so a 20-second drop over a chatty session wrote a "N bytes of output
     /// were lost here" marker for bytes the target's ring still held. Telling
     /// the target where to start makes the reported loss the real one.
+    ///
+    /// The offset sent is also recorded, so the reply can be classified
+    /// against exactly what was presented ([`Self::record_reattach`]).
     pub fn reattach_frame(&self, request_id: &str) -> Value {
         let (cols, rows) = self.dims();
+        let have = self.remote_offset();
+        if let Ok(mut slot) = self.last_reattach_have.lock() {
+            *slot = Some(have);
+        }
         json!({
             "type": "remote_terminal_attach",
             "request_id": request_id,
             "grant": self.grant,
             "cols": cols,
             "rows": rows,
-            "have_offset": self.remote_offset(),
+            "have_offset": have,
         })
+    }
+
+    /// Classify a reattach reply and record it as this pane's
+    /// [`ReattachRecord`]. Call BEFORE [`Self::splice_replay`]:
+    /// `lost_bytes_marked` is computed from the same offset the splice's
+    /// loss test reads. A reply with no recorded `have_offset` (no reattach
+    /// frame was built) is classified [`ReattachArm::Unknown`] against the
+    /// pane's current offset.
+    pub fn record_reattach(&self, ring: &AttachedRing, tail_bytes: u64) -> ReattachRecord {
+        let current = self.remote_offset();
+        let sent = self.last_reattach_have.lock().ok().and_then(|h| *h);
+        let (have, arm) = match sent {
+            Some(h) => (h, classify_reattach(h, ring, tail_bytes)),
+            None => (current, ReattachArm::Unknown),
+        };
+        let record = ReattachRecord {
+            have_offset: have,
+            start_offset: ring.start_offset,
+            ring_start_offset: ring.history_start,
+            total_bytes_produced: ring.total_bytes_produced,
+            arm,
+            // `splice_replay` writes a marker exactly when `current < start`
+            // (then `current < end` too, so its early return cannot fire).
+            lost_bytes_marked: ring.start_offset.saturating_sub(current),
+            at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Ok(mut slot) = self.last_reattach.lock() {
+            *slot = Some(record.clone());
+        }
+        record
+    }
+
+    /// The last reattach this pane spliced, if any.
+    pub fn last_reattach(&self) -> Option<ReattachRecord> {
+        self.last_reattach.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// The target clears this grant's flow gate on every (re)attach (a
+    /// fresh binding must not inherit a stale pause), so a pause the source
+    /// still wants — backpressure, an `Unwatched` tier, or the debug wire
+    /// hold — would silently lapse while the source's `WireFlow` keeps
+    /// reporting the wire as paused. Re-send it after a reattach splice.
+    /// A resume needs nothing: the target's gate is already open.
+    pub fn reassert_flow_after_reattach(&self) {
+        // Held across the read AND the send — see the field's note.
+        let wanted = self.flow_paused.lock().unwrap_or_else(|e| e.into_inner());
+        if !*wanted {
+            return;
+        }
+        if let Err(e) = self.send_flow(true) {
+            warn!(
+                grant_jti = %self.grant_jti,
+                error = %e,
+                "remote pane: could not re-assert the wire pause after reattach"
+            );
+        }
+    }
+
+    fn send_flow(&self, paused: bool) -> Result<(), String> {
+        self.send(json!({
+            "type": "remote_terminal_flow",
+            "grant_jti": self.grant_jti,
+            "terminal_id": self.terminal_id,
+            "paused": paused,
+        }))
     }
 }
 
@@ -875,12 +1041,11 @@ impl PaneIo for RemotePaneIo {
     }
 
     fn set_paused(&self, paused: bool) -> Result<(), String> {
-        self.send(json!({
-            "type": "remote_terminal_flow",
-            "grant_jti": self.grant_jti,
-            "terminal_id": self.terminal_id,
-            "paused": paused,
-        }))
+        // Held across the send AND the record — see the field's note.
+        let mut wanted = self.flow_paused.lock().unwrap_or_else(|e| e.into_inner());
+        self.send_flow(paused)?;
+        *wanted = paused;
+        Ok(())
     }
 
     fn pid(&self) -> Option<u32> {
@@ -1492,6 +1657,140 @@ pub(crate) mod tests {
         expected.extend_from_slice(&lost_output_marker(5));
         expected.extend_from_slice(b"XYZ");
         assert_eq!(read_to_end_blocking(reader), expected);
+    }
+
+    /// Phase 3 (A5): one case per row of the reattach classification table,
+    /// in the order the rows are decided.
+    #[test]
+    fn classify_reattach_decides_each_row_in_order() {
+        const TAIL: u64 = 64 * 1024;
+        let ring = |start: u64, ring_start: Option<u64>, total: u64| AttachedRing {
+            buffer: Vec::new(),
+            start_offset: start,
+            total_bytes_produced: total,
+            history_start: ring_start,
+        };
+        let h = 100_000;
+        // 1. R absent → unknown, whatever else holds.
+        assert_eq!(
+            classify_reattach(h, &ring(h, None, h + 10 * TAIL), TAIL),
+            ReattachArm::Unknown
+        );
+        // 2. T < H → unknown: the target's offsets were reset.
+        assert_eq!(
+            classify_reattach(h, &ring(h, Some(0), h - 1), TAIL),
+            ReattachArm::Unknown
+        );
+        // 3. R > H → the ring rolled past what we hold: a real loss — even
+        // when the drift is within the tail (a ring smaller than the tail).
+        assert_eq!(
+            classify_reattach(h, &ring(h + 500, Some(h + 1), h + 2 * TAIL), TAIL),
+            ReattachArm::RingRolled
+        );
+        assert_eq!(
+            classify_reattach(h, &ring(h + 50, Some(h + 10), h + 100), TAIL),
+            ReattachArm::RingRolled
+        );
+        // 4. T - H <= tail → indistinguishable (boundary inclusive), even
+        // when S > H would otherwise read as a fresh tail.
+        assert_eq!(
+            classify_reattach(h, &ring(h + 5, Some(0), h + TAIL), TAIL),
+            ReattachArm::Indistinguishable
+        );
+        // 5. S <= H → shipped from have (equal and below both qualify).
+        assert_eq!(
+            classify_reattach(h, &ring(h, Some(0), h + 2 * TAIL), TAIL),
+            ReattachArm::ReattachFromHave
+        );
+        assert_eq!(
+            classify_reattach(h, &ring(h - 10, Some(h - 10), h + 2 * TAIL), TAIL),
+            ReattachArm::ReattachFromHave
+        );
+        // 6. R <= H < S → fresh tail: the false loss.
+        assert_eq!(
+            classify_reattach(h, &ring(h + 1, Some(h), h + 2 * TAIL), TAIL),
+            ReattachArm::FreshTail
+        );
+    }
+
+    /// The target opens its flow gate on every (re)attach, so a pause the
+    /// source still wants must be re-sent after the reattach splice — and
+    /// only a pause: an open wire needs nothing, and a failed send is never
+    /// recorded as the state the source wants.
+    #[test]
+    fn a_wanted_pause_is_reasserted_after_reattach() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let flows = |sink: &RecordingSink| -> Vec<bool> {
+            sink.frames()
+                .iter()
+                .filter(|f| f["type"] == "remote_terminal_flow")
+                .map(|f| f["paused"].as_bool().unwrap())
+                .collect()
+        };
+
+        pane.reassert_flow_after_reattach(); // never paused: nothing sent
+        assert!(flows(&sink).is_empty());
+
+        pane.set_paused(true).unwrap();
+        pane.reassert_flow_after_reattach();
+        assert_eq!(flows(&sink), vec![true, true]);
+
+        pane.set_paused(false).unwrap();
+        pane.reassert_flow_after_reattach(); // resumed: nothing re-sent
+        assert_eq!(flows(&sink), vec![true, true, false]);
+    }
+
+    /// The arm serializes as the snake_case names a harness asserts on, and
+    /// the record's fields in camelCase like the identity carrying it.
+    #[test]
+    fn reattach_record_wire_shape() {
+        let rec = ReattachRecord {
+            have_offset: 1,
+            start_offset: 2,
+            ring_start_offset: None,
+            total_bytes_produced: 3,
+            arm: ReattachArm::ReattachFromHave,
+            lost_bytes_marked: 0,
+            at: "2026-09-30T00:00:00+00:00".into(),
+        };
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["arm"], "reattach_from_have");
+        assert_eq!(v["haveOffset"], 1);
+        assert_eq!(v["ringStartOffset"], Value::Null);
+        assert_eq!(v["lostBytesMarked"], 0);
+        assert_eq!(
+            serde_json::to_value(ReattachArm::FreshTail).unwrap(),
+            "fresh_tail"
+        );
+    }
+
+    /// A reply with no reattach frame behind it has no `H` to classify
+    /// against, so it says `unknown` rather than guessing.
+    #[test]
+    fn record_reattach_without_a_frame_is_unknown() {
+        let sink = Arc::new(RecordingSink::default());
+        let p = pane(
+            &sink,
+            AttachedRing {
+                buffer: b"abc".to_vec(),
+                start_offset: 0,
+                total_bytes_produced: 3,
+                history_start: Some(0),
+            },
+        );
+        let rec = p.record_reattach(
+            &AttachedRing {
+                buffer: Vec::new(),
+                start_offset: 3,
+                total_bytes_produced: 1_000_000,
+                history_start: Some(0),
+            },
+            64 * 1024,
+        );
+        assert_eq!(rec.arm, ReattachArm::Unknown);
+        assert_eq!(rec.have_offset, 3);
+        assert_eq!(p.last_reattach(), Some(rec));
     }
 
     /// Lazy scrollback: the history range is exactly the target ring below
