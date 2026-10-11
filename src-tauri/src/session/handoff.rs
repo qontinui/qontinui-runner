@@ -49,10 +49,28 @@
 //!    this lane degrades to POLL cadence (one tick), not to silence. The
 //!    other three lanes are harmless against the old coord because their
 //!    subjects sit under `events.*`; this one is not, which is why the tick
-//!    exists. The tick re-sights every handoff whose `close_source` failed,
-//!    so [`MaterializedSources`] turns a repeat sighting into a close-only
-//!    retry — a second child is never started for a source this process
-//!    already materialized.
+//!    exists. A repeat sighting of a handoff this process already
+//!    materialized never starts a second child: [`MaterializedSources`]
+//!    turns it into a close-only retry, and a source whose close coord
+//!    REFUSED for good (see [`SourceClose`]) into no request at all.
+//!
+//!    The close RETRY itself is not driven by sightings. Coord drops a
+//!    handoff from its pending list as soon as this device's child row
+//!    exists, and that row registers asynchronously — often after the first
+//!    close was already refused as `handoff_child_not_materialized` — so the
+//!    source may never be sighted again. Every handoff catch-up pass (the
+//!    tick included) therefore re-sends the close for each source in
+//!    [`MaterializedSources`] that has not settled, under the tenant scope it
+//!    recorded, whether or not coord still lists it: exponential backoff from
+//!    one tick up to [`CLOSE_RETRY_CEIL`], abandoned (logged once) after
+//!    [`CLOSE_RETRY_LIFETIME`] of failures. The backoff is measured from the
+//!    moment each close request STARTED. Because these closes run inline on
+//!    the socket pump, each one carries its own [`CLOSE_REQUEST_TIMEOUT`], and
+//!    one [`retry_due_closes`] pass sends at most [`CLOSE_RETRY_PASS_CAP`] of
+//!    them (most overdue first), leaving the rest due for the next pass. That
+//!    cap bounds the retry pass only: a handoff coord still LISTS that comes
+//!    back as close-only is retried in the catch-up loop itself, before the
+//!    capped pass, so a whole catch-up pass also grows with coord's list.
 //!
 //!    The tick drives only the arms with no OTHER periodic owner — handoff
 //!    and respawn. The remote-attach and remote-create arms that share this
@@ -88,10 +106,25 @@
 //!    (the classifier restores terminal+cwd with a fresh conversation —
 //!    exactly the existing phantom-shell branch, no new restore path).
 //!    Best-effort: any failure here never fails the handoff.
-//! 6. Close the source session (`DELETE /sessions/:id`) so it transitions
-//!    to `closed` (`closed_at = now()`); coord's delete handler releases
-//!    the source claim and publishes `closed`. The child's `started`
-//!    event carries `parent_session_id`, which is the durable
+//! 6. Close the source session through coord's device-authed handoff
+//!    completion door (`POST /sessions/:id/handoff/complete`, presenting the
+//!    SOURCE session's tenant slot) so it transitions to `closed`
+//!    (`closed_at = now()`) and coord runs its close side effects exactly
+//!    once. Coord authorizes it on the handoff request itself: the caller
+//!    must be the request's target device AND already hold the materialized
+//!    child (`parent_session_id = :id`) — so a close sent before the child's
+//!    row has registered is refused as `handoff_child_not_materialized`. That
+//!    refusal, a 5xx, a transport error and any answer outside the contract
+//!    are retried from [`MaterializedSources`] on the catch-up passes with
+//!    per-source backoff (module doc, point 3), not by waiting for coord to
+//!    list the source again. A `not_handoff_target` refusal is settled, but a
+//!    FRESH `handoff_request` push frame for the same source addressed to
+//!    this device (a re-handoff back here) revives it and the close is sent
+//!    again; a `session_not_found` refusal and a successful close stay
+//!    settled. (`DELETE /sessions/:id`, which this step
+//!    used to send, is coord's operator-admin route and 401s a device; plan
+//!    `2026-10-10-remote-create-residuals-followups` Phase 4.) The child's
+//!    `started` event carries `parent_session_id`, which is the durable
 //!    `handoff_to` link (parent → child by `parent_session_id` index).
 //!
 //! ## This loop also carries the RESPAWN arm
@@ -106,8 +139,8 @@
 //! [`parse_handoff_push`] requires `.handoff_request`,
 //! [`super::respawn::parse_respawn_push`] requires `.respawn_request` — so
 //! neither swallows the other's frames and nothing is materialized twice.
-//! A respawn deliberately does NOT run step 6 below: its source is already
-//! closed, which is the premise of the feature.
+//! A respawn deliberately does NOT run step 6 of the receiver flow above:
+//! its source is already closed, which is the premise of the feature.
 //!
 //! Step 3 happening before step 6 is deliberate: the source is only torn
 //! down once the child exists, so a failed materialization leaves the
@@ -116,7 +149,7 @@
 //! materialized child on this device, so a push + catch-up double-delivery
 //! never materializes twice.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -124,6 +157,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::intent::Intent;
@@ -146,6 +180,39 @@ const RECONNECT_BACKOFF_CEIL: Duration = Duration::from_secs(60);
 /// Same interval class as `agent_runtime`'s poll backstop. Against a coord
 /// predating `?subscribe=` this is the lane's whole delivery cadence.
 const CATCHUP_TICK: Duration = Duration::from_secs(60);
+/// Ceiling of a failing source close's retry backoff (module doc, point 3).
+/// The backoff doubles from one [`CATCHUP_TICK`] per failure; ten minutes
+/// keeps a close stuck behind a coord outage at six requests an hour instead
+/// of sixty, while a child row that registered late is still picked up within
+/// a tick or two of its first refusal (the early steps are 1 and 2 ticks).
+const CLOSE_RETRY_CEIL: Duration = Duration::from_secs(10 * 60);
+/// How long a source close keeps being retried after its FIRST failure before
+/// this process abandons it (logged once at warn). A day comfortably covers a
+/// coord outage, a late child registration, or a credential gap a re-pairing
+/// fixes; a close still failing after that is failing for a reason a retry
+/// will not change, and coord's staleness reaper is the backstop for the
+/// source. At the ceiling that is ~150 requests per stuck source in total,
+/// and a fresh handoff request for the source revives it.
+const CLOSE_RETRY_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+/// Slack when deciding whether a scheduled close retry is due. The retry is
+/// scheduled from the moment its attempt STARTED, and the passes that drive it
+/// run on [`CATCHUP_TICK`] — a few seconds of jitter between ticks must not
+/// push a one-tick backoff out to two.
+const CLOSE_RETRY_DUE_SLACK: Duration = Duration::from_secs(5);
+/// Per-request timeout of one source close (`POST …/handoff/complete`),
+/// tighter than the shared client's. Every close — the first one and each
+/// retry — runs inline on the socket pump's task, so against a coord that
+/// accepts the connection and never answers, a pass with N due retries would
+/// otherwise hold the pump (push frames, pings, the drain arm) for N times the
+/// client's 30 s. The close is a tiny idempotent POST; ten seconds is ample
+/// for a healthy coord, and a timeout is just another retryable answer.
+const CLOSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most close retries one [`retry_due_closes`] pass sends. With
+/// [`CLOSE_REQUEST_TIMEOUT`] this bounds one pass's stall on an unresponsive
+/// coord at ~80 s, whatever the backlog. Any further due closes are left
+/// pending and due, so the next pass (one [`CATCHUP_TICK`] later) sends them;
+/// the most overdue go first, so none is starved.
+const CLOSE_RETRY_PASS_CAP: usize = 8;
 
 /// The periodic catch-up ticker (module doc, point 3): fires immediately
 /// once (the caller consumes that tick, since the on-connect catch-up just
@@ -164,18 +231,117 @@ pub(super) enum Sighting {
     /// First sighting this run: start the child, then close the source.
     Materialize,
     /// A child for this source was already started by THIS process: do not
-    /// start another; only retry the `close_source` that must have failed.
-    CloseOnly,
+    /// start another; only retry the `close_source` that must have failed,
+    /// presenting the SOURCE's tenant scope captured when the child started.
+    CloseOnly(TenantScope),
+    /// This process already settled the source's close — coord closed it,
+    /// refused it ([`SourceClose::Refused`]), or the retries were abandoned
+    /// after [`CLOSE_RETRY_LIFETIME`]. Nothing to send on a sighting: only a
+    /// fresh handoff request can reopen a `not_handoff_target` refusal or an
+    /// abandoned close (`revive_on_fresh_request`).
+    Settled,
 }
 
-/// Source sessions this process has already started a child for.
+/// Where one materialized source's close stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloseState {
+    /// Not settled: the close is (re-)sent once `next_at` comes due.
+    Pending {
+        /// Failed attempts so far (0 until the first close is answered).
+        failures: u32,
+        /// When the next attempt is due.
+        next_at: Instant,
+        /// When the FIRST failure happened — the start of the lifetime bound.
+        first_failure_at: Option<Instant>,
+    },
+    /// Coord closed the source (200). Settled for good: nothing revives it.
+    Closed,
+    /// Coord refused the close for good ([`SourceClose::Refused`]).
+    /// `revivable` is `true` for `403 not_handoff_target`, which a later
+    /// re-handoff of the same source BACK to this device makes stale; `false`
+    /// for `404 session_not_found`, which nothing changes.
+    Refused { revivable: bool },
+    /// Retried for [`CLOSE_RETRY_LIFETIME`] without a terminal answer; left to
+    /// coord's staleness reaper. A fresh handoff request revives it.
+    Abandoned,
+}
+
+impl CloseState {
+    fn pending_now(now: Instant) -> Self {
+        CloseState::Pending {
+            failures: 0,
+            next_at: now,
+            first_failure_at: None,
+        }
+    }
+
+    fn settled(self) -> bool {
+        !matches!(self, CloseState::Pending { .. })
+    }
+}
+
+/// What this process knows about one source it started a child for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MaterializedSource {
+    /// The SOURCE session's tenant scope, taken from the child intent exactly
+    /// as [`reacquire_claim`] takes it, so a close retry presents the same
+    /// credential the first close did.
+    tenant: TenantScope,
+    /// The close's progress, and the retry schedule while it is pending.
+    close: CloseState,
+}
+
+/// How [`MaterializedSources::record`] filed one close outcome — the input to
+/// [`settle_close`]'s log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Recorded {
+    /// The source was never marked here; nothing was recorded.
+    Untracked,
+    /// Settled: closed.
+    Closed,
+    /// Settled: refused. `revivable` mirrors [`CloseState::Refused`]: `true`
+    /// for `not_handoff_target` (a fresh handoff request back here revives
+    /// it), `false` for `session_not_found` (terminal).
+    Refused { revivable: bool },
+    /// A retryable answer to a close whose entry had ALREADY settled (a racing
+    /// or late attempt). Ignored: a settled entry is never reopened by a
+    /// retryable answer — only a fresh handoff request revives one.
+    AlreadySettled,
+    /// A retryable failure, rescheduled `retry_in` from the attempt.
+    /// `first` is `true` for the source's first failure (the one logged at
+    /// warn; repeats log at debug).
+    Retry {
+        failures: u32,
+        retry_in: Duration,
+        first: bool,
+    },
+    /// A retryable failure past [`CLOSE_RETRY_LIFETIME`]: abandoned.
+    Abandoned { failures: u32 },
+}
+
+/// The backoff after `failures` consecutive failed closes (`failures >= 1`):
+/// one [`CATCHUP_TICK`], doubling per failure, capped at [`CLOSE_RETRY_CEIL`].
+pub(super) fn close_retry_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    CATCHUP_TICK
+        .saturating_mul(1u32 << doublings)
+        .min(CLOSE_RETRY_CEIL)
+}
+
+/// Source sessions this process has already started a child for, and how
+/// each one's close stands.
 ///
 /// The only "ack" of a handoff is `close_source`, which runs AFTER the child
 /// is started (`materialize`). A close that keeps failing — 403 in a
 /// credential gap, coord 5xx — leaves the handoff in coord's pending list, and
 /// with the [`CATCHUP_TICK`] every tick would otherwise start ANOTHER child
 /// terminal for the same source: an unbounded duplicate-spawn loop, one per
-/// minute. This set turns a repeat sighting into a close-only retry.
+/// minute. This set turns a repeat sighting into a close-only retry, and a
+/// sighting after a terminal answer into nothing at all.
+///
+/// It is also what DRIVES the close retries ([`retry_due_closes`]): a source
+/// coord has stopped listing — its child row registered after the first
+/// close was refused — is still re-sent from here, on a per-source backoff.
 ///
 /// Per-process on purpose: it is the process that started the child, so it is
 /// the process that knows. A restart forgets it, and the next sighting after
@@ -183,30 +349,163 @@ pub(super) enum Sighting {
 /// one per tick. Marked at the moment the child is STARTED, not when the
 /// close succeeds, because the child is what must not be duplicated.
 #[derive(Default)]
-pub(super) struct MaterializedSources(Mutex<HashSet<Uuid>>);
+pub(super) struct MaterializedSources(Mutex<HashMap<Uuid, MaterializedSource>>);
 
 impl MaterializedSources {
-    /// The pure decision for one sighting of `source`.
-    pub(super) fn sighting(&self, source: Uuid) -> Sighting {
-        sighting_for(&self.0.lock().unwrap_or_else(|p| p.into_inner()), source)
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, MaterializedSource>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Record that a child for `source` has been started. Returns `true` when
-    /// this is the first record (the set changed).
-    pub(super) fn mark(&self, source: Uuid) -> bool {
-        self.0
+    /// The pure decision for one sighting of `source`.
+    pub(super) fn sighting(&self, source: Uuid) -> Sighting {
+        sighting_for(&self.lock(), source)
+    }
+
+    /// Record that a child for `source` has been started under `tenant` (the
+    /// SOURCE session's scope). Returns `true` when this is the first record
+    /// (the set changed); a repeat keeps the original record untouched.
+    pub(super) fn mark(&self, source: Uuid, tenant: TenantScope) -> bool {
+        let mut seen = self.lock();
+        if seen.contains_key(&source) {
+            return false;
+        }
+        seen.insert(
+            source,
+            MaterializedSource {
+                tenant,
+                close: CloseState::pending_now(Instant::now()),
+            },
+        );
+        true
+    }
+
+    /// A FRESH `handoff_request` push frame for `source` addressed to this
+    /// device: coord has just recorded a new handoff of it to here. That makes
+    /// a `not_handoff_target` refusal (an earlier request had moved it
+    /// elsewhere) or an abandoned retry stale, so either is revived and the
+    /// close becomes due now; a pending close's backoff is reset for the same
+    /// reason. A closed source, and one coord said does not exist, stay
+    /// settled. Returns `true` when the state changed.
+    pub(super) fn revive_on_fresh_request(&self, source: Uuid, now: Instant) -> bool {
+        let mut seen = self.lock();
+        let Some(entry) = seen.get_mut(&source) else {
+            return false;
+        };
+        match entry.close {
+            CloseState::Closed | CloseState::Refused { revivable: false } => false,
+            CloseState::Refused { revivable: true }
+            | CloseState::Abandoned
+            | CloseState::Pending { .. } => {
+                entry.close = CloseState::pending_now(now);
+                true
+            }
+        }
+    }
+
+    /// The tenant scope to close `source` under, when its close is pending
+    /// and due at `now`; `None` when it is settled, backing off, or unknown.
+    pub(super) fn due(&self, source: Uuid, now: Instant) -> Option<TenantScope> {
+        self.lock()
+            .get(&source)
+            .and_then(|entry| close_due(entry, now).then_some(entry.tenant))
+    }
+
+    /// Every pending close that is due at `now`, with its tenant scope —
+    /// independent of whether coord still lists the source as pending.
+    /// Ordered most overdue first, so a pass that sends only a capped prefix
+    /// ([`CLOSE_RETRY_PASS_CAP`]) never starves the rest.
+    pub(super) fn due_closes(&self, now: Instant) -> Vec<(Uuid, TenantScope)> {
+        let mut due: Vec<(Instant, Uuid, TenantScope)> = self
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(source)
+            .iter()
+            .filter_map(|(source, entry)| match entry.close {
+                CloseState::Pending { next_at, .. } if close_due(entry, now) => {
+                    Some((next_at, *source, entry.tenant))
+                }
+                _ => None,
+            })
+            .collect();
+        due.sort_by_key(|(next_at, source, _)| (*next_at, *source));
+        due.into_iter()
+            .map(|(_, source, tenant)| (source, tenant))
+            .collect()
+    }
+
+    /// File one close outcome for `source`, attempted at `attempted_at`. A
+    /// source this process never marked is left unrecorded: it has no child
+    /// here, and settling it would suppress a materialization this process
+    /// has not done.
+    pub(super) fn record(
+        &self,
+        source: Uuid,
+        close: &SourceClose,
+        attempted_at: Instant,
+    ) -> Recorded {
+        let mut seen = self.lock();
+        let Some(entry) = seen.get_mut(&source) else {
+            return Recorded::Untracked;
+        };
+        match close {
+            SourceClose::Closed { .. } => {
+                entry.close = CloseState::Closed;
+                Recorded::Closed
+            }
+            SourceClose::Refused { status, error } => {
+                let revivable = (*status, error.as_str()) == (403, "not_handoff_target");
+                entry.close = CloseState::Refused { revivable };
+                Recorded::Refused { revivable }
+            }
+            SourceClose::Retry(_) => {
+                let (failures, first_failure_at) = match entry.close {
+                    CloseState::Pending {
+                        failures,
+                        first_failure_at,
+                        ..
+                    } => (failures + 1, first_failure_at.unwrap_or(attempted_at)),
+                    // A retryable answer arriving after the entry settled (a
+                    // racing or late attempt) must not reopen it: a Closed
+                    // source is done, a Refused or Abandoned one is reopened
+                    // only by a fresh handoff request.
+                    CloseState::Closed | CloseState::Refused { .. } | CloseState::Abandoned => {
+                        return Recorded::AlreadySettled;
+                    }
+                };
+                if attempted_at.saturating_duration_since(first_failure_at) >= CLOSE_RETRY_LIFETIME
+                {
+                    entry.close = CloseState::Abandoned;
+                    return Recorded::Abandoned { failures };
+                }
+                let retry_in = close_retry_backoff(failures);
+                entry.close = CloseState::Pending {
+                    failures,
+                    next_at: attempted_at + retry_in,
+                    first_failure_at: Some(first_failure_at),
+                };
+                Recorded::Retry {
+                    failures,
+                    retry_in,
+                    first: failures == 1,
+                }
+            }
+        }
     }
 }
 
-/// [`Sighting`] for `source` against the set of sources already materialized.
-pub(super) fn sighting_for(seen: &HashSet<Uuid>, source: Uuid) -> Sighting {
-    if seen.contains(&source) {
-        Sighting::CloseOnly
-    } else {
-        Sighting::Materialize
+/// Whether `entry`'s close is pending and due at `now` (within
+/// [`CLOSE_RETRY_DUE_SLACK`]).
+fn close_due(entry: &MaterializedSource, now: Instant) -> bool {
+    match entry.close {
+        CloseState::Pending { next_at, .. } => now + CLOSE_RETRY_DUE_SLACK >= next_at,
+        _ => false,
+    }
+}
+
+/// [`Sighting`] for `source` against the sources already materialized.
+pub(super) fn sighting_for(seen: &HashMap<Uuid, MaterializedSource>, source: Uuid) -> Sighting {
+    match seen.get(&source) {
+        None => Sighting::Materialize,
+        Some(entry) if entry.close.settled() => Sighting::Settled,
+        Some(entry) => Sighting::CloseOnly(entry.tenant),
     }
 }
 
@@ -747,6 +1046,68 @@ async fn run_catchup(
             tracing::debug!(error = %e, "session handoff: catch-up GET failed (push path still active)");
         }
     }
+    // Whatever the GET answered — including a failure — re-send every close
+    // that is due. Coord stops listing a source once this device's child row
+    // exists, so the pending list above cannot be what drives these retries.
+    retry_due_closes(http, coord_url, sources).await;
+}
+
+/// Re-send the close of every materialized source whose close is pending and
+/// due (module doc, point 3), each under the tenant scope recorded when its
+/// child started, and file each outcome. Driven by [`MaterializedSources`],
+/// never by coord's pending list.
+///
+/// Sends at most [`CLOSE_RETRY_PASS_CAP`] closes, most overdue first: this
+/// runs inline on the socket pump, so a large backlog against an unresponsive
+/// coord must not hold the pump for the whole backlog. The rest stay pending
+/// and due, and the next pass picks them up.
+async fn retry_due_closes(http: &reqwest::Client, coord_url: &str, sources: &MaterializedSources) {
+    let due = sources.due_closes(Instant::now());
+    if due.len() > CLOSE_RETRY_PASS_CAP {
+        tracing::debug!(
+            due = due.len(),
+            cap = CLOSE_RETRY_PASS_CAP,
+            "session handoff: more source closes due than one pass sends; the rest wait for the next pass"
+        );
+    }
+    for (source, tenant) in due.into_iter().take(CLOSE_RETRY_PASS_CAP) {
+        retry_close(http, coord_url, sources, source, tenant).await;
+    }
+}
+
+/// One close-only retry of `source`, filed against the moment it started.
+async fn retry_close(
+    http: &reqwest::Client,
+    coord_url: &str,
+    sources: &MaterializedSources,
+    source: Uuid,
+    tenant: TenantScope,
+) {
+    let attempt = attempt_close(http, coord_url, source, tenant).await;
+    settle_close(sources, source, attempt.close, true, attempt.started_at);
+}
+
+/// One close of a source, with the instant its request STARTED — what the
+/// retry schedule is measured from ([`MaterializedSources::record`]).
+#[derive(Debug)]
+pub(super) struct CloseAttempt {
+    /// Taken immediately before the request, so nothing that ran before it
+    /// (in `materialize`: the drain gate, the state fetch, the claim
+    /// re-acquires, the scrollback replay) is counted against the backoff.
+    started_at: Instant,
+    close: SourceClose,
+}
+
+/// [`close_source`], timed from the start of its request.
+async fn attempt_close(
+    http: &reqwest::Client,
+    coord_url: &str,
+    source_session_id: Uuid,
+    tenant: TenantScope,
+) -> CloseAttempt {
+    let started_at = Instant::now();
+    let close = close_source(http, coord_url, source_session_id, tenant).await;
+    CloseAttempt { started_at, close }
 }
 
 /// Parse one inbound coord `/ws` envelope. Coord wraps each pub/sub
@@ -789,6 +1150,17 @@ async fn handle_push_frame(
         source = %handoff.source_session_id,
         "session handoff: push received; materializing"
     );
+    // A push frame is a FRESH handoff request for this source addressed to
+    // this device — unlike a catch-up sighting, which can repeat an old one.
+    // It revives a `not_handoff_target` refusal (or an abandoned retry) that a
+    // re-handoff back here has made stale, and makes a backing-off close due.
+    if sources.revive_on_fresh_request(handoff.source_session_id, Instant::now()) {
+        tracing::info!(
+            source = %handoff.source_session_id,
+            "session handoff: fresh handoff request for a source this process already \
+             materialized; its close is due again"
+        );
+    }
     materialize_logged(
         registry,
         lifecycle_store,
@@ -869,7 +1241,8 @@ pub(super) fn parse_handoff_push(text: &str, device_id: Uuid) -> Option<PendingH
 /// A source this process has ALREADY started a child for (`sources`) is not
 /// materialized again: the repeat sighting means the earlier `close_source`
 /// failed and the handoff is still pending, so only the close is retried —
-/// never a second child (module doc, point 3).
+/// never a second child (module doc, point 3). A source whose close already
+/// reached a terminal answer is not touched at all.
 async fn materialize_logged(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
@@ -878,35 +1251,129 @@ async fn materialize_logged(
     sources: &MaterializedSources,
     handoff: &PendingHandoff,
 ) {
-    match sources.sighting(handoff.source_session_id) {
+    let source = handoff.source_session_id;
+    match sources.sighting(source) {
         Sighting::Materialize => {
-            if let Err(e) =
-                materialize(registry, lifecycle_store, http, coord_url, sources, handoff).await
-            {
-                tracing::warn!(
-                    source = %handoff.source_session_id,
+            match materialize(registry, lifecycle_store, http, coord_url, sources, handoff).await {
+                // Scheduled from the close's OWN start, not from the start of
+                // `materialize`: everything before the close (drain gate, state
+                // fetch, claim re-acquires, scrollback) can take seconds, and
+                // counting it would make a retryable first close due again in
+                // this very pass's `retry_due_closes`.
+                Ok(attempt) => {
+                    settle_close(sources, source, attempt.close, false, attempt.started_at)
+                }
+                Err(e) => tracing::warn!(
+                    source = %source,
                     error = %e,
                     "session handoff: materialize failed; source left intact, will retry on next push/catch-up"
+                ),
+            }
+        }
+        Sighting::CloseOnly(_) => match sources.due(source, Instant::now()) {
+            Some(tenant) => {
+                tracing::info!(
+                    source = %source,
+                    "session handoff: source already materialized by this process; retrying close only (no second child)"
                 );
+                retry_close(http, coord_url, sources, source, tenant).await;
             }
+            None => tracing::debug!(
+                source = %source,
+                "session handoff: source already materialized by this process; its close is backing off"
+            ),
+        },
+        Sighting::Settled => tracing::debug!(
+            source = %source,
+            "session handoff: source's close already settled by this process; nothing to send"
+        ),
+    }
+}
+
+/// Record one close outcome in `sources` and log it.
+///
+/// A terminal answer — closed, or refused for good — settles the source so
+/// the next sighting and the next retry pass send nothing; a refusal is logged
+/// ONCE at warn. A retryable answer is rescheduled on the source's backoff:
+/// its first failure logs at warn, repeats at debug (each one names the next
+/// delay), and abandoning it after [`CLOSE_RETRY_LIFETIME`] logs once at warn.
+fn settle_close(
+    sources: &MaterializedSources,
+    source: Uuid,
+    close: SourceClose,
+    deferred: bool,
+    attempted_at: Instant,
+) {
+    let attempt = if deferred { "deferred close" } else { "close" };
+    match (sources.record(source, &close, attempted_at), &close) {
+        (_, SourceClose::Closed { already_closed }) => tracing::info!(
+            source = %source,
+            already_closed,
+            "session handoff: {attempt} of the source succeeded"
+        ),
+        (Recorded::Refused { revivable: true }, SourceClose::Refused { status, error }) => {
+            tracing::warn!(
+                source = %source,
+                status,
+                error = %error,
+                "session handoff: coord refused the {attempt} of the source (this device is no \
+                 longer its handoff target); not retrying unless a fresh handoff request \
+                 re-targets it here (coord's staleness reaper remains the backstop)"
+            )
         }
-        Sighting::CloseOnly => {
-            tracing::info!(
-                source = %handoff.source_session_id,
-                "session handoff: source already materialized by this process; retrying close only (no second child)"
-            );
-            match close_source(http, coord_url, handoff.source_session_id).await {
-                Ok(()) => tracing::info!(
-                    source = %handoff.source_session_id,
-                    "session handoff: deferred close of the source succeeded"
-                ),
-                Err(e) => tracing::warn!(
-                    source = %handoff.source_session_id,
-                    error = %e,
-                    "session handoff: deferred close of the source failed again; will retry on next tick"
-                ),
-            }
-        }
+        (_, SourceClose::Refused { status, error }) => tracing::warn!(
+            source = %source,
+            status,
+            error = %error,
+            "session handoff: coord refused the {attempt} of the source for good; not retrying \
+             (coord's staleness reaper remains the backstop)"
+        ),
+        (
+            Recorded::Retry {
+                failures,
+                retry_in,
+                first: true,
+            },
+            SourceClose::Retry(e),
+        ) => tracing::warn!(
+            source = %source,
+            error = %e,
+            failures,
+            retry_in_secs = retry_in.as_secs(),
+            "session handoff: {attempt} of the source failed; retrying with backoff"
+        ),
+        (
+            Recorded::Retry {
+                failures, retry_in, ..
+            },
+            SourceClose::Retry(e),
+        ) => tracing::debug!(
+            source = %source,
+            error = %e,
+            failures,
+            retry_in_secs = retry_in.as_secs(),
+            "session handoff: {attempt} of the source failed again; still backing off"
+        ),
+        (Recorded::AlreadySettled, SourceClose::Retry(e)) => tracing::debug!(
+            source = %source,
+            error = %e,
+            "session handoff: late retryable answer to the {attempt} of a source whose close \
+             already settled; ignored"
+        ),
+        (Recorded::Abandoned { failures }, SourceClose::Retry(e)) => tracing::warn!(
+            source = %source,
+            error = %e,
+            failures,
+            "session handoff: giving up on closing the source after {} hours of retries \
+             (coord's staleness reaper remains the backstop)",
+            CLOSE_RETRY_LIFETIME.as_secs() / 3600
+        ),
+        (_, SourceClose::Retry(e)) => tracing::warn!(
+            source = %source,
+            error = %e,
+            "session handoff: {attempt} of the source failed for a source this process never \
+             materialized; not scheduling a retry"
+        ),
     }
 }
 
@@ -973,6 +1440,11 @@ pub(super) async fn fetch_state(
 /// Materialize one handoff: build the child intent, start the child
 /// session with `parent_session_id`, re-acquire claims, replay
 /// scrollback, then close the source. Plan §Phase 7.
+///
+/// `Err` is a failure BEFORE the child started (the source is left intact and
+/// the next sighting materializes again); once the child exists the result is
+/// `Ok` carrying the close outcome and the instant the close request started,
+/// which the caller records.
 async fn materialize(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
@@ -980,7 +1452,7 @@ async fn materialize(
     coord_url: &str,
     sources: &MaterializedSources,
     handoff: &PendingHandoff,
-) -> Result<(), HandoffError> {
+) -> Result<CloseAttempt, HandoffError> {
     // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D3): materializing a handoff starts a session on this device on coord's
     // say-so, so it is a coord dispatch and is deferred while the drain holds.
@@ -1011,7 +1483,7 @@ async fn materialize(
     let child_id = child.id();
     // Marked the moment the child EXISTS — before the close below, whose
     // failure is exactly what makes this source get sighted again.
-    sources.mark(handoff.source_session_id);
+    sources.mark(handoff.source_session_id, tenant);
 
     tracing::info!(
         source = %handoff.source_session_id,
@@ -1053,16 +1525,17 @@ async fn materialize(
         }
     }
 
-    // Tear down the source FIRST — one-way move. coord's DELETE sets
-    // state='closed', closed_at=now(), and releases the source claim. This
+    // Tear down the source FIRST — one-way move. coord's handoff-completion
+    // door sets state='closed', closed_at=now(), and runs the close side
+    // effects (claim release, `closed` publish) exactly once. This
     // deliberately runs before the restore-registry materialization below
     // (F6): the materialization's bounded SSE read pays an idle wait (up to
     // RESTORE_RECORD_FETCH_DEADLINE) even when the source mirrored nothing,
     // and the load-bearing teardown must not queue behind it. Ordering is
-    // safe: coord's DELETE is a soft close (the row and its
+    // safe: coord's close is a soft close (the row and its
     // coord.session_events rows survive), so the events replay still serves
     // the mirror afterwards.
-    let close_result = close_source(http, coord_url, handoff.source_session_id).await;
+    let close_attempt = attempt_close(http, coord_url, handoff.source_session_id, tenant).await;
 
     // Phase 4 (session-history cloud sync §3.4) — materialize a local
     // restore-registry record from the source's newest mirrored
@@ -1082,7 +1555,7 @@ async fn materialize(
     )
     .await;
 
-    close_result
+    Ok(close_attempt)
 }
 
 // ---------------------------------------------------------------------------
@@ -1509,31 +1982,101 @@ pub(super) async fn reacquire_claim(
     Ok(())
 }
 
-/// Close the source session via `DELETE /sessions/:id`.
+/// Coord's answer to a handoff-completion request, classified for the retry
+/// machinery in [`settle_close`].
+#[derive(Debug)]
+pub(super) enum SourceClose {
+    /// `200 {"closed": true, "already_closed": bool}` — done either way:
+    /// `already_closed` only says whether THIS request was the one that closed
+    /// it.
+    Closed { already_closed: bool },
+    /// Coord refused the close for a reason a retry from this device cannot
+    /// change (`404 session_not_found`, `403 not_handoff_target`). Not retried
+    /// on the catch-up cadence. `session_not_found` is terminal; a
+    /// `not_handoff_target` refusal is re-sent only when a fresh handoff
+    /// request re-targets this device (`revive_on_fresh_request`).
+    Refused { status: u16, error: String },
+    /// Worth sending again on the catch-up cadence: a transport error, a 5xx,
+    /// `403 handoff_child_not_materialized` (the child's row may simply not
+    /// have registered with coord yet), or any answer outside the contract —
+    /// a 401 in a credential gap, or a 404 from a coord predating the door.
+    Retry(HandoffError),
+}
+
+/// Classify a handoff-completion response by status and body.
+///
+/// Only the two refusals coord names as terminal are terminal; an error code
+/// is read from the body's `error` field so a bare 404 (a coord without the
+/// route yet) stays retryable rather than abandoning the source for good.
+pub(super) fn classify_close_response(status: u16, body: &str) -> SourceClose {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    if (200..300).contains(&status) {
+        let closed = parsed
+            .as_ref()
+            .and_then(|v| v.get("closed"))
+            .and_then(|v| v.as_bool());
+        return match closed {
+            Some(true) => SourceClose::Closed {
+                already_closed: parsed
+                    .as_ref()
+                    .and_then(|v| v.get("already_closed"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            },
+            _ => SourceClose::Retry(HandoffError::Parse(format!(
+                "handoff completion answered {status} without `closed: true`: {}",
+                body.chars().take(200).collect::<String>()
+            ))),
+        };
+    }
+    let error = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match (status, error.as_str()) {
+        (404, "session_not_found") | (403, "not_handoff_target") => {
+            SourceClose::Refused { status, error }
+        }
+        _ => SourceClose::Retry(HandoffError::Status(
+            status,
+            body.chars().take(200).collect(),
+        )),
+    }
+}
+
+/// Close the source session through coord's handoff-completion door,
+/// `POST /sessions/:id/handoff/complete` with an empty JSON body.
+///
+/// `tenant` is the SOURCE session's scope, taken from the child intent exactly
+/// as [`reacquire_claim`] takes it: coord authorizes the close against the
+/// source's tenant, so this presents THAT binding's device-JWT slot, never the
+/// device's default.
+///
+/// Bounded by its own [`CLOSE_REQUEST_TIMEOUT`] rather than the shared
+/// client's: it runs inline on the socket pump. A timeout is a transport error,
+/// so it classifies as [`SourceClose::Retry`].
 async fn close_source(
     http: &reqwest::Client,
     coord_url: &str,
     source_session_id: Uuid,
-) -> Result<(), HandoffError> {
+    tenant: TenantScope,
+) -> SourceClose {
     let url = format!(
-        "{}/sessions/{}",
+        "{}/sessions/{}/handoff/complete",
         coord_url.trim_end_matches('/'),
         source_session_id
     );
-    // coord-tenant-scope(escalated): source_session_id is the fn's parameter, so a tenant IS resolvable here -- but census E2 found DELETE /sessions/{id} mounted on coord's admin-gated operator_admin_writes router, which needs the coord `admin` role from a forwarded Cognito operator bearer and whose own comment asserts "the runner does NOT call these". No device-JWT slot satisfies that, so the open question is whether the mount or this call is wrong, not which credential to present. Census E2.
-    let resp = crate::auth::attach_device_auth(http.delete(&url))
-        .send()
-        .await
-        .map_err(|e| HandoffError::Http(format!("DELETE {url}: {e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(HandoffError::Status(
-            status.as_u16(),
-            text.chars().take(200).collect(),
-        ));
-    }
-    Ok(())
+    let request = crate::auth::attach_device_auth_for(http.post(&url).json(&json!({})), tenant)
+        .timeout(CLOSE_REQUEST_TIMEOUT);
+    let resp = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => return SourceClose::Retry(HandoffError::Http(format!("POST {url}: {e}"))),
+    };
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    classify_close_response(status, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,17 +2098,19 @@ mod tests {
         let sources = MaterializedSources::default();
         let src = Uuid::new_v4();
         let other = Uuid::new_v4();
+        let tenant = TenantScope::Owned(Uuid::new_v4());
 
         assert_eq!(sources.sighting(src), Sighting::Materialize);
         // The child is started: mark. First record changes the set.
-        assert!(sources.mark(src));
+        assert!(sources.mark(src, tenant));
         // Every later sighting of the SAME source (the next tick, the next
-        // reconnect's catch-up, a replayed push frame) is close-only.
-        assert_eq!(sources.sighting(src), Sighting::CloseOnly);
-        assert_eq!(sources.sighting(src), Sighting::CloseOnly);
-        // Re-marking is idempotent and does not flip the decision.
-        assert!(!sources.mark(src));
-        assert_eq!(sources.sighting(src), Sighting::CloseOnly);
+        // reconnect's catch-up, a replayed push frame) is close-only, under
+        // the SOURCE's tenant captured at materialization.
+        assert_eq!(sources.sighting(src), Sighting::CloseOnly(tenant));
+        assert_eq!(sources.sighting(src), Sighting::CloseOnly(tenant));
+        // Re-marking is idempotent and does not flip the decision or the scope.
+        assert!(!sources.mark(src, TenantScope::Device));
+        assert_eq!(sources.sighting(src), Sighting::CloseOnly(tenant));
         // A different source is unaffected.
         assert_eq!(sources.sighting(other), Sighting::Materialize);
     }
@@ -1573,11 +2118,833 @@ mod tests {
     #[test]
     fn handoff_dedupe_pure_decision_is_membership() {
         let src = Uuid::new_v4();
-        let mut seen = HashSet::new();
+        let tenant = TenantScope::Owned(Uuid::new_v4());
+        let mut seen = HashMap::new();
         assert_eq!(sighting_for(&seen, src), Sighting::Materialize);
-        seen.insert(src);
-        assert_eq!(sighting_for(&seen, src), Sighting::CloseOnly);
+        seen.insert(
+            src,
+            MaterializedSource {
+                tenant,
+                close: CloseState::pending_now(Instant::now()),
+            },
+        );
+        assert_eq!(sighting_for(&seen, src), Sighting::CloseOnly(tenant));
         assert_eq!(sighting_for(&seen, Uuid::new_v4()), Sighting::Materialize);
+        for settled in [
+            CloseState::Closed,
+            CloseState::Refused { revivable: true },
+            CloseState::Refused { revivable: false },
+            CloseState::Abandoned,
+        ] {
+            seen.get_mut(&src).unwrap().close = settled;
+            assert_eq!(sighting_for(&seen, src), Sighting::Settled, "{settled:?}");
+        }
+    }
+
+    /// A terminal close answer settles the source: the next sighting sends
+    /// nothing. A retryable one leaves it close-only. Settling a source this
+    /// process never materialized records nothing.
+    #[test]
+    fn settle_close_settles_only_terminal_answers() {
+        let sources = MaterializedSources::default();
+        let tenant = TenantScope::Owned(Uuid::new_v4());
+        let (closed, refused, retry) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for src in [closed, refused, retry] {
+            sources.mark(src, tenant);
+        }
+        let now = Instant::now();
+        settle_close(
+            &sources,
+            closed,
+            SourceClose::Closed {
+                already_closed: false,
+            },
+            false,
+            now,
+        );
+        settle_close(
+            &sources,
+            refused,
+            SourceClose::Refused {
+                status: 403,
+                error: "not_handoff_target".into(),
+            },
+            true,
+            now,
+        );
+        settle_close(
+            &sources,
+            retry,
+            SourceClose::Retry(HandoffError::Status(503, String::new())),
+            true,
+            now,
+        );
+        assert_eq!(sources.sighting(closed), Sighting::Settled);
+        assert_eq!(sources.sighting(refused), Sighting::Settled);
+        assert_eq!(sources.sighting(retry), Sighting::CloseOnly(tenant));
+
+        let never = Uuid::new_v4();
+        assert_eq!(
+            sources.record(
+                never,
+                &SourceClose::Closed {
+                    already_closed: false
+                },
+                now
+            ),
+            Recorded::Untracked
+        );
+        assert_eq!(sources.sighting(never), Sighting::Materialize);
+    }
+
+    // =======================================================================
+    // Phase 4 (plan `2026-10-10-remote-create-residuals-followups`): the source
+    // is closed through coord's handoff-completion door, never the
+    // operator-admin `DELETE /sessions/:id` that 401s a device.
+    // =======================================================================
+
+    #[test]
+    fn close_response_200_is_closed_either_way() {
+        assert!(matches!(
+            classify_close_response(200, r#"{"closed":true,"already_closed":false}"#),
+            SourceClose::Closed {
+                already_closed: false
+            }
+        ));
+        assert!(matches!(
+            classify_close_response(200, r#"{"closed":true,"already_closed":true}"#),
+            SourceClose::Closed {
+                already_closed: true
+            }
+        ));
+    }
+
+    #[test]
+    fn close_response_2xx_without_closed_true_is_retried() {
+        assert!(matches!(
+            classify_close_response(200, r#"{"closed":false}"#),
+            SourceClose::Retry(HandoffError::Parse(_))
+        ));
+        assert!(matches!(
+            classify_close_response(200, "not json"),
+            SourceClose::Retry(HandoffError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn close_response_named_refusals_are_terminal() {
+        match classify_close_response(404, r#"{"error":"session_not_found"}"#) {
+            SourceClose::Refused { status, error } => {
+                assert_eq!((status, error.as_str()), (404, "session_not_found"));
+            }
+            other => panic!("404 session_not_found must be terminal, got {other:?}"),
+        }
+        match classify_close_response(403, r#"{"error":"not_handoff_target"}"#) {
+            SourceClose::Refused { status, error } => {
+                assert_eq!((status, error.as_str()), (403, "not_handoff_target"));
+            }
+            other => panic!("403 not_handoff_target must be terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_response_child_not_materialized_is_retried() {
+        assert!(matches!(
+            classify_close_response(403, r#"{"error":"handoff_child_not_materialized"}"#),
+            SourceClose::Retry(HandoffError::Status(403, _))
+        ));
+    }
+
+    /// Everything outside the named refusals retries: a 5xx, a 401 in a
+    /// credential gap, and — load-bearing for rollout order — a bare 404 from a
+    /// coord that predates the door, which must not abandon the source.
+    #[test]
+    fn close_response_outside_the_contract_is_retried() {
+        for (status, body) in [
+            (500, r#"{"error":"internal"}"#),
+            (503, ""),
+            (401, r#"{"error":"unauthorized"}"#),
+            (404, ""),
+            (404, r#"{"error":"not_found"}"#),
+            (403, r#"{"error":"forbidden"}"#),
+        ] {
+            assert!(
+                matches!(
+                    classify_close_response(status, body),
+                    SourceClose::Retry(HandoffError::Status(s, _)) if s == status
+                ),
+                "{status} {body:?} must be retryable"
+            );
+        }
+    }
+
+    /// One request recorded by the fake coord below.
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        auth: Option<String>,
+        body: String,
+    }
+
+    /// A fake coord that records every request and answers each with
+    /// `(status, body)`.
+    async fn spawn_fake_coord(
+        status: u16,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        use axum::{body::Bytes, http::HeaderMap, http::Method, http::Uri};
+        let seen: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+        let rec = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, bytes: Bytes| {
+                let rec = rec.clone();
+                async move {
+                    rec.lock().unwrap().push(RecordedRequest {
+                        method: method.to_string(),
+                        path: uri.path().to_string(),
+                        auth: headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                        body: String::from_utf8_lossy(&bytes).into_owned(),
+                    });
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// An unexpired, unsigned device JWT claiming `tenant` — enough for the
+    /// slot reader, which checks `exp` and never verifies a signature.
+    fn device_jwt_for(tenant: &Uuid) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let exp = chrono::Utc::now().timestamp() + 3 * 60 * 60;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"tenant_id":"{tenant}","exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    /// `close_source` POSTs `{}` to `/sessions/:id/handoff/complete` with the
+    /// SOURCE tenant's credential — on a device whose DEFAULT binding is a
+    /// different tenant, so presenting the default slot would fail here — and
+    /// never sends `DELETE /sessions/:id`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_source_posts_handoff_complete_with_the_source_tenant_slot() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let (default_tenant, source_tenant) = (Uuid::now_v7(), Uuid::now_v7());
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({
+                "default_tenant_id": default_tenant,
+                "bindings": [{ "tenant_id": default_tenant }, { "tenant_id": source_tenant }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let am = crate::auth::AuthManager::new();
+        let default_jwt = device_jwt_for(&default_tenant);
+        let source_jwt = device_jwt_for(&source_tenant);
+        am.store_tenant_device_jwt(&default_tenant, &default_jwt)
+            .expect("the default tenant's slot");
+        am.store_tenant_device_jwt(&source_tenant, &source_jwt)
+            .expect("the source tenant's slot");
+
+        let (base, seen) = spawn_fake_coord(200, r#"{"closed":true,"already_closed":false}"#).await;
+        let source = Uuid::new_v4();
+        let outcome = close_source(
+            &reqwest::Client::new(),
+            &base,
+            source,
+            TenantScope::Owned(source_tenant),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                SourceClose::Closed {
+                    already_closed: false
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one request: {seen:?}");
+        let req = &seen[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, format!("/sessions/{source}/handoff/complete"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&req.body).unwrap(),
+            json!({}),
+            "an empty JSON body"
+        );
+        assert_eq!(
+            req.auth,
+            Some(format!("Bearer {source_jwt}")),
+            "the SOURCE tenant's slot, not the default binding's"
+        );
+        assert!(
+            seen.iter().all(|r| r.method != "DELETE"),
+            "the operator-admin DELETE /sessions/:id is never sent"
+        );
+    }
+
+    /// The close outcome is classified off the wire, not just off a 2xx: a
+    /// terminal refusal and a retryable one both come back as such.
+    #[tokio::test]
+    async fn close_source_classifies_coords_refusals() {
+        let (base, _) = spawn_fake_coord(403, r#"{"error":"not_handoff_target"}"#).await;
+        assert!(matches!(
+            close_source(
+                &reqwest::Client::new(),
+                &base,
+                Uuid::new_v4(),
+                TenantScope::Device
+            )
+            .await,
+            SourceClose::Refused { status: 403, .. }
+        ));
+        let (base, _) =
+            spawn_fake_coord(403, r#"{"error":"handoff_child_not_materialized"}"#).await;
+        assert!(matches!(
+            close_source(
+                &reqwest::Client::new(),
+                &base,
+                Uuid::new_v4(),
+                TenantScope::Device
+            )
+            .await,
+            SourceClose::Retry(HandoffError::Status(403, _))
+        ));
+        // Transport failure: nothing listens on a bound-then-dropped port.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(matches!(
+            close_source(
+                &reqwest::Client::new(),
+                &format!("http://127.0.0.1:{port}"),
+                Uuid::new_v4(),
+                TenantScope::Device
+            )
+            .await,
+            SourceClose::Retry(HandoffError::Http(_))
+        ));
+    }
+
+    /// Source-level guard: the module's executable code never sends a DELETE.
+    #[test]
+    fn the_handoff_module_never_sends_a_delete() {
+        let src = include_str!("handoff.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module has a production half");
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [".delete(", "DELETE"] {
+            assert!(
+                !code.contains(forbidden),
+                "close_source must not DELETE, but the module's code contains {forbidden:?}"
+            );
+        }
+        assert!(code.contains("/handoff/complete"));
+    }
+
+    // =======================================================================
+    // Close retries are driven by `MaterializedSources`, not by re-sightings
+    // (module doc, point 3).
+    // =======================================================================
+
+    /// A fake coord answering each request with the next scripted
+    /// `(status, body)`; the last one repeats once the script runs out.
+    async fn spawn_scripted_fake_coord(
+        script: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        use axum::{body::Bytes, http::HeaderMap, http::Method, http::Uri};
+        assert!(!script.is_empty());
+        let seen: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+        let rec = seen.clone();
+        let script = Arc::new(script);
+        let app = axum::Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, bytes: Bytes| {
+                let rec = rec.clone();
+                let script = script.clone();
+                async move {
+                    let n = {
+                        let mut rec = rec.lock().unwrap();
+                        rec.push(RecordedRequest {
+                            method: method.to_string(),
+                            path: uri.path().to_string(),
+                            auth: headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                            body: String::from_utf8_lossy(&bytes).into_owned(),
+                        });
+                        rec.len() - 1
+                    };
+                    let (status, body) = script[n.min(script.len() - 1)];
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The first close is refused `handoff_child_not_materialized` (the child
+    /// row has not registered yet). Coord then drops the source from its
+    /// pending list — nothing will ever sight it again — yet a later catch-up
+    /// pass still re-sends the close from `MaterializedSources` and settles on
+    /// coord's 200. Before the fix the retry was driven only by a re-sighting,
+    /// so this close was never sent a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_refused_before_the_child_registered_is_retried_without_a_resighting() {
+        let (base, seen) = spawn_scripted_fake_coord(vec![
+            (403, r#"{"error":"handoff_child_not_materialized"}"#),
+            (200, r#"{"closed":true,"already_closed":false}"#),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let sources = MaterializedSources::default();
+        let source = Uuid::new_v4();
+        let tenant = TenantScope::Device;
+        sources.mark(source, tenant);
+
+        // The first close (materialize's own): refused, rescheduled one tick out.
+        let t0 = Instant::now();
+        let close = close_source(&http, &base, source, tenant).await;
+        settle_close(&sources, source, close, false, t0);
+        assert_eq!(sources.sighting(source), Sighting::CloseOnly(tenant));
+
+        // A pass before the backoff is up sends nothing.
+        assert!(sources.due_closes(t0 + CATCHUP_TICK / 2).is_empty());
+        // The next tick's pass — with coord no longer listing the source, so
+        // the only driver is the set itself — re-sends and settles.
+        let due = sources.due_closes(t0 + CATCHUP_TICK);
+        assert_eq!(due, vec![(source, tenant)]);
+        for (src, scope) in due {
+            let close = close_source(&http, &base, src, scope).await;
+            settle_close(&sources, src, close, true, t0 + CATCHUP_TICK);
+        }
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        assert!(sources.due_closes(t0 + CLOSE_RETRY_LIFETIME * 2).is_empty());
+
+        // And the production pass the catch-up runs sends nothing further.
+        retry_due_closes(&http, &base, &sources).await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one refused close, one retry: {seen:?}");
+        for req in &seen {
+            assert_eq!(
+                (req.method.as_str(), req.path.clone()),
+                ("POST", format!("/sessions/{source}/handoff/complete"))
+            );
+        }
+    }
+
+    /// `retry_due_closes` itself (the function every handoff catch-up pass
+    /// ends with) re-sends a due close with no pending-list input at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_catchup_retry_pass_resends_a_due_close_it_was_never_shown() {
+        let (base, seen) =
+            spawn_scripted_fake_coord(vec![(200, r#"{"closed":true,"already_closed":true}"#)])
+                .await;
+        let sources = MaterializedSources::default();
+        let source = Uuid::new_v4();
+        sources.mark(source, TenantScope::Device);
+        retry_due_closes(&reqwest::Client::new(), &base, &sources).await;
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Repeated retryable failures space attempts out — one tick, doubling,
+    /// capped — and the source is abandoned once its failures span the
+    /// lifetime bound, after which no pass sends anything.
+    #[test]
+    fn repeated_retryable_failures_back_off_and_are_eventually_abandoned() {
+        assert_eq!(close_retry_backoff(1), CATCHUP_TICK);
+        assert_eq!(close_retry_backoff(2), CATCHUP_TICK * 2);
+        assert_eq!(close_retry_backoff(3), CATCHUP_TICK * 4);
+        assert_eq!(close_retry_backoff(4), CATCHUP_TICK * 8);
+        assert_eq!(close_retry_backoff(5), CLOSE_RETRY_CEIL);
+        assert_eq!(close_retry_backoff(u32::MAX), CLOSE_RETRY_CEIL);
+
+        let sources = MaterializedSources::default();
+        let source = Uuid::new_v4();
+        sources.mark(source, TenantScope::Device);
+        let retry = || SourceClose::Retry(HandoffError::Status(503, String::new()));
+
+        let t0 = Instant::now();
+        let mut at = t0;
+        let mut gaps = Vec::new();
+        for n in 1..=6u32 {
+            assert_eq!(sources.due_closes(at), vec![(source, TenantScope::Device)]);
+            let recorded = sources.record(source, &retry(), at);
+            let Recorded::Retry {
+                failures,
+                retry_in,
+                first,
+            } = recorded
+            else {
+                panic!("attempt {n}: {recorded:?}");
+            };
+            assert_eq!((failures, first), (n, n == 1));
+            // Not due a tick before the backoff is up (outside the slack)…
+            assert!(
+                sources
+                    .due_closes(at + retry_in - CLOSE_RETRY_DUE_SLACK - Duration::from_secs(1))
+                    .is_empty(),
+                "attempt {n} came due early"
+            );
+            gaps.push(retry_in);
+            at += retry_in;
+        }
+        assert_eq!(
+            gaps,
+            vec![
+                CATCHUP_TICK,
+                CATCHUP_TICK * 2,
+                CATCHUP_TICK * 4,
+                CATCHUP_TICK * 8,
+                CLOSE_RETRY_CEIL,
+                CLOSE_RETRY_CEIL,
+            ]
+        );
+
+        // Past the lifetime bound measured from the FIRST failure: abandoned.
+        let late = t0 + CLOSE_RETRY_LIFETIME;
+        assert!(matches!(
+            sources.record(source, &retry(), late),
+            Recorded::Abandoned { failures: 7 }
+        ));
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        assert!(sources.due_closes(late + CLOSE_RETRY_CEIL * 10).is_empty());
+    }
+
+    /// `403 not_handoff_target` settles the source — until a FRESH push frame
+    /// for that source addressed to this device (a re-handoff back here)
+    /// revives it, after which the close is sent again and settles on 200. A
+    /// 200-closed source stays settled on a later push frame, and so does a
+    /// `404 session_not_found` refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_handoff_request_revives_a_not_handoff_target_refusal() {
+        let (base, seen) = spawn_scripted_fake_coord(vec![
+            (403, r#"{"error":"not_handoff_target"}"#),
+            (200, r#"{"closed":true,"already_closed":false}"#),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let sources = MaterializedSources::default();
+        let device = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let tenant = TenantScope::Owned(tenant_id);
+        sources.mark(source, tenant);
+
+        let t0 = Instant::now();
+        let close = close_source(&http, &base, source, tenant).await;
+        settle_close(&sources, source, close, false, t0);
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        // A catch-up pass sends nothing for a refused source, however late.
+        assert!(sources.due_closes(t0 + CLOSE_RETRY_CEIL).is_empty());
+
+        // The re-handoff back here arrives as a push frame for this device.
+        let frame = ws_envelope(
+            &format!("qontinui.sessions.{tenant_id}.{device}.handoff_request"),
+            handoff_payload(source, device, tenant_id, "terminal_shell"),
+        );
+        let fresh = parse_handoff_push(&frame, device).expect("a frame for this device");
+        let t1 = Instant::now();
+        assert!(sources.revive_on_fresh_request(fresh.source_session_id, t1));
+        assert_eq!(sources.sighting(source), Sighting::CloseOnly(tenant));
+        assert_eq!(sources.due(source, t1), Some(tenant));
+        retry_due_closes(&http, &base, &sources).await;
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        assert_eq!(seen.lock().unwrap().len(), 2, "the close was re-attempted");
+
+        // Now 200-closed: a further fresh frame leaves it settled.
+        assert!(!sources.revive_on_fresh_request(source, Instant::now()));
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        retry_due_closes(&http, &base, &sources).await;
+        assert_eq!(seen.lock().unwrap().len(), 2, "nothing more was sent");
+
+        // `session_not_found` is terminal even against a fresh frame.
+        let gone = Uuid::new_v4();
+        sources.mark(gone, tenant);
+        sources.record(
+            gone,
+            &SourceClose::Refused {
+                status: 404,
+                error: "session_not_found".into(),
+            },
+            t1,
+        );
+        assert!(!sources.revive_on_fresh_request(gone, Instant::now()));
+        assert_eq!(sources.sighting(gone), Sighting::Settled);
+    }
+
+    /// A registry and lifecycle store that the close-only paths below accept
+    /// but never use: no transport starts anything, and the coord-sync loops
+    /// are never spawned. The returned dir must outlive both.
+    fn inert_registry(
+        coord_url: &str,
+    ) -> (
+        Arc<SessionRegistry>,
+        Arc<SessionLifecycleStore>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let coord = crate::session::coord_sync::CoordSync::new_for_test(
+            outbox,
+            coord_url.to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let external: crate::session::DynTransport = Arc::new(crate::session::ExternalTransport);
+        let registry = SessionRegistry::new(
+            Uuid::new_v4(),
+            crate::session::SessionTransports {
+                pty: external.clone(),
+                claude_cli: external.clone(),
+                workflow: external,
+            },
+            coord,
+        );
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        (registry, store, dir)
+    }
+
+    /// The handoff catch-up pass, through its real entry `run_catchup`: coord's
+    /// pending-list GET fails (500), yet the pass still re-sends the due close
+    /// of a source this process materialized — exactly once — and settles it
+    /// on coord's 200. Fails if `run_catchup` stops ending with
+    /// `retry_due_closes`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_catchup_resends_a_due_close_even_when_the_pending_list_get_fails() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let (base, seen) = spawn_scripted_fake_coord(vec![
+            (500, r#"{"error":"boom"}"#),
+            (200, r#"{"closed":true,"already_closed":false}"#),
+        ])
+        .await;
+        let (registry, store, _dir) = inert_registry(&base);
+        let sources = MaterializedSources::default();
+        let source = Uuid::new_v4();
+        sources.mark(source, TenantScope::Device);
+
+        run_catchup(
+            &registry,
+            &store,
+            &reqwest::Client::new(),
+            &base,
+            Uuid::new_v4(),
+            &sources,
+        )
+        .await;
+
+        let seen = seen.lock().unwrap().clone();
+        let closes: Vec<_> = seen
+            .iter()
+            .filter(|r| r.path == format!("/sessions/{source}/handoff/complete"))
+            .collect();
+        assert_eq!(closes.len(), 1, "exactly one close: {seen:?}");
+        assert_eq!(closes[0].method, "POST");
+        assert_eq!(
+            seen[0].path, "/sessions/handoff-requests",
+            "the pending-list GET ran first and failed: {seen:?}"
+        );
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        assert!(sources
+            .due_closes(Instant::now() + CLOSE_RETRY_CEIL)
+            .is_empty());
+    }
+
+    /// A push frame, through its real entry `handle_push_frame`: a source whose
+    /// close was refused `403 not_handoff_target` is settled, and a FRESH
+    /// `handoff_request` frame for it addressed to this device revives it — the
+    /// close is POSTed and settles Closed on coord's 200, with no second child.
+    /// Fails if `handle_push_frame` stops calling `revive_on_fresh_request`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_frame_revives_a_not_handoff_target_refusal_and_closes_the_source() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let (base, seen) = spawn_fake_coord(200, r#"{"closed":true,"already_closed":false}"#).await;
+        let (registry, store, _dir) = inert_registry(&base);
+        let sources = MaterializedSources::default();
+        let (device, tenant_id, source) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let tenant = TenantScope::Owned(tenant_id);
+        sources.mark(source, tenant);
+        assert_eq!(
+            sources.record(
+                source,
+                &SourceClose::Refused {
+                    status: 403,
+                    error: "not_handoff_target".into(),
+                },
+                Instant::now(),
+            ),
+            Recorded::Refused { revivable: true }
+        );
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+
+        let frame = ws_envelope(
+            &format!("qontinui.sessions.{tenant_id}.{device}.handoff_request"),
+            handoff_payload(source, device, tenant_id, "terminal_shell"),
+        );
+        handle_push_frame(
+            &registry,
+            &store,
+            &reqwest::Client::new(),
+            &base,
+            device,
+            &sources,
+            &frame,
+        )
+        .await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one request, the close: {seen:?}");
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.clone()),
+            ("POST", format!("/sessions/{source}/handoff/complete"))
+        );
+        assert_eq!(sources.sighting(source), Sighting::Settled);
+        assert!(
+            registry.snapshot().is_empty(),
+            "a revived close never starts a second child"
+        );
+    }
+
+    /// One retry pass sends at most `CLOSE_RETRY_PASS_CAP` closes, most overdue
+    /// first; the rest stay due and the next pass sends them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_pass_sends_at_most_the_cap_and_leaves_the_rest_due() {
+        let (base, seen) = spawn_fake_coord(200, r#"{"closed":true,"already_closed":false}"#).await;
+        let sources = MaterializedSources::default();
+        let total = CLOSE_RETRY_PASS_CAP + 3;
+        for _ in 0..total {
+            sources.mark(Uuid::new_v4(), TenantScope::Device);
+        }
+        let http = reqwest::Client::new();
+        retry_due_closes(&http, &base, &sources).await;
+        assert_eq!(seen.lock().unwrap().len(), CLOSE_RETRY_PASS_CAP);
+        assert_eq!(sources.due_closes(Instant::now()).len(), 3);
+        retry_due_closes(&http, &base, &sources).await;
+        assert_eq!(seen.lock().unwrap().len(), total);
+        assert!(sources.due_closes(Instant::now()).is_empty());
+    }
+
+    /// Due closes come back most overdue first.
+    #[test]
+    fn due_closes_are_ordered_most_overdue_first() {
+        let sources = MaterializedSources::default();
+        let (early, late) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        sources.mark(late, TenantScope::Device);
+        sources.mark(early, TenantScope::Device);
+        let retry = || SourceClose::Retry(HandoffError::Status(503, String::new()));
+        sources.record(early, &retry(), t0);
+        sources.record(late, &retry(), t0 + Duration::from_secs(30));
+        let at = t0 + CATCHUP_TICK + Duration::from_secs(30);
+        assert_eq!(
+            sources.due_closes(at),
+            vec![(early, TenantScope::Device), (late, TenantScope::Device)]
+        );
+    }
+
+    /// A retryable answer that arrives after the entry settled — Closed,
+    /// either kind of Refused, Abandoned — is ignored: it never turns a settled
+    /// entry back into a pending one.
+    #[test]
+    fn a_late_retryable_answer_never_reopens_a_settled_close() {
+        let sources = MaterializedSources::default();
+        let now = Instant::now();
+        let retry = || SourceClose::Retry(HandoffError::Status(503, String::new()));
+        let settle: [(SourceClose, Recorded); 3] = [
+            (
+                SourceClose::Closed {
+                    already_closed: false,
+                },
+                Recorded::Closed,
+            ),
+            (
+                SourceClose::Refused {
+                    status: 403,
+                    error: "not_handoff_target".into(),
+                },
+                Recorded::Refused { revivable: true },
+            ),
+            (
+                SourceClose::Refused {
+                    status: 404,
+                    error: "session_not_found".into(),
+                },
+                Recorded::Refused { revivable: false },
+            ),
+        ];
+        for (answer, expected) in settle {
+            let source = Uuid::new_v4();
+            sources.mark(source, TenantScope::Device);
+            assert_eq!(sources.record(source, &answer, now), expected);
+            assert_eq!(
+                sources.record(source, &retry(), now),
+                Recorded::AlreadySettled
+            );
+            assert_eq!(sources.sighting(source), Sighting::Settled);
+            assert!(sources.due(source, now + CLOSE_RETRY_CEIL).is_none());
+        }
+        // Abandoned, too.
+        let source = Uuid::new_v4();
+        sources.mark(source, TenantScope::Device);
+        sources.record(source, &retry(), now);
+        assert!(matches!(
+            sources.record(source, &retry(), now + CLOSE_RETRY_LIFETIME),
+            Recorded::Abandoned { .. }
+        ));
+        assert_eq!(
+            sources.record(source, &retry(), now + CLOSE_RETRY_LIFETIME),
+            Recorded::AlreadySettled
+        );
+        assert_eq!(sources.sighting(source), Sighting::Settled);
     }
 
     /// A (re)connect missed every push, so it replays EVERY arm.
