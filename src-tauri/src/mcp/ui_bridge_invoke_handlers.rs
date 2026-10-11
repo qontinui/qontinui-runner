@@ -252,6 +252,7 @@ macro_rules! in_process_dispatch_table {
 in_process_dispatch_table! {
     (state, args) {
         "redeem_pair_code" => in_process_redeem_pair_code(args),
+        "get_web_integration_status" => in_process_get_web_integration_status(state, args),
         "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
         "get_coord_device_token" => in_process_get_coord_device_token(args),
         "get_access_token_for_websocket" => in_process_get_access_token_for_websocket(args),
@@ -366,6 +367,87 @@ async fn in_process_redeem_pair_code(
     let response = crate::commands::web_integration::redeem_pair_code(code, backend_url)
         .await
         .map_err(|e| in_process_command_failed(COMMAND, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+    })
+}
+
+/// Upper bound on one in-process `get_web_integration_status`.
+///
+/// The arm exists so this command answers when the webview IPC is wedged
+/// (plan `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`,
+/// G2: every frontend-dispatched invoke 504'd at 30 s on 2026-10-11 while the
+/// in-process arms answered in ~11 ms). The body takes the server-mode read
+/// lock and awaits `ServerModeState` accessors; if a future command-side block
+/// ever holds one of those, this bound keeps the HTTP handler from hanging
+/// with it. Kept well under [`DEFAULT_INVOKE_TIMEOUT_MS`] so the answer is
+/// distinguishable from a frontend timeout.
+const IN_PROCESS_WEB_INTEGRATION_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// In-process arm for `get_web_integration_status`
+/// (`crate::commands::web_integration::get_web_integration_status`).
+///
+/// Runs the SAME `get_web_integration_status_impl` the Tauri command wraps,
+/// against the `AppState::server_mode` slot `ApiState` already carries — the
+/// slot `backend_relay` reads through `AppState::current_server_mode`. So an
+/// agent (or `/coord-revive`) reads the web-integration state without the
+/// window, and the HTTP door cannot drift from the IPC one.
+///
+/// Takes no arguments; a non-empty `args` object is a 400. Bounded by
+/// [`IN_PROCESS_WEB_INTEGRATION_STATUS_TIMEOUT`]: on expiry, a 504 naming the
+/// command and saying the in-process body (not the webview) did not answer.
+async fn in_process_get_web_integration_status(
+    state: &Arc<ApiState>,
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    web_integration_status_bounded(
+        &state.app_state.server_mode,
+        args,
+        IN_PROCESS_WEB_INTEGRATION_STATUS_TIMEOUT,
+    )
+    .await
+}
+
+/// Body of [`in_process_get_web_integration_status`], with the server-mode
+/// slot and the bound passed in so tests can drive it with no `ApiState`
+/// (which needs a Tauri `AppHandle`) and with a short bound.
+async fn web_integration_status_bounded(
+    server_mode: &tokio::sync::RwLock<Option<crate::server_mode::ServerModeState>>,
+    args: &Value,
+    bound: Duration,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "get_web_integration_status";
+
+    match args {
+        Value::Null => {}
+        Value::Object(o) if o.is_empty() => {}
+        _ => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "takes no arguments — send `{}`",
+            ))
+        }
+    }
+
+    let response = match tokio::time::timeout(
+        bound,
+        crate::commands::web_integration::get_web_integration_status_impl(server_mode),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| in_process_command_failed(COMMAND, e))?,
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(api_error(format!(
+                    "invoke proxy: in-process invoke of '{}' did not answer within {}ms —                      the runner's own status read is blocked (settings read or the                      server-mode lock), not the webview",
+                    COMMAND,
+                    bound.as_millis()
+                ))),
+            ))
+        }
+    };
 
     serde_json::to_value(response).map_err(|e| {
         in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
@@ -1062,6 +1144,14 @@ mod in_process_dispatch_tests {
         // `2026-07-10-split-cloud-sync-consent`): same shape, same argument —
         // a local consent flag with no credential, already reachable via
         // `page/evaluate` on a windowed runner.
+        //
+        // `get_web_integration_status` joined for plan
+        // `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
+        // Phase 5: a read of the persisted web-integration settings plus live
+        // relay state, so an agent can read it while the webview IPC is wedged.
+        // It returns no credential — `runnerTokenMasked` is a 16+4-char mask —
+        // and the identical response was already served by the frontend
+        // round-trip on the same loopback door, so the surface is unchanged.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
@@ -1075,6 +1165,7 @@ mod in_process_dispatch_tests {
                 "get_cloud_sync_settings",
                 "get_coord_device_token",
                 "get_session_metadata_sync_settings",
+                "get_web_integration_status",
                 "redeem_pair_code",
                 "save_cloud_sync_settings",
                 "save_session_metadata_sync_settings",
@@ -1236,7 +1327,7 @@ mod in_process_dispatch_tests {
         // This is the whole point of the phase. Same runner, same
         // `server_mode = true`, two commands, two outcomes.
         let InvokeDecision::NoWebview((status, Json(body))) =
-            decide_invoke("get_web_integration_status", true)
+            decide_invoke("get_scripted_output_settings", true)
         else {
             panic!("a Dispatch::Frontend command must still be refused on a webview-less runner");
         };
@@ -1284,7 +1375,7 @@ mod in_process_dispatch_tests {
     #[test]
     fn a_frontend_command_on_a_windowed_runner_still_takes_the_round_trip() {
         assert!(matches!(
-            decide_invoke("get_web_integration_status", false),
+            decide_invoke("get_scripted_output_settings", false),
             InvokeDecision::Frontend
         ));
     }
@@ -1345,6 +1436,96 @@ mod in_process_dispatch_tests {
             .error
             .expect("error message present")
             .contains("backendUrl"));
+    }
+
+    #[tokio::test]
+    async fn in_process_get_web_integration_status_answers_without_a_frontend() {
+        // No webview, no AppHandle, no oneshot: the arm reads settings and the
+        // server-mode slot directly. Before Phase 5 this command only had the
+        // frontend round-trip, which 504'd at 30 s with the IPC wedged.
+        let _amb = crate::test_env::isolated_ambient();
+        let slot = tokio::sync::RwLock::new(None);
+
+        let value = web_integration_status_bounded(
+            &slot,
+            &serde_json::json!({}),
+            IN_PROCESS_WEB_INTEGRATION_STATUS_TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|(status, body)| {
+            panic!("arm must answer, got {status}: {:?}", body.0.error)
+        });
+
+        let obj = value.as_object().expect("a JSON object");
+        for key in [
+            "enabled",
+            "backendUrl",
+            "webBaseUrl",
+            "runnerTokenMasked",
+            "runnerId",
+            "lastHeartbeatAt",
+            "registrationError",
+            "wsConnected",
+            "settingsFault",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "missing camelCase key `{key}`: {value}"
+            );
+        }
+        assert!(obj["enabled"].is_boolean());
+        assert!(obj["backendUrl"].is_string());
+        // An empty server-mode slot means no live relay state.
+        assert_eq!(obj["runnerId"], Value::Null);
+        assert_eq!(obj["wsConnected"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn in_process_get_web_integration_status_is_bounded_with_a_504() {
+        // Hold the server-mode WRITE lock so the body's read lock can never be
+        // taken — the shape of a future command-side block. The arm must give
+        // up with a 504 naming the command, not hang the HTTP handler.
+        let _amb = crate::test_env::isolated_ambient();
+        let slot = tokio::sync::RwLock::new(None);
+        let _held = slot.write().await;
+
+        let (status, body) = web_integration_status_bounded(
+            &slot,
+            &serde_json::json!({}),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a blocked body must time out");
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        let error = body.0.error.unwrap_or_default();
+        assert!(error.contains("get_web_integration_status"), "{error}");
+        assert!(error.contains("did not answer within 200ms"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn in_process_get_web_integration_status_rejects_args_with_400() {
+        let slot = tokio::sync::RwLock::new(None);
+        let (status, _) = web_integration_status_bounded(
+            &slot,
+            &serde_json::json!({ "x": 1 }),
+            IN_PROCESS_WEB_INTEGRATION_STATUS_TIMEOUT,
+        )
+        .await
+        .expect_err("unexpected args must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn web_integration_status_is_served_in_process_with_or_without_a_window() {
+        for server_mode in [false, true] {
+            assert!(
+                matches!(
+                    decide_invoke("get_web_integration_status", server_mode),
+                    InvokeDecision::InProcess
+                ),
+                "get_web_integration_status must not depend on the webview                  (server_mode={server_mode})"
+            );
+        }
     }
 
     #[test]

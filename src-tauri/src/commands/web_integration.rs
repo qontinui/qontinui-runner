@@ -144,14 +144,34 @@ pub struct GetWebIntegrationStatusResponse {
 pub async fn get_web_integration_status(
     integration: State<'_, IntegrationCompartment>,
 ) -> Result<GetWebIntegrationStatusResponse, String> {
-    let loaded = settings::load_settings_full();
-    let persisted = loaded.settings.web_integration.clone();
-    let settings_fault = if loaded.is_authoritative() {
-        None
-    } else {
-        crate::settings::settings_fault()
-    };
-    let sm_state_opt = integration.server_mode().read().await.clone();
+    get_web_integration_status_impl(integration.server_mode()).await
+}
+
+/// Shared body of [`get_web_integration_status`], taking the server-mode slot
+/// directly so the UI Bridge's in-process invoke arm
+/// (`mcp::ui_bridge_invoke_handlers::in_process_get_web_integration_status`)
+/// runs the SAME code as the Tauri command without a webview round-trip.
+///
+/// The settings read is a synchronous filesystem read, so it runs on the
+/// blocking pool rather than on the async worker that called us — plan
+/// `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
+/// Phase 5 named it as one of the ways this command could stall a runtime
+/// thread.
+pub(crate) async fn get_web_integration_status_impl(
+    server_mode: &tokio::sync::RwLock<Option<ServerModeState>>,
+) -> Result<GetWebIntegrationStatusResponse, String> {
+    let (persisted, settings_fault) = tokio::task::spawn_blocking(|| {
+        let loaded = settings::load_settings_full();
+        let settings_fault = if loaded.is_authoritative() {
+            None
+        } else {
+            crate::settings::settings_fault()
+        };
+        (loaded.settings.web_integration, settings_fault)
+    })
+    .await
+    .map_err(|e| format!("settings read task failed: {e}"))?;
+    let sm_state_opt = server_mode.read().await.clone();
 
     let (runner_id, last_heartbeat_at, registration_error, ws_connected) = match sm_state_opt {
         Some(sm) => (

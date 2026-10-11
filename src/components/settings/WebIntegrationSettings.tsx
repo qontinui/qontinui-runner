@@ -39,6 +39,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { describeThrown } from "@/lib/utils";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
 import {
@@ -246,10 +247,50 @@ function deriveWebAppUrl(backendUrl: string): string | null {
 
 const PLACEHOLDER_BACKEND_URL = "https://api.qontinui.io";
 
+/** The Tauri command the status load calls. Named so the error state can say which one hung. */
+const STATUS_COMMAND = "get_web_integration_status";
+
+/**
+ * Upper bound on one `get_web_integration_status` round-trip.
+ *
+ * A wedged webview IPC leaves the invoke promise unsettled forever (observed
+ * 2026-10-10: the page sat on "Loading…" indefinitely, and the same command
+ * over the UI Bridge invoke door 504'd after 30 s). Without a bound, `loading`
+ * never cleared and the pair-code control — the recovery path — never
+ * rendered. Plan 2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap, G2.
+ */
+const STATUS_LOAD_TIMEOUT_MS = 10_000;
+
+/**
+ * Race `invoke(command)` against a timeout. Rejects with an error naming the
+ * command when it does not settle within `timeoutMs`; the timer is always
+ * cleared so a settled invoke leaves nothing scheduled.
+ */
+async function invokeWithTimeout<T>(command: string, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${command} did not answer within ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([invoke<T>(command), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // --- Persisted/server state ------------------------------------------------
   const [status, setStatus] = useState<WebIntegrationStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  /**
+   * Why the most recent status load failed (rejected or timed out), or null
+   * when it succeeded. Rendered as an error banner with a Retry button; the
+   * rest of the page — the pair-code control above all — still renders.
+   */
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [statusRetrying, setStatusRetrying] = useState(false);
 
   // --- Form state (user edits, may diverge from `status`) -------------------
   const [formEnabled, setFormEnabled] = useState(false);
@@ -339,8 +380,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
   const refreshStatus = useCallback(async (): Promise<WebIntegrationStatus | null> => {
     try {
-      const next = await invoke<WebIntegrationStatus>("get_web_integration_status");
+      const next = await invokeWithTimeout<WebIntegrationStatus>(
+        STATUS_COMMAND,
+        STATUS_LOAD_TIMEOUT_MS,
+      );
       setStatus(next);
+      setStatusError(null);
       if (!seededRef.current) {
         applyStatusToForm(next);
         seededRef.current = true;
@@ -349,6 +394,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     } catch (err) {
       console.error("Failed to load web integration status:", err);
       onLog("error", `Failed to load web integration status: ${err}`);
+      setStatusError(describeThrown(err, "status load failed"));
       return null;
     }
   }, [applyStatusToForm, onLog]);
@@ -357,8 +403,13 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   useEffect(() => {
     let cancelled = false;
     const init = async () => {
-      await refreshStatus();
-      if (!cancelled) setLoading(false);
+      // `refreshStatus` never throws and is bounded by STATUS_LOAD_TIMEOUT_MS,
+      // so `loading` always clears; the `finally` is belt and braces.
+      try {
+        await refreshStatus();
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     };
     init();
     return () => {
@@ -923,6 +974,15 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     }
   }, [formBackendUrl, onLog, refreshStatus]);
 
+  const handleRetryStatus = useCallback(async () => {
+    setStatusRetrying(true);
+    try {
+      await refreshStatus();
+    } finally {
+      setStatusRetrying(false);
+    }
+  }, [refreshStatus]);
+
   // --- Render ---------------------------------------------------------------
   if (loading) {
     return (
@@ -1040,14 +1100,14 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           );
         }
         return (
-          <div className="flex items-center gap-1.5 text-xs text-green-500" title={testState.detail}>
+          <div
+            className="flex items-center gap-1.5 text-xs text-green-500"
+            title={testState.detail}
+          >
             <CheckCircle2 className="w-3.5 h-3.5" />
             Connected as device <code className="font-mono">{testState.deviceId}</code>
             {testState.tokenFormatValid === false && (
-              <span className="text-yellow-500">
-                {" "}
-                · saved runner token is malformed
-              </span>
+              <span className="text-yellow-500"> · saved runner token is malformed</span>
             )}
           </div>
         );
@@ -1095,6 +1155,42 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               until this file can be read, so it cannot overwrite it with defaults. Fix or move the
               file and restart.
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* The status load rejected or timed out. Name the command that did not
+          answer and offer a Retry; everything below (pair code included)
+          still renders, because none of it depends on this load. */}
+      {statusError && (
+        <div
+          id="banner-web-integration-status-error"
+          role="alert"
+          className="flex items-start gap-2 p-3 rounded-md bg-destructive/10 border border-destructive/20"
+        >
+          <XCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
+          <div className="text-xs flex-1 min-w-0">
+            <div className="font-medium text-destructive">
+              Could not load web integration status
+            </div>
+            <div className="text-muted-foreground break-all" title={statusError}>
+              <code className="font-mono">{STATUS_COMMAND}</code> did not answer:{" "}
+              {truncate(statusError, 160)}
+            </div>
+            <div className="text-muted-foreground">
+              {status
+                ? "The values below are from the last successful load."
+                : "Values below are defaults, not your saved configuration. Pairing with a code still works."}
+            </div>
+            <button
+              type="button"
+              id="web-integration-status-retry"
+              onClick={() => void handleRetryStatus()}
+              disabled={statusRetrying}
+              className="mt-1.5 text-primary hover:underline text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {statusRetrying ? "Retrying…" : "Retry"}
+            </button>
           </div>
         </div>
       )}
@@ -1346,16 +1442,19 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           content sync above, which governs whether that shared content
           actually leaves the machine. Saves immediately, same as the two
           blocks above. */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-bridge-id="settings.share-terminal-output">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-bridge-id="settings.share-terminal-output"
+      >
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1 pr-4">
             <div className="text-sm font-medium">Share terminal output</div>
             <div className="text-xs text-muted-foreground">
               Default for new sessions: stream this session&apos;s terminal output to your coord
-              tenant through the same warm/cold retention tiers as AI content sync above. Off: a
-              new session&apos;s output stays local, whether or not AI content sync is on.
-              Existing sessions keep whatever they started with — this sets the default for
-              sessions started after the change, not a live switch on open ones.
+              tenant through the same warm/cold retention tiers as AI content sync above. Off: a new
+              session&apos;s output stays local, whether or not AI content sync is on. Existing
+              sessions keep whatever they started with — this sets the default for sessions started
+              after the change, not a live switch on open ones.
             </div>
           </div>
           {perfCapsLoadState !== "loaded" ? (
@@ -1390,9 +1489,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         <div className="px-3 space-y-1.5" data-ui-bridge-id="settings.redact-terminal-secrets">
           <div className="text-xs font-medium">Redact secrets in shared output</div>
           <div className="text-[10px] text-muted-foreground">
-            Scrubs shared terminal output for common secret patterns before it leaves this
-            machine — defense-in-depth, not a security boundary. Left on &quot;Follow
-            sharing&quot;, redaction tracks the toggle above (on whenever sharing is on).
+            Scrubs shared terminal output for common secret patterns before it leaves this machine —
+            defense-in-depth, not a security boundary. Left on &quot;Follow sharing&quot;, redaction
+            tracks the toggle above (on whenever sharing is on).
           </div>
           <div className="flex gap-2 pt-1">
             {(
@@ -1421,8 +1520,8 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
         {shareOutputError && (
           <p className="text-[10px] text-destructive px-3">
-            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been
-            changed — the runner is still using whatever you last saved.
+            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been changed
+            — the runner is still using whatever you last saved.
           </p>
         )}
       </div>

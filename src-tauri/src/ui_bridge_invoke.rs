@@ -216,7 +216,10 @@ const fn default_probe_safe() -> bool {
 pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "get_web_integration_status",
-        dispatch: Dispatch::Frontend,
+        // In-process: answers over HTTP even when the webview IPC is wedged
+        // (plan 2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap,
+        // Phase 5). See `in_process_get_web_integration_status`.
+        dispatch: Dispatch::InProcess,
         description: "Return the persisted web-integration settings plus live registration state (runner id, last heartbeat, last registration error). `settingsFault` is non-null when settings.json could not be read — every other field is then a placeholder, not the user's saved configuration.",
         args_schema: "{}",
         response_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"webBaseUrl\": string, \"runnerTokenMasked\": string, \"runnerId\": string | null, \"lastHeartbeatAt\": string | null, \"registrationError\": string | null, \"wsConnected\": boolean, \"settingsFault\": { \"path\": string, \"error\": string, \"detectedAtUnix\": number } | null }",
