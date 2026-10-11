@@ -52,7 +52,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::past_sessions::{account_from_config_dir, PastSessionAccount};
+use super::past_sessions::{account_from_config_dir, account_resume_command, PastSessionAccount};
 
 /// Raw on-disk shape of `<config_dir>/sessions/<pid>.json`.
 ///
@@ -128,7 +128,8 @@ pub struct LiveClaudeSession {
     pub kind: String,
     pub started_at: i64,
     pub updated_at: i64,
-    /// Ready-to-run: `cd '<dir>' && <wrapper> --resume <id>`.
+    /// Ready-to-run: `cd '<dir>' && <resume>`, where `<resume>` names the
+    /// account explicitly (`super::past_sessions::account_resume_command`).
     ///
     /// The `cd` is **not** cosmetic — Claude Code scopes sessions by project
     /// directory, so resuming from the wrong cwd does not find the session.
@@ -180,13 +181,15 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     // Normalize separators so the emitted `cd` works verbatim in the POSIX-ish
     // shells the operator pastes into (Git Bash, the runner's own PTY).
     let working_dir = raw.cwd.unwrap_or_default().replace('\\', "/");
+    // The account is named explicitly: a generic-wrapper (`claude`) account —
+    // the default `~/.claude` above all — gets a `CLAUDE_CONFIG_DIR="<dir>"`
+    // prefix, so the line resumes under THIS registry file's account even when
+    // pasted into a pane pinned to another (`account_resume_command`).
+    let resume = account_resume_command(config_dir.to_str(), &raw.session_id);
     let resume_command = if working_dir.is_empty() {
-        format!("{} --resume {}", account.wrapper, raw.session_id)
+        resume
     } else {
-        format!(
-            "cd '{}' && {} --resume {}",
-            working_dir, account.wrapper, raw.session_id
-        )
+        format!("cd '{working_dir}' && {resume}")
     };
     Some(LiveClaudeSession {
         session_id: raw.session_id,
@@ -570,6 +573,20 @@ mod tests {
         let pids = live_pids_from_snapshot(&ok).unwrap();
         assert!(pids.contains(&1234));
         assert_eq!(pids.len(), 1);
+    }
+
+    /// A live session under the DEFAULT account (`~/.claude`, generic
+    /// `claude` wrapper) used to render a bare `claude --resume <id>`, which a
+    /// pane pinned to another account resolves under THAT account ("No
+    /// conversation found"). The line must name the registry file's own dir.
+    #[test]
+    fn default_account_live_row_names_its_config_dir() {
+        let json = r#"{"pid":7,"sessionId":"abc","name":"n","cwd":"/w"}"#;
+        let s = parse_registry_file(json, Path::new("/home/u/.claude")).unwrap();
+        assert_eq!(
+            s.resume_command,
+            "cd '/w' && CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume abc"
+        );
     }
 
     #[test]

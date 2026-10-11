@@ -28,8 +28,18 @@ export interface PastSession {
   claudeSessionId: string;
   /** The real `/rename` name (the headline — show prominently). */
   resumeName: string;
-  /** Ready-to-copy resume command, e.g. `"clg --resume <id>"`. */
+  /**
+   * Ready-to-copy resume command naming its account explicitly, e.g.
+   * `"clg --resume <id>"`, or `CLAUDE_CONFIG_DIR="<dir>" claude --resume <id>`
+   * for a non-roster (e.g. the default `~/.claude`) account.
+   */
   resumeCommand: string;
+  /**
+   * DERIVED by the backend: the account a resume of this session must run
+   * under — where its transcript is found, else `configDir`, else the ambient
+   * default. Present even when `configDir` is absent.
+   */
+  resumeConfigDir?: string;
   /** Which account/wrapper the session ran under. */
   account: PastSessionAccount;
   /** Terminal page the session belonged to. */

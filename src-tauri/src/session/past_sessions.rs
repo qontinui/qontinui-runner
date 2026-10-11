@@ -59,8 +59,19 @@ pub struct PastSession {
     /// → auto summary → first-message preview → registry title →
     /// `"Session <date>"`).
     pub resume_name: String,
-    /// Ready-to-run resume command: `"<wrapper> --resume <id>"`.
+    /// Ready-to-run resume command naming its account explicitly — see
+    /// [`account_resume_command`]: `"<wrapper> --resume <id>"` for a roster
+    /// account, else `CLAUDE_CONFIG_DIR="<dir>" claude --resume <id>`, built
+    /// from [`Self::resume_config_dir`] rather than the raw `config_dir`.
     pub resume_command: String,
+    /// The account a resume of this session MUST run under — the config dir
+    /// its transcript is found under, else the record's own, else the ambient
+    /// default ([`resolve_resume_config_dir`]). Explicit even when
+    /// `config_dir` is absent: "no account" resumed into a pane carrying the
+    /// spawn picker's account answers "No conversation found" (2026-10-08).
+    /// Absent only when no dir can be named at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_config_dir: Option<String>,
     /// Account derived from `config_dir`.
     pub account: PastSessionAccount,
     /// Grid page the session's tile belonged to.
@@ -289,6 +300,52 @@ pub(crate) fn resolve_resume_config_dir_in(
     (dir, false)
 }
 
+/// [`resolve_resume_config_dir_in`] over THIS machine's account search set
+/// ([`transcript_search_dirs`]) and its ambient default — the one resolver
+/// every resume path (boot restore, zone-profile resume, transcript/Past
+/// Sessions resume, the ready-to-paste lines) goes through.
+pub(crate) fn resolve_resume_config_dir(
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    session_id: &str,
+) -> (Option<String>, bool) {
+    resolve_resume_config_dir_in(
+        config_dir,
+        working_dir,
+        session_id,
+        &transcript_search_dirs(),
+        transcript::ambient_claude_config_dir().as_deref(),
+    )
+}
+
+/// A ready-to-paste `--resume` line that names its account EXPLICITLY.
+///
+/// A roster account's wrapper (`clg`/`clh`/…) pins its own config dir, so it
+/// stays `"<wrapper> --resume <id>"`. Every other dir — the default `~/.claude`
+/// above all — used to render as a bare `claude --resume <id>`, which runs
+/// under whatever `CLAUDE_CONFIG_DIR` the shell it is pasted into carries; a
+/// runner pane carries the spawn picker's account, so a default-account
+/// session answered "No conversation found". Those now carry
+/// `CLAUDE_CONFIG_DIR="<dir>"`. Backslashes are written as forward slashes
+/// (the line targets the POSIX-ish shells the registry already normalizes
+/// for). A dir that cannot be quoted safely, or no dir at all, yields the
+/// bare form — there is no account to name.
+pub(crate) fn account_resume_command(config_dir: Option<&str>, session_id: &str) -> String {
+    let account = account_from_config_dir(config_dir);
+    if account.wrapper != "claude" {
+        return format!("{} --resume {}", account.wrapper, session_id);
+    }
+    match config_dir
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| d.trim().replace('\\', "/"))
+        .as_deref()
+        .and_then(crate::agent_worktree::custody::shell_quote_path)
+    {
+        Some(dir) => format!("CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {session_id}"),
+        None => format!("claude --resume {session_id}"),
+    }
+}
+
 /// Format a unix-millis timestamp into a short human date for the `"Session
 /// <date>"` fallback name.
 fn short_date(ts_ms: i64) -> String {
@@ -340,7 +397,17 @@ fn build_enriched(
     let restorable = confirmed && transcript_exists;
 
     let account = account_from_config_dir(config_dir.as_deref());
-    let resume_command = format!("{} --resume {}", account.wrapper, claude_session_id);
+    // The resume line names the account the TRANSCRIPT is under, never "none"
+    // for a null-account record (see `account_resume_command`).
+    let (resume_config_dir, _) = resolve_resume_config_dir(
+        config_dir.as_deref(),
+        working_dir.as_deref(),
+        &claude_session_id,
+    );
+    let resume_command = account_resume_command(
+        resume_config_dir.as_deref().or(config_dir.as_deref()),
+        &claude_session_id,
+    );
 
     // resume name: on-disk resume/preview name → registry title → date default.
     let resume_name = transcript_path
@@ -353,6 +420,7 @@ fn build_enriched(
         claude_session_id,
         resume_name,
         resume_command,
+        resume_config_dir,
         account,
         page_id,
         zone_index,
@@ -617,6 +685,7 @@ mod tests {
             claude_session_id: id.to_string(),
             resume_name: "n".to_string(),
             resume_command: "c".to_string(),
+            resume_config_dir: None,
             account: PastSessionAccount {
                 label: "gmail".to_string(),
                 wrapper: "clg".to_string(),
@@ -663,6 +732,63 @@ mod tests {
         // Exactly two distinct cohorts.
         let distinct: std::collections::HashSet<_> = sessions.iter().map(|s| s.cohort_id).collect();
         assert_eq!(distinct.len(), 2);
+    }
+
+    /// The ready-to-paste resume line names its account: a roster wrapper
+    /// keeps its own pin; the DEFAULT dir (generic `claude` wrapper) — the
+    /// account a `configDir: null` record resolves to — carries an explicit
+    /// `CLAUDE_CONFIG_DIR`, never the bare `claude --resume <id>` that resumed
+    /// under the pane's picker-chosen account (2026-10-08).
+    #[test]
+    fn resume_line_names_the_default_account_explicitly() {
+        assert_eq!(
+            account_resume_command(Some("/home/u/.claude"), "s1"),
+            "CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume s1"
+        );
+        assert_eq!(
+            account_resume_command(Some("C:\\Users\\u\\.claude"), "s1"),
+            "CLAUDE_CONFIG_DIR=\"C:/Users/u/.claude\" claude --resume s1",
+            "backslashes render as forward slashes for the POSIX-ish paste target"
+        );
+        assert_eq!(
+            account_resume_command(Some("C:/claude/.claude-hotmail"), "s1"),
+            "clh --resume s1"
+        );
+        // Nothing nameable → the bare form (no account to name).
+        assert_eq!(account_resume_command(None, "s1"), "claude --resume s1");
+        assert_eq!(
+            account_resume_command(Some("/x/$(rm)/.claude"), "s1"),
+            "claude --resume s1",
+            "an unquotable dir is never spliced into a shell line"
+        );
+    }
+
+    /// End to end over the resolver: a `configDir: null` record whose
+    /// transcript is ONLY under the default dir (a picker home searched first)
+    /// renders a resume line carrying the default dir.
+    #[test]
+    fn null_config_dir_resume_line_carries_the_transcripts_default_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let picker = tmp.path().join(".claude-iris");
+        let default = tmp.path().join(".claude");
+        std::fs::create_dir_all(picker.join("projects")).unwrap();
+        plant_transcript(&default, "/w", "sess-null");
+        let (dir, found) = resolve_resume_config_dir_in(
+            None,
+            Some("/w"),
+            "sess-null",
+            &[picker.clone(), default.clone()],
+            Some(&picker),
+        );
+        assert!(found);
+        let line = account_resume_command(dir.as_deref(), "sess-null");
+        assert_eq!(
+            line,
+            format!(
+                "CLAUDE_CONFIG_DIR=\"{}\" claude --resume sess-null",
+                default.to_string_lossy().replace('\\', "/")
+            )
+        );
     }
 
     /// Lay down `<config_dir>/projects/<encoded wd>/<sid>.jsonl`.

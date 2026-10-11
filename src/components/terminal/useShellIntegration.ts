@@ -5,6 +5,9 @@ import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import { rememberSessionId } from "./lastKnownSessionIds";
+import { resolveResumeAccount } from "./resumeAccount";
+import { buildResumeCmd } from "./useTerminalInitialization";
+import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import {
   describeRecordOpenOutcome,
   noteRecordedZone,
@@ -42,7 +45,13 @@ interface UseShellIntegrationParams {
     }>,
   ) => void;
   renameTab: (id: string, title: string) => void;
-  createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
+  createTerminal: (
+    title?: string,
+    workingDir?: string,
+    tenantId?: string,
+    spawnSource?: ResourceGuardSource,
+    claudeConfigDir?: string,
+  ) => Promise<string | null>;
   setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   setRightPanelMode: React.Dispatch<
@@ -153,18 +162,35 @@ export function useShellIntegration({
     async (session: TranscriptSession) => {
       // Derive a short label from the session ID for the tab title
       const tabTitle = `claude ${session.session_id.slice(0, 8)}`;
-      const tabId = await createTerminal(tabTitle, session.project_path);
+      // The account this resume runs under, resolved by the backend from where
+      // the transcript actually lives (`resumeAccount.ts`). A Past Sessions row
+      // with `configDir: null` arrives here as `config_dir: ""`, which used to
+      // type a bare `claude --resume` into a pane on the spawn picker's
+      // account — "No conversation found". The pane is PINNED to the account
+      // too, so the PTY and the typed prefix agree.
+      const account = await resolveResumeAccount({
+        claudeSessionId: session.session_id,
+        configDir: session.config_dir,
+        workingDir: session.project_path,
+      });
+      const tabId = await createTerminal(
+        tabTitle,
+        session.project_path,
+        undefined,
+        undefined,
+        account,
+      );
       if (!tabId) return;
 
       // Track which Claude session is running in this tab so "Generate Workflow"
       // can find the correct transcript instead of picking a random recent session.
       updateTab(tabId, {
         claudeSessionId: session.session_id,
-        claudeConfigDir: session.config_dir,
+        claudeConfigDir: account,
       });
       // Persist durably so the tab stays resumable across a close→reopen even
       // if the live tab object later loses the id.
-      rememberSessionId(tabId, session.session_id, session.config_dir);
+      rememberSessionId(tabId, session.session_id, account);
       // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
       // the exact id. The tab was created a moment ago and no zone has been
       // assigned to it yet, so the honest recorded zone here is UNZONED. Note
@@ -198,7 +224,7 @@ export function useShellIntegration({
       // migration unnoticed on the sibling writer in `TerminalSessionContext`).
       const openArgs: SessionOpenArgs = {
         claudeSessionId: session.session_id,
-        configDir: session.config_dir,
+        configDir: account,
         workingDir: session.project_path,
         pageId,
         zoneIndex: UNZONED_INDEX,
@@ -224,21 +250,10 @@ export function useShellIntegration({
       setSelectedTranscriptSessionId(null);
 
       // Queue the resume command — it will be sent once the shell emits its first prompt.
-      // Include the config_dir so Claude CLI searches the right directory.
-      // Windows terminals use PowerShell ($env:VAR), others use bash (VAR=val cmd).
-      const configDir = session.config_dir;
-      const isWindows = navigator.platform.startsWith("Win");
-      // Resume autonomously (`--permission-mode bypassPermissions`) to match
-      // the operator's clg/clh/clp wrappers — a resumed session shouldn't
-      // stall on a permission prompt either.
-      let resumeCmd: string;
-      if (configDir) {
-        resumeCmd = isWindows
-          ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --permission-mode bypassPermissions --resume ${session.session_id}`
-          : `CLAUDE_CONFIG_DIR="${configDir}" claude --permission-mode bypassPermissions --resume ${session.session_id}`;
-      } else {
-        resumeCmd = `claude --permission-mode bypassPermissions --resume ${session.session_id}`;
-      }
+      // Built by the boot restore's `buildResumeCmd` over the RESOLVED account
+      // (autonomous permission mode, PowerShell vs POSIX env syntax). The
+      // pending queue appends its own `\r`, so the builder's is dropped.
+      const resumeCmd = buildResumeCmd(session.session_id, account).replace(/\r$/, "");
       pendingResumeRef.current = { tabId, resumeCmd };
 
       // Fallback: send after 1.5 s regardless (in case shell integration isn't active)
