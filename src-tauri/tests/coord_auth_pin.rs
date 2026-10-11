@@ -826,7 +826,11 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 6),
+    // 7th: `report_session_launched` (plan 2026-09-30-session-attribution-is-too-
+    // sparse-to-derive-a-terminal-state Phase 4) — POST /agents/{agent_id}/session;
+    // coord resolves the tenant from the allocation's own rows (like post_log); route
+    // and its reporter_owns_allocation check land in qontinui-coord#2746.
+    ("agent_runtime.rs", "session-noop", 7),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
     ("claude_session/trust_gate.rs", "device", 1),
@@ -947,7 +951,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// the set came from those slots), so `device` 22 -> 21.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 21),
-    ("session-noop", 10),
+    ("session-noop", 11),
     ("session-owed", 0),
     ("work-owed", 8),
     ("escalated", 2),
@@ -1108,8 +1112,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 41,
-        "expected 41 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 42,
+        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1154,7 +1158,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          never either side's literal. Plan \
          2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential \
          (review finding 1) then moved fleet.rs's register heartbeat onto the stating seam \
-         (its bearer follows the binding set's source): 42 - 1 = 41. Found {sites}. A change here \
+         (its bearer follows the binding set's source): 42 - 1 = 41. Plan \
+         2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
+         added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
+         session-noop): 41 to 42. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
