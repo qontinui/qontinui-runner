@@ -916,10 +916,15 @@ if ($CrossPlatform) {
         }
         # A report that names the WRONG platform was passed in the wrong slot,
         # and comparing it would report a platform difference that is really no
-        # difference at all. One with NO platform predates Phase 6B, so it can
-        # only be a Windows report -- accepted in neither slot, not guessed at.
-        if ([string]$obj.platform -ne $Expected) {
-            $label = $(if ($obj.platform) { [string]$obj.platform } else { 'unlabelled' })
+        # difference at all. One with NO provenance.platform predates Phase 6B
+        # (or recorded it as unknown), so it is accepted in neither slot, not
+        # guessed at.
+        $plat = $null
+        if ($null -ne $obj.provenance -and $obj.provenance.platform -and -not ([string]$obj.provenance.platform -match '^unknown\(')) {
+            $plat = [string]$obj.provenance.platform
+        }
+        if ($plat -ne $Expected) {
+            $label = $(if ($plat) { $plat } else { 'unlabelled' })
             return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_is_$label" }
         }
         return [PSCustomObject]@{ Report = $obj; Problem = $null }
@@ -1025,7 +1030,7 @@ function New-ParityRunProvenance {
         -RunId $env:GITHUB_RUN_ID -RunEvent $env:GITHUB_EVENT_NAME -GeneratedAt $GeneratedAt `
         -ManifestAxis $ManifestAxis `
         -BehaviouralAxis (Format-ParityUnknown 'not_yet_measured: the contract-smoke legs run after this step') `
-        -Siblings $siblingProvenance)
+        -Siblings $siblingProvenance -Platform $ParityPlatform)
 }
 
 # A comparison that could not happen still reports. Before this, exit 2 left
@@ -1378,11 +1383,6 @@ Write-Host ""
 $generatedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $provenance = New-ParityRunProvenance -GeneratedAt $generatedAt -ManifestAxis (Get-ParityManifestAxis -Result $result)
 $reportObj = ConvertTo-ParityReportObject -Result $result -GeneratedAt $generatedAt -Observability $observability -Provenance $provenance
-# Which platform BOTH legs ran on (Phase 6B). Added here rather than inside
-# ConvertTo-ParityReportObject because it is a fact about this run, not about
-# the two manifests -- and the cross-platform comparison (-CrossPlatform, below)
-# refuses a pair of reports whose platforms are not one windows and one linux.
-$reportObj | Add-Member -NotePropertyName platform -NotePropertyValue $ParityPlatform
 if ($JsonOut) {
     $dir = Split-Path -Parent $JsonOut
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }

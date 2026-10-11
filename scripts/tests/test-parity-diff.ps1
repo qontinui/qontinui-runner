@@ -839,10 +839,10 @@ if ($null -ne $gitCmd) {
 }
 
 # ---------------------------------------------------------------------------
-# [14] Platform helpers (Phase 6B). The dev leg's name and build-dir guard were
+# [17] Platform helpers (Phase 6B). The dev leg's name and build-dir guard were
 # Windows literals; on Linux they would have refused every dev binary.
 # ---------------------------------------------------------------------------
-Write-Host "[14] platform helpers: dev exe name, build-dir guard, /proc/<pid>/stat"
+Write-Host "[17] platform helpers: dev exe name, build-dir guard, /proc/<pid>/stat"
 Assert-Equal "windows dev exe"                 'qontinui-runner.exe' (Get-ParityDevExeName -Platform 'windows')
 Assert-Equal "linux dev exe"                   'qontinui-runner'     (Get-ParityDevExeName -Platform 'linux')
 Assert-True  "host platform is one of three"   (@('windows', 'linux', 'macos') -contains (Get-ParityHostPlatform))
@@ -867,17 +867,17 @@ Assert-Equal "stat: truncated line"            $null    (ConvertFrom-ParityProcS
 Assert-Equal "stat: non-numeric pid"           $null    (ConvertFrom-ParityProcStat -Line ('x (y) ' + (@(1..25) -join ' ')))
 
 # ---------------------------------------------------------------------------
-# [15] Cross-platform, published side only. The reports are built by the REAL
+# [18] Cross-platform, published side only. The reports are built by the REAL
 # pipeline (Compare-CapabilityManifests -> ConvertTo-ParityReportObject) and
 # round-tripped through JSON, because the workflow compares the two JSON
 # artifacts the legs uploaded, not in-memory objects.
 # ---------------------------------------------------------------------------
-Write-Host "[15] cross-platform comparison over two real-shaped reports"
+Write-Host "[18] cross-platform comparison over two real-shaped reports"
 function New-PlatformReport {
     param($Published, [string]$Platform)
     $res = Compare-CapabilityManifests -Dev (New-Manifest) -Published $Published
-    $obj = ConvertTo-ParityReportObject -Result $res -GeneratedAt '2026-10-09T00:00:00Z' -Observability $null
-    $obj | Add-Member -NotePropertyName platform -NotePropertyValue $Platform
+    $prov = New-ParityProvenance -GeneratedAt '2026-10-09T00:00:00Z' -Platform $Platform
+    $obj = ConvertTo-ParityReportObject -Result $res -GeneratedAt '2026-10-09T00:00:00Z' -Observability $null -Provenance $prov
     return (($obj | ConvertTo-Json -Depth 10) | ConvertFrom-Json)
 }
 $pubObserved = { Set-Rung (Set-Rung (New-Manifest) 'bundled_resources' 'bundle_resource') 'spec_pages' 'embedded' }
@@ -912,11 +912,11 @@ Assert-Equal "roster difference is labelled"   'only_on_linux' (@($c4.Rows | Whe
 Assert-Equal "  and is not counted as differs" 0 $c4.DifferCount
 
 # ---------------------------------------------------------------------------
-# [16] The refusals. Each one would otherwise produce a number that means
+# [19] The refusals. Each one would otherwise produce a number that means
 # something else: a 0 from a missing leg, or "platform difference" from two
 # different releases.
 # ---------------------------------------------------------------------------
-Write-Host "[16] cross-platform refusals are UNKNOWN, never 0"
+Write-Host "[19] cross-platform refusals are UNKNOWN, never 0"
 $r1 = Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport $null
 Assert-True  "missing linux: unavailable"      (-not $r1.Available)
 Assert-Equal "missing linux: reason"           'linux_report_missing' $r1.Reason
@@ -946,6 +946,27 @@ Assert-Equal "roster-only row is counted"      1 $c4.OnlyOnOneCount
 $noVer = & $pubObserved
 $noVer.app_version = $null
 Assert-Equal "version unknown: reason"         'published_version_unknown' (Compare-ParityPublishedAcrossPlatforms -WindowsReport $winR -LinuxReport (New-PlatformReport $noVer 'linux')).Reason
+
+# ---------------------------------------------------------------------------
+# [20] The platform lives in the PROVENANCE block (Phase 6B on top of Phase 2).
+# It is a fact about the run, recorded where the other run facts are, and the
+# summary's first line names it so the two legs' summaries are told apart.
+# ---------------------------------------------------------------------------
+Write-Host "[20] provenance.platform, and the summary heading that names it"
+$pLin = New-ParityProvenance -GeneratedAt '2026-10-09T00:00:00Z' -Platform 'linux'
+Assert-Equal "provenance records the platform"  'linux' $pLin.platform
+$pNone = New-ParityProvenance -GeneratedAt '2026-10-09T00:00:00Z'
+Assert-True  "no platform is unknown, never empty" ([string]$pNone.platform -match '^unknown\(')
+Assert-Equal "report carries it under provenance" 'linux' $linR.provenance.platform
+Assert-True  "and not as a top-level field"     ($null -eq $linR.PSObject.Properties['platform'])
+$mdLin = @(Format-ParitySummaryMarkdown -Result $r9 -Provenance $pLin)
+Assert-True  "heading names the platform"       ($mdLin[0] -match '^### Published-build capability parity \(linux\) -- ')
+Assert-True  "heading still carries the unobserved count" ($mdLin[0] -match '\b9 of 9\b')
+$mdNone = @(Format-ParitySummaryMarkdown -Result $r9 -Provenance $pNone)
+Assert-True  "an unknown platform adds no label" ($mdNone[0] -match '^### Published-build capability parity -- ')
+$unl = Compare-CapabilityManifests -Dev (New-Manifest) -Published (& $pubObserved)
+$unlR = ((ConvertTo-ParityReportObject -Result $unl -GeneratedAt '2026-10-09T00:00:00Z' -Observability $null -Provenance $pNone) | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+Assert-True  "an unknown provenance.platform is not a platform" ([string]$unlR.provenance.platform -match '^unknown\(')
 
 Write-Host ""
 if ($failures -gt 0) {

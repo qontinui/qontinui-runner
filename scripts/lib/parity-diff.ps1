@@ -838,7 +838,8 @@ function New-ParityProvenance {
     param(
         $DevSha, [string]$PublishedTag, $PublishedSha, $SkewCommits,
         [string]$RunId, [string]$RunEvent, [string]$GeneratedAt,
-        [string]$ManifestAxis, [string]$BehaviouralAxis, $Siblings = @(), $Divergence = $null
+        [string]$ManifestAxis, [string]$BehaviouralAxis, $Siblings = @(), $Divergence = $null,
+        [string]$Platform = $null
     )
 
     $skew = $SkewCommits
@@ -862,6 +863,10 @@ function New-ParityProvenance {
         run_id        = $(if ($RunId) { $RunId } else { Format-ParityUnknown 'not_a_workflow_run' })
         run_event     = $(if ($RunEvent) { $RunEvent } else { Format-ParityUnknown 'not_a_workflow_run' })
         generated_at  = $GeneratedAt
+        # Which platform BOTH legs ran on (Phase 6B). The cross-platform list
+        # (-CrossPlatform) refuses a pair whose platforms are not one windows
+        # and one linux, so a report that cannot say is unknown, never assumed.
+        platform      = $(if ($Platform) { $Platform } else { Format-ParityUnknown 'not_recorded' })
         axes          = $axes
         siblings      = @($Siblings)
         siblings_note = ("Checked out by .github/actions/checkout-sibling (declared PR, else " +
@@ -918,7 +923,13 @@ function Update-ParityReportBehaviouralAxis {
     $axis = Format-ParityUnknown 'behavioural_step_did_not_report'
     if (Test-Path -LiteralPath $AxisPath) { $axis = (Get-Content -LiteralPath $AxisPath -Raw).Trim() }
     $full = (Resolve-Path -LiteralPath $JsonPath).Path
-    $report = Get-Content -LiteralPath $full -Raw -Encoding UTF8 | ConvertFrom-Json
+    # -DateKind String where it exists (pwsh 7.5+): without it pwsh would turn the
+    # ISO generated_at strings into DateTime and could re-serialize them in
+    # another format. Windows PowerShell 5.1 has no such conversion and no such
+    # parameter; the Linux leg has only pwsh.
+    $fromJson = @{}
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $fromJson['DateKind'] = 'String' }
+    $report = Get-Content -LiteralPath $full -Raw -Encoding UTF8 | ConvertFrom-Json @fromJson
     if (-not (Set-ParityBehaviouralAxis -Report $report -Axis $axis)) {
         Write-Host "::warning::The parity artifact carries no provenance.axes block (report_version $($report.report_version)); behavioural axis not stamped."
         return 'no_axes_block'
@@ -946,6 +957,9 @@ function Format-ParitySummaryMarkdown {
           $SelfReportDisagreements = @(), $SessionLedgerRows = @())
 
     $md = New-Object System.Collections.Generic.List[string]
+    # The platform, from the provenance block, so the two legs' summaries are
+    # told apart on the first line.
+    $plat = $(if ($null -ne $Provenance -and $Provenance.platform -and -not ([string]$Provenance.platform -match '^unknown\(')) { " ($($Provenance.platform))" } else { '' })
     $total = @($Result.Rows).Count
     $u = $Result.UnobservedCount
 
@@ -953,11 +967,11 @@ function Format-ParitySummaryMarkdown {
         # A refusal compared nothing, so every row is unobserved. The row union
         # was never built; the larger leg's roster is the honest denominator.
         $n = [Math]::Max([int]$Result.Identity.DevRowCount, [int]$Result.Identity.PublishedRowCount)
-        $md.Add("### Published-build capability parity -- REFUSED (schema mismatch): $n of $n rows UNOBSERVED (refused), none compared")
+        $md.Add("### Published-build capability parity$plat -- REFUSED (schema mismatch): $n of $n rows UNOBSERVED (refused), none compared")
     } elseif ($u -ge $script:ParityUnobservedHeadlineThreshold) {
-        $md.Add("### Published-build capability parity -- THIN: $u of $total rows UNOBSERVED, never compared")
+        $md.Add("### Published-build capability parity$plat -- THIN: $u of $total rows UNOBSERVED, never compared")
     } else {
-        $md.Add("### Published-build capability parity -- $u of $total rows unobserved")
+        $md.Add("### Published-build capability parity$plat -- $u of $total rows unobserved")
     }
     $md.Add("")
 

@@ -1000,7 +1000,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     # Ladder: apt 10 + build 60 + unpack 10 + parity 30 + smoke 25 + 25 +
-    # diff 5 = 165 of step budget, plus checkout, the siblings, setup,
+    # diff 5 + stamp 2 = 167 of step budget, plus checkout, the siblings, setup,
     # `pnpm install` and the unit tests (~10). A JOB timeout cancels rather than
     # reports (the #1511 shape the Windows job's comment records), so the job
     # bound sits above the ladder.
@@ -1246,6 +1246,9 @@ jobs:
         env:
           QONTINUI_ALLOW_NO_DB: "1"
           PREFIX: ${{ steps.linux_asset.outputs.prefix }}
+          # The provenance block's published_tag / skew_commits, bound through
+          # env as on the Windows job.
+          PARITY_RELEASE_TAG: ${{ steps.release.outputs.tag }}
         shell: bash
         run: |
           mkdir -p parity-report
@@ -1302,6 +1305,18 @@ jobs:
         shell: bash
         run: bash scripts/behavioural-diff.sh smoke-dev.log smoke-published.log linux
 
+      # The Windows job's stamp step, under pwsh (the only PowerShell here).
+      # Update-ParityReportBehaviouralAxis reads the JSON with -DateKind String
+      # where pwsh offers it, so generated_at survives the round trip.
+      - name: Stamp the behavioural axis into the provenance block
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          . ./scripts/lib/parity-diff.ps1
+          Update-ParityReportBehaviouralAxis -JsonPath 'parity-report/published-parity.json' -AxisPath 'parity-report/behavioural-axis.txt'
+
       - name: Upload the row-level parity diff
         if: always()
         uses: actions/upload-artifact@v4
@@ -1312,6 +1327,7 @@ jobs:
           path: |
             parity-report/published-parity.json
             parity-report/published-parity.log
+            parity-report/behavioural-axis.txt
             smoke-dev.log
             smoke-published.log
             dev-routes.txt
@@ -1324,6 +1340,7 @@ jobs:
           COMPARABLE_COUNT: ${{ steps.parity.outputs.comparable-count }}
           UNOBSERVED_COUNT: ${{ steps.parity.outputs.unobserved-count }}
           SCHEMA_REFUSED: ${{ steps.parity.outputs.schema-refused }}
+          SKEW_COMMITS: ${{ steps.parity.outputs.skew-commits }}
           PLATFORM: ${{ steps.parity.outputs.platform }}
           LINUX_UNKNOWN: ${{ steps.linux_asset.outputs.linux-unknown }}
           LOCATOR_UNKNOWN: ${{ steps.parity.outputs.linux-unknown-reason }}
@@ -1333,6 +1350,7 @@ jobs:
           echo "comparable-count          = '${COMPARABLE_COUNT:-}'"
           echo "unobserved-count          = '${UNOBSERVED_COUNT:-}'"
           echo "schema-refused            = '${SCHEMA_REFUSED:-}'"
+          echo "skew-commits              = '${SKEW_COMMITS:-}'"
           echo "linux-unknown             = '${LINUX_UNKNOWN:-${LOCATOR_UNKNOWN:-}}'"
           if [ -z "${PARITY_COUNT:-}" ]; then
             echo "::warning::No Linux parity count was produced (unknown reason: '${LINUX_UNKNOWN:-${LOCATOR_UNKNOWN:-none recorded}}'). This is UNKNOWN, not zero."
