@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
+import { pageWindowStorageKey } from "./pageWindowStorageKey";
 import {
   parseGridSnapshot,
   parseMru,
@@ -378,8 +379,7 @@ interface PersistedState {
 // layout MUST be namespaced by its `windowLabel` or they clobber each other.
 // `"main"` keeps the legacy key unchanged (existing layouts preserved).
 function storageKey(pageId: string, windowLabel: string = "main"): string {
-  const base = pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
-  return windowLabel === "main" ? base : `${base}:window:${windowLabel}`;
+  return pageWindowStorageKey(BASE_STORAGE_KEY, pageId, windowLabel);
 }
 
 /**
