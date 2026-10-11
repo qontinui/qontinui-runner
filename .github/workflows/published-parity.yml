@@ -1013,7 +1013,65 @@ jobs:
       linux_unknown: ${{ steps.linux_asset.outputs.linux-unknown || steps.parity.outputs.linux-unknown-reason }}
 
     steps:
+      # Full history, as on the Windows job: skew_commits is `git rev-list
+      # --count <tag>..HEAD`, which a depth-1 clone can only answer as
+      # unknown(shallow_clone). blob:none keeps it cheap.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      # The Windows job's guard, verbatim: a dispatch whose ref would mislabel
+      # the run is refused here too, before the build.
+      # FIRST, before the hour-long build: refuse the two dispatch shapes that
+      # would MISLABEL a run, and nothing else. release.yml's dispatch-parity
+      # falls back from `--ref refs/tags/v<ver>` to the bare `--ref v<ver>`,
+      # and GitHub resolves a bare name itself -- possibly to a BRANCH of the
+      # same name. Refused, naming both values:
+      #   (a) GITHUB_REF is a tag, but not refs/tags/<release_tag>: the run
+      #       would build one release's tag and install another's.
+      #   (b) GITHUB_REF is refs/heads/<release_tag>: a branch shadowing the
+      #       tag name -- the fallback-resolution case. It would build the
+      #       branch while reading as the release's own tag.
+      # Any OTHER branch with release_tag set PASSES: comparing a branch (main,
+      # say) against an older release is a capability this workflow keeps, and
+      # the provenance block labels it honestly -- dev_sha, published_sha, and
+      # skew_commits, which is a count only when the tag is an ancestor of the
+      # branch and unknown(<reason>) otherwise.
+      - name: A dispatched release_tag cannot be mislabelled by the ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          # Bound through env, not spliced into the script text: a tag name
+          # may carry shell metacharacters (see "Resolve the release" below).
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -z "$INPUT_TAG" ]; then
+            echo "No release_tag supplied -- this run compares against the latest release."
+            exit 0
+          fi
+          # Charset gate BEFORE the value is echoed anywhere. A dispatched input
+          # is caller-supplied text: a newline in it would put a line starting
+          # `::` on stdout, which the runner reads as a WORKFLOW COMMAND. A
+          # release tag here is vX.Y.Z[-pre][+build], so [0-9A-Za-z.+-] is the
+          # whole alphabet. The refusal prints the value %q-escaped (a newline
+          # renders as $'\n'), never raw.
+          if [[ ! "$INPUT_TAG" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            printf '::error::release_tag_invalid_charset: release_tag=%q contains a character outside [0-9A-Za-z.+-]. Refusing before it is used anywhere.\n' "$INPUT_TAG"
+            exit 1
+          fi
+          case "$GITHUB_REF" in
+            "refs/tags/${INPUT_TAG}")
+              echo "GITHUB_REF is refs/tags/${INPUT_TAG}: a same-SHA reading of the release's own tag." ;;
+            refs/tags/*)
+              echo "::error::release_tag/ref mismatch: release_tag='${INPUT_TAG}' but GITHUB_REF='${GITHUB_REF}' is a DIFFERENT tag. This run would build one release and install another. Re-dispatch with --ref refs/tags/${INPUT_TAG}."
+              exit 1 ;;
+            "refs/heads/${INPUT_TAG}")
+              echo "::error::release_tag/ref mismatch: release_tag='${INPUT_TAG}' but GITHUB_REF='${GITHUB_REF}' is a BRANCH shadowing that tag name -- the bare-name ref resolved to the branch. This run would build the branch while reading as the release's own tag. Re-dispatch with --ref refs/tags/${INPUT_TAG}."
+              exit 1 ;;
+            *)
+              echo "Building ${GITHUB_REF} against release ${INPUT_TAG}: a cross-version comparison. skew_commits in the provenance block states the distance (unknown when the tag is not an ancestor)." ;;
+          esac
+        shell: bash
 
       # Same coupling, same reason as the Windows job: the rust-cache step below
       # reads ci.yml's `test` job cache (its ubuntu-22.04 leg, by OS key).

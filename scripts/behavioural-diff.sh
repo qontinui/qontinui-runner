@@ -12,7 +12,9 @@
 # stamp step reads (Update-ParityReportBehaviouralAxis, lib/parity-diff.ps1). A leg with no probe lines is
 # reported as UNKNOWN and exits 0: a missing measurement is never a clean one.
 # Gates nothing; exits non-zero only on a usage error.
-set -u
+# -eo pipefail, as the inline step it replaced ran under GitHub's bash: a
+# failure mid-diff must abort before `observed` is written (see the end).
+set -euo pipefail
 if [ $# -lt 2 ]; then
   echo "usage: $0 <dev-log> <published-log> [label]" >&2
   exit 2

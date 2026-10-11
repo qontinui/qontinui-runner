@@ -927,6 +927,12 @@ if ($CrossPlatform) {
             $label = $(if ($plat) { $plat } else { 'unlabelled' })
             return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_is_$label" }
         }
+        # A leg that could not compare (exit 2) still writes a provenance-only
+        # artifact; name ITS reason rather than letting the comparison refuse
+        # it later as published_version_unknown.
+        if ($obj.unavailable) {
+            return [PSCustomObject]@{ Report = $null; Problem = "${Expected}_report_unavailable($($obj.unavailable))" }
+        }
         return [PSCustomObject]@{ Report = $obj; Problem = $null }
     }
     $w = & $readReport $WindowsReport 'windows'
