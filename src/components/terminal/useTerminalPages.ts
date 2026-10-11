@@ -407,7 +407,7 @@ export function reconcilePages(
  * (`terminal_session_list_open`). Returns `null` when a source could not be read
  * (occupancy UNKNOWN) unless `bestEffort`, which returns whatever was read.
  */
-async function readOccupiedPageIds(bestEffort = false): Promise<Set<string> | null> {
+export async function readOccupiedPageIds(bestEffort = false): Promise<Set<string> | null> {
   const ids = new Set<string>();
   let complete = true;
 
