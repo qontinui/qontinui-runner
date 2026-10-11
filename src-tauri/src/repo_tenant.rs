@@ -390,6 +390,45 @@ pub fn parse_repo_tenants(body: &serde_json::Value) -> Result<RepoTenantsAnswer,
     })
 }
 
+/// Why a `GET /coord/repos/tenants` read established nothing. Every arm is
+/// UNKNOWN; `transient` says whether asking again can change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoTenantsError {
+    pub reason: String,
+    /// `true` for a failure that may clear by itself (transport, timeout, a
+    /// 5xx, an unreadable body). `false` for a standing refusal that a retry
+    /// in this process cannot change: a `404` (this coord predates the door),
+    /// a `403` (this credential does not prove a device — e.g. a session
+    /// running on the anonymous bootstrap credential), a `400` (coord refuses
+    /// the repo spelling).
+    pub transient: bool,
+}
+
+impl RepoTenantsError {
+    /// What a probe arm that never needs coord ([`RepoProbe::NotACheckout`],
+    /// [`RepoProbe::Failed`], [`RepoProbe::NotGithub`]) hands the classifier.
+    /// The classifier answers those arms before reading it.
+    fn not_consulted() -> Self {
+        Self {
+            reason: "not consulted".to_string(),
+            transient: false,
+        }
+    }
+
+    fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            transient: true,
+        }
+    }
+}
+
+/// Does a non-2xx status describe a standing refusal rather than a blip?
+/// See [`RepoTenantsError::transient`].
+fn repo_tenants_status_is_standing(status: u16) -> bool {
+    matches!(status, 400 | 403 | 404)
+}
+
 /// The `Err` text for a non-2xx from `GET /coord/repos/tenants`. Every such
 /// answer is UNKNOWN — coord's own contract is that it never answers "could
 /// not look" (`503`) or "will not say" (`403`) as `none` — and the typed
@@ -411,7 +450,7 @@ fn repo_tenants_refusal(status: u16, body: &serde_json::Value) -> String {
     }
 }
 
-async fn fetch_repo_tenants(slug: String) -> Result<RepoTenantsAnswer, String> {
+async fn fetch_repo_tenants(slug: String) -> Result<RepoTenantsAnswer, RepoTenantsError> {
     let (base, _coord_base_source) = crate::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/repos/tenants");
@@ -421,28 +460,33 @@ async fn fetch_repo_tenants(slug: String) -> Result<RepoTenantsAnswer, String> {
         // read's own error (named) rather than the resolver's generic timeout.
         .timeout(REPO_TENANTS_HTTP_TIMEOUT)
         .build()
-        .map_err(|e| format!("build http client: {e}"))?;
+        .map_err(|e| RepoTenantsError::transient(format!("build http client: {e}")))?;
 
     // coord-tenant-scope(device): the door is scoped BY the device — it answers `coord.tenant_repos ∩ the caller device's coord.tenant_devices bindings` and refuses a principal that does not prove a device (`repo_tenants_read.rs` "Who can ask"). The device credential is therefore the one the answer is defined over, not a default standing in for an unknown tenant; this read is also what DETERMINES a cwd's tenant, so scoping it on one would be circular.
     let resp = crate::auth::attach_device_auth(client.get(&url).query(&[("repo", slug.as_str())]))
         .send()
         .await
-        .map_err(|e| format!("GET /coord/repos/tenants: {e}"))?;
+        .map_err(|e| RepoTenantsError::transient(format!("GET /coord/repos/tenants: {e}")))?;
 
     let status = resp.status();
     if !status.is_success() {
         // The typed refusal body is best-effort: an unreadable one still
         // leaves the status, which is already an UNKNOWN.
         let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
-        return Err(repo_tenants_refusal(status.as_u16(), &body));
+        return Err(RepoTenantsError {
+            reason: repo_tenants_refusal(status.as_u16(), &body),
+            transient: !repo_tenants_status_is_standing(status.as_u16()),
+        });
     }
 
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("parse repo-tenants body: {e}"))?;
+        .map_err(|e| RepoTenantsError::transient(format!("parse repo-tenants body: {e}")))?;
 
-    parse_repo_tenants(&body)
+    // A 2xx we cannot read is treated as transient: a coord mid-deploy may
+    // serve a shape the next instance does not.
+    parse_repo_tenants(&body).map_err(RepoTenantsError::transient)
 }
 
 // ===========================================================================
@@ -543,9 +587,18 @@ static CANONICAL_REPOS: once_cell::sync::Lazy<CanonicalRepoCache> =
 ///
 /// Generic over the key so the same TTL'd, failure-aware cache also holds the
 /// per-repo `GET /coord/repos/tenants` answers ([`REPO_TENANTS`]).
+///
+/// **Single-flight per key.** A cold burst for one key (every spawn into one
+/// checkout, all at once) runs `detect` ONCE and every concurrent caller
+/// shares that one result — including an uncacheable one, so a coord outage
+/// costs one bounded read per burst rather than one per spawn. A caller that
+/// arrives after the flight finished and finds nothing cached starts a new
+/// flight, which is what "a failure is not remembered" means.
 struct KeyCache<K, V> {
     ttl: Duration,
     entries: RwLock<HashMap<K, (Instant, V)>>,
+    /// The in-flight `detect` per key. Removed when it completes.
+    inflight: tokio::sync::Mutex<HashMap<K, std::sync::Arc<tokio::sync::OnceCell<V>>>>,
 }
 
 /// The directory-keyed instance of [`KeyCache`].
@@ -554,12 +607,23 @@ type DirCache<V> = KeyCache<PathBuf, V>;
 /// The slug cache is the `Option<String>` instance of [`DirCache`].
 type RepoSlugCache = DirCache<Option<String>>;
 
-impl<K: std::hash::Hash + Eq, V: Clone> KeyCache<K, V> {
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> KeyCache<K, V> {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
             entries: RwLock::new(HashMap::new()),
+            inflight: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn fresh_hit<Q>(&self, key: &Q, now: Instant) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let entries = self.entries.read().await;
+        let (at, v) = entries.get(key)?;
+        (now.saturating_duration_since(*at) < self.ttl).then(|| v.clone())
     }
 
     /// Answer for `dir` from the cache, else through `detect`, storing the
@@ -578,22 +642,46 @@ impl<K: std::hash::Hash + Eq, V: Clone> KeyCache<K, V> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = V>,
     {
-        {
-            let entries = self.entries.read().await;
-            if let Some((at, v)) = entries.get(key) {
-                if now.saturating_duration_since(*at) < self.ttl {
-                    return v.clone();
+        if let Some(hit) = self.fresh_hit(key, now).await {
+            return hit;
+        }
+        let flight = {
+            let mut inflight = self.inflight.lock().await;
+            // Re-check under the flight lock: a flight that finished while we
+            // waited has already stored its (cacheable) answer.
+            if let Some(hit) = self.fresh_hit(key, now).await {
+                return hit;
+            }
+            match inflight.get(key) {
+                Some(f) => f.clone(),
+                None => {
+                    let f = std::sync::Arc::new(tokio::sync::OnceCell::new());
+                    inflight.insert(key.to_owned(), f.clone());
+                    f
                 }
             }
-        }
-        let fresh = detect().await;
-        if cacheable(&fresh) {
-            let mut entries = self.entries.write().await;
-            // Prune expired entries on every insert, so directories that are
-            // never asked about again (every spawn's cwd) do not accumulate.
-            let ttl = self.ttl;
-            entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
-            entries.insert(key.to_owned(), (now, fresh.clone()));
+        };
+        // Exactly one caller's `detect` runs; the rest wait on it. If that
+        // caller is cancelled mid-flight (its budget ran out), the OnceCell
+        // hands initialisation to the next waiter.
+        let fresh = flight.get_or_init(detect).await.clone();
+        {
+            let mut inflight = self.inflight.lock().await;
+            if inflight
+                .get(key)
+                .is_some_and(|f| std::sync::Arc::ptr_eq(f, &flight))
+            {
+                inflight.remove(key);
+                if cacheable(&fresh) {
+                    let mut entries = self.entries.write().await;
+                    // Prune expired entries on every insert, so directories
+                    // that are never asked about again (every spawn's cwd) do
+                    // not accumulate.
+                    let ttl = self.ttl;
+                    entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
+                    entries.insert(key.to_owned(), (now, fresh.clone()));
+                }
+            }
         }
         fresh
     }
@@ -623,22 +711,30 @@ static REPO_SLUGS: once_cell::sync::Lazy<RepoSlugCache> =
 /// TTL'd `repo slug → GET /coord/repos/tenants answer` cache for the cwd
 /// resolver: a burst of spawns into one checkout (~130 were observed during the
 /// 2026-08-30 wedge) costs one coord read per repo per [`CACHE_TTL`], not one
-/// per spawn. Only an ANSWER is kept — an `Err` (coord unreachable, a 503, a
-/// 403) is UNKNOWN and is asked again by the next caller, the same rule
-/// [`REPO_PROBES`] applies to a failed `git` probe; each such retry is bounded
-/// by [`REPO_TENANTS_HTTP_TIMEOUT`].
-static REPO_TENANTS: once_cell::sync::Lazy<KeyCache<String, Result<RepoTenantsAnswer, String>>> =
+/// per spawn. Only an ANSWER is kept ([`repo_tenants_cacheable`]) — an `Err`
+/// (coord unreachable, a 503, a 403) is UNKNOWN and is asked again by the next
+/// flight, the same rule [`REPO_PROBES`] applies to a failed `git` probe; the
+/// cache's single flight bounds that to one [`REPO_TENANTS_HTTP_TIMEOUT`]-bound
+/// read per burst.
+type RepoTenantsResult = Result<RepoTenantsAnswer, RepoTenantsError>;
+
+static REPO_TENANTS: once_cell::sync::Lazy<KeyCache<String, RepoTenantsResult>> =
     once_cell::sync::Lazy::new(|| KeyCache::new(CACHE_TTL));
 
+/// What [`REPO_TENANTS`] keeps: an answer, never a failure.
+fn repo_tenants_cacheable(r: &RepoTenantsResult) -> bool {
+    r.is_ok()
+}
+
 /// The tenants-for-repo answer for `slug`, through [`REPO_TENANTS`].
-pub async fn repo_tenants_for_slug(slug: &str) -> Result<RepoTenantsAnswer, String> {
+pub async fn repo_tenants_for_slug(slug: &str) -> RepoTenantsResult {
     let owned = slug.to_string();
     REPO_TENANTS
         .lookup(
             slug,
             Instant::now(),
             || fetch_repo_tenants(owned),
-            |r| r.is_ok(),
+            repo_tenants_cacheable,
         )
         .await
 }
@@ -961,7 +1057,7 @@ fn display_remote(url: &str) -> String {
 /// without coord).
 pub fn classify_cwd_tenant(
     probe: &RepoProbe,
-    answer: Result<&RepoTenantsAnswer, &str>,
+    answer: Result<&RepoTenantsAnswer, &RepoTenantsError>,
     observed_at: &str,
 ) -> CwdTenant {
     let slug = match probe {
@@ -978,9 +1074,14 @@ pub fn classify_cwd_tenant(
         Ok(a) => a,
         // Coord did not answer (unreachable, a 403/503, a 404 from a coord that
         // predates the door, an unparseable body): UNKNOWN, never
-        // "unregistered".
+        // "unregistered". A standing refusal is a standing UNKNOWN.
         Err(e) => {
-            return CwdTenant::unknown_transient(format!("coord tenants-for-repo unreadable: {e}"))
+            let reason = format!("coord tenants-for-repo unreadable: {}", e.reason);
+            return if e.transient {
+                CwdTenant::unknown_transient(reason)
+            } else {
+                CwdTenant::unknown(reason)
+            };
         }
     };
     // Coord echoes its normalized spelling of what was asked. An answer for a
@@ -1030,7 +1131,7 @@ pub async fn cwd_tenant_for_path(path: &Path) -> CwdTenant {
 async fn cwd_tenant_with<F, Fut>(path: &Path, budget: Duration, fetch: F) -> CwdTenant
 where
     F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Result<RepoTenantsAnswer, String>>,
+    Fut: Future<Output = RepoTenantsResult>,
 {
     let resolve = async {
         // A session's workdir is a DIRECTORY. One that does not exist says
@@ -1073,13 +1174,13 @@ where
             // Only a slug needs coord at all.
             RepoProbe::Slug(slug) => {
                 let answer = fetch(slug.clone()).await;
-                classify_cwd_tenant(
-                    &probe,
-                    answer.as_ref().map_err(|e| e.as_str()),
-                    &observed_at,
-                )
+                classify_cwd_tenant(&probe, answer.as_ref(), &observed_at)
             }
-            _ => classify_cwd_tenant(&probe, Err("not consulted"), &observed_at),
+            _ => classify_cwd_tenant(
+                &probe,
+                Err(&RepoTenantsError::not_consulted()),
+                &observed_at,
+            ),
         }
     };
     match tokio::time::timeout(budget, resolve).await {
@@ -1098,7 +1199,7 @@ pub async fn cwd_tenant_for_slug(slug: &str) -> CwdTenant {
     let answer = repo_tenants_for_slug(slug).await;
     classify_cwd_tenant(
         &RepoProbe::Slug(slug.to_string()),
-        answer.as_ref().map_err(|e| e.as_str()),
+        answer.as_ref(),
         &observed_at,
     )
 }
@@ -1210,7 +1311,7 @@ mod tests {
     fn an_scp_remote_never_shows_what_precedes_the_at() {
         let t = classify_cwd_tenant(
             &RepoProbe::NotGithub("me:s3cret@gitlab.example:acme/x.git".into()),
-            Err("not consulted"),
+            Err(&RepoTenantsError::not_consulted()),
             "t0",
         );
         match t {
@@ -1760,18 +1861,43 @@ mod tests {
     /// "unregistered" — the two used to render identically.
     #[test]
     fn a_coord_failure_is_unknown_not_unregistered() {
-        for err in [
-            "GET /coord/repos/tenants: connection refused",
-            "GET /coord/repos/tenants returned 503 (tenant_repos_unavailable)",
-            "GET /coord/repos/tenants returned 404 — this coord predates the tenants-for-repo door",
+        for (err, transient) in [
+            ("GET /coord/repos/tenants: connection refused", true),
+            (
+                "GET /coord/repos/tenants returned 503 (tenant_repos_unavailable)",
+                true,
+            ),
+            (
+                "GET /coord/repos/tenants returned 404 — this coord predates the tenants-for-repo door",
+                false,
+            ),
         ] {
-            match classify_cwd_tenant(&slug("acme/pizzeria"), Err(err), "t0") {
-                CwdTenant::Unknown { reason, transient } => {
+            let e = RepoTenantsError {
+                reason: err.to_string(),
+                transient,
+            };
+            match classify_cwd_tenant(&slug("acme/pizzeria"), Err(&e), "t0") {
+                CwdTenant::Unknown {
+                    reason,
+                    transient: got,
+                } => {
                     assert!(reason.contains(err), "{reason}");
-                    assert!(transient, "a coord failure may clear by itself");
+                    assert_eq!(got, transient, "transience is carried through: {err}");
                 }
                 other => panic!("coord failure must be Unknown, got {other:?}"),
             }
+        }
+    }
+
+    /// A refusal a retry cannot change (older coord, unproven device,
+    /// refused spelling) is a STANDING unknown; a 5xx or 429 is transient.
+    #[test]
+    fn standing_refusals_are_not_transient() {
+        for status in [400u16, 403, 404] {
+            assert!(repo_tenants_status_is_standing(status), "{status}");
+        }
+        for status in [401u16, 429, 500, 502, 503, 504] {
+            assert!(!repo_tenants_status_is_standing(status), "{status}");
         }
     }
 
@@ -1798,13 +1924,17 @@ mod tests {
     #[test]
     fn git_failure_is_unknown_and_no_checkout_is_no_repo() {
         assert_eq!(
-            classify_cwd_tenant(&RepoProbe::NotACheckout, Err("not consulted"), "t0"),
+            classify_cwd_tenant(
+                &RepoProbe::NotACheckout,
+                Err(&RepoTenantsError::not_consulted()),
+                "t0"
+            ),
             CwdTenant::NoRepo
         );
         assert!(matches!(
             classify_cwd_tenant(
                 &RepoProbe::Failed("timed out".into()),
-                Err("not consulted"),
+                Err(&RepoTenantsError::not_consulted()),
                 "t0"
             ),
             CwdTenant::Unknown { .. }
@@ -1817,7 +1947,7 @@ mod tests {
     fn a_non_github_remote_is_unregistered_and_redacted() {
         let t = classify_cwd_tenant(
             &RepoProbe::NotGithub("https://user:s3cret@gitlab.com/acme/x.git".into()),
-            Err("not consulted"),
+            Err(&RepoTenantsError::not_consulted()),
             "t0",
         );
         match t {
@@ -1857,7 +1987,9 @@ mod tests {
     async fn the_resolver_reports_coord_unreachable_as_unknown() {
         let Some(d) = github_checkout() else { return };
         let t = cwd_tenant_with(d.path(), Duration::from_secs(10), |_| async {
-            Err("GET /coord/repos/tenants: connection refused".to_string())
+            Err(RepoTenantsError::transient(
+                "GET /coord/repos/tenants: connection refused",
+            ))
         })
         .await;
         assert!(
@@ -1906,7 +2038,7 @@ mod tests {
         let Some(d) = github_checkout() else { return };
         let gone = d.path().join("deleted-subdir");
         let t = cwd_tenant_with(&gone, Duration::from_secs(5), |_| async {
-            Err("must not be asked".to_string())
+            Err(RepoTenantsError::transient("must not be asked"))
         })
         .await;
         assert!(
@@ -1989,17 +2121,22 @@ mod tests {
     /// UNKNOWN and the next caller asks again.
     #[tokio::test]
     async fn the_repo_tenants_cache_keeps_answers_never_failures() {
-        let cache: KeyCache<String, Result<RepoTenantsAnswer, String>> =
-            KeyCache::new(Duration::from_secs(60));
+        let cache: KeyCache<String, RepoTenantsResult> = KeyCache::new(Duration::from_secs(60));
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let now = Instant::now();
-        let ok = |r: &Result<RepoTenantsAnswer, String>| r.is_ok();
-        let fetch = |out: Result<RepoTenantsAnswer, String>| {
+        // The PRODUCTION predicate, so a regression in it fails here.
+        let ok = repo_tenants_cacheable;
+        let fetch = |out: RepoTenantsResult| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { out }
         };
         let got = cache
-            .lookup("acme/x", now, || fetch(Err("503".into())), ok)
+            .lookup(
+                "acme/x",
+                now,
+                || fetch(Err(RepoTenantsError::transient("503"))),
+                ok,
+            )
             .await;
         assert!(got.is_err());
         let got = cache
@@ -2015,7 +2152,7 @@ mod tests {
             .lookup(
                 "acme/x",
                 now + Duration::from_secs(59),
-                || fetch(Err("x".into())),
+                || fetch(Err(RepoTenantsError::transient("x"))),
                 ok,
             )
             .await;
@@ -2025,7 +2162,7 @@ mod tests {
             .lookup(
                 "acme/x",
                 now + Duration::from_secs(60),
-                || fetch(Err("x".into())),
+                || fetch(Err(RepoTenantsError::transient("x"))),
                 ok,
             )
             .await;
@@ -2034,6 +2171,53 @@ mod tests {
             3,
             "past the TTL coord is asked again"
         );
+    }
+
+    /// A cold burst of concurrent lookups for one repo runs ONE fetch, and
+    /// every caller gets that fetch's result — a failure included, which is
+    /// what bounds a coord outage to one read per burst.
+    #[tokio::test]
+    async fn concurrent_cold_repo_tenants_lookups_are_single_flight() {
+        for outcome in [
+            Ok(answer("acme/x", "resolved", &[T1])),
+            Err(RepoTenantsError::transient("coord unreachable")),
+        ] {
+            let cache = std::sync::Arc::new(KeyCache::<String, RepoTenantsResult>::new(
+                Duration::from_secs(60),
+            ));
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let now = Instant::now();
+            let mut joins = Vec::new();
+            for _ in 0..8 {
+                let (cache, calls, outcome) = (cache.clone(), calls.clone(), outcome.clone());
+                joins.push(tokio::spawn(async move {
+                    cache
+                        .lookup(
+                            "acme/x",
+                            now,
+                            || async move {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                outcome
+                            },
+                            repo_tenants_cacheable,
+                        )
+                        .await
+                }));
+            }
+            for j in joins {
+                assert_eq!(j.await.unwrap(), outcome);
+            }
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "one fetch for the whole burst ({outcome:?})"
+            );
+            assert!(
+                cache.inflight.lock().await.is_empty(),
+                "the finished flight is removed"
+            );
+        }
     }
 
     #[test]
@@ -2073,7 +2257,7 @@ mod tests {
     async fn a_directory_outside_any_checkout_is_no_repo() {
         let d = tempfile::tempdir().unwrap();
         let t = cwd_tenant_with(d.path(), Duration::from_secs(5), |_| async {
-            Err("must not be asked".to_string())
+            Err(RepoTenantsError::transient("must not be asked"))
         })
         .await;
         assert_eq!(t, CwdTenant::NoRepo);
