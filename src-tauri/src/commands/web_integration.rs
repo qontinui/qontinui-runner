@@ -160,7 +160,7 @@ pub async fn get_web_integration_status(
 pub(crate) async fn get_web_integration_status_impl(
     server_mode: &tokio::sync::RwLock<Option<ServerModeState>>,
 ) -> Result<GetWebIntegrationStatusResponse, String> {
-    let (persisted, settings_fault) = tokio::task::spawn_blocking(|| {
+    let (persisted, settings_fault) = spawn_blocking_tracked(|| {
         let loaded = settings::load_settings_full();
         let settings_fault = if loaded.is_authoritative() {
             None

@@ -379,42 +379,60 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     setWebBaseUrlError(null);
   }, []);
 
-  // Status loads overlap (the 10 s poll, the change event, Retry), and with a
-  // wedged IPC each one can take the full timeout. Only the LATEST call may
-  // write status/statusError, so an older call timing out cannot overwrite a
-  // newer success with a stale error.
+  // Status loads can overlap (Retry or a save while a load is pending), and
+  // with a wedged IPC each one can take the full timeout. Only the LATEST
+  // started call may write status/statusError, so an older call timing out
+  // cannot overwrite a newer success with a stale error.
   const statusGenerationRef = useRef(0);
+  // Loads currently awaiting an answer. BACKGROUND refreshes (the 10 s poll,
+  // the change event) skip while this is non-zero: the poll period equals
+  // STATUS_LOAD_TIMEOUT_MS, so a poll started on every tick would supersede
+  // the previous one just before its timeout fired — a wedge after one good
+  // load would then never surface — and never-settling invokes would pile up.
+  const statusInFlightRef = useRef(0);
   // Last error text sent to onLog, so a wedge polled every 10 s logs once.
   const lastLoggedStatusErrorRef = useRef<string | null>(null);
 
-  const refreshStatus = useCallback(async (): Promise<WebIntegrationStatus | null> => {
-    const generation = ++statusGenerationRef.current;
-    try {
-      const next = await invokeWithTimeout<WebIntegrationStatus>(
-        STATUS_COMMAND,
-        STATUS_LOAD_TIMEOUT_MS,
-      );
-      if (generation !== statusGenerationRef.current) return next;
-      setStatus(next);
-      setStatusError(null);
-      lastLoggedStatusErrorRef.current = null;
-      if (!seededRef.current) {
-        applyStatusToForm(next);
-        seededRef.current = true;
+  /**
+   * Load the status. `background: true` (poll / change event) is skipped when
+   * a load is already in flight; an explicit refresh (initial load, Retry,
+   * save, pair, sign-in) always starts a new load and takes the generation.
+   */
+  const refreshStatus = useCallback(
+    async (opts?: { background?: boolean }): Promise<WebIntegrationStatus | null> => {
+      if (opts?.background && statusInFlightRef.current > 0) return null;
+      const generation = ++statusGenerationRef.current;
+      statusInFlightRef.current += 1;
+      try {
+        const next = await invokeWithTimeout<WebIntegrationStatus>(
+          STATUS_COMMAND,
+          STATUS_LOAD_TIMEOUT_MS,
+        );
+        if (generation !== statusGenerationRef.current) return next;
+        setStatus(next);
+        setStatusError(null);
+        lastLoggedStatusErrorRef.current = null;
+        if (!seededRef.current) {
+          applyStatusToForm(next);
+          seededRef.current = true;
+        }
+        return next;
+      } catch (err) {
+        if (generation !== statusGenerationRef.current) return null;
+        const message = describeThrown(err, "status load failed");
+        if (message !== lastLoggedStatusErrorRef.current) {
+          lastLoggedStatusErrorRef.current = message;
+          console.error("Failed to load web integration status:", err);
+          onLog("error", `${STATUS_COMMAND} failed: ${message}`);
+        }
+        setStatusError(message);
+        return null;
+      } finally {
+        statusInFlightRef.current -= 1;
       }
-      return next;
-    } catch (err) {
-      if (generation !== statusGenerationRef.current) return null;
-      const message = describeThrown(err, "status load failed");
-      if (message !== lastLoggedStatusErrorRef.current) {
-        lastLoggedStatusErrorRef.current = message;
-        console.error("Failed to load web integration status:", err);
-        onLog("error", `Failed to load web integration status: ${STATUS_COMMAND} ${message}`);
-      }
-      setStatusError(message);
-      return null;
-    }
-  }, [applyStatusToForm, onLog]);
+    },
+    [applyStatusToForm, onLog],
+  );
 
   // --- Initial load + event subscription + polling ---------------------------
   useEffect(() => {
@@ -638,7 +656,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   useEffect(() => {
     // React to save events fired from anywhere (including the web token flow).
     const unlisten = listen("web-integration-changed", () => {
-      void refreshStatus();
+      void refreshStatus({ background: true });
     });
     return () => {
       unlisten
@@ -653,7 +671,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     // Lightweight poll every 10s to pick up lastHeartbeatAt changes and
     // registration state transitions that don't fire the event.
     const id = setInterval(() => {
-      void refreshStatus();
+      void refreshStatus({ background: true });
     }, 10_000);
     return () => clearInterval(id);
   }, [refreshStatus]);

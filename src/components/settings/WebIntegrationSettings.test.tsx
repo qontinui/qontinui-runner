@@ -14,10 +14,12 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 /** When set, the NEXT status invoke resolves with this value (once). */
 let nextStatusReply: unknown = null;
+/** When set, EVERY status invoke rejects with this (unless a reply is queued). */
+let statusRejectWith: Error | null = null;
 
 const STATUS_B = {
   enabled: true,
@@ -38,6 +40,7 @@ const invokeMock = vi.fn((command: string): Promise<unknown> => {
       nextStatusReply = null;
       return Promise.resolve(reply);
     }
+    if (statusRejectWith) return Promise.reject(statusRejectWith);
     // Never settles — the wedged-webview shape.
     return new Promise<unknown>(() => {});
   }
@@ -52,6 +55,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { WebIntegrationSettings } from "./WebIntegrationSettings";
+import type { LogFunction } from "./types";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -62,18 +66,36 @@ function statusCalls(): number {
 describe("WebIntegrationSettings status load", () => {
   let container: HTMLDivElement;
   let root: Root;
+  let onLog: Mock<LogFunction>;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.useFakeTimers();
     invokeMock.mockClear();
     nextStatusReply = null;
+    statusRejectWith = null;
+    onLog = vi.fn<LogFunction>();
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
-    await act(async () => {
-      root.render(createElement(WebIntegrationSettings, { onLog: () => {} }));
-    });
   });
+
+  /** Render the component. Configure the mock replies BEFORE calling this. */
+  async function mount(): Promise<void> {
+    await act(async () => {
+      root.render(createElement(WebIntegrationSettings, { onLog }));
+    });
+  }
+
+  function banner(): Element | null {
+    return container.querySelector("#banner-web-integration-status-error");
+  }
+
+  function statusErrorLogs(): number {
+    return onLog.mock.calls.filter(
+      ([level, msg]) =>
+        level === "error" && String(msg).startsWith("get_web_integration_status failed:"),
+    ).length;
+  }
 
   afterEach(() => {
     act(() => root.unmount());
@@ -83,6 +105,7 @@ describe("WebIntegrationSettings status load", () => {
   });
 
   it("is still loading just before the 10 s bound", async () => {
+    await mount();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(9_999);
     });
@@ -91,6 +114,7 @@ describe("WebIntegrationSettings status load", () => {
   });
 
   it("renders the error state, Retry and the pair-code input once the bound elapses", async () => {
+    await mount();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
@@ -114,6 +138,7 @@ describe("WebIntegrationSettings status load", () => {
   });
 
   it("Retry re-invokes the status command", async () => {
+    await mount();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
@@ -137,6 +162,7 @@ describe("WebIntegrationSettings status load", () => {
   });
 
   it("an older load timing out cannot overwrite a newer success", async () => {
+    await mount();
     // t=10 s: the initial load times out (banner up) and poll A starts; A
     // never settles.
     await act(async () => {
@@ -160,5 +186,40 @@ describe("WebIntegrationSettings status load", () => {
     });
     expect(container.querySelector("#banner-web-integration-status-error")).toBeNull();
     expect(container.textContent).toContain("runner-b");
+  });
+
+  it("a wedge after one good load still surfaces the error, with no poll pile-up", async () => {
+    // The first load answers; every later one never settles.
+    nextStatusReply = STATUS_B;
+    await mount();
+    expect(container.textContent).toContain("runner-b");
+    expect(statusCalls()).toBe(1);
+
+    // t=10 s: the poll starts load A, which hangs. t=20 s: the next tick
+    // must SKIP (A is in flight) rather than supersede A just before A's
+    // timeout — otherwise the wedge would never be reported.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(statusCalls()).toBe(2);
+    expect(banner()).not.toBeNull();
+    expect(banner()?.textContent).toContain("did not answer within 10s");
+  });
+
+  it("a rejected load renders 'failed: <cause>' and logs once across polls", async () => {
+    statusRejectWith = new Error("boom");
+    await mount();
+
+    expect(banner()?.textContent).toContain("get_web_integration_status failed: boom");
+    expect(statusErrorLogs()).toBe(1);
+
+    // Two more polls, both rejecting the same way: the banner stays, the log
+    // does not repeat.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(statusCalls()).toBe(3);
+    expect(banner()?.textContent).toContain("failed: boom");
+    expect(statusErrorLogs()).toBe(1);
   });
 });

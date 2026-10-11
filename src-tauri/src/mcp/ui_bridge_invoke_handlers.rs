@@ -430,12 +430,31 @@ async fn web_integration_status_bounded(
         }
     }
 
-    let response = match tokio::time::timeout(
+    web_integration_status_within(
         bound,
         crate::commands::web_integration::get_web_integration_status_impl(server_mode),
     )
     .await
-    {
+}
+
+/// Bound `body` (the status read) by `bound` and map it onto the invoke
+/// envelope: 504 on expiry, 500 on the command's own `Err`.
+///
+/// Generic over the body so the timeout test can hand it a future that never
+/// completes and touches nothing — no settings read on the blocking pool that
+/// could outlive the test's ambient fixture once the timeout drops its handle.
+async fn web_integration_status_within<F>(
+    bound: Duration,
+    body: F,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)>
+where
+    F: std::future::Future<
+        Output = Result<crate::commands::web_integration::GetWebIntegrationStatusResponse, String>,
+    >,
+{
+    const COMMAND: &str = "get_web_integration_status";
+
+    let response = match tokio::time::timeout(bound, body).await {
         Ok(result) => result.map_err(|e| in_process_command_failed(COMMAND, e))?,
         Err(_) => {
             return Err((
@@ -1151,9 +1170,10 @@ mod in_process_dispatch_tests {
         // `2026-10-11-runner-coord-credential-self-renewal-land-and-close-the-dark-gap`
         // Phase 5: a read of the persisted web-integration settings plus live
         // relay state, so an agent can read it while the webview IPC is wedged.
-        // It returns no credential — `runnerTokenMasked` is a 16+4-char mask —
-        // and the identical response was already served by the frontend
-        // round-trip on the same loopback door, so the surface is unchanged.
+        // The surface is unchanged on windowed runners (the identical response
+        // was already served by the frontend round-trip on the same loopback
+        // door) and newly readable on headless (server_mode) runners; either
+        // way it carries no credential — `runnerTokenMasked` is a 16+4-char mask.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
@@ -1484,17 +1504,16 @@ mod in_process_dispatch_tests {
 
     #[tokio::test]
     async fn in_process_get_web_integration_status_is_bounded_with_a_504() {
-        // Hold the server-mode WRITE lock so the body's read lock can never be
-        // taken — the shape of a future command-side block. The arm must give
-        // up with a 504 naming the command, not hang the HTTP handler.
-        let _amb = crate::test_env::isolated_ambient();
-        let slot = tokio::sync::RwLock::new(None);
-        let _held = slot.write().await;
-
-        let (status, body) = web_integration_status_bounded(
-            &slot,
-            &serde_json::json!({}),
+        // A body that never completes — the shape of a future command-side
+        // block. The arm must give up with a 504 naming the command, not hang
+        // the HTTP handler. The body is `pending()` rather than the real status
+        // read so nothing (no settings read on the blocking pool) is left
+        // running after the timeout drops it, and no ambient fixture is needed.
+        let (status, body) = web_integration_status_within(
             Duration::from_millis(200),
+            std::future::pending::<
+                Result<crate::commands::web_integration::GetWebIntegrationStatusResponse, String>,
+            >(),
         )
         .await
         .expect_err("a blocked body must time out");
