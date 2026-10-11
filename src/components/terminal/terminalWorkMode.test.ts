@@ -4,8 +4,15 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { MAX_WEBGL_PANES } from "./backends/webglContextLru";
 import {
   MRU_LIMIT,
+  TMUX_WARM_TAB_LIMIT,
+  gridZoneOfTab,
+  mruOnEnter,
+  placeInGridSnapshot,
+  rekeyGridSnapshot,
+  tmuxMountedTabIds,
   nextShownAfterClose,
   parseGridSnapshot,
   parseMru,
@@ -96,6 +103,19 @@ describe("nextShownAfterClose", () => {
   it("with no closed tab, picks the MRU head", () => {
     expect(nextShownAfterClose(["c", "a"], ["a", "b", "c"], null)).toBe("c");
   });
+  it("a live tab beats an exited one, from the MRU and from creation order alike", () => {
+    const alive = new Set(["c"]);
+    // MRU head b has exited: the live c wins although it is older in the MRU.
+    expect(nextShownAfterClose(["a", "b", "c"], ["a", "b", "c"], "a", alive)).toBe("c");
+    // No live tab in the MRU: the first live tab in creation order.
+    expect(nextShownAfterClose(["a", "b"], ["b", "c", "a"], "a", alive)).toBe("c");
+  });
+
+  it("an exited tab is shown only when nothing live is left, MRU first", () => {
+    const alive = new Set<string>();
+    expect(nextShownAfterClose(["a", "c", "b"], ["b", "c", "a"], "a", alive)).toBe("c");
+    expect(nextShownAfterClose([], ["b", "c"], null, alive)).toBe("b");
+  });
 });
 
 describe("shownTabOnEnter", () => {
@@ -110,6 +130,10 @@ describe("shownTabOnEnter", () => {
   it("falls back to creation order with no MRU, and to null with no tabs", () => {
     expect(shownTabOnEnter({}, 0, [], ["b", "a"])).toBe("b");
     expect(shownTabOnEnter({}, 0, [], [])).toBeNull();
+  });
+
+  it("the fallback prefers a live tab", () => {
+    expect(shownTabOnEnter({}, 0, ["a"], ["a", "b"], new Set(["b"]))).toBe("b");
   });
 });
 
@@ -151,6 +175,17 @@ describe("reconcileTmuxAssignments", () => {
     expect(reconcileTmuxAssignments(prev, ["a", "c"], ["a", "b"])).toBe(prev);
   });
 
+  it("closing the shown tab skips an exited tombstone for a live tab", () => {
+    expect(
+      reconcileTmuxAssignments({ 0: "c" }, ["a", "b"], ["c", "b", "a"], new Set(["a"])),
+    ).toStrictEqual({ 0: "a" });
+  });
+
+  it("an exited shown tab is kept: the operator sees how it ended", () => {
+    const prev = { 0: "a" };
+    expect(reconcileTmuxAssignments(prev, ["a", "b"], ["a"], new Set(["b"]))).toBe(prev);
+  });
+
   it("drops any zone other than 0", () => {
     expect(reconcileTmuxAssignments({ 0: "a", 3: "b" }, ["a", "b"], [])).toStrictEqual({ 0: "a" });
   });
@@ -159,8 +194,24 @@ describe("reconcileTmuxAssignments", () => {
 describe("parseGridSnapshot", () => {
   it("reads a well-formed snapshot", () => {
     expect(
-      parseGridSnapshot({ layoutId: "quad", assignments: { 0: "a", 3: "b" }, focusedZone: 3 }),
-    ).toStrictEqual({ layoutId: "quad", assignments: { 0: "a", 3: "b" }, focusedZone: 3 });
+      parseGridSnapshot({
+        layoutId: "quad",
+        assignments: { 0: "a", 3: "b" },
+        focusedZone: 3,
+        sessionKeys: { 3: "sess-b" },
+      }),
+    ).toStrictEqual({
+      layoutId: "quad",
+      assignments: { 0: "a", 3: "b" },
+      focusedZone: 3,
+      sessionKeys: { 3: "sess-b" },
+    });
+  });
+
+  it("a snapshot saved before session keys existed reads with none", () => {
+    expect(
+      parseGridSnapshot({ layoutId: "quad", assignments: { 0: "a" }, focusedZone: 0 }),
+    ).toStrictEqual({ layoutId: "quad", assignments: { 0: "a" }, focusedZone: 0, sessionKeys: {} });
   });
 
   it("anything malformed is null", () => {
@@ -174,11 +225,30 @@ describe("parseGridSnapshot", () => {
     expect(
       parseGridSnapshot({ layoutId: "quad", assignments: { 0: 5 }, focusedZone: 0 }),
     ).toBeNull();
+    expect(
+      parseGridSnapshot({
+        layoutId: "quad",
+        assignments: { 0: "a" },
+        focusedZone: 0,
+        sessionKeys: { 0: 7 },
+      }),
+    ).toBeNull();
+  });
+
+  it("a focused zone that is not a non-negative integer is malformed", () => {
+    for (const focusedZone of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "2"]) {
+      expect(parseGridSnapshot({ layoutId: "quad", assignments: {}, focusedZone })).toBeNull();
+    }
   });
 });
 
 describe("restoreGridSnapshot", () => {
-  const snapshot = { layoutId: "quad", assignments: { 0: "a", 1: "b", 3: "d" }, focusedZone: 3 };
+  const snapshot = {
+    layoutId: "quad",
+    assignments: { 0: "a", 1: "b", 3: "d" },
+    focusedZone: 3,
+    sessionKeys: {},
+  };
 
   it("every tab still live keeps its exact zone", () => {
     expect(restoreGridSnapshot(snapshot, ["a", "b", "d"], 4)).toStrictEqual(snapshot);
@@ -189,6 +259,7 @@ describe("restoreGridSnapshot", () => {
       layoutId: "quad",
       assignments: { 0: "a", 3: "d" },
       focusedZone: 3,
+      sessionKeys: {},
     });
   });
 
@@ -197,6 +268,7 @@ describe("restoreGridSnapshot", () => {
       layoutId: "quad",
       assignments: { 0: "a", 1: "b", 2: "new", 3: "d" },
       focusedZone: 3,
+      sessionKeys: {},
     });
   });
 
@@ -205,6 +277,7 @@ describe("restoreGridSnapshot", () => {
       layoutId: "quad",
       assignments: { 0: "a", 1: "new", 3: "d" },
       focusedZone: 3,
+      sessionKeys: {},
     });
   });
 
@@ -213,12 +286,134 @@ describe("restoreGridSnapshot", () => {
       layoutId: "quad",
       assignments: { 0: "a", 1: "b", 2: "n1", 3: "d" },
       focusedZone: 3,
+      sessionKeys: {},
     });
   });
 
   it("an out-of-range focused zone resets to 0", () => {
     expect(
-      restoreGridSnapshot({ layoutId: "split", assignments: { 0: "a" }, focusedZone: 5 }, ["a"], 2),
-    ).toStrictEqual({ layoutId: "split", assignments: { 0: "a" }, focusedZone: 0 });
+      restoreGridSnapshot(
+        { layoutId: "split", assignments: { 0: "a" }, focusedZone: 5, sessionKeys: {} },
+        ["a"],
+        2,
+      ),
+    ).toStrictEqual({
+      layoutId: "split",
+      assignments: { 0: "a" },
+      focusedZone: 0,
+      sessionKeys: {},
+    });
+  });
+
+  it("sessions whose tabs were replaced keep their zones, matched by session key", () => {
+    const saved = {
+      layoutId: "quad",
+      assignments: { 0: "a", 2: "b", 3: "shell" },
+      focusedZone: 2,
+      sessionKeys: { 0: "sess-a", 2: "sess-b" },
+    };
+    // After a runner restart: new tab ids, in an order unrelated to the zones;
+    // the plain shell was not resumed.
+    const keyOf = (id: string) => ({ b2: "sess-b", a2: "sess-a" })[id];
+    expect(restoreGridSnapshot(saved, ["b2", "x", "a2"], 4, keyOf)).toStrictEqual({
+      layoutId: "quad",
+      assignments: { 0: "a2", 1: "x", 2: "b2" },
+      focusedZone: 2,
+      sessionKeys: { 0: "sess-a", 2: "sess-b" },
+    });
+  });
+});
+
+describe("rekeyGridSnapshot", () => {
+  const base = {
+    layoutId: "quad",
+    assignments: { 0: "a", 1: "b" },
+    focusedZone: 0,
+    sessionKeys: { 0: "sess-a" },
+  };
+
+  it("returns the snapshot itself when nothing moved", () => {
+    expect(rekeyGridSnapshot(base, ["a", "b"], (id) => ({ a: "sess-a" })[id])).toBe(base);
+  });
+
+  it("records a key a zone's tab gained since", () => {
+    const next = rekeyGridSnapshot(base, ["a", "b"], (id) => ({ a: "sess-a", b: "sess-b" })[id]);
+    expect(next.sessionKeys).toStrictEqual({ 0: "sess-a", 1: "sess-b" });
+  });
+
+  it("re-points a zone at the tab its session now runs in", () => {
+    const next = rekeyGridSnapshot(base, ["b", "a2"], (id) => ({ a2: "sess-a" })[id]);
+    expect(next.assignments).toStrictEqual({ 0: "a2", 1: "b" });
+  });
+
+  it("never takes a tab that already holds another zone", () => {
+    const snapshot = { ...base, assignments: { 0: "a", 1: "a2" } };
+    const next = rekeyGridSnapshot(snapshot, ["a2"], (id) => ({ a2: "sess-a" })[id]);
+    expect(next.assignments).toStrictEqual({ 0: "a", 1: "a2" });
+  });
+
+  it("leaves a zone whose session has not come back as it was", () => {
+    expect(rekeyGridSnapshot(base, ["b"], () => undefined)).toBe(base);
+  });
+});
+
+describe("placeInGridSnapshot and gridZoneOfTab", () => {
+  const base = {
+    layoutId: "quad",
+    assignments: { 0: "a", 1: "b" },
+    focusedZone: 0,
+    sessionKeys: { 0: "sess-a", 1: "sess-b" },
+  };
+
+  it("places a tab in a zone, moving it out of any other and dropping the zone's old key", () => {
+    expect(placeInGridSnapshot(base, 0, "b")).toStrictEqual({
+      ...base,
+      assignments: { 0: "b" },
+      sessionKeys: {},
+    });
+    expect(placeInGridSnapshot(base, 3, "r").assignments).toStrictEqual({ 0: "a", 1: "b", 3: "r" });
+  });
+
+  it("finds the zone a tab holds, or null", () => {
+    expect(gridZoneOfTab(base, "b")).toBe(1);
+    expect(gridZoneOfTab(base, "z")).toBeNull();
+    expect(gridZoneOfTab(null, "b")).toBeNull();
+    expect(gridZoneOfTab(base, null)).toBeNull();
+  });
+});
+
+describe("mruOnEnter", () => {
+  it("is the shown tab, then the grid's zones in order, then the old MRU", () => {
+    expect(mruOnEnter("c", { 0: "a", 2: "c", 1: "b" }, ["z", "a"], ["a", "b", "c", "z"])).toEqual([
+      "c",
+      "a",
+      "b",
+      "z",
+    ]);
+  });
+
+  it("drops ids that are not tabs any more", () => {
+    expect(mruOnEnter("a", { 0: "a", 1: "gone" }, ["old"], ["a"])).toEqual(["a"]);
+  });
+});
+
+describe("tmuxMountedTabIds", () => {
+  it("is the shown tab plus the most recently shown others, up to the limit", () => {
+    const tabs = ["a", "b", "c", "d", "e"];
+    expect([...tmuxMountedTabIds("a", ["a", "c", "b", "e", "d"], tabs, 2)]).toEqual([
+      "a",
+      "c",
+      "b",
+    ]);
+  });
+
+  it("skips MRU entries that are no longer tabs", () => {
+    expect([...tmuxMountedTabIds("a", ["gone", "b"], ["a", "b"], 1)]).toEqual(["a", "b"]);
+  });
+
+  it("defaults to the WebGL cap", () => {
+    const tabs = Array.from({ length: 20 }, (_, i) => `t${i}`);
+    expect(tmuxMountedTabIds("t0", tabs, tabs).size).toBe(TMUX_WARM_TAB_LIMIT + 1);
+    expect(TMUX_WARM_TAB_LIMIT).toBe(MAX_WEBGL_PANES);
   });
 });

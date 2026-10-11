@@ -53,6 +53,13 @@ interface UseShellIntegrationParams {
   setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
   /** Page the resumed tab lands on — recorded in the durable registry. */
   pageId: string;
+  /**
+   * The operator just resumed a session into this new tab
+   * (`useZoneLayout().showSpawnedTab`): in tmux mode it is shown, like any
+   * terminal the operator creates; in grid mode its zone comes from the
+   * reconcile and this is a no-op.
+   */
+  onResumedTab?: (tabId: string) => void;
 }
 
 interface UseShellIntegrationResult {
@@ -73,6 +80,7 @@ export function useShellIntegration({
   setRightPanelMode,
   setSelectedTranscriptSessionId,
   pageId,
+  onResumedTab,
 }: UseShellIntegrationParams): UseShellIntegrationResult {
   // Shell integration: structured command history per tab
   const [commandHistories, setCommandHistories] = useState<Record<string, CommandHistoryEntry[]>>(
@@ -155,6 +163,7 @@ export function useShellIntegration({
       const tabTitle = `claude ${session.session_id.slice(0, 8)}`;
       const tabId = await createTerminal(tabTitle, session.project_path);
       if (!tabId) return;
+      onResumedTab?.(tabId);
 
       // Track which Claude session is running in this tab so "Generate Workflow"
       // can find the correct transcript instead of picking a random recent session.
@@ -261,6 +270,7 @@ export function useShellIntegration({
       setRightPanelMode,
       setSelectedTranscriptSessionId,
       pageId,
+      onResumedTab,
     ],
   );
 

@@ -2,18 +2,14 @@ import { memo, useCallback, useMemo, useReducer, useRef, useState, useEffect } f
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
-import { MessageSquare, ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
-import { TerminalInstance } from "./TerminalInstance";
-import { PlanViewer } from "./PlanViewer";
-import { TabTitle, useDisplayTitleResolver } from "./displayTitle";
-import { WorkerSessionCell } from "./WorkerSessionCell";
+import { useDisplayTitleResolver } from "./displayTitle";
 import type { LayoutPreset } from "./useZoneLayout";
 import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX, findNextZone } from "./useZoneLayout";
+import { tmuxMountedTabIds } from "./terminalWorkMode";
 import {
   ZoneContextMenu,
   buildZoneCells,
-  buildParkedCells,
-  reviewPanelAvailable,
+  type MaximizedNav,
   type ZoneCellSharedProps,
 } from "./zone-grid";
 import {
@@ -22,16 +18,7 @@ import {
   useTransitionEffects,
   useUIStateCx,
 } from "./contexts";
-import { SessionInfoDropdown } from "./SessionInfoDropdown";
-import { ZonePromptsPanel } from "./ZonePromptsPanel";
-import { SessionReviewPanel, SessionReviewToggle } from "./SessionReviewPanel";
-import { reviewBadgeState } from "./sessionReviewView";
-import { useSessionReview } from "./useSessionReview";
-import {
-  PROMPTS_PANEL_GEOMETRY,
-  REVIEW_PANEL_GEOMETRY,
-  toggleZonePanel,
-} from "./promptsPanelLayout";
+import { toggleZonePanel } from "./promptsPanelLayout";
 import { classifyTabs } from "./classifyTabs";
 import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
@@ -69,13 +56,6 @@ function loadPanelTabs(pageId: string): PanelTabs {
     review: new Set(instanceStorage.getJSON<string[]>(reviewTabsStorageKey(pageId), [])),
   };
 }
-
-/**
- * Height of the maximized-view header strip. It used to be implicit (`py-1`
- * around a 10px line); the prompts column has to start exactly below it, so
- * the value is now stated once and shared by both.
- */
-const MAXIMIZED_HEADER_HEIGHT_PX = 26;
 
 interface ZoneGridProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
@@ -334,9 +314,14 @@ function ZoneGridInner({
   // scrolling grid container (`gridRef`) and expose the set of tab-ids near the
   // viewport. `registerCell`/`cellFor` also form the reusable zone-cell DOM
   // registry Phase 4 (scroll routing) consumes. No-op outside flow mode.
+  // Frozen while a zone is maximized: the other zones are parked (display:
+  // none), and an observer would read that as "scrolled far away" and unmount
+  // every one of them — only to remount them on restore. Frozen, the near set
+  // stays what it was in the grid, so maximize ⇄ grid mounts nothing new.
   const { nearViewport, registerCell, unregisterCell, cellFor } = useZoneVirtualization(
     gridRef,
     isFlowMode,
+    maximizedZone !== null,
   );
   const setFocusedZone = zoneLayout.setFocusedZone;
 
@@ -631,28 +616,24 @@ function ZoneGridInner({
   // terminal id that names no process.
   const workMode = zoneLayout.workMode;
   const isTmux = workMode === "tmux";
+  const shownTabId = zoneLayout.shownTabId;
+  const mru = zoneLayout.mru;
+  // tmux keeps the shown tab and the most recently shown few mounted; every
+  // other off-screen tab mounts when it is shown (`TMUX_WARM_TAB_LIMIT`).
+  const tmuxMounted = useMemo(
+    () =>
+      isTmux
+        ? tmuxMountedTabIds(
+            shownTabId,
+            mru,
+            tabs.map((t) => t.id),
+          )
+        : undefined,
+    [isTmux, shownTabId, mru, tabs],
+  );
   const tabClassification = useMemo(
-    () => classifyTabs(tabs, assignments, isFlowMode, nearViewport, workMode),
-    [tabs, assignments, isFlowMode, nearViewport, workMode],
-  );
-
-  // The maximized view renders its own header (below, after the early
-  // return), so its review read is hooked here, unconditionally.
-  const maximizedTab =
-    isSingleView && layout.id !== "single"
-      ? tabs.find((t) => t.id === assignments[singleViewZone])
-      : undefined;
-  const maximizedReviewAvailable =
-    reviewPanelAvailable(maximizedTab, !!maximizedTab?.claudeSessionId) &&
-    tabClassification.get(maximizedTab?.id ?? "") !== "hidden";
-  const maximizedReview = useSessionReview(
-    maximizedReviewAvailable ? (maximizedTab?.claudeSessionId ?? null) : null,
-    { visible: maximizedReviewAvailable },
-  );
-  // Memoised on the two reads: the badge walks every hunk of every file.
-  const maximizedBadge = useMemo(
-    () => reviewBadgeState(maximizedReview.changes, maximizedReview.review),
-    [maximizedReview.changes, maximizedReview.review],
+    () => classifyTabs(tabs, assignments, isFlowMode, nearViewport, workMode, tmuxMounted),
+    [tabs, assignments, isFlowMode, nearViewport, workMode, tmuxMounted],
   );
 
   // The props every zone cell of this render shares, built once for both work
@@ -776,230 +757,46 @@ function ZoneGridInner({
       })()
     : null;
 
-  // `maximizedZone` is always null in tmux mode, so this branch is grid-only.
-  if (isSingleView && layout.id !== "single") {
-    const tab = maximizedTab;
-    // A maximized zone owns the page, so its prompts go in the full-height
-    // right-hand column rather than the short strip a tiled zone gets.
-    const maximizedPromptsOpen = !!tab?.claudeSessionId && promptTabs.has(tab.id);
-    const prevZone = maximizedNeighbour(-1);
-    const nextZone = maximizedNeighbour(1);
-    const maximizedReviewOpen = maximizedReviewAvailable && !!tab && reviewTabs.has(tab.id);
-    const maximizedPanelWidth = maximizedReviewOpen
-      ? REVIEW_PANEL_GEOMETRY.rightWidthPx
-      : maximizedPromptsOpen
-        ? PROMPTS_PANEL_GEOMETRY.rightWidthPx
-        : undefined;
+  // The maximized view (grid only: `maximizedZone` is always null in tmux).
+  const isMaximizedView = maximizedZone !== null && layout.id !== "single";
+  const maximizedNav: MaximizedNav | undefined = isMaximizedView
+    ? {
+        prevZone: maximizedNeighbour(-1),
+        nextZone: maximizedNeighbour(1),
+        onGoToZone: goToMaximizedZone,
+        onDeleteAndForward: deleteAndForward,
+      }
+    : undefined;
 
-    return (
-      <div
-        className="h-full w-full relative"
-        onDoubleClickCapture={() => onZoneDoubleClick(singleViewZone)}
-      >
-        {tab && (
-          <div
-            className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer"
-            style={{ height: `${MAXIMIZED_HEADER_HEIGHT_PX}px` }}
-          >
-            <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
-            <span className="text-[10px] text-[#a9b1d6]">
-              <TabTitle tab={tab} />
-            </span>
-            <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={singleViewZone} />
-            {tab.claudeSessionId && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  togglePromptsForTab(tab.id);
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                onDoubleClick={(e) => e.stopPropagation()}
-                className={`p-0.5 rounded transition-colors shrink-0 ${
-                  maximizedPromptsOpen
-                    ? "text-[#9ece6a] bg-[#9ece6a]/15"
-                    : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                }`}
-                title={maximizedPromptsOpen ? "Hide my prompts" : "Show my prompts"}
-                aria-pressed={maximizedPromptsOpen}
-              >
-                <MessageSquare className="w-3 h-3" />
-              </button>
-            )}
-            {maximizedReviewAvailable && (
-              <SessionReviewToggle
-                open={maximizedReviewOpen}
-                onToggle={() => toggleReviewForTab(tab.id)}
-                badge={maximizedBadge}
-                iconClassName="w-3 h-3"
-              />
-            )}
-            <div className="flex items-center gap-0.5 ml-auto">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (prevZone !== null) goToMaximizedZone(prevZone);
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                onDoubleClick={(e) => e.stopPropagation()}
-                disabled={prevZone === null}
-                className="p-0.5 rounded shrink-0 text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 disabled:opacity-30 disabled:pointer-events-none "
-                title="Previous terminal"
-                aria-label="Previous terminal"
-              >
-                <ChevronLeft className="w-3 h-3" />
-              </button>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (nextZone !== null) goToMaximizedZone(nextZone);
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                onDoubleClick={(e) => e.stopPropagation()}
-                disabled={nextZone === null}
-                className="p-0.5 rounded shrink-0 text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 disabled:opacity-30 disabled:pointer-events-none "
-                title="Next terminal"
-                aria-label="Next terminal"
-              >
-                <ChevronRight className="w-3 h-3" />
-              </button>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  deleteAndForward();
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                onDoubleClick={(e) => e.stopPropagation()}
-                className="p-0.5 rounded shrink-0 text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 disabled:opacity-30 disabled:pointer-events-none hover:!text-[#f7768e]"
-                title="Delete this terminal and go to the next"
-                aria-label="Delete and forward"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            </div>
-            <span className="text-[9px] text-[#565f89]">Esc or double-click to restore</span>
-            <ZoneHoverActions zoneIdx={singleViewZone} onExportZone={onExportZone} inline />
-          </div>
-        )}
-
-        {tab?.claudeSessionId &&
-          maximizedPromptsOpen &&
-          tabClassification.get(tab.id) !== "hidden" && (
-            <ZonePromptsPanel
-              claudeSessionId={tab.claudeSessionId}
-              configDir={tab.claudeConfigDir}
-              projectPath={tab.workingDir}
-              orientation="right"
-              topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
-              onClose={() => togglePromptsForTab(tab.id)}
-            />
-          )}
-
-        {tab && maximizedReviewOpen && (
-          <SessionReviewPanel
-            handle={maximizedReview}
-            terminalId={tab.id}
-            orientation="right"
-            topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
-            onClose={() => toggleReviewForTab(tab.id)}
-          />
-        )}
-
-        {/* eslint-disable-next-line react-hooks/refs -- terminalRefs is a stable Map-cache (see above). */}
-        {layout.zones.map((_, zoneIdx) => {
-          const zoneTabId = assignments[zoneIdx];
-          const zoneTab = tabs.find((t) => t.id === zoneTabId);
-          if (!zoneTab) return null;
-          // Layer 1 invariant: only render the visible inline TerminalInstance
-          // when the centralized classification agrees this tab is NOT hidden
-          // (i.e. `assigned` in preset mode, or `assigned-live`/`assigned-virtual`
-          // in flow mode — the maximized/single view is a full-screen single
-          // terminal, not the scrolling grid, so it mounts every assigned zone
-          // as before rather than virtualizing). If classification still says
-          // "hidden" (e.g. assignments updated mid render before the memo
-          // recomputed), defer the visible mount so the hidden mount stays the
-          // sole owner this render pass.
-          if (tabClassification.get(zoneTab.id) === "hidden") return null;
-
-          const isVisible = zoneIdx === singleViewZone;
-          const ref = terminalRefs.get(zoneTab.id);
-
-          return (
-            <div
-              key={zoneTab.id}
-              className={isVisible ? "h-full w-full" : "hidden"}
-              style={
-                isVisible
-                  ? {
-                      // The header is an absolute overlay here too, so without
-                      // this it covers the terminal's first line — it always
-                      // did; naming its height is what made that visible.
-                      paddingTop: `${MAXIMIZED_HEADER_HEIGHT_PX}px`,
-                      paddingRight:
-                        maximizedPanelWidth !== undefined ? `${maximizedPanelWidth}px` : undefined,
-                    }
-                  : undefined
-              }
-              onMouseDown={(e) => handleZoneMouseDown(zoneIdx, e)}
-            >
-              {zoneTab.type === "plan" && zoneTab.planFilePath ? (
-                <PlanViewer filePath={zoneTab.planFilePath} visible={isVisible} />
-              ) : zoneTab.sessionBacked && zoneTab.taskRunId ? (
-                <WorkerSessionCell
-                  tab={zoneTab}
-                  taskRunId={zoneTab.taskRunId}
-                  visible={isVisible}
-                />
-              ) : (
-                <TerminalInstance
-                  ref={ref}
-                  terminalId={zoneTab.id}
-                  pageId={pageId}
-                  visible={isVisible}
-                  isReconnecting={zoneTab.isReconnecting}
-                  onReconnected={() => onReconnected(zoneTab.id)}
-                  onExit={(code) => onExit(zoneTab.id, code)}
-                  onFirstInput={(input) => onFirstInput(zoneTab.id, input)}
-                  onUserInputLine={
-                    onUserInputLine ? (input) => onUserInputLine(zoneTab.id, input) : undefined
-                  }
-                  onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
-                  onTitleChange={(title) => onTitleChange(zoneTab.id, title)}
-                />
-              )}
-            </div>
-          );
-        })}
-
-        {/* The tabs with no zone keep their parked mount, as in the grid. */}
-        {/* eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above). */}
-        {buildParkedCells(layout.zones[0], cellProps)}
-      </div>
-    );
-  }
-
-  // Grid and tmux render through ONE root element with ONE keyed cell list as
-  // its first child, so switching modes re-renders every tab's cell in place —
-  // no terminal unmounts (see `buildZoneCells`). tmux mode is the `single`
-  // layout's one zone filling the page, with no resize handles.
+  // Grid, the maximized view and tmux render through ONE root element with ONE
+  // keyed cell list as its first child, so switching between them re-renders
+  // every tab's cell in place — no terminal unmounts (see `buildZoneCells`).
+  // tmux mode and the maximized view are one cell filling the page, with no
+  // resize handles.
   // eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above).
   const cells = buildZoneCells({
     workMode,
     zones: layout.zones,
     // eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above).
     cellProps,
-    shownTabId: zoneLayout.shownTabId,
+    shownTabId,
+    maximizedZone: isMaximizedView ? maximizedZone : null,
+    maximizedNav,
+    cosmeticZoneFor: zoneLayout.cosmeticZoneFor,
     promptTabs,
     reviewTabs,
     dropTargetZone: gridState.dropTargetZone,
   });
+  const isOnePane = isTmux || isMaximizedView;
 
   return (
     <div
       ref={gridRef}
       className="h-full w-full relative"
       data-terminal-work-mode={workMode}
+      data-maximized-zone={isMaximizedView ? maximizedZone : undefined}
       style={
-        isTmux
+        isOnePane
           ? { display: "grid", gridTemplateColumns: "1fr", gridTemplateRows: "1fr" }
           : isFlowMode
             ? {
@@ -1023,7 +820,7 @@ function ZoneGridInner({
     >
       {cells}
 
-      {!isTmux &&
+      {!isOnePane &&
         !isFlowMode &&
         layout.columns > 1 &&
         Array.from({ length: layout.columns - 1 }, (_, i) => {
@@ -1070,7 +867,7 @@ function ZoneGridInner({
           );
         })}
 
-      {!isTmux &&
+      {!isOnePane &&
         !isFlowMode &&
         layout.rows > 1 &&
         Array.from({ length: layout.rows - 1 }, (_, i) => {

@@ -77,6 +77,7 @@ async function spawnOne(
         assignTabToZone: () => {},
         setLayoutId,
         showSpawnedTab,
+        workMode: "grid",
         isMultiZone: layout.zones.length > 1,
         toggleMaximize: () => {},
       },

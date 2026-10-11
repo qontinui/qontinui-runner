@@ -49,7 +49,11 @@ import {
   planToggleMaximizeZone,
   buildMaximizeResult,
 } from "./zone-grid/maximizeActions";
-import { applyWorkModeRequest, parseWorkModeRequest } from "./terminalWorkModeControl";
+import {
+  applyWorkModeRequest,
+  createShownTerminal,
+  parseWorkModeRequest,
+} from "./terminalWorkModeControl";
 import { pickSpawnTenant } from "./SpawnTenantPicker";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
@@ -71,11 +75,10 @@ import {
   buildSessionOpenArgs,
   noteRecordedZone,
   describeRecordOpenOutcome,
-  planZoneReemits,
   recordedZoneLedgerFor,
-  resolveZoneIndex,
   type SessionOrigin,
 } from "./sessionRecordArgs";
+import { useRecordedZoneBackstop } from "./useRecordedZoneBackstop";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
 import {
   getActiveProjectHint,
@@ -227,6 +230,7 @@ function TerminalPageInner({
     zoneCount: zoneLayout.layout.zones.length,
     setMaximizedZone: zoneLayout.setMaximizedZone,
     layoutId: zoneLayout.layoutId,
+    workMode: zoneLayout.workMode,
   });
   useEffect(() => {
     zoneMaximizeRef.current = {
@@ -234,12 +238,14 @@ function TerminalPageInner({
       zoneCount: zoneLayout.layout.zones.length,
       setMaximizedZone: zoneLayout.setMaximizedZone,
       layoutId: zoneLayout.layoutId,
+      workMode: zoneLayout.workMode,
     };
   }, [
     zoneLayout.maximizedZone,
     zoneLayout.layout.zones.length,
     zoneLayout.setMaximizedZone,
     zoneLayout.layoutId,
+    zoneLayout.workMode,
   ]);
 
   // Plan `2026-10-11-runner-terminal-tmux-work-mode`, Phase 4 — the work-mode
@@ -283,7 +289,8 @@ function TerminalPageInner({
       {
         id: "create-terminal",
         label: "Create Terminal",
-        description: "Spawn a new PTY-backed terminal tab and assign it to the next free zone.",
+        description:
+          "Spawn a new PTY-backed terminal tab and assign it to the next free zone (in tmux work mode: show it in the one viewport).",
         // Thread the explicitly chosen tenant (flag or picker pick, never the
         // device default) so a chosen `tab.tenantId` matches what Rust stamps. Deferred read (see the `resolveTenantForSpawn`
         // note below) — the handler runs long after that const is initialized.
@@ -292,7 +299,12 @@ function TerminalPageInner({
         // undoes it. Contrast `terminal-launch-menu.create-with-command` below.
         effect: "write",
         handler: async () => {
-          await createTerminal(undefined, undefined, resolveTenantForSpawn());
+          // Operator-initiated (through the UI Bridge): shown in tmux mode,
+          // like every terminal the operator creates. No-op in grid mode.
+          await createShownTerminal(
+            () => createTerminal(undefined, undefined, resolveTenantForSpawn()),
+            zoneLayout.showSpawnedTab,
+          );
         },
       },
       // Discoverable, named plain-terminal launcher on the now-primary
@@ -412,7 +424,7 @@ function TerminalPageInner({
         id: "maximize-zone",
         label: "Maximize Zone",
         description:
-          "Maximize one zone to fill the page. Params: { zoneIndex: number }. Returns { maximizedZone, previousMaximizedZone, zoneCount, changed }.",
+          "Maximize one zone to fill the page (grid mode only — refused in tmux work mode, which already shows one session at full size). Params: { zoneIndex: number }. Returns { maximizedZone, previousMaximizedZone, zoneCount, changed }.",
         paramSchema: ZONE_INDEX_SCHEMA,
         // `read` — display state only: `maximizedZone` is plain `useState` in
         // useZoneLayout, never persisted, and restore-zone undoes it without trace.
@@ -426,8 +438,8 @@ function TerminalPageInner({
         // eslint-disable-next-line react-hooks/refs
         handler: guardedHandler("maximize-zone", ZONE_INDEX_SCHEMA, async (args) => {
           const { zoneIndex } = args as { zoneIndex?: unknown };
-          const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
-          const plan = planMaximizeZone(zoneIndex, zoneCount);
+          const { maximizedZone, zoneCount, setMaximizedZone, workMode } = zoneMaximizeRef.current;
+          const plan = planMaximizeZone(zoneIndex, zoneCount, workMode);
           if (!plan.ok) throw new Error(`maximize-zone: ${plan.error}`);
           setMaximizedZone(plan.next);
           return buildMaximizeResult(maximizedZone, plan.next, zoneCount);
@@ -450,7 +462,7 @@ function TerminalPageInner({
         id: "toggle-maximize-zone",
         label: "Toggle Maximize Zone",
         description:
-          "Maximize the given zone, or restore if it is already maximized — the same rule the keyboard shortcut uses. Params: { zoneIndex: number }.",
+          "Maximize the given zone, or restore if it is already maximized — the same rule the keyboard shortcut uses (grid mode only — refused in tmux work mode). Params: { zoneIndex: number }.",
         paramSchema: ZONE_INDEX_SCHEMA,
         // `read` — maximize-zone or restore-zone by the keyboard rule; display state.
         effect: "read",
@@ -460,8 +472,8 @@ function TerminalPageInner({
         // eslint-disable-next-line react-hooks/refs
         handler: guardedHandler("toggle-maximize-zone", ZONE_INDEX_SCHEMA, async (args) => {
           const { zoneIndex } = args as { zoneIndex?: unknown };
-          const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
-          const plan = planToggleMaximizeZone(zoneIndex, zoneCount, maximizedZone);
+          const { maximizedZone, zoneCount, setMaximizedZone, workMode } = zoneMaximizeRef.current;
+          const plan = planToggleMaximizeZone(zoneIndex, zoneCount, maximizedZone, workMode);
           if (!plan.ok) throw new Error(`toggle-maximize-zone: ${plan.error}`);
           setMaximizedZone(plan.next);
           return buildMaximizeResult(maximizedZone, plan.next, zoneCount);
@@ -769,10 +781,13 @@ function TerminalPageInner({
   // identity-stable while still reading the freshest assignments/tabs. The
   // capture hook fires the callback from a long-lived polling closure, so a
   // stale closure would resolve the wrong zone / working dir.
-  const assignmentsRef = useRef(zoneLayout.assignments);
+  // The GRID assignments (`gridView`), not the on-screen ones: a session's
+  // recorded zone is its zone in the grid, which in tmux mode is the snapshot
+  // the operator returns to — the one viewport is no zone a session lives in.
+  const assignmentsRef = useRef(zoneLayout.gridView.assignments);
   useEffect(() => {
-    assignmentsRef.current = zoneLayout.assignments;
-  }, [zoneLayout.assignments]);
+    assignmentsRef.current = zoneLayout.gridView.assignments;
+  }, [zoneLayout.gridView.assignments]);
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -860,56 +875,16 @@ function TerminalPageInner({
   // The registry record was already written backend-side — this is UI-only.
   useSessionBoundEvents({ tabs, updateTab });
 
-  // Zone re-resolution backstop. Two jobs, one mechanism:
-  //
-  //  1. Zone MOVE — a Claude session dragged between zones: the recorded
-  //     `zoneIndex` must follow it (in both directions, including back to
-  //     `UNZONED_INDEX` when the drag leaves the tab unassigned).
-  //  2. Zone BIND-TIME STALENESS — the OPEN record is written the moment a tab
-  //     binds its `claudeSessionId`, which is normally before
-  //     `reconcileAssignments` has auto-filled that tab into a zone, so the
-  //     record is written `-1` and then never revisited. `recordSessionOpen`
-  //     seeds the ledger with the zone it WROTE, so the first observation here
-  //     sees `-1 → 3` and corrects it.
-  //
-  // `-1` is deliberately still a reachable recorded value: past the 9-zone
-  // ceiling a live tab is genuinely unassigned, and nothing here clamps it to
-  // zone 0. Debounced 300ms and keyed on `assignments`/`tabs`, so it runs only
-  // after the assignment it is re-resolving has actually settled — it cannot
-  // race an in-flight restore drain into recording a half-applied layout.
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      const assignments = zoneLayout.assignments;
-      const emits = planZoneReemits(
-        recordedZones,
-        tabs
-          .filter((tab): tab is typeof tab & { claudeSessionId: string } => !!tab.claudeSessionId)
-          .map((tab) => ({
-            claudeSessionId: tab.claudeSessionId,
-            tabId: tab.id,
-            zoneIndex: resolveZoneIndex(assignments, tab.id),
-          })),
-      );
-      for (const emit of emits) {
-        const tab = tabs.find((t) => t.id === emit.tabId);
-        invoke("terminal_session_record_open", {
-          ...buildSessionOpenArgs({
-            assignments,
-            tabs,
-            tabId: emit.tabId,
-            claudeSessionId: emit.claudeSessionId,
-            configDir: tab?.claudeConfigDir,
-            pageId,
-          }),
-        }).catch((err) => {
-          logger.warn(
-            `terminal_session_record_open (zone re-resolve) failed for ${emit.claudeSessionId}: ${err}`,
-          );
-        });
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [zoneLayout.assignments, tabs, pageId, recordedZones]);
+  // Zone re-resolution backstop (`useRecordedZoneBackstop`): keeps each
+  // session's durable recorded zone in step with its zone in the grid, and
+  // stands down in tmux work mode, whose one viewport is not a grid.
+  useRecordedZoneBackstop({
+    workMode: zoneLayout.workMode,
+    assignments: zoneLayout.assignments,
+    tabs,
+    pageId,
+    recordedZones,
+  });
   const {
     labelsAndTags,
     eventHistory,
@@ -1056,12 +1031,16 @@ function TerminalPageInner({
     zoneLayout,
     labelsAndTags,
     sessionPersistence,
+    // The grid as the operator will see it (`gridView`): in tmux mode the
+    // saved session layout is the snapshot's grid, so each session's label,
+    // notes and pin are saved against ITS zone, not the one viewport's.
     layoutState: {
-      layoutId: zoneLayout.layoutId,
+      layoutId: zoneLayout.gridView.layoutId,
+      assignments: zoneLayout.gridView.assignments,
       zoneLabels: labelsAndTags.zoneLabels,
       zoneNotes: labelsAndTags.zoneNotes,
       pinnedZones: labelsAndTags.pinnedZones,
-      focusedZone: zoneLayout.focusedZone,
+      focusedZone: zoneLayout.gridView.focusedZone,
     },
   });
 

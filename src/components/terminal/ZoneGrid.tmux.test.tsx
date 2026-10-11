@@ -123,6 +123,9 @@ vi.mock("./TerminalInstance", () => {
 vi.mock("./PlanViewer", () => ({ PlanViewer: () => null }));
 vi.mock("./WorkerSessionCell", () => ({ WorkerSessionCell: () => null }));
 vi.mock("./suggestions", () => ({ SuggestionChip: () => null }));
+vi.mock("./zone-grid/MaximizedHeader", () => ({
+  MaximizedHeader: () => createElement("div", { "data-maximized-header": true }),
+}));
 vi.mock("./ZoneHoverActions", () => ({ ZoneHoverActions: () => null }));
 vi.mock("./SessionInfoDropdown", () => ({ SessionInfoDropdown: () => null }));
 vi.mock("./ZonePromptsPanel", async (importOriginal) => ({
@@ -145,6 +148,7 @@ vi.mock("./useTerminalWindowActions", () => ({
 }));
 
 import { ZoneGrid } from "./ZoneGrid";
+import { TMUX_WARM_TAB_LIMIT } from "./terminalWorkMode";
 
 function pty(id: string): TerminalTab {
   return { id, title: `session ${id}`, pid: 1, isAlive: true, exitCode: null };
@@ -164,19 +168,23 @@ function gridLayout(columns: number) {
   return { id: `grid-${columns}x2`, name: "Grid", columns, rows: 2, zones };
 }
 
-/** Render the page's grid in grid work mode with `assignments` zoned. */
+/**
+ * Render the page's grid in grid work mode with `assignments` zoned, and
+ * `maximizedZone` maximized (the maximized view) when given.
+ */
 function renderGridPage(
   tabs: TerminalTab[],
   layout: ReturnType<typeof gridLayout>,
   assignments: Record<number, string>,
+  maximizedZone: number | null = null,
 ) {
   page.tabs = tabs;
   page.zoneLayout = {
     layout,
     layoutId: layout.id,
     assignments,
-    focusedZone: 0,
-    maximizedZone: null,
+    focusedZone: maximizedZone ?? 0,
+    maximizedZone,
     isMultiZone: true,
     assignTabToZone: noop,
     setFocusedZone: noop,
@@ -185,6 +193,8 @@ function renderGridPage(
     consumeReveal: noop,
     workMode: "grid",
     shownTabId: null,
+    mru: [],
+    cosmeticZoneFor: (zoneIdx: number) => zoneIdx,
   };
   const onZoneClick = () => {};
   act(() => {
@@ -192,8 +202,16 @@ function renderGridPage(
   });
 }
 
-/** Render the page's grid in tmux work mode with `shown` on screen. */
-function renderTmuxPage(tabs: TerminalTab[], shown: string) {
+/**
+ * Render the page's grid in tmux work mode with `shown` on screen. `mru` is
+ * the hook's most-recently-shown list (shown first); by default every tab, so
+ * every one is warm.
+ */
+function renderTmuxPage(
+  tabs: TerminalTab[],
+  shown: string,
+  mru: string[] = [shown, ...tabs.map((t) => t.id).filter((id) => id !== shown)],
+) {
   page.tabs = tabs;
   page.zoneLayout = {
     layout: { id: "single", name: "Single", columns: 1, rows: 1, zones: [{ col: "1", row: "1" }] },
@@ -209,6 +227,8 @@ function renderTmuxPage(tabs: TerminalTab[], shown: string) {
     consumeReveal: noop,
     workMode: "tmux",
     shownTabId: shown,
+    mru,
+    cosmeticZoneFor: () => null,
   };
   // A fresh callback per render: the context is mocked rather than provided,
   // so this is what tells the memoised grid that its inputs moved (the page
@@ -318,5 +338,96 @@ describe("ZoneGrid across grid ⇄ tmux switches", () => {
     // The same DOM node: React kept the root, so it kept everything under it.
     expect(container.firstElementChild).toBe(gridRoot);
     expect(gridRoot?.getAttribute("data-terminal-work-mode")).toBe("tmux");
+  });
+});
+
+describe("ZoneGrid across grid ⇄ maximized ⇄ tmux", () => {
+  function expectNoRemount(ids: string[], before: Map<string, object>) {
+    expect([...rec.mounts].sort()).toEqual([...ids].sort());
+    expect(rec.unmounts).toEqual([]);
+    for (const id of ids) expect(rec.instances.get(id)).toBe(before.get(id));
+  }
+
+  it("maximizing, entering tmux from the maximized view, and back never remounts", () => {
+    const tabs = [pty("a"), pty("b"), pty("c")];
+    const layout = gridLayout(2);
+    const zoned = { 0: "a", 1: "b", 2: "c" };
+    renderGridPage(tabs, layout, zoned);
+    const before = new Map(rec.instances);
+    const gridRoot = container.firstElementChild;
+
+    renderGridPage(tabs, layout, zoned, 1);
+    expect(visiblePanes()).toEqual(["b"]);
+    expect(container.firstElementChild).toBe(gridRoot);
+    expect(gridRoot?.getAttribute("data-maximized-zone")).toBe("1");
+    // The maximized view keeps its own header.
+    expect(container.querySelectorAll("[data-maximized-header]")).toHaveLength(1);
+
+    renderTmuxPage(tabs, "b");
+    expect(visiblePanes()).toEqual(["b"]);
+    renderGridPage(tabs, layout, zoned, 1);
+    renderGridPage(tabs, layout, zoned);
+    expect(visiblePanes().sort()).toEqual(["a", "b", "c"]);
+    expect(container.querySelectorAll("[data-maximized-header]")).toHaveLength(0);
+    expect(container.firstElementChild).toBe(gridRoot);
+    expectNoRemount(["a", "b", "c"], before);
+  });
+
+  it("stepping the maximized zone moves visibility without remounting", () => {
+    const tabs = [pty("a"), pty("b")];
+    const layout = gridLayout(1);
+    renderGridPage(tabs, layout, { 0: "a", 1: "b" }, 0);
+    const before = new Map(rec.instances);
+    expect(visiblePanes()).toEqual(["a"]);
+    renderGridPage(tabs, layout, { 0: "a", 1: "b" }, 1);
+    expect(visiblePanes()).toEqual(["b"]);
+    expectNoRemount(["a", "b"], before);
+  });
+});
+
+describe("ZoneGrid in tmux mode keeps a bounded set mounted", () => {
+  it("mounts the shown tab and the warm MRU only; a cold tab mounts when shown", () => {
+    const tabs = Array.from({ length: TMUX_WARM_TAB_LIMIT + 4 }, (_, i) => pty(`t${i}`));
+    const ids = tabs.map((t) => t.id);
+    // MRU: t0 shown, then t1..t(K) warm; the rest have never been shown.
+    renderTmuxPage(tabs, "t0", ids.slice(0, TMUX_WARM_TAB_LIMIT + 1));
+    expect([...rec.mounts].sort()).toEqual(ids.slice(0, TMUX_WARM_TAB_LIMIT + 1).sort());
+
+    // Showing a cold tab mounts it (a ring replay) and, the MRU now led by it,
+    // the least recent warm tab goes cold.
+    const cold = `t${TMUX_WARM_TAB_LIMIT + 2}`;
+    renderTmuxPage(tabs, cold, [cold, ...ids.slice(0, TMUX_WARM_TAB_LIMIT + 1)]);
+    expect(rec.mounts).toContain(cold);
+    expect(visiblePanes()).toEqual([cold]);
+    expect(rec.unmounts).toEqual([`t${TMUX_WARM_TAB_LIMIT}`]);
+  });
+});
+
+describe("ZoneGrid DOM order", () => {
+  it("follows the zones, then the parked cells — whatever the tab creation order", () => {
+    const tabs = [pty("a"), pty("b"), pty("c"), pty("d")];
+    const twoZones = { ...gridLayout(1), zones: gridLayout(1).zones.slice(0, 2) };
+    renderGridPage(tabs, twoZones, { 0: "c", 1: "a" });
+    const order = [...container.querySelectorAll("[data-pane]")].map((el) =>
+      el.getAttribute("data-pane"),
+    );
+    expect(order).toEqual(["c", "a", "b", "d"]);
+  });
+
+  it("re-orders by moving cells, not remounting them, when zones swap", () => {
+    const tabs = [pty("a"), pty("b")];
+    const layout = gridLayout(1);
+    renderGridPage(tabs, layout, { 0: "a", 1: "b" });
+    const before = new Map(rec.instances);
+    const paneA = container.querySelector("[data-pane='a']");
+    renderGridPage(tabs, layout, { 0: "b", 1: "a" });
+    const order = [...container.querySelectorAll("[data-pane]")].map((el) =>
+      el.getAttribute("data-pane"),
+    );
+    expect(order).toEqual(["b", "a"]);
+    // The same DOM node, moved: an xterm host keeps its buffer and canvases.
+    expect(container.querySelector("[data-pane='a']")).toBe(paneA);
+    expect(rec.unmounts).toEqual([]);
+    for (const id of ["a", "b"]) expect(rec.instances.get(id)).toBe(before.get(id));
   });
 });

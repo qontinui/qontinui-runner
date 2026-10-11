@@ -17,6 +17,7 @@ import {
   RotateCcw,
   FolderGit2,
   Monitor,
+  X,
 } from "lucide-react";
 import type { UnifiedSession } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
@@ -88,6 +89,13 @@ interface SessionCardProps {
    * — tmux zones only the shown session.
    */
   isOffScreen?: boolean;
+  /**
+   * Close this row's terminal tab — the page's close path, the same one the
+   * zone's close button takes. Absent when the row has no live tab in this
+   * window (a transcript-only row has nothing to close), and the card then
+   * offers no close.
+   */
+  onClose?: (session: UnifiedSession) => void;
 }
 
 const STATUS_DOT: Record<SessionCardStatus, { color: string; pulse: boolean; label: string }> = {
@@ -287,6 +295,16 @@ export function sessionCardElementId(sessionId: string): string {
 }
 
 /**
+ * UI-Bridge id of a card's close button. Stamped for the same reason as
+ * {@link sessionCardElementId}, and distinct from the zone close button's
+ * `terminal.close-session-<tabId>`: both can be on screen at once for the
+ * same session, and the stamp must name one element.
+ */
+export function sessionCardCloseElementId(sessionId: string): string {
+  return `terminal.session-card-close-${sessionId}`;
+}
+
+/**
  * Memoized: the session manager renders one card per session, so an unrelated
  * re-render of the panel used to walk every card (plan Phase 1).
  */
@@ -310,6 +328,7 @@ function SessionCardInner({
   onOpenWorktrees,
   isOnScreen = false,
   isOffScreen = false,
+  onClose,
 }: SessionCardProps) {
   const actions = sessionCardActions(session);
   const statusInfo = sessionCardStatusInfo(session, isOffScreen);
@@ -858,6 +877,20 @@ function SessionCardInner({
             <Copy className="w-3 h-3" />
           </button>
         )}
+        {onClose && (
+          <button
+            data-ui-bridge-id={sessionCardCloseElementId(session.sessionId)}
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose(session);
+            }}
+            className="p-1 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors"
+            title="Close this session's terminal"
+            aria-label="Close session"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
 
       {/* Context menu */}
@@ -988,6 +1021,20 @@ function SessionCardInner({
                 >
                   <Copy className="w-3 h-3" /> Select for Bulk
                 </button>
+              )}
+              {onClose && (
+                <>
+                  <div className="my-1 h-px bg-[#2a2d3d]" />
+                  <button
+                    onClick={() => {
+                      setContextMenu(null);
+                      onClose(session);
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
+                  >
+                    <X className="w-3 h-3" /> Close Session
+                  </button>
+                </>
               )}
             </>
           )}
