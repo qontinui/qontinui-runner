@@ -1007,17 +1007,22 @@ pub fn child_env_plan_for(
     // Always pinned (review M1): a dir that could not be resolved must not
     // leave an earlier subscription-account `CLAUDE_CONFIG_DIR` in force, and
     // removing the var would fall back to `~/.claude`, also a subscription dir.
+    let dir_missing = session_config_dir.is_none();
     let dir = session_config_dir
         .map(str::to_string)
         .unwrap_or_else(unresolvable_config_dir);
     plan.set.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
     plan.set
         .push((NONESSENTIAL_TRAFFIC_ENV.to_string(), "1".to_string()));
-    match resolution {
-        Resolution::Unresolved(_) => plan
-            .set
-            .push((BASE_URL_ENV.to_string(), UNRESOLVED_BASE_URL.to_string())),
-        _ => plan.remove.push(BASE_URL_ENV.to_string()),
+    // The unroutable URL is pinned for an unresolved gateway AND whenever the
+    // dir is missing, whatever the resolution: a valid gateway's URL rides only
+    // that dir's settings.json, so without the dir the env is the only routing
+    // left and it must send nowhere.
+    if dir_missing || matches!(resolution, Resolution::Unresolved(_)) {
+        plan.set
+            .push((BASE_URL_ENV.to_string(), UNRESOLVED_BASE_URL.to_string()));
+    } else {
+        plan.remove.push(BASE_URL_ENV.to_string());
     }
     plan
 }
@@ -1828,6 +1833,14 @@ mod tests {
                 "{dir} must not be creatable"
             );
             assert!(!plan.remove.iter().any(|v| v == "CLAUDE_CONFIG_DIR"));
+            // Without the dir the base URL is pinned unroutable, whatever the
+            // resolution — never merely removed.
+            assert!(
+                plan.set
+                    .contains(&(BASE_URL_ENV.to_string(), UNRESOLVED_BASE_URL.to_string())),
+                "{res:?}: {plan:?}"
+            );
+            assert!(!plan.remove.iter().any(|v| v == BASE_URL_ENV), "{plan:?}");
         }
         // A resolved dir is still the one pinned.
         let plan = child_env_plan_for(&Resolution::Unresolved("x".into()), Some("/cfg"));
