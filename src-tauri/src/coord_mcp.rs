@@ -22386,8 +22386,8 @@ pub(crate) mod doctor {
         let slots_are_unknown = all_tenant_slots.is_empty();
 
         // D4 (plan 2026-09-20): is the BINDING STORE split-brained? See
-        // `binding_store_check`. `qontinui_runner_lib::` because this module
-        // is compiled into both the lib and the bin.
+        // `binding_store_check`. `qontinui_runner_lib::` because `pair` is a
+        // lib-only module and this one is bin-only.
         let binding_store = qontinui_runner_lib::pair::binding_store_check();
         let binding_store_unknown = binding_store.is_unknown();
         let binding_store_failed = binding_store.failed();

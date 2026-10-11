@@ -391,7 +391,7 @@ pub struct StoredNonceBinding {
         deserialize_with = "lenient_expected_tenant",
         skip_serializing_if = "Option::is_none"
     )]
-    pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
+    pub expected_tenant: Option<crate::repo_tenant::CwdTenant>,
 }
 
 /// Deserialize [`StoredNonceBinding::expected_tenant`] without ever failing:
@@ -399,7 +399,7 @@ pub struct StoredNonceBinding {
 /// unreadable one is `None`, which restores as pending (re-resolved).
 fn lenient_expected_tenant<'de, D>(
     deserializer: D,
-) -> Result<Option<qontinui_runner_lib::repo_tenant::CwdTenant>, D::Error>
+) -> Result<Option<crate::repo_tenant::CwdTenant>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -2913,7 +2913,7 @@ mod tests {
         assert_eq!(nonces["wrong_shape"].expected_tenant, None);
         assert_eq!(
             nonces["good"].expected_tenant,
-            Some(qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo)
+            Some(crate::repo_tenant::CwdTenant::NoRepo)
         );
     }
 

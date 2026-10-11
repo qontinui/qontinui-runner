@@ -3,23 +3,14 @@ use std::fs;
 use std::sync::OnceLock;
 use tauri::Manager;
 
-// Self-alias so `qontinui_runner_lib::…` paths resolve INSIDE this crate too.
-//
-// The bin reaches lib items by their external path. Modules the bin shares
-// with this lib are OWNED here and imported by the bin
+// The bin reaches lib items by their external path (`qontinui_runner_lib::…`);
+// lib modules name each other `crate::…`. Modules the bin shares with this lib
+// are OWNED here and imported by the bin
 // (`pub(crate) use qontinui_runner_lib::X;` in `main.rs`), so each compiles
 // once and has one set of statics; `crate_roots_ratchet` (a bin test) fails
-// on any module declared in both roots outside its shrinking allowlist.
-// Lib code spells some lib paths `qontinui_runner_lib::…` rather than
-// `crate::…` — `auth`, `process_helpers`, `machine_identity`,
-// `secure_storage`, `env_agent`, `accessibility` and `plan_workunit_adapter`
-// all do — and this alias is what makes that spelling resolve here. For
-// `auth`, which is still declared in both roots (plan
-// `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`
-// Phase 2), it is also what gives its call sites one spelling whichever crate
-// compiles it: `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked`
-// works in both.
-extern crate self as qontinui_runner_lib;
+// on any module declared in both roots outside its allowlist, which holds
+// only the per-crate `test_env` and the `util` name. Plan
+// `2026-10-04-runner-seven-modules-compile-into-both-crates-and-split-their-process-state`.
 
 pub mod accessibility;
 // The ONE seam for reading ambient machine state (`~/.qontinui/`, and the env
@@ -142,7 +133,7 @@ pub mod util {
     // task_limit), its per-episode event, the cached memory reading and the
     // EMFILE/ENFILE stamp. LIB-only on purpose: `process_helpers` and the
     // bin's heartbeat and allocator breadcrumb must stamp and read the SAME
-    // statics — so every caller spells it
+    // statics — so the bin spells it
     // `qontinui_runner_lib::util::resource_exhaustion`, and the bin's own
     // `util/mod.rs` must NOT declare it (a second declaration is a second,
     // half-blind static).

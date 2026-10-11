@@ -79,7 +79,7 @@ async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, 
         session_id
     );
 
-    let device_token = qontinui_runner_lib::auth::AuthManager::new()
+    let device_token = crate::auth::AuthManager::new()
         .get_access_token()
         .map_err(|e| format!("get device token: {e}"))?;
 

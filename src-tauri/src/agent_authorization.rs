@@ -1348,7 +1348,7 @@ fn redact_url(url: &str) -> String {
 /// GET the effective registry for this device.
 ///
 /// Auth is the repo's canonical device-JWT path — [`crate::coord_http::coord_get`]
-/// → `qontinui_runner_lib::auth::attach_device_auth` — the same bearer the
+/// → `crate::auth::attach_device_auth` — the same bearer the
 /// write path presents, so this read feeds the one auth-coverage metric. No
 /// token is minted here and none is logged.
 ///
