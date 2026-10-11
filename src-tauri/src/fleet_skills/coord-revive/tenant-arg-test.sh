@@ -8,7 +8,7 @@
 # /ui-bridge/invoke/*) and coord (POST /mcp, POST /agents/credential), and reads
 # back the request bodies the stub recorded:
 #
-#   (t1) $QONTINUI_TENANT_ID=B, a P3 runner      -> invoke body {"tenantId":B}, L4 LIVE
+#   (t1) $QONTINUI_TENANT_ID=B, a P3 runner      -> invoke body {"args":{"tenantId":B}}, L4 LIVE
 #   (t2) no env; the census row for $QONTINUI_TERMINAL_ID says B
 #                                                -> tenantId B, source named "tenancy.row"
 #   (t3) the census row names no tenant but the credential is resolved to C
@@ -55,6 +55,35 @@
 #   (s2) TERMINAL_ID unset, census non-200, census status != ok, malformed
 #        $QONTINUI_TENANT_ID, row outranks credential, RUNNER_MINT_TENANT_INVALID,
 #        and base64url `-`/`_` + every padding length in the claim decode
+#
+# THE RUNNER CONTRACT, modelled rather than assumed (plan
+# 2026-10-05-fleet-scripts-act-for-an-unnamed-tenant-on-a-multi-bound-device
+# Phase 3). qontinui-runner's InvokeRequestBody has ONE field, `args` (serde
+# default {}), and DROPS every top-level key (a runner carrying that plan's
+# Phase 7 refuses a top-level tenantId with 400 tenant_misplaced instead; this
+# stub models the older, dropping runner, which is the harder case for a
+# caller - a wrong-slot token rather than a refusal). This stub reads the tenant ONLY
+# from body["args"] -- (k0) proves it does -- so a script that sends
+# {"tenantId":…} at the top level makes a tenant-less call here exactly as it
+# does against the real runner. The previous stub read the top-level key and was
+# green against that defect. Mutant "send the tenant at the TOP level" proves
+# the suite now reds on it.
+#
+# WHOSE door (same plan): every LIVE bearer door names its acting tenant by slug
+# and id (the stub's coord answers coord_query_identity over a bearer with the
+# claim's tenant and slugs alpha/beta/gamma), and prints
+# `TENANT DIFFERS from expected <slug> (<id>)` when it acts for a tenant other
+# than the session's:
+#   (e1) a STATIC $COORD_DEVICE_JWT claiming A, session tenant B -> LIVE, and
+#        TENANT DIFFERS from expected beta (B); the same token with session
+#        tenant A is the negative control (no DIFFERS line)
+#   (e2) no expected tenant -> the TENANT line says so, and no DIFFERS line
+#   (e3) the identity read fails -> the acting tenant is the token's claim and
+#        its slug reads `slug UNKNOWN`, never a guess
+#
+#   (e4) L3's acting bearer and (e5) L6's web-host token are named too, from the
+#        token's own claim only (neither is spent on a coord identity read), with
+#        TENANT DIFFERS against the session tenant and a same-tenant control
 #
 # THE DISCHARGE (last section): staged copies of coord-revive.sh with the tenant
 # dropped from the invoke body, the wrong-tenant check deleted, the L5 tenant_id
@@ -139,6 +168,20 @@ def b64(obj):
     return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
 
 
+TA = "aaaaaaaa-0000-4000-8000-00000000000a"
+TB = "bbbbbbbb-0000-4000-8000-00000000000b"
+TC = "cccccccc-0000-4000-8000-00000000000c"
+
+
+def bearer_claim(h):
+    try:
+        seg = h.split("Bearer ", 1)[1].strip().split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg)).get("tenant_id")
+    except Exception:
+        return None
+
+
 def token(tenant):
     exp = int(time.time()) + 3600
     payload = {"sub_type": "device", "exp": exp}
@@ -202,6 +245,13 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/coord/agent-findings"):
             self._send(200, {"findings": [], "count": 0})
             return
+        if self.path.startswith("/api/v1/plan-library"):
+            # The WEB host (L6): anonymous is the served-and-refused 401.
+            if (self.headers.get("Authorization") or "").startswith("Bearer "):
+                self._send(200, {"items": [], "total": 0})
+            else:
+                self._send(401, {"detail": "Not authenticated"})
+            return
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -258,7 +308,10 @@ class H(BaseHTTPRequestHandler):
             self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
             return
         if self.path == "/ui-bridge/invoke/get_coord_device_token":
-            asked = req.get("tenantId")
+            # The REAL contract: only body["args"] is read; a top-level
+            # tenantId is ignored, exactly as InvokeRequestBody ignores it.
+            args = req.get("args") if isinstance(req.get("args"), dict) else {}
+            asked = args.get("tenantId")
             runner = mode("runner", "p3")
             if runner == "absent":
                 self._send(404, {"error": "not found"})
@@ -284,7 +337,25 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path == "/mcp":
             rid = req.get("id", 1)
+            if (req.get("params") or {}).get("name") == "coord_query_identity":
+                if mode("identity_bearer", "ok") == "fail":
+                    # Answers (so the probe's own end-to-end call stays LIVE)
+                    # but names no tenant: the identity READ has failed.
+                    self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": json.dumps({"principal_kind": "device"})}]}})
+                    return
+                t = bearer_claim(self.headers.get("Authorization") or "")
+                slugs = {TA: "alpha", TB: "beta", TC: "gamma"}
+                text = json.dumps({"principal_kind": "device", "tenant_id": t, "tenant_slug": slugs.get(t),
+                                   "device_tenant_bindings": {"tenant_ids": [{"tenant_id": k, "tenant_slug": v} for k, v in slugs.items()],
+                                                              "source": "coord.tenant_devices"}})
+                self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+                return
             self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "coord_query_identity"}, {"name": "coord_memory_search"}]}})
+            return
+        if self.path == "/coord/auth/acting-user-service-token":
+            # L3's acting-bearer mint: a token for the presented bearer's tenant.
+            t = bearer_claim(self.headers.get("Authorization") or "")
+            self._send(200, {"token": token(t)})
             return
         if self.path == "/agents/credential":
             cm = mode("coord", "live")
@@ -354,22 +425,24 @@ cred_body() { printf '%s\n' "$REQS" | sed -n 's#^POST /agents/credential ##p' | 
 echo "== (t1) \$QONTINUI_TENANT_ID names the tenant -> sent to a P3 runner, L4 LIVE"
 setmode runner p3-multi; setmode census none; setmode default_tenant "$TA"
 run_case "$STUB" "$STUB" QONTINUI_TENANT_ID="$TB"
-assert_eq  "(t1) the invoke body names tenant B" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
+assert_eq  "(t1) the invoke body names tenant B" "{\"args\":{\"tenantId\":\"$TB\"}}" "$(invoke_body)"
 assert_has "(t1) VERDICT: LIVE" "VERDICT: LIVE" "$OUT"
-assert_has "(t1) the PARTIAL block states the tenant established" "PARTIAL: tenant established: the minted token's tenant_id claim is $TB; sent tenant $TB (from \$QONTINUI_TENANT_ID)" "$OUT"
+assert_has "(t1) the PARTIAL block states the tenant established" "PARTIAL: tenant established: the minted token's tenant_id claim is beta ($TB); sent tenant $TB (from \$QONTINUI_TENANT_ID)" "$OUT"
+assert_has "(t1) the TENANT line names the acting tenant by slug and id, read from coord" "TENANT: acting tenant beta ($TB) (coord_query_identity over this bearer); expected beta ($TB) from \$QONTINUI_TENANT_ID" "$OUT"
+assert_lacks "(t1) acting == expected: no DIFFERS line" "TENANT DIFFERS" "$OUT"
 assert_lacks "(t1) no token on stdout" "sig" "$(printf '%s' "$OUT" | grep -o 'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.sig' || true)"
 
 echo "== (t2) the runner's session census row names the tenant"
 setmode census row; setmode row_tenant "$TB"
 run_case "$STUB" "$STUB" QONTINUI_TERMINAL_ID=term-1
-assert_eq  "(t2) the invoke body names the row tenant" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
+assert_eq  "(t2) the invoke body names the row tenant" "{\"args\":{\"tenantId\":\"$TB\"}}" "$(invoke_body)"
 assert_has "(t2) VERDICT: LIVE" "VERDICT: LIVE" "$OUT"
 assert_has "(t2) the census was asked" "GET /control/sessions/info" "$REQS"
 
 echo "== (t3) the row names none; the resolved credential tenant is used"
 setmode census credential; setmode cred_tenant "$TC"
 run_case "$STUB" "$STUB" QONTINUI_TERMINAL_ID=term-1
-assert_eq  "(t3) the invoke body names the credential tenant" "{\"tenantId\":\"$TC\"}" "$(invoke_body)"
+assert_eq  "(t3) the invoke body names the credential tenant" "{\"args\":{\"tenantId\":\"$TC\"}}" "$(invoke_body)"
 
 echo "== (t4) a census with no tenancy block, on a multi-slot P3 runner -> typed refusal"
 setmode census no-tenancy
@@ -402,7 +475,8 @@ run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB"
 assert_has "(t7) the credential body names tenant_id B" "\"tenant_id\":\"$TB\"" "$(cred_body)"
 assert_has "(t7) the device_id is still sent" "\"device_id\":\"11111111-1111-4111-8111-111111111111\"" "$(cred_body)"
 assert_has "(t7) L5 LIVE" "transport=https-bootstrap-agent-jwt" "$OUT"
-assert_has "(t7) the LIVE names the token's tenant claim" "TENANT: token tenant_id claim $TB; sent tenant $TB (from" "$OUT"
+assert_has "(t7) the LIVE names the acting tenant by slug and id" "TENANT: acting tenant beta ($TB) (coord_query_identity over this bearer); expected beta ($TB) from" "$OUT"
+assert_has "(t7) and the token's own claim and what was sent" "token tenant_id claim $TB; sent tenant $TB (from" "$OUT"
 
 echo "== (t8) L5 with no tenant on a multi-bound device -> BOOTSTRAP_TENANT_AMBIGUOUS"
 run_case "$DEAD" "$STUB"
@@ -505,7 +579,7 @@ setmode runner p3-multi; setmode census row; setmode row_tenant "$TB"
 case "$PORT" in 9876) bad "(w3) the stub must not be on 9876 for this case to mean anything" ;; esac
 run_case - "$STUB" QONTINUI_RUNNER_API_PORT="$PORT" QONTINUI_TERMINAL_ID=term-1
 assert_has "(w3) the census on the API_PORT runner was asked" "GET /control/sessions/info" "$REQS"
-assert_eq  "(w3) and its row tenant was sent to that runner's mint" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
+assert_eq  "(w3) and its row tenant was sent to that runner's mint" "{\"args\":{\"tenantId\":\"$TB\"}}" "$(invoke_body)"
 assert_has "(w3) the mint that went LIVE was that runner's" "device-jwt@http://127.0.0.1:$PORT source=runner-invoke" "$ERR"
 assert_has "(w3) VERDICT: LIVE" "VERDICT: LIVE" "$OUT"
 
@@ -536,7 +610,7 @@ assert_has "(s2d) reason names the variable" "QONTINUI_TENANT_ID is set but is n
 echo "== (s2) the census row outranks the credential"
 setmode census both; setmode row_tenant "$TB"; setmode cred_tenant "$TC"
 run_case "$STUB" "$STUB" QONTINUI_TERMINAL_ID=term-1
-assert_eq "(s2e) the row tenant is sent" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
+assert_eq "(s2e) the row tenant is sent" "{\"args\":{\"tenantId\":\"$TB\"}}" "$(invoke_body)"
 
 echo "== (s2) the runner answers tenant_invalid -> RUNNER_MINT_TENANT_INVALID"
 setmode runner p3-invalid; setmode census none
@@ -646,6 +720,65 @@ else
   assert_lacks "(c1b) never LIVE" "VERDICT: LIVE" "$OUT"
 fi
 
+# ================================================================ the runner contract + WHOSE door
+echo "== (k0) the stub models the runner's contract: a top-level tenantId is IGNORED"
+setmode runner p3-multi
+K0="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$STUB/ui-bridge/invoke/get_coord_device_token" -H 'Content-Type: application/json' -d "{\"tenantId\":\"$TB\"}")"
+assert_eq "(k0) top-level {\"tenantId\":B} on a multi-slot stub is tenant-less: 409" "409" "$K0"
+K0="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$STUB/ui-bridge/invoke/get_coord_device_token" -H 'Content-Type: application/json' -d "{\"args\":{\"tenantId\":\"$TB\"}}")"
+assert_eq "(k0) {\"args\":{\"tenantId\":B}} is the tenant: 200" "200" "$K0"
+
+mkjwt() { "$PY" - "$1" <<'PYJ'
+import base64, json, sys, time
+enc = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+print(enc({"alg": "none"}) + "." + enc({"sub_type": "device", "tenant_id": sys.argv[1], "exp": int(time.time()) + 3600}) + ".sig")
+PYJ
+}
+JWT_A="$(mkjwt "$TA")"
+
+echo "== (e1) a STATIC token claiming A, session tenant B -> LIVE, TENANT DIFFERS from expected beta (B)"
+setmode census none; setmode identity_bearer ok
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB" COORD_DEVICE_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(e1) LIVE over the env token" "transport=https-device-jwt-env" "$OUT"
+assert_has "(e1) the acting tenant is named by slug and id" "TENANT: acting tenant alpha ($TA) (coord_query_identity over this bearer); expected beta ($TB) from \$QONTINUI_TENANT_ID" "$OUT"
+assert_has "(e1) TENANT DIFFERS from expected beta (B)" "TENANT DIFFERS from expected beta ($TB): this door acts as alpha ($TA)" "$OUT"
+assert_lacks "(e1) no token on stdout" ".sig" "$(printf '%s' "$OUT" | grep -o 'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.sig' || true)"
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TA" COORD_DEVICE_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(e1 control) the same token for the session's own tenant is LIVE" "transport=https-device-jwt-env" "$OUT"
+assert_lacks "(e1 control) acting == expected: no DIFFERS line" "TENANT DIFFERS" "$OUT"
+
+echo "== (e2) no expected tenant -> said, and no DIFFERS line"
+run_case "$DEAD" "$STUB" COORD_DEVICE_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(e2) acting tenant named" "TENANT: acting tenant alpha ($TA)" "$OUT"
+assert_has "(e2) no expected tenant, and why" "no expected tenant (" "$OUT"
+assert_lacks "(e2) nothing to differ from" "TENANT DIFFERS" "$OUT"
+
+echo "== (e3) the identity read fails -> the claim, with slug UNKNOWN"
+setmode identity_bearer fail
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB" COORD_DEVICE_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1
+setmode identity_bearer ok
+assert_has "(e3) the claim is used and the slug is UNKNOWN, never guessed" "TENANT: acting tenant slug UNKNOWN ($TA) (the token's tenant_id claim; the identity read failed" "$OUT"
+assert_has "(e3) and it still DIFFERS from the expected tenant" "TENANT DIFFERS from expected slug UNKNOWN ($TB)" "$OUT"
+
+echo "== (e4) L3 acting bearer claiming A, session tenant B -> TENANT + TENANT DIFFERS (claim only)"
+setmode census none
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB" COORD_AGENT_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(e4) LIVE over the acting bearer" "transport=https-acting-bearer" "$OUT"
+assert_has "(e4) the acting tenant is the token's claim" "TENANT: acting tenant slug UNKNOWN ($TA) (the token's tenant_id claim); expected slug UNKNOWN ($TB) from \$QONTINUI_TENANT_ID" "$OUT"
+assert_has "(e4) TENANT DIFFERS" "TENANT DIFFERS from expected slug UNKNOWN ($TB): this door acts as slug UNKNOWN ($TA)" "$OUT"
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TA" COORD_AGENT_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(e4 control) same tenant: LIVE" "transport=https-acting-bearer" "$OUT"
+assert_lacks "(e4 control) no DIFFERS line" "TENANT DIFFERS" "$OUT"
+
+echo "== (e5) L6 web-host token claiming A, session tenant B -> TENANT + TENANT DIFFERS (claim only)"
+run_case "$DEAD" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_DEVICE_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1 QONTINUI_WEB_HTTP_URL="$STUB"
+assert_has "(e5) LIVE over the web host" "transport=https-web-device-jwt" "$OUT"
+assert_has "(e5) the acting tenant is the token's claim" "TENANT: acting tenant slug UNKNOWN ($TA) (the token's tenant_id claim)" "$OUT"
+assert_has "(e5) TENANT DIFFERS" "TENANT DIFFERS from expected slug UNKNOWN ($TB)" "$OUT"
+run_case "$DEAD" "$DEAD" QONTINUI_TENANT_ID="$TA" COORD_DEVICE_JWT="$JWT_A" COORD_REVIVE_NO_BOOTSTRAP=1 QONTINUI_WEB_HTTP_URL="$STUB"
+assert_has "(e5 control) same tenant: LIVE" "transport=https-web-device-jwt" "$OUT"
+assert_lacks "(e5 control) no DIFFERS line" "TENANT DIFFERS" "$OUT"
+
 # ================================================================ the discharge
 if [ "${MC_MUTANT:-0}" = "1" ]; then
   :
@@ -667,7 +800,22 @@ else
       tail -20 "$SANDBOX/ctl.log"
     fi
     mc_expect_red "never put the tenant on the invoke body" \
-      "$SCRIPT" 's/^      MINVOKE_BODY="{\\"tenantId\\":\\"\$SESSION_TENANT\\"}"$/      MINVOKE_BODY="{}"/' \
+      "$SCRIPT" 's/^      MINVOKE_BODY="{\\"args\\":{\\"tenantId\\":\\"\$SESSION_TENANT\\"}}"$/      MINVOKE_BODY="{}"/' \
+      -- bash "$0"
+    mc_expect_red "send the tenant at the TOP level (the pre-fix body the runner drops)" \
+      "$SCRIPT" 's/^      MINVOKE_BODY="{\\"args\\":{\\"tenantId\\":\\"\$SESSION_TENANT\\"}}"$/      MINVOKE_BODY="{\\"tenantId\\":\\"$SESSION_TENANT\\"}"/' \
+      -- bash "$0"
+    mc_expect_red "never say TENANT DIFFERS" \
+      "$SCRIPT" 's/^  \[ -n "\${LIVE_TENANT_DIFFERS:-}" \] && echo "\$LIVE_TENANT_DIFFERS"$/  :/' \
+      -- bash "$0"
+    mc_expect_red "L3 acting-bearer LIVE names no tenant" \
+      "$SCRIPT" 's/tenant_lines "\$TOKEN" .* claim-only$/:/' \
+      -- bash "$0"
+    mc_expect_red "L6 web-host LIVE names no tenant" \
+      "$SCRIPT" 's/tenant_lines "\$WEBJWT" .* claim-only$/:/' \
+      -- bash "$0"
+    mc_expect_red "name the acting tenant without its slug" \
+      "$SCRIPT" 's/^tenant_label() { local g; g="\$(slug_of "\$1")"; /tenant_label() { local g; g=""; /' \
       -- bash "$0"
     mc_expect_red "trust whatever token comes back, whichever tenant it claims" \
       "$SCRIPT" 's/^      if \[ "\$MCLAIM" != /      if false \&\& [ "$MCLAIM" != /' \

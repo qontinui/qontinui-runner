@@ -650,8 +650,12 @@ trap 'cleanup; cleanup2; cleanup3' EXIT
   echo '  */author-session) k=door ;;'
   echo '  */coord/agent-pr-labels) if [ -n "$getflag" ]; then k=read; else k=read_not_get; fi ;;'
   echo '  */pr-merge/labels) case "$data" in *"\"labels\": []"*) k=probe ;; *) k=post ;; esac ;;'
+  echo '  */ui-bridge/invoke/get_coord_device_token) k=runner ;;'
   echo '  *) k=other ;; esac'
   echo 'bearer=""; case "$hdr" in *"@"*) f="${hdr##*@}"; [ -r "$f" ] && bearer="$(cat "$f")" ;; esac'
+  # A runner-minted token (signature `.runner`) gets the read_runner answer when
+  # one is staged -- coord refusing the runner's token on the read-back only.
+  echo 'case "$k:$bearer" in read:*.runner) [ -r "$d/read_runner.code" ] && k=read_runner ;; esac'
   echo 'printf "%s %s%s %s\n" "$k" "$url" "$q" "$data" >> "$d/calls"'
   echo '[ -n "$bearer" ] && printf "%s\n" "$bearer" >> "$d/bearers"'
   echo '[ -n "$out" ] && cat "$d/$k.body" > "$out" 2>/dev/null'
@@ -676,9 +680,12 @@ b=lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("="
 print(b({"alg":"EdDSA"})+"."+b({"tenant_id":os.environ["H_T"],"exp":int(time.time())+int(os.environ["H_OFF"])})+".sig")'
 }
 # Isolate the credential cascade from this box: no env token, an empty HOME
-# (no file token, no machine.json), a pinned device id.
+# (no file token, no machine.json), a pinned device id, and no local-runner
+# rung (CTC_NO_RUNNER=1: the box's runner is not part of this fixture, and its
+# 127.0.0.1 mint is not a coord call, which T13 counts).
 FAKEHOME="$STUBDIR3/home"; mkdir -p "$FAKEHOME"
 unset COORD_DEVICE_JWT
+export CTC_NO_RUNNER=1
 export QONTINUI_MACHINE_ID="11111111-2222-4333-8444-555555555555"
 printf '0\n' > "$GH_STUB_RC_FILE"; : > "$GH_STUB_MSG_FILE"
 
@@ -880,6 +887,21 @@ if [[ "$(grep -c " https://coord.example.test/" "$STUBDIR3/calls")" -ne "$(wc -l
 if [[ "$(cat "$STUBDIR3/t13b.rc")" != 0 ]]; then fail "T13b: expected rc=0, got $(cat "$STUBDIR3/t13b.rc") :: $(cat "$STUBDIR3/calls")"; else ok; fi
 if [[ "$(grep -c " https://coord.qontinui.io/" "$STUBDIR3/calls")" -ne "$(wc -l < "$STUBDIR3/calls" | tr -d ' ')" ]]; then
   fail "T13b: not every call used the hosted base :: $(cat "$STUBDIR3/calls")"; else ok; fi
+# T13c: the read-back under the local runner's token answers 401 -- the runner
+# token is dropped and the read is re-staged ONCE, reaching the mint, exactly as
+# the library's own walkers retry it. Production coord, so the runner is asked.
+RUNNER_TOK="$(mkjwt "$T_OWN" | sed 's/\.sig$/.runner/')"
+stub runner 200 "{\"success\":true,\"data\":\"$RUNNER_TOK\"}"
+stub read_runner 401 '{"error":"unknown signer"}'
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+COORD_URL="https://coord.qontinui.io" CTC_NO_RUNNER=0 run_coord "coord:stacked-on=#6"
+expect_rc 0 "T13c a 401 to the runner's token on the read-back re-stages to the mint"
+expect_out "coord recorded label" "T13c"
+expect_calls runner 1 "T13c (the owner check staged the runner's token)"
+expect_calls read_runner 1 "T13c (the first read went out under it)"
+expect_calls read 1 "T13c (the retry read went out under the mint)"
+expect_calls mint 1 "T13c (the re-stage minted)"
+rm -f "$STUBDIR3/read_runner.code" "$STUBDIR3/read_runner.body" "$STUBDIR3/runner.code" "$STUBDIR3/runner.body"
 
 no_ok() { if [[ "$OUT" == *"ok: coord recorded"* ]]; then fail "$1: printed ok without a present read-back :: $OUT"; else ok; fi; }
 
