@@ -19,6 +19,12 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
+import {
+  extractAccountLabel,
+  extractProjectLabel,
+  mergeLiveRows,
+  tabLiveStatus,
+} from "./sessionManagerLiveRows";
 import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -226,7 +232,15 @@ export interface ProbeConflictsRequest {
   hinted_files?: string[];
 }
 
-export interface UnifiedSession {
+/**
+ * Fields every session-manager row carries, whichever source produced it.
+ * {@link UnifiedSession} adds the `source` discriminant and `_transcript`.
+ */
+export interface UnifiedSessionFields {
+  /**
+   * The row's key. The Claude session id for a transcript row; the TAB id for
+   * a tab-sourced row (which has no transcript, and possibly no session id).
+   */
   sessionId: string;
   accountLabel: string;
   configDir: string;
@@ -265,6 +279,11 @@ export interface UnifiedSession {
   liveStatus: SessionLiveStatus;
   zoneTabId: string | null;
   zoneIndex: number | null;
+  /**
+   * The device a remote session tab mirrors (`TerminalTab.remote.deviceLabel`);
+   * `null` for a local session and for every transcript row.
+   */
+  remoteDeviceLabel: string | null;
 
   // Timing
   startedAt: string | null;
@@ -284,10 +303,28 @@ export interface UnifiedSession {
    * meaningful when `liveStatus === "frozen"`.
    */
   isOrphaned: boolean;
+}
 
+/** A row projected from a Claude transcript (`message_count > 0`). */
+export interface TranscriptSessionRow extends UnifiedSessionFields {
+  source: "transcript";
   // Original transcript session (for resume)
   _transcript: TranscriptSession;
 }
+
+/**
+ * A row for a live tab no transcript row represents — a plain shell, a session
+ * not yet past its first message, a remote session tab. Built by
+ * `sessionManagerLiveRows.ts`; keyed by the tab id, with no transcript, so the
+ * transcript-only actions (view transcript, copy session id, resume, promote,
+ * commit) do not apply to it.
+ */
+export interface TabSessionRow extends UnifiedSessionFields {
+  source: "tab";
+  _transcript: null;
+}
+
+export type UnifiedSession = TranscriptSessionRow | TabSessionRow;
 
 export type SessionGroupBy = "status" | "account" | "project" | "date";
 export type SessionSortBy = "recent" | "oldest" | "messages" | "staleness";
@@ -383,20 +420,6 @@ export interface UseSessionManagerReturn {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function extractAccountLabel(configDir: string): string {
-  // Extract label from config dir path like "C:\claude\.claude-gmail" → "gmail"
-  const normalized = configDir.replace(/\\/g, "/").replace(/\/$/, "");
-  const last = normalized.split("/").pop() ?? "";
-  const match = last.match(/^\.claude-(.+)$/);
-  return match ? match[1] : last === ".claude" ? "default" : last;
-}
-
-function extractProjectLabel(projectPath: string): string {
-  if (!projectPath) return "";
-  const normalized = projectPath.replace(/\\/g, "/").replace(/\/$/, "");
-  return normalized.split("/").pop() ?? "";
-}
 
 function computeDuration(
   startedAt: string | null | undefined,
@@ -516,6 +539,8 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
  *   included; revealing an exited stub would push a live terminal out of its
  *   zone to show a dead one, so only a live tab qualifies.
  * - Injected fixtures point `zoneTabId` at a synthetic tab no zone can hold.
+ * - A tab-sourced row (`_transcript: null`) points `zoneTabId` at the live tab
+ *   it was built from, so it resolves exactly like a transcript row's join.
  */
 export function liveTabIdForSession(
   session: Pick<UnifiedSession, "zoneTabId" | "_transcript">,
@@ -850,10 +875,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // ── Merge into UnifiedSession[] ────────────────────────────────────────────
 
-  const allSessions = useMemo((): UnifiedSession[] => {
+  const transcriptRows = useMemo((): TranscriptSessionRow[] => {
     return transcriptSessions
       .filter((s) => s.message_count > 0)
-      .map((s): UnifiedSession => {
+      .map((s): TranscriptSessionRow => {
         const tab = tabSessionMap.get(s.session_id);
         const digest = digests[s.session_id];
 
@@ -872,6 +897,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         if (s.injected_live_status) {
           liveStatus = s.injected_live_status as SessionLiveStatus;
           return {
+            source: "transcript",
             sessionId: s.session_id,
             accountLabel: extractAccountLabel(s.config_dir),
             configDir: s.config_dir,
@@ -887,6 +913,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
             liveStatus,
             zoneTabId: null,
             zoneIndex: null,
+            remoteDeviceLabel: null,
             startedAt: s.started_at ?? null,
             durationMs: computeDuration(s.started_at, s.last_modified),
             lastMessageType: "",
@@ -903,18 +930,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
         if (tab) {
           zoneTabId = tab.id;
-          const tabState = sessionStates[tab.id];
-          if (tabState === "needs-input") {
-            liveStatus = "needs-input";
-          } else if (tabState === "error") {
-            liveStatus = "error";
-          } else if (tabState === "completed") {
-            liveStatus = "completed";
-          } else if (staleTabs.has(tab.id)) {
-            liveStatus = "frozen";
-          } else {
-            liveStatus = "active-in-zone";
-          }
+          liveStatus = tabLiveStatus(tab.id, sessionStates, staleTabs);
         } else if (digest?.likely_frozen) {
           // If external processes are running and session was modified very recently,
           // it's likely active externally rather than frozen
@@ -947,6 +963,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         }
 
         return {
+          source: "transcript",
           sessionId: s.session_id,
           accountLabel: extractAccountLabel(s.config_dir),
           configDir: s.config_dir,
@@ -962,6 +979,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           liveStatus,
           zoneTabId,
           zoneIndex: null, // Could be enriched from zone assignments
+          remoteDeviceLabel: null,
           startedAt: s.started_at ?? null,
           durationMs: computeDuration(s.started_at, s.last_modified),
           lastMessageType: digest?.last_message_type ?? "",
@@ -987,6 +1005,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     registryNames,
     now,
   ]);
+
+  // Every live tab gets a row (plan 2026-10-11-runner-terminal-tmux-work-mode,
+  // D5): its transcript row when it has one, else a tab-sourced row. In tmux
+  // mode the panel is the only way to reach an off-screen session.
+  const allSessions = useMemo(
+    (): UnifiedSession[] =>
+      mergeLiveRows(transcriptRows, { tabs, sessionStates, staleTabs, registryNames }),
+    [transcriptRows, tabs, sessionStates, staleTabs, registryNames],
+  );
 
   // ── Filter and sort ────────────────────────────────────────────────────────
 
@@ -1077,9 +1104,13 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // ── Stats ──────────────────────────────────────────────────────────────────
 
+  // Frozen counts transcript rows only: it drives "select all frozen" bulk
+  // resume and the "may need resume" notification, and a tab-sourced row has
+  // nothing to resume. The needs-input / active pills count every live row, so
+  // a hidden plain shell waiting on input shows up in them.
   const frozenCount = useMemo(
-    () => allSessions.filter((s) => s.liveStatus === "frozen").length,
-    [allSessions],
+    () => transcriptRows.filter((s) => s.liveStatus === "frozen").length,
+    [transcriptRows],
   );
   const needsInputCount = useMemo(
     () => allSessions.filter((s) => s.liveStatus === "needs-input").length,
@@ -1126,7 +1157,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   // Buckets are mapped explicitly over the 7 SessionLiveStatus values so
   // adding a new status forces a compile-time decision here rather than
   // silently dropping it.
-  const statusCounts = useMemo(() => computeStatusCounts(allSessions), [allSessions]);
+  //
+  // Transcript rows only: the strip counts Claude sessions, and a tab-sourced
+  // row (a plain shell, a session before its first message) is a PTY tab.
+  const statusCounts = useMemo(() => computeStatusCounts(transcriptRows), [transcriptRows]);
 
   // ── Desktop notifications for frozen sessions ──────────────────────────────
 
@@ -1158,6 +1192,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   const resumeSession = useCallback(
     (session: UnifiedSession) => {
+      // A tab-sourced row has no transcript to resume — it IS the live tab.
+      if (session.source !== "transcript") return;
       // F1 inertness: a debug-injected fake has no real transcript on disk —
       // resuming it would spawn a stray `claude --resume <fake-id>` against a
       // session id that doesn't exist. No-op it.
@@ -1174,6 +1210,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   const viewTranscript = useCallback(
     (session: UnifiedSession) => {
+      if (session.source !== "transcript") return;
       onSelectSession(session.sessionId);
     },
     [onSelectSession],
@@ -1192,6 +1229,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   );
 
   const copySessionId = useCallback((session: UnifiedSession) => {
+    // A tab-sourced row's key is a tab id, not a session id.
+    if (session.source !== "transcript") return;
     navigator.clipboard.writeText(session.sessionId).catch(() => {});
   }, []);
 
@@ -1212,9 +1251,11 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   const selectAllFrozen = useCallback(() => {
-    const frozenIds = allSessions.filter((s) => s.liveStatus === "frozen").map((s) => s.sessionId);
+    const frozenIds = transcriptRows
+      .filter((s) => s.liveStatus === "frozen")
+      .map((s) => s.sessionId);
     setSelectedIds(new Set(frozenIds));
-  }, [allSessions]);
+  }, [transcriptRows]);
 
   const clearSelection = useCallback(() => {
     setSelectedIds(new Set());
@@ -1223,10 +1264,13 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   const bulkResume = useCallback(async () => {
     // F1 inertness: drop synthetic-backed fakes from the bulk set — they have
     // no real transcript to resume (see `resumeSession`).
-    const toResume = allSessions.filter(
+    // Only transcript rows are resumable; a tab-sourced row is already live.
+    const toResume = transcriptRows.filter(
       (s) => selectedIds.has(s.sessionId) && !isInjectedSession(s),
     );
-    const skipped = allSessions.filter((s) => selectedIds.has(s.sessionId) && isInjectedSession(s));
+    const skipped = transcriptRows.filter(
+      (s) => selectedIds.has(s.sessionId) && isInjectedSession(s),
+    );
     for (const s of skipped) {
       console.warn(
         `[test-fixtures] ignoring resume on synthetic tab ${s.zoneTabId ?? s.sessionId}`,
@@ -1239,7 +1283,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       // Small delay between resumes to avoid race conditions in terminal creation
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-  }, [allSessions, selectedIds, onResumeSession]);
+  }, [transcriptRows, selectedIds, onResumeSession]);
 
   return {
     sessions,

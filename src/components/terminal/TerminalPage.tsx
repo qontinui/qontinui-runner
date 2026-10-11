@@ -1523,6 +1523,7 @@ function TerminalPageInner({
               sessionConflictCounts={fileConflicts.sessionConflictCounts}
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
+              onScreenTabId={zoneLayout.shownTabId}
             />
           )}
 
