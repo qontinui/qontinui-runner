@@ -441,7 +441,10 @@ function Start-ParityRunner {
     # for both legs. The difference the report measures must come from the
     # ARTIFACT, not from an environment this script arranged. Whatever
     # QONTINUI_ROOT happens to be is recorded in the report's observability
-    # block so a reader can see what the two legs were measured under.
+    # block so a reader can see what the two legs were measured under. An
+    # unpacked AppImage is launched through its own AppRun, which sets its own
+    # environment before exec'ing the binary; that comes from the artifact's
+    # launcher, not from this table, so the invariant holds.
     #
     # $EnvOverrides is the ONE exception and it exists for exactly one caller:
     # -NegativeControl, whose whole purpose is to vary the environment on
@@ -1210,6 +1213,12 @@ if ($NegativeControl) {
 
 try {
     $pubPath = Find-InstalledRunnerExe -InstallRoot $InstallRoot -Platform $ParityPlatform
+    # What is LAUNCHED can differ from what was located: an unpacked AppImage
+    # boots through its AppRun (lib/installed-runner.ps1
+    # Get-PublishedLinuxLaunchPath), the way a user's launch does. The located
+    # binary is still the one the never-the-dev-binary guard checked.
+    $pubLaunch = $pubPath
+    if ($ParityPlatform -eq 'linux') { $pubLaunch = Get-PublishedLinuxLaunchPath -BinaryPath $pubPath }
 } catch {
     Write-Host "PARITY-UNAVAILABLE published_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
@@ -1228,6 +1237,7 @@ try {
 
 Write-Host "  development build : $devPath"
 Write-Host "  published build   : $pubPath"
+if ($pubLaunch -ne $pubPath) { Write-Host "  published launch  : $pubLaunch (AppImage AppRun)" }
 Write-Host "  door              : $Door"
 Write-Host ""
 
@@ -1238,7 +1248,7 @@ if ($Door -eq 'cli') {
 }
 
 $devRead = Get-Manifest -ExePath $devPath -Label "dev" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
-$pubRead = Get-Manifest -ExePath $pubPath -Label "published" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
+$pubRead = Get-Manifest -ExePath $pubLaunch -Label "published" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
 
 $failed = @()
 if ($null -eq $devRead.Manifest) { $failed += "development ($($devRead.Door)): $($devRead.Error)" }

@@ -1296,6 +1296,11 @@ jobs:
             throw
           }
           Write-Host "Published Linux runner: $exe"
+          # An AppImage boots through its AppRun (the bundle's own runtime
+          # environment), never its inner binary -- resolved here so a broken
+          # extract refuses before the parity step boots anything.
+          $launch = Get-PublishedLinuxLaunchPath -BinaryPath $exe
+          Write-Host "Published Linux launch: $launch"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "prefix=$prefix"
 
       # AXIS 1 on Linux. pwsh directly (there is no 5.1 here, and the 5.1
