@@ -4998,11 +4998,11 @@ pub(crate) async fn refresh_cognito_bearer(
 ///
 /// A configured value comes from [`crate::api_config::configured_api_base_from`],
 /// the one ladder, so this can not disagree with the relay by construction
-/// (a release build's refusal of a loopback persisted value included; plan
+/// (the refusal of a machine-local persisted value included; plan
 /// 2026-07-08's prod/local device-JWT split). When the ladder yields nothing
 /// but a non-blank persisted value exists, the value was not honoured as
-/// configured: it was refused (release loopback), equal to the build default
-/// (debug), or web-integration is disabled. In each case the base is what the
+/// configured: it was refused (machine-local), or web-integration is
+/// disabled. In each case the base is what the
 /// relay actually dials, with its arm. NOTE the disabled case is a deliberate
 /// behaviour change: the refresher used to ignore `web_integration.enabled`
 /// and now falls back to the relay's base instead. Otherwise `("", None)`:
@@ -5568,9 +5568,9 @@ async fn refresher_loop(
                 // relay DIALS, or the runner presents a credential to a backend
                 // that never issued it.
                 //
-                // `api_config` refuses a LOOPBACK persisted `backend_url` on a
-                // RELEASE build (see `api_config::resolve_api_base_url`), so on
-                // such a runner the relay dials the release default. Reading the
+                // `api_config` refuses a MACHINE-LOCAL persisted `backend_url`
+                // in every build (see `api_config::resolve_api_base_url`), so on
+                // such a runner the relay dials the build default. Reading the
                 // persisted field raw here would leave this loop minting against
                 // `127.0.0.1:8000` while the relay talks to production — the
                 // prod/local device-JWT split the persisted rung was introduced
@@ -5579,9 +5579,8 @@ async fn refresher_loop(
                 // So a refused value defers to `get_api_base_url()` — the one
                 // authority — rather than to a second copy of rung 4 here. The
                 // two can then not disagree by construction. A runner whose
-                // persisted value is honoured (every debug build, and every
-                // release build pointed at a real remote backend) takes the
-                // same path it always did.
+                // persisted value is honoured (one pointed at a real remote
+                // backend) takes the same path it always did.
                 let (pair_base, pair_base_arm) = resolve_pair_base(&settings_snapshot);
                 if pair_base.is_empty() {
                     warn!("device_jwt_refresher: backend_url empty — cannot pair");
@@ -5895,19 +5894,18 @@ mod tests {
                 &["web_integration.backend_url"][..],
             ),
             (
-                A::BuildDefaultDebug,
-                "build_default:debug",
+                A::BuildDefault,
+                "build_default",
                 &["QONTINUI_WEB_BACKEND_URL", "profiles.json"][..],
             ),
             (
-                A::BuildDefaultRelease,
-                "build_default:release",
-                &["QONTINUI_WEB_BACKEND_URL", "profiles.json"][..],
-            ),
-            (
-                A::BuildDefaultReleaseLoopbackRejected,
-                "build_default:release:persisted_loopback_rejected",
-                &["web_integration.backend_url"][..],
+                A::BuildDefaultLoopbackRejected,
+                "build_default:persisted_loopback_rejected",
+                &[
+                    "web_integration.backend_url",
+                    "QONTINUI_WEB_BACKEND_URL",
+                    "profiles.json",
+                ][..],
             ),
         ] {
             let o = pair_base_origin(Some(arm));

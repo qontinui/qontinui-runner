@@ -824,7 +824,7 @@ async fn relay_loop(
         }
 
         // `get_api_base_url()` now honors the persisted paired backend
-        // (`web_integration.backend_url`) as its step-3 fallback, so the relay
+        // (`web_integration.backend_url`) as its step-4 fallback, so the relay
         // targets the SAME backend that pairing minted this device's JWT
         // against — closing the prod/local device-JWT split. The relay re-reads
         // settings every iteration (see `load_settings()` at the loop top), so
@@ -881,7 +881,10 @@ async fn relay_loop(
         //    QONTINUI_WEB_BACKEND_URL fell through `api_config` rung 4 to
         //    `http://127.0.0.1:8000`, a dev stack that was not running, and
         //    every attempt was `Connection refused`. The old wording sent the
-        //    reader hunting a device-JWT that was perfectly valid.
+        //    reader hunting a device-JWT that was perfectly valid. (The build
+        //    default has since become PROD_API_BASE_URL in every build, and a
+        //    persisted machine-local value is refused, so that exact path is
+        //    closed; a deliberate local override can still point here.)
         //  * ACKed earlier and dropping now -> we DID reach the backend and it
         //    is refusing or dropping us, which is where a revoked device-JWT or
         //    an un-paired device belongs.
@@ -896,8 +899,11 @@ async fn relay_loop(
                  lifetime, so this is a reachability problem, not a credential \
                  one: check that the URL above is the backend you mean \
                  (QONTINUI_WEB_BACKEND_URL, else QONTINUI_API_URL, else the \
-                 persisted paired backend, else the build default — which is \
-                 http://127.0.0.1:8000 on a DEBUG build) and that it is up."
+                 active profile's api_url in ~/.qontinui/profiles.json, else \
+                 the persisted paired backend, else the build default — which \
+                 is production in every build) and that it is up. To use a \
+                 local backend, set api_url in the active profile or export \
+                 QONTINUI_WEB_BACKEND_URL."
             } else {
                 "This relay connected successfully earlier in this process's \
                  lifetime and is being dropped now, so the backend IS reachable \
