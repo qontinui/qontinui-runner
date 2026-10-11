@@ -74,7 +74,7 @@ describe("readOccupiedPageIds (fail-closed occupancy)", () => {
 
 describe("TerminalPageTabBar close-empty button", () => {
   const page = (id: string): TerminalPageConfig => ({ id, name: id, createdAt: 0 });
-  const render = (pages: TerminalPageConfig[], withHandler = true) =>
+  const render = (pages: TerminalPageConfig[], withHandler = true, emptyPageCount?: number) =>
     renderToStaticMarkup(
       <TerminalPageTabBar
         pages={pages}
@@ -84,6 +84,7 @@ describe("TerminalPageTabBar close-empty button", () => {
         onRemovePage={() => {}}
         onRenamePage={() => {}}
         onCloseEmptyPages={withHandler ? async () => 0 : undefined}
+        emptyPageCount={emptyPageCount}
       />,
     );
 
@@ -97,5 +98,17 @@ describe("TerminalPageTabBar close-empty button", () => {
 
   it("is hidden when no handler is wired", () => {
     expect(render([page("a"), page("b")], false)).not.toContain("Close empty tabs");
+  });
+
+  it("is disabled with a hint when no tab is empty", () => {
+    const html = render([page("a"), page("b")], true, 0);
+    expect(html).toContain('disabled=""');
+    expect(html).toContain("No empty tabs to close");
+  });
+
+  it("states how many tabs it will close", () => {
+    const html = render([page("a"), page("b")], true, 2);
+    expect(html).toContain("Close 2 empty tabs");
+    expect(html).not.toContain('disabled=""');
   });
 });
