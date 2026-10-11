@@ -433,12 +433,7 @@ CREATE TYPE public.notificationtype AS ENUM (
     'MENTION',
     'SHARE',
     'COMMENT',
-    'REPLY',
-    'LOCK_RELEASED',
-    'PROJECT_UPDATE',
-    'TEAM_INVITE',
-    'ACCESS_GRANTED',
-    'ACCESS_REVOKED'
+    'REPLY'
 );
 
 
@@ -846,6 +841,27 @@ CREATE TABLE agent.session_artifacts (
 
 
 --
+-- Name: work_artifact_edge_anchors; Type: TABLE; Schema: agent; Owner: -
+--
+
+CREATE TABLE agent.work_artifact_edge_anchors (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    edge_id uuid NOT NULL,
+    repo text NOT NULL,
+    path text NOT NULL,
+    line_start integer,
+    line_end integer,
+    symbol text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_work_artifact_edge_anchors_lines CHECK ((((line_start IS NULL) OR (line_start >= 1)) AND ((line_end IS NULL) OR ((line_start IS NOT NULL) AND (line_end >= line_start))))),
+    CONSTRAINT ck_work_artifact_edge_anchors_path_shape CHECK (((path <> ''::text) AND (length(path) <= 1024) AND ("left"(path, 1) <> ALL (ARRAY['/'::text, ' '::text])) AND ("right"(path, 1) <> ALL (ARRAY['/'::text, ' '::text])) AND (strpos(path, chr(92)) = 0) AND (strpos(path, '//'::text) = 0) AND (path !~ '(^|/)[.][.]?(/|$)'::text) AND (path !~ ((((((('['::text || chr(1)) || '-'::text) || chr(31)) || chr(127)) || '-'::text) || chr(159)) || ']'::text)))),
+    CONSTRAINT ck_work_artifact_edge_anchors_repo_shape CHECK (((length(repo) <= 255) AND (repo ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'::text))),
+    CONSTRAINT ck_work_artifact_edge_anchors_symbol_nonblank CHECK (((symbol IS NULL) OR (btrim(symbol, ' 	
+v'::text) <> ''::text)))
+);
+
+
+--
 -- Name: work_artifact_edges; Type: TABLE; Schema: agent; Owner: -
 --
 
@@ -857,10 +873,37 @@ CREATE TABLE agent.work_artifact_edges (
     note text,
     created_by text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolution_pr text,
+    resolution_commit text,
+    resolution_note text,
+    resolved_by text,
+    resolved_at timestamp with time zone,
+    resolution text,
+    resolution_history jsonb DEFAULT '[]'::jsonb NOT NULL,
+    size_class text,
+    size_class_source text,
+    unanchored_reason text,
+    CONSTRAINT ck_work_artifact_edges_dismissed_reason CHECK (((resolution IS DISTINCT FROM 'dismissed'::text) OR ((resolution_note IS NOT NULL) AND (btrim(resolution_note, ' 	
+v'::text) <> ''::text)))),
     CONSTRAINT ck_work_artifact_edges_followup_note CHECK (((relation <> 'spawned_followup'::text) OR ((note IS NOT NULL) AND (btrim(note, ' 	
 v'::text) <> ''::text)))),
+    CONSTRAINT ck_work_artifact_edges_followup_only_columns CHECK (((relation = 'spawned_followup'::text) OR ((resolution IS NULL) AND (resolution_pr IS NULL) AND (resolution_commit IS NULL) AND (resolution_note IS NULL) AND (resolved_by IS NULL) AND (resolved_at IS NULL) AND (size_class IS NULL) AND (size_class_source IS NULL) AND (unanchored_reason IS NULL) AND (resolution_history = '[]'::jsonb)))),
+    CONSTRAINT ck_work_artifact_edges_open_carries_no_resolution CHECK (((resolution IS NOT NULL) OR ((resolution_pr IS NULL) AND (resolution_commit IS NULL) AND (resolution_note IS NULL) AND (resolved_by IS NULL) AND (resolved_at IS NULL)))),
     CONSTRAINT ck_work_artifact_edges_open_target CHECK (((relation = 'spawned_followup'::text) OR (to_id IS NOT NULL))),
-    CONSTRAINT ck_work_artifact_edges_relation CHECK ((relation = ANY (ARRAY['produced_report'::text, 'feeds'::text, 'authored_plan'::text, 'supersedes'::text, 'depends_on'::text, 'spawned_followup'::text, 'refutes'::text])))
+    CONSTRAINT ck_work_artifact_edges_relation CHECK ((relation = ANY (ARRAY['produced_report'::text, 'feeds'::text, 'authored_plan'::text, 'supersedes'::text, 'depends_on'::text, 'spawned_followup'::text, 'refutes'::text]))),
+    CONSTRAINT ck_work_artifact_edges_resolution CHECK ((resolution = ANY (ARRAY['fixing'::text, 'fixed'::text, 'already_fixed'::text, 'dismissed'::text]))),
+    CONSTRAINT ck_work_artifact_edges_resolution_commit_required CHECK (((resolution IS DISTINCT FROM 'already_fixed'::text) OR (resolution_commit IS NOT NULL))),
+    CONSTRAINT ck_work_artifact_edges_resolution_commit_shape CHECK ((resolution_commit ~ '^[0-9a-f]{7,64}$'::text)),
+    CONSTRAINT ck_work_artifact_edges_resolution_history_array CHECK ((jsonb_typeof(resolution_history) = 'array'::text)),
+    CONSTRAINT ck_work_artifact_edges_resolution_pr_required CHECK (((resolution IS NULL) OR (resolution <> ALL (ARRAY['fixing'::text, 'fixed'::text])) OR (resolution_pr IS NOT NULL))),
+    CONSTRAINT ck_work_artifact_edges_resolution_pr_shape CHECK ((resolution_pr ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$'::text)),
+    CONSTRAINT ck_work_artifact_edges_resolution_unclaimed CHECK (((resolution IS NULL) OR (to_id IS NULL))),
+    CONSTRAINT ck_work_artifact_edges_resolved_at_required CHECK (((resolution IS NULL) OR (resolved_at IS NOT NULL))),
+    CONSTRAINT ck_work_artifact_edges_size_class CHECK ((size_class = ANY (ARRAY['trivial'::text, 'small'::text, 'plan_sized'::text]))),
+    CONSTRAINT ck_work_artifact_edges_size_class_paired CHECK (((size_class IS NULL) = (size_class_source IS NULL))),
+    CONSTRAINT ck_work_artifact_edges_size_class_source CHECK ((size_class_source = ANY (ARRAY['declared'::text, 'sweep'::text]))),
+    CONSTRAINT ck_work_artifact_edges_unanchored_reason_nonblank CHECK (((unanchored_reason IS NULL) OR (btrim(unanchored_reason, ' 	
+v'::text) <> ''::text)))
 );
 
 
@@ -1232,7 +1275,9 @@ CREATE TABLE auth.pair_codes (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     expires_at timestamp with time zone DEFAULT (now() + '00:05:00'::interval) NOT NULL,
     redeemed_at timestamp with time zone,
-    redeemed_by_device_id uuid
+    redeemed_by_device_id uuid,
+    bound_device_id uuid,
+    delivered_at timestamp with time zone
 );
 
 
@@ -1674,6 +1719,7 @@ CREATE TABLE coord.agent_worktrees (
     retention text DEFAULT 'auto'::text NOT NULL,
     dispatch_source text,
     credentialed_at timestamp with time zone,
+    client_allocation_id uuid,
     CONSTRAINT agent_worktrees_status_chk CHECK ((status = ANY (ARRAY['allocated'::text, 'active'::text, 'merging'::text, 'merged'::text, 'abandoned'::text]))),
     CONSTRAINT coord_agent_worktrees_retention_check CHECK ((retention = ANY (ARRAY['auto'::text, 'pinned'::text])))
 );
@@ -2452,6 +2498,28 @@ CREATE TABLE coord.ci_pool_specs (
 --
 
 COMMENT ON TABLE coord.ci_pool_specs IS 'Self-hosted CI pool specs: (tenant, repo, label set; the coord writer stores it sorted and de-duplicated) with secrets_class, isolation, per-slot sizing and min_idle/max_slots bounds. Written through the coord spec door, never by hand DML.';
+
+
+--
+-- Name: ci_repo_read_token_requests; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_repo_read_token_requests (
+    jti text NOT NULL,
+    tenant_id uuid,
+    consumer_repo text NOT NULL,
+    target_repo text NOT NULL,
+    run_id text,
+    job_workflow_ref text,
+    ref text,
+    event_name text,
+    outcome text DEFAULT 'pending'::text NOT NULL,
+    installation_id bigint,
+    token_expires_at timestamp with time zone,
+    oidc_expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    decided_at timestamp with time zone
+);
 
 
 --
@@ -4002,6 +4070,7 @@ CREATE TABLE coord.devices (
     accept_remote_attach text DEFAULT 'same_user'::text NOT NULL,
     accept_remote_create text DEFAULT 'off'::text NOT NULL,
     ui_thread jsonb,
+    credential_revoked_at timestamp with time zone,
     CONSTRAINT coord_devices_accept_remote_attach_check CHECK ((accept_remote_attach = ANY (ARRAY['same_user'::text, 'tenant'::text, 'off'::text]))),
     CONSTRAINT coord_devices_accept_remote_create_check CHECK ((accept_remote_create = ANY (ARRAY['off'::text, 'same_user'::text, 'tenant'::text]))),
     CONSTRAINT devices_role_chk CHECK (((role IS NULL) OR (role = ANY (ARRAY['agent'::text, 'build'::text, 'cache'::text, 'coord'::text])))),
@@ -4035,6 +4104,13 @@ COMMENT ON COLUMN coord.devices.max_concurrent_ci_jobs IS 'How many CI jobs this
 --
 
 COMMENT ON COLUMN coord.devices.ui_thread IS 'Runner native UI-thread liveness block from its latest heartbeat (wedged tri-state, reason, ping deliverability). NULL = UNKNOWN, never not-wedged.';
+
+
+--
+-- Name: COLUMN devices.credential_revoked_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.devices.credential_revoked_at IS 'Device-scoped credential deny. NULL = not revoked. While set, every door that issues this device a credential refuses (device_credential_revoked). Cleared only by an operator authorize-redeem.';
 
 
 --
@@ -6728,6 +6804,130 @@ CREATE TABLE coord.priority_sets (
 
 
 --
+-- Name: process_conformance_verdicts; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_conformance_verdicts (
+    tenant_id uuid NOT NULL,
+    constraint_id text NOT NULL,
+    case_type text NOT NULL,
+    case_id text NOT NULL,
+    verdict text NOT NULL,
+    reason text,
+    evaluated_at timestamp with time zone DEFAULT now() NOT NULL,
+    window_closes_at timestamp with time zone,
+    evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT ck_process_conformance_verdicts_verdict CHECK ((verdict = ANY (ARRAY['held'::text, 'violated'::text, 'unknown'::text])))
+);
+
+
+--
+-- Name: process_event_objects; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_event_objects (
+    event_id uuid NOT NULL,
+    tenant_id uuid,
+    object_type text NOT NULL,
+    object_id text NOT NULL,
+    qualifier text NOT NULL,
+    occurred_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: process_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_events (
+    event_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid,
+    activity text NOT NULL,
+    occurred_at timestamp with time zone NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    source text NOT NULL,
+    source_key text NOT NULL,
+    actor text,
+    evidence_tier text NOT NULL,
+    time_basis text NOT NULL,
+    attrs jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT ck_process_events_evidence_tier CHECK ((evidence_tier = ANY (ARRAY['coord_observed'::text, 'derived'::text, 'agent_reported'::text, 'operator'::text]))),
+    CONSTRAINT ck_process_events_time_basis CHECK ((time_basis = ANY (ARRAY['event'::text, 'insert'::text, 'observed'::text, 'declared'::text])))
+);
+
+
+--
+-- Name: process_flow_snapshots; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_flow_snapshots (
+    tenant_id uuid NOT NULL,
+    computed_at timestamp with time zone DEFAULT now() NOT NULL,
+    window_days integer NOT NULL,
+    body jsonb NOT NULL,
+    CONSTRAINT ck_process_flow_snapshots_window_days CHECK ((window_days > 0))
+);
+
+
+--
+-- Name: process_forecasts; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_forecasts (
+    forecast_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    question text NOT NULL,
+    object_type text NOT NULL,
+    object_id text NOT NULL,
+    issued_at timestamp with time zone NOT NULL,
+    horizon_secs integer NOT NULL,
+    p double precision NOT NULL,
+    predicted jsonb DEFAULT '{}'::jsonb NOT NULL,
+    resolved_at timestamp with time zone,
+    observed jsonb,
+    CONSTRAINT ck_process_forecasts_horizon_secs CHECK ((horizon_secs > 0)),
+    CONSTRAINT ck_process_forecasts_p CHECK (((p >= (0)::double precision) AND (p <= (1)::double precision)))
+);
+
+
+--
+-- Name: process_log_watermarks; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_log_watermarks (
+    source text NOT NULL,
+    stamp text NOT NULL,
+    watermark_ts timestamp with time zone,
+    watermark_key text,
+    rows_projected bigint DEFAULT 0 NOT NULL,
+    late_rows_found bigint DEFAULT 0 NOT NULL,
+    last_error text,
+    completed_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: process_object_links; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.process_object_links (
+    link_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid,
+    from_type text NOT NULL,
+    from_id text NOT NULL,
+    to_type text NOT NULL,
+    to_id text NOT NULL,
+    qualifier text NOT NULL,
+    resolution text NOT NULL,
+    source text NOT NULL,
+    first_observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_process_object_links_resolution CHECK ((resolution = ANY (ARRAY['resolved'::text, 'ambiguous'::text])))
+);
+
+
+--
 -- Name: prompt_document_claim_states; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -7877,6 +8077,41 @@ CREATE TABLE coord.session_policy_reads (
 
 
 --
+-- Name: session_usage; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.session_usage (
+    tenant_id uuid NOT NULL,
+    agent_session_id uuid NOT NULL,
+    model text NOT NULL,
+    input_tokens bigint DEFAULT 0 NOT NULL,
+    output_tokens bigint DEFAULT 0 NOT NULL,
+    cache_creation_input_tokens bigint DEFAULT 0 NOT NULL,
+    cache_read_input_tokens bigint DEFAULT 0 NOT NULL,
+    cost_microusd bigint,
+    cost_source text,
+    first_turn_at timestamp with time zone,
+    last_turn_at timestamp with time zone,
+    turn_count integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_session_usage_cost_microusd_nonneg CHECK (((cost_microusd IS NULL) OR (cost_microusd >= 0))),
+    CONSTRAINT ck_session_usage_cost_pair CHECK (((cost_microusd IS NULL) = (cost_source IS NULL))),
+    CONSTRAINT ck_session_usage_cost_source CHECK ((cost_source = ANY (ARRAY['reported'::text, 'estimated'::text]))),
+    CONSTRAINT ck_session_usage_tokens_nonneg CHECK (((input_tokens >= 0) AND (output_tokens >= 0) AND (cache_creation_input_tokens >= 0) AND (cache_read_input_tokens >= 0))),
+    CONSTRAINT ck_session_usage_turn_count_nonneg CHECK ((turn_count >= 0)),
+    CONSTRAINT ck_session_usage_turn_order CHECK (((first_turn_at IS NULL) OR (last_turn_at IS NULL) OR (first_turn_at <= last_turn_at)))
+);
+
+
+--
+-- Name: TABLE session_usage; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.session_usage IS 'Per-session, per-model Claude token and cost totals, one row per (tenant_id, agent_session_id, model), UPSERTed by the writer. agent_session_id is the Claude Code session id, a UUID of the same identity and type as coord.commit_lineage.agent_session_id (no FK). cost_microusd (millionths of a USD) NULL means not known, never zero; cost_source says whether a cost was reported by the provider or estimated from token counts.';
+
+
+--
 -- Name: sessions; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -8400,6 +8635,58 @@ CREATE TABLE coord.test_targets (
 
 
 --
+-- Name: twin_fidelity_observations; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.twin_fidelity_observations (
+    id bigint NOT NULL,
+    computed_at timestamp with time zone NOT NULL,
+    replica_id text NOT NULL,
+    bound_secs integer NOT NULL,
+    total integer NOT NULL,
+    observed_count integer NOT NULL,
+    blind_count integer NOT NULL,
+    honesty_violations integer NOT NULL,
+    stale_evidence_violations integer NOT NULL,
+    stale_at_decision_violations integer,
+    observability_rate double precision,
+    subspaces jsonb NOT NULL,
+    CONSTRAINT ck_twin_fidelity_obs_bound_positive CHECK ((bound_secs > 0)),
+    CONSTRAINT ck_twin_fidelity_obs_counts_nonneg CHECK (((total >= 0) AND (observed_count >= 0) AND (blind_count >= 0) AND (honesty_violations >= 0) AND (stale_evidence_violations >= 0) AND ((stale_at_decision_violations IS NULL) OR (stale_at_decision_violations >= 0)))),
+    CONSTRAINT ck_twin_fidelity_obs_counts_within_total CHECK (((observed_count + blind_count) <= total)),
+    CONSTRAINT ck_twin_fidelity_obs_rate_iff_total CHECK (((total = 0) = (observability_rate IS NULL))),
+    CONSTRAINT ck_twin_fidelity_obs_rate_range CHECK (((observability_rate IS NULL) OR ((observability_rate >= (0)::double precision) AND (observability_rate <= (1)::double precision)))),
+    CONSTRAINT ck_twin_fidelity_obs_subspaces_array CHECK ((jsonb_typeof(subspaces) = 'array'::text))
+);
+
+
+--
+-- Name: TABLE twin_fidelity_observations; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.twin_fidelity_observations IS 'One row per twin-fidelity report coord computed: observed/blind sub-space counts, honesty violations and the per-sub-space rows. stale_at_decision_violations NULL means no decision surface was sampled (UNKNOWN), never zero. Append-only.';
+
+
+--
+-- Name: twin_fidelity_observations_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.twin_fidelity_observations_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: twin_fidelity_observations_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.twin_fidelity_observations_id_seq OWNED BY coord.twin_fidelity_observations.id;
+
+
+--
 -- Name: twin_targets; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -8899,6 +9186,52 @@ CREATE TABLE coord.worker_heartbeats (
     last_detail_code text,
     body_started_at timestamp with time zone
 );
+
+
+--
+-- Name: worktree_cargo_lock; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.worktree_cargo_lock (
+    id bigint NOT NULL,
+    device_id uuid NOT NULL,
+    tenant_id uuid,
+    target_key text NOT NULL,
+    holder_pid integer,
+    holder_kind text,
+    holder_age_secs bigint,
+    holder_cmd text,
+    waiters integer DEFAULT 0 NOT NULL,
+    oldest_wait_secs bigint,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_worktree_cargo_lock_holder_kind CHECK ((holder_kind = ANY (ARRAY['build'::text, 'sweep'::text, 'unknown'::text])))
+);
+
+
+--
+-- Name: TABLE worktree_cargo_lock; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.worktree_cargo_lock IS 'One row per shared cargo target dir (one .cargo-lock) probed per runner census tick, device-level sibling of coord.worktree_volume. Idle targets are included with the holder columns NULL and waiters 0. Written by coord persist_worktree_census from the census cargo_locks field; read by the per-device allocation stats. Plan 2026-09-19-build-slots-are-not-build-parallelism-cargo-target-lock-and-devops-allocation-stats, Phase 2.';
+
+
+--
+-- Name: worktree_cargo_lock_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.worktree_cargo_lock_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: worktree_cargo_lock_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.worktree_cargo_lock_id_seq OWNED BY coord.worktree_cargo_lock.id;
 
 
 --
@@ -12616,13 +12949,13 @@ CREATE TABLE project.notification_preferences (
     email_comments boolean NOT NULL,
     email_shares boolean NOT NULL,
     email_replies boolean NOT NULL,
-    email_team_invites boolean NOT NULL,
+    email_team_invites boolean DEFAULT true NOT NULL,
     in_app_mentions boolean NOT NULL,
     in_app_comments boolean NOT NULL,
     in_app_shares boolean NOT NULL,
     in_app_replies boolean NOT NULL,
-    in_app_team_invites boolean NOT NULL,
-    in_app_project_updates boolean NOT NULL,
+    in_app_team_invites boolean DEFAULT true NOT NULL,
+    in_app_project_updates boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL
 );
@@ -13151,6 +13484,7 @@ CREATE TABLE project.phase_token_usage (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     cost_source text,
     cost_microusd bigint,
+    CONSTRAINT ck_phase_token_usage_cost_microusd_nonneg CHECK (((cost_microusd IS NULL) OR (cost_microusd >= 0))),
     CONSTRAINT ck_phase_token_usage_cost_source CHECK ((cost_source = ANY (ARRAY['reported'::text, 'estimated'::text])))
 );
 
@@ -18284,6 +18618,20 @@ ALTER TABLE ONLY coord.session_events ALTER COLUMN id SET DEFAULT nextval('coord
 
 
 --
+-- Name: twin_fidelity_observations id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.twin_fidelity_observations ALTER COLUMN id SET DEFAULT nextval('coord.twin_fidelity_observations_id_seq'::regclass);
+
+
+--
+-- Name: worktree_cargo_lock id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worktree_cargo_lock ALTER COLUMN id SET DEFAULT nextval('coord.worktree_cargo_lock_id_seq'::regclass);
+
+
+--
 -- Name: worktree_census id; Type: DEFAULT; Schema: coord; Owner: -
 --
 
@@ -18752,6 +19100,14 @@ ALTER TABLE ONLY agent.session_artifacts
 
 
 --
+-- Name: work_artifact_edge_anchors work_artifact_edge_anchors_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
+--
+
+ALTER TABLE ONLY agent.work_artifact_edge_anchors
+    ADD CONSTRAINT work_artifact_edge_anchors_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: work_artifact_edges work_artifact_edges_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
 --
 
@@ -19205,6 +19561,14 @@ ALTER TABLE ONLY coord.ci_pool_observations
 
 ALTER TABLE ONLY coord.ci_pool_specs
     ADD CONSTRAINT ci_pool_specs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ci_repo_read_token_requests ci_repo_read_token_requests_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_repo_read_token_requests
+    ADD CONSTRAINT ci_repo_read_token_requests_pkey PRIMARY KEY (jti);
 
 
 --
@@ -20200,6 +20564,14 @@ ALTER TABLE ONLY coord.pr_author_nudges
 
 
 --
+-- Name: session_usage pk_session_usage; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_usage
+    ADD CONSTRAINT pk_session_usage PRIMARY KEY (tenant_id, agent_session_id, model);
+
+
+--
 -- Name: tenant_repo_unenrollments pk_tenant_repo_unenrollments; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -20341,6 +20713,62 @@ ALTER TABLE ONLY coord.primary_trees
 
 ALTER TABLE ONLY coord.priority_sets
     ADD CONSTRAINT priority_sets_pkey PRIMARY KEY (priority_set_id);
+
+
+--
+-- Name: process_conformance_verdicts process_conformance_verdicts_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_conformance_verdicts
+    ADD CONSTRAINT process_conformance_verdicts_pkey PRIMARY KEY (tenant_id, constraint_id, case_type, case_id);
+
+
+--
+-- Name: process_event_objects process_event_objects_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_event_objects
+    ADD CONSTRAINT process_event_objects_pkey PRIMARY KEY (event_id, object_type, object_id, qualifier);
+
+
+--
+-- Name: process_events process_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_events
+    ADD CONSTRAINT process_events_pkey PRIMARY KEY (event_id);
+
+
+--
+-- Name: process_flow_snapshots process_flow_snapshots_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_flow_snapshots
+    ADD CONSTRAINT process_flow_snapshots_pkey PRIMARY KEY (tenant_id, computed_at);
+
+
+--
+-- Name: process_forecasts process_forecasts_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_forecasts
+    ADD CONSTRAINT process_forecasts_pkey PRIMARY KEY (forecast_id);
+
+
+--
+-- Name: process_log_watermarks process_log_watermarks_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_log_watermarks
+    ADD CONSTRAINT process_log_watermarks_pkey PRIMARY KEY (source, stamp);
+
+
+--
+-- Name: process_object_links process_object_links_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_object_links
+    ADD CONSTRAINT process_object_links_pkey PRIMARY KEY (link_id);
 
 
 --
@@ -20856,6 +21284,14 @@ ALTER TABLE ONLY coord.test_targets
 
 
 --
+-- Name: twin_fidelity_observations twin_fidelity_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.twin_fidelity_observations
+    ADD CONSTRAINT twin_fidelity_observations_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: twin_targets twin_targets_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -21125,6 +21561,14 @@ ALTER TABLE ONLY coord.work_units
 
 ALTER TABLE ONLY coord.worker_heartbeats
     ADD CONSTRAINT worker_heartbeats_name_replica_id_uq UNIQUE (name, replica_id);
+
+
+--
+-- Name: worktree_cargo_lock worktree_cargo_lock_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worktree_cargo_lock
+    ADD CONSTRAINT worktree_cargo_lock_pkey PRIMARY KEY (id);
 
 
 --
@@ -24141,10 +24585,24 @@ CREATE INDEX ix_session_artifacts_tenant_id ON agent.session_artifacts USING btr
 
 
 --
+-- Name: ix_work_artifact_edge_anchors_repo_path; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE INDEX ix_work_artifact_edge_anchors_repo_path ON agent.work_artifact_edge_anchors USING btree (repo, path);
+
+
+--
 -- Name: ix_work_artifact_edges_from_id; Type: INDEX; Schema: agent; Owner: -
 --
 
 CREATE INDEX ix_work_artifact_edges_from_id ON agent.work_artifact_edges USING btree (from_id);
+
+
+--
+-- Name: ix_work_artifact_edges_open_followup_queue_created_id; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE INDEX ix_work_artifact_edges_open_followup_queue_created_id ON agent.work_artifact_edges USING btree (created_at, id) WHERE ((relation = 'spawned_followup'::text) AND (to_id IS NULL) AND (resolution IS NULL));
 
 
 --
@@ -24243,6 +24701,13 @@ CREATE UNIQUE INDEX uq_plan_scan_root_refusals_identity ON agent.plan_scan_root_
 --
 
 CREATE UNIQUE INDEX uq_session_artifacts_identity ON agent.session_artifacts USING btree (claude_session_id, COALESCE(account_label, ''::text));
+
+
+--
+-- Name: uq_work_artifact_edge_anchors_edge_repo_path_line; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_work_artifact_edge_anchors_edge_repo_path_line ON agent.work_artifact_edge_anchors USING btree (edge_id, repo, path, COALESCE(line_start, '-1'::integer));
 
 
 --
@@ -24433,6 +24898,13 @@ CREATE INDEX idx_org_slug ON auth.organizations USING btree (slug);
 --
 
 CREATE INDEX idx_org_user ON auth.team_members USING btree (organization_id, user_id);
+
+
+--
+-- Name: idx_pair_codes_bound_device_pending; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX idx_pair_codes_bound_device_pending ON auth.pair_codes USING btree (bound_device_id, expires_at) WHERE ((bound_device_id IS NOT NULL) AND (redeemed_at IS NULL));
 
 
 --
@@ -25371,6 +25843,27 @@ CREATE INDEX idx_ci_dispatches_no_subscriber_device ON coord.ci_dispatches USING
 --
 
 CREATE INDEX idx_ci_dispatches_repo_head_sha ON coord.ci_dispatches USING btree (repo, head_sha);
+
+
+--
+-- Name: idx_ci_repo_read_token_requests_consumer; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_repo_read_token_requests_consumer ON coord.ci_repo_read_token_requests USING btree (consumer_repo, created_at DESC);
+
+
+--
+-- Name: idx_ci_repo_read_token_requests_oidc_expires_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_repo_read_token_requests_oidc_expires_at ON coord.ci_repo_read_token_requests USING btree (oidc_expires_at);
+
+
+--
+-- Name: idx_ci_repo_read_token_requests_target; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_repo_read_token_requests_target ON coord.ci_repo_read_token_requests USING btree (target_repo, created_at DESC);
 
 
 --
@@ -27514,10 +28007,24 @@ CREATE INDEX idx_work_units_tenant_vet_state ON coord.work_units USING btree (te
 
 
 --
+-- Name: idx_worktree_cargo_lock_device_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_worktree_cargo_lock_device_observed_at ON coord.worktree_cargo_lock USING btree (device_id, observed_at DESC);
+
+
+--
 -- Name: idx_worktree_census_device_observed_at; Type: INDEX; Schema: coord; Owner: -
 --
 
 CREATE INDEX idx_worktree_census_device_observed_at ON coord.worktree_census USING btree (device_id, observed_at DESC);
+
+
+--
+-- Name: idx_worktree_census_device_repo_path_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_worktree_census_device_repo_path_observed ON coord.worktree_census USING btree (device_id, repo, path, observed_at DESC);
 
 
 --
@@ -27920,6 +28427,314 @@ CREATE INDEX ix_primary_trees_app_id ON coord.primary_trees USING btree (app_id)
 
 
 --
+-- Name: ix_process_event_objects_object_trace; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_event_objects_object_trace ON coord.process_event_objects USING btree (tenant_id, object_type, object_id, occurred_at);
+
+
+--
+-- Name: ix_process_events_occurred_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_events_occurred_at ON coord.process_events USING btree (occurred_at);
+
+
+--
+-- Name: ix_process_events_tenant_occurred_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_events_tenant_occurred_at ON coord.process_events USING btree (tenant_id, occurred_at);
+
+
+--
+-- Name: ix_process_flow_snapshots_computed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_flow_snapshots_computed_at ON coord.process_flow_snapshots USING btree (computed_at);
+
+
+--
+-- Name: ix_process_forecasts_unresolved; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_forecasts_unresolved ON coord.process_forecasts USING btree (issued_at) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: ix_process_object_links_last_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_object_links_last_observed_at ON coord.process_object_links USING btree (last_observed_at);
+
+
+--
+-- Name: ix_process_object_links_to; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_process_object_links_to ON coord.process_object_links USING btree (tenant_id, to_type, to_id);
+
+
+--
+-- Name: ix_proclog_agent_questions_created_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_agent_questions_created_at ON coord.agent_questions USING btree (created_at, question_id) WHERE (created_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_agent_questions_responded_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_agent_questions_responded_at ON coord.agent_questions USING btree (responded_at, question_id) WHERE (responded_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_alerts_claimed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_alerts_claimed_at ON coord.alerts USING btree (claimed_at, id) WHERE (claimed_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_claims_audit_occurred_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_claims_audit_occurred_at ON coord.claims_audit USING btree (occurred_at, id) WHERE (occurred_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_deploy_signatures_created_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_deploy_signatures_created_at ON coord.deploy_signatures USING btree (created_at, id) WHERE (created_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_deploy_verifications_created_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_deploy_verifications_created_at ON coord.deploy_verifications USING btree (created_at, id) WHERE (created_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_findings_triaged_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_findings_triaged_at ON coord.findings USING btree (triaged_at, finding_id) WHERE (triaged_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_archived_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_archived_at ON coord.gates USING btree (archived_at, gate_id) WHERE (archived_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_cleared_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_cleared_at ON coord.gates USING btree (cleared_at, gate_id) WHERE (cleared_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_condition_met_since; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_condition_met_since ON coord.gates USING btree (condition_met_since, gate_id) WHERE (condition_met_since IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_continuation_cancelled_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_continuation_cancelled_at ON coord.gates USING btree (continuation_cancelled_at, gate_id) WHERE (continuation_cancelled_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_continuation_consumed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_continuation_consumed_at ON coord.gates USING btree (continuation_consumed_at, gate_id) WHERE (continuation_consumed_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_continuation_deferred_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_continuation_deferred_at ON coord.gates USING btree (continuation_deferred_at, gate_id) WHERE (continuation_deferred_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_continuation_dispatched_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_continuation_dispatched_at ON coord.gates USING btree (continuation_dispatched_at, gate_id) WHERE (continuation_dispatched_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_continuation_expired_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_continuation_expired_at ON coord.gates USING btree (continuation_expired_at, gate_id) WHERE (continuation_expired_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_created_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_created_at ON coord.gates USING btree (created_at, gate_id) WHERE (created_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_gates_terminal_unarchived; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_gates_terminal_unarchived ON coord.gates USING btree (gate_id) WHERE ((verdict <> 'open'::text) AND (archived_at IS NULL));
+
+
+--
+-- Name: ix_proclog_merge_proposals_updated_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_merge_proposals_updated_at ON coord.merge_proposals USING btree (updated_at, proposal_id) WHERE (updated_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_operator_touch_classifications_classified_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_operator_touch_classifications_classified_at ON coord.operator_touch_classifications USING btree (classified_at, classification_id) WHERE (classified_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_operator_touches_emitted_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_operator_touches_emitted_at ON coord.operator_touches USING btree (emitted_at, touch_id) WHERE (emitted_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_operator_touches_resolved_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_operator_touches_resolved_at ON coord.operator_touches USING btree (resolved_at, touch_id) WHERE (resolved_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_policy_rule_resolutions_outcome_labeled_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_policy_rule_resolutions_outcome_labeled_at ON coord.policy_rule_resolutions USING btree (outcome_labeled_at, resolution_id) WHERE (outcome_labeled_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_repo_branches_author_bound_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_repo_branches_author_bound_at ON coord.repo_branches USING btree (author_bound_at, repo, branch) WHERE (author_bound_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_compliance_updated_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_compliance_updated_at ON coord.session_compliance USING btree (updated_at, id) WHERE (updated_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_expectations_updated_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_expectations_updated_at ON coord.session_expectations USING btree (updated_at, id) WHERE (updated_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_messages_acked_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_messages_acked_at ON coord.session_messages USING btree (acked_at, message_id) WHERE (acked_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_messages_created_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_messages_created_at ON coord.session_messages USING btree (created_at, message_id) WHERE (created_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_messages_delivered_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_messages_delivered_at ON coord.session_messages USING btree (delivered_at, message_id) WHERE (delivered_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_messages_read_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_messages_read_at ON coord.session_messages USING btree (read_at, message_id) WHERE (read_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_session_policy_reads_read_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_session_policy_reads_read_at ON coord.session_policy_reads USING btree (read_at, read_id) WHERE (read_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_unit_dispatches_consumed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_unit_dispatches_consumed_at ON coord.work_unit_dispatches USING btree (consumed_at, dispatch_id) WHERE (consumed_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_unit_dispatches_dispatched_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_unit_dispatches_dispatched_at ON coord.work_unit_dispatches USING btree (dispatched_at, dispatch_id) WHERE (dispatched_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_unit_phase_attestations_attested_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_unit_phase_attestations_attested_at ON coord.work_unit_phase_attestations USING btree (attested_at, id) WHERE (attested_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_unit_phase_attestations_retracted_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_unit_phase_attestations_retracted_at ON coord.work_unit_phase_attestations USING btree (retracted_at, id) WHERE (retracted_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_unit_pr_citations_cited_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_unit_pr_citations_cited_at ON coord.work_unit_pr_citations USING btree (cited_at, id) WHERE (cited_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_unit_status_history_transitioned_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_unit_status_history_transitioned_at ON coord.work_unit_status_history USING btree (transitioned_at, history_id) WHERE (transitioned_at IS NOT NULL);
+
+
+--
+-- Name: ix_proclog_work_units_created_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_proclog_work_units_created_at ON coord.work_units USING btree (created_at, id) WHERE (created_at IS NOT NULL);
+
+
+--
 -- Name: ix_prompt_document_proposals_tenant_status; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -27983,6 +28798,13 @@ CREATE INDEX ix_session_policy_reads_tenant_session ON coord.session_policy_read
 
 
 --
+-- Name: ix_session_usage_tenant_last_turn_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_session_usage_tenant_last_turn_at ON coord.session_usage USING btree (tenant_id, last_turn_at DESC NULLS LAST);
+
+
+--
 -- Name: ix_spawn_admission_ledger_device_created_at; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -28018,6 +28840,13 @@ CREATE INDEX ix_test_targets_tenant ON coord.test_targets USING btree (tenant_id
 
 
 --
+-- Name: ix_twin_fidelity_observations_computed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_twin_fidelity_observations_computed_at ON coord.twin_fidelity_observations USING btree (computed_at DESC);
+
+
+--
 -- Name: replica_presence_heartbeat_at_idx; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -28043,6 +28872,13 @@ CREATE UNIQUE INDEX uq_agent_questions_open_effect ON coord.agent_questions USIN
 --
 
 CREATE UNIQUE INDEX uq_agent_registry_tenant_agent ON coord.agent_registry USING btree (tenant_id, agent_name);
+
+
+--
+-- Name: uq_agent_worktrees_device_client_alloc_repo; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_agent_worktrees_device_client_alloc_repo ON coord.agent_worktrees USING btree (device_id, client_allocation_id, repo) WHERE (client_allocation_id IS NOT NULL);
 
 
 --
@@ -28155,6 +28991,27 @@ CREATE UNIQUE INDEX uq_policy_rules_tenant_override ON coord.policy_rules USING 
 --
 
 CREATE UNIQUE INDEX uq_priority_sets_tenant_name_repo ON coord.priority_sets USING btree (tenant_id, set_name, COALESCE(repo, ''::text)) WHERE (enabled = true);
+
+
+--
+-- Name: uq_process_events_source_key; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_process_events_source_key ON coord.process_events USING btree (tenant_id, source, source_key) NULLS NOT DISTINCT;
+
+
+--
+-- Name: uq_process_forecasts_issue; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_process_forecasts_issue ON coord.process_forecasts USING btree (tenant_id, question, object_type, object_id, issued_at);
+
+
+--
+-- Name: uq_process_object_links_link; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_process_object_links_link ON coord.process_object_links USING btree (tenant_id, from_type, from_id, to_type, to_id, qualifier, source) NULLS NOT DISTINCT;
 
 
 --
@@ -34696,6 +35553,14 @@ CREATE INDEX wrapper_ratings_wrapper_idx ON project.wrapper_ratings USING btree 
 
 
 --
+-- Name: work_artifact_edge_anchors work_artifact_edge_anchors_edge_id_fkey; Type: FK CONSTRAINT; Schema: agent; Owner: -
+--
+
+ALTER TABLE ONLY agent.work_artifact_edge_anchors
+    ADD CONSTRAINT work_artifact_edge_anchors_edge_id_fkey FOREIGN KEY (edge_id) REFERENCES agent.work_artifact_edges(id) ON DELETE CASCADE;
+
+
+--
 -- Name: work_artifact_edges work_artifact_edges_from_id_fkey; Type: FK CONSTRAINT; Schema: agent; Owner: -
 --
 
@@ -35533,6 +36398,14 @@ ALTER TABLE ONLY coord.primary_trees
 
 ALTER TABLE ONLY coord.primary_trees
     ADD CONSTRAINT primary_trees_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE SET NULL;
+
+
+--
+-- Name: process_event_objects process_event_objects_event_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.process_event_objects
+    ADD CONSTRAINT process_event_objects_event_id_fkey FOREIGN KEY (event_id) REFERENCES coord.process_events(event_id) ON DELETE CASCADE;
 
 
 --
