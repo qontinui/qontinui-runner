@@ -723,6 +723,12 @@ pub(crate) mod test_env {
     }
 }
 
+/// Source pins read the production half of a file only. The lib owns the
+/// module (`crate_roots_ratchet`); the bin's tests reach it as
+/// `crate::source_pin` through this import.
+#[cfg(test)]
+pub(crate) use qontinui_runner_lib::source_pin;
+
 use commands::AppState;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;

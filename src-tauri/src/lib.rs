@@ -310,6 +310,18 @@ pub(crate) mod test_env {
     pub(crate) use crate::ambient::test_support::*;
 }
 
+/// Source pins read the production half of a file only — see the module doc.
+///
+/// Declared HERE only (`crate_roots_ratchet`: one owner per module); the bin
+/// imports it with `pub(crate) use qontinui_runner_lib::source_pin;`. It is
+/// `pub` under `any(test, debug_assertions)` — the `ambient::test_support`
+/// shape — because `cargo test` builds this rlib for the BIN's tests without
+/// `cfg(test)` but with `debug_assertions`, so a `cfg(test)` copy would be
+/// invisible to them. A release build compiles none of it.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod source_pin;
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================

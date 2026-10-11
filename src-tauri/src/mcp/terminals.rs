@@ -1344,7 +1344,7 @@ mod tests {
         // Both built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");
         let fn_header = format!("pub fn {}() -> axum::Router<Arc<ApiState>> {{", "routes");
-        let src = include_str!("terminals.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("terminals.rs"));
 
         let start = src
             .find(fn_header.as_str())

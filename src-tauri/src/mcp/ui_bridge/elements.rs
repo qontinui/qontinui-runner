@@ -6616,7 +6616,7 @@ mod action_not_supported_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_element_read_handler_advertises_custom_actions() {
-        let src = include_str!("elements.rs").replace("\r\n", "\n");
+        let src = crate::source_pin::ProdSource::of(include_str!("elements.rs"));
         for handler in [
             "ui_bridge_get_elements_handler",
             "ui_bridge_get_element_handler",

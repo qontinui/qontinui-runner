@@ -1882,7 +1882,7 @@ mod tests {
     /// tests above pin to carry `-v`.
     #[test]
     fn no_removal_argv_is_spelled_by_hand() {
-        let src = include_str!("services.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("services.rs"));
         let hand_spelled = concat!("&[", "\"rm\"");
         assert!(
             !src.contains(hand_spelled),
@@ -2129,7 +2129,10 @@ mod tests {
             "    let f = \"{{range .Networks}}{{.IPAddress}} {{end}}\";"
         ));
 
-        for (lineno, line) in include_str!("services.rs").lines().enumerate() {
+        // The production half: an operator message is a production literal, and
+        // this test module's own fixtures spell mangled literals on purpose.
+        let prod = crate::source_pin::ProdSource::of(include_str!("services.rs"));
+        for (lineno, line) in prod.lines().enumerate() {
             assert!(
                 !has_mangled_literal(line),
                 "services.rs:{}: a string literal carries a run of spaces — a lost line \

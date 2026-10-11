@@ -221,8 +221,7 @@ mod tests {
         // A per-test ring proves nothing if the production functions stop
         // routing through `BUFFER`, or if a second static ring appears beside
         // it. Pin both against this file's own source.
-        let src = include_str!("mod.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let prod = crate::source_pin::ProdSource::of(include_str!("mod.rs"));
         let compact: String = prod.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             compact.contains("pub fn record(command: &str) { BUFFER.record_in(command) }"),

@@ -3963,18 +3963,10 @@ mod device_identity_invariant_tests {
     /// full, a helper that mints on your behalf). It pins the ONE spelling that
     /// has actually sprawled here.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn pair_module_has_exactly_one_mint_site() {
-        let src = include_str!("pair.rs");
-        // Split so these needles do not match themselves in the source scan.
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = match src.find(test_marker) {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        // The production half only, so the needle does not match itself (and
+        // the test modules' own mints are not counted).
+        let production = crate::source_pin::ProdSource::of(include_str!("pair.rs"));
         let needle = concat!("Uuid::new_", "v4()");
         let mints = production.matches(needle).count();
         assert_eq!(

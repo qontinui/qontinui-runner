@@ -1111,14 +1111,11 @@ mod tests {
     /// to that fact noisy.
     #[test]
     fn the_executor_never_reaches_a_kill_path() {
-        let src = include_str!("wind_down_executor.rs");
-        // Strip this test module, and then every comment line: BOTH the module
-        // docs and this test NAME the forbidden calls, so a scan over raw text
-        // can only ever fail. Only executable lines are evidence.
+        let src = crate::source_pin::ProdSource::of(include_str!("wind_down_executor.rs"));
+        // `ProdSource` strips this test module; then drop every comment line:
+        // BOTH the module docs and this test NAME the forbidden calls, so a scan
+        // over raw text can only ever fail. Only executable lines are evidence.
         let body: String = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the module has a non-test half")
             .lines()
             .filter(|line| {
                 let t = line.trim_start();
