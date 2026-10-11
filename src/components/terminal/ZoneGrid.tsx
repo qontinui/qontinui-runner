@@ -813,6 +813,7 @@ function ZoneGridInner({
               </button>
             </div>
             <span className="text-[9px] text-[#565f89]">Esc or double-click to restore</span>
+            <ZoneHoverActions zoneIdx={singleViewZone} onExportZone={onExportZone} inline />
           </div>
         )}
 
