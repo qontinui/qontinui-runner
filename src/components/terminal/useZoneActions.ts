@@ -3,6 +3,7 @@ import { useDisplayTitleResolver } from "./displayTitle";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { computeQuickLaunchLayoutId, type SessionState } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { UIAction } from "./useUIState";
 import type { TerminalTab } from "./useTerminalManager";
 import type { Metrics } from "./useEventHistory";
@@ -20,7 +21,8 @@ interface UseZoneActionsParams {
     layout: { zones: unknown[] };
     setFocusedZone: (idx: number) => void;
     assignTabToZone: (zoneIdx: number, tabId: string) => void;
-    setLayoutId: (id: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
+    showSpawnedTab: (tabId: string) => void;
     isMultiZone: boolean;
     toggleMaximize: (zoneIdx?: number) => void;
   };
@@ -134,7 +136,10 @@ export function useZoneActions({
         hasEmptyZone,
         totalTabs,
       );
-      if (targetLayout !== null) zoneLayout.setLayoutId(targetLayout);
+      // A `spawn` request: it grows the grid in grid mode and is a no-op in
+      // tmux mode, where the new terminal is shown in the one viewport instead.
+      if (targetLayout !== null) zoneLayout.setLayoutId(targetLayout, { source: "spawn" });
+      zoneLayout.showSpawnedTab(tabId);
 
       return tabId;
     },
@@ -143,6 +148,7 @@ export function useZoneActions({
       createTerminal,
       zoneLayout.layoutId,
       zoneLayout.setLayoutId,
+      zoneLayout.showSpawnedTab,
       zoneLayout.layout,
       zoneLayout.assignments,
       tabs.length,
