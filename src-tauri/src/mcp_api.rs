@@ -19999,7 +19999,7 @@ mod coord_provision_session_gate_tests {
         let squeezed: String = region.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             squeezed
-                .contains("spawn_blocking_tracked(crate::session::tenant_pin::resolve_tenant_pin)"),
+                .contains("spawn_blocking_tracked(crate::session::tenant_pin::resolve_tenant_pin"),
             "the pin must be read LIVE from resolve_tenant_pin(), on the blocking pool \
              (through the tracked wrapper, so the body counts toward the thread guard)"
         );
