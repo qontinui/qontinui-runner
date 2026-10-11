@@ -1058,6 +1058,116 @@
       "id": "review-send-preview",
       "name": "Review Send Preview",
       "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The work-mode toggle reads tmux.",
+          "enabled": true,
+          "id": "tmux-one-session-on-screen-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "attributes": {
+                "data-terminal-work-mode": "tmux"
+              },
+              "id": "terminal.work-mode-toggle"
+            },
+            "label": "Work mode toggle (tmux)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The single viewport's header (zone 0) is shown; it carries the session name and its k / n position.",
+          "enabled": true,
+          "id": "tmux-one-session-on-screen-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal-zone-header-0"
+            },
+            "label": "tmux viewport header",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Terminal page's tmux work mode (plan 2026-10-11-runner-terminal-tmux-work-mode, D1-D4): exactly ONE session is on screen, full size, in a single viewport (`TmuxViewport`, terminal/zone-grid/TmuxViewport.tsx) and every other live session stays mounted off-screen at the `background` visibility tier, still running and still producing output. The layout is pinned to `single` (`get-zone-view-state` reads `{layoutId: \"single\", zoneCount: 1}`), so the page has exactly one zone header (`terminal-zone-header-0`) and no `terminal-zone-header-1`; only the shown tab's `terminal-input-<tabId>` and `terminal.close-session-<tabId>` have a non-zero rect. The viewport header carries the session name (full value in the title span's `title`) and its position `k / n` (`data-tmux-position=\"k/n\"`, title `<name> — session k of n`). The CommandBar work-mode toggle (`terminal.work-mode-toggle`) reads `tmux` with `data-terminal-work-mode=\"tmux\"` and `aria-pressed=true`. Read the mode without inferring it from the DOM through the `terminal-page` component action `get-terminal-work-mode` → `{mode: \"tmux\", shownTabId, sidebarOpen}`. The mode is entered/left by the toggle, Ctrl+Shift+Y, `/terminal.mode [grid|tmux]` (alias `/work-mode`) and the `set-terminal-work-mode` action (`{mode?: \"grid\"|\"tmux\"}`, omitted toggles; returns `{previousMode, mode, changed, sidebarOpened, message}`), and survives a page reload together with the session-manager sidebar. A newly created session is shown immediately; when the shown session closes, the most recently shown survivor replaces it (MRU, falling back to creation order). Ctrl+Tab / Ctrl+Shift+Tab cycle the shown session. Picking a layout preset (Ctrl+Shift+1..8, the layout picker, `terminal.layout`) is an explicit grid request: it exits to grid mode, restoring the grid the operator left with the preset applied over it, so every live session is placed in a zone.",
+      "id": "tmux-one-session-on-screen",
+      "name": "tmux Work Mode: One Session On Screen",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "The session manager's Live view is shown.",
+          "enabled": true,
+          "id": "tmux-session-manager-navigator-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "terminal.session-manager-view-live"
+            },
+            "label": "Session manager Live view",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "One session row is marked as the session on screen.",
+          "enabled": true,
+          "id": "tmux-session-manager-navigator-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "attributes": {
+                "data-session-on-screen": "true"
+              }
+            },
+            "label": "On-screen session row",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "A live tab with no transcript (e.g. a plain shell) is listed as a tab-sourced row.",
+          "enabled": true,
+          "id": "tmux-session-manager-navigator-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "attributes": {
+                "data-session-source": "tab"
+              }
+            },
+            "label": "Tab-sourced live session row",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their state chips so a hidden session needing input is visible from the list. Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
+      "id": "tmux-session-manager-navigator",
+      "name": "tmux Session Manager Lists Every Live Session",
+      "source": "ai-generated"
     }
   ],
   "metadata": {
@@ -1102,7 +1212,33 @@
           "conditionalOn": "no terminals open (empty-state hint; rendered only when tabs.length === 0 at TerminalPage.tsx:768-777)"
         },
         "name": "Multi-Tab Terminal Sessions",
-        "transitions": []
+        "transitions": [
+          {
+            "activateStates": [
+              "tmux-one-session-on-screen",
+              "tmux-session-manager-navigator"
+            ],
+            "deactivateStates": [],
+            "id": "enter-tmux-work-mode",
+            "name": "Enter tmux work mode",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "dataAttributes": {
+                    "data-terminal-work-mode": "grid"
+                  },
+                  "id": "terminal.work-mode-toggle"
+                },
+                "waitAfter": {
+                  "timeout": 2000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": true
+          }
+        ]
       },
       {
         "description": "When a workflow is generated (from a session transcript, command history, or findings), a preview panel opens on the right side showing the full workflow structure. Users can review the generated workflow's phases and steps, then choose to execute it immediately, save it to the workflow library for later use, edit it in the Workflow Builder for refinement, or regenerate it with different parameters. The panel shows loading state during generation and error messages if generation fails. This workflow enables a rapid 'do it once in the terminal, then automate it' development pattern. Conditional state: a workflow has been generated via /generate against a live Claude session (not exercisable in spec-check, which invokes no AI) — not rendered on the base terminal page, so it cannot match in a default snapshot (annotation pending the expectedConditionalStates baseline-waiver mechanism, plan §7).",
@@ -1403,6 +1539,98 @@
         "isInitial": false,
         "name": "Review Send Preview",
         "transitions": []
+      },
+      {
+        "description": "The Terminal page's tmux work mode (plan 2026-10-11-runner-terminal-tmux-work-mode, D1-D4): exactly ONE session is on screen, full size, in a single viewport (`TmuxViewport`, terminal/zone-grid/TmuxViewport.tsx) and every other live session stays mounted off-screen at the `background` visibility tier, still running and still producing output. The layout is pinned to `single` (`get-zone-view-state` reads `{layoutId: \"single\", zoneCount: 1}`), so the page has exactly one zone header (`terminal-zone-header-0`) and no `terminal-zone-header-1`; only the shown tab's `terminal-input-<tabId>` and `terminal.close-session-<tabId>` have a non-zero rect. The viewport header carries the session name (full value in the title span's `title`) and its position `k / n` (`data-tmux-position=\"k/n\"`, title `<name> — session k of n`). The CommandBar work-mode toggle (`terminal.work-mode-toggle`) reads `tmux` with `data-terminal-work-mode=\"tmux\"` and `aria-pressed=true`. Read the mode without inferring it from the DOM through the `terminal-page` component action `get-terminal-work-mode` → `{mode: \"tmux\", shownTabId, sidebarOpen}`. The mode is entered/left by the toggle, Ctrl+Shift+Y, `/terminal.mode [grid|tmux]` (alias `/work-mode`) and the `set-terminal-work-mode` action (`{mode?: \"grid\"|\"tmux\"}`, omitted toggles; returns `{previousMode, mode, changed, sidebarOpened, message}`), and survives a page reload together with the session-manager sidebar. A newly created session is shown immediately; when the shown session closes, the most recently shown survivor replaces it (MRU, falling back to creation order). Ctrl+Tab / Ctrl+Shift+Tab cycle the shown session. Picking a layout preset (Ctrl+Shift+1..8, the layout picker, `terminal.layout`) is an explicit grid request: it exits to grid mode, restoring the grid the operator left with the preset applied over it, so every live session is placed in a zone.",
+        "elements": [
+          {
+            "dataAttributes": {
+              "data-terminal-work-mode": "tmux"
+            },
+            "id": "terminal.work-mode-toggle"
+          },
+          {
+            "id": "terminal-zone-header-0"
+          }
+        ],
+        "id": "tmux-one-session-on-screen",
+        "isInitial": false,
+        "name": "tmux Work Mode: One Session On Screen",
+        "transitions": [
+          {
+            "activateStates": [
+              "term-multi-tab"
+            ],
+            "deactivateStates": [
+              "tmux-one-session-on-screen"
+            ],
+            "id": "exit-tmux-work-mode",
+            "name": "Leave tmux work mode",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "dataAttributes": {
+                    "data-terminal-work-mode": "tmux"
+                  },
+                  "id": "terminal.work-mode-toggle"
+                },
+                "waitAfter": {
+                  "timeout": 2000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      },
+      {
+        "description": "In tmux mode the session manager (opened on entering the mode) is the navigator, because it is the only way to reach an off-screen session (plan 2026-10-11-runner-terminal-tmux-work-mode, D5). Its Live view (`terminal.session-manager-view-live`) lists EVERY live session: Claude transcript rows and, for every live tab with no transcript row (a plain shell, or a Claude session not yet past 0 messages), a tab-sourced row (`data-session-source=\"tab\"`, transcript-only actions hidden). Each row is a `terminal.session-card-<id>` button whose `data-session-on-screen` is `true` for exactly one row — the session on screen, which also carries the `on screen` badge (`data-testid=\"session-card-on-screen\"`) and `aria-current=\"true\"` — and `false` for the off-screen rows, which keep their state chips so a hidden session needing input is visible from the list. Clicking an off-screen row swaps it into the viewport; clicking the on-screen row is a no-op that still reports it selected.",
+        "elements": [
+          {
+            "id": "terminal.session-manager-view-live"
+          },
+          {
+            "dataAttributes": {
+              "data-session-on-screen": "true"
+            }
+          },
+          {
+            "dataAttributes": {
+              "data-session-source": "tab"
+            }
+          }
+        ],
+        "id": "tmux-session-manager-navigator",
+        "isInitial": false,
+        "name": "tmux Session Manager Lists Every Live Session",
+        "transitions": [
+          {
+            "activateStates": [
+              "tmux-one-session-on-screen"
+            ],
+            "deactivateStates": [],
+            "id": "tmux-swap-session",
+            "name": "Swap the on-screen session from the session manager",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "dataAttributes": {
+                    "data-session-on-screen": "false"
+                  },
+                  "role": "button"
+                },
+                "waitAfter": {
+                  "timeout": 2000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": true
+          }
+        ]
       }
     ]
   },
