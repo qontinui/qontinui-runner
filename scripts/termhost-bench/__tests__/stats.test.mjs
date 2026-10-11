@@ -338,3 +338,25 @@ test("degradationKpi reads the base KPI and statistic from the catalog's degrada
   );
   assert.throws(() => degradationKpi("cpu_pct", {}, {}), /not a degradation KPI/);
 });
+
+test("degradationKpi on an N = 1 row is not_applicable(baseline_level), never a measured 1", () => {
+  const baseline = windowsDesktopResults().rows[3].kpis; // runner, N = 1, tiled
+  const na = { state: "not_applicable", unit: "ratio", reason: "baseline_level" };
+  for (const id of [
+    "degradation_output_latency_ms",
+    "degradation_input_latency_ms",
+    "degradation_cpu_pct",
+  ]) {
+    assert.deepEqual(degradationKpi(id, baseline, baseline), na, `${id}: the row against itself`);
+    assert.deepEqual(
+      degradationKpi(id, structuredClone(baseline), baseline, { n: 1 }),
+      na,
+      `${id}: told N = 1`,
+    );
+  }
+  assert.equal(
+    degradationKpi("degradation_cpu_pct", structuredClone(baseline), baseline, { n: 15 }).value,
+    1,
+    "an N = 15 row that happens to equal its baseline is still a measured ratio",
+  );
+});

@@ -157,6 +157,13 @@ test("the golden codec block carries the EXACT pixel rules a decoder reads", () 
       `the rule text says when ${reason} applies`,
     );
   }
+  assert.ok(
+    p.rules[0].includes(
+      "round(x) is the nearest integer with ties toward +infinity (JS Math.round; Rust f64::round",
+    ),
+    "rule 1 names the exact rounding function",
+  );
+  assert.match(p.rules[0], /which pixel rows of a captured frame to decode is Phase 2's/);
   assert.ok(!JSON.stringify(golden.codec).includes("~"), "no approximate numbers in the contract");
 });
 
@@ -191,7 +198,7 @@ const summarize = (r) =>
     : { ok: false, reason: r.reason };
 
 test("every golden raster row decodes to exactly its expected list", () => {
-  assert.ok(golden.rows.length >= 31);
+  assert.ok(golden.rows.length >= 40);
   for (const row of golden.rows) {
     const pixels = decodeRle(row.rle);
     assert.equal(pixels.length, row.width_px, row.name);
@@ -271,6 +278,35 @@ test("the golden raster rows exercise exactly what their names promise", () => {
   assert.deepEqual(byName("valid with a red-cyan pair inside"), [
     { ok: true, kind: 0, session: 2, seq: 7 },
   ]);
+  assert.deepEqual(byName("7 px cells with 1 px impure gaps"), mid);
+  assert.deepEqual(byName("cells 0-5 of (session 1, seq 10), then a whole marker"), [
+    { ok: false, reason: "bad_end_sentinel" },
+    { ok: true, kind: 0, session: 2, seq: 20 },
+  ]);
+  assert.deepEqual(
+    byName("cells 17-19 equal, drawn as one 25 px run"),
+    rejected("adjacent_cells_equal"),
+  );
+  for (const prefix of [
+    "cells 18-19 as 20 px of rgb(135,0,0) up to the row end",
+    "cells 17-19 as 25 px of rgb(135,0,0) up to the row end",
+  ]) {
+    assert.deepEqual(byName(prefix), rejected("off_palette"), prefix);
+  }
+  assert.deepEqual(
+    byName("red 10 px, cyan 9 px, exactly 6 px impure"),
+    rejected("irregular_cells"),
+  );
+  assert.deepEqual(
+    byName("a 22 px two-cell run, a 15 px impure stretch"),
+    rejected("wrong_length"),
+  );
+  for (const prefix of [
+    "the row ends 10 px after a 4 px cyan",
+    "a 4 px red-cyan gap, a 6 px cyan",
+  ]) {
+    assert.deepEqual(byName(prefix), [], prefix);
+  }
   for (const row of golden.rows.slice(17)) {
     assert.match(row.note, /^rules? \d/, `${row.name}: a rule-pinning row names its rule`);
   }

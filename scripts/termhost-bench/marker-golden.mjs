@@ -64,7 +64,7 @@ export const GOLDEN_SCHEMA = "termhost-bench/marker-golden/v2";
  * is its reference implementation, and the golden rows are what it produced).
  */
 export const PIXEL_RULE_TEXT = Object.freeze([
-  "1. geometry: pixel i spans [i, i + 1); a segment over pixels start..end-1 spans [start, end); for segments A then B, gap(A, B) = B.start - A.end and mid(A, B) = (A.end + B.start) / 2; round(x) rounds half up (every x rounded here is >= 0); arithmetic is IEEE-754 binary64, evaluated as written",
+  "1. scope and geometry: the rules decode ONE pixel row, and which pixel rows of a captured frame to decode is Phase 2's (the probe's) to define; pixel i spans [i, i + 1); a segment over pixels start..end-1 spans [start, end); for segments A then B, gap(A, B) = B.start - A.end and mid(A, B) = (A.end + B.start) / 2; round(x) is the nearest integer with ties toward +infinity (JS Math.round; Rust f64::round is the same for x >= 0, and every x rounded here is >= 0); arithmetic is IEEE-754 binary64, evaluated as written",
   "2. classify each pixel: a channel <= channel_low_max is 0, >= channel_high_min is 1, anything else is impure; a pixel is pure when all three channels are, value = 4R + 2G + B",
   "3. segments: the maximal runs of pure pixels with one value, numbered left to right; impure pixels lie in the gaps between them",
   "4. first width at segment s, when s is red (4) and s+1 is cyan (3): b1 = mid(s, s+1); if segment s+2 exists, m = mid(s+1, s+2), cyan_wide = gap(s+1, s+2) >= boundary_gap_max * (m - b1) and b2 = cyan_wide ? (s+1).end : m; if it does not, cyan_wide = false and b2 = (s+1).end; w = b2 - b1",
@@ -634,6 +634,109 @@ function buildRowVectors() {
       shifted(0, 191),
     ),
   );
+  const off = xtermRgb(OFF_PALETTE_INDEX);
+  rows.push(
+    rowVector(
+      "7 px cells with 1 px impure gaps, cell 2 9 px wide",
+      "rule 7: a narrow gap's MIDDLE is the boundary, so cell 2 spans 10 px = 1.25 cells and the marker decodes; measured to the next segment's start it would be 10.5 px = 1.31 cells, irregular_cells",
+      8,
+      [
+        pad(16, GREY),
+        ...mid.flatMap((v, at) => [pad(at === 2 ? 9 : 7, rgbOf(v)), pad(1, GREY)]),
+        pad(16, GREY),
+      ],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "cells 0-5 of (session 1, seq 10), then a whole marker (session 2, seq 20)",
+      "rule 9: the first candidate reads 6 + 14 cells and fails (bad_end_sentinel); scanning resumes at the segment after its red one, so the second marker's start is still found; resuming after the cells it read would miss it",
+      10,
+      [
+        pad(16, GREY),
+        ...cellSpans(markerValues({ kind: 0, session: 1, seq: 10 }).slice(0, 6), 10),
+        ...cellSpans(markerValues({ kind: 0, session: 2, seq: 20 }), 10),
+        pad(16, GREY),
+      ],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "cells 17-19 equal, drawn as one 25 px run",
+      "rule 1: round is the nearest integer with ties toward +infinity, so 25 / 10 = 2.5 is 3 cells: adjacent_cells_equal; half-even rounding would give 2 cells and irregular_cells",
+      10,
+      [pad(16, GREY), ...cellSpans(mid.slice(0, 17), 10), pad(25, rgbOf(mid[17])), pad(16, GREY)],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "cells 18-19 as 20 px of rgb(135,0,0) up to the row end",
+      "rule 6: an impure gap that runs to the row end ends at the row length and still counts its cells: off_palette, not wrong_length",
+      10,
+      [pad(16, GREY), ...cellSpans(mid.slice(0, 18), 10), pad(20, off)],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "red 10 px, cyan 9 px, exactly 6 px impure, then 10 px cells",
+      "rule 4: cyan_wide uses >=: the 6 px gap is exactly half of the 12 px from b1 to its middle, so cyan ends at its pure pixels (w = 9) and the 10 px cells after the impure cell are irregular_cells; with > the marker would decode",
+      10,
+      [
+        pad(16, GREY),
+        pad(10, rgbOf(mid[0])),
+        pad(9, rgbOf(mid[1])),
+        pad(6, GREY),
+        ...cellSpans(mid.slice(2), 10),
+        pad(16, GREY),
+      ],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "the row ends 10 px after a 4 px cyan",
+      "rule 4: with no segment after cyan, b2 is cyan's end (w = 5.5 px), so the 3 px red-cyan gap is no start: no candidate; b2 at the row end would make it a wrong_length candidate",
+      10,
+      [pad(16, GREY), pad(10, rgbOf(mid[0])), pad(3, GREY), pad(4, rgbOf(mid[1])), pad(10, GREY)],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "a 22 px two-cell run, a 15 px impure stretch, six cells, then the row ends",
+      "rules 6-7: the stretch is counted with the w updated after the run (112 / 11 = 10.18 px): 1 impure cell, 19 cells, wrong_length; counted with the w before the run (10 px) it would be 2 cells and off_palette",
+      10,
+      [
+        pad(16, GREY),
+        ...cellSpans(mid.slice(0, 10), 10),
+        pad(22, rgbOf(mid[10])),
+        pad(15, GREY),
+        ...cellSpans(mid.slice(13, 19), 10),
+      ],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "cells 17-19 as 25 px of rgb(135,0,0) up to the row end",
+      "rule 6: 25 / 10 = 2.5 rounds (ties toward +infinity) to 3 impure cells: off_palette; floor or half-even rounding give 2 cells and wrong_length",
+      10,
+      [pad(16, GREY), ...cellSpans(mid.slice(0, 17), 10), pad(25, off)],
+    ),
+  );
+  rows.push(
+    rowVector(
+      "a 4 px red-cyan gap, a 6 px cyan, then an 8 px impure stretch",
+      "rule 5: cyan_wide puts b2 at cyan's end, so w = 8 px and the 4 px gap is not < 0.5 x w: no start, no candidate; measured to the gap middle (12 px) it would start",
+      10,
+      [
+        pad(16, GREY),
+        pad(10, rgbOf(mid[0])),
+        pad(4, GREY),
+        pad(6, rgbOf(mid[1])),
+        pad(8, GREY),
+        ...cellSpans(mid.slice(2), 10),
+        pad(16, GREY),
+      ],
+    ),
+  );
   return rows;
 }
 
@@ -652,8 +755,10 @@ export function buildGolden() {
       "one is rejected with exactly its `reason`, checks running in `codec.decode_order`. `rows` " +
       "are pixel rows ([r, g, b, count] runs): decoding a row by `codec.pixel` must produce " +
       "exactly its `expected` list, left to right (empty = no candidate in the row). A row " +
-      'whose `note` begins "rule N" pins that step of `codec.pixel.rules`: a decoder ' +
-      "departing from the step gets the row wrong.",
+      'whose `note` begins "rule N" pins one misreading of that step of `codec.pixel.rules`, ' +
+      "named in the note: a decoder that misreads the step that way gets the row wrong. The " +
+      "rows check a decoder; the rule text is the authority. Which pixel rows of a captured " +
+      "frame to decode is Phase 2's to define.",
     codec: {
       version: CODEC_VERSION,
       cells: MARKER_CELLS,

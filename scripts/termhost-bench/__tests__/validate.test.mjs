@@ -22,6 +22,8 @@ import {
   validateResults,
 } from "../validate.mjs";
 
+import { withLadderSlopes } from "./helpers/results.mjs";
+
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const load = (name) => JSON.parse(readFileSync(join(FIXTURES, name), "utf8"));
 const desktop = () => load("results-windows-desktop.json");
@@ -376,6 +378,79 @@ test("REJECTS a baseline whose base KPI is not measured, and a measured degradat
   rejects(
     onBaseline,
     /rows\/0\/kpis\/degradation_cpu_pct \[semantic\] a measured degradation_cpu_pct on an N = 1 row/,
+  );
+});
+
+test("REJECTS a measured degradation whose own row's base KPI is not measured", () => {
+  const numerator = desktop();
+  numerator.rows[1].kpis.output_latency_ms = {
+    state: "unknown",
+    unit: "ms",
+    reason: "occluded",
+  };
+  rejects(
+    numerator,
+    /rows\/1\/kpis\/degradation_output_latency_ms \[semantic\] a measured degradation_output_latency_ms on a row whose own output_latency_ms is not measured/,
+  );
+  const notApplicable = desktop();
+  notApplicable.rows[2].kpis.cpu_pct = {
+    state: "not_applicable",
+    unit: "% of one logical core",
+    reason: "not_applicable_to_setup",
+  };
+  rejects(
+    notApplicable,
+    /rows\/2\/kpis\/degradation_cpu_pct \[semantic\] .*own cpu_pct is not measured/,
+  );
+});
+
+test("REJECTS a slope over the N ladder counting more N levels than the file holds", () => {
+  const measured = desktop();
+  measured.rows[1].kpis.memory_mb_per_session = {
+    state: "measured",
+    unit: "MB/session",
+    n: 3,
+    value: 22.5,
+  };
+  rejects(
+    measured,
+    /rows\/1\/kpis\/memory_mb_per_session \[semantic\] memory_mb_per_session counts 3 N levels; this file holds 2 for the same setup, variant, build role and arm with a measured memory_mb/,
+  );
+  const unknown = desktop();
+  unknown.rows[0].kpis.memory_mb_per_session = {
+    state: "unknown",
+    unit: "MB/session",
+    reason: "too_few_levels",
+    n: 2,
+  };
+  rejects(
+    unknown,
+    /rows\/0\/kpis\/memory_mb_per_session \[semantic\] .*counts 2 N levels; this file holds 1/,
+  );
+  const unmeasuredBase = desktop();
+  unmeasuredBase.rows[3].kpis.memory_mb = { state: "unknown", unit: "MB", reason: "harness_error" };
+  rejects(unmeasuredBase, /rows\/1\/kpis\/memory_mb_per_session \[semantic\] .*this file holds 1/);
+});
+
+test("ACCEPTS a slope over three N levels the file holds", () => {
+  const doc = desktop();
+  const atN5 = structuredClone(doc.rows[1]); // runner, tiled, a third N level
+  Object.assign(atN5.scenario, { n: 5, v_target: 5, v_actual: 5 });
+  atN5.kpis.memory_mb = { ...atN5.kpis.memory_mb, value: 812.4 + 4 * 22.5 };
+  doc.rows[1].kpis.memory_mb = { ...doc.rows[1].kpis.memory_mb, value: 812.4 + 14 * 22.5 };
+  doc.rows.push(atN5);
+  withLadderSlopes(doc);
+  assert.deepEqual(validateResults(doc).errors, []);
+  const runnerTiled = doc.rows.filter((r) => r.setup.id === "runner" && r.scenario.arm === "tiled");
+  for (const row of runnerTiled) {
+    assert.equal(row.kpis.memory_mb_per_session.state, "measured");
+    assert.equal(row.kpis.memory_mb_per_session.n, 3);
+    assert.ok(Math.abs(row.kpis.memory_mb_per_session.value - 22.5) < 1e-9);
+  }
+  assert.deepEqual(
+    { ...doc.rows[2].kpis.memory_mb_per_session },
+    { state: "unknown", unit: "MB/session", reason: "too_few_levels", n: 2 },
+    "vscode still has two levels",
   );
 });
 

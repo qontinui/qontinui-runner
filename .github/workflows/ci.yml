@@ -324,9 +324,9 @@ jobs:
       # vectors, the AI-session generator, the calibrator and the statistics — plus
       # the tests of runner#1856's frame builders the generator is built on, which no
       # other step runs. Node built-ins only, so no `pnpm install`. `shell: bash` so
-      # the glob expands on windows-latest too — pwsh would pass it to node
-      # literally, and Node 20 does not expand it. Bounded because some tests run
-      # real generator processes. Mirrored in .qontinui/ci.toml as
+      # the shell expands the glob on windows-latest too (pwsh would pass it to node
+      # literally), whatever node itself does with one. Bounded because some tests
+      # run real generator processes. Mirrored in .qontinui/ci.toml as
       # `termhost-bench-node-tests`.
       - name: Run termhost-bench unit tests
         shell: bash

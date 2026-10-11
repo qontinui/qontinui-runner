@@ -842,8 +842,8 @@ export function parseCodePage(text) {
  * On a Windows console, make the byte stream mean the same in every host: let libuv
  * enable VT processing (creating process.stdout does it) and switch the console's
  * output code page to UTF-8, because a raw fs.writeSync to a console is decoded in
- * the console code page (437 by default) and every multi-byte glyph would become
- * several cells. The previous code page is restored at exit (main() restores it in a
+ * the console code page (the system's OEM code page unless something changed it) and
+ * every multi-byte glyph would become several cells. The previous code page is restored at exit (main() restores it in a
  * `finally`). When the original code page cannot be read, nothing is changed: a page
  * that cannot be restored is never switched.
  *
