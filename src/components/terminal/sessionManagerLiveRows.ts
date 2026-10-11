@@ -161,3 +161,22 @@ export function isRowOnScreen(
 ): boolean {
   return onScreenTabId !== null && session.zoneTabId === onScreenTabId;
 }
+
+/**
+ * The right-hand panel mode after a session row is selected.
+ *
+ * Selecting a row also selects it as the "current" session
+ * (`selectedTranscriptSessionId`, which the card highlight reads). For a
+ * tab-sourced row that id is a TAB id with no transcript behind it, so a
+ * transcript panel left open would render the previous session's messages
+ * under the new selection. A tab row therefore closes the TRANSCRIPT panel;
+ * every other panel (workflow, analysis, findings, file ownership) is not
+ * about the selected session and stays as it is. A transcript row changes
+ * nothing here — its own panel follows the selection.
+ */
+export function rightPanelModeAfterRowSelect<M extends string>(
+  source: "transcript" | "tab",
+  current: M | null,
+): M | null {
+  return source === "tab" && current === "transcript" ? null : current;
+}

@@ -17,6 +17,8 @@
  *   - `terminal.maximize`    — `/maximize [<n>]`
  *   - `terminal.close`       — `/close [<n>]`
  *   - `terminal.layout`      — `/layout <preset>`
+ *   - `terminal.mode`        — `/terminal.mode [grid|tmux]` (alias `/work-mode`;
+ *                              no argument toggles)
  *   - `terminal.restart`     — `/restart [<n>]`
  *   - `terminal.swap`        — `/swap <a> <b>`
  *
@@ -65,6 +67,12 @@ import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 import { describeThrown } from "@/lib/utils";
 import type { ApprovalReport } from "../approveAll";
+import {
+  WORK_MODE_NAMES,
+  applyWorkModeRequest,
+  parseWorkModeRequest,
+  type WorkModeChange,
+} from "../terminalWorkModeControl";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -225,6 +233,7 @@ const SCHEMA = {
     tabId: "string (explicit tab id; takes precedence over zone)",
   },
   layout: { preset: `string — one of ${LAYOUT_IDS.join(", ")}` },
+  mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
 } as const;
@@ -616,6 +625,31 @@ export function resolveTenantArg(
     return { error: `tenant "${value}" is ambiguous (matches ${prefixed.length} bindings)` };
   }
   return { error: `no tenant binding matches "${value}"` };
+}
+
+/**
+ * The `/terminal.mode` verdict. A state report whose sentence is exactly the
+ * shared acknowledgement — "entered tmux mode", "left tmux mode — grid
+ * restored" — and a noop (`·`, "work mode was already tmux") when the mode was
+ * already the requested one, unless that request still opened the Session
+ * Manager, which is then the change it reports.
+ */
+export function workModeEffect(change: WorkModeChange): EffectReport {
+  if (change.changed) {
+    return change.mode === "tmux"
+      ? stateEffect(
+          "entered",
+          "tmux mode",
+          true,
+          change.sidebarOpened ? { detail: "session manager opened" } : {},
+        )
+      : stateEffect("left", "tmux mode", true, { detail: "grid restored" });
+  }
+  return change.sidebarOpened
+    ? stateEffect("opened", "the session manager", true, {
+        detail: `already in ${change.mode} mode`,
+      })
+    : stateEffect(change.mode, "work mode", false);
 }
 
 export function useTerminalCommands(ctx: TerminalCommandsContext): void {
@@ -1049,6 +1083,37 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
             : normalized;
       const detail = leftTmux ? `left tmux mode — ${layoutDetail}` : layoutDetail;
       return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
+    },
+  });
+
+  // ── 8b. /terminal.mode ────────────────────────────────────────────────
+  // Grid ⇄ tmux work mode. The decision, the Session Manager side effect and
+  // the acknowledgement sentence all come from `applyWorkModeRequest`, the
+  // rule the CommandBar toggle, Ctrl+Shift+Y and the UI Bridge action share,
+  // so the four surfaces cannot report different things for one change.
+  useCommandAction({
+    id: "terminal.mode",
+    slash: "/terminal.mode",
+    aliases: ["/work-mode"],
+    label: "Switch terminal work mode",
+    description:
+      "Switch between grid mode (every session in a zone) and tmux mode (one session on screen, the rest live off-screen; the session manager opens as its navigator). No argument toggles.",
+    paramSchema: SCHEMA.mode,
+    patterns: [/^(?<mode>tmux|grid)\s+mode$/i, /^work\s+mode\s+(?<mode>tmux|grid)$/i],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
+      const parsed = parseWorkModeRequest(args.mode);
+      if (!parsed.ok) return fail("invalid-mode", parsed.error);
+      const change = applyWorkModeRequest(
+        {
+          workMode: zoneLayout.workMode,
+          enterTmuxMode: zoneLayout.enterTmuxMode,
+          exitTmuxMode: zoneLayout.exitTmuxMode,
+          showSidebar: workflowGen.showSidebar,
+          setShowSidebar: workflowGen.setShowSidebar,
+        },
+        parsed.request,
+      );
+      return ok(workModeEffect(change));
     },
   });
 

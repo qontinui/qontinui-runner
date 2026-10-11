@@ -4,6 +4,7 @@ import { stepShownTab, type LayoutRequestSource, type TerminalWorkMode } from ".
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { deliverApprovals } from "./approveAll";
+import { applyWorkModeRequest } from "./terminalWorkModeControl";
 import { runRegistryAction } from "./commands";
 import {
   GLOBAL_CHORDS,
@@ -40,6 +41,8 @@ interface UseKeyboardShortcutsParams {
     assignTabToZone: (idx: number, tabId: string) => void;
     /** tmux mode shows one session (zone 0); the cyclers swap it. */
     workMode: TerminalWorkMode;
+    enterTmuxMode: () => void;
+    exitTmuxMode: () => void;
     shownTabId: string | null;
     requestReveal: (tabId: string) => void;
   };
@@ -397,6 +400,23 @@ export function useKeyboardShortcuts({
         focusHistory.goForward();
         return;
       }
+      // Ctrl+Shift+Y: Grid ⇄ tmux work mode. Same rule as the CommandBar
+      // toggle, `/terminal.mode` and the UI Bridge action — entering tmux also
+      // opens the Session Manager, the mode's only navigator.
+      if (matchesChord(e, GLOBAL_CHORDS.terminalWorkMode)) {
+        e.preventDefault();
+        applyWorkModeRequest(
+          {
+            workMode: zoneLayout.workMode,
+            enterTmuxMode: zoneLayout.enterTmuxMode,
+            exitTmuxMode: zoneLayout.exitTmuxMode,
+            showSidebar: workflowGen.showSidebar,
+            setShowSidebar: workflowGen.setShowSidebar,
+          },
+          "toggle",
+        );
+        return;
+      }
       // Ctrl+Shift+B: Toggle session manager sidebar
       if (isCtrlShiftChord(e, "b")) {
         e.preventDefault();
@@ -452,6 +472,8 @@ export function useKeyboardShortcuts({
     closeTerminal,
     setActiveId,
     workflowGen.rightPanelMode,
+    workflowGen.showSidebar,
+    workflowGen.setShowSidebar,
     zoneLayout,
     sessionStates,
     swapSource,

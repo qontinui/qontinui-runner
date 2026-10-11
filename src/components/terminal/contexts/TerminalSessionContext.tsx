@@ -105,6 +105,7 @@ import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
+import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
 import { noteDecode, transportClockStart } from "../transportStats";
@@ -742,7 +743,7 @@ const PageSessionScope = memo(function PageSessionScope({
       selectedSessionSetterRef.current(sessionId);
       rightPanelModeSetterRef.current("transcript" as never);
     },
-    onFocusSessionTab: (sessionId: string, tabId: string) => {
+    onFocusSessionTab: (sessionId: string, tabId: string, source: "transcript" | "tab") => {
       // Defensive: `zoneTabId` only ever names a tab this window owns, but a
       // stale or synthetic id must fall back to the transcript, not a no-op.
       const plan = tabs.some((t) => t.id === tabId)
@@ -755,6 +756,8 @@ const PageSessionScope = memo(function PageSessionScope({
           )
         : null;
       if (!plan) {
+        // A tab row has no transcript to fall back to — its id is a tab id.
+        if (source === "tab") return;
         selectedSessionSetterRef.current(sessionId);
         rightPanelModeSetterRef.current("transcript" as never);
         return;
@@ -771,6 +774,9 @@ const PageSessionScope = memo(function PageSessionScope({
       zoneLayout.requestReveal(tabId);
       // Keep the card highlighted as the current session.
       selectedSessionSetterRef.current(sessionId);
+      // A tab row's id names no transcript: an open transcript panel would
+      // keep painting the previous session's messages under it, so close it.
+      rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
   });
 
@@ -780,6 +786,8 @@ const PageSessionScope = memo(function PageSessionScope({
     loadMessages,
     onNavigateToBuilder,
     onNavigateToActive,
+    pageId,
+    windowLabel: myWindowLabel,
   });
 
   const analysis = useAnalysis({
