@@ -4600,6 +4600,7 @@ pub(crate) fn derive_and_publish_posture_with(
                 tenant_id: None,
                 exp: None,
                 outcome: None,
+                recovery: None,
                 signal: upstream_signal_for(None),
                 pin_arm: None,
                 detail: Some(refusal.clone()),
@@ -12697,6 +12698,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }
     }
 
