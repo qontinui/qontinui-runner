@@ -67,56 +67,138 @@ export function parseMru(raw: unknown): string[] {
 }
 
 /**
+ * Which tabs are alive. `null` means liveness is not threaded and every tab
+ * counts as alive (the hook's callers that predate the tmux mode pass none).
+ */
+export type AliveTabs = ReadonlySet<string> | null;
+
+/**
  * The tab to show once `closedId` is gone (or, with `closedId` null, whenever
- * zone 0 is empty): the most recently shown tab that is still live, else the
- * first live tab in creation order (`liveTabIds` order), else `null` when no
- * tab is left. Never `closedId` itself, even if it is still in `liveTabIds`
- * (the close and the tab-list update can land in either order).
+ * zone 0 is empty). A LIVE tab always beats an exited tombstone: the most
+ * recently shown live tab, else the first live tab in creation order
+ * (`tabIds` order). Only when no live tab is left does an exited one qualify,
+ * in the same MRU-then-creation order, so the operator still sees how the last
+ * session ended rather than a blank viewport. `null` when no tab is left.
+ * Never `closedId` itself, even if it is still in `tabIds` (the close and the
+ * tab-list update can land in either order).
  */
 export function nextShownAfterClose(
   mru: readonly string[],
-  liveTabIds: readonly string[],
+  tabIds: readonly string[],
   closedId: string | null,
+  alive: AliveTabs = null,
 ): string | null {
-  const live = new Set(liveTabIds);
-  if (closedId !== null) live.delete(closedId);
-  for (const id of mru) if (live.has(id)) return id;
-  for (const id of liveTabIds) if (live.has(id)) return id;
+  const present = new Set(tabIds);
+  if (closedId !== null) present.delete(closedId);
+  const isAlive = (id: string) => alive === null || alive.has(id);
+  for (const id of mru) if (present.has(id) && isAlive(id)) return id;
+  for (const id of tabIds) if (present.has(id) && isAlive(id)) return id;
+  for (const id of mru) if (present.has(id)) return id;
+  for (const id of tabIds) if (present.has(id)) return id;
   return null;
 }
 
 /**
  * The tab shown when tmux mode is entered: the focused zone's tab if it is
- * live, else the MRU head / creation-order fallback of {@link nextShownAfterClose}.
+ * still a tab (the operator was looking at it, exited or not), else the
+ * live-first fallback of {@link nextShownAfterClose}.
  */
 export function shownTabOnEnter(
   assignments: ZoneAssignments,
   focusedZone: number,
   mru: readonly string[],
-  liveTabIds: readonly string[],
+  tabIds: readonly string[],
+  alive: AliveTabs = null,
 ): string | null {
   const focused = assignments[focusedZone];
-  if (focused && liveTabIds.includes(focused)) return focused;
-  return nextShownAfterClose(mru, liveTabIds, null);
+  if (focused && tabIds.includes(focused)) return focused;
+  return nextShownAfterClose(mru, tabIds, null, alive);
 }
 
 /**
- * Reconcile tmux-mode assignments against the live tabs. The result holds at
- * most zone 0: the shown tab is kept while it lives; when it is gone (or zone 0
- * is empty) the next shown tab comes from {@link nextShownAfterClose} — the MRU
- * first, creation order only as the last resort. Returns `prev` (same
- * identity) when nothing changed.
+ * The MRU on entering tmux mode. The sessions that were on screen in the grid
+ * a moment ago are the most recently seen ones, so they follow the shown tab
+ * (in zone order) ahead of whatever an earlier tmux visit left in the list.
+ * That ordering is also what keeps them mounted across the switch
+ * ({@link tmuxMountedTabIds} keeps the MRU head warm), and it makes "close the
+ * shown session" fall back to a session the operator just had on screen.
+ */
+export function mruOnEnter(
+  shown: string | null,
+  assignments: ZoneAssignments,
+  mru: readonly string[],
+  tabIds: readonly string[],
+): string[] {
+  const present = new Set(tabIds);
+  const zoned = Object.keys(assignments)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map((z) => assignments[z]);
+  const ordered = [...(shown === null ? [] : [shown]), ...zoned, ...mru];
+  const out: string[] = [];
+  for (const id of ordered) {
+    if (present.has(id) && !out.includes(id)) out.push(id);
+  }
+  return out.slice(0, MRU_LIMIT);
+}
+
+/**
+ * How many off-screen tabs tmux mode keeps MOUNTED (warm) besides the shown
+ * one: the most recently shown ones. Every other off-screen tab is
+ * `offscreen-unmounted` and mounts on reveal, rebuilding from the PTY's
+ * scrollback ring. Without the bound, entering tmux from a flow grid of dozens
+ * of sessions would mount an xterm parser for every one of them at once — the
+ * exact OOM the flow grid's virtualization exists to prevent (incident #535).
+ *
+ * Eight matches `MAX_WEBGL_PANES`, the WebGL context cap
+ * (`backends/webglContextLru.ts`): a warm pane past that cap would be a Canvas
+ * pane anyway, so a larger bound buys memory cost without the fast renderer.
+ * Within the bound a swap is a prop flip; past it, a ring replay.
+ */
+export const TMUX_WARM_TAB_LIMIT = 8;
+
+/**
+ * The tabs tmux mode keeps mounted: the shown tab plus the
+ * {@link TMUX_WARM_TAB_LIMIT} most recently shown other tabs that still exist.
+ */
+export function tmuxMountedTabIds(
+  shownTabId: string | null,
+  mru: readonly string[],
+  tabIds: readonly string[],
+  limit: number = TMUX_WARM_TAB_LIMIT,
+): Set<string> {
+  const present = new Set(tabIds);
+  const mounted = new Set<string>();
+  if (shownTabId !== null && present.has(shownTabId)) mounted.add(shownTabId);
+  let warm = 0;
+  for (const id of mru) {
+    if (warm >= limit) break;
+    if (id === shownTabId || !present.has(id) || mounted.has(id)) continue;
+    mounted.add(id);
+    warm++;
+  }
+  return mounted;
+}
+
+/**
+ * Reconcile tmux-mode assignments against the tabs. The result holds at most
+ * zone 0: the shown tab is kept while it is still a tab (an exited shown tab
+ * stays on screen as its tombstone — the operator sees how it ended); when it
+ * is gone (or zone 0 is empty) the next shown tab comes from
+ * {@link nextShownAfterClose} — live tabs first, the MRU before creation
+ * order. Returns `prev` (same identity) when nothing changed.
  */
 export function reconcileTmuxAssignments(
   prev: ZoneAssignments,
-  liveTabIds: readonly string[],
+  tabIds: readonly string[],
   mru: readonly string[],
+  alive: AliveTabs = null,
 ): ZoneAssignments {
   const shown = prev[0];
-  const shownLive = shown !== undefined && liveTabIds.includes(shown);
+  const shownPresent = shown !== undefined && tabIds.includes(shown);
   const onlyZoneZero = Object.keys(prev).every((z) => z === "0");
-  if (shownLive && onlyZoneZero) return prev;
-  const next = shownLive ? shown : nextShownAfterClose(mru, liveTabIds, shown ?? null);
+  if (shownPresent && onlyZoneZero) return prev;
+  const next = shownPresent ? shown : nextShownAfterClose(mru, tabIds, shown ?? null, alive);
   if (next === null) return Object.keys(prev).length === 0 ? prev : {};
   return { 0: next };
 }
@@ -147,26 +229,156 @@ export function stepShownTab(
   return null;
 }
 
-/** The grid the operator left when entering tmux mode. */
+/**
+ * The grid the operator left when entering tmux mode.
+ *
+ * `assignments` names tabs by TAB id, and a tab id is not durable: a runner
+ * restart cold-resumes every session into a NEW tab. `sessionKeys` therefore
+ * records, per zone, the durable identity of the session in it — its
+ * `claudeSessionId`, the key the cold-resume path re-creates a tab from — so
+ * the zone can be re-matched to the session's new tab
+ * ({@link rekeyGridSnapshot}). A zone whose tab has no session id (a plain
+ * shell) has no entry: a shell is not resumed, so there is nothing to match.
+ */
 export interface GridSnapshot {
   layoutId: string;
   assignments: ZoneAssignments;
   focusedZone: number;
+  /** zone index → the `claudeSessionId` of the session in that zone. */
+  sessionKeys: Record<number, string>;
 }
 
-/** Read a persisted grid snapshot; anything not shaped like one is `null`. */
+/** A tab's durable session key (`claudeSessionId`), if it has one. */
+export type SessionKeyOf = (tabId: string) => string | undefined;
+
+/** Read a zone-index-keyed map of strings; `null` when any entry is malformed. */
+function parseZoneStringMap(raw: unknown): Record<number, string> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out: Record<number, string> = {};
+  for (const [zone, value] of Object.entries(raw as Record<string, unknown>)) {
+    const z = Number(zone);
+    if (!Number.isInteger(z) || z < 0 || typeof value !== "string") return null;
+    out[z] = value;
+  }
+  return out;
+}
+
+/**
+ * Read a persisted grid snapshot; anything not shaped like one is `null`. A
+ * focused zone must be a non-negative integer — a fractional or negative one
+ * names no zone, and restoring it would focus nothing. A snapshot saved before
+ * `sessionKeys` existed reads with none (its zones still match by tab id).
+ */
 export function parseGridSnapshot(raw: unknown): GridSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  if (typeof r.layoutId !== "string" || typeof r.focusedZone !== "number") return null;
-  if (!r.assignments || typeof r.assignments !== "object") return null;
-  const assignments: ZoneAssignments = {};
-  for (const [zone, tabId] of Object.entries(r.assignments as Record<string, unknown>)) {
-    const z = Number(zone);
-    if (!Number.isInteger(z) || z < 0 || typeof tabId !== "string") return null;
-    assignments[z] = tabId;
+  if (typeof r.layoutId !== "string") return null;
+  if (!Number.isInteger(r.focusedZone) || (r.focusedZone as number) < 0) return null;
+  const assignments = parseZoneStringMap(r.assignments);
+  if (assignments === null) return null;
+  const sessionKeys = r.sessionKeys === undefined ? {} : parseZoneStringMap(r.sessionKeys);
+  if (sessionKeys === null) return null;
+  return { layoutId: r.layoutId, assignments, focusedZone: r.focusedZone as number, sessionKeys };
+}
+
+/** The durable keys of the sessions in `assignments`, zone by zone. */
+export function sessionKeysFor(
+  assignments: ZoneAssignments,
+  sessionKeyOf: SessionKeyOf,
+): Record<number, string> {
+  const keys: Record<number, string> = {};
+  for (const [zone, tabId] of Object.entries(assignments)) {
+    const key = sessionKeyOf(tabId);
+    if (key) keys[Number(zone)] = key;
   }
-  return { layoutId: r.layoutId, assignments, focusedZone: r.focusedZone };
+  return keys;
+}
+
+/**
+ * Bring a snapshot's tab ids up to date with the tabs that exist now:
+ *
+ *   - a zone whose tab still exists keeps it, and records that tab's session
+ *     key if it has gained one since (a Claude session binds its id after the
+ *     tab is created);
+ *   - a zone whose tab is gone but whose recorded session now runs in another
+ *     tab — the new tab a runner restart cold-resumed it into — is re-pointed
+ *     at that tab, unless the tab already holds another zone of the snapshot;
+ *   - a zone whose tab is gone with no such match is left as it is, so a
+ *     session that resumes later can still claim it.
+ *
+ * Returns `snapshot` itself when nothing changed.
+ */
+export function rekeyGridSnapshot(
+  snapshot: GridSnapshot,
+  tabIds: readonly string[],
+  sessionKeyOf: SessionKeyOf,
+): GridSnapshot {
+  const present = new Set(tabIds);
+  const tabByKey = new Map<string, string>();
+  for (const id of tabIds) {
+    const key = sessionKeyOf(id);
+    if (key && !tabByKey.has(key)) tabByKey.set(key, id);
+  }
+  const held = new Set(Object.values(snapshot.assignments).filter((id) => present.has(id)));
+  const assignments: ZoneAssignments = { ...snapshot.assignments };
+  const sessionKeys: Record<number, string> = { ...snapshot.sessionKeys };
+  let changed = false;
+  for (const [zone, tabId] of Object.entries(snapshot.assignments)) {
+    const z = Number(zone);
+    if (present.has(tabId)) {
+      const key = sessionKeyOf(tabId);
+      if (key && sessionKeys[z] !== key) {
+        sessionKeys[z] = key;
+        changed = true;
+      }
+      continue;
+    }
+    const recorded = snapshot.sessionKeys[z];
+    const successor = recorded ? tabByKey.get(recorded) : undefined;
+    if (successor && !held.has(successor)) {
+      assignments[z] = successor;
+      held.add(successor);
+      changed = true;
+    }
+  }
+  return changed ? { ...snapshot, assignments, sessionKeys } : snapshot;
+}
+
+/**
+ * Put `tabId` into zone `zone` of a snapshot (a restore placing a session at
+ * its recorded grid zone while tmux mode is on). The tab leaves any other zone
+ * it held; the zone's old session key goes with its old tab, and
+ * {@link rekeyGridSnapshot} records the new tab's key once it has one.
+ */
+export function placeInGridSnapshot(
+  snapshot: GridSnapshot,
+  zone: number,
+  tabId: string,
+): GridSnapshot {
+  if (snapshot.assignments[zone] === tabId) return snapshot;
+  const assignments: ZoneAssignments = {};
+  const sessionKeys: Record<number, string> = {};
+  for (const [z, id] of Object.entries(snapshot.assignments)) {
+    if (id === tabId) continue;
+    assignments[Number(z)] = id;
+    const key = snapshot.sessionKeys[Number(z)];
+    if (key !== undefined) sessionKeys[Number(z)] = key;
+  }
+  assignments[zone] = tabId;
+  delete sessionKeys[zone];
+  return { ...snapshot, assignments, sessionKeys };
+}
+
+/**
+ * The grid zone the snapshot holds `tabId` in, or `null` — the zone whose
+ * label, notes and pin belong to that session while tmux mode shows it.
+ */
+export function gridZoneOfTab(snapshot: GridSnapshot | null, tabId: string | null): number | null {
+  if (snapshot === null || tabId === null) return null;
+  for (const [zone, id] of Object.entries(snapshot.assignments)) {
+    if (id === tabId) return Number(zone);
+  }
+  return null;
 }
 
 /**
@@ -175,7 +387,9 @@ export function parseGridSnapshot(raw: unknown): GridSnapshot | null {
  * to reach every live tab).
  *
  *   - a tab still live keeps its recorded zone EXACTLY (its label, notes and
- *     pin are keyed by that index);
+ *     pin are keyed by that index) — and so does a session whose tab was
+ *     replaced (a runner restart cold-resumes into a new tab id), matched
+ *     through its recorded session key ({@link rekeyGridSnapshot});
  *   - a tab closed during tmux leaves its zone empty — nothing re-packs;
  *   - a tab created during tmux fills the lowest empty zone, in creation
  *     order; one that does not fit stays unassigned, and the grid's auto-grow
@@ -183,10 +397,12 @@ export function parseGridSnapshot(raw: unknown): GridSnapshot | null {
  *   - the focused zone is kept when it is inside the layout, else zone 0.
  */
 export function restoreGridSnapshot(
-  snapshot: GridSnapshot,
+  saved: GridSnapshot,
   liveTabIds: readonly string[],
   zoneCount: number,
+  sessionKeyOf: SessionKeyOf = () => undefined,
 ): GridSnapshot {
+  const snapshot = rekeyGridSnapshot(saved, liveTabIds, sessionKeyOf);
   const live = new Set(liveTabIds);
   const assignments: ZoneAssignments = {};
   const placed = new Set<string>();
@@ -205,5 +421,6 @@ export function restoreGridSnapshot(
     layoutId: snapshot.layoutId,
     assignments,
     focusedZone: snapshot.focusedZone < zoneCount ? snapshot.focusedZone : 0,
+    sessionKeys: sessionKeysFor(assignments, sessionKeyOf),
   };
 }

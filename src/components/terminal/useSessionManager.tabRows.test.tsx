@@ -122,3 +122,49 @@ describe("useSessionManager — live tabs with no transcript", () => {
     expect(manager!.frozenCount).toBe(0);
   });
 });
+
+describe("useSessionManager — closing a session from its row", () => {
+  function mountManager(tabs: TerminalTab[], onCloseSessionTab?: (tabId: string) => void) {
+    let manager: UseSessionManagerReturn | null = null;
+    function Page() {
+      manager = useSessionManager({
+        tabs,
+        sessionStates: {},
+        staleTabs: new Set<string>(),
+        transcriptSessions: [],
+        sessionsLoading: false,
+        desktopNotify: false,
+        onRefreshSessions: () => {},
+        onResumeSession: () => {},
+        onSelectSession: () => {},
+        onFocusSessionTab: () => {},
+        onCloseSessionTab,
+      });
+      return null;
+    }
+    act(() => root.render(createElement(Page)));
+    return manager!;
+  }
+
+  const shell: TerminalTab = { id: "tab-x", title: "bash", pid: 9, isAlive: true, exitCode: null };
+
+  it("closes the row's live tab through the page's close path", () => {
+    const close = vi.fn();
+    const manager = mountManager([shell], close);
+    const row = manager.sessions.find((s) => s.zoneTabId === "tab-x")!;
+    expect(manager.closableTabId(row)).toBe("tab-x");
+    act(() => manager.closeSession(row));
+    expect(close.mock.calls).toEqual([["tab-x"]]);
+  });
+
+  it("offers no close for a row with no live tab, nor without a close path", () => {
+    const close = vi.fn();
+    const manager = mountManager([shell], close);
+    const row = manager.sessions.find((s) => s.zoneTabId === "tab-x")!;
+    const transcriptOnly = { ...row, source: "transcript" as const, zoneTabId: null };
+    expect(manager.closableTabId(transcriptOnly as typeof row)).toBeNull();
+    act(() => manager.closeSession(transcriptOnly as typeof row));
+    expect(close).not.toHaveBeenCalled();
+    expect(mountManager([shell]).closableTabId(row)).toBeNull();
+  });
+});

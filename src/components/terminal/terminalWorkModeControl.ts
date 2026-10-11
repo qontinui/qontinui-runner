@@ -119,3 +119,20 @@ export function describeWorkModeChange(
   if (!changed) return `already in ${mode} mode${opened}`;
   return mode === "tmux" ? `entered tmux mode${opened}` : "left tmux mode — grid restored";
 }
+
+/**
+ * Create a terminal the OPERATOR asked for (a UI Bridge `create-terminal`, a
+ * session-manager Resume, a "Fix finding"), and show it: in tmux mode a new
+ * session takes the one viewport (tmux `new-window`, plan D3); in grid mode
+ * `showSpawnedTab` is a no-op and the reconcile gives it a zone. Restore and
+ * background ingest create tabs too, and must NOT come through here — neither
+ * may take the screen from the session the operator is typing in.
+ */
+export async function createShownTerminal(
+  create: () => Promise<string | null>,
+  showSpawnedTab: (tabId: string) => void,
+): Promise<string | null> {
+  const tabId = await create();
+  if (tabId) showSpawnedTab(tabId);
+  return tabId;
+}

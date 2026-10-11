@@ -41,7 +41,7 @@ vi.mock("./useTerminalWindowActions", () => ({
 import { ZoneHoverActions } from "./ZoneHoverActions";
 
 const render = (props: { zoneIdx: number; inline?: boolean }) =>
-  renderToStaticMarkup(<ZoneHoverActions {...props} />);
+  renderToStaticMarkup(<ZoneHoverActions labelZone={props.zoneIdx} {...props} />);
 
 describe("ZoneHoverActions", () => {
   it("default mode is the hover-revealed overlay", () => {
