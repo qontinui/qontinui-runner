@@ -1,6 +1,5 @@
 import { memo, useCallback, useMemo, useReducer, useRef, useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
 import { MessageSquare, ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
@@ -12,9 +11,8 @@ import type { LayoutPreset } from "./useZoneLayout";
 import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX, findNextZone } from "./useZoneLayout";
 import {
   ZoneContextMenu,
-  HiddenTerminal,
-  ZoneCell,
-  TmuxViewport,
+  buildZoneCells,
+  buildParkedCells,
   reviewPanelAvailable,
   type ZoneCellSharedProps,
 } from "./zone-grid";
@@ -622,37 +620,21 @@ function ZoneGridInner({
   // an IntersectionObserver.
   //
   // tmux work mode adds its own arm: the shown tab is `assigned`, every other
-  // PTY tab `offscreen` (parked inside `TmuxViewport`), and a parked plan or
-  // worker tab `offscreen-unmounted`. Nothing is `hidden`, so the
-  // `HiddenTerminal` parking below owns no tab in that mode.
+  // PTY tab `offscreen` (parked), and a parked plan or worker tab
+  // `offscreen-unmounted`. Nothing is `hidden` in that mode.
+  //
+  // `buildZoneCells` turns the classification into mounts for both modes: one
+  // cell per mounted tab, keyed by tab id, so a grid ⇄ tmux switch keeps every
+  // terminal mounted (plan `2026-10-11-runner-terminal-tmux-work-mode` D2). A
+  // `hidden` plan or Conductor worker tab (`sessionBacked`) takes no parked
+  // mount — it has no PTY, and a parked `TerminalInstance` would attach to a
+  // terminal id that names no process.
   const workMode = zoneLayout.workMode;
+  const isTmux = workMode === "tmux";
   const tabClassification = useMemo(
     () => classifyTabs(tabs, assignments, isFlowMode, nearViewport, workMode),
     [tabs, assignments, isFlowMode, nearViewport, workMode],
   );
-
-  // A Conductor worker's tab (`sessionBacked`) has no PTY and no scrollback
-  // to keep warm, so it never takes the hidden mount — an offscreen
-  // `TerminalInstance` would attach to a terminal id that names no process.
-  const unassignedTerminals = tabs.filter(
-    (t) => tabClassification.get(t.id) === "hidden" && t.type !== "plan" && !t.sessionBacked,
-  );
-
-  const renderHiddenTabs = (extraTabs: TerminalTab[]) =>
-    extraTabs.map((tab) => (
-      <HiddenTerminal
-        key={tab.id}
-        tab={tab}
-        pageId={pageId}
-        terminalRef={terminalRefs.get(tab.id)}
-        onExit={onExit}
-        onFirstInput={onFirstInput}
-        onUserInputLine={onUserInputLine}
-        onShellIntegration={onShellIntegration}
-        onReconnected={onReconnected}
-        onTitleChange={onTitleChange}
-      />
-    ));
 
   // The maximized view renders its own header (below, after the early
   // return), so its review read is hooked here, unconditionally.
@@ -673,8 +655,8 @@ function ZoneGridInner({
     [maximizedReview.changes, maximizedReview.review],
   );
 
-  // The props every zone cell of this render shares, built once for both
-  // renderers below (the grid's cells and `TmuxViewport`'s), so the tmux pane
+  // The props every zone cell of this render shares, built once for both work
+  // modes (`buildZoneCells` adds tmux's viewport overrides), so the tmux pane
   // is the grid's zone content and not a second copy of it. Every value is a
   // stable identity, so the spread keeps `ZoneCell`'s memo holding.
   const cellProps: ZoneCellSharedProps = {
@@ -794,27 +776,7 @@ function ZoneGridInner({
       })()
     : null;
 
-  // tmux work mode: one session on screen, the rest parked and still mounted.
-  // The viewport is the ONLY mount owner in this mode — no `renderHiddenTabs`
-  // beside it — and `maximizedZone` is always null here, so the maximized
-  // branch below never competes with it.
-  if (workMode === "tmux") {
-    return (
-      <>
-        <TmuxViewport
-          // eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above).
-          cellProps={cellProps}
-          shownTabId={zoneLayout.shownTabId}
-          zone={layout.zones[0]}
-          promptTabs={promptTabs}
-          reviewTabs={reviewTabs}
-          isDropTarget={gridState.dropTargetZone === 0}
-        />
-        {contextMenu}
-      </>
-    );
-  }
-
+  // `maximizedZone` is always null in tmux mode, so this branch is grid-only.
   if (isSingleView && layout.id !== "single") {
     const tab = maximizedTab;
     // A maximized zone owns the page, so its prompts go in the full-height
@@ -1007,51 +969,61 @@ function ZoneGridInner({
           );
         })}
 
-        {/* eslint-disable-next-line react-hooks/refs -- renderHiddenTabs reads the stable terminalRefs Map-cache (see above). */}
-        {renderHiddenTabs(unassignedTerminals)}
+        {/* The tabs with no zone keep their parked mount, as in the grid. */}
+        {/* eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above). */}
+        {buildParkedCells(layout.zones[0], cellProps)}
       </div>
     );
   }
+
+  // Grid and tmux render through ONE root element with ONE keyed cell list as
+  // its first child, so switching modes re-renders every tab's cell in place —
+  // no terminal unmounts (see `buildZoneCells`). tmux mode is the `single`
+  // layout's one zone filling the page, with no resize handles.
+  // eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above).
+  const cells = buildZoneCells({
+    workMode,
+    zones: layout.zones,
+    // eslint-disable-next-line react-hooks/refs -- cellProps carries the stable terminalRefs Map-cache (see above).
+    cellProps,
+    shownTabId: zoneLayout.shownTabId,
+    promptTabs,
+    reviewTabs,
+    dropTargetZone: gridState.dropTargetZone,
+  });
 
   return (
     <div
       ref={gridRef}
       className="h-full w-full relative"
+      data-terminal-work-mode={workMode}
       style={
-        isFlowMode
-          ? {
-              // Flow-grid: fixed 3 equal columns, rows at least MIN_TILE_HEIGHT_PX
-              // tall (expanding to fill when few) and the container scrolls once
-              // rows overflow. No ratio machinery / resize handles — uniform tiles.
-              display: "grid",
-              gridTemplateColumns: `repeat(${FLOW_COLS}, 1fr)`,
-              gridTemplateRows: `repeat(${layout.rows}, minmax(${MIN_TILE_HEIGHT_PX}px, 1fr))`,
-              gap: "2px",
-              overflowY: "auto",
-            }
-          : {
-              display: "grid",
-              gridTemplateColumns: gridState.colRatios.map((r) => `${r}fr`).join(" "),
-              gridTemplateRows: gridState.rowRatios.map((r) => `${r}fr`).join(" "),
-              gap: "2px",
-            }
+        isTmux
+          ? { display: "grid", gridTemplateColumns: "1fr", gridTemplateRows: "1fr" }
+          : isFlowMode
+            ? {
+                // Flow-grid: fixed 3 equal columns, rows at least MIN_TILE_HEIGHT_PX
+                // tall (expanding to fill when few) and the container scrolls once
+                // rows overflow. No ratio machinery / resize handles — uniform tiles.
+                display: "grid",
+                gridTemplateColumns: `repeat(${FLOW_COLS}, 1fr)`,
+                gridTemplateRows: `repeat(${layout.rows}, minmax(${MIN_TILE_HEIGHT_PX}px, 1fr))`,
+                gap: "2px",
+                overflowY: "auto",
+              }
+            : {
+                display: "grid",
+                gridTemplateColumns: gridState.colRatios.map((r) => `${r}fr`).join(" "),
+                gridTemplateRows: gridState.rowRatios.map((r) => `${r}fr`).join(" "),
+                gap: "2px",
+              }
       }
       onDragEnd={() => dispatch({ type: "SET_DROP_TARGET", zone: null })}
     >
-      {/* eslint-disable-next-line react-hooks/refs -- ZoneCell receives the stable terminalRefs Map-cache (see above). */}
-      {layout.zones.map((zone, zoneIdx) => (
-        <ZoneCell
-          key={`zone-${zoneIdx}`}
-          zone={zone}
-          zoneIdx={zoneIdx}
-          {...cellProps}
-          isDropTarget={gridState.dropTargetZone === zoneIdx}
-          promptsOpen={promptTabs.has(assignments[zoneIdx] ?? "")}
-          reviewOpen={reviewTabs.has(assignments[zoneIdx] ?? "")}
-        />
-      ))}
+      {cells}
 
-      {!isFlowMode &&
+      {!isTmux &&
+        !isFlowMode &&
         layout.columns > 1 &&
         Array.from({ length: layout.columns - 1 }, (_, i) => {
           const leftFr = gridState.colRatios.slice(0, i + 1).reduce((a, b) => a + b, 0);
@@ -1097,7 +1069,8 @@ function ZoneGridInner({
           );
         })}
 
-      {!isFlowMode &&
+      {!isTmux &&
+        !isFlowMode &&
         layout.rows > 1 &&
         Array.from({ length: layout.rows - 1 }, (_, i) => {
           const topFr = gridState.rowRatios.slice(0, i + 1).reduce((a, b) => a + b, 0);
@@ -1142,9 +1115,6 @@ function ZoneGridInner({
             </div>
           );
         })}
-
-      {/* eslint-disable-next-line react-hooks/refs -- renderHiddenTabs reads the stable terminalRefs Map-cache (see above). */}
-      {renderHiddenTabs(unassignedTerminals)}
 
       {contextMenu}
     </div>
