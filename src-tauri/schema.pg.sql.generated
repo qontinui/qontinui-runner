@@ -433,12 +433,7 @@ CREATE TYPE public.notificationtype AS ENUM (
     'MENTION',
     'SHARE',
     'COMMENT',
-    'REPLY',
-    'LOCK_RELEASED',
-    'PROJECT_UPDATE',
-    'TEAM_INVITE',
-    'ACCESS_GRANTED',
-    'ACCESS_REVOKED'
+    'REPLY'
 );
 
 
@@ -1232,7 +1227,9 @@ CREATE TABLE auth.pair_codes (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     expires_at timestamp with time zone DEFAULT (now() + '00:05:00'::interval) NOT NULL,
     redeemed_at timestamp with time zone,
-    redeemed_by_device_id uuid
+    redeemed_by_device_id uuid,
+    bound_device_id uuid,
+    delivered_at timestamp with time zone
 );
 
 
@@ -1853,8 +1850,17 @@ CREATE TABLE coord.canonical_repos (
     tenant_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     ci_lane text DEFAULT 'github'::text NOT NULL,
-    CONSTRAINT ck_canonical_repos_ci_lane CHECK ((ci_lane = ANY (ARRAY['github'::text, 'shadow'::text, 'runner'::text])))
+    ci_node_required_capabilities jsonb DEFAULT '[]'::jsonb,
+    CONSTRAINT ck_canonical_repos_ci_lane CHECK ((ci_lane = ANY (ARRAY['github'::text, 'shadow'::text, 'runner'::text]))),
+    CONSTRAINT ck_canonical_repos_ci_node_required_capabilities CHECK (((ci_node_required_capabilities IS NOT NULL) AND (jsonb_typeof(ci_node_required_capabilities) = 'array'::text) AND (NOT jsonb_path_exists(ci_node_required_capabilities, 'strict $[*]?(@.type() != "string")'::jsonpath, silent => true))))
 );
+
+
+--
+-- Name: COLUMN canonical_repos.ci_node_required_capabilities; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.canonical_repos.ci_node_required_capabilities IS 'JSON array of capability tokens (e.g. os:windows) a device must advertise in coord.devices.capabilities to be electable for this repo''s ci_node lane; coord select_ci_node_device filters with capabilities @> this. [] = no requirement; NULL is refused by the CHECK. The repo allowlist is matched separately via the device''s ci_repo:<repo> token, not stored here.';
 
 
 --
@@ -2443,6 +2449,28 @@ CREATE TABLE coord.ci_pool_specs (
 --
 
 COMMENT ON TABLE coord.ci_pool_specs IS 'Self-hosted CI pool specs: (tenant, repo, label set; the coord writer stores it sorted and de-duplicated) with secrets_class, isolation, per-slot sizing and min_idle/max_slots bounds. Written through the coord spec door, never by hand DML.';
+
+
+--
+-- Name: ci_repo_read_token_requests; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_repo_read_token_requests (
+    jti text NOT NULL,
+    tenant_id uuid,
+    consumer_repo text NOT NULL,
+    target_repo text NOT NULL,
+    run_id text,
+    job_workflow_ref text,
+    ref text,
+    event_name text,
+    outcome text DEFAULT 'pending'::text NOT NULL,
+    installation_id bigint,
+    token_expires_at timestamp with time zone,
+    oidc_expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    decided_at timestamp with time zone
+);
 
 
 --
@@ -3992,6 +4020,8 @@ CREATE TABLE coord.devices (
     max_concurrent_ci_jobs integer,
     accept_remote_attach text DEFAULT 'same_user'::text NOT NULL,
     accept_remote_create text DEFAULT 'off'::text NOT NULL,
+    ui_thread jsonb,
+    credential_revoked_at timestamp with time zone,
     CONSTRAINT coord_devices_accept_remote_attach_check CHECK ((accept_remote_attach = ANY (ARRAY['same_user'::text, 'tenant'::text, 'off'::text]))),
     CONSTRAINT coord_devices_accept_remote_create_check CHECK ((accept_remote_create = ANY (ARRAY['off'::text, 'same_user'::text, 'tenant'::text]))),
     CONSTRAINT devices_role_chk CHECK (((role IS NULL) OR (role = ANY (ARRAY['agent'::text, 'build'::text, 'cache'::text, 'coord'::text])))),
@@ -4018,6 +4048,20 @@ COMMENT ON COLUMN coord.devices.reaped_at IS 'When coord retired this device row
 --
 
 COMMENT ON COLUMN coord.devices.max_concurrent_ci_jobs IS 'How many CI jobs this device will run concurrently, as advertised by qontinui-runner. Read ONLY by coord ci_dispatch, for devices matching capabilities @> ''["ci_node"]''. NULL = no publisher has asserted a CI slot count; coord floors the read at 1 (GREATEST(COALESCE(...,0),1)) so a NULL or a stale 0 still admits one job — the capability is a 30s heartbeat signal while this column is written by a 600s republisher, and ANDing the two is what silenced the shadow lane for six days on 2026-07-28. Do NOT confuse with max_concurrent_builds, which is build-POOL slots, is owned by qontinui-supervisor, and is read only by build_dispatcher: one column meaning both is the defect this split exists to end.';
+
+
+--
+-- Name: COLUMN devices.ui_thread; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.devices.ui_thread IS 'Runner native UI-thread liveness block from its latest heartbeat (wedged tri-state, reason, ping deliverability). NULL = UNKNOWN, never not-wedged.';
+
+
+--
+-- Name: COLUMN devices.credential_revoked_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.devices.credential_revoked_at IS 'Device-scoped credential deny. NULL = not revoked. While set, every door that issues this device a credential refuses (device_credential_revoked). Cleared only by an operator authorize-redeem.';
 
 
 --
@@ -6426,6 +6470,63 @@ CREATE TABLE coord.pr_author_nudges (
 
 
 --
+-- Name: pr_body_citation_watermarks; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.pr_body_citation_watermarks (
+    repo text NOT NULL,
+    pr_number integer NOT NULL,
+    body_updated_at timestamp with time zone NOT NULL,
+    body_sha256 text NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pr_body_citation_watermarks_pr_number_positive_check CHECK ((pr_number > 0)),
+    CONSTRAINT pr_body_citation_watermarks_repo_nonblank_check CHECK ((length(btrim(repo)) > 0))
+);
+
+
+--
+-- Name: TABLE pr_body_citation_watermarks; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.pr_body_citation_watermarks IS 'Newest PR body coord has processed per (repo, pr_number), by GitHub updated_at and body sha256. A delivery whose updated_at is older than the watermark changes no citation; an equal updated_at with a different digest is ambiguous and applies nothing. Must be written by coord under a per-PR advisory lock in the same transaction as the pr_body citation re-derivation (the qontinui-coord writer lands after this revision).';
+
+
+--
+-- Name: COLUMN pr_body_citation_watermarks.repo; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.pr_body_citation_watermarks.repo IS 'GitHub repository spelled exactly as coord.work_unit_pr_citations.repo (the join key): the owner/name full name as the webhook delivers it, case NOT normalised, so there is deliberately no lowercase CHECK. Never blank.';
+
+
+--
+-- Name: COLUMN pr_body_citation_watermarks.pr_number; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.pr_body_citation_watermarks.pr_number IS 'Pull request number within repo.';
+
+
+--
+-- Name: COLUMN pr_body_citation_watermarks.body_updated_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.pr_body_citation_watermarks.body_updated_at IS 'GitHub pull_request.updated_at of the newest body processed. Ordering key: a body older than this is ignored.';
+
+
+--
+-- Name: COLUMN pr_body_citation_watermarks.body_sha256; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.pr_body_citation_watermarks.body_sha256 IS 'Hex sha256 of the newest processed body, so an equal updated_at carrying a different body is detected as ambiguous.';
+
+
+--
+-- Name: COLUMN pr_body_citation_watermarks.observed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.pr_body_citation_watermarks.observed_at IS 'When coord processed the body. The writer must set it explicitly on the update arm of its upsert; the default covers the insert arm only.';
+
+
+--
 -- Name: pr_check_runs; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -8441,6 +8542,120 @@ COMMENT ON TABLE coord.work_plans IS 'Family: proposal (work-plan member, spelle
 
 
 --
+-- Name: work_unit_citation_retractions; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.work_unit_citation_retractions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid,
+    work_unit_id uuid NOT NULL,
+    repo text NOT NULL,
+    pr_number integer NOT NULL,
+    source text NOT NULL,
+    delivery_scope jsonb,
+    cited_at timestamp with time zone,
+    body_updated_at timestamp with time zone NOT NULL,
+    state text NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    applied_at timestamp with time zone,
+    CONSTRAINT work_unit_citation_retractions_pr_number_positive_check CHECK ((pr_number > 0)),
+    CONSTRAINT work_unit_citation_retractions_repo_nonblank_check CHECK ((length(btrim(repo)) > 0)),
+    CONSTRAINT work_unit_citation_retractions_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'applied'::text, 'withdrawn'::text, 'superseded'::text, 'ambiguous'::text])))
+);
+
+
+--
+-- Name: TABLE work_unit_citation_retractions; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.work_unit_citation_retractions IS 'Ledger of pr_body citation retractions decided when a newer PR body drops a work-unit marker. pending: the PR has not landed, so the citation row stays. applied: the PR landed and the pr_body row was deleted; this row preserves it. withdrawn: the marker reappeared before the land. superseded: it reappeared after an applied retraction and the row was re-created. ambiguous: equal updated_at with a different body, nothing applied (applied_at records when the tie was resolved, NULL while it is open). No FK to coord.work_units: the ledger outlives the unit.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.id IS 'Ledger row id.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.tenant_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.tenant_id IS 'Tenant of the retracted citation row. NULL when unknown.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.work_unit_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.work_unit_id IS 'Work unit the retracted citation credited. Deliberately not a foreign key.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.repo; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.repo IS 'GitHub repository spelled exactly as coord.work_unit_pr_citations.repo: the owner/name full name as the webhook delivers it, case NOT normalised. Never blank.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.pr_number; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.pr_number IS 'Pull request whose body dropped the marker.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.source; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.source IS 'Citation source of the retracted row, copied from coord.work_unit_pr_citations.source. Only pr_body rows are ever retracted.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.delivery_scope; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.delivery_scope IS 'delivery_scope of the retracted citation row, preserved so an applied retraction loses nothing. NULL when the row had none.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.cited_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.cited_at IS 'cited_at of the retracted citation row. NULL when unknown.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.body_updated_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.body_updated_at IS 'GitHub updated_at of the PR body that dropped the marker.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.state; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.state IS 'pending, applied, withdrawn, superseded or ambiguous. At most one pending row per (work_unit_id, repo, pr_number).';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.recorded_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.recorded_at IS 'When coord recorded the retraction decision.';
+
+
+--
+-- Name: COLUMN work_unit_citation_retractions.applied_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.work_unit_citation_retractions.applied_at IS 'On an applied row (and a superseded one, which was applied first): when the citation row was deleted on observing the land. On an ambiguous row: when coord resolved the same-second tie (a newer body, or its own REST read of the current one); the state stays ambiguous as the record. NULL on a pending or withdrawn row, and on an ambiguous row whose tie is still open.';
+
+
+--
 -- Name: work_unit_deps; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -8711,6 +8926,52 @@ CREATE TABLE coord.worker_heartbeats (
     last_detail_code text,
     body_started_at timestamp with time zone
 );
+
+
+--
+-- Name: worktree_cargo_lock; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.worktree_cargo_lock (
+    id bigint NOT NULL,
+    device_id uuid NOT NULL,
+    tenant_id uuid,
+    target_key text NOT NULL,
+    holder_pid integer,
+    holder_kind text,
+    holder_age_secs bigint,
+    holder_cmd text,
+    waiters integer DEFAULT 0 NOT NULL,
+    oldest_wait_secs bigint,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_worktree_cargo_lock_holder_kind CHECK ((holder_kind = ANY (ARRAY['build'::text, 'sweep'::text, 'unknown'::text])))
+);
+
+
+--
+-- Name: TABLE worktree_cargo_lock; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.worktree_cargo_lock IS 'One row per shared cargo target dir (one .cargo-lock) probed per runner census tick, device-level sibling of coord.worktree_volume. Idle targets are included with the holder columns NULL and waiters 0. Written by coord persist_worktree_census from the census cargo_locks field; read by the per-device allocation stats. Plan 2026-09-19-build-slots-are-not-build-parallelism-cargo-target-lock-and-devops-allocation-stats, Phase 2.';
+
+
+--
+-- Name: worktree_cargo_lock_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.worktree_cargo_lock_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: worktree_cargo_lock_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.worktree_cargo_lock_id_seq OWNED BY coord.worktree_cargo_lock.id;
 
 
 --
@@ -12428,13 +12689,13 @@ CREATE TABLE project.notification_preferences (
     email_comments boolean NOT NULL,
     email_shares boolean NOT NULL,
     email_replies boolean NOT NULL,
-    email_team_invites boolean NOT NULL,
+    email_team_invites boolean DEFAULT true NOT NULL,
     in_app_mentions boolean NOT NULL,
     in_app_comments boolean NOT NULL,
     in_app_shares boolean NOT NULL,
     in_app_replies boolean NOT NULL,
-    in_app_team_invites boolean NOT NULL,
-    in_app_project_updates boolean NOT NULL,
+    in_app_team_invites boolean DEFAULT true NOT NULL,
+    in_app_project_updates boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL
 );
@@ -12963,6 +13224,7 @@ CREATE TABLE project.phase_token_usage (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     cost_source text,
     cost_microusd bigint,
+    CONSTRAINT ck_phase_token_usage_cost_microusd_nonneg CHECK (((cost_microusd IS NULL) OR (cost_microusd >= 0))),
     CONSTRAINT ck_phase_token_usage_cost_source CHECK ((cost_source = ANY (ARRAY['reported'::text, 'estimated'::text])))
 );
 
@@ -18096,6 +18358,13 @@ ALTER TABLE ONLY coord.session_events ALTER COLUMN id SET DEFAULT nextval('coord
 
 
 --
+-- Name: worktree_cargo_lock id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worktree_cargo_lock ALTER COLUMN id SET DEFAULT nextval('coord.worktree_cargo_lock_id_seq'::regclass);
+
+
+--
 -- Name: worktree_census id; Type: DEFAULT; Schema: coord; Owner: -
 --
 
@@ -19017,6 +19286,14 @@ ALTER TABLE ONLY coord.ci_pool_observations
 
 ALTER TABLE ONLY coord.ci_pool_specs
     ADD CONSTRAINT ci_pool_specs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ci_repo_read_token_requests ci_repo_read_token_requests_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_repo_read_token_requests
+    ADD CONSTRAINT ci_repo_read_token_requests_pkey PRIMARY KEY (jti);
 
 
 --
@@ -20060,6 +20337,14 @@ ALTER TABLE ONLY coord.policy_rules
 
 
 --
+-- Name: pr_body_citation_watermarks pr_body_citation_watermarks_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.pr_body_citation_watermarks
+    ADD CONSTRAINT pr_body_citation_watermarks_pkey PRIMARY KEY (repo, pr_number);
+
+
+--
 -- Name: pr_check_runs pr_check_runs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -20852,6 +21137,14 @@ ALTER TABLE ONLY coord.work_plans
 
 
 --
+-- Name: work_unit_citation_retractions work_unit_citation_retractions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.work_unit_citation_retractions
+    ADD CONSTRAINT work_unit_citation_retractions_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: work_unit_deps work_unit_deps_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -20921,6 +21214,14 @@ ALTER TABLE ONLY coord.work_units
 
 ALTER TABLE ONLY coord.worker_heartbeats
     ADD CONSTRAINT worker_heartbeats_name_replica_id_uq UNIQUE (name, replica_id);
+
+
+--
+-- Name: worktree_cargo_lock worktree_cargo_lock_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worktree_cargo_lock
+    ADD CONSTRAINT worktree_cargo_lock_pkey PRIMARY KEY (id);
 
 
 --
@@ -23944,6 +24245,13 @@ CREATE INDEX ix_work_artifact_edges_from_id ON agent.work_artifact_edges USING b
 
 
 --
+-- Name: ix_work_artifact_edges_open_followups_created_id; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE INDEX ix_work_artifact_edges_open_followups_created_id ON agent.work_artifact_edges USING btree (created_at, id) WHERE ((relation = 'spawned_followup'::text) AND (to_id IS NULL));
+
+
+--
 -- Name: ix_work_artifact_edges_to_id; Type: INDEX; Schema: agent; Owner: -
 --
 
@@ -23976,6 +24284,13 @@ CREATE INDEX ix_work_artifacts_kind_slug ON agent.work_artifacts USING btree (ki
 --
 
 CREATE INDEX ix_work_artifacts_kind_status ON agent.work_artifacts USING btree (kind, status);
+
+
+--
+-- Name: ix_work_artifacts_org_created_id; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE INDEX ix_work_artifacts_org_created_id ON agent.work_artifacts USING btree (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), created_at, id);
 
 
 --
@@ -24215,6 +24530,13 @@ CREATE INDEX idx_org_slug ON auth.organizations USING btree (slug);
 --
 
 CREATE INDEX idx_org_user ON auth.team_members USING btree (organization_id, user_id);
+
+
+--
+-- Name: idx_pair_codes_bound_device_pending; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX idx_pair_codes_bound_device_pending ON auth.pair_codes USING btree (bound_device_id, expires_at) WHERE ((bound_device_id IS NOT NULL) AND (redeemed_at IS NULL));
 
 
 --
@@ -24642,6 +24964,13 @@ CREATE INDEX coord_sessions_parent_idx ON coord.sessions USING btree (parent_ses
 --
 
 CREATE INDEX coord_sessions_tenant_role_idx ON coord.sessions USING btree (tenant_id, role) WHERE (role IS NOT NULL);
+
+
+--
+-- Name: coord_sessions_tenant_started_idx; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX coord_sessions_tenant_started_idx ON coord.sessions USING btree (tenant_id, started_at DESC, id DESC);
 
 
 --
@@ -25146,6 +25475,27 @@ CREATE INDEX idx_ci_dispatches_no_subscriber_device ON coord.ci_dispatches USING
 --
 
 CREATE INDEX idx_ci_dispatches_repo_head_sha ON coord.ci_dispatches USING btree (repo, head_sha);
+
+
+--
+-- Name: idx_ci_repo_read_token_requests_consumer; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_repo_read_token_requests_consumer ON coord.ci_repo_read_token_requests USING btree (consumer_repo, created_at DESC);
+
+
+--
+-- Name: idx_ci_repo_read_token_requests_oidc_expires_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_repo_read_token_requests_oidc_expires_at ON coord.ci_repo_read_token_requests USING btree (oidc_expires_at);
+
+
+--
+-- Name: idx_ci_repo_read_token_requests_target; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_repo_read_token_requests_target ON coord.ci_repo_read_token_requests USING btree (target_repo, created_at DESC);
 
 
 --
@@ -27163,6 +27513,20 @@ CREATE INDEX idx_work_plans_tenant_id ON coord.work_plans USING btree (tenant_id
 
 
 --
+-- Name: idx_work_unit_citation_retractions_one_pending; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_work_unit_citation_retractions_one_pending ON coord.work_unit_citation_retractions USING btree (work_unit_id, repo, pr_number) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: idx_work_unit_citation_retractions_repo_pr; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_work_unit_citation_retractions_repo_pr ON coord.work_unit_citation_retractions USING btree (repo, pr_number);
+
+
+--
 -- Name: idx_work_unit_deps_tenant; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -27275,10 +27639,24 @@ CREATE INDEX idx_work_units_tenant_vet_state ON coord.work_units USING btree (te
 
 
 --
+-- Name: idx_worktree_cargo_lock_device_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_worktree_cargo_lock_device_observed_at ON coord.worktree_cargo_lock USING btree (device_id, observed_at DESC);
+
+
+--
 -- Name: idx_worktree_census_device_observed_at; Type: INDEX; Schema: coord; Owner: -
 --
 
 CREATE INDEX idx_worktree_census_device_observed_at ON coord.worktree_census USING btree (device_id, observed_at DESC);
+
+
+--
+-- Name: idx_worktree_census_device_repo_path_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_worktree_census_device_repo_path_observed ON coord.worktree_census USING btree (device_id, repo, path, observed_at DESC);
 
 
 --
@@ -27895,6 +28273,13 @@ CREATE UNIQUE INDEX uq_operator_touches_idempotency_key ON coord.operator_touche
 --
 
 CREATE UNIQUE INDEX uq_policy_rule_proposals_pending ON coord.policy_rule_proposals USING btree (tenant_id, policy_id, field) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: uq_policy_rules_agent_domain_name; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_policy_rules_agent_domain_name ON coord.policy_rules USING btree (tenant_id, decision_domain, name) WHERE ((kind IS NULL) AND (decision_domain = ANY (ARRAY['pr_fix'::text, 'red_main_fix'::text])) AND (starts_with(created_by, 'session:'::text) OR starts_with(created_by, 'agent:'::text) OR starts_with(created_by, 'device:'::text)));
 
 
 --
