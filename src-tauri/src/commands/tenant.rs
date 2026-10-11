@@ -358,6 +358,18 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
                  registration, the coord-mcp doctor, GET /tenant/active)",
     },
     PinSurface {
+        surface: "egress_switch_scope",
+        timing: PinTiming::Live,
+        readers: &[
+            "mcp/fleet_policy_poller.rs::poll_egress_once",
+            "egress.rs::production_scope",
+        ],
+        detail: "the tenant whose egress switches (plan 2026-10-10-spec-front-end-phase-9-\
+                 generic-boundary) are polled and applied to calls that name no tenant: sampled \
+                 at the first egress check of the process, then re-read on every \
+                 fleet-policy poll (≤ 45 s)",
+    },
+    PinSurface {
         surface: "session_coordination_dual_write_gate",
         timing: PinTiming::NextStart,
         readers: &["session/dual_write.rs::new"],

@@ -437,6 +437,11 @@ impl Mirror {
     /// [`WriterLock`] and the child-tree guard, and rewrite packs while the
     /// next writer clears what it takes for leftovers.
     fn fetch(&self, held: &WriterLock) -> Result<CanonicalSnapshot, String> {
+        // The network operation itself refuses too, so no caller of the
+        // mirror can fetch past the tenant's switch.
+        if !crate::egress::permit(crate::egress::Flow::SkillMirror).allowed {
+            return Err(SKILL_MIRROR_OFF.to_string());
+        }
         self.ensure_init()?;
         let cleared = self.clear_interrupted_fetch(held);
         if cleared > 0 {
@@ -916,6 +921,30 @@ impl Published {
         }
     }
 
+    /// The tenant's `egress_skill_mirror` switch is off: serve the EMBEDDED
+    /// floor. A generation fetched before the flip is unpublished too, so what
+    /// a session is served while the switch is off never depends on whether
+    /// this process happened to fetch earlier. Logged once per run of
+    /// switched-off ticks (it shares the failure de-duplication slot, so the
+    /// first successful fetch afterwards logs the recovery).
+    fn egress_off(&self) {
+        *self
+            .corpus
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let mut last = self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.as_deref() != Some(SKILL_MIRROR_OFF) {
+            info!(
+                "canonical_corpus: {SKILL_MIRROR_OFF} — not fetching; sessions are served the \
+                 embedded bundle"
+            );
+            *last = Some(SKILL_MIRROR_OFF.to_string());
+        }
+    }
+
     fn failed(&self, why: String) {
         let mut last = self
             .last_failure
@@ -937,6 +966,10 @@ impl Published {
 
 /// The process's published corpus. `None` until the first complete load.
 static LATEST: Published = Published::new();
+
+/// Why nothing is fetched while the tenant's switch is off — also the reason
+/// the served-corpus header names.
+pub(crate) const SKILL_MIRROR_OFF: &str = "egress_skill_mirror is off for this project";
 
 /// The last loaded corpus, for synchronous registry resolution. No I/O.
 pub(crate) fn latest() -> Option<Arc<CanonicalCorpus>> {
@@ -1021,6 +1054,14 @@ pub(crate) fn refresh_into(
     command_names: &[&str],
     skill_names: &[&str],
 ) -> Option<CanonicalSnapshot> {
+    // The tenant's `egress_skill_mirror` switch (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), checked
+    // every tick before the mirror is touched: off means the embedded floor,
+    // and no fetch.
+    if !crate::egress::permit_or_count(crate::egress::Flow::SkillMirror) {
+        published.egress_off();
+        return None;
+    }
     let lock = mirror.try_lock_writer();
     published.last_tick_contended.store(
         matches!(lock, Ok(None)),
@@ -1905,5 +1946,68 @@ mod tests {
             "a hung git must not hold the refresh past its budget: {:?}",
             started.elapsed()
         );
+    }
+}
+
+/// The registered flow test for the skill mirror (`crate::egress::FLOW_TESTS`):
+/// [`refresh_into`] against a counting loopback "git host", with the switch
+/// pinned each way.
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+
+    fn refresh_once(level: Level, published: &Published) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = ConnCounter::start();
+        let mirror = Mirror::new(
+            dir.path().join("mirror.git"),
+            format!("{}/example/corpus.git", counter.http_base()),
+        )
+        .with_timeouts(Duration::from_secs(20), Duration::from_secs(20));
+        let _pin = pin(Flow::SkillMirror, level);
+        let _ = refresh_into(&mirror, published, &[], &[]);
+        counter.wait_for(1, Duration::from_millis(300))
+    }
+
+    #[test]
+    pub(crate) fn skill_mirror_pinned_off_makes_zero_connections() {
+        let published = Published::new();
+        assert_eq!(
+            refresh_once(Level::Off, &published),
+            0,
+            "no fetch with the switch off"
+        );
+        assert!(published.get().is_none(), "the embedded floor is served");
+    }
+
+    #[test]
+    pub(crate) fn skill_mirror_pinned_on_makes_a_connection() {
+        let published = Published::new();
+        assert!(
+            refresh_once(Level::On, &published) >= 1,
+            "with the switch on git fetches"
+        );
+    }
+
+    /// A generation fetched before the flip is not served after it.
+    #[test]
+    fn a_flip_to_off_unpublishes_an_earlier_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let url = test_support::remote_with(root.path(), &[("README.md", "synthetic")]);
+        let mirror = Mirror::new(root.path().join("mirror.git"), url);
+        let published = Published::new();
+        let _ = refresh_into(&mirror, &published, &[], &[]);
+        assert!(
+            published.get().is_some(),
+            "precondition: a generation is published"
+        );
+        let _pin = pin(Flow::SkillMirror, Level::Off);
+        assert!(refresh_into(&mirror, &published, &[], &[]).is_none());
+        assert!(published.get().is_none());
+        // The mirror's own fetch refuses too.
+        let held = mirror.try_lock_writer().unwrap().unwrap();
+        assert_eq!(mirror.fetch(&held).unwrap_err(), SKILL_MIRROR_OFF);
     }
 }

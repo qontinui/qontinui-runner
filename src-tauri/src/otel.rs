@@ -105,6 +105,16 @@ pub fn init_otel(config: &OtelConfig) -> (OtelGuard, BoxedOtelLayer) {
         info!("OpenTelemetry disabled by configuration");
         return (OtelGuard { _provider: None }, None);
     }
+    // The tenant's `egress_telemetry` switch (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7). Read at
+    // boot — the exporter is installed once — so a flip applies at the next
+    // start; the persisted rung makes a tenant `off` hold from the second
+    // start onwards, before the first poll. No exporter is built when it is
+    // off, so no connection can be attempted.
+    if !crate::egress::telemetry_permitted_at_boot() {
+        info!("OpenTelemetry export is off for this project (egress_telemetry)");
+        return (OtelGuard { _provider: None }, None);
+    }
 
     match try_init_otel(config) {
         Ok((guard, layer)) => {
@@ -189,4 +199,57 @@ fn try_init_otel(
         },
         layer,
     ))
+}
+
+/// The registered flow test for telemetry (`crate::egress::FLOW_TESTS`):
+/// [`init_otel`] pointed at a counting loopback collector, one span emitted,
+/// the provider shut down (which flushes), with the switch pinned each way.
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn export_one_span(level: Level) -> (usize, bool) {
+        let counter = ConnCounter::start();
+        let config = OtelConfig {
+            enabled: true,
+            endpoint: format!("{}/v1/traces", counter.http_base()),
+            protocol: "http".into(),
+            sampling_rate: 1.0,
+            service_name: "egress-test".into(),
+        };
+        let _pin = pin(Flow::Telemetry, level);
+        let (guard, layer) = init_otel(&config);
+        let installed = layer.is_some();
+        if let Some(layer) = layer {
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info_span!("egress_probe").in_scope(|| {});
+            });
+        }
+        drop(guard); // shutdown flushes the batch processor
+        (
+            counter.wait_for(1, std::time::Duration::from_secs(3)),
+            installed,
+        )
+    }
+
+    #[test]
+    pub(crate) fn telemetry_pinned_off_makes_zero_connections() {
+        let (connects, installed) = export_one_span(Level::Off);
+        assert!(
+            !installed,
+            "no exporter may be installed with the switch off"
+        );
+        assert_eq!(connects, 0);
+    }
+
+    #[test]
+    pub(crate) fn telemetry_pinned_on_makes_a_connection() {
+        let (connects, installed) = export_one_span(Level::On);
+        assert!(installed);
+        assert!(connects >= 1, "with the switch on the span is exported");
+    }
 }

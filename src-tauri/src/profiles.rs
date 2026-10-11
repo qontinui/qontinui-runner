@@ -113,6 +113,23 @@ pub struct Profile {
     /// Auth provider configuration.
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    /// This machine's default for the six outbound data flows (plan
+    /// `2026-10-10-spec-front-end-phase-9-generic-boundary` C6 rung 3, C7).
+    /// Absent: no opinion — the product default `on` applies until coord
+    /// answers. Skipped when absent so existing files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressProfile>,
+}
+
+/// The profile's `egress` block. `default` is `"on"` | `"off"`; the runner's
+/// `egress` module reads it as the third rung of its resolution, below coord's
+/// live answer and the answer persisted from a previous process. Kept as a raw
+/// string so a typo cannot fail the whole profiles.json parse — the reader
+/// treats any value other than `on` as `off`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 /// S3-compatible blob storage settings. `kind` distinguishes MinIO from
@@ -198,19 +215,76 @@ pub fn load_strict() -> Result<ResolvedProfile> {
     load_inner()
 }
 
-fn load_inner() -> Result<ResolvedProfile> {
+/// What the profile loader can say about the active profile's `egress` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveEgress {
+    /// No profiles.json at all — MEASURED (or no home directory to hold one):
+    /// the machine has no profile opinion.
+    FileAbsent,
+    /// The active profile, and its `egress` block when it has one.
+    Profile(Option<EgressProfile>),
+    /// profiles.json is PRESENT but could not be used — unreadable,
+    /// unparseable, naming an active profile it does not define, or its
+    /// existence could not even be checked. Carries
+    /// why. A reader of the egress switches treats this as `off`.
+    Unreadable(String),
+}
+
+/// The active profile's `egress` block, distinguishing an absent file from an
+/// unusable one (see [`ActiveEgress`]).
+pub fn active_egress_profile() -> ActiveEgress {
+    match profiles_path() {
+        Some(path) => active_egress_profile_at(&path, std::env::var("QONTINUI_ENV").ok()),
+        None => ActiveEgress::FileAbsent,
+    }
+}
+
+/// [`active_egress_profile`] over an explicit path and `QONTINUI_ENV` value,
+/// so the classification is testable without the operator's real file.
+pub fn active_egress_profile_at(
+    path: &std::path::Path,
+    env_active: Option<String>,
+) -> ActiveEgress {
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return ActiveEgress::FileAbsent,
+        // Whether the file is there could not even be checked: that is not a
+        // measured absence.
+        Err(e) => {
+            return ActiveEgress::Unreadable(format!(
+                "cannot check whether {} exists: {e}",
+                path.display()
+            ))
+        }
+    }
+    match read_active_profile_at(path, env_active) {
+        Ok((_, profile)) => ActiveEgress::Profile(profile.egress),
+        Err(e) => ActiveEgress::Unreadable(format!("{e:#}")),
+    }
+}
+
+/// Read profiles.json and pick the active profile: `QONTINUI_ENV`, else the
+/// file's `active`, else `dev`. Returns `(name, profile, path)`.
+fn read_active_profile() -> Result<(String, Profile, PathBuf)> {
     let path = profiles_path().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
     if !path.exists() {
         return Err(anyhow!("profiles.json not found at {}", path.display()));
     }
+    let (active, profile) = read_active_profile_at(&path, std::env::var("QONTINUI_ENV").ok())?;
+    Ok((active, profile, path))
+}
 
-    let bytes = std::fs::read(&path)
+/// The body of [`read_active_profile`] over an explicit path and env value.
+fn read_active_profile_at(
+    path: &std::path::Path,
+    env_active: Option<String>,
+) -> Result<(String, Profile)> {
+    let bytes = std::fs::read(path)
         .with_context(|| format!("Reading profiles file at {}", path.display()))?;
     let file: ProfilesFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("Parsing profiles file at {}", path.display()))?;
 
-    let active = std::env::var("QONTINUI_ENV")
-        .ok()
+    let active = env_active
         .or_else(|| file.active.clone())
         .unwrap_or_else(|| "dev".to_string());
 
@@ -221,6 +295,11 @@ fn load_inner() -> Result<ResolvedProfile> {
             path.display()
         )
     })?;
+    Ok((active, profile))
+}
+
+fn load_inner() -> Result<ResolvedProfile> {
+    let (active, profile, path) = read_active_profile()?;
 
     debug!("Loaded profile '{}' from {}", active, path.display());
 

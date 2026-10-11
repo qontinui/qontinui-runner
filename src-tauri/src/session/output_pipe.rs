@@ -257,6 +257,21 @@ async fn flush(
     if buffer.is_empty() {
         return;
     }
+    // The tenant's `egress_terminal_stream` switch, checked on EVERY flush so a
+    // flip takes effect on the next coalesced chunk (plan
+    // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), in the
+    // owning session's tenant scope. A refused
+    // chunk is dropped and counted, never held: the offset does not advance,
+    // exactly like a quota drop, and nothing is released by a later flip.
+    if !crate::egress::permit_or_count_session(crate::egress::Flow::TerminalStream, tenant.into()) {
+        tracing::debug!(
+            session = %session_id,
+            bytes = buffer.len(),
+            "session output_pipe: terminal streaming is off for this tenant — dropping chunk"
+        );
+        buffer.clear();
+        return;
+    }
     let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&buffer[..]);
     let offset = *next_offset;
     let len = buffer.len() as i64;
@@ -301,4 +316,57 @@ async fn flush(
         }
     }
     buffer.clear();
+}
+
+/// The registered flow test for terminal streaming
+/// (`crate::egress::FLOW_TESTS`): [`flush`] against a counting loopback
+/// listener, with the switch pinned each way.
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+
+    async fn flush_once(level: Level) -> (usize, bool) {
+        let counter = ConnCounter::start();
+        let url = format!("{}/sessions/{}/output", counter.http_base(), Uuid::nil());
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut buffer = b"terminal bytes".to_vec();
+        let mut offset = 0i64;
+        let _pin = pin(Flow::TerminalStream, level);
+        flush(
+            &http,
+            &url,
+            Uuid::nil(),
+            &mut buffer,
+            &mut offset,
+            TenantScope::Unresolved,
+        )
+        .await;
+        (
+            counter.wait_for(1, Duration::from_millis(300)),
+            buffer.is_empty(),
+        )
+    }
+
+    #[tokio::test]
+    pub(crate) async fn terminal_stream_pinned_off_makes_zero_connections() {
+        let (connects, cleared) = flush_once(Level::Off).await;
+        assert_eq!(
+            connects, 0,
+            "no byte of terminal output may leave with the switch off"
+        );
+        assert!(cleared, "a refused chunk is dropped, never held");
+    }
+
+    #[tokio::test]
+    pub(crate) async fn terminal_stream_pinned_on_makes_a_connection() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (connects, _) = flush_once(Level::On).await;
+        assert!(connects >= 1, "with the switch on the chunk is posted");
+    }
 }

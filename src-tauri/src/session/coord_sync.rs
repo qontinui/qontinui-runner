@@ -1622,6 +1622,25 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // of filing another tenant's session row.
     let scope = record_session_tenant(inner, rec);
 
+    // The last line of the per-tenant egress switches for BOTH session-output
+    // streams (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
+    // Phase 7): a chunk queued before a flip to `off` is ACKed and DROPPED —
+    // counted, never held — so the backlog does not leave afterwards and a
+    // later flip to `on` does not release it either. Evaluated in the OWNING
+    // session's tenant scope, the same tenant whose credential the push uses.
+    if kind == "output_chunk" {
+        if let Some(flow) = output_chunk_egress_refusal(&rec.payload, scope.into()) {
+            OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                flow = flow.key(),
+                "coord_sync: output chunk refused by the egress switch — ACK-and-drop"
+            );
+            return PushOutcome::Acked;
+        }
+    }
+
     let result = match kind {
         "started" => {
             // POST /sessions with the full create body. The runner
@@ -1906,6 +1925,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             let status = resp.status();
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
+                if detail.contains("egress_off") {
+                    // Coord's ingest-side second line of the egress switch
+                    // refused it. The runner's own gate above should have
+                    // caught it first (a flip coord saw before our next
+                    // poll); retrying can never succeed while the switch is
+                    // off, so ACK-drop like the quota arm.
+                    OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        "coord_sync: output chunk refused by coord's egress switch (429) — dropping"
+                    );
+                    return PushOutcome::Acked;
+                }
                 if detail.contains("warm_quota_exceeded") {
                     // Tenant warm-quota exceeded (gate 2, enforced
                     // coord-side). Retrying can't help until quota frees,
@@ -2761,6 +2794,46 @@ fn progress_body(payload: &JsonValue) -> JsonValue {
 /// `output_chunk` outbox rows is the transcript emitter (the PTY stream
 /// bypasses the outbox via `output_pipe.rs`), so a missing field can only
 /// be a transcript row.
+/// Output chunks the drain ACKed and dropped because their egress switch was
+/// off (both streams). Process-global, read by tests and diagnostics; the
+/// per-flow tally is in `/health` `egress.<flow>.refused`.
+pub(crate) static OUTPUT_CHUNKS_DROPPED_EGRESS_OFF: AtomicU64 = AtomicU64::new(0);
+
+/// The egress flow that refuses this output chunk right now, if any.
+///
+/// Stream `pty` is terminal streaming; every other stream — `transcript`, and
+/// an absent stream, which [`output_chunk_body`] defaults to `transcript` — is
+/// transcript sync, whose verdict includes the user's own consent.
+fn output_chunk_egress_refusal(
+    payload: &JsonValue,
+    scope: crate::egress::SessionScope,
+) -> Option<crate::egress::Flow> {
+    use crate::egress::Flow;
+    let stream = payload
+        .get("stream")
+        .and_then(|v| v.as_str())
+        .unwrap_or(crate::session::transcript_emitter::TRANSCRIPT_STREAM);
+    let (flow, allowed) = if stream == PTY_STREAM {
+        (
+            Flow::TerminalStream,
+            crate::egress::permit_or_count_session(Flow::TerminalStream, scope),
+        )
+    } else {
+        // Counted as an egress refusal only when the TENANT switch refused; a
+        // user who turned their own consent off is not the switch's doing.
+        crate::egress::permit_or_count_session(Flow::TranscriptSync, scope);
+        (
+            Flow::TranscriptSync,
+            crate::egress::transcript_sync_gate_session(scope).is_open(),
+        )
+    };
+    (!allowed).then_some(flow)
+}
+
+/// The `stream` value of raw terminal output on `POST /sessions/:id/output`
+/// (coord's `session_output.stream` default).
+const PTY_STREAM: &str = "pty";
+
 fn output_chunk_body(payload: &JsonValue) -> JsonValue {
     json!({
         "chunk_offset": payload.get("chunk_offset").cloned().unwrap_or(json!(0)),
@@ -8166,6 +8239,148 @@ mod tests {
             !body.contains("tracing::warn!") && !body.contains("tracing::info!"),
             "the fetch must not log a refusal itself — only the loop can tell a standing \
              refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
+        );
+    }
+}
+
+/// The drain as the last line of the egress switches (plan
+/// `2026-10-10-spec-front-end-phase-9-generic-boundary`, Phase 7): a queued
+/// output chunk whose switch is off is ACKed and dropped without a single
+/// request reaching coord. The transcript pair is transcript sync's registered
+/// flow test (`crate::egress::FLOW_TESTS`).
+#[cfg(test)]
+pub(crate) mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::{pin, ConnCounter};
+    use crate::egress::{Flow, Level};
+
+    /// One output-chunk record on `stream`, read back from a real outbox.
+    fn chunk_record(dir: &std::path::Path, stream: &str) -> OutboxRecord {
+        let outbox = OutboxWriter::open(dir.join("outbox.jsonl")).unwrap();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::OutputChunk,
+                json!({"stream": stream, "chunk_offset": 0, "payload_b64": "aGVsbG8="}),
+            )
+            .unwrap();
+        outbox.pending().unwrap().pop().expect("the record")
+    }
+
+    fn coord_at(dir: &std::path::Path, base: String) -> CoordSync {
+        let outbox = Arc::new(OutboxWriter::open(dir.join("drain.jsonl")).unwrap());
+        CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+    }
+
+    async fn drive(stream: &str, level: Level, flow: Flow) -> (bool, usize, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = ConnCounter::start();
+        let coord = coord_at(dir.path(), counter.http_base());
+        let rec = chunk_record(dir.path(), stream);
+        let _pin = pin(flow, level);
+        let before = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed);
+        let outcome = push_record(&coord.inner, &rec).await;
+        let dropped = OUTPUT_CHUNKS_DROPPED_EGRESS_OFF.load(Ordering::Relaxed) - before;
+        let acked = matches!(outcome, PushOutcome::Acked);
+        (
+            acked,
+            counter.wait_for(1, Duration::from_millis(300)),
+            dropped,
+        )
+    }
+
+    #[tokio::test]
+    pub(crate) async fn transcript_chunk_pinned_off_makes_zero_requests() {
+        let (acked, connects, dropped) =
+            drive("transcript", Level::Off, Flow::TranscriptSync).await;
+        assert!(
+            acked,
+            "a refused chunk is ACKed, never held for a later flip"
+        );
+        assert_eq!(connects, 0, "nothing may reach coord with the switch off");
+        assert!(dropped >= 1, "the drop is counted");
+    }
+
+    #[tokio::test]
+    pub(crate) async fn transcript_chunk_pinned_on_makes_a_request() {
+        // The user's consent half reads settings.json — isolated, default on.
+        let _amb = crate::test_env::isolated_ambient();
+        let (acked, connects, _) = drive("transcript", Level::On, Flow::TranscriptSync).await;
+        assert!(connects >= 1, "with the switch on the chunk is posted");
+        assert!(!acked, "the fake answers 503, so the row is kept for retry");
+    }
+
+    #[tokio::test]
+    async fn pty_chunk_pinned_off_makes_zero_requests() {
+        let (acked, connects, dropped) = drive("pty", Level::Off, Flow::TerminalStream).await;
+        assert!(acked);
+        assert_eq!(connects, 0);
+        assert!(dropped >= 1);
+    }
+
+    #[tokio::test]
+    async fn pty_chunk_pinned_on_makes_a_request() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_, connects, _) = drive("pty", Level::On, Flow::TerminalStream).await;
+        assert!(connects >= 1);
+    }
+
+    /// The streams follow their OWN switches: terminal off does not stop a
+    /// transcript chunk, and transcript off does not stop a pty chunk.
+    #[tokio::test]
+    async fn each_stream_follows_its_own_switch() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        let (_, connects, _) = drive("transcript", Level::On, Flow::TranscriptSync).await;
+        assert!(
+            connects >= 1,
+            "transcript must not obey the terminal switch"
+        );
+        drop(_t);
+        let _x = pin(Flow::TranscriptSync, Level::Off);
+        let (_, connects, _) = drive("pty", Level::On, Flow::TerminalStream).await;
+        assert!(connects >= 1, "pty must not obey the transcript switch");
+    }
+
+    /// A non-output kind is never touched by the egress check.
+    #[test]
+    fn only_output_chunks_are_subject_to_the_drain_check() {
+        let _t = pin(Flow::TranscriptSync, Level::Off);
+        let _p = pin(Flow::TerminalStream, Level::Off);
+        assert_eq!(
+            output_chunk_egress_refusal(
+                &json!({"stream": "pty"}),
+                crate::egress::SessionScope::DeviceDefault
+            ),
+            Some(Flow::TerminalStream)
+        );
+        assert_eq!(
+            output_chunk_egress_refusal(&json!({}), crate::egress::SessionScope::DeviceDefault),
+            Some(Flow::TranscriptSync),
+            "an absent stream is a transcript chunk"
+        );
+        let src = include_str!("coord_sync.rs");
+        let body = src.split_once("async fn push_record(").unwrap().1;
+        let check = body
+            .find("output_chunk_egress_refusal(&rec.payload, scope.into())")
+            .unwrap();
+        let scope = body
+            .find("let scope = record_session_tenant(inner, rec);")
+            .unwrap();
+        assert!(
+            scope < check,
+            "the owning session's tenant is resolved before the check"
+        );
+        let dispatch = body.find("let result = match kind").unwrap();
+        assert!(
+            check < dispatch,
+            "the check must run before any request is built"
         );
     }
 }

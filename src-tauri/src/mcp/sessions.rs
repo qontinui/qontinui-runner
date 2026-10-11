@@ -907,8 +907,11 @@ type AdoptionCheck =
 /// tests drive every arm without the machine's settings, credential store,
 /// lifecycle store, coord, or a Tauri app.
 pub(crate) struct TranscriptBindEnv {
-    /// Gate 1, `Settings.cloud_sync_enabled`.
-    pub cloud_sync_enabled: bool,
+    /// Transcript sync's gate for the caller's tenant: the tenant's
+    /// `egress_transcript_sync` switch AND the user's own toggle
+    /// ([`crate::egress::transcript_sync_gate_for`]).
+    pub transcript_gate:
+        Box<dyn Fn(Option<uuid::Uuid>) -> crate::egress::TranscriptGate + Send + Sync>,
     pub tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
     /// The config dirs the transcript watcher actually watches.
     pub watched_config_dirs: Vec<std::path::PathBuf>,
@@ -968,7 +971,8 @@ pub(crate) struct TranscriptBindEnv {
 /// - `400 {"error":"malformed_request"|"malformed_id"}`
 /// - `403 {"error":"tenant_unresolvable"}` — the nonce's tenant is not knowable
 /// - `403 {"error":"not_caller_session"}` — the session is not the caller's
-/// - `409 {"error":"sync_disabled"}` — `Settings.cloud_sync_enabled` is off; nothing written
+/// - `409 {"error":"sync_disabled"}` — the user's own transcript-sync toggle is off; nothing written
+/// - `409 {"error":"egress_off","flow":"transcript_sync"}` — the tenant's `egress_transcript_sync` switch is off; nothing written
 /// - `409 {"error":"registration_disabled"}` — the registrar declined the binding
 /// - `409 {"error":"coord_session_in_use"}` — the id to adopt is bound to another session
 /// - `409 {"error":"bound_to_other_row","bound":x,"requested":y}` — already bound to another row; nothing written
@@ -993,7 +997,7 @@ async fn transcript_bind(
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
     let env = TranscriptBindEnv {
-        cloud_sync_enabled: crate::settings::get_cloud_sync_enabled(),
+        transcript_gate: Box::new(crate::egress::transcript_sync_gate_for),
         tailer,
         watched_config_dirs: crate::terminal::transcript_watcher::watched_config_dirs(),
         session_tenant: Box::new(|nonce| {
@@ -1117,17 +1121,39 @@ pub(crate) async fn transcript_bind_core(
         },
     };
 
-    // 3. Gate 1 — the runner's transcript-sync toggle. Off writes nothing.
-    if !env.cloud_sync_enabled {
-        return bind_error(
-            StatusCode::CONFLICT,
-            "sync_disabled",
-            Some(
-                "transcript sync is off on this runner (Settings.cloud_sync_enabled = false); \
-                 nothing was bound or written"
-                    .to_string(),
-            ),
-        );
+    // 3. Transcript sync's gate — the tenant's `egress_transcript_sync` switch
+    // and the user's own toggle — asked in the caller's tenant, which the
+    // nonce resolves here. A nonce that resolves to no tenant (`Ok(None)`)
+    // writes under the device default, so the default scope is the right one
+    // to ask. A resolution that FAILS also lands on the default scope here,
+    // which says nothing about the caller's tenant — harmless only because
+    // step 4 then refuses (`tenant_unresolvable`) before anything is bound or
+    // written. Closed writes nothing.
+    let tenant_hint = (env.session_tenant)(&nonce).ok().flatten();
+    match (env.transcript_gate)(tenant_hint) {
+        crate::egress::TranscriptGate::Open => {}
+        crate::egress::TranscriptGate::UserConsentOff => {
+            return bind_error(
+                StatusCode::CONFLICT,
+                "sync_disabled",
+                Some(
+                    "transcript sync is off on this runner (the user's AI content sync toggle \
+                     is off); nothing was bound or written"
+                        .to_string(),
+                ),
+            );
+        }
+        crate::egress::TranscriptGate::TenantSwitchOff => {
+            let mut body = serde_json::json!({
+                "error": "egress_off",
+                "flow": crate::egress::Flow::TranscriptSync.key(),
+                "domain": crate::egress::Flow::TranscriptSync.domain(),
+                "detail": "transcript sync is off for this project \
+                     (egress_transcript_sync); nothing was bound or written",
+            });
+            body["tenant_id"] = serde_json::json!(tenant_hint);
+            return (StatusCode::CONFLICT, body);
+        }
     }
     let Some(tailer) = env.tailer else {
         return bind_error(
@@ -1227,13 +1253,13 @@ pub(crate) async fn transcript_bind_core(
     };
 
     // 8. Bind + replay — file I/O and fsyncs, off the async runtime.
-    let sync_enabled = env.cloud_sync_enabled;
     let joined = spawn_blocking_tracked(move || {
         tailer.bind_and_replay(
             &session_key,
             &path,
             BindRequest { adopt, tenant },
-            sync_enabled,
+            // Step 3 returned on every closed gate arm, so it is open here.
+            true,
         )
     })
     .await;
@@ -1920,7 +1946,7 @@ mod tests {
             let (status, body) = transcript_coverage_body(Some(&t));
             assert_eq!(status, StatusCode::OK);
             for key in [
-                "cloud_sync_enabled",
+                "transcript_sync_permitted",
                 "sessions_tailed",
                 "sessions_unbound",
                 "unbound_session_ids",
@@ -1932,7 +1958,7 @@ mod tests {
             }
             assert_eq!(body["transcript_holes"], 0);
             assert!(
-                body["cloud_sync_enabled"].is_null(),
+                body["transcript_sync_permitted"].is_null(),
                 "no append observed yet"
             );
         }
@@ -1990,7 +2016,7 @@ mod tests {
             confirm: bool,
         ) -> TranscriptBindEnv {
             TranscriptBindEnv {
-                cloud_sync_enabled: true,
+                transcript_gate: Box::new(|_| crate::egress::TranscriptGate::Open),
                 tailer: t,
                 watched_config_dirs: cfg,
                 session_tenant: Box::new(|_| Ok(None)),
@@ -2132,10 +2158,36 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let mut e = env(Some(t), vec![cfg], true);
-            e.cloud_sync_enabled = false;
+            e.transcript_gate = Box::new(|_| crate::egress::TranscriptGate::UserConsentOff);
             let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(v["error"], "sync_disabled");
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        /// M1: the TENANT's switch off answers 409 `egress_off`, asks the gate
+        /// in the caller's tenant scope, and writes nothing.
+        #[tokio::test]
+        async fn tenant_switch_off_is_egress_off_and_writes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let tenant = uuid::Uuid::from_u128(0x7e);
+            let asked = Arc::new(std::sync::Mutex::new(None));
+            let seen = asked.clone();
+            let mut e = env(Some(t), vec![cfg], true);
+            e.session_tenant = Box::new(move |_| Ok(Some(tenant)));
+            e.transcript_gate = Box::new(move |t| {
+                *seen.lock().unwrap() = Some(t);
+                crate::egress::TranscriptGate::TenantSwitchOff
+            });
+            let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(v["error"], "egress_off");
+            assert_eq!(v["flow"], "transcript_sync");
+            assert_eq!(*asked.lock().unwrap(), Some(Some(tenant)));
             assert!(outbox.pending().unwrap().is_empty());
         }
 

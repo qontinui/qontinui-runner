@@ -68,7 +68,7 @@ use qontinui_runner_lib::pair::{
 };
 use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
-    load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
+    load_strict, profiles_path, AuthConfig, BlobConfig, EgressProfile, Profile, ProfilesFile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,6 +113,13 @@ enum Cmd {
         /// Host / IP for DB, Redis, blob, and coord URLs. Defaults to localhost.
         #[arg(long, default_value = "localhost")]
         host: String,
+        /// Default for the six outbound data flows (transcript sync, code
+        /// mirror, terminal streaming, telemetry, update check, skill mirror)
+        /// written as the profile's `egress.default`. `off` is the self-hosted
+        /// deployment's switch: every flow stays off until coord answers
+        /// otherwise for the tenant. Omitted: no profile opinion (on).
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        egress_default: Option<String>,
     },
     /// Print the absolute profiles.json path.
     Path,
@@ -229,7 +236,10 @@ fn main() -> ExitCode {
         Cmd::Show => cmd_show(),
         Cmd::List => cmd_list(),
         Cmd::Use { name } => cmd_use(&name),
-        Cmd::Init { host } => cmd_init(&host),
+        Cmd::Init {
+            host,
+            egress_default,
+        } => cmd_init(&host, egress_default.as_deref()),
         Cmd::Path => cmd_path(),
         // `machine` is a legacy alias — both variants dispatch to the same
         // device handlers. Phase 3 unified the canonical name on `device`.
@@ -311,6 +321,18 @@ fn cmd_show() -> ExitCode {
                 "coord_url":    p.coord_url,
                 "api_url":      p.api_url,
                 "auth":         auth_view,
+                // The machine's default for the six outbound data flows
+                // (`on` | `off`); `null` is no profile opinion.
+                "egress_default": match qontinui_runner_lib::profiles::active_egress_profile() {
+                    qontinui_runner_lib::profiles::ActiveEgress::Profile(e) => {
+                        json!(e.and_then(|e| e.default))
+                    }
+                    qontinui_runner_lib::profiles::ActiveEgress::FileAbsent => json!(null),
+                    // The runner reads an unusable file as `off`; say so.
+                    qontinui_runner_lib::profiles::ActiveEgress::Unreadable(why) => {
+                        json!(format!("off (profiles.json unusable: {why})"))
+                    }
+                },
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             ExitCode::SUCCESS
@@ -411,7 +433,7 @@ fn cmd_use(name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_init(host: &str) -> ExitCode {
+fn cmd_init(host: &str, egress_default: Option<&str>) -> ExitCode {
     let path = match profiles_path() {
         Some(p) => p,
         None => {
@@ -435,6 +457,25 @@ fn cmd_init(host: &str) -> ExitCode {
         }
     }
 
+    let file = starter_profiles(host, egress_default);
+    if let Err(e) = atomic_write(&path, &file) {
+        eprintln!("write {} failed: {}", path.display(), e);
+        return ExitCode::from(2);
+    }
+    println!(
+        "wrote {} (active=canonical, host={}{})",
+        path.display(),
+        host,
+        egress_default
+            .map(|d| format!(", egress.default={d}"))
+            .unwrap_or_default()
+    );
+    ExitCode::SUCCESS
+}
+
+/// The starter profiles.json `init` writes. Pure, so the `--egress-default`
+/// arm is testable without writing the operator's real file.
+fn starter_profiles(host: &str, egress_default: Option<&str>) -> ProfilesFile {
     let mut profiles = HashMap::new();
     let canonical = Profile {
         // Seeds the CANONICAL STACK, deliberately. A newly provisioned box on
@@ -465,18 +506,15 @@ fn cmd_init(host: &str) -> ExitCode {
             client_id: Some("qontinui-runner".to_string()),
             token: None,
         }),
+        egress: egress_default.map(|d| EgressProfile {
+            default: Some(d.to_string()),
+        }),
     };
     profiles.insert("canonical".to_string(), canonical);
-    let file = ProfilesFile {
+    ProfilesFile {
         active: Some("canonical".to_string()),
         profiles,
-    };
-    if let Err(e) = atomic_write(&path, &file) {
-        eprintln!("write {} failed: {}", path.display(), e);
-        return ExitCode::from(2);
     }
-    println!("wrote {} (active=canonical, host={})", path.display(), host);
-    ExitCode::SUCCESS
 }
 
 fn atomic_write(path: &Path, file: &ProfilesFile) -> std::io::Result<()> {
@@ -2106,7 +2144,13 @@ mod tests {
     fn init_defaults_to_localhost() {
         let cli = Cli::try_parse_from(["qontinui_profile", "init"]).expect("parses");
         match cli.cmd {
-            Some(Cmd::Init { host }) => assert_eq!(host, "localhost"),
+            Some(Cmd::Init {
+                host,
+                egress_default,
+            }) => {
+                assert_eq!(host, "localhost");
+                assert_eq!(egress_default, None);
+            }
             other => panic!("expected Init, got {:?}", other),
         }
     }
@@ -2116,9 +2160,33 @@ mod tests {
         let cli = Cli::try_parse_from(["qontinui_profile", "init", "--host", "192.168.1.42"])
             .expect("parses");
         match cli.cmd {
-            Some(Cmd::Init { host }) => assert_eq!(host, "192.168.1.42"),
+            Some(Cmd::Init { host, .. }) => assert_eq!(host, "192.168.1.42"),
             other => panic!("expected Init, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn init_accepts_egress_default_off_and_writes_it() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "init", "--egress-default", "off"])
+            .expect("parses");
+        let Some(Cmd::Init {
+            host,
+            egress_default,
+        }) = cli.cmd
+        else {
+            panic!("expected Init");
+        };
+        assert_eq!(egress_default.as_deref(), Some("off"));
+        let file = starter_profiles(&host, egress_default.as_deref());
+        let json = serde_json::to_value(&file).unwrap();
+        assert_eq!(json["profiles"]["canonical"]["egress"]["default"], "off");
+        // Without the flag the key is absent, not `null`.
+        let plain = serde_json::to_value(starter_profiles("localhost", None)).unwrap();
+        assert!(plain["profiles"]["canonical"].get("egress").is_none());
+        // Anything but on/off is refused at the door.
+        assert!(
+            Cli::try_parse_from(["qontinui_profile", "init", "--egress-default", "maybe"]).is_err()
+        );
     }
 
     #[test]

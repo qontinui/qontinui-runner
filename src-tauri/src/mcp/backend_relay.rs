@@ -2428,6 +2428,11 @@ async fn handle_outbound(
             Ok(event) => {
                 let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
 
+                // Per-tenant egress switches (terminal stream, telemetry).
+                if !outbound_egress_permitted(channel, &event) {
+                    continue;
+                }
+
                 // Flood control: only forward terminal-output / terminal-exit
                 // frames when the backend has an active terminal subscriber.
                 // Never gate phase-result / ui-error / recent-crash /
@@ -2859,6 +2864,92 @@ pub(crate) fn route_relay_frame(msg_type: &str, data: &Value) -> RelayRoute {
     RelayRoute::Refuse(remote_type_refusal(&msg_type, &data))
 }
 
+/// The relay frames that stream a terminal (or open one to stream), or read a
+/// session's output back out, and so stop at the tenant's
+/// `egress_terminal_stream` switch (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7), each with the
+/// reply type its caller is waiting for. AI-session content relayed to the
+/// console (`chat_get_output`) rides the same switch as terminal output — it
+/// is the same live view, over the same relay (see the `egress` module doc).
+/// Tear-down and flow-control frames (`terminal_detach`, `terminal_flow`,
+/// `terminal_subscribe` / `_unsubscribe`, which are fire-and-forget and expect
+/// no reply) pass: none of them sends session bytes, and the outbound
+/// forwarder withholds the output frames themselves.
+const EGRESS_GATED_RELAY_FRAMES: &[(&str, &str)] = &[
+    ("terminal_list", "terminal_response"),
+    ("terminal_create", "terminal_response"),
+    ("terminal_input", "terminal_response"),
+    ("terminal_resize", "terminal_response"),
+    ("terminal_close", "terminal_response"),
+    ("terminal_buffer", "terminal_response"),
+    ("terminal_attach", "terminal_response"),
+    ("chat_get_output", "chat_output"),
+];
+
+/// The scope of the session a relay frame (or a forwarded event's payload)
+/// names: the open session on its terminal id, else the session the
+/// AI-session registrar recorded for its task-run id. A frame naming no id is
+/// [`crate::egress::SessionScope::Unresolved`] — judged by the strictest bound
+/// tenant. Both wire spellings are read: frames use snake_case,
+/// `AiOutputEvent` camelCase.
+fn relay_session_tenant(data: &Value) -> crate::egress::SessionScope {
+    let field = |snake: &str, camel: &str| {
+        data.get(snake)
+            .or_else(|| data.get(camel))
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(terminal_id) = field("terminal_id", "terminalId") {
+        return crate::egress::terminal_session_tenant(terminal_id);
+    }
+    field("task_run_id", "taskRunId").map_or(
+        crate::egress::SessionScope::Unresolved,
+        crate::egress::task_run_session_tenant,
+    )
+}
+
+/// `Some(refusal frame)` when `msg_type` is a gated relay frame and the
+/// terminal-stream switch is off in the tenant of the session the frame names
+/// ([`relay_session_tenant`]). Checked live on every frame.
+fn terminal_egress_refusal(msg_type: &str, data: &Value) -> Option<Value> {
+    let (_, reply_type) = EGRESS_GATED_RELAY_FRAMES
+        .iter()
+        .find(|(frame, _)| *frame == msg_type)?;
+    if crate::egress::permit_or_count_session(
+        crate::egress::Flow::TerminalStream,
+        relay_session_tenant(data),
+    ) {
+        return None;
+    }
+    Some(crate::egress::egress_refusal_frame(
+        reply_type,
+        crate::egress::Flow::TerminalStream,
+        data,
+    ))
+}
+
+/// Whether the outbound forwarder may send an event on `channel` right now:
+/// `terminal-output` / `terminal-exit` and the AI-session content channels
+/// (`ai-output`, `session-state`) follow `egress_terminal_stream`, and
+/// `ui-error` / `recent-crash` follow `egress_telemetry` (checked live, unlike
+/// the boot-time crash reporter). Every other channel is not an egress flow.
+/// The session channels ask in the tenant of the session the event's payload
+/// names ([`relay_session_tenant`]); telemetry is device-wide.
+fn outbound_egress_permitted(channel: &str, event: &Value) -> bool {
+    use crate::egress::Flow;
+    match channel {
+        "terminal-output" | "terminal-exit" | "ai-output" | "session-state" => {
+            let scope = event.get("payload").map_or(
+                crate::egress::SessionScope::Unresolved,
+                relay_session_tenant,
+            );
+            crate::egress::permit_or_count_session(Flow::TerminalStream, scope)
+        }
+        "ui-error" | "recent-crash" => crate::egress::permit_or_count(Flow::Telemetry),
+        _ => true,
+    }
+}
+
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
@@ -2869,6 +2960,10 @@ async fn handle_relay_command(
         RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
     };
     let data = &data;
+
+    if let Some(refusal) = terminal_egress_refusal(&msg_type, data) {
+        return Some(refusal);
+    }
 
     match msg_type.as_str() {
         // --------------------------------------------------------------
@@ -3489,6 +3584,561 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
     )
 }
 
+/// Every [`crate::mcp::relay_path_policy::RELAY_ALLOWED`] route and the egress
+/// gate its RESPONSE passes (audited route by route). "Refuse" = 409
+/// `egress_off`, the loopback API never called; "redact" = the per-record
+/// content fields are blanked ([`redact_relay_content`]); "strictest" = the
+/// strictest verdict across every bound tenant (nothing attributes the
+/// content to one).
+///
+/// | Route | Gate |
+/// |---|---|
+/// | `GET /health`, `/status` | none — device status |
+/// | `GET /apps/{app_id}/spec/list`, `/spec/graph` | none — app specs, not session content |
+/// | `GET /ui-bridge/control/snapshot` | terminal stream, strictest, refuse — the runner UI shows session panes |
+/// | `POST /prompt-home/plan` | none — plans the caller's own prompt |
+/// | `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}` | terminal stream, per run, redact |
+/// | `GET /task-runs/{id}/events`, `/output`, `/session-state`, `/workflow-state`, `/screenshots` | terminal stream, that run's tenant, refuse |
+/// | `POST /task-runs/{id}/message`, `/stop`, `/pause`, `/unpause`, `POST /task-runs/session` | none — inbound actions |
+/// | `POST /load-config`, `/run-workflow`, `/stop-execution`; `GET /configs`, `/monitors` | none — config and control |
+/// | `GET /findings/task/{task_run_id}` | terminal stream, per record, redact |
+/// | `PUT /findings/{id}/status`, `POST /findings/{id}/user-response` | none — inbound |
+/// | `GET /screenshots/list` | terminal stream, strictest, refuse |
+/// | `GET /graph/*` (summary, search, cross-run-patterns, phase-stats, similar-errors, ineffective-rules) | terminal stream, strictest, refuse — cross-run knowledge built from run output |
+/// | `GET /memory/search` | transcript sync, strictest, refuse — tenant memory |
+/// | `GET /hitl/pending` | terminal stream, per record, redact |
+/// | `POST /hitl/{id}/respond` | none — inbound |
+/// | `GET /processes` | none — process names and states |
+/// | `GET /processes/{id}/output` | terminal stream, strictest (a process names no session), refuse |
+/// | `POST /processes/{id}/start`, `/stop`, `/restart` | none — actions |
+/// | `GET /worktrees`; `POST /worktrees/merge`, `/merge-force`, `/remove` | none — paths, branch names, action results |
+/// | `POST /worktrees/diff` | code mirror, the branch's worktree owner AND the repo's, refuse ([`code_mirror_egress_refusal`]) |
+/// | `GET /files/roots` | none — the configured roots |
+/// | `GET /files/browse`, `/files/read` | code mirror, the path's owner, refuse |
+/// | `GET /prompts*`, `/skills*`, `POST /skills/{id}/instantiate` | none — the prompt and skill library |
+/// | `GET /state-explorer/strategies`; `POST /state-explorer/start` | none |
+/// | `GET /state-explorer/history` | terminal stream, strictest, refuse |
+/// | `GET /state-explorer/{run_id}` | terminal stream, that run's tenant (else strictest), refuse |
+/// | `GET/PUT /settings/*`, `POST /settings/*` | none — settings |
+/// | `GET /analytics/*` | none — usage counters |
+///
+/// A run id resolves through [`crate::egress::task_run_session_tenant`]; an
+/// id this runner did not register is judged by the strictest bound tenant.
+fn http_request_egress_refusal(request_id: &Value, raw_path: &str) -> Option<Value> {
+    use crate::egress::{Flow, SessionScope};
+    let segments = crate::mcp::relay_path_policy::normalize_relay_path(raw_path)?;
+    let run = |id: &str| crate::egress::task_run_session_tenant(id);
+    let (flow, scope) = match segments.as_slice() {
+        [route, id, leaf]
+            if route == "task-runs"
+                && matches!(
+                    leaf.as_str(),
+                    "output" | "session-state" | "events" | "workflow-state" | "screenshots"
+                ) =>
+        {
+            (Flow::TerminalStream, run(id))
+        }
+        [route, _, leaf] if route == "processes" && leaf == "output" => {
+            (Flow::TerminalStream, SessionScope::Unresolved)
+        }
+        [route, leaf] if route == "state-explorer" && leaf == "history" => {
+            (Flow::TerminalStream, SessionScope::Unresolved)
+        }
+        [route, id] if route == "state-explorer" && id != "strategies" && id != "start" => {
+            (Flow::TerminalStream, run(id))
+        }
+        [route, ..] if route == "graph" => (Flow::TerminalStream, SessionScope::Unresolved),
+        [route, leaf] if route == "screenshots" && leaf == "list" => {
+            (Flow::TerminalStream, SessionScope::Unresolved)
+        }
+        [route, leaf] if route == "memory" && leaf == "search" => {
+            (Flow::TranscriptSync, SessionScope::Unresolved)
+        }
+        // Matched as one route string: it is the runner's own HTTP route, not
+        // the `ui-bridge` sibling repo the workspace-assumption scan looks for.
+        _ if segments.join("/") == "ui-bridge/control/snapshot" => {
+            (Flow::TerminalStream, SessionScope::Unresolved)
+        }
+        _ => return None,
+    };
+    if crate::egress::permit_or_count_session(flow, scope) {
+        return None;
+    }
+    Some(egress_off_http_response(request_id, flow))
+}
+
+/// The fixed 409 `egress_off` reply every `http_request` refusal answers with.
+fn egress_off_http_response(request_id: &Value, flow: crate::egress::Flow) -> Value {
+    let body = serde_json::json!({
+        "error": "egress_off",
+        "flow": flow.key(),
+        "domain": flow.domain(),
+        "message": crate::egress::refusal_message(flow),
+    })
+    .to_string();
+    http_relay_response(
+        request_id,
+        409,
+        serde_json::json!({ "content-type": "application/json" }),
+        STANDARD.encode(body.as_bytes()),
+    )
+}
+
+/// The `http_request` reads whose responses carry a task run's SESSION
+/// CONTENT (AI output, prompts, summaries, findings and questions about it)
+/// as fields of a record rather than as a stream — audited against
+/// [`crate::mcp::relay_path_policy::RELAY_ALLOWED`]:
+///
+/// - `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}`: `TaskRun`
+///   (`output_log` is the full accumulated output);
+/// - `GET /findings/task/{task_run_id}`: the run's findings;
+/// - `GET /hitl/pending`: deferred questions, each naming its run.
+///
+/// The streamed reads (`/output`, `/session-state`, `/events`,
+/// `/processes/{id}/output`) are refused outright by
+/// [`http_request_egress_refusal`]. The other allowed reads carry no
+/// per-run session content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayContentRoute {
+    TaskRuns,
+    Findings,
+    Hitl,
+}
+
+impl RelayContentRoute {
+    /// The record fields that are session content on this route.
+    const fn content_fields(self) -> &'static [&'static str] {
+        match self {
+            RelayContentRoute::TaskRuns => &[
+                "output_log",
+                "prompt",
+                "summary",
+                "ai_summary",
+                "remaining_work",
+                "error_message",
+                "execution_steps_json",
+                "transition_history_json",
+            ],
+            RelayContentRoute::Findings => &[
+                "title",
+                "description",
+                "resolution",
+                "codeContext",
+                "userInput",
+                "userResponse",
+            ],
+            RelayContentRoute::Hitl => &[
+                "question",
+                "context_json",
+                "auto_decision_detail",
+                "reviewer_comment",
+            ],
+        }
+    }
+
+    /// The run a JSON object on this route is a record of, if it is one.
+    /// `path_run` is the run id the path names (`/findings/task/{id}`,
+    /// `/task-runs/{id}`).
+    /// `Some(run)` when the object is a record of this route — `run` being
+    /// its run id, or `None` when the record carries none (e.g. a question
+    /// with a NULL `task_run_id`), which is judged by the strictest bound
+    /// tenant rather than skipped. `None` = not a record.
+    fn record_run<'a>(
+        self,
+        obj: &'a serde_json::Map<String, Value>,
+        path_run: Option<&'a str>,
+    ) -> Option<Option<&'a str>> {
+        let field = |k: &str| obj.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+        match self {
+            RelayContentRoute::TaskRuns => obj.contains_key("output_log").then(|| field("id")),
+            RelayContentRoute::Findings => (obj.contains_key("signatureHash")
+                || obj.contains_key("taskRunId"))
+            .then(|| field("taskRunId").or(path_run)),
+            RelayContentRoute::Hitl => obj.contains_key("question").then(|| field("task_run_id")),
+        }
+    }
+}
+
+/// Which content route `raw_path` is, with the run id it names.
+fn relay_content_route(raw_path: &str) -> Option<(RelayContentRoute, Option<String>)> {
+    let segments = crate::mcp::relay_path_policy::normalize_relay_path(raw_path)?;
+    match segments.as_slice() {
+        [r] if r == "task-runs" => Some((RelayContentRoute::TaskRuns, None)),
+        [r, id] if r == "task-runs" => Some((RelayContentRoute::TaskRuns, Some(id.clone()))),
+        [r, t, id] if r == "findings" && t == "task" => {
+            Some((RelayContentRoute::Findings, Some(id.clone())))
+        }
+        [r, p] if r == "hitl" && p == "pending" => Some((RelayContentRoute::Hitl, None)),
+        _ => None,
+    }
+}
+
+/// C2: blank the session content of every run record in an `http_request`
+/// response whose run's tenant has `egress_terminal_stream` off (a run whose
+/// tenant cannot be established is judged by the strictest bound tenant).
+/// Each blanked field becomes `""` (`output_log`, which clients read as a
+/// string) or `null`, and the record gains `egress_redacted: [fields]`, so a
+/// client can tell a refusal from an empty run. `None` = the body is left
+/// exactly as the local API produced it (not a content route, not JSON, or
+/// nothing to blank).
+/// What [`redact_relay_content`] decided for one response body.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayContent {
+    /// Forward the body exactly as the local API produced it.
+    Keep,
+    /// Forward this rewritten body instead.
+    Replace(Vec<u8>),
+    /// Forward nothing of it: answer the fixed `egress_off` refusal.
+    Refuse,
+}
+
+fn redact_relay_content(raw_path: &str, body: &[u8]) -> RelayContent {
+    let Some((route, path_run)) = relay_content_route(raw_path) else {
+        return RelayContent::Keep;
+    };
+    // A body that cannot be parsed cannot be redacted record by record: it
+    // goes out only when even the strictest bound tenant permits. Passing it
+    // through (`Keep`) when that verdict PERMITS is deliberate, as specified —
+    // refusal is reserved for a refused verdict.
+    let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
+        return if crate::egress::permit_or_count_session(
+            crate::egress::Flow::TerminalStream,
+            crate::egress::SessionScope::Unresolved,
+        ) {
+            RelayContent::Keep
+        } else {
+            RelayContent::Refuse
+        };
+    };
+    let mut changed = false;
+    redact_value(&mut json, route, path_run.as_deref(), &mut changed);
+    if changed {
+        RelayContent::Replace(serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec()))
+    } else {
+        RelayContent::Keep
+    }
+}
+
+fn redact_value(
+    value: &mut Value,
+    route: RelayContentRoute,
+    path_run: Option<&str>,
+    changed: &mut bool,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                redact_value(item, route, path_run, changed);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(run) = route.record_run(obj, path_run) {
+                let scope = run.map_or(
+                    crate::egress::SessionScope::Unresolved,
+                    crate::egress::task_run_session_tenant,
+                );
+                if !crate::egress::permit_or_count_session(
+                    crate::egress::Flow::TerminalStream,
+                    scope,
+                ) {
+                    let mut blanked = Vec::new();
+                    for field in route.content_fields() {
+                        if let Some(v) = obj.get_mut(*field) {
+                            if v.is_null() {
+                                continue;
+                            }
+                            *v = if *field == "output_log" {
+                                Value::String(String::new())
+                            } else {
+                                Value::Null
+                            };
+                            blanked.push(*field);
+                        }
+                    }
+                    if !blanked.is_empty() {
+                        obj.insert("egress_redacted".to_string(), serde_json::json!(blanked));
+                        *changed = true;
+                    }
+                }
+            }
+            for (_, v) in obj.iter_mut() {
+                redact_value(v, route, path_run, changed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Repository / worktree CONTENT over `http_request` follows the owning
+/// tenant's `egress_code_mirror` switch: 409 `egress_off`, and the loopback
+/// API is never called. Audited against
+/// [`crate::mcp::relay_path_policy::RELAY_ALLOWED`], the routes that return
+/// repo or worktree content are:
+///
+/// - `GET /files/read?path=` — a file's bytes;
+/// - `GET /files/browse?path=` — a directory's listing (the repo's tree);
+/// - `POST /worktrees/diff` (`repo_path` in the body) — a branch's diff.
+///
+/// `GET /files/roots` (the configured root directories), `GET /worktrees`
+/// (worktree paths and branch names) and the merge / remove actions return
+/// no file content. The owner is the session working in the path's closest
+/// enclosing directory ([`crate::egress::path_session_tenant`]); a path no
+/// session owns, sessions of different tenants sharing it, or a request
+/// naming no path is judged by the strictest bound tenant.
+/// What the code-mirror gate decided for one `http_request` frame.
+#[derive(Debug)]
+enum CodeMirrorGate {
+    /// Not a repo / worktree route.
+    NotCodeRoute,
+    /// Refuse with this reply; the loopback API is never called.
+    Refuse(Value),
+    /// Forward, with this query in place of the caller's (the files routes
+    /// forward the CANONICAL path the gate checked).
+    Forward { query: Option<String> },
+    /// Forward the action, then blank the cross-tenant metadata in its
+    /// response ([`redact_code_metadata`]).
+    ForwardRedacted,
+}
+
+async fn code_mirror_gate(
+    request_id: &Value,
+    raw_path: &str,
+    query: &str,
+    body: &[u8],
+) -> CodeMirrorGate {
+    use crate::egress::SessionScope;
+    let Some(segments) = crate::mcp::relay_path_policy::normalize_relay_path(raw_path) else {
+        return CodeMirrorGate::NotCodeRoute;
+    };
+    // The owner lookup canonicalizes paths, so it runs on the blocking pool.
+    async fn owner(p: Option<&str>) -> SessionScope {
+        match p {
+            Some(p) => crate::egress::path_session_tenant_off_runtime(p.to_string()).await,
+            None => SessionScope::Unresolved,
+        }
+    }
+    let req = serde_json::from_slice::<Value>(body).ok();
+    let field = |k: &str| {
+        req.as_ref()
+            .and_then(|v| v.get(k)?.as_str().map(str::to_string))
+            .filter(|v| !v.is_empty())
+    };
+    // The worktree that has `branch` checked out in `repo` (blocking git,
+    // off the runtime). A branch no worktree holds is unresolved.
+    let branch_owner = |branch: Option<String>| {
+        let repo = field("repo_path");
+        async move {
+            let wt = match (repo, branch) {
+                (Some(repo), Some(branch)) => {
+                    tokio::task::spawn_blocking(move || branch_worktree_path(&repo, &branch))
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            wt
+        }
+    };
+    let flow = crate::egress::Flow::CodeMirror;
+    let all_permit = |scopes: Vec<SessionScope>| {
+        scopes
+            .into_iter()
+            .all(|scope| crate::egress::permit_or_count_session(flow, scope))
+    };
+    match segments.as_slice() {
+        [r, leaf] if r == "files" && (leaf == "read" || leaf == "browse") => {
+            let path = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(k, _)| k == "path")
+                .map(|(_, v)| v.into_owned());
+            // Canonicalize ONCE, off the runtime, and both judge and forward
+            // that path. This closes a symlink already present in the path
+            // being swapped between the check and the read (the handler gets
+            // a path with no symlink left to re-resolve); it does NOT close a
+            // directory component being replaced after the check — that race
+            // remains, as for any check-then-open across processes.
+            let canonical = match path.clone() {
+                Some(p) => tokio::task::spawn_blocking(move || std::fs::canonicalize(p).ok())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| strip_verbatim_prefix(&c.to_string_lossy())),
+                None => None,
+            };
+            let judged = canonical.as_deref().or(path.as_deref());
+            if !all_permit(vec![owner(judged).await]) {
+                return CodeMirrorGate::Refuse(egress_off_http_response(request_id, flow));
+            }
+            let query = canonical.map(|c| {
+                let mut out = url::form_urlencoded::Serializer::new(String::new());
+                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                    if k == "path" {
+                        out.append_pair("path", &c);
+                    } else {
+                        out.append_pair(&k, &v);
+                    }
+                }
+                out.finish()
+            });
+            CodeMirrorGate::Forward { query }
+        }
+        [r, leaf] if r == "worktrees" && leaf == "diff" => {
+            // The diff carries BOTH branches' content, and a repo's refs are
+            // shared by every worktree of it: the owners of the worktrees
+            // holding `branch_name` and `source_branch`, and of the repo path,
+            // must all permit.
+            let branch_wt = branch_owner(field("branch_name")).await;
+            let source_wt = branch_owner(field("source_branch")).await;
+            let repo = field("repo_path");
+            if all_permit(vec![
+                owner(branch_wt.as_deref()).await,
+                owner(source_wt.as_deref()).await,
+                owner(repo.as_deref()).await,
+            ]) {
+                CodeMirrorGate::Forward { query: None }
+            } else {
+                CodeMirrorGate::Refuse(egress_off_http_response(request_id, flow))
+            }
+        }
+        [r, leaf]
+            if r == "worktrees" && matches!(leaf.as_str(), "merge" | "merge-force" | "remove") =>
+        {
+            // The action stays allowed; what its response says about the
+            // branches (conflicts, files, owning sessions, an AI merge prompt)
+            // follows the owners' switches.
+            let branch_wt = branch_owner(field("branch_name")).await;
+            let source_wt = branch_owner(field("source_branch")).await;
+            let mut scopes = vec![
+                owner(branch_wt.as_deref()).await,
+                owner(field("repo_path").as_deref()).await,
+            ];
+            if leaf == "remove" {
+                scopes.push(owner(field("worktree_path").as_deref()).await);
+            } else {
+                scopes.push(owner(source_wt.as_deref()).await);
+            }
+            if all_permit(scopes) {
+                CodeMirrorGate::Forward { query: None }
+            } else {
+                CodeMirrorGate::ForwardRedacted
+            }
+        }
+        _ => CodeMirrorGate::NotCodeRoute,
+    }
+}
+
+/// `path` without Windows' verbatim prefix — `\\?\C:\x` becomes `C:\x`
+/// and `\\?\UNC\server\share` becomes `\\server\share` — so a client is
+/// never handed a verbatim path. Case is kept. Anything else is unchanged.
+/// PURE.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// The fields of a merge / remove response that describe the branches'
+/// content or their sessions.
+///
+/// `stashed_files` / `stash_note` are merge-force's report of the dirty files
+/// it stashed (the conflicting files under another key); `error` /
+/// `error_detail` are blanked because git's messages name files ("Your local
+/// changes to the following files would be overwritten…").
+const CODE_METADATA_FIELDS: &[&str] = &[
+    "conflicting_files",
+    "owning_sessions",
+    "conflicts",
+    "ai_merge_prompt",
+    "summary",
+    "stashed_files",
+    "stash_note",
+    "error",
+    "error_detail",
+];
+
+/// Blank [`CODE_METADATA_FIELDS`] anywhere in a merge / remove response,
+/// marking each object that lost one with `egress_redacted`. A body that is
+/// not JSON is replaced whole by a fixed notice: the action ran, its report
+/// is withheld.
+fn redact_code_metadata(body: &[u8]) -> Vec<u8> {
+    fn walk(v: &mut Value) {
+        match v {
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            Value::Object(obj) => {
+                let mut blanked = Vec::new();
+                for field in CODE_METADATA_FIELDS {
+                    if let Some(val) = obj.get_mut(*field) {
+                        if !val.is_null() {
+                            *val = Value::Null;
+                            blanked.push(*field);
+                        }
+                    }
+                }
+                if !blanked.is_empty() {
+                    obj.insert("egress_redacted".to_string(), serde_json::json!(blanked));
+                }
+                obj.values_mut().for_each(walk);
+            }
+            _ => {}
+        }
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Ok(mut json) => {
+            walk(&mut json);
+            serde_json::to_vec(&json).unwrap_or_default()
+        }
+        Err(_) => serde_json::json!({
+            "egress_redacted": true,
+            "message": crate::egress::refusal_message(crate::egress::Flow::CodeMirror),
+        })
+        .to_string()
+        .into_bytes(),
+    }
+}
+
+/// The worktree of the repository at `repo` that has `branch` checked out,
+/// from `git worktree list --porcelain -z` (NUL-separated, so a path holding
+/// a newline cannot forge a record); `None` when none does, or git fails.
+/// `-z` with `--porcelain` needs git 2.36 or later; an older git rejects the
+/// flag, which lands here as a failure — `None`, so the branch is unresolved
+/// and judged by the strictest bound tenant (fails closed).
+/// Blocking.
+fn branch_worktree_path(repo: &str, branch: &str) -> Option<String> {
+    // No console window on Windows, no inherited GIT_DIR redirecting it, and
+    // a credential prompt fails rather than blocks.
+    let out = crate::process_helpers::scrubbed_git(std::ffi::OsStr::new("git"))
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    worktree_for_branch(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// The `worktree` path of the porcelain block whose `branch` is
+/// `refs/heads/<branch>`. PURE.
+fn worktree_for_branch(porcelain: &str, branch: &str) -> Option<String> {
+    let want = format!("refs/heads/{}", branch.trim_start_matches("refs/heads/"));
+    let mut current: Option<&str> = None;
+    for line in porcelain.split('\0') {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(path);
+        } else if line.strip_prefix("branch ") == Some(want.as_str()) {
+            return current.map(str::to_string);
+        } else if line.is_empty() {
+            current = None;
+        }
+    }
+    None
+}
+
 /// Handle a generic `http_request` relay command (mobile remote-runner
 /// connection). Self-calls the runner's own local Axum server over loopback
 /// and returns the response as a `command_response` frame. See
@@ -3558,6 +4208,9 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         );
         return http_relay_error(&request_id, 403, verdict.message());
     }
+    if let Some(refusal) = http_request_egress_refusal(&request_id, raw_path) {
+        return refusal;
+    }
 
     let path = raw_path.trim_start_matches('/');
     let query = data.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -3584,6 +4237,20 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         );
         return http_relay_error(&request_id, 413, "request body exceeds relay size limit");
     }
+    let mut redact_code = false;
+    let forwarded_query;
+    let query = match code_mirror_gate(&request_id, raw_path, query, &body_bytes).await {
+        CodeMirrorGate::Refuse(refusal) => return refusal,
+        CodeMirrorGate::Forward { query: Some(q) } => {
+            forwarded_query = q;
+            forwarded_query.as_str()
+        }
+        CodeMirrorGate::ForwardRedacted => {
+            redact_code = true;
+            query
+        }
+        CodeMirrorGate::Forward { query: None } | CodeMirrorGate::NotCodeRoute => query,
+    };
 
     // Build the loopback URL from the supplied base (caller derives it from
     // the runner's OWN bound port via `get_self_base_url`).
@@ -3674,6 +4341,14 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         return http_relay_error(&request_id, 413, "response body exceeds relay size limit");
     }
 
+    let resp_body = match redact_relay_content(raw_path, &resp_body) {
+        RelayContent::Keep if redact_code => redact_code_metadata(&resp_body),
+        RelayContent::Keep => resp_body.to_vec(),
+        RelayContent::Replace(body) => body,
+        RelayContent::Refuse => {
+            return egress_off_http_response(&request_id, crate::egress::Flow::TerminalStream)
+        }
+    };
     let body_out = STANDARD.encode(&resp_body);
     http_relay_response(&request_id, status, Value::Object(headers_obj), body_out)
 }
@@ -8838,5 +9513,899 @@ mod relay_create_drain_message_tests {
             );
             assert_eq!(message.matches(" — ").count(), 1, "{message}");
         }
+    }
+}
+
+/// The relay half of the egress switches (plan
+/// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7).
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use crate::egress::test_support::pin;
+    use crate::egress::{Flow, Level};
+
+    #[test]
+    fn gated_terminal_frames_answer_egress_off_while_the_switch_is_off() {
+        let data = serde_json::json!({"request_id": "r-1", "terminal_id": "t-1"});
+        let _pin = pin(Flow::TerminalStream, Level::Off);
+        for (frame, reply) in EGRESS_GATED_RELAY_FRAMES {
+            let refusal = terminal_egress_refusal(frame, &data).expect(frame);
+            assert_eq!(refusal["type"], *reply);
+            assert_eq!(refusal["error"], "egress_off");
+            assert_eq!(refusal["flow"], "terminal_stream");
+            assert_eq!(refusal["request_id"], "r-1");
+            assert_eq!(refusal["terminal_id"], "t-1");
+        }
+        for frame in [
+            "terminal_detach",
+            "terminal_flow",
+            "terminal_subscribe",
+            "chat_message",
+        ] {
+            assert!(terminal_egress_refusal(frame, &data).is_none(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn gated_terminal_frames_pass_while_the_switch_is_on() {
+        let _pin = pin(Flow::TerminalStream, Level::On);
+        for (frame, _) in EGRESS_GATED_RELAY_FRAMES {
+            assert!(terminal_egress_refusal(frame, &serde_json::json!({})).is_none());
+        }
+    }
+
+    #[test]
+    fn the_outbound_forwarder_follows_each_channels_own_switch() {
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        assert!(!outbound_egress_permitted(
+            "terminal-output",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "terminal-exit",
+            &serde_json::Value::Null
+        ));
+        assert!(
+            outbound_egress_permitted("ui-error", &serde_json::Value::Null),
+            "telemetry is still on"
+        );
+        assert!(outbound_egress_permitted(
+            "phase-result",
+            &serde_json::Value::Null
+        ));
+        drop(_t);
+        let _m = pin(Flow::Telemetry, Level::Off);
+        assert!(!outbound_egress_permitted(
+            "ui-error",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "recent-crash",
+            &serde_json::Value::Null
+        ));
+        assert!(outbound_egress_permitted(
+            "terminal-output",
+            &serde_json::Value::Null
+        ));
+    }
+
+    /// M4: relay channels carrying AI session content ride the terminal
+    /// streaming switch — the `ai-output` / `session-state` forwards and the
+    /// `chat_get_output` read.
+    #[test]
+    fn ai_session_content_follows_the_terminal_stream_switch() {
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        assert!(!outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "session-state",
+            &serde_json::Value::Null
+        ));
+        let data = serde_json::json!({"request_id": "r-9", "session_id": "s-1"});
+        let refusal = terminal_egress_refusal("chat_get_output", &data).expect("refused");
+        assert_eq!(refusal["error"], "egress_off");
+        assert_eq!(refusal["type"], "chat_output");
+        assert_eq!(refusal["request_id"], "r-9");
+        drop(_t);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        assert!(outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
+        assert!(terminal_egress_refusal("chat_get_output", &data).is_none());
+    }
+
+    /// Re-review 3: the `http_request` arm's session-output reads ride the
+    /// terminal-streaming switch: 409 `egress_off`, and no loopback call.
+    #[tokio::test]
+    async fn http_request_session_output_reads_are_refused_while_the_switch_is_off() {
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let _t = pin(Flow::TerminalStream, Level::Off);
+        for path in [
+            "/task-runs/11111111-1111-1111-1111-111111111111/output",
+            "/task-runs/11111111-1111-1111-1111-111111111111/session-state",
+            "/task-runs/11111111-1111-1111-1111-111111111111/events",
+            "/processes/p1/output",
+        ] {
+            let frame = serde_json::json!({"request_id": "rq", "method": "GET", "path": path});
+            let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+            assert_eq!(reply["status"], 409, "{path}: {reply}");
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(reply["body_b64"].as_str().unwrap())
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "egress_off", "{path}");
+        }
+        assert_eq!(counter.count(), 0, "nothing may reach the loopback API");
+    }
+
+    /// Item 9: a relay frame naming a session this runner knows asks in THAT
+    /// session's tenant, not the device default. The default scope is pinned
+    /// ON and the session's tenant OFF, so only a tenant-routed check refuses.
+    #[test]
+    fn session_frames_ask_in_the_sessions_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0001);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", crate::egress::SessionScope::Tenant(tenant));
+        let _r = fake_session_tenant("run-tenant", crate::egress::SessionScope::Tenant(tenant));
+        for (frame, _) in EGRESS_GATED_RELAY_FRAMES {
+            let data = if *frame == "chat_get_output" {
+                serde_json::json!({"task_run_id": "run-tenant"})
+            } else {
+                serde_json::json!({"terminal_id": "t-tenant"})
+            };
+            assert!(
+                terminal_egress_refusal(frame, &data).is_some(),
+                "{frame}: the session's tenant has the switch off"
+            );
+        }
+        // A frame naming no known session asks in the default scope (on).
+        assert!(terminal_egress_refusal(
+            "terminal_buffer",
+            &serde_json::json!({"terminal_id": "t-other"})
+        )
+        .is_none());
+    }
+
+    /// Item 9: the forwarder asks in the tenant of the session the event's
+    /// payload names — `terminal_id` for terminal frames, `taskRunId` for an
+    /// `AiOutputEvent`.
+    #[test]
+    fn the_outbound_forwarder_asks_in_the_events_session_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0005);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("t-tenant", crate::egress::SessionScope::Tenant(tenant));
+        let _r = fake_session_tenant("run-tenant", crate::egress::SessionScope::Tenant(tenant));
+        let terminal = serde_json::json!({"payload": {"terminal_id": "t-tenant"}});
+        let ai = serde_json::json!({"payload": {"taskRunId": "run-tenant"}});
+        assert!(!outbound_egress_permitted("terminal-output", &terminal));
+        assert!(!outbound_egress_permitted("terminal-exit", &terminal));
+        assert!(!outbound_egress_permitted("ai-output", &ai));
+        assert!(!outbound_egress_permitted("session-state", &ai));
+        let other = serde_json::json!({"payload": {"terminal_id": "t-other"}});
+        assert!(outbound_egress_permitted("terminal-output", &other));
+        assert!(outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
+    }
+
+    /// M3: a frame or event naming no session, and a process-output read, are
+    /// judged by the strictest bound tenant.
+    #[tokio::test]
+    async fn unattributable_relay_content_takes_the_strictest_bound_tenant() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0007);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        assert!(terminal_egress_refusal("terminal_buffer", &serde_json::json!({})).is_some());
+        assert!(!outbound_egress_permitted(
+            "ai-output",
+            &serde_json::Value::Null
+        ));
+        assert!(!outbound_egress_permitted(
+            "terminal-output",
+            &serde_json::json!({"payload": {}})
+        ));
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let frame = serde_json::json!({"request_id": "rq", "method": "GET", "path": "/processes/p1/output"});
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_eq!(reply["status"], 409, "{reply}");
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Repo / worktree content over `http_request` follows the OWNING
+    /// tenant's code-mirror switch: the tenant of the session working in the
+    /// path's closest enclosing directory.
+    #[tokio::test]
+    async fn repo_content_reads_follow_the_owning_tenants_code_mirror() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000b);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _off = pin_for(Flow::CodeMirror, tenant, Level::Off);
+        let _t = fake_session_tenant("/work/wt-t", SessionScope::Tenant(tenant));
+        let _o = fake_session_tenant("/work/wt-o", SessionScope::DeviceDefault);
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let refused = |reply: &serde_json::Value| {
+            assert_eq!(reply["status"], 409, "{reply}");
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(reply["body_b64"].as_str().unwrap())
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "egress_off");
+            assert_eq!(body["flow"], "code_mirror");
+        };
+        for path in ["/files/read", "/files/browse"] {
+            let frame = serde_json::json!({
+                "request_id": "rq", "method": "GET", "path": path,
+                "query": "path=%2Fwork%2Fwt-t",
+            });
+            refused(&relay_http_to_base(&counter.http_base(), &frame).await);
+        }
+        let diff = |repo: &str| {
+            let body = serde_json::json!({
+                "branch_name": "b", "source_branch": "main", "repo_path": repo, "full_diff": true
+            })
+            .to_string();
+            serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": "/worktrees/diff",
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            })
+        };
+        refused(&relay_http_to_base(&counter.http_base(), &diff("/work/wt-t")).await);
+        assert_eq!(counter.count(), 0, "nothing reached the loopback API");
+
+        // Another tenant's (here the device default's) content still flows.
+        let frame = serde_json::json!({
+            "request_id": "rq", "method": "GET", "path": "/files/read",
+            "query": "path=%2Fwork%2Fwt-o",
+        });
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_ne!(reply["status"], 409, "{reply}");
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+    }
+
+    /// A path no session owns — or a request naming no path — is judged by
+    /// the strictest bound tenant's code-mirror switch.
+    #[tokio::test]
+    async fn unattributable_repo_content_takes_the_strictest_bound_tenant() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000c);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _off = pin_for(Flow::CodeMirror, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let counter = crate::egress::test_support::ConnCounter::start();
+        for frame in [
+            serde_json::json!({"request_id": "rq", "method": "GET", "path": "/files/read",
+                               "query": "path=%2Fnobody%2Fx"}),
+            serde_json::json!({"request_id": "rq", "method": "GET", "path": "/files/read"}),
+            serde_json::json!({"request_id": "rq", "method": "POST", "path": "/worktrees/diff"}),
+        ] {
+            let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+            assert_eq!(reply["status"], 409, "{frame}: {reply}");
+        }
+        assert_eq!(counter.count(), 0);
+    }
+
+    fn status_and_flow(reply: &serde_json::Value) -> (u64, Option<String>) {
+        let status = reply["status"].as_u64().unwrap_or(0);
+        let flow = reply["body_b64"]
+            .as_str()
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["flow"].as_str().map(str::to_string));
+        (status, flow)
+    }
+
+    /// Re-review M4: per-run reads follow THAT run's tenant; cross-run and
+    /// unattributable reads are refused under the strictest bound tenant;
+    /// a route carrying no session content is untouched.
+    #[tokio::test]
+    async fn per_run_and_cross_run_relay_reads_are_gated() {
+        use crate::egress::test_support::{fake_bound_tenants, fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000d);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _ton = pin(Flow::TranscriptSync, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _toff = pin_for(Flow::TranscriptSync, tenant, Level::Off);
+        let _r = fake_session_tenant("run-t", SessionScope::Tenant(tenant));
+        let _o = fake_session_tenant("run-o", SessionScope::DeviceDefault);
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let get =
+            |path: &str| serde_json::json!({"request_id": "rq", "method": "GET", "path": path});
+
+        for path in [
+            "/task-runs/run-t/workflow-state",
+            "/task-runs/run-t/screenshots",
+            "/state-explorer/run-t",
+        ] {
+            let reply = relay_http_to_base(&counter.http_base(), &get(path)).await;
+            assert_eq!(
+                status_and_flow(&reply),
+                (409, Some("terminal_stream".into())),
+                "{path}"
+            );
+        }
+        // Another run's per-run read is not this tenant's business.
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &get("/task-runs/run-o/workflow-state"),
+        )
+        .await;
+        assert_ne!(reply["status"], 409, "{reply}");
+
+        let _bound = fake_bound_tenants(vec![tenant]);
+        for path in [
+            "/graph/summary",
+            "/graph/search",
+            "/graph/cross-run-patterns",
+            "/graph/phase-stats",
+            "/graph/similar-errors",
+            "/graph/ineffective-rules",
+            "/screenshots/list",
+            "/state-explorer/history",
+            "/ui-bridge/control/snapshot",
+        ] {
+            let reply = relay_http_to_base(&counter.http_base(), &get(path)).await;
+            assert_eq!(
+                status_and_flow(&reply),
+                (409, Some("terminal_stream".into())),
+                "{path}"
+            );
+        }
+        let reply = relay_http_to_base(&counter.http_base(), &get("/memory/search")).await;
+        assert_eq!(
+            status_and_flow(&reply),
+            (409, Some("transcript_sync".into()))
+        );
+        // No session content: untouched even with every tenant refusing.
+        let before = counter.count();
+        let reply = relay_http_to_base(&counter.http_base(), &get("/configs")).await;
+        assert_ne!(reply["status"], 409, "{reply}");
+        assert!(counter.wait_for(before + 1, Duration::from_secs(5)) > before);
+    }
+
+    /// Re-review m5: a recognised record carrying NO run id is unattributable
+    /// and judged by the strictest bound tenant — never skipped.
+    #[test]
+    fn a_record_without_a_run_id_takes_the_strictest_bound_tenant() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000e);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let hitl = redacted(
+            "/hitl/pending",
+            serde_json::json!({"data": {"questions": [
+                {"id": "q", "task_run_id": null, "question": "SECRET-Q"}
+            ]}}),
+        );
+        assert!(!hitl.to_string().contains("SECRET"), "{hitl}");
+        let run = redacted(
+            "/task-runs",
+            serde_json::json!({"data": [{"task_name": "n", "output_log": "SECRET-O"}]}),
+        );
+        assert!(!run.to_string().contains("SECRET"), "{run}");
+    }
+
+    /// Re-review m6: on a content route, a body that cannot be parsed is never
+    /// passed through when the strictest bound tenant refuses.
+    #[test]
+    fn an_unparseable_content_body_is_refused_not_passed_through() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_000f);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        assert_eq!(
+            redact_relay_content("/task-runs", b"SECRET not json"),
+            RelayContent::Refuse
+        );
+    }
+
+    /// Re-review C2: a branch diff is attributed by the BRANCH — the worktree
+    /// that has it checked out — not by the repo path, whose refs are shared.
+    #[tokio::test]
+    async fn a_branch_diff_follows_the_tenant_owning_the_branch() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = base.join("repo");
+        let wt = base.join("wt-b");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("f"), "x").unwrap();
+        git(&root, &["add", "f"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+
+        let a = uuid::Uuid::from_u128(0x7e7a_0010);
+        let b = uuid::Uuid::from_u128(0x7e7a_0011);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let root_s = root.to_string_lossy().to_string();
+        let wt_s = wt.to_string_lossy().to_string();
+        let _ra = fake_session_tenant(&root_s, SessionScope::Tenant(a));
+        let _wb = fake_session_tenant(&wt_s, SessionScope::Tenant(b));
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let diff = |branch: &str| {
+            let body = serde_json::json!({
+                "branch_name": branch, "source_branch": "main", "repo_path": root_s, "full_diff": true
+            })
+            .to_string();
+            serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": "/worktrees/diff",
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            })
+        };
+        let reply = relay_http_to_base(&counter.http_base(), &diff("feat")).await;
+        assert_eq!(
+            status_and_flow(&reply),
+            (409, Some("code_mirror".into())),
+            "{reply}"
+        );
+        assert_eq!(counter.count(), 0);
+        // The root's own branch belongs to the root's tenant, which is on.
+        let reply = relay_http_to_base(&counter.http_base(), &diff("main")).await;
+        assert_ne!(reply["status"], 409, "{reply}");
+    }
+
+    /// A loopback HTTP server answering every request with `body` (200,
+    /// JSON) and recording each request line plus its body.
+    struct RecordingServer {
+        base: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingServer {
+        fn start(body: String) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text
+                                .get(..end)
+                                .unwrap_or("")
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let line = text.lines().next().unwrap_or("").to_string();
+                    let req_body = text.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
+                    log.lock().unwrap().push(format!("{line}\n{req_body}"));
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            Self { base, seen }
+        }
+    }
+
+    fn git_repo_with_worktrees(base: &std::path::Path, branches: &[&str]) -> std::path::PathBuf {
+        let root = base.join("repo");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("f"), "x").unwrap();
+        git(&root, &["add", "f"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        for b in branches {
+            let wt = base.join(format!("wt-{b}"));
+            git(
+                &root,
+                &["worktree", "add", "-q", "-b", b, wt.to_str().unwrap()],
+            );
+        }
+        root
+    }
+
+    /// Re-review C1: the diff also carries `source_branch`'s content, so its
+    /// owner must permit too.
+    #[tokio::test]
+    async fn a_branch_diff_also_follows_the_source_branchs_owner() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = git_repo_with_worktrees(&base, &["src-b"]);
+        let a = uuid::Uuid::from_u128(0x7e7a_0012);
+        let b = uuid::Uuid::from_u128(0x7e7a_0013);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let root_s = root.to_string_lossy().to_string();
+        let wt_s = base.join("wt-src-b").to_string_lossy().to_string();
+        let _ra = fake_session_tenant(&root_s, SessionScope::Tenant(a));
+        let _wb = fake_session_tenant(&wt_s, SessionScope::Tenant(b));
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let body = serde_json::json!({
+            "branch_name": "main", "source_branch": "src-b", "repo_path": root_s, "full_diff": true
+        })
+        .to_string();
+        let frame = serde_json::json!({
+            "request_id": "rq", "method": "POST", "path": "/worktrees/diff",
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+        });
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_eq!(
+            status_and_flow(&reply),
+            (409, Some("code_mirror".into())),
+            "{reply}"
+        );
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Re-review W4: the files routes forward the CANONICAL path the gate
+    /// checked, so the handler cannot re-resolve a swapped symlink.
+    #[tokio::test]
+    async fn the_files_routes_forward_the_canonical_path_the_gate_checked() {
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("real/f.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let server = RecordingServer::start("{}".to_string());
+        let asked = base.join("link/f.txt");
+        let query: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", &asked.to_string_lossy())
+            .append_pair("x", "1")
+            .finish();
+        let frame = serde_json::json!({
+            "request_id": "rq", "method": "GET", "path": "/files/read", "query": query,
+        });
+        let reply = relay_http_to_base(&server.base, &frame).await;
+        assert_eq!(reply["status"], 200, "{reply}");
+        let seen = server.seen.lock().unwrap().clone();
+        let line = seen
+            .first()
+            .expect("forwarded")
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let want: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", &base.join("real/f.txt").to_string_lossy())
+            .finish();
+        assert!(line.contains(&want), "{line} lacks {want}");
+        assert!(line.contains("x=1"), "other parameters survive: {line}");
+    }
+
+    /// Re-review W5: merge / remove still run, but their cross-tenant
+    /// metadata is blanked when an owner's code mirror is off.
+    #[tokio::test]
+    async fn merge_and_remove_responses_hide_metadata_of_a_refused_owner() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let b = uuid::Uuid::from_u128(0x7e7a_0014);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let _r = fake_session_tenant("/work/repo-b", SessionScope::Tenant(b));
+        let _o = fake_session_tenant("/work/repo-o", SessionScope::DeviceDefault);
+        let response = serde_json::json!({
+            "success": true,
+            "data": {"success": false, "conflicts": ["SECRET-C"], "summary": "SECRET-S",
+                     "ai_merge_prompt": "SECRET-P"},
+            "hint": {"status": "blocked", "conflicting_files": ["SECRET-F"],
+                     "owning_sessions": ["SECRET-O"]}
+        })
+        .to_string();
+        let server = RecordingServer::start(response);
+        let frame = |path: &str, repo: &str| {
+            let body = serde_json::json!({
+                "branch_name": "feat", "source_branch": "main", "repo_path": repo,
+                "worktree_path": repo, "ai_resolve": false, "delete_branch": false
+            })
+            .to_string();
+            serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": path,
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            })
+        };
+        let decode = |reply: &serde_json::Value| {
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(reply["body_b64"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        for path in [
+            "/worktrees/merge",
+            "/worktrees/merge-force",
+            "/worktrees/remove",
+        ] {
+            let before = server.seen.lock().unwrap().len();
+            let reply = relay_http_to_base(&server.base, &frame(path, "/work/repo-b")).await;
+            assert_eq!(reply["status"], 200, "{path}: the action still runs");
+            assert_eq!(
+                server.seen.lock().unwrap().len(),
+                before + 1,
+                "{path} forwarded"
+            );
+            let text = decode(&reply);
+            assert!(!text.contains("SECRET"), "{path}: {text}");
+            assert!(text.contains("egress_redacted"), "{path}: {text}");
+        }
+        let reply =
+            relay_http_to_base(&server.base, &frame("/worktrees/merge", "/work/repo-o")).await;
+        assert!(
+            decode(&reply).contains("SECRET-F"),
+            "an owner that is on sees it all"
+        );
+    }
+
+    /// Round 7 (W5): merge-force's `stashed_files` / `stash_note` are the
+    /// conflicting files under another key, and an `error` string from git
+    /// can name files too — all blanked when an owner's mirror is off.
+    #[tokio::test]
+    async fn merge_force_stash_report_and_error_text_are_redacted_too() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let b = uuid::Uuid::from_u128(0x7e7a_0015);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let _r = fake_session_tenant("/work/repo-b2", SessionScope::Tenant(b));
+        for response in [
+            serde_json::json!({"success": true, "data": {
+                "success": true, "status": "merged", "stash_ref": "stash@{0}",
+                "stashed_files": ["SECRET/a.rs"],
+                "stash_note": "Recover with: git stash pop SECRET"}}),
+            serde_json::json!({"success": false, "data": null,
+                "error": "error: Your local changes to the following files would be overwritten by merge:\n\tSECRET/b.rs",
+                "error_detail": "SECRET/b.rs"}),
+        ] {
+            let server = RecordingServer::start(response.to_string());
+            let body = serde_json::json!({
+                "branch_name": "feat", "source_branch": "main", "repo_path": "/work/repo-b2"
+            })
+            .to_string();
+            let frame = serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": "/worktrees/merge-force",
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            });
+            let reply = relay_http_to_base(&server.base, &frame).await;
+            let text = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(reply["body_b64"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!text.contains("SECRET"), "{text}");
+            assert!(text.contains("egress_redacted"), "{text}");
+        }
+    }
+
+    /// Round 7 (W4): the canonical path forwarded to the files routes loses
+    /// Windows' verbatim prefix and keeps its case.
+    #[test]
+    fn the_forwarded_canonical_path_drops_the_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Work\Repo\a.RS"),
+            r"C:\Work\Repo\a.RS"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\Server\Share\X"),
+            r"\\Server\Share\X"
+        );
+        assert_eq!(strip_verbatim_prefix("/home/u/Repo"), "/home/u/Repo");
+        assert_eq!(strip_verbatim_prefix(r"C:\plain"), r"C:\plain");
+    }
+
+    /// Re-review W7: the porcelain is read NUL-separated (`-z`).
+    #[test]
+    fn the_worktree_porcelain_is_read_nul_separated() {
+        let z = "worktree /r/main\0HEAD abc\0branch refs/heads/main\0\0worktree /r/odd\nname\0HEAD def\0branch refs/heads/feat\0\0";
+        assert_eq!(
+            worktree_for_branch(z, "feat").as_deref(),
+            Some("/r/odd\nname")
+        );
+        assert_eq!(worktree_for_branch(z, "main").as_deref(), Some("/r/main"));
+        assert_eq!(worktree_for_branch(z, "none"), None);
+    }
+
+    fn redacted(path: &str, body: serde_json::Value) -> serde_json::Value {
+        match redact_relay_content(path, body.to_string().as_bytes()) {
+            RelayContent::Replace(out) => serde_json::from_slice(&out).unwrap(),
+            other => panic!("expected a rewritten body, got {other:?}"),
+        }
+    }
+
+    /// C2: task-run reads (list, running, single) strip the session content of
+    /// every run whose tenant has terminal streaming off; other runs keep it.
+    #[test]
+    fn task_run_reads_strip_content_of_a_refused_tenants_runs() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0008);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("run-t", SessionScope::Tenant(tenant));
+        let _o = fake_session_tenant("run-o", SessionScope::DeviceDefault);
+        let run = |id: &str| {
+            serde_json::json!({
+                "id": id, "task_name": "n", "status": "running", "sessions_count": 1,
+                "output_log": "SECRET-OUT", "prompt": "SECRET-PROMPT",
+                "summary": "SECRET-SUM", "ai_summary": "SECRET-SUM",
+                "remaining_work": "SECRET-REM", "error_message": "SECRET-ERR",
+            })
+        };
+        let list = redacted(
+            "/task-runs",
+            serde_json::json!({"success": true, "data": [run("run-t"), run("run-o")]}),
+        );
+        let text = list["data"][0].to_string();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert_eq!(list["data"][0]["output_log"], "");
+        assert!(list["data"][0]["egress_redacted"].is_array());
+        assert_eq!(
+            list["data"][1]["output_log"], "SECRET-OUT",
+            "another tenant's run keeps it"
+        );
+
+        let running = redacted(
+            "/task-runs/running",
+            serde_json::json!({"scope": {}, "task_runs": [run("run-t")]}),
+        );
+        assert!(!running.to_string().contains("SECRET"), "{running}");
+        let single = redacted("/task-runs/run-t", run("run-t"));
+        assert!(!single.to_string().contains("SECRET"), "{single}");
+        // A run nobody can attribute is judged by the strictest bound tenant.
+        let _bound = crate::egress::test_support::fake_bound_tenants(vec![tenant]);
+        let unknown = redacted("/task-runs/run-x", run("run-x"));
+        assert!(!unknown.to_string().contains("SECRET"), "{unknown}");
+    }
+
+    /// C2: findings and pending human-in-the-loop questions of a refused
+    /// tenant's run lose their content fields too.
+    #[test]
+    fn findings_and_hitl_reads_strip_content_of_a_refused_tenants_runs() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0009);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _t = fake_session_tenant("run-t", SessionScope::Tenant(tenant));
+        let findings = redacted(
+            "/findings/task/run-t",
+            serde_json::json!({"success": true, "data": [{
+                "id": "f1", "taskRunId": "run-t", "sessionNum": 1,
+                "title": "SECRET-T", "description": "SECRET-D", "resolution": "SECRET-R",
+                "codeContext": {"file": "SECRET-F"}, "userResponse": "SECRET-U",
+                "signatureHash": "h"
+            }]}),
+        );
+        assert!(!findings.to_string().contains("SECRET"), "{findings}");
+        let hitl = redacted(
+            "/hitl/pending",
+            serde_json::json!({"success": true, "data": {"questions": [{
+                "id": "q1", "task_run_id": "run-t", "question": "SECRET-Q",
+                "context_json": "SECRET-C", "auto_decision_detail": "SECRET-A",
+                "reviewer_comment": "SECRET-RC", "status": "pending"
+            }]}}),
+        );
+        assert!(!hitl.to_string().contains("SECRET"), "{hitl}");
+    }
+
+    /// C2: with every tenant streaming, nothing is rewritten; a route that
+    /// carries no run content is never touched.
+    #[test]
+    fn content_reads_are_untouched_while_streaming_is_on() {
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let body = serde_json::json!({"data": [{"id": "r", "task_name": "n", "output_log": "x"}]});
+        assert_eq!(
+            redact_relay_content("/task-runs", body.to_string().as_bytes()),
+            RelayContent::Keep
+        );
+        let _off = pin(Flow::TerminalStream, Level::Off);
+        assert_eq!(
+            redact_relay_content("/configs", body.to_string().as_bytes()),
+            RelayContent::Keep
+        );
+    }
+
+    #[tokio::test]
+    async fn http_request_task_run_reads_ask_in_the_runs_tenant() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        let tenant = uuid::Uuid::from_u128(0x7e7a_0002);
+        let run = "22222222-2222-2222-2222-222222222222";
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let _r = fake_session_tenant(run, crate::egress::SessionScope::Tenant(tenant));
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let path = format!("/task-runs/{run}/output");
+        let frame = serde_json::json!({"request_id": "rq", "method": "GET", "path": path});
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_eq!(reply["status"], 409, "{reply}");
+        assert_eq!(counter.count(), 0, "nothing may reach the loopback API");
+    }
+
+    /// Both checks are wired where they act: before dispatch, and before the
+    /// forwarder builds a frame.
+    #[test]
+    fn both_gates_are_wired() {
+        let src = include_str!("backend_relay.rs");
+        let cmd = src
+            .split_once("\nasync fn handle_relay_command(")
+            .unwrap()
+            .1;
+        let gate = cmd
+            .find("terminal_egress_refusal(&msg_type, data)")
+            .unwrap();
+        let dispatch = cmd.find("match msg_type.as_str()").unwrap();
+        assert!(gate < dispatch);
+        let out = src.split_once("\nasync fn handle_outbound(").unwrap().1;
+        let gate = out
+            .find("outbound_egress_permitted(channel, &event)")
+            .unwrap();
+        let build = out.find("let relay_msg = match channel").unwrap();
+        assert!(gate < build);
     }
 }
