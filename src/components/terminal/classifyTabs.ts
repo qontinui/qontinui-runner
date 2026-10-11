@@ -1,4 +1,5 @@
 import type { ZoneAssignments } from "./useZoneLayout";
+import type { TerminalWorkMode } from "./terminalWorkMode";
 
 /**
  * Per-tab mount classification for a single render pass (Layer 1 of
@@ -25,8 +26,29 @@ import type { ZoneAssignments } from "./useZoneLayout";
  *                           flips it to `assigned-live`, the instance cold-mounts
  *                           and the grid-snapshot + PTY-ring scrollback replay
  *                           repaints full history for free.
+ *
+ * tmux work mode (plan `2026-10-11-runner-terminal-tmux-work-mode` D2) has ONE
+ * mount owner for every tab — `TmuxViewport` — and no `HiddenTerminal`
+ * parking at all:
+ *  - `"assigned"`            — the shown tab (zone 0) → its visible cell.
+ *  - `"offscreen"`           — any other PTY tab → a parked cell that keeps
+ *                              its `TerminalInstance` mounted with
+ *                              `visible={false}`, so a swap is a prop flip,
+ *                              not a remount.
+ *  - `"offscreen-unmounted"` — a parked plan tab or Conductor worker
+ *                              (`sessionBacked`) tab → mounts NOTHING. Neither
+ *                              has a PTY to keep warm, and an off-screen
+ *                              `TerminalInstance` for one would attach to a
+ *                              terminal id naming no process (the same
+ *                              exclusion grid mode's hidden parking applies).
  */
-export type TabClassification = "assigned" | "assigned-live" | "assigned-virtual" | "hidden";
+export type TabClassification =
+  | "assigned"
+  | "assigned-live"
+  | "assigned-virtual"
+  | "hidden"
+  | "offscreen"
+  | "offscreen-unmounted";
 
 /**
  * Number of `TerminalInstance` mount owners a classification implies. The
@@ -36,7 +58,7 @@ export type TabClassification = "assigned" | "assigned-live" | "assigned-virtual
  * the invariant is "exactly one OR zero", never two.
  */
 export function mountOwnerCount(classification: TabClassification): 0 | 1 {
-  return classification === "assigned-virtual" ? 0 : 1;
+  return classification === "assigned-virtual" || classification === "offscreen-unmounted" ? 0 : 1;
 }
 
 /**
@@ -51,14 +73,28 @@ export function mountOwnerCount(classification: TabClassification): 0 | 1 {
  *                       `nearViewport` is ignored for them.
  * @param nearViewport   tab-ids whose zone cell is at/near the viewport (within
  *                       the observer overscan). Only consulted in flow mode.
+ * @param workMode       the page's work mode. In `tmux` the shown tab is
+ *                       zone 0's and every other tab is parked; `isFlowMode`
+ *                       and `nearViewport` are ignored (the layout is pinned
+ *                       to `single`).
  */
 export function classifyTabs(
-  tabs: readonly { id: string }[],
+  tabs: readonly { id: string; type?: string; sessionBacked?: boolean }[],
   assignments: ZoneAssignments,
   isFlowMode: boolean,
   nearViewport: ReadonlySet<string>,
+  workMode: TerminalWorkMode = "grid",
 ): Map<string, TabClassification> {
   const m = new Map<string, TabClassification>();
+  if (workMode === "tmux") {
+    const shown = assignments[0];
+    for (const t of tabs) {
+      if (t.id === shown) m.set(t.id, "assigned");
+      else if (t.type === "plan" || t.sessionBacked) m.set(t.id, "offscreen-unmounted");
+      else m.set(t.id, "offscreen");
+    }
+    return m;
+  }
   const assignedIds = new Set(Object.values(assignments).filter((id): id is string => id != null));
   for (const t of tabs) {
     if (!assignedIds.has(t.id)) {

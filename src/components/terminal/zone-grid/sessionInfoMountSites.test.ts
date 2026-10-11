@@ -15,7 +15,7 @@
  * The five paths that render a live session:
  *   1. full zone header      `zone-grid/ZoneLabel.tsx`      → mounts
  *   2. single / maximized    `ZoneGrid.tsx`                 → mounts
- *   3. solo session strip    `ZoneGrid.tsx`                 → mounts
+ *   3. solo session strip    `zone-grid/ZoneCell.tsx`       → mounts
  *   4. compact zone card     `zone-grid/CompactZoneCard.tsx`→ mounts (this fix)
  *   5. off-grid parking      `zone-grid/HiddenTerminal.tsx` → deliberately NOT
  *
@@ -38,6 +38,7 @@ const COMPACT = read("./CompactZoneCard.tsx");
 const ZONE_LABEL = read("./ZoneLabel.tsx");
 const HIDDEN = read("./HiddenTerminal.tsx");
 const ZONE_GRID = read("../ZoneGrid.tsx");
+const ZONE_CELL = read("./ZoneCell.tsx");
 
 /** The one call shape every mount site uses. */
 const MOUNT = "<SessionInfoDropdown claudeSessionId={tab.claudeSessionId}";
@@ -54,7 +55,7 @@ describe("SessionInfoDropdown mount sites", () => {
 
   it("still mounts in the single/maximized header and the solo strip", () => {
     expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={singleViewZone} />`);
-    expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
+    expect(ZONE_CELL).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
   });
 
   it("does NOT mount inside the off-grid hidden parking slot", () => {
@@ -84,7 +85,7 @@ describe("SessionInfoDropdown addressability across mount sites", () => {
     // `showCompactCard` gates the two apart in the zone cell, and
     // `showSoloSessionInfo` excludes the compact card outright — so at most one
     // of the three mount sites renders for any given `zoneIdx`.
-    expect(ZONE_GRID).toContain("{showCompactCard && (");
-    expect(ZONE_GRID).toContain("{!showCompactCard && showLabels && (");
+    expect(ZONE_CELL).toContain("{showCompactCard && (");
+    expect(ZONE_CELL).toContain("{!showCompactCard && showLabels && (");
   });
 });
