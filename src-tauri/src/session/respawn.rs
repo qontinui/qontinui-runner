@@ -79,7 +79,9 @@
 //!    arm genuinely diverges from handoff's step 6: the source is *already*
 //!    closed — that is the premise of the feature — and coord's `post_respawn`
 //!    issues no `UPDATE` against `coord.sessions` either. There is no
-//!    `DELETE /sessions/:id` anywhere in this module, and a test asserts it.
+//!    `DELETE /sessions/:id` anywhere in this module, and no
+//!    `POST /sessions/:id/handoff/complete` (handoff's step-6 close door)
+//!    either; [`tests::respawn_module_never_closes_the_source`] asserts both.
 
 use std::sync::Arc;
 
@@ -601,11 +603,11 @@ fn transcript_bytes_from_output_body(body: &serde_json::Value) -> Vec<u8> {
 /// Materialize one respawn end-to-end. Returns the new terminal id.
 ///
 /// **The source session is never closed here.** Handoff's step 6
-/// (`DELETE /sessions/:id`) has nothing to act on: the source is already
-/// `closed`, which is the premise of a respawn, and coord's `post_respawn`
-/// issues no `UPDATE` against `coord.sessions` either. This function contains
-/// no delete of any kind, and [`tests::respawn_module_never_closes_the_source`]
-/// asserts it stays that way.
+/// (`POST /sessions/:id/handoff/complete`) has nothing to act on: the source
+/// is already `closed`, which is the premise of a respawn, and coord's
+/// `post_respawn` issues no `UPDATE` against `coord.sessions` either. This
+/// function contains no delete and no handoff completion of any kind, and
+/// [`tests::respawn_module_never_closes_the_source`] asserts it stays that way.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -1208,10 +1210,11 @@ mod tests {
     // The do-not-close-the-source divergence
     // -----------------------------------------------------------------------
 
-    /// Handoff's step 6 closes the source (`DELETE /sessions/:id`). A respawn
-    /// must NOT: the source is already `closed`, and coord's `post_respawn`
-    /// issues no `UPDATE` against `coord.sessions` either. This is a source
-    /// guard — a future edit that adds a close here trips it.
+    /// Handoff's step 6 closes the source
+    /// (`POST /sessions/:id/handoff/complete`). A respawn must NOT: the source
+    /// is already `closed`, and coord's `post_respawn` issues no `UPDATE`
+    /// against `coord.sessions` either. This is a source guard — a future edit
+    /// that adds a close here trips it.
     #[test]
     fn respawn_module_never_closes_the_source() {
         let src = include_str!("respawn.rs");
@@ -1232,7 +1235,13 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for forbidden in ["close_source", "http.delete", ".delete(", "DELETE"] {
+        for forbidden in [
+            "close_source",
+            "http.delete",
+            ".delete(",
+            "DELETE",
+            "handoff/complete",
+        ] {
             assert!(
                 !code.contains(forbidden),
                 "the respawn arm must never close its source, but the module's code \
