@@ -3677,6 +3677,26 @@ pub struct Settings {
     /// runner restart.
     #[serde(default)]
     pub api: ApiSettings,
+    /// Model gateway declaration (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D12). An
+    /// empty `base_url` (the default) means no gateway: every behavior is
+    /// unchanged. See [`crate::model_gateway`].
+    #[serde(default)]
+    pub model_gateway: crate::model_gateway::ModelGatewaySettings,
+    /// Permission posture for runner-spawned `claude` sessions (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D7). The
+    /// default keeps each spawn site's bypass flag. `allow_list` replaces it
+    /// with a pre-approved tool list, for machines whose IT-managed Claude Code
+    /// settings disable bypass mode. Read per spawn: into
+    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`] (every
+    /// `LaunchSpec` spawn site, the typed resume renderer
+    /// `commands::config::build_ai_resume_command`, and the provider-adapter
+    /// launch spec), by the scheduler's RemoteAgent launch (intersected with the
+    /// task's tools), and by the orchestration fix agent. Settings layers the
+    /// runner does not own (a repository's `.claude/settings.json`, managed
+    /// settings) can still pre-approve more tools.
+    #[serde(default)]
+    pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
 }
 
 /// Settings → Runner → "Allowed browser origins".
@@ -6306,6 +6326,46 @@ pub fn get_remote_create_settings() -> RemoteCreateSettings {
 /// Persist the remote-create preference.
 pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), String> {
     update_settings(|settings| settings.remote_create.accept_remote_create = pref)
+}
+
+/// Get the model gateway declaration. See [`crate::model_gateway`].
+pub fn get_model_gateway() -> crate::model_gateway::ModelGatewaySettings {
+    crate::model_gateway::current_settings()
+}
+
+/// Validate, normalize and persist the model gateway declaration. An invalid
+/// declaration is refused and nothing is written. Returns what was stored.
+pub fn save_model_gateway(
+    value: crate::model_gateway::ModelGatewaySettings,
+) -> Result<crate::model_gateway::ModelGatewaySettings, String> {
+    let normalized = value.normalized();
+    normalized.validate()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.model_gateway = normalized)?;
+    // The sticky marker (written for a gateway, deleted for an explicit clear)
+    // is what lets a later settings reset read as UNKNOWN rather than "no
+    // gateway" — see `model_gateway` "Fail closed".
+    crate::model_gateway::record_saved_declaration(&stored)?;
+    Ok(stored)
+}
+
+/// Get the session permission posture. See [`Settings::claude_session_permission`].
+///
+/// Read-only loader: consulted per spawn by `LaunchConfig::from_settings`.
+pub fn get_claude_session_permission(
+) -> crate::claude_session::launch_spec::SessionPermissionSetting {
+    read_settings_from_disk().settings.claude_session_permission
+}
+
+/// Validate, normalize and persist the session permission posture. Returns what
+/// was stored.
+pub fn save_claude_session_permission(
+    value: crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<crate::claude_session::launch_spec::SessionPermissionSetting, String> {
+    let normalized = value.normalized()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.claude_session_permission = normalized)?;
+    Ok(stored)
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see

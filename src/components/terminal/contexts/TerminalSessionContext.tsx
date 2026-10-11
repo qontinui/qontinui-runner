@@ -80,7 +80,7 @@ import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
-import { decideColdResume } from "../useTerminalInitialization";
+import { buildResumeCmd, decideColdResume } from "../useTerminalInitialization";
 import {
   buildSessionOpenArgs,
   describeRecordOpenOutcome,
@@ -340,17 +340,6 @@ const PageSessionScope = memo(function PageSessionScope({
     const sessions = pendingProfileSessionsRef.current;
     if (!sessions || sessions.length === 0) return;
 
-    const isWindows = navigator.platform.startsWith("Win");
-    const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
-      // Autonomous resume (matches clg/clh/clp) so a re-attached session
-      // doesn't stall on a permission prompt.
-      const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
-      if (!configDir) return `${base}\r`;
-      return isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
-        : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
-    };
-
     // Process only sessions whose zone now has an assignment; leave the
     // rest in the ref for the next assignments tick. The partition (and the
     // ref update) stays SYNCHRONOUS so a re-fire of this effect while the
@@ -449,17 +438,23 @@ const PageSessionScope = memo(function PageSessionScope({
             ),
           )
           .catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
-        writeWhenReady(
-          terminalRefs.current,
-          tabId,
-          buildResumeCmd(s.claudeSessionId, s.claudeConfigDir),
-          {
-            onTimeout: (id) =>
-              console.warn(
-                `[TerminalSession] profile resume: terminal ref for ${id} never became ready`,
-              ),
-          },
-        );
+        // Rendered by the backend: the config dir (a model gateway replaces
+        // the recorded subscription dir) and the permission posture are its
+        // decisions, never this file's.
+        let resumeCmd: string;
+        try {
+          // "summary": no threshold env, exactly as this path always typed it.
+          resumeCmd = await buildResumeCmd(s.claudeSessionId, s.claudeConfigDir, "summary");
+        } catch (err) {
+          console.warn(`[TerminalSession] profile resume not rendered:`, err);
+          continue;
+        }
+        writeWhenReady(terminalRefs.current, tabId, resumeCmd, {
+          onTimeout: (id) =>
+            console.warn(
+              `[TerminalSession] profile resume: terminal ref for ${id} never became ready`,
+            ),
+        });
       }
     })();
   }, [zoneLayout.assignments, updateTab, tabs, pageId]);

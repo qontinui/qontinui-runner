@@ -405,7 +405,8 @@ async fn handle_http_forward(
             if let Some((name, _rest)) = header.split_once(':') {
                 if cred_proxy.should_scan_header(name.trim()) {
                     let value = header.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
-                    if let Some((replaced_value, cred_name)) = cred_proxy.resolve_placeholder(value)
+                    if let Some((replaced_value, cred_name)) =
+                        cred_proxy.resolve_placeholder(value, &domain)
                     {
                         header_line = format!("{}: {}\r\n", name.trim(), replaced_value);
                         // Log credential injection (without the actual value)

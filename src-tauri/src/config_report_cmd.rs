@@ -2406,6 +2406,14 @@ mod tests {
                 "C:/claude/acct-d",
                 "request_override",
             ),
+            (
+                (
+                    Some("C:/q/model-gateway/claude-config".to_string()),
+                    ClaudeConfigDirSource::ModelGateway,
+                ),
+                "C:/q/model-gateway/claude-config",
+                "model_gateway",
+            ),
             // An account IS configured and its credentials are dead …
             (
                 (None, ClaudeConfigDirSource::RejectedNoCredentials),

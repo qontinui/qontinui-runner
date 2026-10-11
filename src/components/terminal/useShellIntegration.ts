@@ -14,6 +14,7 @@ import {
 } from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
 import { writeToPaneOrReport } from "./approveAll";
+import { buildResumeCmd } from "./useTerminalInitialization";
 
 /** Written-vs-bound reporting for the shell-integration OPEN record. */
 const recordOpenLogger = createLogger("ShellIntegration");
@@ -223,36 +224,32 @@ export function useShellIntegration({
       setRightPanelMode(null);
       setSelectedTranscriptSessionId(null);
 
-      // Queue the resume command — it will be sent once the shell emits its first prompt.
-      // Include the config_dir so Claude CLI searches the right directory.
-      // Windows terminals use PowerShell ($env:VAR), others use bash (VAR=val cmd).
-      const configDir = session.config_dir;
-      const isWindows = navigator.platform.startsWith("Win");
-      // Resume autonomously (`--permission-mode bypassPermissions`) to match
-      // the operator's clg/clh/clp wrappers — a resumed session shouldn't
-      // stall on a permission prompt either.
-      let resumeCmd: string;
-      if (configDir) {
-        resumeCmd = isWindows
-          ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --permission-mode bypassPermissions --resume ${session.session_id}`
-          : `CLAUDE_CONFIG_DIR="${configDir}" claude --permission-mode bypassPermissions --resume ${session.session_id}`;
-      } else {
-        resumeCmd = `claude --permission-mode bypassPermissions --resume ${session.session_id}`;
-      }
-      pendingResumeRef.current = { tabId, resumeCmd };
+      // Queue the resume command — it will be sent once the shell emits its
+      // first prompt. RENDERED BY THE BACKEND (`buildResumeCmd` →
+      // `build_ai_resume_command`): the config dir (a declared model gateway
+      // replaces the recorded subscription dir) and the permission posture
+      // are its decisions, never this file's.
+      // "summary": an operator-clicked resume keeps the CLI's own resume-size
+      // picker (no threshold env), exactly as this path always typed it.
+      void buildResumeCmd(session.session_id, session.config_dir ?? undefined, "summary")
+        .then((typed) => {
+          const resumeCmd = typed.replace(/\r$/, "");
+          pendingResumeRef.current = { tabId, resumeCmd };
 
-      // Fallback: send after 1.5 s regardless (in case shell integration isn't active)
-      setTimeout(() => {
-        const pending = pendingResumeRef.current;
-        if (!pending || pending.tabId !== tabId) return;
-        pendingResumeRef.current = null;
-        void writeToPaneOrReport(
-          terminalRefs.current,
-          tabId,
-          `${pending.resumeCmd}\r`,
-          "resume fallback timer",
-        );
-      }, 1500);
+          // Fallback: send after 1.5 s regardless (in case shell integration isn't active)
+          setTimeout(() => {
+            const pending = pendingResumeRef.current;
+            if (!pending || pending.tabId !== tabId) return;
+            pendingResumeRef.current = null;
+            void writeToPaneOrReport(
+              terminalRefs.current,
+              tabId,
+              `${pending.resumeCmd}\r`,
+              "resume fallback timer",
+            );
+          }, 1500);
+        })
+        .catch((err) => console.warn(`[ShellIntegration] resume not rendered:`, err));
     },
     [
       createTerminal,

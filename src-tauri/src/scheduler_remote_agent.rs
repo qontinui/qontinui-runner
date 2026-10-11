@@ -183,34 +183,65 @@ pub(crate) fn compose_prompt(prompt: &str, mcp_connections: &[McpConnectionRef])
 /// child EXIT when the task is done — an interactive session would idle at its
 /// prompt forever. `--dangerously-skip-permissions` for the same reason every
 /// autonomous spawn carries it: nobody is at the keyboard to click Allow.
+///
+/// When the operator selected the allow-list session posture
+/// (`settings.claude_session_permission`, plan
+/// `2026-10-09-spec-front-end-of-the-software-factory` D7), bypass is replaced by
+/// `--permission-mode dontAsk` and a tool list that can only NARROW the
+/// operator's: the INTERSECTION of the task's `allowed_tools` and the
+/// operator's list (review M1), or the operator's list when the task declares
+/// none. A task whose tools share nothing with the operator's list is refused —
+/// running it with the task's wider list, or with none, would both be wrong.
+/// `--allowedTools` is rendered by the shared
+/// [`allowed_tools_args`](crate::claude_session::launch_spec::allowed_tools_args).
 pub(crate) fn claude_args(
     session_id: &str,
     model: Option<&str>,
     allowed_tools: &[String],
     max_turns: u32,
-) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        "--dangerously-skip-permissions".to_string(),
+    session_permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<Vec<String>, String> {
+    use crate::claude_session::launch_spec::{
+        allowed_tools_args, intersect_tool_lists, PermissionMode,
+    };
+
+    let task_tools = allowed_tools_args(allowed_tools);
+    let (permission, tools_tail) = match session_permission.apply(PermissionMode::DangerouslySkip) {
+        PermissionMode::AllowList { tools } => {
+            let effective = if task_tools.is_empty() {
+                tools.clone()
+            } else {
+                let kept = intersect_tool_lists(&tools, allowed_tools);
+                if kept.is_empty() {
+                    return Err(format!(
+                        "scheduled task refused: none of its allowed_tools {allowed_tools:?} is on \
+                         the operator's session allow-list {tools:?}"
+                    ));
+                }
+                kept
+            };
+            (
+                PermissionMode::AllowList { tools: Vec::new() }.render(),
+                allowed_tools_args(&effective),
+            )
+        }
+        other => (other.render(), task_tools),
+    };
+
+    let mut args = vec!["-p".to_string()];
+    args.extend(permission);
+    args.extend([
         "--session-id".to_string(),
         session_id.to_string(),
         "--max-turns".to_string(),
         max_turns.to_string(),
-    ];
+    ]);
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(m.to_string());
     }
-    let tools: Vec<&str> = allowed_tools
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-    if !tools.is_empty() {
-        args.push("--allowedTools".to_string());
-        args.extend(tools.into_iter().map(str::to_string));
-    }
-    args
+    args.extend(tools_tail);
+    Ok(args)
 }
 
 /// Classify a child's end into the scheduler's `(success, error)` pair.
@@ -296,7 +327,8 @@ pub(crate) async fn launch(
         spec.model.as_deref(),
         &spec.allowed_tools,
         spec.max_turns,
-    );
+        &crate::settings::get_claude_session_permission(),
+    )?;
 
     let (mut child, _preconditions) =
         crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
@@ -475,7 +507,7 @@ mod tests {
 
     #[test]
     fn args_are_print_mode_bounded_and_pinned() {
-        let args = claude_args("sid-1", None, &[], 200);
+        let args = claude_args("sid-1", None, &[], 200, &Default::default()).unwrap();
         assert_eq!(
             args,
             vec![
@@ -492,7 +524,8 @@ mod tests {
     #[test]
     fn args_carry_model_and_one_token_per_allowed_tool() {
         let tools = vec!["Bash".to_string(), " Read ".to_string(), "".to_string()];
-        let args = claude_args("sid", Some("claude-opus-5"), &tools, 5);
+        let args =
+            claude_args("sid", Some("claude-opus-5"), &tools, 5, &Default::default()).unwrap();
         assert_eq!(
             args,
             vec![
@@ -509,6 +542,54 @@ mod tests {
                 "Read"
             ]
         );
+    }
+
+    /// Review M1: under the allow-list posture the task's tools are
+    /// INTERSECTED with the operator's list — a task can narrow, never widen.
+    #[test]
+    fn allow_list_posture_intersects_task_and_operator_tools() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let op = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+        };
+        let task = vec!["Bash(git status)".to_string(), "Read".to_string()];
+        let args = claude_args("sid", None, &task, 3, &op).expect("non-empty intersection");
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--permission-mode",
+                "dontAsk",
+                "--session-id",
+                "sid",
+                "--max-turns",
+                "3",
+                "--allowedTools",
+                "Read"
+            ]
+        );
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("dangerously") || a.contains("Bash")));
+
+        // No task tools: the operator's list applies.
+        let args = claude_args("sid", None, &[], 3, &op).unwrap();
+        assert_eq!(
+            args[args.len() - 3..].to_vec(),
+            vec!["--allowedTools", "Read", "Grep"]
+        );
+    }
+
+    /// Review M1: a task whose tools share nothing with the operator's list is
+    /// refused rather than run with the task's (wider) list or with none.
+    #[test]
+    fn allow_list_posture_refuses_an_empty_intersection() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let op = SessionPermissionSetting::AllowList {
+            tools: vec!["Read".to_string()],
+        };
+        let err = claude_args("sid", None, &["Bash".to_string()], 3, &op).unwrap_err();
+        assert!(err.contains("allow-list"), "{err}");
     }
 
     #[test]

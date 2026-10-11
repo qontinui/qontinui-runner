@@ -7,6 +7,17 @@
 //! covers all token cost. The subprocess inherits whatever auth the
 //! operator's `claude` install has.
 //!
+//! **Exception: an install that declares a model gateway.** The accepted
+//! decision record `gateway-tenants-route-every-model-call-through-the-gateway`
+//! (2026-10-10) supersedes the rule above for gateway tenants only. Their
+//! spawned `claude` children run under the runner-owned gateway
+//! `CLAUDE_CONFIG_DIR`, with `ANTHROPIC_BASE_URL` pointed at the gateway and the
+//! key supplied by the operator's `apiKeyHelper`. Subscription accounts and
+//! account rotation are off. The env is applied by the credential scrub this
+//! module's spawn seam already calls last (`finalize_headless_child_env`); the
+//! mechanism is [`crate::model_gateway`]. Every other install keeps the rule
+//! unchanged.
+//!
 //! ## Flow
 //!
 //! 1. `spawn_runtime()` connects this runner to coord's `/ws` and
@@ -9543,6 +9554,12 @@ pub(crate) async fn spawn_claude_child(
     // signal delivery.
     own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
+    // A model gateway that cannot be resolved (invalid, or its state unknown)
+    // refuses the spawn outright rather than starting a session that can only
+    // fail — or worse, reach a vendor (`crate::model_gateway`, review H2).
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        anyhow::bail!(refusal);
+    }
     // Resolved to an absolute path through the same PATH walk the PTY seams
     // use, so a failure names the real file. Falls back to the bare name when
     // nothing resolves; the spawn below retries either way (plan
@@ -11580,6 +11597,7 @@ mod tests {
                 &crate::claude_session::launch_spec::LaunchConfig {
                     default_template: template.map(str::to_string),
                     account_command: None,
+                    ..Default::default()
                 },
             )
         };
@@ -17258,5 +17276,40 @@ mod launch_hold_tests {
         )
         .await;
         assert_eq!(out, LaunchHold::Refused(refusal));
+    }
+}
+
+/// Review N1/H2 wiring: `spawn_claude_child` refuses while the model gateway is
+/// unresolved (a reset settings file with the sticky marker present). Goes red
+/// if the `spawn_refusal` check is removed from the spawn path.
+#[cfg(test)]
+mod gateway_spawn_refusal_tests {
+    #[tokio::test]
+    async fn spawn_claude_child_refuses_an_unresolved_gateway() {
+        let _amb = crate::test_env::isolated_ambient();
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://wiring-gw.example.com".to_string()),
+            api_key_helper: Some("echo wiring-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        let workdir = std::env::temp_dir();
+        let outcome = super::spawn_claude_child(
+            &workdir.to_string_lossy(),
+            "hi",
+            None,
+            crate::coord_mcp::CoordMcpDelivery::Provisioned,
+            &[],
+            false,
+        )
+        .await;
+        match outcome {
+            Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
+            Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
+        }
     }
 }

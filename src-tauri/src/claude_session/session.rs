@@ -229,6 +229,9 @@ impl ClaudeSession {
             "Spawning interactive Claude session: {} in {}",
             session_id, working_dir
         );
+        if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+            return Err(refusal);
+        }
 
         // Spawn CLI with stream-json input AND output. The Command itself is
         // built further down, once `render_program_and_argv` has resolved the

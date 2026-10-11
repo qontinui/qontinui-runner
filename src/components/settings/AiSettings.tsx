@@ -26,6 +26,7 @@ import { ClaudeApiSection } from "./ai-settings/ClaudeApiSection";
 import { GeminiCliSection } from "./ai-settings/GeminiCliSection";
 import { GeminiApiSection } from "./ai-settings/GeminiApiSection";
 import { ProviderHealthStatus } from "./ai-settings/ProviderHealthStatus";
+import { ModelRoutingSection } from "./ai-settings/ModelRoutingSection";
 
 interface AiSettingsProps {
   onLog: LogFunction;
@@ -529,6 +530,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           onDeleteKey={deleteGeminiApiKey}
         />
       )}
+
+      {/* Model gateway + session permission posture (apply to every provider) */}
+      <div className="rounded-lg bg-card/50 p-4">
+        <ModelRoutingSection onLog={onLog} />
+      </div>
 
       {/* Auto-Refine Defaults */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">

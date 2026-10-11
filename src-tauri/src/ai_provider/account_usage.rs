@@ -96,6 +96,11 @@ use tracing::info;
 /// (cold start), then to the soonest-to-expire cooldown when every account is
 /// rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
+    // Subscription accounts are off while a model gateway is declared: there
+    // is nothing to pick between (`crate::model_gateway`).
+    if crate::model_gateway::gateway_declared() {
+        return;
+    }
     let ai_settings = settings::get_ai_settings();
     let mode = ai_settings.claude_cli.account_selection_mode;
     if mode == AccountSelectionMode::Manual {
