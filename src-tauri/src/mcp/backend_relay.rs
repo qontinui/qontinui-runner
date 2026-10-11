@@ -3910,8 +3910,13 @@ async fn code_mirror_gate(
     let Some(segments) = crate::mcp::relay_path_policy::normalize_relay_path(raw_path) else {
         return CodeMirrorGate::NotCodeRoute;
     };
-    let owner =
-        |p: Option<&str>| p.map_or(SessionScope::Unresolved, crate::egress::path_session_tenant);
+    // The owner lookup canonicalizes paths, so it runs on the blocking pool.
+    async fn owner(p: Option<&str>) -> SessionScope {
+        match p {
+            Some(p) => crate::egress::path_session_tenant_off_runtime(p.to_string()).await,
+            None => SessionScope::Unresolved,
+        }
+    }
     let req = serde_json::from_slice::<Value>(body).ok();
     let field = |k: &str| {
         req.as_ref()
@@ -3947,17 +3952,21 @@ async fn code_mirror_gate(
                 .find(|(k, _)| k == "path")
                 .map(|(_, v)| v.into_owned());
             // Canonicalize ONCE, off the runtime, and both judge and forward
-            // that path: the handler then reads exactly what was checked.
+            // that path. This closes a symlink already present in the path
+            // being swapped between the check and the read (the handler gets
+            // a path with no symlink left to re-resolve); it does NOT close a
+            // directory component being replaced after the check — that race
+            // remains, as for any check-then-open across processes.
             let canonical = match path.clone() {
                 Some(p) => tokio::task::spawn_blocking(move || std::fs::canonicalize(p).ok())
                     .await
                     .ok()
                     .flatten()
-                    .map(|c| c.to_string_lossy().to_string()),
+                    .map(|c| strip_verbatim_prefix(&c.to_string_lossy())),
                 None => None,
             };
             let judged = canonical.as_deref().or(path.as_deref());
-            if !all_permit(vec![owner(judged)]) {
+            if !all_permit(vec![owner(judged).await]) {
                 return CodeMirrorGate::Refuse(egress_off_http_response(request_id, flow));
             }
             let query = canonical.map(|c| {
@@ -3982,9 +3991,9 @@ async fn code_mirror_gate(
             let source_wt = branch_owner(field("source_branch")).await;
             let repo = field("repo_path");
             if all_permit(vec![
-                owner(branch_wt.as_deref()),
-                owner(source_wt.as_deref()),
-                owner(repo.as_deref()),
+                owner(branch_wt.as_deref()).await,
+                owner(source_wt.as_deref()).await,
+                owner(repo.as_deref()).await,
             ]) {
                 CodeMirrorGate::Forward { query: None }
             } else {
@@ -4000,13 +4009,13 @@ async fn code_mirror_gate(
             let branch_wt = branch_owner(field("branch_name")).await;
             let source_wt = branch_owner(field("source_branch")).await;
             let mut scopes = vec![
-                owner(branch_wt.as_deref()),
-                owner(field("repo_path").as_deref()),
+                owner(branch_wt.as_deref()).await,
+                owner(field("repo_path").as_deref()).await,
             ];
             if leaf == "remove" {
-                scopes.push(owner(field("worktree_path").as_deref()));
+                scopes.push(owner(field("worktree_path").as_deref()).await);
             } else {
-                scopes.push(owner(source_wt.as_deref()));
+                scopes.push(owner(source_wt.as_deref()).await);
             }
             if all_permit(scopes) {
                 CodeMirrorGate::Forward { query: None }
@@ -4018,14 +4027,37 @@ async fn code_mirror_gate(
     }
 }
 
+/// `path` without Windows' verbatim prefix — `\\?\C:\x` becomes `C:\x`
+/// and `\\?\UNC\server\share` becomes `\\server\share` — so a client is
+/// never handed a verbatim path. Case is kept. Anything else is unchanged.
+/// PURE.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// The fields of a merge / remove response that describe the branches'
 /// content or their sessions.
+///
+/// `stashed_files` / `stash_note` are merge-force's report of the dirty files
+/// it stashed (the conflicting files under another key); `error` /
+/// `error_detail` are blanked because git's messages name files ("Your local
+/// changes to the following files would be overwritten…").
 const CODE_METADATA_FIELDS: &[&str] = &[
     "conflicting_files",
     "owning_sessions",
     "conflicts",
     "ai_merge_prompt",
     "summary",
+    "stashed_files",
+    "stash_note",
+    "error",
+    "error_detail",
 ];
 
 /// Blank [`CODE_METADATA_FIELDS`] anywhere in a merge / remove response,
@@ -4071,6 +4103,9 @@ fn redact_code_metadata(body: &[u8]) -> Vec<u8> {
 /// The worktree of the repository at `repo` that has `branch` checked out,
 /// from `git worktree list --porcelain -z` (NUL-separated, so a path holding
 /// a newline cannot forge a record); `None` when none does, or git fails.
+/// `-z` with `--porcelain` needs git 2.36 or later; an older git rejects the
+/// flag, which lands here as a failure — `None`, so the branch is unresolved
+/// and judged by the strictest bound tenant (fails closed).
 /// Blocking.
 fn branch_worktree_path(repo: &str, branch: &str) -> Option<String> {
     // No console window on Windows, no inherited GIT_DIR redirecting it, and
@@ -10165,6 +10200,63 @@ mod egress_tests {
             decode(&reply).contains("SECRET-F"),
             "an owner that is on sees it all"
         );
+    }
+
+    /// Round 7 (W5): merge-force's `stashed_files` / `stash_note` are the
+    /// conflicting files under another key, and an `error` string from git
+    /// can name files too — all blanked when an owner's mirror is off.
+    #[tokio::test]
+    async fn merge_force_stash_report_and_error_text_are_redacted_too() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let b = uuid::Uuid::from_u128(0x7e7a_0015);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let _r = fake_session_tenant("/work/repo-b2", SessionScope::Tenant(b));
+        for response in [
+            serde_json::json!({"success": true, "data": {
+                "success": true, "status": "merged", "stash_ref": "stash@{0}",
+                "stashed_files": ["SECRET/a.rs"],
+                "stash_note": "Recover with: git stash pop SECRET"}}),
+            serde_json::json!({"success": false, "data": null,
+                "error": "error: Your local changes to the following files would be overwritten by merge:\n\tSECRET/b.rs",
+                "error_detail": "SECRET/b.rs"}),
+        ] {
+            let server = RecordingServer::start(response.to_string());
+            let body = serde_json::json!({
+                "branch_name": "feat", "source_branch": "main", "repo_path": "/work/repo-b2"
+            })
+            .to_string();
+            let frame = serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": "/worktrees/merge-force",
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            });
+            let reply = relay_http_to_base(&server.base, &frame).await;
+            let text = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(reply["body_b64"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!text.contains("SECRET"), "{text}");
+            assert!(text.contains("egress_redacted"), "{text}");
+        }
+    }
+
+    /// Round 7 (W4): the canonical path forwarded to the files routes loses
+    /// Windows' verbatim prefix and keeps its case.
+    #[test]
+    fn the_forwarded_canonical_path_drops_the_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Work\Repo\a.RS"),
+            r"C:\Work\Repo\a.RS"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\Server\Share\X"),
+            r"\\Server\Share\X"
+        );
+        assert_eq!(strip_verbatim_prefix("/home/u/Repo"), "/home/u/Repo");
+        assert_eq!(strip_verbatim_prefix(r"C:\plain"), r"C:\plain");
     }
 
     /// Re-review W7: the porcelain is read NUL-separated (`-z`).
