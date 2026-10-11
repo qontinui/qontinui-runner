@@ -596,10 +596,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PG via DATABASE_URL"]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test-only Row::get on columns this test just wrote"
-    )]
     async fn reported_cost_round_trips_with_microdollar_precision_and_provenance() {
         let pg = test_pg().await;
         let run_id = unique_run_id("reported");
@@ -634,14 +630,28 @@ mod tests {
             )
             .await
             .expect("read back");
-        assert_eq!(row.get::<_, i64>("cost_cents"), 0);
-        assert_eq!(row.get::<_, Option<i64>>("cost_microusd"), Some(4_200));
+        assert_eq!(row.try_get::<_, i64>("cost_cents").expect("cost_cents"), 0);
         assert_eq!(
-            row.get::<_, Option<String>>("cost_source").as_deref(),
+            row.try_get::<_, Option<i64>>("cost_microusd")
+                .expect("cost_microusd"),
+            Some(4_200)
+        );
+        assert_eq!(
+            row.try_get::<_, Option<String>>("cost_source")
+                .expect("cost_source")
+                .as_deref(),
             Some("reported")
         );
-        assert_eq!(row.get::<_, i64>("cache_creation_tokens"), 6_402);
-        assert_eq!(row.get::<_, i64>("cache_read_tokens"), 31_002);
+        assert_eq!(
+            row.try_get::<_, i64>("cache_creation_tokens")
+                .expect("cache_creation_tokens"),
+            6_402
+        );
+        assert_eq!(
+            row.try_get::<_, i64>("cache_read_tokens")
+                .expect("cache_read_tokens"),
+            31_002
+        );
 
         cleanup_task_run(&pg, &run_id).await;
     }
