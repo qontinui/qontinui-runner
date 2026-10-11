@@ -135,13 +135,36 @@ permissions:
   contents: read
 
 concurrency:
-  # One at a time: the job INSTALLS a build machine-wide-ish (per-user) and
-  # kills leftover "Qontinui Runner" processes on the box. Two concurrent runs
-  # on the same ephemeral image would be fine, but serialising keeps the
-  # summary history readable. Never cancel-in-progress — a half-finished parity
-  # run reports nothing, and this workflow blocks no one.
-  group: published-parity-${{ github.ref }}
-  cancel-in-progress: false
+  # Two regimes in ONE expression (pattern: qontinui-claude-config#1475; the
+  # group shape of schema-pg-sql-freshness-nightly.yml, the cancel shape of
+  # ci.yml -- that nightly only reaps a PENDING run, this one cancels a
+  # RUNNING one, which is what pays off on a 30+ min Windows job):
+  #
+  # - schedule / release / workflow_dispatch / any re-run (run_attempt > 1):
+  #   one at a time per ref. The job INSTALLS a build machine-wide-ish
+  #   (per-user) and kills leftover "Qontinui Runner" processes on the box;
+  #   serialising keeps the summary history readable. Never cancel-in-progress
+  #   here -- a half-finished parity run reports nothing.
+  # - a first-attempt pull_request run: one group per PR, and a newer push
+  #   CANCELS the older head's run in flight. Without this, GitHub keeps the
+  #   oldest head's 30+ min Windows run going, evicts the middle head's
+  #   PENDING run unrun, and makes the current head wait behind the oldest
+  #   head's run (measured
+  #   on #1844, plan 2026-10-01-a-pushed-to-pr-runs-the-oldest-head-to-
+  #   completion-and-discards-the-middle-one). "A half-finished run reports
+  #   nothing" does not apply: nobody is asking about a superseded head.
+  #   The pull_request trigger itself is added by #1844; until it lands this
+  #   arm is dormant.
+  #
+  # `github.workflow` is in the PR key because concurrency groups are
+  # repo-wide. The group is one expression, so coord models it as "" (never
+  # reaper-at-risk) -- unlike the bare `published-parity-${{ github.ref }}` it
+  # replaces, which resolved to the same group coord computes for a push to
+  # main. KNOWN coord gap: the budget-cancel candidate scan in
+  # stuck_pr_watcher.rs compares groups with `=`, so every "" group matches
+  # every other one and suppresses its auto re-run; the fix belongs in coord.
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('published-parity-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 jobs:
   published-parity:
