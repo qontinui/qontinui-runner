@@ -845,9 +845,12 @@ mod tests {
     // ---- spawn validation (V9) ----
 
     fn checkout_resolver(root: &Path) -> impl Fn(&str) -> Result<PathBuf, String> + '_ {
+        // Lowercased so the case-insensitive dedup is exercised identically on
+        // a case-SENSITIVE filesystem (Linux CI), where `QONTINUI-SCHEMAS`
+        // would otherwise name a directory that does not exist.
         move |repo: &str| {
             let bare = bare_repo_name(repo)?;
-            Ok(root.join(bare))
+            Ok(root.join(bare.to_ascii_lowercase()))
         }
     }
 
