@@ -6,10 +6,11 @@
  * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 1.
  *
  * Every setup's session is the platform's default interactive shell running this
- * generator with ONE identical command line (D13):
+ * generator with ONE identical command line (D13). Every session runs with --echo:
+ * only the focused pane ever receives input, so the others behave as without it.
  *
  *   node scripts/termhost-bench/generator/ai-session.mjs --run-dir <dir> --profile <p>
- *        --seed <s> --termhost-bench-generator <run-id>
+ *        --seed <s> --echo --termhost-bench-generator <run-id>
  *
  * `--termhost-bench-generator <run-id>` is how the probe excludes generators from a
  * host's process tree, so never rewrite process.title. Because the command line is
@@ -18,22 +19,28 @@
  * session shell) and any host terminal id there.
  *
  * Output (stdout, fd 1): the profile's byte stream with a marker overlay re-drawn on
- * every write; markers advance at the profile's `marker_hz` (<= 10 Hz). Every write
- * goes through a blocking `fs.writeSync(1, ...)`, timed on both sides, so time a host
- * makes the producer wait is measured directly (`producer_stall_pct`). A generator
- * that falls behind writes the SAME bytes late — it never skips — and logs how far
- * behind it is.
+ * every write; markers advance at the profile's `marker_hz` (<= 10 Hz). The first write
+ * hides the cursor (a block cursor on marker cell 0 would recolour it) and parks it
+ * below the reserved rows; the last write shows it again. Every write goes through a
+ * blocking `fs.writeSync(1, ...)`, timed on both sides, so time a host makes the
+ * producer wait is measured directly (`producer_stall_pct`). A generator that falls
+ * behind writes the SAME bytes late — it never skips — and logs how far behind it is;
+ * while behind it still yields to the event loop every 50 ms, so stdin, EOF and
+ * signals are serviced. A generator blocked INSIDE one write (its host stopped reading
+ * altogether) runs no JavaScript until that write returns: no stop file, EOF or signal
+ * handler can end it, only killing its PID (recorded in its slot file).
  *
  * Records (`<run-dir>/gen-<slot>.jsonl`, one JSON object per line; absolute
  * process.hrtime nanosecond timestamps are DECIMAL STRINGS because they exceed 2^53):
  *   start     configuration, t0_ns, terminal size, console handling
  *   marker    {seq, t_sched_ns, t_emit_ns, t_written_ns, bytes, phase} on each tick
- *   echo      {seq, byte, t_read_ns, t_emit_ns, t_written_ns, bytes} (--echo)
+ *   echo      {seq, byte, t_read_ns, t_emit_ns, t_written_ns, bytes} (--echo);
+ *             t_read_ns is the string "unknown" when the read time is not known
  *   progress  cumulative counters every 500 ms (window any interval by differencing)
  *   exit      reason and final counters
  *
- * Flags beyond D13's: --echo (raw-mode stdin; each received byte is answered by an
- * echo marker in row 1), --calibration (a static calibration marker, no load),
+ * --echo puts stdin in raw mode and answers each received byte with an echo marker in
+ * row 1. Flags beyond D13's: --calibration (a static calibration marker, no load),
  * --duration-ms N (stop after N ms; tests and manual runs).
  *
  * Exit: 0 on the stop file (`<run-dir>/stop`), stdin EOF, a signal, the stdout
@@ -172,7 +179,10 @@ export const USAGE =
 // Clocks, writers, logs
 // ---------------------------------------------------------------------------
 
-/** process.hrtime clock; sleeps with setTimeout (so stdin and signals are serviced). */
+/**
+ * process.hrtime clock. `sleepUntil` uses setTimeout and `yield` uses setImmediate, so
+ * stdin data, EOF and signal handlers run whenever the driver waits or yields.
+ */
 export function createRealClock() {
   return {
     nowNs: () => process.hrtime.bigint(),
@@ -180,35 +190,50 @@ export function createRealClock() {
       const ms = Number(tNs - process.hrtime.bigint()) / 1e6;
       return new Promise((r) => setTimeout(r, Math.max(0, Math.ceil(ms))));
     },
+    yield: () => new Promise((r) => setImmediate(r)),
   };
 }
 
 /**
  * A virtual clock: time moves only when the driver sleeps or a writer advances it.
- * Inputs scheduled with `scheduleInput` are delivered at their virtual time.
+ * Scheduled events (stdin bytes, EOF, a signal) are delivered when the driver sleeps
+ * past their time — at that time — or yields after it — at the yield, as a real
+ * event loop would deliver them to a busy generator.
  */
 export function createVirtualClock({ startNs = 0n } = {}) {
   let now = startNs;
-  const inputs = [];
+  const events = [];
   let handler = null;
+  const deliverThrough = (tNs, advance) => {
+    while (events.length > 0 && events[0].tNs <= tNs) {
+      const ev = events.shift();
+      if (advance && ev.tNs > now) now = ev.tNs;
+      handler?.(ev.event, now);
+    }
+  };
   return {
     nowNs: () => now,
     advance(ns) {
       now += BigInt(ns);
     },
     async sleepUntil(tNs) {
-      while (inputs.length > 0 && inputs[0].tNs <= tNs) {
-        const ev = inputs.shift();
-        if (ev.tNs > now) now = ev.tNs;
-        handler?.(ev.bytes, now);
-      }
+      deliverThrough(tNs, true);
       if (tNs > now) now = tNs;
     },
-    scheduleInput(tNs, bytes) {
-      inputs.push({ tNs: BigInt(tNs), bytes: Buffer.from(bytes) });
-      inputs.sort((a, b) => (a.tNs < b.tNs ? -1 : a.tNs > b.tNs ? 1 : 0));
+    async yield() {
+      deliverThrough(now, false);
     },
-    setInputHandler(fn) {
+    /**
+     * @param {number | bigint} tNs
+     * @param {{bytes?: string | Buffer, eof?: boolean, signal?: string}} event
+     */
+    scheduleEvent(tNs, event) {
+      const ev = { ...event };
+      if (ev.bytes !== undefined) ev.bytes = Buffer.from(ev.bytes);
+      events.push({ tNs: BigInt(tNs), event: ev });
+      events.sort((a, b) => (a.tNs < b.tNs ? -1 : a.tNs > b.tNs ? 1 : 0));
+    },
+    setEventHandler(fn) {
       handler = fn;
     },
   };
@@ -342,128 +367,161 @@ export function createControl() {
 // The driver
 // ---------------------------------------------------------------------------
 
+/** While writes are queued, the driver yields to the event loop at least this often. */
+export const YIELD_INTERVAL_MS = 50;
+
 /**
- * Run one session's load until a stop condition.
+ * The first write: enter the alternate screen if the profile asks, HIDE THE CURSOR
+ * (a block cursor resting on marker cell 0 would turn it into the cursor colour), clear,
+ * and park the cursor on the row below the echo region, out of both reserved regions.
  *
- * @param {{
- *   profile: object, profileDigest?: string, seed: number, session: number, runId: string,
- *   clock: {nowNs: () => bigint, sleepUntil: (tNs: bigint) => Promise<void>},
- *   write: (buf: Buffer) => void, log: (record: object) => void,
- *   echo?: boolean, calibration?: boolean, durationMs?: number|null,
- *   shouldStop?: () => string|null, control?: ReturnType<typeof createControl>,
- *   startExtra?: object,
- * }} opts
- * @returns {Promise<object>} the exit record
+ * @param {object} profile
+ * @returns {string}
  */
-export async function runGenerator(opts) {
-  const {
-    profile,
-    seed,
-    session,
-    runId,
-    clock,
-    write,
-    log,
-    echo = false,
-    calibration = false,
-    durationMs = null,
-    shouldStop = () => null,
-    control = createControl(),
-    startExtra = {},
-  } = opts;
-  const geometry = profile.geometry;
-  const t0 = clock.nowNs();
-  const endNs = durationMs === null ? null : t0 + BigInt(Math.round(durationMs * 1e6));
-  const st = {
-    bytesScheduled: 0,
-    bytesWritten: 0,
-    writes: 0,
-    blockedNs: 0n,
-    markers: 0,
-    echoes: 0,
-    echoBytes: 0,
-    schedPosUs: 0,
-    echoOverlay: "",
-  };
+export function preambleFor(profile) {
+  return `${profile.alt_screen ? "\x1b[?1049h" : ""}\x1b[?25l\x1b[H\x1b[2J\x1b[${ECHO_REGION.row + 2};1H`;
+}
 
-  log({
-    type: "start",
-    schema: GEN_SCHEMA,
-    run_id: runId,
-    session,
-    mode: calibration ? "calibration" : "load",
-    profile: profile.id,
-    profile_digest: opts.profileDigest ?? profileDigest(profile),
-    profile_calibrated: profile.calibrated,
-    seed,
-    geometry: { ...geometry },
-    marker_hz: profile.marker_hz,
-    echo,
-    clock: "process.hrtime",
-    t0_ns: String(t0),
-    ...startExtra,
-  });
+/**
+ * The last write: reset SGR, show the cursor again, leave the alternate screen.
+ *
+ * @param {object} profile
+ * @returns {string}
+ */
+export function postambleFor(profile) {
+  return `\x1b[0m\x1b[?25h${profile.alt_screen ? "\x1b[?1049l" : ""}\r\n`;
+}
 
-  const timedWrite = (buf) => {
-    const before = clock.nowNs();
-    write(buf);
-    const after = clock.nowNs();
-    st.blockedNs += after - before;
+/**
+ * One generator run. Built by `runGenerator`; the methods share the run's counters.
+ */
+class GeneratorRun {
+  constructor(opts) {
+    this.opts = opts;
+    this.profile = opts.profile;
+    this.geometry = opts.profile.geometry;
+    this.session = opts.session;
+    this.clock = opts.clock;
+    this.write = opts.write;
+    this.log = opts.log;
+    this.echo = opts.echo ?? false;
+    this.shouldStop = opts.shouldStop ?? (() => null);
+    this.control = opts.control ?? createControl();
+    this.t0 = this.clock.nowNs();
+    this.endNs =
+      opts.durationMs == null ? null : this.t0 + BigInt(Math.round(opts.durationMs * 1e6));
+    this.st = {
+      bytesScheduled: 0,
+      bytesWritten: 0,
+      writes: 0,
+      blockedNs: 0n,
+      markers: 0,
+      echoes: 0,
+      echoBytes: 0,
+      schedPosUs: 0,
+      echoOverlay: "",
+    };
+    this.queue = [];
+    this.nextProgressNs = this.t0 + BigInt(PROGRESS_INTERVAL_MS) * MS;
+    this.nextStopCheckNs = this.t0;
+    this.lastYieldNs = this.t0;
+  }
+
+  async run() {
+    this.logStart();
+    this.control.onInput = (buf, tReadNs) => this.onInput(buf, tReadNs);
+    this.writePreamble();
+    if (this.opts.calibration) await this.calibrationLoop();
+    else await this.loadLoop();
+    return this.finish();
+  }
+
+  logStart() {
+    const { profile, opts } = this;
+    this.log({
+      type: "start",
+      schema: GEN_SCHEMA,
+      run_id: opts.runId,
+      session: this.session,
+      mode: opts.calibration ? "calibration" : "load",
+      profile: profile.id,
+      profile_digest: opts.profileDigest ?? profileDigest(profile),
+      profile_calibrated: profile.calibrated,
+      seed: opts.seed,
+      geometry: { ...this.geometry },
+      marker_hz: profile.marker_hz,
+      echo: this.echo,
+      clock: "process.hrtime",
+      t0_ns: String(this.t0),
+      ...(opts.startExtra ?? {}),
+    });
+  }
+
+  /** One blocking write, timed on both sides; the time inside it is producer stall. */
+  timedWrite(buf) {
+    const before = this.clock.nowNs();
+    this.write(buf);
+    const after = this.clock.nowNs();
+    this.st.blockedNs += after - before;
     return [before, after];
-  };
-  const failWrite = (e) => {
-    control.stop(e && CLOSED_STDOUT_CODES.has(e.code) ? "stdout_closed" : "error", e);
-  };
+  }
 
-  control.onInput = (buf, tReadNs) => {
-    if (!echo) return;
+  failWrite(e) {
+    this.control.stop(e && CLOSED_STDOUT_CODES.has(e.code) ? "stdout_closed" : "error", e);
+  }
+
+  /** --echo: answer each received byte with an echo marker; 0x03 stops the run. */
+  onInput(buf, tReadNs) {
+    if (!this.echo) return;
     for (const byte of buf) {
-      if (control.stopped) return;
+      if (this.control.stopped) return;
       if (byte === 0x03) {
-        control.stop("interrupt");
+        this.control.stop("interrupt");
         return;
       }
-      const seq = st.echoes;
-      st.echoes += 1;
-      st.echoOverlay = markerOverlay(
-        { kind: MARKER_KINDS.echo, session, seq: markerSeq(seq) },
+      const seq = this.st.echoes;
+      this.st.echoes += 1;
+      this.st.echoOverlay = markerOverlay(
+        { kind: MARKER_KINDS.echo, session: this.session, seq: markerSeq(seq) },
         ECHO_REGION,
       );
-      const bytes = Buffer.from(st.echoOverlay, "latin1");
+      const bytes = Buffer.from(this.st.echoOverlay, "latin1");
       try {
-        const [before, after] = timedWrite(bytes);
-        st.echoBytes += bytes.length;
-        log({
+        const [before, after] = this.timedWrite(bytes);
+        this.st.echoBytes += bytes.length;
+        this.log({
           type: "echo",
           seq,
           byte,
-          t_read_ns: String(tReadNs ?? before),
+          // An unknown read time is recorded as unknown, never as the emit time (that
+          // would read as zero latency).
+          t_read_ns: tReadNs == null ? "unknown" : String(tReadNs),
           t_emit_ns: String(before),
           t_written_ns: String(after),
           bytes: bytes.length,
         });
       } catch (e) {
-        failWrite(e);
+        this.failWrite(e);
         return;
       }
     }
-  };
-
-  const preamble = `${profile.alt_screen ? "\x1b[?1049h" : ""}\x1b[H\x1b[2J`;
-  try {
-    timedWrite(Buffer.from(preamble, "latin1"));
-    st.bytesScheduled += preamble.length;
-    st.bytesWritten += preamble.length;
-    st.writes += 1;
-  } catch (e) {
-    failWrite(e);
   }
 
-  const queue = [];
-  let nextProgressNs = t0 + BigInt(PROGRESS_INTERVAL_MS) * MS;
-  let nextStopCheckNs = t0;
-  const progress = (now) => {
-    log({
+  writePreamble() {
+    const preamble = preambleFor(this.profile);
+    try {
+      this.timedWrite(Buffer.from(preamble, "latin1"));
+      this.st.bytesScheduled += preamble.length;
+      this.st.bytesWritten += preamble.length;
+      this.st.writes += 1;
+    } catch (e) {
+      this.failWrite(e);
+    }
+  }
+
+  progress(now) {
+    const { st } = this;
+    this.log({
       type: "progress",
       t_ns: String(now),
       sched_pos_us: st.schedPosUs,
@@ -472,206 +530,245 @@ export async function runGenerator(opts) {
       writes: st.writes,
       blocked_ns: Number(st.blockedNs),
       echo_bytes: st.echoBytes,
-      queued: queue.length,
+      queued: this.queue.length,
     });
-  };
-  const pollStop = (now) => {
-    if (endNs !== null && now >= endNs) control.stop("duration");
-    if (!control.stopped && now >= nextStopCheckNs) {
-      const reason = shouldStop();
-      if (reason) control.stop(reason);
-      nextStopCheckNs = now + BigInt(STOP_CHECK_INTERVAL_MS) * MS;
+  }
+
+  pollStop(now) {
+    if (this.endNs !== null && now >= this.endNs) this.control.stop("duration");
+    if (!this.control.stopped && now >= this.nextStopCheckNs) {
+      const reason = this.shouldStop();
+      if (reason) this.control.stop(reason);
+      this.nextStopCheckNs = now + BigInt(STOP_CHECK_INTERVAL_MS) * MS;
     }
-  };
+  }
 
-  if (calibration) {
-    await calibrationLoop({
-      ...opts,
-      st,
-      t0,
-      timedWrite,
-      failWrite,
-      control,
-      pollStop,
-      endNs,
-      clock,
-      log,
+  /**
+   * Yield to the event loop when YIELD_INTERVAL_MS has passed without one, so stdin,
+   * EOF and signals are serviced while writes are queued. A generator blocked INSIDE
+   * one write runs no JavaScript at all until that write returns.
+   */
+  async yieldIfDue() {
+    if (this.clock.nowNs() - this.lastYieldNs < BigInt(YIELD_INTERVAL_MS) * MS) return;
+    await this.clock.yield();
+    this.lastYieldNs = this.clock.nowNs();
+  }
+
+  dueAt(w) {
+    return this.t0 + BigInt(w.tUs) * 1000n;
+  }
+
+  /** Pull a due write into the queue, counting its scheduled bytes. */
+  materialize(w) {
+    const overlay = markerOverlay(
+      { kind: MARKER_KINDS.output, session: this.session, seq: markerSeq(w.seq) },
+      MARKER_REGION,
+    );
+    let content = null;
+    let contentBytes = 0;
+    if (w.content) {
+      const known = knownContentSize(w.content);
+      if (known !== null) {
+        contentBytes = known;
+      } else {
+        content = buildContent(w.content, this.geometry);
+        contentBytes = Buffer.byteLength(content, "utf8");
+        if (this.queue.length >= RETAIN_QUEUED_CONTENT) content = null;
+      }
+    }
+    const detBytes = contentBytes + overlay.length;
+    this.st.bytesScheduled += detBytes;
+    return { w, content, overlay, detBytes };
+  }
+
+  pullDue(now) {
+    while (this.dueAt(this.pending) <= now) {
+      this.queue.push(this.materialize(this.pending));
+      this.pending = this.schedule.next();
+    }
+  }
+
+  /** Write one queued item: its content, its marker and any echo marker. */
+  perform(item) {
+    const { w } = item;
+    const { st } = this;
+    const content = w.content ? (item.content ?? buildContent(w.content, this.geometry)) : "";
+    const text = composeWrite(
+      content,
+      item.overlay + st.echoOverlay,
+      w.content ? isSyncContent(w.content) : false,
+    );
+    const bytes = Buffer.from(text, "utf8");
+    const [before, after] = this.timedWrite(bytes);
+    st.writes += 1;
+    st.bytesWritten += item.detBytes;
+    st.echoBytes += bytes.length - item.detBytes;
+    st.schedPosUs = w.tUs;
+    if (w.newSeq !== null) {
+      st.markers += 1;
+      this.log({
+        type: "marker",
+        kind: "output",
+        seq: w.newSeq,
+        phase: w.phase.id,
+        t_sched_ns: String(this.dueAt(w)),
+        t_emit_ns: String(before),
+        t_written_ns: String(after),
+        bytes: bytes.length,
+      });
+    }
+  }
+
+  async loadLoop() {
+    const { control, clock } = this;
+    this.schedule = new Schedule({
+      profile: this.profile,
+      seed: this.opts.seed,
+      session: this.session,
     });
-  } else {
-    const schedule = new Schedule({ profile, seed, session });
-    let pending = schedule.next();
-    const dueAt = (w) => t0 + BigInt(w.tUs) * 1000n;
-    const materialize = (w) => {
-      const overlay = markerOverlay(
-        { kind: MARKER_KINDS.output, session, seq: markerSeq(w.seq) },
-        MARKER_REGION,
-      );
-      let content = null;
-      let contentBytes = 0;
-      if (w.content) {
-        const known = knownContentSize(w.content);
-        if (known !== null) {
-          contentBytes = known;
-        } else {
-          content = buildContent(w.content, geometry);
-          contentBytes = Buffer.byteLength(content, "utf8");
-          if (queue.length >= RETAIN_QUEUED_CONTENT) content = null;
-        }
-      }
-      const detBytes = contentBytes + overlay.length;
-      st.bytesScheduled += detBytes;
-      return { w, content, overlay, detBytes };
-    };
-    const pullDue = (now) => {
-      while (dueAt(pending) <= now) {
-        queue.push(materialize(pending));
-        pending = schedule.next();
-      }
-    };
-    const perform = (item) => {
-      const { w } = item;
-      const content = w.content ? (item.content ?? buildContent(w.content, geometry)) : "";
-      const text = composeWrite(
-        content,
-        item.overlay + st.echoOverlay,
-        w.content ? isSyncContent(w.content) : false,
-      );
-      const bytes = Buffer.from(text, "utf8");
-      const [before, after] = timedWrite(bytes);
-      st.writes += 1;
-      st.bytesWritten += item.detBytes;
-      st.echoBytes += bytes.length - item.detBytes;
-      st.schedPosUs = w.tUs;
-      if (w.newSeq !== null) {
-        st.markers += 1;
-        log({
-          type: "marker",
-          kind: "output",
-          seq: w.newSeq,
-          phase: w.phase.id,
-          t_sched_ns: String(dueAt(w)),
-          t_emit_ns: String(before),
-          t_written_ns: String(after),
-          bytes: bytes.length,
-        });
-      }
-    };
-
+    this.pending = this.schedule.next();
     while (!control.stopped) {
       const now = clock.nowNs();
       // A run of duration D owns exactly the writes due before D.
-      if (endNs !== null && now >= endNs) {
+      if (this.endNs !== null && now >= this.endNs) {
         control.stop("duration");
         break;
       }
-      pullDue(now);
-      if (now >= nextProgressNs) {
-        progress(now);
-        while (nextProgressNs <= now) nextProgressNs += BigInt(PROGRESS_INTERVAL_MS) * MS;
+      this.pullDue(now);
+      if (now >= this.nextProgressNs) {
+        this.progress(now);
+        while (this.nextProgressNs <= now) this.nextProgressNs += BigInt(PROGRESS_INTERVAL_MS) * MS;
       }
-      pollStop(now);
+      this.pollStop(now);
       if (control.stopped) break;
-      if (queue.length > 0) {
+      if (this.queue.length > 0) {
         try {
-          perform(queue.shift());
+          this.perform(this.queue.shift());
         } catch (e) {
-          failWrite(e);
+          this.failWrite(e);
         }
+        await this.yieldIfDue();
         continue;
       }
-      let wake = dueAt(pending);
-      if (nextProgressNs < wake) wake = nextProgressNs;
-      if (nextStopCheckNs < wake) wake = nextStopCheckNs;
-      if (endNs !== null && endNs < wake) wake = endNs;
+      let wake = this.dueAt(this.pending);
+      if (this.nextProgressNs < wake) wake = this.nextProgressNs;
+      if (this.nextStopCheckNs < wake) wake = this.nextStopCheckNs;
+      if (this.endNs !== null && this.endNs < wake) wake = this.endNs;
       await clock.sleepUntil(wake);
+      this.lastYieldNs = clock.nowNs();
     }
     // Count everything the schedule called for up to the stop, written or not
     // (for a duration stop, everything due strictly before the end).
-    pullDue(control.reason === "duration" ? endNs - 1n : clock.nowNs());
+    this.pullDue(control.reason === "duration" ? this.endNs - 1n : clock.nowNs());
   }
 
-  const now = clock.nowNs();
-  const elapsedUs = Number((now - t0) / 1000n);
-  const postamble = `\x1b[0m${profile.alt_screen ? "\x1b[?1049l" : ""}\r\n`;
-  try {
-    write(Buffer.from(postamble, "latin1"));
-  } catch {
-    // the reader is gone; nothing left to restore
+  async calibrationLoop() {
+    const { control, clock, st } = this;
+    const overlay = markerOverlay(
+      { kind: MARKER_KINDS.calibration, session: this.session, seq: 0 },
+      MARKER_REGION,
+    );
+    const bytes = Buffer.from(overlay, "latin1");
+    let nextDraw = this.t0;
+    let first = true;
+    while (!control.stopped) {
+      const now = clock.nowNs();
+      this.pollStop(now);
+      if (control.stopped) break;
+      if (now >= nextDraw) {
+        try {
+          const [before, after] = this.timedWrite(bytes);
+          st.writes += 1;
+          st.bytesScheduled += bytes.length;
+          st.bytesWritten += bytes.length;
+          if (first) {
+            st.markers += 1;
+            this.log({
+              type: "marker",
+              kind: "calibration",
+              seq: 0,
+              phase: "calibration",
+              t_sched_ns: String(this.t0),
+              t_emit_ns: String(before),
+              t_written_ns: String(after),
+              bytes: bytes.length,
+            });
+            first = false;
+          }
+        } catch (e) {
+          this.failWrite(e);
+          break;
+        }
+        nextDraw += BigInt(CALIBRATION_REDRAW_MS) * MS;
+      }
+      let wake = nextDraw;
+      const check = clock.nowNs() + BigInt(STOP_CHECK_INTERVAL_MS) * MS;
+      if (check < wake) wake = check;
+      if (this.endNs !== null && this.endNs < wake) wake = this.endNs;
+      await clock.sleepUntil(wake);
+    }
   }
-  control.onInput = null;
-  const exit = {
-    type: "exit",
-    reason: control.reason ?? "error",
-    t_ns: String(now),
-    wall_ns: Number(now - t0),
-    bytes_scheduled: st.bytesScheduled,
-    bytes_written: st.bytesWritten,
-    writes: st.writes,
-    blocked_ns: Number(st.blockedNs),
-    markers: st.markers,
-    echoes: st.echoes,
-    echo_bytes: st.echoBytes,
-    sched_pos_us: st.schedPosUs,
-    queued: queue.length,
-    lag_us: queue.length > 0 ? Math.max(0, elapsedUs - queue[0].w.tUs) : 0,
-  };
-  if (control.error) exit.error = String(control.error.message ?? control.error);
-  log(exit);
-  return exit;
+
+  finish() {
+    const { st, control, clock } = this;
+    const now = clock.nowNs();
+    const elapsedUs = Number((now - this.t0) / 1000n);
+    try {
+      this.write(Buffer.from(postambleFor(this.profile), "latin1"));
+    } catch {
+      // the reader is gone; nothing left to restore
+    }
+    control.onInput = null;
+    const exit = {
+      type: "exit",
+      reason: control.reason ?? "error",
+      t_ns: String(now),
+      wall_ns: Number(now - this.t0),
+      bytes_scheduled: st.bytesScheduled,
+      bytes_written: st.bytesWritten,
+      writes: st.writes,
+      blocked_ns: Number(st.blockedNs),
+      markers: st.markers,
+      echoes: st.echoes,
+      echo_bytes: st.echoBytes,
+      sched_pos_us: st.schedPosUs,
+      queued: this.queue.length,
+      lag_us: this.queue.length > 0 ? Math.max(0, elapsedUs - this.queue[0].w.tUs) : 0,
+    };
+    if (control.error) exit.error = String(control.error.message ?? control.error);
+    this.log(exit);
+    return exit;
+  }
 }
 
-async function calibrationLoop({
-  session,
-  st,
-  t0,
-  timedWrite,
-  failWrite,
-  control,
-  pollStop,
-  endNs,
-  clock,
-  log,
-}) {
-  const overlay = markerOverlay({ kind: MARKER_KINDS.calibration, session, seq: 0 }, MARKER_REGION);
-  const bytes = Buffer.from(overlay, "latin1");
-  let nextDraw = t0;
-  let first = true;
-  while (!control.stopped) {
-    const now = clock.nowNs();
-    pollStop(now);
-    if (control.stopped) break;
-    if (now >= nextDraw) {
-      try {
-        const [before, after] = timedWrite(bytes);
-        st.writes += 1;
-        st.bytesScheduled += bytes.length;
-        st.bytesWritten += bytes.length;
-        if (first) {
-          st.markers += 1;
-          log({
-            type: "marker",
-            kind: "calibration",
-            seq: 0,
-            phase: "calibration",
-            t_sched_ns: String(t0),
-            t_emit_ns: String(before),
-            t_written_ns: String(after),
-            bytes: bytes.length,
-          });
-          first = false;
-        }
-      } catch (e) {
-        failWrite(e);
-        break;
-      }
-      nextDraw += BigInt(CALIBRATION_REDRAW_MS) * MS;
-    }
-    let wake = nextDraw;
-    const check = clock.nowNs() + BigInt(STOP_CHECK_INTERVAL_MS) * MS;
-    if (check < wake) wake = check;
-    if (endNs !== null && endNs < wake) wake = endNs;
-    await clock.sleepUntil(wake);
-  }
+/**
+ * Run one session's load until a stop condition.
+ *
+ * @param {{
+ *   profile: object, profileDigest?: string, seed: number, session: number, runId: string,
+ *   clock: {nowNs: () => bigint, sleepUntil: (tNs: bigint) => Promise<void>, yield: () => Promise<void>},
+ *   write: (buf: Buffer) => void, log: (record: object) => void,
+ *   echo?: boolean, calibration?: boolean, durationMs?: number|null,
+ *   shouldStop?: () => string|null, control?: ReturnType<typeof createControl>,
+ *   startExtra?: object,
+ * }} opts
+ * @returns {Promise<object>} the exit record
+ */
+export async function runGenerator(opts) {
+  return new GeneratorRun(opts).run();
+}
+
+/**
+ * The event handling main() wires to stdin and signals, applied to a virtual event.
+ *
+ * @param {ReturnType<typeof createControl>} control
+ * @param {{bytes?: Buffer, eof?: boolean, signal?: string}} event
+ * @param {bigint} tNs
+ */
+function applyEvent(control, event, tNs) {
+  if (event.bytes) control.onInput?.(event.bytes, tNs);
+  else if (event.eof) control.stop("stdin_eof");
+  else if (event.signal) control.stop(`signal:${event.signal}`);
 }
 
 /**
@@ -680,7 +777,11 @@ async function calibrationLoop({
  *
  * @param {{profile: object, seed?: number, session?: number, durationMs: number,
  *   writeDelayNs?: number | bigint | ((buf: Buffer) => number | bigint),
- *   echo?: boolean, calibration?: boolean, inputs?: {tNs: number|bigint, bytes: string|Buffer}[]}} opts
+ *   echo?: boolean, calibration?: boolean,
+ *   inputs?: ({tNs: number|bigint, bytes: string|Buffer} | {tNs: number|bigint, eof: true}
+ *     | {tNs: number|bigint, signal: string})[]}} opts
+ * @returns {Promise<{writes: {tNs: bigint, bytes: Buffer}[], records: object[], exit: object,
+ *   bytes: Buffer, postamble: Buffer}>}
  */
 export async function runVirtual({
   profile,
@@ -701,8 +802,8 @@ export async function runVirtual({
     const d = typeof writeDelayNs === "function" ? writeDelayNs(buf) : writeDelayNs;
     if (d) clock.advance(d);
   };
-  for (const ev of inputs) clock.scheduleInput(ev.tNs, ev.bytes);
-  clock.setInputHandler((bytes, t) => control.onInput?.(bytes, t));
+  for (const { tNs, ...event } of inputs) clock.scheduleEvent(tNs, event);
+  clock.setEventHandler((event, t) => applyEvent(control, event, t));
   const exit = await runGenerator({
     profile,
     seed,
@@ -718,7 +819,13 @@ export async function runVirtual({
   });
   // The postamble is the last write; it is outside the measured stream.
   const stream = writes.slice(0, -1);
-  return { writes: stream, records, exit, bytes: Buffer.concat(stream.map((w) => w.bytes)) };
+  return {
+    writes: stream,
+    records,
+    exit,
+    bytes: Buffer.concat(stream.map((w) => w.bytes)),
+    postamble: writes[writes.length - 1].bytes,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -736,10 +843,12 @@ export function parseCodePage(text) {
  * enable VT processing (creating process.stdout does it) and switch the console's
  * output code page to UTF-8, because a raw fs.writeSync to a console is decoded in
  * the console code page (437 by default) and every multi-byte glyph would become
- * several cells. The previous code page is restored at exit.
+ * several cells. The previous code page is restored at exit (main() restores it in a
+ * `finally`). When the original code page cannot be read, nothing is changed: a page
+ * that cannot be restored is never switched.
  *
  * @param {{platform?: string, stdoutIsTty?: boolean, run?: typeof spawnSync, env?: object}} [deps]
- * @returns {{applied: boolean, cp_before?: number|null, cp_after?: number|null, chcp?: string}}
+ * @returns {{applied: boolean, reason?: string, cp_before?: number|null, cp_after?: number|null, chcp?: string}}
  */
 export function prepareConsole({
   platform = process.platform,
@@ -756,6 +865,9 @@ export function prepareConsole({
         .stdout,
     );
   const before = read();
+  if (before === null) {
+    return { applied: false, reason: "the console code page could not be read", cp_before: null };
+  }
   let after = before;
   if (before !== 65001) {
     run(chcp, ["65001"], { windowsHide: false, stdio: "ignore" });
@@ -806,7 +918,6 @@ async function main(argv) {
     return 1;
   }
   const clock = createRealClock();
-  const consoleState = prepareConsole();
   const { slot, path: slotPath } = claimSlot(runDir, {
     run_id: opts.runId,
     pid: process.pid,
@@ -826,51 +937,57 @@ async function main(argv) {
   }
   const stdin = process.stdin;
   let raw = false;
-  if (opts.echo && stdin.isTTY && typeof stdin.setRawMode === "function") {
-    stdin.setRawMode(true);
-    raw = true;
-  }
-  stdin.on("data", (buf) => control.onInput?.(buf, clock.nowNs()));
-  stdin.on("end", () => control.stop("stdin_eof"));
-  stdin.on("error", () => control.stop("stdin_eof"));
-  stdin.resume();
+  // The console is changed only once the slot and the log exist, and always restored.
+  let consoleState = { applied: false };
+  try {
+    consoleState = prepareConsole();
+    if (opts.echo && stdin.isTTY && typeof stdin.setRawMode === "function") {
+      stdin.setRawMode(true);
+      raw = true;
+    }
+    stdin.on("data", (buf) => control.onInput?.(buf, clock.nowNs()));
+    stdin.on("end", () => control.stop("stdin_eof"));
+    stdin.on("error", () => control.stop("stdin_eof"));
+    stdin.resume();
 
-  const stopPath = join(runDir, STOP_FILE);
-  const exit = await runGenerator({
-    profile: loaded.profile,
-    profileDigest: loaded.digest,
-    seed: opts.seed,
-    session: slot,
-    runId: opts.runId,
-    clock,
-    write: createFdWriter({ fd: 1 }),
-    log,
-    echo: opts.echo,
-    calibration: opts.calibration,
-    durationMs: opts.durationMs,
-    shouldStop: () => (existsSync(stopPath) ? "stop_file" : null),
-    control,
-    startExtra: {
-      pid: process.pid,
-      ppid: process.ppid,
-      slot_path: slotPath,
-      platform: process.platform,
-      node: process.version,
-      stdout_tty: isatty(1),
-      terminal_size: terminalSize(),
-      console: consoleState,
-      host_terminal_id: hostTerminalIds(),
-    },
-  });
-  if (raw) stdin.setRawMode(false);
-  stdin.pause();
-  restoreConsole(consoleState);
-  log.close();
-  if (exit.reason === "error") {
-    process.stderr.write(`ai-session: ${exit.error ?? "failed"}\n`);
-    return 1;
+    const stopPath = join(runDir, STOP_FILE);
+    const exit = await runGenerator({
+      profile: loaded.profile,
+      profileDigest: loaded.digest,
+      seed: opts.seed,
+      session: slot,
+      runId: opts.runId,
+      clock,
+      write: createFdWriter({ fd: 1 }),
+      log,
+      echo: opts.echo,
+      calibration: opts.calibration,
+      durationMs: opts.durationMs,
+      shouldStop: () => (existsSync(stopPath) ? "stop_file" : null),
+      control,
+      startExtra: {
+        pid: process.pid,
+        ppid: process.ppid,
+        slot_path: slotPath,
+        platform: process.platform,
+        node: process.version,
+        stdout_tty: isatty(1),
+        terminal_size: terminalSize(),
+        console: consoleState,
+        host_terminal_id: hostTerminalIds(),
+      },
+    });
+    if (exit.reason === "error") {
+      process.stderr.write(`ai-session: ${exit.error ?? "failed"}\n`);
+      return 1;
+    }
+    return 0;
+  } finally {
+    if (raw) stdin.setRawMode(false);
+    stdin.pause();
+    restoreConsole(consoleState);
+    log.close();
   }
-  return 0;
 }
 
 const invokedDirectly =

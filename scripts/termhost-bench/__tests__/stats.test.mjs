@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   degradation,
+  degradationKpi,
   max,
   mean,
   measureKpi,
@@ -156,6 +157,22 @@ test("degradation: measured operands, a zero baseline, and propagated reasons", 
     reason: "insufficient_samples",
     n: 0,
   });
+  assert.deepEqual(degradation(m(0), m(30)), { state: "measured", value: 0, n: 2 });
+  assert.deepEqual(
+    degradation({ state: "not_applicable", reason: "arm_not_realisable" }, m(30)),
+    { state: "not_applicable", reason: "arm_not_realisable", n: 1 },
+    "a not_applicable value at N is not_applicable, never unknown",
+  );
+  assert.deepEqual(
+    degradation(m(90), { state: "not_applicable", reason: "not_applicable_to_setup" }),
+    { state: "not_applicable", reason: "not_applicable_to_setup", n: 1 },
+  );
+  assert.throws(() => degradation({ state: "not_applicable" }, m(30)), /must carry its reason/);
+  assert.deepEqual(
+    measureKpi("degradation_cpu_pct", { state: "not_applicable", reason: "baseline_level", n: 0 }),
+    { state: "not_applicable", unit: "ratio", n: 0, reason: "baseline_level" },
+    "measureKpi keeps not_applicable",
+  );
 });
 
 test("non-finite samples are a defect, not data", () => {
@@ -240,6 +257,7 @@ test("measureKpi applies the catalog's statistics and min_n", () => {
 
 test("every value stats.mjs builds is accepted by the result schema", () => {
   const doc = windowsDesktopResults();
+  const baseline = doc.rows[3]; // runner, N = 1, tiled
   const kpis = { ...doc.rows[1].kpis };
   kpis.input_latency_ms = measureKpi("input_latency_ms", range(1, 40));
   kpis.gpu_pct = notApplicableKpi("gpu_pct", "gpu_counters_unavailable", { detail: "no WDDM GPU" });
@@ -251,13 +269,72 @@ test("every value stats.mjs builds is accepted by the result schema", () => {
       range(1, 30).map((x) => 800 - x),
     ),
   );
-  doc.rows = [row({ kpis })];
+  kpis.cpu_pct = measureKpi("cpu_pct", Array(120).fill(0));
+  for (const id of [
+    "degradation_output_latency_ms",
+    "degradation_input_latency_ms",
+    "degradation_cpu_pct",
+  ]) {
+    kpis[id] = degradationKpi(id, kpis, baseline.kpis);
+  }
+  doc.rows = [row({ kpis }), baseline];
   const r = validateResults(doc);
   assert.deepEqual(r.errors, []);
   assert.equal(kpis.input_latency_ms.state, "unknown");
+  assert.equal(kpis.degradation_input_latency_ms.state, "unknown", "an unknown base stays unknown");
+  assert.deepEqual(
+    kpis.degradation_cpu_pct,
+    { state: "measured", unit: "ratio", n: 2, value: 0 },
+    "a KPI of 0 at N is a measured ratio of 0, and the schema accepts it",
+  );
   assert.equal(
     kpis.memory_growth_mb_per_min.value,
     -1,
     "memory can shrink: the slope is unbounded below",
   );
+});
+
+test("degradationKpi reads the base KPI and statistic from the catalog's degradation_of", () => {
+  const latency = (p95) => ({
+    state: "measured",
+    unit: "ms",
+    n: 200,
+    stats: { p50: 1, p95, p99: p95 + 1 },
+  });
+  assert.deepEqual(
+    degradationKpi(
+      "degradation_output_latency_ms",
+      { output_latency_ms: latency(60) },
+      { output_latency_ms: latency(30) },
+    ),
+    { state: "measured", unit: "ratio", n: 2, value: 2 },
+    "output latency degrades by its p95",
+  );
+  const cpu = (mean, p95) => ({
+    state: "measured",
+    unit: "% of one logical core",
+    n: 120,
+    stats: { mean, p95 },
+  });
+  assert.equal(
+    degradationKpi("degradation_cpu_pct", { cpu_pct: cpu(50, 90) }, { cpu_pct: cpu(25, 30) }).value,
+    2,
+    "cpu degrades by its mean (the p95 ratio would be 3)",
+  );
+  assert.deepEqual(degradationKpi("degradation_cpu_pct", { cpu_pct: cpu(50, 90) }, undefined), {
+    state: "unknown",
+    unit: "ratio",
+    n: 1,
+    reason: "no_baseline_level",
+  });
+  assert.deepEqual(
+    degradationKpi(
+      "degradation_input_latency_ms",
+      { input_latency_ms: notApplicableKpi("input_latency_ms", "arm_not_realisable") },
+      { input_latency_ms: latency(20) },
+    ),
+    { state: "not_applicable", unit: "ratio", n: 1, reason: "arm_not_realisable" },
+    "not_applicable stays not_applicable",
+  );
+  assert.throws(() => degradationKpi("cpu_pct", {}, {}), /not a degradation KPI/);
 });

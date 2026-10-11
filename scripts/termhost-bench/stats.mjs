@@ -13,7 +13,8 @@
  *     below that the nearest-rank percentile IS the maximum, and calling it p99 would
  *     mislabel it; a caller may raise the minimum, never lower it;
  *   - a slope needs 3 points and two distinct x values;
- *   - a degradation ratio needs both operands measured and a non-zero N = 1 value.
+ *   - a degradation ratio needs both operands measured and a non-zero N = 1 value; a
+ *     not_applicable operand makes it not_applicable (never unknown).
  *
  * Inputs must be finite numbers. A NaN or null sample is a defect upstream, so it
  * throws rather than being silently dropped (silent-empty is unknown, not data).
@@ -24,7 +25,8 @@ import { getKpi, minSamplesForStatistic, percentParts, percentileFloor } from ".
 /**
  * @typedef {{state: "measured", value: number, n: number}} MeasuredReading
  * @typedef {{state: "unknown", reason: string, n: number}} UnknownReading
- * @typedef {MeasuredReading | UnknownReading} Reading
+ * @typedef {{state: "not_applicable", reason: string, n: number}} NotApplicableReading
+ * @typedef {MeasuredReading | UnknownReading | NotApplicableReading} Reading
  */
 
 /**
@@ -182,20 +184,54 @@ export function slope(xs, ys, { minN = 3 } = {}) {
 
 /**
  * A KPI at N divided by the same setup's value at N = 1. The ratio's n counts its
- * measured operands. An unknown value at N propagates its own reason; an unknown or
- * zero N = 1 value makes the ratio unknown(no_baseline_level / zero_baseline).
+ * measured operands. A not_applicable operand makes the ratio not_applicable with that
+ * operand's reason; an unknown value at N propagates its own reason; an unknown or zero
+ * N = 1 value makes the ratio unknown(no_baseline_level / zero_baseline). A value of 0
+ * at N is a measured ratio of 0.
  *
- * @param {{state: string, value?: number, reason?: string}} atN
- * @param {{state: string, value?: number, reason?: string}} atOne
+ * @param {{state: string, value?: number, reason?: string} | undefined} atN
+ * @param {{state: string, value?: number, reason?: string} | undefined} atOne
  * @returns {Reading}
  */
 export function degradation(atN, atOne) {
   const nMeasured = (atN?.state === "measured" ? 1 : 0) + (atOne?.state === "measured" ? 1 : 0);
+  if (atN?.state === "not_applicable") return notApplicable(atN.reason, nMeasured);
   if (atN?.state !== "measured") return unknown(atN?.reason ?? "insufficient_samples", nMeasured);
+  if (atOne?.state === "not_applicable") return notApplicable(atOne.reason, nMeasured);
   if (atOne?.state !== "measured") return unknown("no_baseline_level", nMeasured);
   finiteArray([atN.value, atOne.value], "operands");
   if (atOne.value === 0) return unknown("zero_baseline", nMeasured);
   return measured(atN.value / atOne.value, 2);
+}
+
+/** @returns {NotApplicableReading} */
+function notApplicable(reason, n) {
+  if (!reason) throw new TypeError("a not_applicable operand must carry its reason");
+  return { state: "not_applicable", reason, n };
+}
+
+/**
+ * A `degradation_*` KPI value for one row: the base KPI and statistic come from the
+ * catalog's `degradation_of`, read out of the row's `kpis` at N and the matching
+ * N = 1 row's `kpis` (pass `undefined` when there is no N = 1 row).
+ *
+ * @param {string} id a degradation_* catalog id
+ * @param {Record<string, object>} kpisAtN the row's `kpis`
+ * @param {Record<string, object> | undefined} kpisAtOne the matching N = 1 row's `kpis`
+ * @returns {object}
+ */
+export function degradationKpi(id, kpisAtN, kpisAtOne) {
+  const of = getKpi(id).degradation_of;
+  if (!of) throw new RangeError(`${id} is not a degradation KPI`);
+  const operand = (kpiValue) => {
+    if (kpiValue?.state !== "measured") return kpiValue;
+    const value = kpiValue.stats?.[of.statistic];
+    if (typeof value !== "number") {
+      throw new TypeError(`${of.kpi} is measured but carries no ${of.statistic}`);
+    }
+    return { state: "measured", value };
+  };
+  return measureKpi(id, degradation(operand(kpisAtN?.[of.kpi]), operand(kpisAtOne?.[of.kpi])));
 }
 
 /**
@@ -267,7 +303,9 @@ export function measureKpi(id, input, extra = {}) {
     const reading = input ?? {};
     const n = reading.n;
     if (!Number.isInteger(n) || n < 0) throw new TypeError(`${id}: input.n must be a count`);
-    if (reading.state !== undefined && reading.state !== "measured") {
+    if (reading.state === "not_applicable") {
+      out = { state: "not_applicable", ...base, n, reason: reading.reason };
+    } else if (reading.state !== undefined && reading.state !== "measured") {
       out = { state: "unknown", ...base, n, reason: reading.reason ?? "insufficient_samples" };
     } else if (n < minN) {
       out = { state: "unknown", ...base, n, reason: "insufficient_samples" };

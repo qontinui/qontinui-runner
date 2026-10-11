@@ -3,7 +3,8 @@
  * output, on a virtual clock), profile conformance (frame rates, sizes, durations,
  * transitions, the 10 Hz marker cadence, and the marker region surviving a repaint),
  * stall accounting through an injected slow writer, echo and calibration modes, and
- * the D13 command line run as real processes (slots, stop file, stdin EOF).
+ * the cursor kept off the marker region, a backlogged generator still serving stdin, EOF
+ * and signals, and the D13 command line run as real processes (slots, stop file, EOF).
  *
  *   node --test scripts/termhost-bench/__tests__/generator.test.mjs
  */
@@ -26,20 +27,32 @@ import {
   parseOverlays,
   stripOverlays,
 } from "../marker.mjs";
-import { SHIPPED_PROFILES, loadProfile, validateProfile } from "../profile.mjs";
+import {
+  SHIPPED_PROFILES,
+  canonicalJson,
+  loadProfile,
+  profileDigest,
+  validateProfile,
+} from "../profile.mjs";
 import { mulberry32 } from "../generator/content.mjs";
 import { PhaseSequencer, Schedule, buildContent, pickWeighted } from "../generator/schedule.mjs";
 import {
   HOST_TERMINAL_ENV,
   UsageError,
+  YIELD_INTERVAL_MS,
   claimSlot,
   composeWrite,
+  createControl,
   createFdWriter,
+  createVirtualClock,
   hostTerminalIds,
   parseArgs,
   parseCodePage,
+  postambleFor,
+  preambleFor,
   prepareConsole,
   restoreConsole,
+  runGenerator,
   runVirtual,
 } from "../generator/ai-session.mjs";
 import { MiniVt } from "./helpers/mini-vt.mjs";
@@ -53,7 +66,7 @@ const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
 const shipped = (id) => loadProfile(id).profile;
 
 /** SHA-256 of the determinism fixture's first 10 s at seed 1, session 0. */
-const PINNED_SHA256 = "fa107f1eb890abfe8ee17485f138015f58a16bfa5bd6c2bf3306aa5d40358c1b";
+const PINNED_SHA256 = "cedda77eabf2a97f501e54a556489659ed28d21c7ad1c73356773bcfc54ac8fe";
 
 // ---------------------------------------------------------------------------
 // Determinism
@@ -272,10 +285,13 @@ test("conformance: each phase emits frames at its profile frame rate (exactly ce
     for (const p of byPhase.values()) {
       if (p.endUs > seconds * 1e6) continue;
       const def = profile.phases[p.id];
-      // Frame j sits at start + floor(j * 1e6 / fps) while that is before the end.
-      const expected = Math.ceil(((p.endUs - p.startUs) * def.fps) / 1e6 - 1e-9);
-      assert.ok(
-        Math.abs(p.frames - expected) <= 1,
+      assert.ok(Number.isInteger(def.fps), `${id}/${p.id}: the shipped frame rates are integers`);
+      // Frame j sits at start + floor(j * 1e6 / fps) while that is before the end, so a
+      // phase of D us holds exactly ceil(D * fps / 1e6) frames (integer arithmetic).
+      const expected = Math.floor(((p.endUs - p.startUs) * def.fps + 1e6 - 1) / 1e6);
+      assert.equal(
+        p.frames,
+        expected,
         `${id}/${p.id} phase ${p.ordinal}: ${p.frames} frames in ${(p.endUs - p.startUs) / 1000} ms at ${def.fps} fps`,
       );
       seen.add(p.id);
@@ -384,11 +400,43 @@ test("conformance: the phase chain follows the duration tables and transition we
   }
 });
 
-test("pickWeighted honours weights and insertion order", () => {
+test("pickWeighted honours weights in sorted key order, whatever the JSON order", () => {
   assert.equal(pickWeighted({ a: 1, b: 3 }, 0), "a");
   assert.equal(pickWeighted({ a: 1, b: 3 }, 0.2499), "a");
   assert.equal(pickWeighted({ a: 1, b: 3 }, 0.25), "b");
   assert.equal(pickWeighted({ a: 1, b: 3 }, 0.9999), "b");
+  assert.equal(pickWeighted({ b: 3, a: 1 }, 0.2), "a", "insertion order does not matter");
+  assert.equal(pickWeighted({ b: 3, a: 1 }, 0.3), "b");
+});
+
+test("the profile digest is canonical, and a reordered profile generates the same stream", async () => {
+  const profile = readJson(FIXTURE_PROFILE);
+  const reorder = (value) => {
+    if (Array.isArray(value)) return value.map(reorder);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.keys(value)
+          .reverse()
+          .map((k) => [k, reorder(value[k])]),
+      );
+    }
+    return value;
+  };
+  const reordered = reorder(profile);
+  assert.notEqual(
+    JSON.stringify(reordered),
+    JSON.stringify(profile),
+    "the key order really differs",
+  );
+  assert.equal(profileDigest(reordered), profileDigest(profile));
+  assert.equal(
+    canonicalJson({ b: [1, { d: 1, c: 2 }], a: null }),
+    '{"a":null,"b":[1,{"c":2,"d":1}]}',
+  );
+  assert.notEqual(profileDigest({ ...profile, marker_hz: 5 }), profileDigest(profile));
+  const a = await runVirtual({ profile, durationMs: 3000 });
+  const b = await runVirtual({ profile: reordered, durationMs: 3000 });
+  assert.ok(a.bytes.equals(b.bytes), "one canonical profile, one stream");
 });
 
 test("conformance: the bulk profile schedules 4 MiB/s of content per session", async () => {
@@ -477,6 +525,36 @@ test("end to end: after every write a profile emits, the region shows that write
   }
 });
 
+test("the cursor is hidden and parked: a visible cursor never sits on a marker region", async () => {
+  const cases = [
+    [readJson(FIXTURE_PROFILE), 10000, {}],
+    [shipped("claude-tui"), 10000, {}],
+    [shipped("all-repaint"), 2000, {}],
+    [readJson(QUIET_PROFILE), 3000, { calibration: true }],
+  ];
+  for (const [profile, ms, extra] of cases) {
+    const label = `${profile.id}${extra.calibration ? " (calibration)" : ""}`;
+    const r = await runVirtual({ profile, durationMs: ms, ...extra });
+    const vt = new MiniVt(profile.geometry.cols, profile.geometry.rows);
+    vt.write(r.writes[0].bytes.toString("utf8"));
+    assert.equal(vt.cursorVisible, false, `${label}: the preamble hides the cursor`);
+    assert.ok(
+      vt.r > ECHO_REGION.row,
+      `${label}: the preamble parks the cursor below the reserved rows`,
+    );
+    for (const w of r.writes.slice(1)) {
+      vt.write(w.bytes.toString("utf8"));
+      for (const region of [MARKER_REGION, ECHO_REGION]) {
+        assert.ok(!vt.visibleCursorIn(region), `${label}: a visible cursor on row ${region.row}`);
+      }
+    }
+    vt.write(r.postamble.toString("utf8"));
+    assert.equal(vt.cursorVisible, true, `${label}: the postamble shows the cursor again`);
+  }
+  assert.ok(preambleFor({ alt_screen: true }).startsWith("\x1b[?1049h\x1b[?25l"));
+  assert.ok(postambleFor({ alt_screen: true }).includes("\x1b[?25h\x1b[?1049l"));
+});
+
 // ---------------------------------------------------------------------------
 // Producer stall accounting
 // ---------------------------------------------------------------------------
@@ -532,6 +610,83 @@ test("stall accounting: a saturated writer falls behind without skipping a byte"
   );
   const progress = slow.records.filter((x) => x.type === "progress");
   for (const p of progress) assert.ok(p.bytes_scheduled >= p.bytes_written);
+});
+
+test("backlogged, the generator still answers an echo and ends on SIGTERM or stdin EOF", async () => {
+  const profile = shipped("all-repaint");
+  const delay = 50_000_000; // 50 ms per write: 30 writes due a second, 20 possible
+  const promptly = BigInt(YIELD_INTERVAL_MS) * 1_000_000n + BigInt(delay); // a yield + one write
+  const run = await runVirtual({
+    profile,
+    durationMs: 6000,
+    echo: true,
+    writeDelayNs: delay,
+    inputs: [
+      { tNs: 1_000_000_000n, bytes: "a" },
+      { tNs: 4_000_000_000n, signal: "SIGTERM" },
+    ],
+  });
+  assert.ok(run.exit.queued > 10, `the writer really is saturated (${run.exit.queued} queued)`);
+  const echoes = run.records.filter((x) => x.type === "echo");
+  assert.deepEqual(
+    echoes.map((e) => e.byte),
+    [97],
+    "the echo is answered while backlogged",
+  );
+  const waited = BigInt(echoes[0].t_read_ns) - 1_000_000_000n;
+  assert.ok(waited >= 0n && waited <= promptly, `read ${waited} ns after it arrived`);
+  assert.equal(run.exit.reason, "signal:SIGTERM");
+  assert.ok(
+    BigInt(run.exit.wall_ns) <= 4_000_000_000n + promptly,
+    `stopped at ${run.exit.wall_ns}`,
+  );
+  const eof = await runVirtual({
+    profile,
+    durationMs: 6000,
+    writeDelayNs: delay,
+    inputs: [{ tNs: 2_000_000_000n, eof: true }],
+  });
+  assert.equal(eof.exit.reason, "stdin_eof");
+  assert.ok(
+    BigInt(eof.exit.wall_ns) <= 2_000_000_000n + promptly,
+    `stopped at ${eof.exit.wall_ns}`,
+  );
+});
+
+test("an echo whose read time is unknown records it as unknown, never as the emit time", async () => {
+  const profile = readJson(QUIET_PROFILE);
+  const clock = createVirtualClock();
+  const control = createControl();
+  const records = [];
+  let poked = false;
+  const sleepUntil = clock.sleepUntil;
+  clock.sleepUntil = async (tNs) => {
+    if (!poked && clock.nowNs() >= 200_000_000n) {
+      poked = true;
+      control.onInput(Buffer.from("z")); // no read time
+    }
+    return sleepUntil(tNs);
+  };
+  await runGenerator({
+    profile,
+    seed: 1,
+    session: 0,
+    runId: "t",
+    clock,
+    write: () => {},
+    log: (r) => records.push(r),
+    echo: true,
+    durationMs: 500,
+    control,
+  });
+  const [echo] = records.filter((r) => r.type === "echo");
+  assert.equal(echo.byte, 122);
+  assert.equal(echo.t_read_ns, "unknown");
+  assert.throws(
+    () => BigInt(echo.t_read_ns),
+    SyntaxError,
+    "a consumer cannot silently compute with it",
+  );
 });
 
 test("the fd writer delivers every byte through partial writes and EAGAIN", () => {
@@ -752,11 +907,33 @@ test("on a Windows console the output code page becomes UTF-8 and is restored af
   assert.equal(already.cp_after, 65001);
 });
 
+test("an unreadable code page is never switched, so there is nothing to restore", () => {
+  const calls = [];
+  const run = (exe, args) => {
+    calls.push(args);
+    return { stdout: "Zugriff verweigert" };
+  };
+  const state = prepareConsole({ platform: "win32", stdoutIsTty: true, run, env: {} });
+  assert.equal(state.applied, false);
+  assert.equal(state.cp_before, null);
+  assert.ok(
+    !calls.some((a) => a[0] === "65001"),
+    "no switch to 65001 without a page to go back to",
+  );
+  restoreConsole(state, { run });
+  assert.ok(
+    calls.every((a) => a.length === 0),
+    "and restore does nothing",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // The real CLI (D13), as processes
 // ---------------------------------------------------------------------------
 
-function startGenerator(runDir, extra = [], profile = QUIET_PROFILE) {
+const BULK_PROFILE = "bulk";
+
+function startGenerator(runDir, extra = [], profile = QUIET_PROFILE, { keepStdout = true } = {}) {
   const child = spawn(
     process.execPath,
     [
@@ -775,8 +952,11 @@ function startGenerator(runDir, extra = [], profile = QUIET_PROFILE) {
   );
   const out = [];
   const err = [];
-  child.stdout.on("data", (b) => out.push(b));
+  child.stdout.on("data", (b) => {
+    if (keepStdout) out.push(b);
+  });
   child.stderr.on("data", (b) => err.push(b));
+  child.stdin.on("error", () => {}); // a child that already exited closes its stdin
   const done = new Promise((res) => child.on("exit", (code, signal) => res({ code, signal })));
   return {
     child,
@@ -784,6 +964,44 @@ function startGenerator(runDir, extra = [], profile = QUIET_PROFILE) {
     stdout: () => Buffer.concat(out),
     stderr: () => Buffer.concat(err).toString(),
   };
+}
+
+/**
+ * A run directory for one CLI test, cleaned up AFTER the test whatever happened: every
+ * generator still alive is killed and awaited first, then the directory is removed
+ * (retrying, never throwing), so a Windows file lock cannot replace the test's own
+ * failure with an EBUSY.
+ */
+function cliHarness(t) {
+  const dir = mkdtempSync(join(tmpdir(), "termhost-gen-"));
+  const started = [];
+  t.after(async () => {
+    for (const g of started) {
+      if (g.child.exitCode === null && g.child.signalCode === null) g.child.kill();
+    }
+    await Promise.all(started.map((g) => g.done));
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+      // the OS temp dir keeps it; the test's own result stands
+    }
+  });
+  return {
+    dir,
+    start(extra, profile, opts) {
+      const g = startGenerator(dir, extra, profile, opts);
+      started.push(g);
+      return g;
+    },
+  };
+}
+
+/** Read a child's stdout slowly (one chunk, then a pause), so writes back up. */
+function throttle(stream, pauseMs) {
+  stream.on("data", () => {
+    stream.pause();
+    setTimeout(() => stream.resume(), pauseMs);
+  });
 }
 
 async function waitFor(predicate, what, timeoutMs = 20000) {
@@ -804,154 +1022,180 @@ const genRecords = (runDir, slot) => {
     .map((l) => JSON.parse(l));
 };
 const hasMarker = (runDir, slot) => genRecords(runDir, slot).some((r) => r.type === "marker");
-
-async function withRunDir(fn) {
-  const dir = mkdtempSync(join(tmpdir(), "termhost-gen-"));
-  try {
-    await fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
+const backlogged = (runDir) =>
+  genRecords(runDir, 0).some((r) => r.type === "progress" && r.queued >= 20);
+const echoCount = (runDir) => genRecords(runDir, 0).filter((r) => r.type === "echo").length;
 
 test(
   "CLI: the D13 command line claims slot 0, logs its records, and exits 0 at --duration-ms",
   { timeout: 60000 },
-  async () => {
-    await withRunDir(async (dir) => {
-      const g = startGenerator(dir, ["--duration-ms", "1200"]);
-      const { code } = await g.done;
-      assert.equal(code, 0, g.stderr());
-      const slot = readJson(join(dir, "slot-0"));
-      assert.equal(slot.pid, g.child.pid);
-      assert.equal(
-        slot.ppid,
-        process.pid,
-        "the slot names the parent (the session shell in a real host)",
-      );
-      assert.equal(slot.run_id, "ci-run-1");
-      const records = genRecords(dir, 0);
-      assert.equal(records[0].type, "start");
-      assert.equal(records[0].profile, "quiet-fixture");
-      assert.equal(records[0].session, 0);
-      assert.match(records[0].t0_ns, /^\d+$/, "absolute ns timestamps are decimal strings");
-      const markers = records.filter((r) => r.type === "marker");
-      assert.ok(markers.length >= 5, `${markers.length} markers`);
-      assert.deepEqual(
-        markers.map((m) => m.seq),
-        markers.map((_, i) => i),
-      );
-      for (const m of markers) assert.ok(BigInt(m.t_written_ns) >= BigInt(m.t_emit_ns));
-      assert.ok(records.some((r) => r.type === "progress"));
-      assert.equal(records.at(-1).type, "exit");
-      assert.equal(records.at(-1).reason, "duration");
-      const overlays = parseOverlays(g.stdout());
-      assert.ok(overlays.length >= markers.length);
-      assert.ok(
-        overlays.every(
-          (o) => o.decoded.ok && o.decoded.session === 0 && o.decoded.kindName === "output",
-        ),
-      );
-    });
+  async (t) => {
+    const h = cliHarness(t);
+    const g = h.start(["--echo", "--duration-ms", "1200"]);
+    const { code } = await g.done;
+    assert.equal(code, 0, g.stderr());
+    const slot = readJson(join(h.dir, "slot-0"));
+    assert.equal(slot.pid, g.child.pid);
+    assert.equal(
+      slot.ppid,
+      process.pid,
+      "the slot names the parent (the session shell in a real host)",
+    );
+    assert.equal(slot.run_id, "ci-run-1");
+    const records = genRecords(h.dir, 0);
+    assert.equal(records[0].type, "start");
+    assert.equal(records[0].profile, "quiet-fixture");
+    assert.equal(records[0].session, 0);
+    assert.equal(records[0].echo, true, "every session runs with --echo (N11)");
+    assert.match(records[0].t0_ns, /^\d+$/, "absolute ns timestamps are decimal strings");
+    const markers = records.filter((r) => r.type === "marker");
+    assert.ok(markers.length >= 5, `${markers.length} markers`);
+    assert.deepEqual(
+      markers.map((m) => m.seq),
+      markers.map((_, i) => i),
+    );
+    for (const m of markers) assert.ok(BigInt(m.t_written_ns) >= BigInt(m.t_emit_ns));
+    assert.ok(records.some((r) => r.type === "progress"));
+    assert.equal(records.at(-1).type, "exit");
+    assert.equal(records.at(-1).reason, "duration");
+    const overlays = parseOverlays(g.stdout());
+    assert.ok(overlays.length >= markers.length);
+    assert.ok(
+      overlays.every(
+        (o) => o.decoded.ok && o.decoded.session === 0 && o.decoded.kindName === "output",
+      ),
+    );
   },
 );
 
-test("CLI: the stop file ends a generator with exit 0", { timeout: 60000 }, async () => {
-  await withRunDir(async (dir) => {
-    const g = startGenerator(dir);
-    await waitFor(() => hasMarker(dir, 0), "the first marker");
-    writeFileSync(join(dir, "stop"), "");
-    const { code } = await g.done;
-    assert.equal(code, 0, g.stderr());
-    assert.equal(genRecords(dir, 0).at(-1).reason, "stop_file");
-  });
+test("CLI: the stop file ends a generator with exit 0", { timeout: 60000 }, async (t) => {
+  const h = cliHarness(t);
+  const g = h.start();
+  await waitFor(() => hasMarker(h.dir, 0), "the first marker");
+  writeFileSync(join(h.dir, "stop"), "");
+  const { code } = await g.done;
+  assert.equal(code, 0, g.stderr());
+  assert.equal(genRecords(h.dir, 0).at(-1).reason, "stop_file");
 });
 
-test("CLI: stdin EOF ends a generator with exit 0", { timeout: 60000 }, async () => {
-  await withRunDir(async (dir) => {
-    const g = startGenerator(dir);
-    await waitFor(() => hasMarker(dir, 0), "the first marker");
-    g.child.stdin.end();
-    const { code } = await g.done;
-    assert.equal(code, 0, g.stderr());
-    assert.equal(genRecords(dir, 0).at(-1).reason, "stdin_eof");
-  });
+test("CLI: stdin EOF ends a generator with exit 0", { timeout: 60000 }, async (t) => {
+  const h = cliHarness(t);
+  const g = h.start();
+  await waitFor(() => hasMarker(h.dir, 0), "the first marker");
+  g.child.stdin.end();
+  const { code } = await g.done;
+  assert.equal(code, 0, g.stderr());
+  assert.equal(genRecords(h.dir, 0).at(-1).reason, "stdin_eof");
 });
 
 test(
   "CLI: concurrent generators with one command line claim distinct slots and mark their own session",
   { timeout: 60000 },
-  async () => {
-    await withRunDir(async (dir) => {
-      const gens = [startGenerator(dir), startGenerator(dir), startGenerator(dir)];
-      await waitFor(
-        () => [0, 1, 2].every((s) => hasMarker(dir, s)),
-        "three generators' first markers",
-      );
-      writeFileSync(join(dir, "stop"), "");
-      const exits = await Promise.all(gens.map((g) => g.done));
-      assert.deepEqual(
-        exits.map((e) => e.code),
-        [0, 0, 0],
-      );
-      const slotOf = new Map([0, 1, 2].map((s) => [readJson(join(dir, `slot-${s}`)).pid, s]));
-      assert.equal(slotOf.size, 3);
-      for (const g of gens) {
-        const slot = slotOf.get(g.child.pid);
-        const sessions = new Set(parseOverlays(g.stdout()).map((o) => o.decoded.session));
-        assert.deepEqual([...sessions], [slot], `pid ${g.child.pid} marks session ${slot}`);
-      }
-    });
+  async (t) => {
+    const h = cliHarness(t);
+    const gens = [h.start(), h.start(), h.start()];
+    await waitFor(
+      () => [0, 1, 2].every((s) => hasMarker(h.dir, s)),
+      "three generators' first markers",
+    );
+    writeFileSync(join(h.dir, "stop"), "");
+    const exits = await Promise.all(gens.map((g) => g.done));
+    assert.deepEqual(
+      exits.map((e) => e.code),
+      [0, 0, 0],
+    );
+    const slotOf = new Map([0, 1, 2].map((s) => [readJson(join(h.dir, `slot-${s}`)).pid, s]));
+    assert.equal(slotOf.size, 3);
+    for (const g of gens) {
+      const slot = slotOf.get(g.child.pid);
+      const sessions = new Set(parseOverlays(g.stdout()).map((o) => o.decoded.session));
+      assert.deepEqual([...sessions], [slot], `pid ${g.child.pid} marks session ${slot}`);
+    }
   },
 );
 
-test("CLI: --echo answers bytes on stdin with echo markers", { timeout: 60000 }, async () => {
-  await withRunDir(async (dir) => {
-    const g = startGenerator(dir, ["--echo"]);
-    await waitFor(() => hasMarker(dir, 0), "the first marker");
+test("CLI: --echo answers bytes on stdin with echo markers", { timeout: 60000 }, async (t) => {
+  const h = cliHarness(t);
+  const g = h.start(["--echo"]);
+  await waitFor(() => hasMarker(h.dir, 0), "the first marker");
+  g.child.stdin.write("ab");
+  await waitFor(() => echoCount(h.dir) === 2, "two echo records");
+  writeFileSync(join(h.dir, "stop"), "");
+  const { code } = await g.done;
+  assert.equal(code, 0, g.stderr());
+  assert.deepEqual(
+    genRecords(h.dir, 0)
+      .filter((r) => r.type === "echo")
+      .map((r) => [r.seq, r.byte]),
+    [
+      [0, 97],
+      [1, 98],
+    ],
+  );
+  const echoes = parseOverlays(g.stdout()).filter((o) => o.row === ECHO_REGION.row);
+  assert.deepEqual([...new Set(echoes.map((o) => o.decoded.seq))], [0, 1]);
+  assert.ok(echoes.every((o) => o.decoded.kindName === "echo"));
+});
+
+test(
+  "CLI: a backlogged generator still answers echo and ends on stdin EOF",
+  { timeout: 120000 },
+  async (t) => {
+    const h = cliHarness(t);
+    const g = h.start(["--echo"], BULK_PROFILE, { keepStdout: false });
+    throttle(g.child.stdout, 40);
+    await waitFor(() => backlogged(h.dir), "a backlog of at least 20 queued writes", 60000);
     g.child.stdin.write("ab");
-    await waitFor(
-      () => genRecords(dir, 0).filter((r) => r.type === "echo").length === 2,
-      "two echo records",
-    );
-    writeFileSync(join(dir, "stop"), "");
+    await waitFor(() => echoCount(h.dir) === 2, "two echo records while backlogged", 30000);
+    g.child.stdin.end();
     const { code } = await g.done;
     assert.equal(code, 0, g.stderr());
-    assert.deepEqual(
-      genRecords(dir, 0)
-        .filter((r) => r.type === "echo")
-        .map((r) => [r.seq, r.byte]),
-      [
-        [0, 97],
-        [1, 98],
-      ],
-    );
-    const echoes = parseOverlays(g.stdout()).filter((o) => o.row === ECHO_REGION.row);
-    assert.deepEqual([...new Set(echoes.map((o) => o.decoded.seq))], [0, 1]);
-    assert.ok(echoes.every((o) => o.decoded.kindName === "echo"));
-  });
-});
+    const exit = genRecords(h.dir, 0).at(-1);
+    assert.equal(exit.reason, "stdin_eof");
+    assert.ok(exit.queued > 0, "it was still behind when EOF ended it");
+  },
+);
+
+test(
+  "CLI: a backlogged generator ends cleanly on SIGTERM",
+  {
+    timeout: 120000,
+    skip:
+      process.platform === "win32"
+        ? "Windows has no catchable SIGTERM: kill() terminates the process outright"
+        : false,
+  },
+  async (t) => {
+    const h = cliHarness(t);
+    const g = h.start(["--echo"], BULK_PROFILE, { keepStdout: false });
+    throttle(g.child.stdout, 40);
+    await waitFor(() => backlogged(h.dir), "a backlog of at least 20 queued writes", 60000);
+    g.child.kill("SIGTERM");
+    const { code } = await g.done;
+    assert.equal(code, 0, g.stderr());
+    assert.equal(genRecords(h.dir, 0).at(-1).reason, "signal:SIGTERM");
+  },
+);
 
 test(
   "CLI: a usage error exits 2 and a bad profile or run dir exits 1",
   { timeout: 60000 },
-  async () => {
-    await withRunDir(async (dir) => {
-      const usage = spawn(process.execPath, [GENERATOR, "--run-dir", dir], {
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const usageExit = await new Promise((r) => usage.on("exit", r));
-      assert.equal(usageExit, 2);
-      const badProfile = startGenerator(dir, [], join(dir, "missing.json"));
-      assert.equal((await badProfile.done).code, 1);
-      const badDir = startGenerator(join(dir, "nope"));
-      assert.equal((await badDir.done).code, 1);
-      assert.equal(
-        existsSync(join(dir, "slot-0")),
-        false,
-        "nothing claims a slot before its arguments are valid",
-      );
+  async (t) => {
+    const h = cliHarness(t);
+    const usage = spawn(process.execPath, [GENERATOR, "--run-dir", h.dir], {
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    const usageExit = await new Promise((r) => usage.on("exit", r));
+    assert.equal(usageExit, 2);
+    const badProfile = h.start([], join(h.dir, "missing.json"));
+    assert.equal((await badProfile.done).code, 1);
+    const badDir = startGenerator(join(h.dir, "nope"));
+    assert.equal((await badDir.done).code, 1);
+    assert.equal(
+      existsSync(join(h.dir, "slot-0")),
+      false,
+      "nothing claims a slot before its arguments are valid",
+    );
   },
 );
 

@@ -1,12 +1,11 @@
-#!/usr/bin/env node
 /**
- * termhost-bench marker codec — (kind, session, sequence) <-> 20 solid-background
+ * termhost-bench marker codec (v2) — (kind, session, sequence) <-> 20 solid-background
  * terminal cells that an outside-in probe can read off a captured frame.
  *
  * Plan `2026-10-11-terminal-page-performance-kpis-across-setups`, Phase 1. This is
- * the ENCODER and a cell-level decoder; the raster decoder is Phase 2's Rust probe,
- * which must reproduce `marker-golden.json` (README.md, "Marker codec", has the
- * exact format and the golden-file shape).
+ * the ENCODER and the cell-level decoder. How a row of captured PIXELS becomes cells is
+ * `marker-raster.mjs` (exact thresholds and tolerances), and `marker-golden.mjs` builds
+ * `marker-golden.json`, which Phase 2's Rust probe must reproduce.
  *
  * Design, each choice for a robust read off a composited, scaled, colour-managed frame:
  *
@@ -14,13 +13,12 @@
  *     255 (indices 16, 21, 46, 51, 196, 201, 226, 231). Indices 16-231 are fixed in
  *     xterm-compatible hosts (colour schemes remap only 0-15), and with binary
  *     channels a decoder thresholds each channel independently, which survives
- *     anti-aliased edges (sample cell centres), 100-200 % scaling and colour
- *     management shifting a channel by tens of levels.
+ *     anti-aliased edges, 100-200 % scaling and colour management shifting a channel
+ *     by tens of levels (the pixel thresholds are 63 and 192).
  *   - Differential digits: cell i's colour is (colour[i-1] + 1 + digit[i]) mod 8,
  *     digits 0-6, from a virtual colour 0 before cell 0. Adjacent cells therefore
- *     ALWAYS differ, so every cell boundary is a colour edge and a decoder can
- *     segment cells without knowing the cell width — and checks that all 20 segments
- *     share one width, which rejects clipped or partly occluded markers.
+ *     ALWAYS differ, so every cell boundary of a valid marker is a colour edge; a pixel
+ *     run k cells wide is k equal cells, which no valid marker contains.
  *   - Layout (20 digits, base 7): start sentinel [3, 6] (always red, cyan), kind (1),
  *     session (3, 0..342), sequence (6, mod 117649 = 3.27 h at 10 Hz), checksum (5),
  *     end sentinel [5, 1, 3].
@@ -35,19 +33,12 @@
  * not seen yet. An overlay saves and restores the cursor (DECSC/DECRC), so it can be
  * appended to streaming text or inserted before the end of a synchronized repaint.
  *
- * Usage:
- *   node scripts/termhost-bench/marker.mjs --check-golden   (default; exit 1 on drift)
- *   node scripts/termhost-bench/marker.mjs --write-golden
+ * Version 2 changed no cell or byte of a marker: it added the exact pixel rules
+ * (marker-raster.mjs), raster vectors, and an off-palette vector a pixel decoder can
+ * reproduce (index 88, rgb(135,0,0)).
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-export const GOLDEN_PATH = join(HERE, "marker-golden.json");
-
-export const CODEC_VERSION = 1;
+export const CODEC_VERSION = 2;
 export const MARKER_CELLS = 20;
 /** Output markers: row 0, columns 0-19 (0-based). */
 export const MARKER_REGION = Object.freeze({ row: 0, col: 0, cells: MARKER_CELLS });
@@ -362,235 +353,4 @@ export function parseOverlays(stream) {
 export function stripOverlays(stream) {
   const text = typeof stream === "string" ? stream : stream.toString("utf8");
   return text.replace(OVERLAY_RE, "");
-}
-
-// ---------------------------------------------------------------------------
-// Golden vectors (the contract with Phase 2's Rust decoder)
-// ---------------------------------------------------------------------------
-
-const GOLDEN_VALID = [
-  ["first output marker", 0, 0, 0],
-  ["session 1 seq 1", 0, 1, 1],
-  ["mid-run output", 0, 14, 1234],
-  ["N = 40 ladder top, one hour at 10 Hz", 0, 39, 36000],
-  [
-    "largest session and seq (every session and seq digit 6)",
-    0,
-    SESSION_LIMIT - 1,
-    SEQ_MODULUS - 1,
-  ],
-  ["seq 0 on session 3 (what a counter of SEQ_MODULUS reduces to)", 0, 3, markerSeq(SEQ_MODULUS)],
-  ["first echo", 1, 0, 0],
-  ["echo 99 on session 7", 1, 7, 99],
-  ["echo seq above 7^5 on session 100", 1, 100, 50000],
-  ["calibration session 0", 2, 0, 0],
-  ["calibration session 39", 2, 39, 0],
-  ["digit-boundary session 48 (066) and seq 16806 (066666)", 0, 48, 16806],
-];
-
-function goldenVector(name, kind, session, seq) {
-  const digits = markerDigits({ kind, session, seq });
-  const values = digitsToValues(digits);
-  const indices = values.map((v) => PALETTE[v].index);
-  return {
-    name,
-    kind,
-    session,
-    seq,
-    digits,
-    values,
-    indices,
-    rgb: values.map((v) => [...PALETTE[v].rgb]),
-    cells_hex: Buffer.from(cellsSgr(indices), "latin1").toString("hex"),
-    overlay_hex: Buffer.from(markerOverlay({ kind, session, seq }), "latin1").toString("hex"),
-    echo_overlay_hex: Buffer.from(
-      markerOverlay({ kind, session, seq }, ECHO_REGION),
-      "latin1",
-    ).toString("hex"),
-  };
-}
-
-function invalidVector(name, indices, reason, note) {
-  return {
-    name,
-    reason,
-    note,
-    indices,
-    rgb: indices.map((i) => xtermRgb(i)),
-  };
-}
-
-function rechain(digits) {
-  return digitsToValues(digits).map((v) => PALETTE[v].index);
-}
-
-function buildInvalidVectors() {
-  const base = markerDigits({ kind: 0, session: 14, seq: 1234 });
-  const baseValues = digitsToValues(base);
-  const baseIndices = baseValues.map((v) => PALETTE[v].index);
-  const vectors = [];
-
-  vectors.push(
-    invalidVector(
-      "19 cells",
-      baseIndices.slice(0, MARKER_CELLS - 1),
-      "wrong_length",
-      "the last cell is missing (a clipped marker)",
-    ),
-  );
-
-  const offPalette = [...baseIndices];
-  offPalette[7] = 17; // cube (0,0,1) = rgb(0,0,95): a non-binary channel
-  vectors.push(
-    invalidVector("off-palette cell", offPalette, "off_palette", "cell 7 is index 17, rgb(0,0,95)"),
-  );
-
-  const adjacent = [...baseIndices];
-  adjacent[9] = adjacent[8];
-  vectors.push(
-    invalidVector(
-      "two adjacent cells share a colour",
-      adjacent,
-      "adjacent_cells_equal",
-      "cell 9 repeats cell 8",
-    ),
-  );
-
-  const badStart = [...baseValues];
-  badStart[0] = [2, 6, 5, 7, 1].find((v) => v !== badStart[1] && v !== 4);
-  vectors.push(
-    invalidVector(
-      "start sentinel not red",
-      badStart.map((v) => PALETTE[v].index),
-      "bad_start_sentinel",
-      "cell 0 is not red",
-    ),
-  );
-
-  const badEnd = [...base];
-  badEnd[MARKER_CELLS - 1] = (END_DIGITS[END_DIGITS.length - 1] + 1) % BASE;
-  vectors.push(
-    invalidVector(
-      "end sentinel digit altered",
-      rechain(badEnd),
-      "bad_end_sentinel",
-      "the last end digit is wrong",
-    ),
-  );
-
-  const reserved = markerDigits({ kind: 3, session: 14, seq: 1234 }, { rawKind: true });
-  vectors.push(
-    invalidVector(
-      "reserved kind 3 with a correct checksum",
-      rechain(reserved),
-      "reserved_kind",
-      "kind digit 3 is reserved",
-    ),
-  );
-
-  const badSum = [...base];
-  const sumAt = START_DIGITS.length + 1 + SESSION_DIGITS + SEQ_DIGITS;
-  badSum[sumAt] = (badSum[sumAt] + 1) % BASE;
-  vectors.push(
-    invalidVector(
-      "checksum digit altered",
-      rechain(badSum),
-      "checksum_mismatch",
-      "first checksum digit +1",
-    ),
-  );
-
-  const torn = [...baseValues];
-  const cell = START_DIGITS.length + 2; // a session cell, recoloured in place
-  torn[cell] = [0, 1, 2, 3, 4, 5, 6, 7].find(
-    (v) =>
-      v !== torn[cell] &&
-      v !== torn[cell - 1] &&
-      v !== torn[cell + 1] &&
-      decodeMarkerValues(Object.assign([...torn], { [cell]: v })).reason === "checksum_mismatch",
-  );
-  vectors.push(
-    invalidVector(
-      "payload cell recoloured",
-      torn.map((v) => PALETTE[v].index),
-      "checksum_mismatch",
-      `cell ${cell} recoloured in place, changing two digits`,
-    ),
-  );
-
-  return vectors;
-}
-
-/** The golden file contents. */
-export function buildGolden() {
-  return {
-    schema: "termhost-bench/marker-golden/v1",
-    description:
-      "GENERATED by scripts/termhost-bench/marker.mjs --write-golden — do not edit by hand. " +
-      "The contract between the JS encoder and Phase 2's raster decoder: every `valid` vector " +
-      "must decode to its (kind, session, seq); every `invalid` vector must be rejected with " +
-      "exactly its `reason`, checks running in `codec.decode_order`.",
-    codec: {
-      version: CODEC_VERSION,
-      cells: MARKER_CELLS,
-      region: { ...MARKER_REGION },
-      echo_region: { ...ECHO_REGION },
-      max_hz: MARKER_MAX_HZ,
-      palette: PALETTE.map((p) => ({
-        value: p.value,
-        index: p.index,
-        rgb: [...p.rgb],
-        name: p.name,
-      })),
-      base: BASE,
-      virtual_predecessor: 0,
-      digit_rule: "value[i] = (value[i-1] + 1 + digit[i]) mod 8, value[-1] = 0, digit in 0..6",
-      layout: LAYOUT.map((f) =>
-        f.fixed
-          ? { name: f.name, digits: f.digits, fixed: [...f.fixed] }
-          : { name: f.name, digits: f.digits },
-      ),
-      kinds: { ...MARKER_KINDS },
-      session_limit: SESSION_LIMIT,
-      seq_modulus: SEQ_MODULUS,
-      checksum: {
-        modulus: CHECKSUM_MODULUS,
-        multiplier: CHECKSUM_MULTIPLIER,
-        rule: "h = 0; for d in kind,session,seq digits: h = (h * 31 + d + 1) mod 16787; written as 5 big-endian base-7 digits",
-      },
-      decode_order: [...DECODE_REASONS],
-      overlay:
-        "ESC 7, ESC [ row+1 ; col+1 H, then per cell ESC [ 48;5;<index> m SPACE, then ESC [ 0 m, ESC 8",
-    },
-    valid: GOLDEN_VALID.map(([name, kind, session, seq]) => goldenVector(name, kind, session, seq)),
-    invalid: buildInvalidVectors(),
-  };
-}
-
-/** The exact bytes the committed golden file must hold. */
-export function renderGolden() {
-  return `${JSON.stringify(buildGolden(), null, 2)}\n`;
-}
-
-const invokedDirectly =
-  process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (invokedDirectly) {
-  const expected = renderGolden();
-  if (process.argv.includes("--write-golden")) {
-    writeFileSync(GOLDEN_PATH, expected);
-    process.stdout.write(`wrote ${GOLDEN_PATH}\n`);
-  } else {
-    let current = null;
-    try {
-      current = readFileSync(GOLDEN_PATH, "utf8");
-    } catch {
-      // absent counts as drift
-    }
-    if (current === expected) {
-      process.stdout.write("marker-golden.json is in sync with marker.mjs\n");
-    } else {
-      process.stderr.write("marker-golden.json is STALE: run marker.mjs --write-golden\n");
-      process.exitCode = 1;
-    }
-  }
 }

@@ -23,6 +23,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { KPI_CATALOG } from "./kpi-catalog.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const RESULT_SCHEMA_PATH = join(HERE, "result-schema.json");
 
@@ -355,15 +357,32 @@ function resolveRef(root, ref) {
   return node;
 }
 
+/**
+ * Call `fn` on every `$ref` in a SCHEMA position. Only subschema keywords are walked,
+ * so the data under `enum` / `const` / `default` / `examples` is skipped, while a
+ * property that merely has one of those NAMES (`properties: {enum: {...}}`) is a
+ * schema like any other and is walked.
+ */
 function forEachRef(schema, fn) {
-  if (Array.isArray(schema)) {
-    for (const s of schema) forEachRef(s, fn);
-  } else if (isPlainObject(schema)) {
-    for (const [k, v] of Object.entries(schema)) {
-      if (k === "$ref" && typeof v === "string") fn(v);
-      else if (k !== "enum" && k !== "const" && k !== "default" && k !== "examples")
-        forEachRef(v, fn);
-    }
+  if (!isPlainObject(schema)) return;
+  if (typeof schema.$ref === "string") fn(schema.$ref);
+  for (const key of ["properties", "$defs"]) {
+    if (isPlainObject(schema[key]))
+      for (const sub of Object.values(schema[key])) forEachRef(sub, fn);
+  }
+  for (const key of [
+    "additionalProperties",
+    "propertyNames",
+    "items",
+    "not",
+    "if",
+    "then",
+    "else",
+  ]) {
+    if (schema[key] !== undefined) forEachRef(schema[key], fn);
+  }
+  for (const key of ["allOf", "anyOf", "oneOf"]) {
+    if (Array.isArray(schema[key])) for (const sub of schema[key]) forEachRef(sub, fn);
   }
 }
 
@@ -450,7 +469,9 @@ const ORDERED_STATS = ["min", "p50", "p95", "p99", "max"];
 /**
  * Validate a parsed results document: the schema first, then the cross-field rules
  * a schema cannot state (percentile order, mean within [min, max], coverage, scenario
- * consistency, duplicate rows). Semantic checks run only on a schema-valid document.
+ * consistency, duplicate rows, and a measured degradation_* backed by an N = 1 row of
+ * the same setup, variant, build role and arm with its base KPI measured). Semantic
+ * checks run only on a schema-valid document.
  *
  * @param {unknown} doc
  * @param {{schema?: object}} [opts] defaults to the committed result-schema.json
@@ -519,6 +540,56 @@ function semanticErrors(doc) {
       seen.set(key, r);
     }
     for (const [id, kpi] of Object.entries(row.kpis)) kpiSemantics(`${at}/kpis/${id}`, kpi, errors);
+  });
+  errors.push(...baselineErrors(doc));
+  return errors;
+}
+
+const DEGRADATIONS = KPI_CATALOG.filter((k) => k.degradation_of);
+
+/** One subject at one arm: setup, variant, build role (A/B builds never share a baseline). */
+function subjectKey(row) {
+  const role = isPlainObject(row.setup.build) && row.setup.build.role ? row.setup.build.role : "-";
+  return [row.setup.id, row.setup.variant, role, row.scenario.arm].join("|");
+}
+
+/**
+ * A measured degradation_* needs an N = 1 row for the same subject and arm whose base
+ * KPI (the catalog's degradation_of) is measured; an N = 1 row is itself the baseline,
+ * so a measured degradation there is a contradiction (it is not_applicable(baseline_level)).
+ */
+function baselineErrors(doc) {
+  const errors = [];
+  const baselines = new Map();
+  for (const row of doc.rows) {
+    if (row.scenario.n !== 1) continue;
+    const key = subjectKey(row);
+    if (!baselines.has(key)) baselines.set(key, []);
+    baselines.get(key).push(row);
+  }
+  doc.rows.forEach((row, r) => {
+    for (const d of DEGRADATIONS) {
+      if (row.kpis[d.id]?.state !== "measured") continue;
+      const at = `/rows/${r}/kpis/${d.id}`;
+      if (row.scenario.n === 1) {
+        errors.push(
+          err(at, "semantic", `a measured ${d.id} on an N = 1 row, which is the baseline itself`),
+        );
+        continue;
+      }
+      const base = (baselines.get(subjectKey(row)) ?? []).filter(
+        (b) => b.kpis[d.degradation_of.kpi]?.state === "measured",
+      );
+      if (base.length === 0) {
+        errors.push(
+          err(
+            at,
+            "semantic",
+            `measured ${d.id} has no N = 1 row for the same setup, variant, build role and arm with a measured ${d.degradation_of.kpi}`,
+          ),
+        );
+      }
+    }
   });
   return errors;
 }

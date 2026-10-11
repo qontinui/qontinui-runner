@@ -2,11 +2,22 @@
  * Builders for termhost-bench results documents, used to generate the committed
  * fixtures (`fixtures/results-*.json`) and as the base the rejection tests mutate.
  * Values are produced through stats.mjs, so a fixture is shaped exactly as the
- * orchestrator will shape real results.
+ * orchestrator will shape real results; degradation ratios are computed from the
+ * matching N = 1 rows, never written as constants.
+ *
+ * Regenerate the committed fixtures (a test fails when they drift):
+ *   node scripts/termhost-bench/__tests__/helpers/results.mjs --write
  */
 
+import { writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { KPI_CATALOG } from "../../kpi-catalog.mjs";
-import { measureKpi, notApplicableKpi, unknownKpi } from "../../stats.mjs";
+import { degradationKpi, measureKpi, notApplicableKpi, unknownKpi } from "../../stats.mjs";
+
+export const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
+const DEGRADATION_IDS = KPI_CATALOG.filter((k) => k.degradation_of).map((k) => k.id);
 
 /** n deterministic samples spread over [lo, hi]. */
 export function spread(n, lo, hi) {
@@ -41,16 +52,14 @@ const VALUES = {
   crashes: { value: 0, n: 6 },
   marker_loss: { value: 0.2, n: 9000 },
   marker_skipped: { value: 3.1, n: 9000 },
-  degradation_output_latency_ms: { value: 1.8, n: 2 },
-  degradation_input_latency_ms: { value: 1.4, n: 2 },
-  degradation_cpu_pct: { value: 6.2, n: 2 },
   workload_memory_mb: { value: 1450, n: 120 },
   compositor_memory_mb: { value: 210, n: 120 },
   wsl_vm_memory_mb: { value: 1900, n: 120 },
 };
 
 /**
- * Every KPI measured, except those `overrides` replaces.
+ * Every KPI measured, except those `overrides` replaces. A degradation_* defaults to
+ * unknown(no_baseline_level): only `withDegradations` and a real N = 1 row measure one.
  *
  * @param {Record<string, object>} [overrides] id -> KPI value
  */
@@ -58,10 +67,25 @@ export function measuredKpis(overrides = {}) {
   const out = {};
   for (const row of KPI_CATALOG) {
     if (overrides[row.id]) out[row.id] = overrides[row.id];
+    else if (row.degradation_of) out[row.id] = unknownKpi(row.id, "no_baseline_level");
     else if (row.shape === "stats") out[row.id] = measureKpi(row.id, SAMPLES[row.id]());
     else out[row.id] = measureKpi(row.id, VALUES[row.id]);
   }
   return out;
+}
+
+/** The row's degradation_* values computed against the matching N = 1 row's kpis. */
+export function withDegradations(kpis, kpisAtOne) {
+  const out = { ...kpis };
+  for (const id of DEGRADATION_IDS) out[id] = degradationKpi(id, kpis, kpisAtOne);
+  return out;
+}
+
+/** An N = 1 row's degradation_* values: it is the baseline itself. */
+export function baselineDegradations() {
+  return Object.fromEntries(
+    DEGRADATION_IDS.map((id) => [id, notApplicableKpi(id, "baseline_level")]),
+  );
 }
 
 export const RUN = {
@@ -160,24 +184,25 @@ export function row({
   };
 }
 
-/** A complete windows-desktop results document. */
+/**
+ * A complete windows-desktop results document: rows 0-2 are N = 1 focus (runner),
+ * N = 15 tiled (runner) and N = 15 tiled (vscode); rows 3-4 are the N = 1 tiled
+ * baselines the two N = 15 rows' degradations are computed against.
+ */
 export function windowsDesktopResults() {
-  const n1 = { n: 1, v_target: 1, v_actual: 1, arm: "focus" };
-  const naDegradation = {
-    degradation_output_latency_ms: notApplicableKpi(
-      "degradation_output_latency_ms",
-      "baseline_level",
-    ),
-    degradation_input_latency_ms: notApplicableKpi(
-      "degradation_input_latency_ms",
-      "baseline_level",
-    ),
-    degradation_cpu_pct: notApplicableKpi("degradation_cpu_pct", "baseline_level"),
-  };
+  const n1Focus = { n: 1, v_target: 1, v_actual: 1, arm: "focus" };
+  const n1Tiled = { n: 1, v_target: 1, v_actual: 1, arm: "tiled" };
   const naWsl = {
     wsl_vm_cpu_pct: notApplicableKpi("wsl_vm_cpu_pct", "not_applicable_to_setup"),
     wsl_vm_memory_mb: notApplicableKpi("wsl_vm_memory_mb", "not_applicable_to_setup"),
   };
+  const atN15 = {
+    output_latency_ms: measureKpi("output_latency_ms", spread(600, 12, 140)),
+    input_latency_ms: measureKpi("input_latency_ms", spread(200, 18, 170)),
+    cpu_pct: measureKpi("cpu_pct", spread(120, 90, 380)),
+  };
+  const runnerBase = measuredKpis({ ...baselineDegradations(), ...naWsl });
+  const vscodeBase = measuredKpis({ ...baselineDegradations(), ...naWsl });
   return {
     schema: "termhost-bench/v1",
     run: RUN,
@@ -203,9 +228,12 @@ export function windowsDesktopResults() {
       "session.interactive": { state: "OPERATIVE", reason: "unlocked interactive desktop" },
     },
     rows: [
-      row({ scenarioOverrides: n1, kpis: measuredKpis({ ...naDegradation, ...naWsl }) }),
       row({
-        kpis: measuredKpis({ ...naWsl }),
+        scenarioOverrides: n1Focus,
+        kpis: measuredKpis({ ...baselineDegradations(), ...naWsl }),
+      }),
+      row({
+        kpis: withDegradations(measuredKpis({ ...naWsl, ...atN15 }), runnerBase),
         diagnostics: {
           "health.ui_thread_wedged": {
             state: "measured",
@@ -239,13 +267,19 @@ export function windowsDesktopResults() {
       }),
       row({
         setupId: "vscode",
-        kpis: measuredKpis({
-          ...naWsl,
-          producer_stall_pct: measureKpi("producer_stall_pct", spread(15, 0, 12), {
-            coverage: { observed: 15, expected: 15 },
+        kpis: withDegradations(
+          measuredKpis({
+            ...naWsl,
+            ...atN15,
+            producer_stall_pct: measureKpi("producer_stall_pct", spread(15, 0, 12), {
+              coverage: { observed: 15, expected: 15 },
+            }),
           }),
-        }),
+          vscodeBase,
+        ),
       }),
+      row({ scenarioOverrides: n1Tiled, kpis: runnerBase }),
+      row({ setupId: "vscode", scenarioOverrides: n1Tiled, kpis: vscodeBase }),
     ],
     incidents: [],
   };
@@ -304,34 +338,36 @@ export function linuxXvfbResults() {
           run_count: 2,
         },
         labels: ["software_rendered"],
-        kpis: measuredKpis({
-          gpu_pct: notApplicableKpi("gpu_pct", "gpu_counters_unavailable"),
-          hangs: unknownCapture("hangs"),
-          marker_loss: unknownCapture("marker_loss"),
-          marker_skipped: unknownCapture("marker_skipped"),
-          input_latency_ms: unknownKpi("input_latency_ms", "insufficient_samples", { n: 40 }),
-          degradation_input_latency_ms: unknownKpi(
-            "degradation_input_latency_ms",
-            "insufficient_samples",
-            { n: 1 },
-          ),
-          memory_mb_per_session: unknownKpi("memory_mb_per_session", "too_few_levels", { n: 2 }),
-          wsl_vm_cpu_pct: notApplicableKpi("wsl_vm_cpu_pct", "not_applicable_to_setup"),
-          wsl_vm_memory_mb: notApplicableKpi("wsl_vm_memory_mb", "not_applicable_to_setup"),
-        }),
+        // No N = 1 row in this file: every degradation is honestly unknown.
+        kpis: withDegradations(
+          measuredKpis({
+            gpu_pct: notApplicableKpi("gpu_pct", "gpu_counters_unavailable"),
+            hangs: unknownCapture("hangs"),
+            marker_loss: unknownCapture("marker_loss"),
+            marker_skipped: unknownCapture("marker_skipped"),
+            input_latency_ms: unknownKpi("input_latency_ms", "insufficient_samples", { n: 40 }),
+            memory_mb_per_session: unknownKpi("memory_mb_per_session", "too_few_levels", { n: 2 }),
+            wsl_vm_cpu_pct: notApplicableKpi("wsl_vm_cpu_pct", "not_applicable_to_setup"),
+            wsl_vm_memory_mb: notApplicableKpi("wsl_vm_memory_mb", "not_applicable_to_setup"),
+          }),
+          undefined,
+        ),
       }),
       row({
         setupId: "tmux",
         scenarioOverrides: { n: 5, arm: "focus", v_target: 1, v_actual: 1, run_count: 2 },
         labels: ["software_rendered", "assert_only_smoke"],
-        kpis: measuredKpis({
-          gpu_pct: notApplicableKpi("gpu_pct", "gpu_counters_unavailable"),
-          switch_latency_ms: unknownKpi("switch_latency_ms", "harness_error", {
-            detail: "select-window timed out",
+        kpis: withDegradations(
+          measuredKpis({
+            gpu_pct: notApplicableKpi("gpu_pct", "gpu_counters_unavailable"),
+            switch_latency_ms: unknownKpi("switch_latency_ms", "harness_error", {
+              detail: "select-window timed out",
+            }),
+            wsl_vm_cpu_pct: notApplicableKpi("wsl_vm_cpu_pct", "not_applicable_to_setup"),
+            wsl_vm_memory_mb: notApplicableKpi("wsl_vm_memory_mb", "not_applicable_to_setup"),
           }),
-          wsl_vm_cpu_pct: notApplicableKpi("wsl_vm_cpu_pct", "not_applicable_to_setup"),
-          wsl_vm_memory_mb: notApplicableKpi("wsl_vm_memory_mb", "not_applicable_to_setup"),
-        }),
+          undefined,
+        ),
         incidents: [
           {
             kind: "harness_error",
@@ -344,4 +380,21 @@ export function linuxXvfbResults() {
     ],
     incidents: [],
   };
+}
+
+/** The committed fixtures: file name -> exact bytes. */
+export function renderFixtures() {
+  return {
+    "results-windows-desktop.json": `${JSON.stringify(windowsDesktopResults(), null, 2)}\n`,
+    "results-linux-xvfb.json": `${JSON.stringify(linuxXvfbResults(), null, 2)}\n`,
+  };
+}
+
+const invokedDirectly =
+  process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly && process.argv.includes("--write")) {
+  for (const [name, text] of Object.entries(renderFixtures())) {
+    writeFileSync(join(FIXTURES_DIR, name), text);
+    process.stdout.write(`wrote ${join(FIXTURES_DIR, name)}\n`);
+  }
 }
