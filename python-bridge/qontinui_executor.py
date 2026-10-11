@@ -1394,7 +1394,7 @@ class QontinuiExecutor(
         # Support both "target_state_id" (from Rust action_service) and "state_id" (legacy)
         state_id = params.get("target_state_id") or params.get("state_id")
         if not state_id:
-            return {"success": False, "error": "target_state_id is required"}
+            return {"success": False, "error": "target_state_id (or state_id) is required"}
         return self.navigate_to_state(state_id)
 
     def _start_async_loop(self):

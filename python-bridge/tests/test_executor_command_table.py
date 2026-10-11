@@ -26,8 +26,10 @@ locally with ``cd python-bridge && python -m pytest tests/test_executor_command_
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib.util
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -238,7 +240,7 @@ def test_unknown_command_returns_the_old_dict():
     [
         ("_cmd_load", "config_path"),
         ("_cmd_start", "workflow_id"),
-        ("_cmd_navigate_to_state", "target_state_id"),
+        ("_cmd_navigate_to_state", "target_state_id (or state_id)"),
     ],
 )
 def test_cmd_handlers_reject_a_missing_required_param(method, required):
@@ -548,3 +550,58 @@ def test_executor_file_stays_under_budget():
 def test_mixin_file_stays_under_budget(path):
     lines = len(path.read_text(encoding="utf-8").splitlines())
     assert lines <= MIXIN_MAX_LINES, f"{path.name} is {lines} lines"
+
+
+# 6 ---------------------------------------------------------------------------
+# sm_execute_transition must report a FAILED transition as a failure. The UI
+# Bridge runtime signals failure by returning a result whose ``success`` is
+# false (an unregistered id, a failed action), not by raising; the state
+# explorer reads this handler's ``success`` to mark a transition passed.
+
+
+@dataclasses.dataclass
+class _StubTransitionResult:
+    success: bool
+    error: str | None = None
+
+
+class _StubRuntime:
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    def execute_transition(self, transition_id: str) -> object:
+        return self._result
+
+
+class _StubEvents:
+    def emit_log(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+
+def _sm_handler(result: object):
+    sys.path.insert(0, str(BRIDGE_DIR))
+    from executor_commands.state_machine import StateMachineCommands
+
+    host = object.__new__(StateMachineCommands)
+    host._ui_bridge_runtime = _StubRuntime(result)  # type: ignore[attr-defined]
+    host.event_manager = _StubEvents()  # type: ignore[attr-defined]
+    return host._handle_sm_execute_transition
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        _StubTransitionResult(success=False, error="Transition 't1' not found"),
+        {"success": False, "error": "Transition 't1' not found"},
+    ],
+)
+def test_sm_execute_transition_reports_a_failed_result_as_failure(result):
+    response = _sm_handler(result)({"transition_id": "t1"})
+    assert response["success"] is False
+    assert response["error"] == "Transition 't1' not found"
+
+
+def test_sm_execute_transition_reports_a_successful_result_as_success():
+    response = _sm_handler(_StubTransitionResult(success=True))({"transition_id": "t1"})
+    assert response["success"] is True
+    assert response["result"] == {"success": True, "error": None}
