@@ -143,6 +143,16 @@ if (-not (Test-Path $InstalledRunnerLib)) {
 }
 . $InstalledRunnerLib
 
+# ConvertFrom-ParityProcStat: the /proc/<pid>/stat parser Stop-ProcessTree uses
+# on Linux, shared with published-parity.ps1 so both harnesses read the process
+# table the same way.
+$ParityDiffLib = Join-Path $PSScriptRoot "lib/parity-diff.ps1"
+if (-not (Test-Path $ParityDiffLib)) {
+    Write-Host "ERROR: missing $ParityDiffLib -- contract-smoke cannot walk the Linux process table." -ForegroundColor Red
+    exit 1
+}
+. $ParityDiffLib
+
 # ---------------------------------------------------------------------------
 # Resolve the exe under test, BEFORE anything boots.
 #   -UseInstalledExe : locate the published install (never a fallback).
@@ -157,6 +167,10 @@ if ($UseInstalledExe) {
     }
     try {
         $DirectExe = Find-InstalledRunnerExe -InstallRoot $InstallRoot
+        # On Linux an unpacked AppImage is LAUNCHED through its AppRun, the way
+        # a user's launch is; the located binary is still the one the guard
+        # checked (lib/installed-runner.ps1 Get-PublishedLinuxLaunchPath).
+        if ($IsLinux) { $DirectExe = Get-PublishedLinuxLaunchPath -BinaryPath $DirectExe }
     } catch {
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
@@ -686,6 +700,11 @@ function Start-DirectRunner {
 # processes and embedded CLI outlive the run and keep the temp WebView2 profile
 # locked. We therefore walk Win32_Process.ParentProcessId ourselves.
 #
+# On Linux the same four fields come from /proc/<pid>/stat
+# (ConvertFrom-ParityProcStat, lib/parity-diff.ps1), with the kernel's starttime
+# standing in for CreationDate. WebKitGTK spawns its web and network processes
+# as children of the runner, so the downward walk is needed there too.
+#
 # The walk is strictly DOWNWARD from $RootPid -- it can never climb to an
 # ancestor, which is why this does not use a tree-kill flag (`taskkill /T`):
 # on this box a mis-aimed tree kill would take out live editor/agent sessions.
@@ -696,8 +715,18 @@ function Start-DirectRunner {
 function Stop-ProcessTree {
     param([int]$RootPid)
 
-    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
-        Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+    if ($IsLinux) {
+        $all = @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+$' } |
+            ForEach-Object {
+                $line = Get-Content -LiteralPath (Join-Path $_.FullName 'stat') -Raw -ErrorAction SilentlyContinue
+                ConvertFrom-ParityProcStat -Line $line
+            } |
+            Where-Object { $null -ne $_ })
+    } else {
+        $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+            Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+    }
 
     $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
     if (-not $root) { return 0 }

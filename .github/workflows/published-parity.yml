@@ -6,7 +6,7 @@ name: published-build parity
 # clean GitHub-hosted windows-latest box -- and, since Phase 6B of plan
 # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
 # on ubuntu-22.04 against the published .deb/AppImage (job
-# `published-parity-linux`, manifest axis only so far) -- and reports where
+# `published-parity-linux`, both axes) -- and reports where
 # they differ, on two axes:
 #
 #   1. CAPABILITY MANIFEST (Phase 5) — scripts/published-parity.ps1 diffs which
@@ -890,89 +890,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 5
         run: |
-          # contract-smoke's Record emits "STATUS  METHOD  PATH  DETAIL" and only
-          # ever PASS / FAIL / SKIP. A handful of synthetic rows reuse a path
-          # that a real route also probes (e.g. "/control/elements (probe)"), so
-          # collapse to ONE row per METHOD+PATH keeping the worst status --
-          # FAIL > SKIP > PASS. Keeping duplicates would make the join below a
-          # cross product and invent differences that are not there.
-          extract() {
-            grep -aoE '^(PASS|FAIL|SKIP)[[:space:]]+[A-Z]+[[:space:]]+[^[:space:]]+' "$1" \
-              | awk '{
-                  key = $2 " " $3
-                  rank = ($1 == "FAIL" ? 3 : ($1 == "SKIP" ? 2 : 1))
-                  if (!(key in best) || rank > bestrank[key]) { best[key] = $1; bestrank[key] = rank }
-                }
-                END { for (k in best) print k " " best[k] }' \
-              | sort
-          }
-
-          {
-            echo ""
-            echo "### Behavioural axis — contract smoke, development vs published"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          dev_ok=1; pub_ok=1
-          [ -s smoke-dev.log ] || dev_ok=0
-          [ -s smoke-published.log ] || pub_ok=0
-          extract smoke-dev.log > dev-routes.txt 2>/dev/null || true
-          extract smoke-published.log > pub-routes.txt 2>/dev/null || true
-          [ -s dev-routes.txt ] || dev_ok=0
-          [ -s pub-routes.txt ] || pub_ok=0
-
-          # The axis verdict for the provenance block, picked up by the stamp
-          # step below. Written on every path that reaches an answer; a step
-          # that never gets here leaves no file, which the stamp reads as
-          # unknown(behavioural_step_did_not_report) -- never as observed.
-          mkdir -p parity-report
-          if [ "$dev_ok" = "0" ] || [ "$pub_ok" = "0" ]; then
-            echo "unknown(no_probe_lines: dev_parsed=$dev_ok published_parsed=$pub_ok)" > parity-report/behavioural-axis.txt
-            echo "::warning::Behavioural axis UNKNOWN — one or both contract-smoke legs produced no probe lines (dev=$dev_ok published=$pub_ok). This is NOT a statement that the two builds behave the same; the measurement did not happen."
-            {
-              echo "**UNKNOWN** — one or both legs produced no probe lines (dev parsed: \`$dev_ok\`, published parsed: \`$pub_ok\`)."
-              echo ""
-              echo "This is not evidence of agreement. A leg that was never measured is unknown, never clean."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          join -j 1 -o 0,1.2,2.2 \
-            <(awk '{print $1"|"$2" "$3}' dev-routes.txt | sort) \
-            <(awk '{print $1"|"$2" "$3}' pub-routes.txt | sort) > joined.txt || true
-
-          differing=$(awk '$2 != $3 {print}' joined.txt | wc -l | tr -d ' ')
-          only_dev=$(comm -23 <(cut -d' ' -f1,2 dev-routes.txt | sort -u) <(cut -d' ' -f1,2 pub-routes.txt | sort -u) | wc -l | tr -d ' ')
-          only_pub=$(comm -13 <(cut -d' ' -f1,2 dev-routes.txt | sort -u) <(cut -d' ' -f1,2 pub-routes.txt | sort -u) | wc -l | tr -d ' ')
-
-          {
-            echo "Routes whose outcome differs between the two builds: **${differing}**"
-            echo ""
-            echo "Probed only on the development leg: **${only_dev}** · only on the published leg: **${only_pub}**"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$differing" != "0" ]; then
-            {
-              echo "| Route | Development build | Published build |"
-              echo "|---|---|---|"
-              awk '$2 != $3 {gsub(/\|/, " ", $1); print "| `" $1 "` | " $2 " | " $3 " |"}' joined.txt
-              echo ""
-            } >> "$GITHUB_STEP_SUMMARY"
-            awk '$2 != $3 {print "::warning::Behavioural parity difference - " $1 ": development build " $2 ", published build " $3}' joined.txt
-          fi
-
-          {
-            echo "Where this axis and the capability-manifest axis disagree, the disagreement is a **finding about the roster** — the manifest can only see capabilities somebody enumerated in \`CAPABILITY_SPECS\`, and this axis is what notices the ones nobody did. It is not reconciled toward either side."
-            echo ""
-            echo "_This report gates nothing._"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # LAST, deliberately: `observed` is a claim that the comparison above
-          # completed. Written any earlier, a failure between it and here (the
-          # job's bash runs -e) would leave `observed` over a diff that never
-          # finished.
-          echo "observed" > parity-report/behavioural-axis.txt
+          bash scripts/behavioural-diff.sh smoke-dev.log smoke-published.log windows
         shell: bash
 
       # -----------------------------------------------------------------------
@@ -1069,19 +987,21 @@ jobs:
   # release's asset LIST, as one of the enumerated reasons in
   # $LinuxUnknownReasons, and reported -- never a 0 and never a failed run.
   #
-  # NOT YET HERE: the behavioural axis. contract-smoke.ps1 tears its runner
-  # down by walking Win32_Process, which does not exist on Linux, so this leg
-  # does not run it. The summary says so as UNKNOWN rather than implying the
-  # two builds behave alike.
+  # BOTH AXES. The behavioural axis runs here as on Windows: contract-smoke.ps1
+  # walks the same routes against both builds (its process-tree teardown reads
+  # /proc on Linux), and scripts/behavioural-diff.sh -- the one implementation
+  # both legs share -- diffs the two pass/fail sets. An unpacked AppImage is
+  # booted through its AppRun on both axes, never its inner binary.
   published-parity-linux:
     name: Published-build parity (linux)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
-    # Ladder: apt 10 + build 60 + parity 30 + unpack 10 = 110 of step budget,
-    # plus checkout, the sibling, setup, `pnpm install` and the unit tests (~10).
-    # A JOB timeout cancels rather than reports (the #1511 shape the Windows
-    # job's comment records), so the job bound sits above the ladder.
-    timeout-minutes: 130
+    # Ladder: apt 10 + build 60 + unpack 10 + parity 30 + smoke 25 + 25 +
+    # diff 5 = 165 of step budget, plus checkout, the siblings, setup,
+    # `pnpm install` and the unit tests (~10). A JOB timeout cancels rather than
+    # reports (the #1511 shape the Windows job's comment records), so the job
+    # bound sits above the ladder.
+    timeout-minutes: 185
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       # A typed UNKNOWN from the asset step (no Linux asset / checksums on the
@@ -1115,10 +1035,15 @@ jobs:
           pwsh -NoProfile -File scripts/tests/test-parity-diff.ps1
           pwsh -NoProfile -File scripts/tests/test-installed-runner.ps1
 
-      # qontinui-schemas is a hard compile dependency. ui-bridge is not checked
-      # out: it feeds only contract-smoke, which this leg does not run.
+      # qontinui-schemas is a hard compile dependency; ui-bridge carries the
+      # UI_BRIDGE_ROUTES source contract-smoke parses (-SdkTypesPath below).
       - name: Check out sibling qontinui-schemas
         uses: ./.github/actions/checkout-sibling
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
 
       # ci.yml's package list (it builds the same workspace on this image), plus
       # xvfb for xvfb-run: both artifacts are GUI processes and WebKitGTK needs a
@@ -1328,16 +1253,45 @@ jobs:
             -SummaryOut "$GITHUB_STEP_SUMMARY" \
             -Annotate 2>&1 | tee parity-report/published-parity.log
 
-      - name: Behavioural axis (linux) -- not run
-        if: always()
+      # AXIS 2 on Linux -- behaviour. The same exerciser and the same contract
+      # (-SdkTypesPath) as the Windows job, run with pwsh directly under
+      # xvfb-run and `timeout`, as AXIS 1 above is. -UseInstalledExe locates the
+      # published build in the verified prefix and boots an AppImage through
+      # its AppRun. SENTRY_DSN stays unset on both legs, as on Windows.
+      - name: Contract smoke -- development build
+        id: smoke_dev
+        if: steps.linux_asset.outputs.prefix != ''
+        continue-on-error: true
+        timeout-minutes: 25
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
         shell: bash
         run: |
-          {
-            echo ""
-            echo "### Behavioural axis (linux)"
-            echo ""
-            echo "**UNKNOWN -- not run on this leg.** contract-smoke.ps1 tears its runner down by walking Win32_Process, which Linux does not have, so the route walk has not been ported. This is not a statement that the two Linux builds behave the same."
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1             -DirectExe target/debug/qontinui-runner             -Profile ci             -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-dev.log
+
+      - name: Contract smoke -- published build
+        id: smoke_published
+        if: steps.linux_asset.outputs.prefix != ''
+        continue-on-error: true
+        timeout-minutes: 25
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+          PREFIX: ${{ steps.linux_asset.outputs.prefix }}
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout 1200 xvfb-run -a pwsh -NoProfile -File scripts/contract-smoke.ps1             -UseInstalledExe -InstallRoot "$PREFIX"             -Profile ci             -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts 2>&1 | tee smoke-published.log
+
+      # The same diff the Windows job runs. always(): a leg that wrote no probe
+      # lines (or never ran) is stated as UNKNOWN in the summary, never as
+      # agreement.
+      - name: Behavioural axis -- diff the two pass/fail sets
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: bash scripts/behavioural-diff.sh smoke-dev.log smoke-published.log linux
 
       - name: Upload the row-level parity diff
         if: always()
@@ -1349,6 +1303,10 @@ jobs:
           path: |
             parity-report/published-parity.json
             parity-report/published-parity.log
+            smoke-dev.log
+            smoke-published.log
+            dev-routes.txt
+            pub-routes.txt
 
       - name: Report the count
         if: always()
