@@ -846,7 +846,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 5),
     ("mcp/probe_executor.rs", "device", 1),
-    ("repo_tenant.rs", "device", 1),
+    ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
     ("session/handoff.rs", "escalated", 1),
 ];
