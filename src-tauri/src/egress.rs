@@ -387,7 +387,10 @@ pub(crate) enum SessionScope {
     /// The session's tenant is known.
     Tenant(Uuid),
     /// The session was positively established as the device default's (spawned
-    /// without a tenant choice, or a route with no tenant dimension).
+    /// without a tenant choice, or a route with no tenant dimension). Judged in
+    /// the DEFAULT scope only — the tenant a new session is stamped with — and
+    /// never by the strictest rule: such a session's sends present the device
+    /// default's credential, so that tenant's switch is the one that governs.
     DeviceDefault,
     /// The tenant could not be established: no session record, an
     /// unregistered run after a restart, a stamp that is not a UUID, a frame
@@ -1146,11 +1149,12 @@ pub(crate) fn path_session_tenant(path: &str) -> SessionScope {
     // rather than to an open session in an enclosing directory. Records that
     // disagree at the closest directory make the path unresolved.
     let records = store.all_records();
-    scope_for_path(
+    scope_for_path_with(
         path,
         records
             .iter()
             .filter_map(|r| Some((r.working_dir.as_deref()?, r.tenant_id.as_deref()))),
+        cached_ownership_key,
     )
 }
 
@@ -1182,11 +1186,41 @@ fn ownership_key(path: &Path) -> Option<PathBuf> {
     ))
 }
 
+/// A session directory's ownership key, cached by its recorded string so a
+/// relay read does not re-canonicalize every recorded session's directory.
+/// A directory whose key could not be computed is not cached (it is retried).
+/// The cache is dropped whole once it outgrows a bound.
+fn cached_ownership_key(dir: &str) -> Option<PathBuf> {
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(dir).cloned()) {
+        return Some(hit);
+    }
+    let key = ownership_key(Path::new(dir))?;
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= 4096 {
+            c.clear();
+        }
+        c.insert(dir.to_string(), key.clone());
+    }
+    Some(key)
+}
+
 /// The rule behind [`path_session_tenant`] over `(working_dir, tenant stamp)`
-/// pairs. PURE.
+/// pairs, canonicalizing each directory afresh.
 pub(crate) fn scope_for_path<'a>(
     path: &str,
     sessions: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> SessionScope {
+    scope_for_path_with(path, sessions, |d| ownership_key(Path::new(d)))
+}
+
+/// [`scope_for_path`] with the session-directory key lookup injected.
+fn scope_for_path_with<'a>(
+    path: &str,
+    sessions: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+    mut dir_key: impl FnMut(&str) -> Option<PathBuf>,
 ) -> SessionScope {
     // Both sides CANONICAL: `..`, symlinks and (on Windows) case / the
     // verbatim prefix must not let a path borrow another tenant's directory.
@@ -1203,7 +1237,7 @@ pub(crate) fn scope_for_path<'a>(
         if !Path::new(dir).is_absolute() {
             continue;
         }
-        let Some(dir) = ownership_key(Path::new(dir)) else {
+        let Some(dir) = dir_key(dir) else {
             continue;
         };
         if !target.starts_with(&dir) {

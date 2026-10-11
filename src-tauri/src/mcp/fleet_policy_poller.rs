@@ -2721,25 +2721,55 @@ fn egress_poll_scope(
 
 /// Every tenant this device may hold a credential for: the per-tenant slots,
 /// the default binding, and the tenant the default slot's credential names —
-/// with whether the enumeration was COMPLETE (the slot store was readable).
-/// An incomplete enumeration is merged but can never mark the device unbound.
-/// Blocking (secure-storage and paired_user.json reads).
+/// with whether the enumeration was COMPLETE. Blocking (secure-storage and
+/// paired_user.json reads).
 fn egress_poll_tenants() -> (Vec<uuid::Uuid>, bool) {
     let am = crate::auth::AuthManager::new();
+    let slots = am.try_list_tenant_device_jwt_tenants().map_err(|e| {
+        warn!("fleet_policy_poller: egress: tenant slots unreadable ({e:#})");
+    });
+    enumerate_bound_tenants(
+        slots,
+        crate::auth::default_binding_tenant_probe(),
+        am.probe_access_token(),
+    )
+}
+
+/// The bound-tenant enumeration over what the three credential sources read.
+/// PURE. COMPLETE only when every source was read and answered definitely:
+/// an unreadable slot store, an UNKNOWN binding read, an unreadable token
+/// store, or a present token that names no tenant (whose owner is therefore
+/// unknown) each make it incomplete — so only a fully read, genuinely
+/// credential-less device can come out as unbound.
+fn enumerate_bound_tenants(
+    slots: Result<Vec<uuid::Uuid>, ()>,
+    binding: crate::auth::BindingTenantRead,
+    token: crate::secure_storage::StoredTokenRead,
+) -> (Vec<uuid::Uuid>, bool) {
+    use crate::auth::BindingTenantRead;
+    use crate::secure_storage::StoredTokenRead;
     let mut tenants = std::collections::BTreeSet::new();
-    let complete = match am.try_list_tenant_device_jwt_tenants() {
-        Ok(slots) => {
-            tenants.extend(slots);
-            true
+    let mut complete = true;
+    match slots {
+        Ok(s) => tenants.extend(s),
+        Err(()) => complete = false,
+    }
+    match binding {
+        BindingTenantRead::Bound(t) => {
+            tenants.insert(t);
         }
-        Err(e) => {
-            warn!("fleet_policy_poller: egress: tenant slots unreadable ({e:#})");
-            false
-        }
-    };
-    tenants.extend(crate::auth::default_binding_tenant());
-    if let Ok(token) = am.get_access_token() {
-        tenants.extend(crate::auth::jwt_tenant_claim(&token));
+        BindingTenantRead::Unbound => {}
+        BindingTenantRead::Unknown => complete = false,
+    }
+    match token {
+        StoredTokenRead::Present(token) => match crate::auth::jwt_tenant_claim(&token) {
+            Some(t) => {
+                tenants.insert(t);
+            }
+            None => complete = false,
+        },
+        StoredTokenRead::Absent => {}
+        StoredTokenRead::Unreadable(_) => complete = false,
     }
     (tenants.into_iter().collect(), complete)
 }
@@ -4649,6 +4679,50 @@ mod egress_poll_tests {
         let pre = body(r#"{"effective_level":"off","resolved_scope":"none"}"#);
         apply_egress_result(&state, &scope, flow, &pre);
         assert_ne!(state.permit(flow).source.as_str(), "unknown");
+    }
+
+    /// Re-review M2: only a FULLY read, genuinely credential-less device is an
+    /// unbound one — an unreadable slot store, an unreadable binding file, an
+    /// unreadable token, or a token naming no tenant are each incomplete.
+    #[test]
+    fn only_a_fully_read_credential_less_device_is_a_complete_empty_enumeration() {
+        use crate::auth::BindingTenantRead as B;
+        use crate::secure_storage::StoredTokenRead as T;
+        let t = uuid::Uuid::from_u128(0xe1);
+        let claimless = {
+            use base64::Engine;
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"x"}"#);
+            format!("e30.{payload}.sig")
+        };
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unbound, T::Absent),
+            (vec![], true),
+            "nothing anywhere, every source read"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Err(()), B::Unbound, T::Absent),
+            (vec![], false),
+            "slot store unreadable"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unknown, T::Absent),
+            (vec![], false),
+            "binding file unreadable"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unbound, T::Unreadable("x".into())),
+            (vec![], false),
+            "token store unreadable"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unbound, T::Present(claimless)),
+            (vec![], false),
+            "a token that names no tenant"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Bound(t), T::Present(jwt_for(t))),
+            (vec![t], true)
+        );
     }
 
     /// Item 5 (behavioural): a poll whose fetches all FAIL does not move the

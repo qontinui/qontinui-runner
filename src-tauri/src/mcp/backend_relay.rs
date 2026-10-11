@@ -3797,7 +3797,9 @@ fn redact_relay_content(raw_path: &str, body: &[u8]) -> RelayContent {
         return RelayContent::Keep;
     };
     // A body that cannot be parsed cannot be redacted record by record: it
-    // goes out only when even the strictest bound tenant permits.
+    // goes out only when even the strictest bound tenant permits. Passing it
+    // through (`Keep`) when that verdict PERMITS is deliberate, as specified —
+    // refusal is reserved for a refused verdict.
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return if crate::egress::permit_or_count_session(
             crate::egress::Flow::TerminalStream,
@@ -3883,36 +3885,45 @@ fn redact_value(
 /// enclosing directory ([`crate::egress::path_session_tenant`]); a path no
 /// session owns, sessions of different tenants sharing it, or a request
 /// naming no path is judged by the strictest bound tenant.
-async fn code_mirror_egress_refusal(
+/// What the code-mirror gate decided for one `http_request` frame.
+#[derive(Debug)]
+enum CodeMirrorGate {
+    /// Not a repo / worktree route.
+    NotCodeRoute,
+    /// Refuse with this reply; the loopback API is never called.
+    Refuse(Value),
+    /// Forward, with this query in place of the caller's (the files routes
+    /// forward the CANONICAL path the gate checked).
+    Forward { query: Option<String> },
+    /// Forward the action, then blank the cross-tenant metadata in its
+    /// response ([`redact_code_metadata`]).
+    ForwardRedacted,
+}
+
+async fn code_mirror_gate(
     request_id: &Value,
     raw_path: &str,
     query: &str,
     body: &[u8],
-) -> Option<Value> {
+) -> CodeMirrorGate {
     use crate::egress::SessionScope;
-    let segments = crate::mcp::relay_path_policy::normalize_relay_path(raw_path)?;
+    let Some(segments) = crate::mcp::relay_path_policy::normalize_relay_path(raw_path) else {
+        return CodeMirrorGate::NotCodeRoute;
+    };
     let owner =
         |p: Option<&str>| p.map_or(SessionScope::Unresolved, crate::egress::path_session_tenant);
-    // Every scope whose code-mirror switch must permit the read.
-    let scopes: Vec<SessionScope> = match segments.as_slice() {
-        [r, leaf] if r == "files" && (leaf == "read" || leaf == "browse") => {
-            let path = url::form_urlencoded::parse(query.as_bytes())
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| v.into_owned());
-            vec![owner(path.as_deref())]
-        }
-        [r, leaf] if r == "worktrees" && leaf == "diff" => {
-            // The diff is the BRANCH's content, and a repo's refs are shared
-            // by every worktree of it: attribute it to the worktree that has
-            // the branch checked out (else unresolved) AND to the repo path.
-            let req = serde_json::from_slice::<Value>(body).ok();
-            let field = |k: &str| {
-                req.as_ref()
-                    .and_then(|v| v.get(k)?.as_str().map(str::to_string))
-                    .filter(|v| !v.is_empty())
-            };
-            let (repo, branch) = (field("repo_path"), field("branch_name"));
-            let branch_worktree = match (repo.clone(), branch) {
+    let req = serde_json::from_slice::<Value>(body).ok();
+    let field = |k: &str| {
+        req.as_ref()
+            .and_then(|v| v.get(k)?.as_str().map(str::to_string))
+            .filter(|v| !v.is_empty())
+    };
+    // The worktree that has `branch` checked out in `repo` (blocking git,
+    // off the runtime). A branch no worktree holds is unresolved.
+    let branch_owner = |branch: Option<String>| {
+        let repo = field("repo_path");
+        async move {
+            let wt = match (repo, branch) {
                 (Some(repo), Some(branch)) => {
                     tokio::task::spawn_blocking(move || branch_worktree_path(&repo, &branch))
                         .await
@@ -3921,22 +3932,145 @@ async fn code_mirror_egress_refusal(
                 }
                 _ => None,
             };
-            vec![owner(branch_worktree.as_deref()), owner(repo.as_deref())]
+            wt
         }
-        _ => return None,
     };
     let flow = crate::egress::Flow::CodeMirror;
-    if scopes
-        .into_iter()
-        .all(|scope| crate::egress::permit_or_count_session(flow, scope))
-    {
-        return None;
+    let all_permit = |scopes: Vec<SessionScope>| {
+        scopes
+            .into_iter()
+            .all(|scope| crate::egress::permit_or_count_session(flow, scope))
+    };
+    match segments.as_slice() {
+        [r, leaf] if r == "files" && (leaf == "read" || leaf == "browse") => {
+            let path = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(k, _)| k == "path")
+                .map(|(_, v)| v.into_owned());
+            // Canonicalize ONCE, off the runtime, and both judge and forward
+            // that path: the handler then reads exactly what was checked.
+            let canonical = match path.clone() {
+                Some(p) => tokio::task::spawn_blocking(move || std::fs::canonicalize(p).ok())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.to_string_lossy().to_string()),
+                None => None,
+            };
+            let judged = canonical.as_deref().or(path.as_deref());
+            if !all_permit(vec![owner(judged)]) {
+                return CodeMirrorGate::Refuse(egress_off_http_response(request_id, flow));
+            }
+            let query = canonical.map(|c| {
+                let mut out = url::form_urlencoded::Serializer::new(String::new());
+                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                    if k == "path" {
+                        out.append_pair("path", &c);
+                    } else {
+                        out.append_pair(&k, &v);
+                    }
+                }
+                out.finish()
+            });
+            CodeMirrorGate::Forward { query }
+        }
+        [r, leaf] if r == "worktrees" && leaf == "diff" => {
+            // The diff carries BOTH branches' content, and a repo's refs are
+            // shared by every worktree of it: the owners of the worktrees
+            // holding `branch_name` and `source_branch`, and of the repo path,
+            // must all permit.
+            let branch_wt = branch_owner(field("branch_name")).await;
+            let source_wt = branch_owner(field("source_branch")).await;
+            let repo = field("repo_path");
+            if all_permit(vec![
+                owner(branch_wt.as_deref()),
+                owner(source_wt.as_deref()),
+                owner(repo.as_deref()),
+            ]) {
+                CodeMirrorGate::Forward { query: None }
+            } else {
+                CodeMirrorGate::Refuse(egress_off_http_response(request_id, flow))
+            }
+        }
+        [r, leaf]
+            if r == "worktrees" && matches!(leaf.as_str(), "merge" | "merge-force" | "remove") =>
+        {
+            // The action stays allowed; what its response says about the
+            // branches (conflicts, files, owning sessions, an AI merge prompt)
+            // follows the owners' switches.
+            let branch_wt = branch_owner(field("branch_name")).await;
+            let source_wt = branch_owner(field("source_branch")).await;
+            let mut scopes = vec![
+                owner(branch_wt.as_deref()),
+                owner(field("repo_path").as_deref()),
+            ];
+            if leaf == "remove" {
+                scopes.push(owner(field("worktree_path").as_deref()));
+            } else {
+                scopes.push(owner(source_wt.as_deref()));
+            }
+            if all_permit(scopes) {
+                CodeMirrorGate::Forward { query: None }
+            } else {
+                CodeMirrorGate::ForwardRedacted
+            }
+        }
+        _ => CodeMirrorGate::NotCodeRoute,
     }
-    Some(egress_off_http_response(request_id, flow))
+}
+
+/// The fields of a merge / remove response that describe the branches'
+/// content or their sessions.
+const CODE_METADATA_FIELDS: &[&str] = &[
+    "conflicting_files",
+    "owning_sessions",
+    "conflicts",
+    "ai_merge_prompt",
+    "summary",
+];
+
+/// Blank [`CODE_METADATA_FIELDS`] anywhere in a merge / remove response,
+/// marking each object that lost one with `egress_redacted`. A body that is
+/// not JSON is replaced whole by a fixed notice: the action ran, its report
+/// is withheld.
+fn redact_code_metadata(body: &[u8]) -> Vec<u8> {
+    fn walk(v: &mut Value) {
+        match v {
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            Value::Object(obj) => {
+                let mut blanked = Vec::new();
+                for field in CODE_METADATA_FIELDS {
+                    if let Some(val) = obj.get_mut(*field) {
+                        if !val.is_null() {
+                            *val = Value::Null;
+                            blanked.push(*field);
+                        }
+                    }
+                }
+                if !blanked.is_empty() {
+                    obj.insert("egress_redacted".to_string(), serde_json::json!(blanked));
+                }
+                obj.values_mut().for_each(walk);
+            }
+            _ => {}
+        }
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Ok(mut json) => {
+            walk(&mut json);
+            serde_json::to_vec(&json).unwrap_or_default()
+        }
+        Err(_) => serde_json::json!({
+            "egress_redacted": true,
+            "message": crate::egress::refusal_message(crate::egress::Flow::CodeMirror),
+        })
+        .to_string()
+        .into_bytes(),
+    }
 }
 
 /// The worktree of the repository at `repo` that has `branch` checked out,
-/// from `git worktree list --porcelain`; `None` when none does, or git fails.
+/// from `git worktree list --porcelain -z` (NUL-separated, so a path holding
+/// a newline cannot forge a record); `None` when none does, or git fails.
 /// Blocking.
 fn branch_worktree_path(repo: &str, branch: &str) -> Option<String> {
     // No console window on Windows, no inherited GIT_DIR redirecting it, and
@@ -3944,7 +4078,7 @@ fn branch_worktree_path(repo: &str, branch: &str) -> Option<String> {
     let out = crate::process_helpers::scrubbed_git(std::ffi::OsStr::new("git"))
         .arg("-C")
         .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
+        .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -3958,7 +4092,7 @@ fn branch_worktree_path(repo: &str, branch: &str) -> Option<String> {
 fn worktree_for_branch(porcelain: &str, branch: &str) -> Option<String> {
     let want = format!("refs/heads/{}", branch.trim_start_matches("refs/heads/"));
     let mut current: Option<&str> = None;
-    for line in porcelain.lines() {
+    for line in porcelain.split('\0') {
         if let Some(path) = line.strip_prefix("worktree ") {
             current = Some(path);
         } else if line.strip_prefix("branch ") == Some(want.as_str()) {
@@ -4068,11 +4202,20 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         );
         return http_relay_error(&request_id, 413, "request body exceeds relay size limit");
     }
-    if let Some(refusal) =
-        code_mirror_egress_refusal(&request_id, raw_path, query, &body_bytes).await
-    {
-        return refusal;
-    }
+    let mut redact_code = false;
+    let forwarded_query;
+    let query = match code_mirror_gate(&request_id, raw_path, query, &body_bytes).await {
+        CodeMirrorGate::Refuse(refusal) => return refusal,
+        CodeMirrorGate::Forward { query: Some(q) } => {
+            forwarded_query = q;
+            forwarded_query.as_str()
+        }
+        CodeMirrorGate::ForwardRedacted => {
+            redact_code = true;
+            query
+        }
+        CodeMirrorGate::Forward { query: None } | CodeMirrorGate::NotCodeRoute => query,
+    };
 
     // Build the loopback URL from the supplied base (caller derives it from
     // the runner's OWN bound port via `get_self_base_url`).
@@ -4164,6 +4307,7 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
     }
 
     let resp_body = match redact_relay_content(raw_path, &resp_body) {
+        RelayContent::Keep if redact_code => redact_code_metadata(&resp_body),
         RelayContent::Keep => resp_body.to_vec(),
         RelayContent::Replace(body) => body,
         RelayContent::Refuse => {
@@ -9796,6 +9940,243 @@ mod egress_tests {
         // The root's own branch belongs to the root's tenant, which is on.
         let reply = relay_http_to_base(&counter.http_base(), &diff("main")).await;
         assert_ne!(reply["status"], 409, "{reply}");
+    }
+
+    /// A loopback HTTP server answering every request with `body` (200,
+    /// JSON) and recording each request line plus its body.
+    struct RecordingServer {
+        base: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingServer {
+        fn start(body: String) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text
+                                .get(..end)
+                                .unwrap_or("")
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let line = text.lines().next().unwrap_or("").to_string();
+                    let req_body = text.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
+                    log.lock().unwrap().push(format!("{line}\n{req_body}"));
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            Self { base, seen }
+        }
+    }
+
+    fn git_repo_with_worktrees(base: &std::path::Path, branches: &[&str]) -> std::path::PathBuf {
+        let root = base.join("repo");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("f"), "x").unwrap();
+        git(&root, &["add", "f"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        for b in branches {
+            let wt = base.join(format!("wt-{b}"));
+            git(
+                &root,
+                &["worktree", "add", "-q", "-b", b, wt.to_str().unwrap()],
+            );
+        }
+        root
+    }
+
+    /// Re-review C1: the diff also carries `source_branch`'s content, so its
+    /// owner must permit too.
+    #[tokio::test]
+    async fn a_branch_diff_also_follows_the_source_branchs_owner() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = git_repo_with_worktrees(&base, &["src-b"]);
+        let a = uuid::Uuid::from_u128(0x7e7a_0012);
+        let b = uuid::Uuid::from_u128(0x7e7a_0013);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let root_s = root.to_string_lossy().to_string();
+        let wt_s = base.join("wt-src-b").to_string_lossy().to_string();
+        let _ra = fake_session_tenant(&root_s, SessionScope::Tenant(a));
+        let _wb = fake_session_tenant(&wt_s, SessionScope::Tenant(b));
+        let counter = crate::egress::test_support::ConnCounter::start();
+        let body = serde_json::json!({
+            "branch_name": "main", "source_branch": "src-b", "repo_path": root_s, "full_diff": true
+        })
+        .to_string();
+        let frame = serde_json::json!({
+            "request_id": "rq", "method": "POST", "path": "/worktrees/diff",
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+        });
+        let reply = relay_http_to_base(&counter.http_base(), &frame).await;
+        assert_eq!(
+            status_and_flow(&reply),
+            (409, Some("code_mirror".into())),
+            "{reply}"
+        );
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Re-review W4: the files routes forward the CANONICAL path the gate
+    /// checked, so the handler cannot re-resolve a swapped symlink.
+    #[tokio::test]
+    async fn the_files_routes_forward_the_canonical_path_the_gate_checked() {
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("real/f.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let server = RecordingServer::start("{}".to_string());
+        let asked = base.join("link/f.txt");
+        let query: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", &asked.to_string_lossy())
+            .append_pair("x", "1")
+            .finish();
+        let frame = serde_json::json!({
+            "request_id": "rq", "method": "GET", "path": "/files/read", "query": query,
+        });
+        let reply = relay_http_to_base(&server.base, &frame).await;
+        assert_eq!(reply["status"], 200, "{reply}");
+        let seen = server.seen.lock().unwrap().clone();
+        let line = seen
+            .first()
+            .expect("forwarded")
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let want: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", &base.join("real/f.txt").to_string_lossy())
+            .finish();
+        assert!(line.contains(&want), "{line} lacks {want}");
+        assert!(line.contains("x=1"), "other parameters survive: {line}");
+    }
+
+    /// Re-review W5: merge / remove still run, but their cross-tenant
+    /// metadata is blanked when an owner's code mirror is off.
+    #[tokio::test]
+    async fn merge_and_remove_responses_hide_metadata_of_a_refused_owner() {
+        use crate::egress::test_support::{fake_session_tenant, pin_for};
+        use crate::egress::SessionScope;
+        let b = uuid::Uuid::from_u128(0x7e7a_0014);
+        let _on = pin(Flow::CodeMirror, Level::On);
+        let _boff = pin_for(Flow::CodeMirror, b, Level::Off);
+        let _r = fake_session_tenant("/work/repo-b", SessionScope::Tenant(b));
+        let _o = fake_session_tenant("/work/repo-o", SessionScope::DeviceDefault);
+        let response = serde_json::json!({
+            "success": true,
+            "data": {"success": false, "conflicts": ["SECRET-C"], "summary": "SECRET-S",
+                     "ai_merge_prompt": "SECRET-P"},
+            "hint": {"status": "blocked", "conflicting_files": ["SECRET-F"],
+                     "owning_sessions": ["SECRET-O"]}
+        })
+        .to_string();
+        let server = RecordingServer::start(response);
+        let frame = |path: &str, repo: &str| {
+            let body = serde_json::json!({
+                "branch_name": "feat", "source_branch": "main", "repo_path": repo,
+                "worktree_path": repo, "ai_resolve": false, "delete_branch": false
+            })
+            .to_string();
+            serde_json::json!({
+                "request_id": "rq", "method": "POST", "path": path,
+                "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+            })
+        };
+        let decode = |reply: &serde_json::Value| {
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(reply["body_b64"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        for path in [
+            "/worktrees/merge",
+            "/worktrees/merge-force",
+            "/worktrees/remove",
+        ] {
+            let before = server.seen.lock().unwrap().len();
+            let reply = relay_http_to_base(&server.base, &frame(path, "/work/repo-b")).await;
+            assert_eq!(reply["status"], 200, "{path}: the action still runs");
+            assert_eq!(
+                server.seen.lock().unwrap().len(),
+                before + 1,
+                "{path} forwarded"
+            );
+            let text = decode(&reply);
+            assert!(!text.contains("SECRET"), "{path}: {text}");
+            assert!(text.contains("egress_redacted"), "{path}: {text}");
+        }
+        let reply =
+            relay_http_to_base(&server.base, &frame("/worktrees/merge", "/work/repo-o")).await;
+        assert!(
+            decode(&reply).contains("SECRET-F"),
+            "an owner that is on sees it all"
+        );
+    }
+
+    /// Re-review W7: the porcelain is read NUL-separated (`-z`).
+    #[test]
+    fn the_worktree_porcelain_is_read_nul_separated() {
+        let z = "worktree /r/main\0HEAD abc\0branch refs/heads/main\0\0worktree /r/odd\nname\0HEAD def\0branch refs/heads/feat\0\0";
+        assert_eq!(
+            worktree_for_branch(z, "feat").as_deref(),
+            Some("/r/odd\nname")
+        );
+        assert_eq!(worktree_for_branch(z, "main").as_deref(), Some("/r/main"));
+        assert_eq!(worktree_for_branch(z, "none"), None);
     }
 
     fn redacted(path: &str, body: serde_json::Value) -> serde_json::Value {
