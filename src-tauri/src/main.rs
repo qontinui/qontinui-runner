@@ -2342,8 +2342,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // when web integration is enabled — deliberately NOT
                     // `api_config::get_api_base_url()`. That getter can never
                     // answer "unconfigured": it falls through to
-                    // `http://127.0.0.1:8000` in debug and PROD_API_BASE_URL in
-                    // release, and it already suppresses the persisted URL when
+                    // PROD_API_BASE_URL (the build default in every build),
+                    // and it already suppresses the persisted URL when
                     // web integration is OFF, so it lands on the build default
                     // precisely when the operator has said not to reach web.
                     // Feeding that into `resolve_backend_base` would defeat its
@@ -2351,9 +2351,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // runner's 1,100-artifact sync at production.
                     let settings = settings::load_settings();
                     // The ladder's configured base (env, profile, persisted);
-                    // `None` when nothing is configured, and a release build's
+                    // `None` when nothing is configured, and the ladder's
                     // refusal of a MACHINE-LOCAL persisted value is `None` too,
-                    // NOT the release default: this call site's contract is
+                    // NOT the build default: this call site's contract is
                     // "return None rather than guess", and redirecting a
                     // 1,100-artifact bulk upload to production on the strength
                     // of a value we just rejected is that guess. Build-default
@@ -2368,7 +2368,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // quiet).
                     if persisted_backend_url.is_none() {
                         let (_, arm) = crate::api_config::resolve_api_base_url_from(&settings);
-                        if arm == crate::api_config::ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected
+                        if arm == crate::api_config::ApiBaseUrlArm::BuildDefaultLoopbackRejected
                             && qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled()
                         {
                             let raw = &settings.web_integration.backend_url;
@@ -2376,13 +2376,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 rejected_backend_url = %raw,
                                 "plan library: REFUSING persisted \
                                  web_integration.backend_url '{raw}' as the body-sync \
-                                 target: it is a MACHINE-LOCAL address and this is a \
-                                 RELEASE build (same refusal as \
+                                 target: it is a MACHINE-LOCAL address, refused in every \
+                                 build (same refusal as \
                                  api_config::resolve_api_base_url). The body sync (on by \
                                  default) will NOT run rather than guess a backend. FIX: set \
                                  web_integration.backend_url in settings.json to the \
-                                 backend this runner actually paired with, then start a \
-                                 new runner."
+                                 backend this runner actually paired with (or, to use a \
+                                 local backend deliberately, set `api_url` in the active \
+                                 profile in ~/.qontinui/profiles.json or export \
+                                 QONTINUI_WEB_BACKEND_URL), then start a new runner."
                             );
                         }
                     }

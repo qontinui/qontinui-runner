@@ -1139,8 +1139,11 @@ pub struct CognitoSignInResponse {
 ///   4. Persist the device JWT, promote to Tier 2, kick the relay + refresher.
 ///
 /// `backend_url` is the web-backend base (e.g. `https://api.qontinui.io`). It
-/// is required and explicit (NOT `get_api_base_url()`) so a debug build can
-/// target prod — symmetric with [`pair_with_credentials`].
+/// is required and explicit (NOT `get_api_base_url()`) so the operator can
+/// target the backend typed into the Settings form — symmetric with
+/// [`pair_with_credentials`]. A MACHINE-LOCAL value is replaced by the ladder's
+/// answer unless a deliberate override selects it
+/// ([`crate::api_config::interactive_pair_base`]).
 ///
 /// `identity_provider` optionally selects a federated IdP to jump straight into
 /// (Cognito provider name — `Google`, `MicrosoftEntra`, `GitHub`). When `None`
@@ -1164,6 +1167,9 @@ async fn cognito_sign_in_impl(
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
     }
+    // Never dial a stale machine-local value the UI read out of settings.json
+    // (see `api_config::interactive_pair_base`).
+    let base = crate::api_config::interactive_pair_base(&base);
 
     // 1. RFC-8252 PKCE login (blocking — browser + loopback). Run on a
     //    worker thread so it doesn't block the tokio runtime.
@@ -1439,6 +1445,9 @@ async fn cognito_sign_in_password_impl(
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
     }
+    // Never dial a stale machine-local value the UI read out of settings.json
+    // (see `api_config::interactive_pair_base`).
+    let base = crate::api_config::interactive_pair_base(&base);
     let email = email.trim().to_string();
     if email.is_empty() {
         return Err(AppError::Raw("email is required".to_string()));

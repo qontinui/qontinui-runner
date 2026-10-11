@@ -1721,8 +1721,8 @@ impl Default for DebugSettings {
 ///
 /// Defaults are tuned for a fresh install to be visible to the qontinui-web
 /// `/connect` flow without any manual configuration: `enabled = true` and
-/// `backend_url` points at the dev backend in debug builds (`http://127.0.0.1:8000`)
-/// or the production backend in release builds (`https://api.qontinui.io`).
+/// `backend_url` points at the production backend (`https://api.qontinui.io`)
+/// in every build, debug included.
 /// `runner_token` still defaults to empty — it must be granted by the user
 /// through one of the device-pairing flows (Cognito sign-in or pair-code
 /// redemption). The runner UI surfaces a "needs authorization" banner
@@ -1735,7 +1735,9 @@ pub struct WebIntegrationSettings {
 
     /// API base — the FastAPI backend that serves `/api/v1/*`. In a unified
     /// production deployment this is also the origin that serves the web SPA.
-    /// Example: `https://api.qontinui.io` or `http://127.0.0.1:8000`.
+    /// Example: `https://api.qontinui.io`. A machine-local value (loopback or
+    /// `0.0.0.0`) is refused here in every build — point a runner at a local
+    /// backend via profile `api_url` or `QONTINUI_WEB_BACKEND_URL` instead.
     /// No trailing slash required.
     #[serde(default = "default_web_integration_backend_url")]
     pub backend_url: String,
@@ -1771,28 +1773,17 @@ fn default_web_integration_enabled() -> bool {
     true
 }
 
-/// Default for [`WebIntegrationSettings::backend_url`] — the dev backend in
-/// debug builds, the production backend in release builds. We pick this at
-/// compile time via `cfg(debug_assertions)` to match how other defaults in
-/// this codebase distinguish dev vs prod (see `dev_services.rs`).
+/// Default for [`WebIntegrationSettings::backend_url`] — the production
+/// backend ([`crate::api_config::PROD_API_BASE_URL`]) in EVERY build, debug
+/// included (operator decision). A runner that should talk to a local
+/// qontinui-web backend says so deliberately: `api_url` in the active profile
+/// in `~/.qontinui/profiles.json`, or an exported `QONTINUI_WEB_BACKEND_URL`.
 ///
-/// The user can override either value via Settings → Web Integration; the
-/// override is persisted to `settings.json` and survives upgrades.
+/// A persisted machine-local value (e.g. the `http://127.0.0.1:8000` older
+/// debug builds wrote back on every settings save) is refused by
+/// [`crate::api_config::persisted_backend_url_refused`] in every build.
 pub(crate) fn default_web_integration_backend_url() -> String {
-    if cfg!(debug_assertions) {
-        // IPv4-pinned to match `api_config::get_api_base_url`'s debug default.
-        // The backend binds IPv4 only, and `localhost` can resolve to IPv6
-        // `::1` first — since `get_api_base_url` now folds this persisted value
-        // in as its step-3 fallback (plan 2026-07-08), any divergence here would
-        // flip an un-signed-in debug box off the IPv4 pin. Keeping them
-        // byte-identical makes step 3 == step 4 for a fresh install.
-        format!(
-            "http://127.0.0.1:{}",
-            crate::api_config::DEFAULT_BACKEND_PORT
-        )
-    } else {
-        crate::api_config::PROD_API_BASE_URL.to_string()
-    }
+    crate::api_config::PROD_API_BASE_URL.to_string()
 }
 
 impl Default for WebIntegrationSettings {
@@ -1812,7 +1803,7 @@ mod web_integration_default_tests {
 
     /// A fresh install (no persisted settings) must default to:
     ///   - enabled: true
-    ///   - backend_url: dev or prod URL depending on build profile
+    ///   - backend_url: the production URL, in every build profile
     ///   - runner_token: empty (token requires user OAuth consent)
     ///   - web_base_url: None
     ///
@@ -1820,7 +1811,7 @@ mod web_integration_default_tests {
     /// when these defaults change, the `/connect` flow on the mobile app
     /// breaks and the in-runner authorization banner stops appearing.
     #[test]
-    fn default_is_enabled_with_environment_appropriate_backend_url() {
+    fn default_is_enabled_with_production_backend_url() {
         let s = WebIntegrationSettings::default();
         assert!(
             s.enabled,
@@ -1832,12 +1823,9 @@ mod web_integration_default_tests {
         );
         assert_eq!(s.web_base_url, None);
 
-        if cfg!(debug_assertions) {
-            // IPv4-pinned to match api_config's debug default (plan 2026-07-08).
-            assert_eq!(s.backend_url, "http://127.0.0.1:8000");
-        } else {
-            assert_eq!(s.backend_url, "https://api.qontinui.io");
-        }
+        // Production in EVERY build — a debug runner with no local backend
+        // must still be able to sign in.
+        assert_eq!(s.backend_url, "https://api.qontinui.io");
     }
 
     /// An empty JSON object must deserialize to the same defaults as

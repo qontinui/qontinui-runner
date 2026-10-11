@@ -833,17 +833,12 @@ pub(crate) fn resolve_web_base() -> Option<String> {
     if let Some((base, _arm)) = crate::api_config::configured_api_base_from(&settings) {
         return Some(base);
     }
-    // A persisted value the ladder REFUSED (a loopback value on a release
-    // build): a value IS configured, so "unconfigured" is the wrong answer and
+    // A persisted value the ladder REFUSED (a machine-local value, refused in
+    // every build): a value IS configured, so "unconfigured" is the wrong answer and
     // the coord-derived step below is the one that once mangled a portless
     // production coord URL. Defer to what the relay actually dials.
     let wi = &settings.web_integration;
-    if wi.enabled
-        && crate::api_config::persisted_backend_url_refused(
-            wi.backend_url.trim(),
-            cfg!(debug_assertions),
-        )
-    {
+    if wi.enabled && crate::api_config::persisted_backend_url_refused(wi.backend_url.trim()) {
         return Some(crate::api_config::get_api_base_url());
     }
     qontinui_runner_lib::env_agent::enroll::resolve_backend_base(None).ok()

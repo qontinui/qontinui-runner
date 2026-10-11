@@ -1915,9 +1915,8 @@ mod tests {
         env_web: Option<&str>,
         env_api: Option<&str>,
         persisted: Option<&str>,
-        is_debug: bool,
     ) -> ApiBaseUrlInputs {
-        inputs_with_profile(env_web, env_api, None, persisted, is_debug)
+        inputs_with_profile(env_web, env_api, None, persisted)
     }
 
     fn inputs_with_profile(
@@ -1925,14 +1924,12 @@ mod tests {
         env_api: Option<&str>,
         profile_api_url: Option<&str>,
         persisted: Option<&str>,
-        is_debug: bool,
     ) -> ApiBaseUrlInputs {
         ApiBaseUrlInputs {
             env_web: env_web.map(str::to_string),
             env_api: env_api.map(str::to_string),
             profile_api_url: profile_api_url.map(str::to_string),
             persisted: persisted.map(str::to_string),
-            is_debug,
         }
     }
 
@@ -1947,7 +1944,6 @@ mod tests {
                     Some("https://web.example/"),
                     Some("https://api.example"),
                     Some("https://persisted.example"),
-                    true,
                 ),
                 "env:QONTINUI_WEB_BACKEND_URL",
                 "https://web.example",
@@ -1957,7 +1953,6 @@ mod tests {
                     None,
                     Some("https://api.example/"),
                     Some("https://persisted.example"),
-                    true,
                 ),
                 "env:QONTINUI_API_URL",
                 "https://api.example",
@@ -1968,24 +1963,28 @@ mod tests {
                     Some("  "),
                     Some("https://profile.example/"),
                     Some("https://persisted.example"),
-                    true,
                 ),
                 "profile:api_url",
                 "https://profile.example",
             ),
             (
-                inputs(Some("   "), None, Some("https://persisted.example/"), true),
+                inputs(Some("   "), None, Some("https://persisted.example/")),
                 "persisted:web_integration.backend_url",
                 "https://persisted.example",
             ),
             (
-                inputs(None, None, None, true),
-                "build_default:debug",
-                "http://127.0.0.1:8000",
+                inputs(None, None, None),
+                "build_default",
+                "https://api.qontinui.io",
             ),
             (
-                inputs(None, None, Some(""), false),
-                "build_default:release",
+                inputs(None, None, Some("")),
+                "build_default",
+                "https://api.qontinui.io",
+            ),
+            (
+                inputs(None, None, Some("http://127.0.0.1:8000")),
+                "build_default:persisted_loopback_rejected",
                 "https://api.qontinui.io",
             ),
         ];
@@ -2119,8 +2118,16 @@ mod tests {
             "layer 11 must still be injected"
         );
         // Layer 5's inputs come from the read-only twin over the SAME document
-        // layer 1 reported on — one read, three layers.
-        assert_eq!(derived.api_base_url.is_debug, cfg!(debug_assertions));
+        // layer 1 reported on — one read, three layers. Re-derive the persisted
+        // rung from a fresh non-mutating read (with the same env overlay) and
+        // require the two to agree.
+        let mut reread = crate::settings::read_settings_from_disk().settings;
+        crate::settings::apply_web_integration_env_overlay(&mut reread);
+        assert_eq!(
+            derived.api_base_url.persisted,
+            crate::api_config::persisted_input(&reread),
+            "layer 5's persisted rung must come from the same disk read layer 1 reported on"
+        );
 
         println!(
             "[config-report evidence] load_settings_full entries on this thread after the full \
@@ -2149,16 +2156,9 @@ mod tests {
                 ApiBaseUrlArm::PersistedBackendUrl,
                 "web_integration.backend_url",
             ),
+            (ApiBaseUrlArm::BuildDefault, "build_default.backend_url"),
             (
-                ApiBaseUrlArm::BuildDefaultDebug,
-                "build_default.backend_url",
-            ),
-            (
-                ApiBaseUrlArm::BuildDefaultRelease,
-                "build_default.backend_url",
-            ),
-            (
-                ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
+                ApiBaseUrlArm::BuildDefaultLoopbackRejected,
                 "build_default.backend_url",
             ),
         ] {
@@ -2191,12 +2191,12 @@ mod tests {
         assert!(url.contains(pw), "the fixture must carry the password");
         for (i, (input, expected_arm)) in [
             (
-                inputs(Some(url), None, None, true),
+                inputs(Some(url), None, None),
                 "env:QONTINUI_WEB_BACKEND_URL",
             ),
-            (inputs(None, Some(url), None, true), "env:QONTINUI_API_URL"),
+            (inputs(None, Some(url), None), "env:QONTINUI_API_URL"),
             (
-                inputs(None, None, Some(url), true),
+                inputs(None, None, Some(url)),
                 "persisted:web_integration.backend_url",
             ),
         ]
@@ -2231,12 +2231,7 @@ mod tests {
         // `WithPassword` — so it is the control for `value_origin_name` being a
         // `*_URL` name.
         let reading = api_base_url_reading(
-            &inputs(
-                Some("https://serviceacct@qontinui.internal"),
-                None,
-                None,
-                true,
-            ),
+            &inputs(Some("https://serviceacct@qontinui.internal"), None, None),
             fixed_stamp(),
         );
         let LayerReading::Known { value, .. } = &reading else {
@@ -2256,12 +2251,12 @@ mod tests {
         // would have broken the diagnostic instead of the leak. LITERALS.
         for (input, expected_value) in [
             (
-                inputs(Some("https://api.qontinui.io"), None, None, true),
+                inputs(Some("https://api.qontinui.io"), None, None),
                 "https://api.qontinui.io",
             ),
-            (inputs(None, None, None, true), "http://127.0.0.1:8000"),
+            (inputs(None, None, None), "https://api.qontinui.io"),
             (
-                inputs(None, None, Some("http://192.168.1.10:8000/"), true),
+                inputs(None, None, Some("http://192.168.1.10:8000/")),
                 "http://192.168.1.10:8000",
             ),
         ] {
@@ -2284,7 +2279,7 @@ mod tests {
             settings_struct: None,
             config_dir: None,
             api_endpoint_registry: Some(api_base_url_reading(
-                &inputs(Some("https://web.example"), None, None, true),
+                &inputs(Some("https://web.example"), None, None),
                 fixed_stamp(),
             )),
             claude_config_dir: None,
@@ -2450,7 +2445,9 @@ mod tests {
                 assert!(!value.is_empty(), "a known backend URL must have a value");
                 assert!(
                     source.starts_with("env:")
+                        || source.starts_with("profile:")
                         || source.starts_with("persisted:")
+                        || source == "build_default"
                         || source.starts_with("build_default:"),
                     "unexpected api base arm: {source}"
                 );
@@ -4471,7 +4468,7 @@ mod tests {
         );
         let mut seeded = config_report_inputs();
         seeded.api_endpoint_registry = Some(api_base_url_reading(
-            &inputs(Some(planted), None, None, true),
+            &inputs(Some(planted), None, None),
             fixed_stamp(),
         ));
         let seeded_render = build_report(&seeded).render();
@@ -4666,7 +4663,7 @@ mod tests {
         // here.
         let mut seeded = config_report_inputs();
         seeded.api_endpoint_registry = Some(api_base_url_reading(
-            &inputs(Some("redis://:s3cretpw@127.0.0.1:6379/0"), None, None, true),
+            &inputs(Some("redis://:s3cretpw@127.0.0.1:6379/0"), None, None),
             fixed_stamp(),
         ));
         let seeded_render = build_report(&seeded).render();
