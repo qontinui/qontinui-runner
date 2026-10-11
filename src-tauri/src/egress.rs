@@ -93,8 +93,11 @@
 //! state) whose tenant cannot be established ([`SessionScope::Unresolved`])
 //! is judged by the STRICTEST verdict across the default scope and every
 //! bound tenant ([`permit_session`]): any refusal refuses. The bound set is
-//! what the poller last enumerated, seeded at start from the tenants the store
-//! holds answers for under the current coord.
+//! every tenant the poller has enumerated, MERGED across ticks (a failed or
+//! partial enumeration never shrinks it), seeded at start from the tenants
+//! the store holds answers for under the current coord. An EMPTY set refuses
+//! such a send, unless a complete enumeration found the device holds no
+//! credentials at all.
 //!
 //! Which paths know their session's tenant:
 //!
@@ -197,8 +200,9 @@ const SCOPE_NOTE: &str = "every tenant this device holds a credential for is pol
      credential; a failed poll records nothing, so a tenant with no answer from a successful \
      coord reply (this process's or persisted) is UNKNOWN and every flow fails closed for it; a \
      content send whose session tenant cannot be established takes the strictest verdict across \
-     all bound tenants; a device with no tenant at all uses the machine profile, else the \
-     product default";
+     all bound tenants (merged across enumerations, never shrunk by a failed one), and refuses \
+     while that set is empty unless a complete enumeration found no credentials; a device with \
+     no tenant at all uses the machine profile, else the product default";
 
 /// One outbound data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -715,7 +719,7 @@ pub(crate) struct EgressState {
     /// under the current coord, so an unresolved session is judged against
     /// them from the first instant). [`SessionScope::Unresolved`] is judged by
     /// the strictest verdict across these and the default scope.
-    bound: RwLock<Vec<Uuid>>,
+    bound: RwLock<BoundSet>,
     /// Rung 3 — the profile's `egress.default`, read once.
     profile: Option<Level>,
     /// Where rung 2 lives; `None` when the config dir does not resolve.
@@ -745,7 +749,10 @@ impl EgressState {
         seeded.dedup();
         Self {
             coord: RwLock::new(ScopedAnswers::new()),
-            bound: RwLock::new(seeded),
+            bound: RwLock::new(BoundSet {
+                tenants: seeded,
+                unbound_device: false,
+            }),
             persisted: RwLock::new(persisted),
             current: RwLock::new(current),
             pending: RwLock::new(None),
@@ -825,13 +832,27 @@ impl EgressState {
         self.permit_for(flow, None)
     }
 
-    /// Record the tenants this device is bound to (the poller, each tick).
-    pub(crate) fn set_bound_tenants(&self, tenants: Vec<Uuid>) {
-        *self.bound.write().unwrap_or_else(|p| p.into_inner()) = tenants;
+    /// Record one enumeration of the tenants this device is bound to (the
+    /// poller, each tick). The tenants are MERGED into the set — never
+    /// replacing it, so a partial or failed enumeration cannot shrink it to
+    /// nothing. `complete` says the enumeration read every source; only a
+    /// complete enumeration that found no tenant at all, with nothing seeded
+    /// or merged before, marks the device as unbound (no credentials) — the
+    /// one state in which an empty set does not refuse.
+    pub(crate) fn record_bound_enumeration(&self, tenants: Vec<Uuid>, complete: bool) {
+        let mut bound = self.bound.write().unwrap_or_else(|p| p.into_inner());
+        bound.unbound_device = complete && tenants.is_empty() && bound.tenants.is_empty();
+        bound.tenants.extend(tenants);
+        bound.tenants.sort();
+        bound.tenants.dedup();
+    }
+
+    pub(crate) fn bound_set(&self) -> BoundSet {
+        self.bound.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub(crate) fn bound_tenants(&self) -> Vec<Uuid> {
-        self.bound.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.bound_set().tenants
     }
 
     /// The verdict for a session-keyed send in `scope`. An unresolved tenant
@@ -842,7 +863,7 @@ impl EgressState {
             flow,
             scope,
             |t| self.permit_for(flow, t),
-            || self.bound_tenants(),
+            || self.bound_set(),
         )
     }
 
@@ -999,9 +1020,13 @@ fn state() -> &'static EgressState {
                 production_scope(),
             )
         }
+        // The test global is an UNBOUND device (no credentials): tests that
+        // need a bound set fake one per thread.
         #[cfg(test)]
         {
-            EgressState::new(None, None, ScopeKey::new("http://coord.test", None))
+            let s = EgressState::new(None, None, ScopeKey::new("http://coord.test", None));
+            s.record_bound_enumeration(Vec::new(), true);
+            s
         }
     })
 }
@@ -1087,13 +1112,21 @@ pub(crate) fn task_run_session_tenant(task_run_id: &str) -> SessionScope {
     SessionScope::from_lookup(tenant)
 }
 
-/// The scope that owns the repository / worktree content at `path`: the open
-/// session whose working directory is the CLOSEST ancestor of `path`
-/// (component-wise). Several sessions at that closest directory must agree —
+/// The scope that owns the repository / worktree content at `path`: the
+/// session (open, or closed but still recorded) whose working directory is
+/// the CLOSEST ancestor of `path`, compared component-wise on CANONICAL paths
+/// (symlinks and `..` resolved; on Windows case-insensitively and without the
+/// `\\?\` prefix). Several sessions at that closest directory must agree —
 /// sessions of different tenants sharing one checkout make it
-/// [`SessionScope::Unresolved`], as does a path no open session works under,
-/// a non-UUID stamp, or the lookup not installed. A session spawned without a
-/// tenant choice is [`SessionScope::DeviceDefault`].
+/// [`SessionScope::Unresolved`], as does a path that cannot be canonicalized,
+/// a path no recorded session works under, a non-UUID stamp, or the lookup
+/// not installed. A session spawned without a tenant choice is
+/// [`SessionScope::DeviceDefault`].
+///
+/// Residual (documented, not closed): a worktree whose session record the
+/// store has already pruned is attributed to whichever recorded session works
+/// in an enclosing directory (typically the primary checkout's) — if that one
+/// is on, the pruned session's content follows it.
 pub(crate) fn path_session_tenant(path: &str) -> SessionScope {
     #[cfg(test)]
     if let Some(faked) = test_support::faked_session_tenant(path) {
@@ -1108,7 +1141,11 @@ pub(crate) fn path_session_tenant(path: &str) -> SessionScope {
     >>() else {
         return SessionScope::Unresolved;
     };
-    let records = store.open_records();
+    // Every record the store still holds — open AND closed — so a worktree
+    // whose session has ended is still attributed to that session's tenant
+    // rather than to an open session in an enclosing directory. Records that
+    // disagree at the closest directory make the path unresolved.
+    let records = store.all_records();
     scope_for_path(
         path,
         records
@@ -1117,20 +1154,59 @@ pub(crate) fn path_session_tenant(path: &str) -> SessionScope {
     )
 }
 
+/// A path in the form ownership is compared in: on Windows without the
+/// verbatim `\\?\` (or `\\?\UNC\`) prefix, with `/` as `\`, lower-cased (NTFS
+/// is case-insensitive); elsewhere unchanged. PURE.
+pub(crate) fn normalize_ownership_key(raw: &str, windows: bool) -> PathBuf {
+    if !windows {
+        return PathBuf::from(raw);
+    }
+    let unprefixed = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.to_string()
+    };
+    PathBuf::from(unprefixed.replace('/', "\\").to_lowercase())
+}
+
+/// `path` canonicalized (symlinks and `..` resolved) and normalized for
+/// comparison; `None` when it cannot be canonicalized (it does not exist, or
+/// is unreadable).
+fn ownership_key(path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    Some(normalize_ownership_key(
+        &canonical.to_string_lossy(),
+        cfg!(windows),
+    ))
+}
+
 /// The rule behind [`path_session_tenant`] over `(working_dir, tenant stamp)`
 /// pairs. PURE.
 pub(crate) fn scope_for_path<'a>(
     path: &str,
     sessions: impl Iterator<Item = (&'a str, Option<&'a str>)>,
 ) -> SessionScope {
-    let target = Path::new(path);
-    if !target.is_absolute() {
+    // Both sides CANONICAL: `..`, symlinks and (on Windows) case / the
+    // verbatim prefix must not let a path borrow another tenant's directory.
+    // A target that cannot be canonicalized is unresolved; a session directory
+    // that cannot be (deleted since) owns nothing.
+    if !Path::new(path).is_absolute() {
         return SessionScope::Unresolved;
     }
+    let Some(target) = ownership_key(Path::new(path)) else {
+        return SessionScope::Unresolved;
+    };
     let mut best: Option<(usize, Vec<Option<&'a str>>)> = None;
     for (dir, stamp) in sessions {
-        let dir = Path::new(dir);
-        if !dir.is_absolute() || !target.starts_with(dir) {
+        if !Path::new(dir).is_absolute() {
+            continue;
+        }
+        let Some(dir) = ownership_key(Path::new(dir)) else {
+            continue;
+        };
+        if !target.starts_with(&dir) {
             continue;
         }
         let depth = dir.components().count();
@@ -1178,13 +1254,26 @@ pub(crate) fn permit_or_count(flow: Flow) -> bool {
     permit_or_count_for(flow, None)
 }
 
+/// The tenants the strictest rule is taken across.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BoundSet {
+    /// Every tenant ever enumerated or seeded for this coord (merged, never
+    /// replaced).
+    pub(crate) tenants: Vec<Uuid>,
+    /// A COMPLETE enumeration found no tenant at all: the device holds no
+    /// credentials, so there is no tenant whose policy could be violated.
+    pub(crate) unbound_device: bool,
+}
+
 /// The rule behind [`permit_session`], over an injected per-scope verdict and
-/// bound-tenant list (`verdict(None)` is the default scope). PURE.
+/// bound set (`verdict(None)` is the default scope). PURE. An unresolved send
+/// with an EMPTY bound set refuses — unless the device is unbound — because
+/// "no tenant known" is not "no tenant to protect".
 fn strictest_session_verdict(
     flow: Flow,
     scope: SessionScope,
     verdict: impl Fn(Option<Uuid>) -> EgressVerdict,
-    bound: impl FnOnce() -> Vec<Uuid>,
+    bound: impl FnOnce() -> BoundSet,
 ) -> EgressVerdict {
     let _ = flow;
     match scope {
@@ -1195,7 +1284,15 @@ fn strictest_session_verdict(
             if !default.allowed {
                 return default;
             }
-            bound()
+            let bound = bound();
+            if bound.tenants.is_empty() && !bound.unbound_device {
+                return EgressVerdict {
+                    allowed: false,
+                    source: LevelSource::Unknown,
+                };
+            }
+            bound
+                .tenants
                 .into_iter()
                 .map(|t| verdict(Some(t)))
                 .find(|v| !v.allowed)
@@ -1204,13 +1301,16 @@ fn strictest_session_verdict(
     }
 }
 
-/// The tenants the poller last enumerated (the strictest rule's set).
-fn bound_tenants() -> Vec<Uuid> {
+/// The bound set the poller last recorded (the strictest rule's set).
+fn bound_tenants() -> BoundSet {
     #[cfg(test)]
     if let Some(faked) = test_support::faked_bound_tenants() {
-        return faked;
+        return BoundSet {
+            tenants: faked,
+            unbound_device: false,
+        };
     }
-    state().bound_tenants()
+    state().bound_set()
 }
 
 /// The verdict for a session-keyed send of a CONTENT flow in `scope` —
@@ -2445,7 +2545,7 @@ mod tests {
         };
         decide(a, Level::On);
         decide(b, Level::Off);
-        state.set_bound_tenants(vec![a, b]);
+        state.record_bound_enumeration(vec![a, b], true);
         let flow = Flow::TerminalStream;
         assert!(state.permit_session(flow, SessionScope::Tenant(a)).allowed);
         assert!(
@@ -2458,13 +2558,130 @@ mod tests {
             !unresolved.allowed,
             "B's off refuses an unattributable send"
         );
+        decide(b, Level::On);
+        assert!(state.permit_session(flow, SessionScope::Unresolved).allowed);
         // A bound tenant nobody has answered for is UNKNOWN, which refuses too.
         let c = Uuid::from_u128(0xc3);
-        decide(b, Level::On);
-        state.set_bound_tenants(vec![a, b, c]);
+        state.record_bound_enumeration(vec![c], true);
         assert!(!state.permit_session(flow, SessionScope::Unresolved).allowed);
-        state.set_bound_tenants(vec![a, b]);
-        assert!(state.permit_session(flow, SessionScope::Unresolved).allowed);
+    }
+
+    /// Re-review M3: an EMPTY bound set refuses unattributable content —
+    /// unless a complete enumeration found the device unbound — and a failed
+    /// or partial enumeration never shrinks the set (merge, not replace).
+    #[test]
+    fn an_empty_bound_set_refuses_and_enumerations_merge() {
+        let base = "http://coord.example";
+        let flow = Flow::TerminalStream;
+        let fresh = || EgressState::new(None, None, ScopeKey::new(base, None));
+
+        let never = fresh();
+        assert!(
+            !never.permit_session(flow, SessionScope::Unresolved).allowed,
+            "nothing enumerated yet: refuse"
+        );
+        let failed = fresh();
+        failed.record_bound_enumeration(Vec::new(), false);
+        assert!(
+            !failed
+                .permit_session(flow, SessionScope::Unresolved)
+                .allowed,
+            "a failed enumeration is not 'no tenants'"
+        );
+        let unbound = fresh();
+        unbound.record_bound_enumeration(Vec::new(), true);
+        assert!(
+            unbound
+                .permit_session(flow, SessionScope::Unresolved)
+                .allowed,
+            "a device with no credentials has no tenant to protect"
+        );
+
+        let a = Uuid::from_u128(0xa6);
+        let b = Uuid::from_u128(0xb6);
+        let merged = fresh();
+        merged.record_bound_enumeration(vec![a], true);
+        merged.record_bound_enumeration(Vec::new(), false);
+        assert_eq!(
+            merged.bound_tenants(),
+            vec![a],
+            "a failed tick keeps the set"
+        );
+        merged.record_bound_enumeration(Vec::new(), true);
+        assert!(
+            !merged.bound_set().unbound_device,
+            "a set with tenants is never 'unbound'"
+        );
+        merged.record_bound_enumeration(vec![b], true);
+        assert_eq!(merged.bound_tenants(), vec![a, b], "enumerations merge");
+        // Never answered: both are UNKNOWN and refuse.
+        assert!(
+            !merged
+                .permit_session(flow, SessionScope::Unresolved)
+                .allowed
+        );
+        // The module door: an empty faked set (not unbound) refuses too.
+        let _on = test_support::pin(flow, Level::On);
+        let _bound = test_support::fake_bound_tenants(Vec::new());
+        assert!(!permit_session(flow, SessionScope::Unresolved).allowed);
+    }
+
+    /// Re-review C1: ownership is decided on CANONICAL paths — `..` and
+    /// symlinks cannot borrow another tenant's directory.
+    #[test]
+    fn path_ownership_is_decided_on_canonical_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let a_dir = root.join("wt-a");
+        let b_dir = root.join("wt-b");
+        std::fs::create_dir_all(a_dir.join("src")).unwrap();
+        std::fs::create_dir_all(b_dir.join("src")).unwrap();
+        std::fs::write(b_dir.join("src/secret.rs"), "b").unwrap();
+        std::fs::write(a_dir.join("src/lib.rs"), "a").unwrap();
+        let a = Uuid::from_u128(0xa7);
+        let b = Uuid::from_u128(0xb7);
+        let (a_s, b_s) = (a.to_string(), b.to_string());
+        let a_path = a_dir.to_string_lossy().to_string();
+        let b_path = b_dir.to_string_lossy().to_string();
+        let sessions = [
+            (a_path.as_str(), Some(a_s.as_str())),
+            (b_path.as_str(), Some(b_s.as_str())),
+        ];
+        let scope =
+            |p: &std::path::Path| scope_for_path(&p.to_string_lossy(), sessions.iter().copied());
+        assert_eq!(scope(&a_dir.join("src/lib.rs")), SessionScope::Tenant(a));
+        // `..` out of A's tree into B's file is B's file.
+        assert_eq!(
+            scope(&a_dir.join("src/../../wt-b/src/secret.rs")),
+            SessionScope::Tenant(b)
+        );
+        // A symlink inside A's tree pointing at B's file is B's file.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(b_dir.join("src/secret.rs"), a_dir.join("src/link.rs"))
+                .unwrap();
+            assert_eq!(scope(&a_dir.join("src/link.rs")), SessionScope::Tenant(b));
+        }
+        // A path that does not exist cannot be canonicalized: unresolved.
+        assert_eq!(
+            scope(&a_dir.join("src/missing.rs")),
+            SessionScope::Unresolved
+        );
+    }
+
+    /// Re-review C1: on Windows, ownership keys drop the verbatim `\\?\`
+    /// prefix and compare case-insensitively; POSIX keys stay as they are.
+    #[test]
+    fn windows_ownership_keys_are_case_and_prefix_insensitive() {
+        let k = |raw: &str| normalize_ownership_key(raw, true);
+        assert_eq!(k(r"\\?\C:\Work\Repo"), k(r"c:\work\repo"));
+        assert_eq!(k(r"\\?\UNC\Server\Share\x"), k(r"\\server\share\X"));
+        assert_eq!(k("C:/Work/Repo"), k(r"c:\work\repo"));
+        assert_ne!(
+            normalize_ownership_key("/Work/Repo", false),
+            normalize_ownership_key("/work/repo", false),
+            "POSIX paths stay case-sensitive"
+        );
     }
 
     /// M3: the strictest rule's set is seeded from the store before the first
@@ -2511,35 +2728,56 @@ mod tests {
     /// closest enclosing directory; disagreement or no session is unresolved.
     #[test]
     fn a_path_is_owned_by_the_session_working_closest_above_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(tmp.path()).unwrap();
+        for f in [
+            "root/wt-a/src/lib.rs",
+            "root/other/x",
+            "root/wt-ab/x",
+            "shared/x",
+            "plain/x",
+            "bad/x",
+            "elsewhere/x",
+        ] {
+            let p = w.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        let d = |rel: &str| w.join(rel).to_string_lossy().to_string();
         let a = Uuid::from_u128(0xa5).to_string();
         let b = Uuid::from_u128(0xb5).to_string();
+        let dirs = [d("root"), d("root/wt-a"), d("shared"), d("plain"), d("bad")];
         let sessions = [
-            ("/work/root", Some(b.as_str())),
-            ("/work/root/wt-a", Some(a.as_str())),
-            ("/work/shared", Some(a.as_str())),
-            ("/work/shared", Some(b.as_str())),
-            ("/work/plain", None),
-            ("/work/bad", Some("not-a-uuid")),
+            (dirs[0].as_str(), Some(b.as_str())),
+            (dirs[1].as_str(), Some(a.as_str())),
+            (dirs[2].as_str(), Some(a.as_str())),
+            (dirs[2].as_str(), Some(b.as_str())),
+            (dirs[3].as_str(), None),
+            (dirs[4].as_str(), Some("not-a-uuid")),
+            ("/no/such/session/dir", Some(a.as_str())),
         ];
-        let scope = |p: &str| scope_for_path(p, sessions.iter().copied());
+        let scope = |rel: &str| scope_for_path(&d(rel), sessions.iter().copied());
         assert_eq!(
-            scope("/work/root/wt-a/src/lib.rs"),
+            scope("root/wt-a/src/lib.rs"),
             SessionScope::Tenant(Uuid::from_u128(0xa5))
         );
         assert_eq!(
-            scope("/work/root/other/x"),
+            scope("root/other/x"),
             SessionScope::Tenant(Uuid::from_u128(0xb5))
         );
         assert_eq!(
-            scope("/work/root/wt-ab/x"),
+            scope("root/wt-ab/x"),
             SessionScope::Tenant(Uuid::from_u128(0xb5)),
             "component-wise"
         );
-        assert_eq!(scope("/work/shared/x"), SessionScope::Unresolved);
-        assert_eq!(scope("/work/plain/x"), SessionScope::DeviceDefault);
-        assert_eq!(scope("/work/bad/x"), SessionScope::Unresolved);
-        assert_eq!(scope("/elsewhere/x"), SessionScope::Unresolved);
-        assert_eq!(scope("relative/x"), SessionScope::Unresolved);
+        assert_eq!(scope("shared/x"), SessionScope::Unresolved);
+        assert_eq!(scope("plain/x"), SessionScope::DeviceDefault);
+        assert_eq!(scope("bad/x"), SessionScope::Unresolved);
+        assert_eq!(scope("elsewhere/x"), SessionScope::Unresolved);
+        assert_eq!(
+            scope_for_path("relative/x", sessions.iter().copied()),
+            SessionScope::Unresolved
+        );
     }
 
     /// Re-review 9: the transcript and code-mirror paths that know their
