@@ -18006,7 +18006,10 @@ mod coord_mcp_body_gate_tests {
             "coord_attest_advisory_ci_override",
             "coord_set_pr_draft",
         ] {
-            assert!(!coord_mcp_tool_is_allowed(tool), "{tool} must stay withheld");
+            assert!(
+                !coord_mcp_tool_is_allowed(tool),
+                "{tool} must stay withheld"
+            );
             assert!(
                 coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must be recorded as a deliberate exclusion, not drift"
