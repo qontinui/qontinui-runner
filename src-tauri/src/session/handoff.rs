@@ -2854,6 +2854,218 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Entry-point-only arming tests. Each one enters ONLY through its
+    // population's entry point (`run_catchup` / `handle_push_frame`): state is
+    // seeded by building `MaterializedSources` as a struct literal (no method of
+    // it is called), and every assertion reads the fake coord's requests — a
+    // second call of the same entry point that sends no further POST is what
+    // "settled" means. Neither these tests nor the helpers below name any other
+    // function this change touched, so they observe the change from outside.
+    // -----------------------------------------------------------------------
+
+    /// A fake coord answering each request with the next scripted
+    /// `(status, body)` (the last repeats), recording into an `RwLock` — so
+    /// reading what it saw needs no `Mutex` guard at all.
+    async fn spawn_rw_fake_coord(
+        script: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<std::sync::RwLock<Vec<RecordedRequest>>>) {
+        use axum::{body::Bytes, http::HeaderMap, http::Method, http::Uri};
+        assert!(!script.is_empty());
+        let seen: Arc<std::sync::RwLock<Vec<RecordedRequest>>> = Arc::default();
+        let rec = seen.clone();
+        let script = Arc::new(script);
+        let app = axum::Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, bytes: Bytes| {
+                let rec = rec.clone();
+                let script = script.clone();
+                async move {
+                    let n = {
+                        let mut rec = rec.write().unwrap();
+                        rec.push(RecordedRequest {
+                            method: method.to_string(),
+                            path: uri.path().to_string(),
+                            auth: headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                            body: String::from_utf8_lossy(&bytes).into_owned(),
+                        });
+                        rec.len() - 1
+                    };
+                    let (status, body) = script[n.min(script.len() - 1)];
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Pair this (isolated) device with ONE tenant and store that tenant's
+    /// device JWT in its slot; returns the tenant and the JWT a close under
+    /// `TenantScope::Owned(tenant)` must present as its bearer.
+    fn pair_one_tenant_slot(amb: &crate::test_env::IsolatedAmbient) -> (Uuid, String) {
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let tenant_id = Uuid::now_v7();
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({
+                "default_tenant_id": tenant_id,
+                "bindings": [{ "tenant_id": tenant_id }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let jwt = device_jwt_for(&tenant_id);
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&tenant_id, &jwt)
+            .expect("the tenant's slot");
+        (tenant_id, jwt)
+    }
+
+    /// The requests the fake coord saw that are closes of `source`.
+    fn handoff_complete_posts(seen: &[RecordedRequest], source: Uuid) -> Vec<RecordedRequest> {
+        let path = format!("/sessions/{source}/handoff/complete");
+        seen.iter()
+            .filter(|r| r.method == "POST" && r.path == path)
+            .cloned()
+            .collect()
+    }
+
+    /// `run_catchup` ALONE: one source this process started a child for, its
+    /// close pending and due now (seeded as a literal). Coord answers the
+    /// pending-list GET 500 and the close 200 `closed:true` — the pass still
+    /// POSTs the close exactly once, with the source tenant's bearer and an
+    /// empty JSON body; a second pass sends no further POST (settled). Fails if
+    /// `run_catchup` stops ending with its retry pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_catchup_alone_retries_a_pending_close_and_settles_it() {
+        let amb = crate::test_env::isolated_ambient();
+        let (tenant_id, jwt) = pair_one_tenant_slot(&amb);
+        let (base, seen) = spawn_rw_fake_coord(vec![
+            (500, r#"{"error":"boom"}"#),
+            (200, r#"{"closed":true,"already_closed":false}"#),
+            (500, r#"{"error":"boom"}"#),
+        ])
+        .await;
+        let (registry, store, _dir) = inert_registry(&base);
+        let source = Uuid::new_v4();
+        let sources = MaterializedSources(Mutex::new(HashMap::from([(
+            source,
+            MaterializedSource {
+                tenant: TenantScope::Owned(tenant_id),
+                close: CloseState::Pending {
+                    failures: 0,
+                    next_at: Instant::now(),
+                    first_failure_at: None,
+                },
+            },
+        )])));
+        let http = reqwest::Client::new();
+        let device = Uuid::new_v4();
+
+        run_catchup(&registry, &store, &http, &base, device, &sources).await;
+
+        let first = seen.read().unwrap().clone();
+        let posts = handoff_complete_posts(&first, source);
+        assert_eq!(posts.len(), 1, "exactly one close POST: {first:?}");
+        assert_eq!(
+            posts[0].auth,
+            Some(format!("Bearer {jwt}")),
+            "the source tenant's slot"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&posts[0].body).unwrap(),
+            json!({}),
+            "an empty JSON body"
+        );
+        assert_eq!(
+            (first[0].method.as_str(), first[0].path.as_str()),
+            ("GET", "/sessions/handoff-requests"),
+            "the pending-list GET ran first (and failed): {first:?}"
+        );
+        assert!(first.iter().all(|r| r.method != "DELETE"), "{first:?}");
+
+        run_catchup(&registry, &store, &http, &base, device, &sources).await;
+
+        let second = seen.read().unwrap().clone();
+        assert_eq!(
+            handoff_complete_posts(&second, source).len(),
+            1,
+            "a settled close is never re-sent: {second:?}"
+        );
+        assert_eq!(
+            second.len(),
+            first.len() + 1,
+            "the second pass sent only its pending-list GET: {second:?}"
+        );
+    }
+
+    /// `handle_push_frame` ALONE: one source whose close was refused
+    /// `403 not_handoff_target` (revivable; seeded as a literal). A FRESH
+    /// `handoff_request` frame for it addressed to this device revives the
+    /// close — exactly one POST, with the source tenant's bearer, and no child
+    /// started. The same frame again, once coord answered 200, sends no POST
+    /// (settled). Fails if `handle_push_frame` stops reviving on a fresh request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_frame_alone_revives_a_refused_close_and_settles_it() {
+        let amb = crate::test_env::isolated_ambient();
+        let (tenant_id, jwt) = pair_one_tenant_slot(&amb);
+        let (base, seen) =
+            spawn_rw_fake_coord(vec![(200, r#"{"closed":true,"already_closed":false}"#)]).await;
+        let (registry, store, _dir) = inert_registry(&base);
+        let (device, source) = (Uuid::new_v4(), Uuid::new_v4());
+        let sources = MaterializedSources(Mutex::new(HashMap::from([(
+            source,
+            MaterializedSource {
+                tenant: TenantScope::Owned(tenant_id),
+                close: CloseState::Refused { revivable: true },
+            },
+        )])));
+        let http = reqwest::Client::new();
+        let frame = ws_envelope(
+            &format!("qontinui.sessions.{tenant_id}.{device}.handoff_request"),
+            handoff_payload(source, device, tenant_id, "terminal_shell"),
+        );
+
+        handle_push_frame(&registry, &store, &http, &base, device, &sources, &frame).await;
+
+        let first = seen.read().unwrap().clone();
+        assert_eq!(first.len(), 1, "exactly one request, the close: {first:?}");
+        let posts = handoff_complete_posts(&first, source);
+        assert_eq!(posts.len(), 1, "{first:?}");
+        assert_eq!(posts[0].auth, Some(format!("Bearer {jwt}")));
+        assert!(
+            registry.snapshot().is_empty(),
+            "a revived close never starts a second child"
+        );
+
+        handle_push_frame(&registry, &store, &http, &base, device, &sources, &frame).await;
+
+        let second = seen.read().unwrap().clone();
+        assert_eq!(
+            second.len(),
+            1,
+            "a closed source sends nothing on a repeat frame: {second:?}"
+        );
+        assert!(registry.snapshot().is_empty(), "still no child");
+    }
+
     /// One retry pass sends at most `CLOSE_RETRY_PASS_CAP` closes, most overdue
     /// first; the rest stay due and the next pass sends them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
