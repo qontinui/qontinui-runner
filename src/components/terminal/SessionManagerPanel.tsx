@@ -6,6 +6,7 @@ import { SessionCard } from "./SessionCard";
 import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import { PastSessionsView } from "./PastSessionsView";
 import { FleetSessionPicker } from "./FleetSessionPicker";
+import { isRowOnScreen } from "./sessionManagerLiveRows";
 import type { PastSession } from "./usePastSessions";
 import type {
   UseSessionManagerReturn,
@@ -35,6 +36,13 @@ interface SessionManagerPanelProps {
    * copying the command.
    */
   onResumePastSession?: (session: PastSession) => void;
+  /**
+   * tmux work mode's shown tab (`useZoneLayout().shownTabId`); `null` in grid
+   * mode. The row whose `zoneTabId` it names is marked "on screen" — in tmux
+   * mode this panel is the navigator, so the operator must be able to tell the
+   * shown session from the hidden ones at a glance.
+   */
+  onScreenTabId?: string | null;
 }
 
 /** Human-readable status group labels. */
@@ -109,6 +117,7 @@ export function SessionManagerPanel({
   sessionConflictCounts,
   sessionLockStates,
   onResumePastSession,
+  onScreenTabId = null,
 }: SessionManagerPanelProps) {
   const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
@@ -330,6 +339,7 @@ export function SessionManagerPanel({
                   onSetLabel={setSessionLabel}
                   onAfterPromote={refresh}
                   onOpenWorktrees={setWorktreeFocus}
+                  isOnScreen={isRowOnScreen(session, onScreenTabId)}
                 />
               ))}
             </div>
