@@ -1744,6 +1744,21 @@ fn resolve_resume_account_in(
             .filter(|v| !v.is_empty())
             .map(str::to_string)
     };
+    // An id that is not a plain token is never looked up or spliced into a
+    // path: the account then comes from the caller / ambient default alone.
+    if !crate::agent_worktree::custody::is_shell_safe_token(claude_session_id) {
+        let (resume_config_dir, _) = crate::session::past_sessions::resolve_resume_config_dir_in(
+            nonblank(config_dir).as_deref(),
+            None,
+            claude_session_id,
+            &[],
+            ambient,
+        );
+        return ResumeAccount {
+            resume_config_dir,
+            transcript_exists: false,
+        };
+    }
     let rec = store.get(claude_session_id);
     let config_dir = nonblank(config_dir)
         .or_else(|| rec.as_ref().and_then(|r| nonblank(r.config_dir.as_deref())));

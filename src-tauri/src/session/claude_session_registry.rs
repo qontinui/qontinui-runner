@@ -130,10 +130,10 @@ pub struct LiveClaudeSession {
     pub kind: String,
     pub started_at: i64,
     pub updated_at: i64,
-    /// Ready-to-run: `cd '<dir>' && <resume>` (`;` on Windows), where
-    /// `<resume>` names the account dir explicitly
-    /// (`super::past_sessions::account_resume_command`). Empty when the id is
-    /// not a shell-safe token.
+    /// Ready-to-run in the runner pane's shell: `cd '<dir>' && <resume>`
+    /// (PowerShell `;` form on Windows), where `<resume>` names the account
+    /// dir explicitly (`super::past_sessions::account_resume_command`). Empty
+    /// when the id or the dir cannot be rendered safely.
     ///
     /// The `cd` is **not** cosmetic — Claude Code scopes sessions by project
     /// directory, so resuming from the wrong cwd does not find the session.
@@ -182,9 +182,9 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
         return None;
     }
     let account = account_from_config_dir(config_dir.to_str());
-    // Normalize separators so the emitted `cd` works verbatim in both shells
-    // the line targets (PowerShell on a Windows runner, POSIX elsewhere; Git
-    // Bash also accepts the Windows form's `;` join and forward slashes).
+    // Normalize separators so the emitted `cd` works verbatim in the shell the
+    // line targets: the runner pane's — PowerShell on a Windows runner (a
+    // Windows line is PowerShell-only), POSIX elsewhere.
     let working_dir = raw.cwd.unwrap_or_default().replace('\\', "/");
     // The account DIR is named explicitly (`account_resume_command`), so the
     // line resumes under THIS registry file's account even when pasted into a
@@ -194,7 +194,7 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     let resume_command = match account_resume_command(config_dir.to_str(), &raw.session_id) {
         None => String::new(),
         Some(resume) if working_dir.is_empty() => resume,
-        Some(resume) => cd_then_resume(&working_dir, &resume, cfg!(windows)),
+        Some(resume) => cd_then_resume(&working_dir, &resume, cfg!(windows)).unwrap_or_default(),
     };
     Some(LiveClaudeSession {
         session_id: raw.session_id,
@@ -384,6 +384,7 @@ mod tests {
                 .unwrap(),
                 cfg!(windows)
             )
+            .unwrap()
         );
         assert!(s
             .resume_command
@@ -561,6 +562,7 @@ mod tests {
                 &account_resume_command(Some(".claude-gmail"), "s").unwrap(),
                 cfg!(windows)
             )
+            .unwrap()
         );
     }
 
@@ -607,9 +609,9 @@ mod tests {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n","cwd":"/w"}"#;
         let s = parse_registry_file(json, Path::new("/home/u/.claude")).unwrap();
         let expected = if cfg!(windows) {
-            "cd '/w'; $env:CLAUDE_CONFIG_DIR=\"/home/u/.claude\"; claude --resume abc"
+            "cd '/w'; $env:CLAUDE_CONFIG_DIR=\"/home/u/.claude\"; claude --permission-mode bypassPermissions --resume abc"
         } else {
-            "cd '/w' && CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume abc"
+            "cd '/w' && CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --permission-mode bypassPermissions --resume abc"
         };
         assert_eq!(s.resume_command, expected);
     }

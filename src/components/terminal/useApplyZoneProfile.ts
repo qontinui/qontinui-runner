@@ -87,8 +87,7 @@ export function useApplyZoneProfile(
 
   return useCallback(async (profile: ZoneProfile) => {
     const {
-      deps: { createAndAssignTerminal, resolveTenantForSpawn },
-      tabs: liveTabs,
+      deps: { resolveTenantForSpawn },
       zoneLayout: zl,
       labelsAndTags: lt,
       transitionEffects: te,
@@ -125,16 +124,22 @@ export function useApplyZoneProfile(
     // auto-filled into ANOTHER session's zone before its explicit placement
     // lands, and a session parked earlier would have its resume typed into it
     // — then the pane's own session typed on top, into a live Claude.
+    // The tab list as it stands NOW, after the await — not the one captured
+    // when the apply began: a tab closed meanwhile must not be reused (its
+    // session would park bound to a dead tab and never resume).
     for (const step of planProfileTabs(
       sessions,
-      liveTabs.map((t) => t.id),
+      latest.current.tabs.map((t) => t.id),
     )) {
       let tabId: string | null | undefined = step.reuseTabId;
       if (!tabId) {
         // A new pane spawned NOW (not a restored session carrying a stored
         // tenant), so it records the current acting tenant like any other
         // new spawn.
-        tabId = await createAndAssignTerminal(
+        // The CURRENT closure (refreshed every render), not the one captured
+        // before the profile's layout was set: its grow-only layout decision
+        // reads the live layout, zones and tab count.
+        tabId = await latest.current.deps.createAndAssignTerminal(
           undefined,
           undefined,
           resolveTenantForSpawn(),

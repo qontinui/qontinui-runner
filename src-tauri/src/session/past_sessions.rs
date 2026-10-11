@@ -333,17 +333,27 @@ pub(crate) fn resolve_resume_config_dir(
 /// Syntax is the HOST shell's — the shell the runner's own panes run, the
 /// same target `buildResumeCmd` uses for the typed resume: PowerShell's
 /// `$env:CLAUDE_CONFIG_DIR="<dir>"; …` on Windows, a POSIX `VAR="<dir>" …`
-/// prefix elsewhere ([`resume_line_for`]). Backslashes are written as forward
-/// slashes (both shells accept them).
+/// prefix elsewhere ([`resume_line_for`]). **A Windows line is PowerShell-only:**
+/// pasted into Git Bash, `$env:` expands to nothing and the account is lost.
+/// Backslashes are written as forward slashes (both shells accept them).
+///
+/// The resume is autonomous (`--permission-mode bypassPermissions`), like every
+/// typed resume (`buildResumeCmd`) and the roster wrappers these lines replace:
+/// they exist to bring sessions back unattended after a runner rebuild.
 ///
 /// `None` when the id is not a shell-safe token — no line beats a broken one,
 /// the same rule `session_ledger` / `on_demand` follow. A dir that cannot be
 /// quoted safely (including `!`, which bash history-expands inside double
-/// quotes on paste), or no dir at all, yields the bare form: there is no
+/// quotes on paste, and the typographic quotes PowerShell also ends a
+/// double-quoted string at), or no dir at all, yields the bare form: there is no
 /// account that can be named.
 pub(crate) fn account_resume_command(config_dir: Option<&str>, session_id: &str) -> Option<String> {
     resume_line_for(config_dir, session_id, cfg!(windows))
 }
+
+/// The autonomous resume every paste line runs — the same flags the typed
+/// resume (`buildResumeCmd`) uses.
+const RESUME_PROGRAM: &str = "claude --permission-mode bypassPermissions --resume";
 
 /// [`account_resume_command`] with the host shell explicit, so both syntaxes
 /// are unit-tested on every OS.
@@ -354,28 +364,39 @@ fn resume_line_for(config_dir: Option<&str>, session_id: &str, windows: bool) ->
     let dir = config_dir
         .filter(|d| !d.trim().is_empty())
         .map(|d| d.trim().replace('\\', "/"))
-        .filter(|d| !d.contains('!'))
+        .filter(|d| {
+            !d.contains([
+                '!', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{201E}',
+            ])
+        })
         .as_deref()
         .and_then(crate::agent_worktree::custody::shell_quote_path);
     Some(match dir {
         Some(dir) if windows => {
-            format!("$env:CLAUDE_CONFIG_DIR=\"{dir}\"; claude --resume {session_id}")
+            format!("$env:CLAUDE_CONFIG_DIR=\"{dir}\"; {RESUME_PROGRAM} {session_id}")
         }
-        Some(dir) => format!("CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {session_id}"),
-        None => format!("claude --resume {session_id}"),
+        Some(dir) => format!("CLAUDE_CONFIG_DIR=\"{dir}\" {RESUME_PROGRAM} {session_id}"),
+        None => format!("{RESUME_PROGRAM} {session_id}"),
     })
 }
 
 /// Join a `cd` into the session's project dir with its resume line, in the
 /// host shell's syntax: `&&` (skip the resume when the `cd` fails) on POSIX,
 /// `;` on Windows, whose runner panes are Windows PowerShell 5.1 — which has
-/// no `&&` at all. `;` also runs in Git Bash.
-pub(crate) fn cd_then_resume(working_dir: &str, resume: &str, windows: bool) -> String {
-    if windows {
+/// no `&&` at all.
+///
+/// `None` when the dir cannot sit inside single quotes safely (a `'` would
+/// close them and run the rest of the name as commands; a control character
+/// would end the line) — no line beats a broken one.
+pub(crate) fn cd_then_resume(working_dir: &str, resume: &str, windows: bool) -> Option<String> {
+    if working_dir.contains('\'') || working_dir.chars().any(char::is_control) {
+        return None;
+    }
+    Some(if windows {
         format!("cd '{working_dir}'; {resume}")
     } else {
         format!("cd '{working_dir}' && {resume}")
-    }
+    })
 }
 
 /// Format a unix-millis timestamp into a short human date for the `"Session
@@ -795,28 +816,32 @@ mod tests {
     fn resume_line_names_the_default_account_explicitly() {
         assert_eq!(
             resume_line_for(Some("/home/u/.claude"), "s1", false).as_deref(),
-            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --resume s1")
+            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude\" claude --permission-mode bypassPermissions --resume s1")
         );
         assert_eq!(
             resume_line_for(Some("C:\\Users\\u\\.claude"), "s1", true).as_deref(),
-            Some("$env:CLAUDE_CONFIG_DIR=\"C:/Users/u/.claude\"; claude --resume s1"),
+            Some("$env:CLAUDE_CONFIG_DIR=\"C:/Users/u/.claude\"; claude --permission-mode bypassPermissions --resume s1"),
             "a Windows runner's panes are PowerShell; backslashes become forward slashes"
         );
         assert_eq!(
             resume_line_for(Some("/home/u/.claude-gmail"), "s1", false).as_deref(),
-            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude-gmail\" claude --resume s1"),
+            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude-gmail\" claude --permission-mode bypassPermissions --resume s1"),
             "a roster-suffixed dir is named, not mapped to a wrapper pinning another dir"
         );
         for windows in [false, true] {
             // Nothing nameable → the bare form (no account to name).
             assert_eq!(
                 resume_line_for(None, "s1", windows).as_deref(),
-                Some("claude --resume s1")
+                Some("claude --permission-mode bypassPermissions --resume s1")
             );
-            for unquotable in ["/x/$(rm)/.claude", "/x/a!b/.claude"] {
+            for unquotable in [
+                "/x/$(rm)/.claude",
+                "/x/a!b/.claude",
+                "/x/a\u{201D}b/.claude",
+            ] {
                 assert_eq!(
                     resume_line_for(Some(unquotable), "s1", windows).as_deref(),
-                    Some("claude --resume s1"),
+                    Some("claude --permission-mode bypassPermissions --resume s1"),
                     "an unquotable dir is never spliced into a shell line: {unquotable}"
                 );
             }
@@ -831,8 +856,22 @@ mod tests {
             account_resume_command(Some("/home/u/.claude"), "s1"),
             resume_line_for(Some("/home/u/.claude"), "s1", cfg!(windows))
         );
-        assert_eq!(cd_then_resume("/w", "R", false), "cd '/w' && R");
-        assert_eq!(cd_then_resume("/w", "R", true), "cd '/w'; R");
+        assert_eq!(
+            cd_then_resume("/w", "R", false).as_deref(),
+            Some("cd '/w' && R")
+        );
+        assert_eq!(
+            cd_then_resume("/w", "R", true).as_deref(),
+            Some("cd '/w'; R")
+        );
+        for windows in [false, true] {
+            assert_eq!(
+                cd_then_resume("/x'; rm -rf ~; '", "R", windows),
+                None,
+                "a quote in the project dir must not break out of the cd"
+            );
+            assert_eq!(cd_then_resume("/x\ny", "R", windows), None);
+        }
     }
 
     /// End to end over the resolver: a `configDir: null` record whose
@@ -857,7 +896,7 @@ mod tests {
         assert_eq!(
             line,
             Some(format!(
-                "CLAUDE_CONFIG_DIR=\"{}\" claude --resume sess-null",
+                "CLAUDE_CONFIG_DIR=\"{}\" claude --permission-mode bypassPermissions --resume sess-null",
                 default.to_string_lossy().replace('\\', "/")
             ))
         );
