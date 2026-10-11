@@ -1822,9 +1822,6 @@ impl TerminalSession {
             caller_pinned_config_dir,
         );
 
-        // Spawn the child process. `seal` is the type-level half of the
-        // credential-scrub obligation (see `pane_io`); `finalize_child_env`
-        // above already ran the same scrub as the production env tail.
         // Whether the PTY child IS an AI CLI (a direct exec of `claude` /
         // `codex`, by its argv head's profile), and whether it resumes an
         // existing session — captured before the command is sealed. Only then
@@ -1842,6 +1839,9 @@ impl TerminalSession {
                 resumed: qontinui_runner_lib::cli_profile::resumes_existing_session(profile, &args),
             }
         });
+        // Spawn the child process. `seal` is the type-level half of the
+        // credential-scrub obligation (see `pane_io`); `finalize_child_env`
+        // above already ran the same scrub as the production env tail.
         let sealed = ScrubbedCommand::seal(cmd);
         let io: Arc<dyn PaneIo> = match opened {
             Some(opened) => Arc::new(opened.spawn(sealed)?),
