@@ -2614,6 +2614,13 @@ async fn health(
         // only populates where the fleet resource sample publishes, and `null`
         // there means the 256/400 floor by design, not a fault.
         "threadCeilings": crate::resource_guard::thread_ceilings_health_json(),
+        // Plan 2026-10-03-retire-the-continuation-session-cap-and-let-the-
+        // queue-pre-check-read-both-resource-lanes, Phase 3: what unattended
+        // admission (gate continuations, coord launches) would decide RIGHT
+        // NOW — the memory and thread lanes' readings, limits and verdicts, and
+        // the deferral stamp the pre-check would write. Read through the same
+        // `resource_guard::lane_verdicts` the gate uses. There is no count cap.
+        "spawnAdmission": crate::agent_runtime::spawn_admission_health_json(),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was

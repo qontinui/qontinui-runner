@@ -411,10 +411,12 @@ pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 /// to [`PER_SESSION_THREADS_FALLBACK`], where it LOSES to the family count,
 /// because there it is a multiplier and the larger number would loosen.
 ///
-/// **3, from the control's own documentation**, not from the thread-name census.
-/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc derives
-/// "roughly 3 OS threads per continuation session" from the 2026-08-29 wedge's
-/// own arithmetic (540 threads at ~130 sessions over a 150-151 idle baseline).
+/// **3, from the 2026-08-29 wedge's own arithmetic**, not from the thread-name
+/// census: 540 threads at ~130 continuation sessions over a 150-151 idle
+/// baseline is roughly 3 OS threads per session. (That derivation used to live
+/// on `agent_runtime`'s `DEFAULT_CONTINUATION_SESSION_CAP`, a fixed count cap
+/// retired on 2026-10-03; it is kept here, beside the one constant that still
+/// consumes it.)
 /// The 2026-09-18 census finds only 2 NAMED per-session threads
 /// (`terminal-waiter`, `terminal-reader`) but also shows per-session
 /// `pipe-drain` and `transcript-scan`, so 2 is a floor and 3 is the measured
@@ -868,8 +870,8 @@ pub(crate) fn at_rest_thread_baseline() -> Option<usize> {
 /// A thread ceiling is a HEADROOM figure wearing an absolute number's clothes.
 /// 256 and 400 mean "105 and 249 threads of room above a runner that idles at
 /// 151" — that is how [`THREAD_CEILING_MIN`]'s doc derives them and how
-/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc converts
-/// them to ~35 and ~83 sessions on the calibration box. Enforced as absolutes on a machine whose idle
+/// [`THREADS_PER_SESSION`] converts them to ~35 and ~83 sessions on the
+/// calibration box. Enforced as absolutes on a machine whose idle
 /// floor is 400, they are not a stricter guard: they are a LATCH. Every
 /// continuation is deferred, the deferral frees ~3 threads against a floor of
 /// ~400, and so the deferral cannot clear the condition that caused it.
@@ -938,7 +940,7 @@ impl LaneMetric {
     /// CRITICAL refusal wire ([`CRITICAL_REFUSAL_PREFIX`], parsed by
     /// `src/lib/resourceGuard.ts`). Snake case to match the Rust field names it
     /// stands in for; the webview only ever compares it, never renders it.
-    fn wire_name(self) -> &'static str {
+    pub(crate) fn wire_name(self) -> &'static str {
         match self {
             LaneMetric::FreeCommitBytes => "free_commit_bytes",
             LaneMetric::ThreadCount => "thread_count",
@@ -2307,8 +2309,9 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
     )
 }
 
-/// The thread lane's live verdict, folded and evaluated. Shared by
-/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+/// The thread lane's live reading, ceilings and verdict. [`lane_verdicts`] is its
+/// only caller, so the gate ([`probe_for_spawn`]) and the `/health` report can
+/// never drift.
 ///
 /// **The single call site of
 /// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
@@ -2326,11 +2329,17 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
 /// honest. `evaluate_threads` and the ceilings it compares against are
 /// untouched; the `GateObservation.observed` every refusal quotes is the
 /// graded number, and [`note_graded_trip`] logs the raw one beside it.
-fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
+fn thread_lane_verdict(local: &SessionGuardSettings) -> ThreadLane {
     let census = crate::health_monitor::thread_name_census_memoized();
     let ceilings = effective_thread_ceilings_given(local, census.as_ref()).ceilings;
+    let lane = |graded: Option<usize>, verdict: SpawnGate| ThreadLane {
+        graded,
+        warn_ceiling: ceilings.warn,
+        critical_ceiling: ceilings.critical,
+        verdict,
+    };
     let Some(total) = crate::health_monitor::thread_count_reading_memoized() else {
-        return evaluate_threads(None, local.enabled, ceilings);
+        return lane(None, evaluate_threads(None, local.enabled, ceilings));
     };
     let reading = graded_thread_reading(
         total,
@@ -2341,40 +2350,86 @@ fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     );
     let verdict = evaluate_threads(Some(reading.graded), local.enabled, ceilings);
     note_graded_trip(&verdict, &reading);
-    verdict
+    lane(Some(reading.graded), verdict)
 }
 
-/// The thread lane's verdict on its own, live — **the entry point for callers
-/// that are not a spawn.**
+/// What [`thread_lane_verdict`] read and decided.
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadLane {
+    /// The GRADED thread count (raw minus the idle blocking pool). `None` when
+    /// the OS thread table could not be read — UNKNOWN, never zero.
+    pub(crate) graded: Option<usize>,
+    /// The effective ceilings the reading was judged against.
+    pub(crate) warn_ceiling: usize,
+    pub(crate) critical_ceiling: usize,
+    pub(crate) verdict: SpawnGate,
+}
+
+/// Both lanes' readings and verdicts, taken ONCE — see [`lane_verdicts`].
+#[derive(Debug, Clone)]
+pub(crate) struct LaneVerdicts {
+    /// The memory lane the reading came from ([`Lane::as_str`]).
+    pub(crate) memory_lane: &'static str,
+    /// Free commit as read (`MemAvailable` off Windows). `None` is UNKNOWN.
+    pub(crate) free_commit_bytes: Option<u64>,
+    /// Free physical memory as read. Reported, never judged.
+    pub(crate) free_phys_bytes: Option<u64>,
+    /// The effective floors the commit reading was judged against.
+    pub(crate) warn_free_commit_bytes: u64,
+    pub(crate) critical_free_commit_bytes: u64,
+    /// The memory lane's verdict.
+    pub(crate) memory: SpawnGate,
+    /// The thread lane's graded reading, ceilings and verdict.
+    pub(crate) threads: ThreadLane,
+}
+
+/// Both lanes' readings and verdicts, read ONCE — the one place the live
+/// readings are taken, so [`probe_for_spawn`] (the gate) and the `/health`
+/// `spawnAdmission` block (the report) can never compute different verdicts
+/// from different reads.
 ///
-/// Phase 1 of `2026-08-30-load-aware-spawn-admission-control` calls this from
-/// `agent_runtime::evaluate_continuation_guard`, and it needs a DIFFERENT
-/// threshold from the one [`admit_spawn`] enforces. The asymmetry is deliberate
-/// and belongs to the caller, which is why this returns the whole
-/// [`SpawnGate`] rather than a bool:
+/// `None` when the session guard is disabled: no reading is taken at all, which
+/// is the cost argument [`probe_for_spawn`]'s doc makes.
 ///
-/// - A **gate continuation** may defer at [`SpawnGate::Warn`]. It can wait and
-///   be re-delivered, nobody is sitting in front of it, and back-pressure that
-///   arrives early is the entire point of a queue — so the cheap verdict is the
-///   right one to act on.
-/// - An **operator's own spawn** is refused only at [`SpawnGate::Critical`], and
-///   even then overridably ([`admit_spawn`]). Refusing a human's terminal on a
-///   soft signal is the false positive this module's doctrine ranks worst.
-///
-/// So: match on the verdict, act at the severity your caller's cost of waiting
-/// justifies. Do not invent a second set of thresholds — the numbers are folded
-/// once, from settings and the fleet, by [`effective_thread_ceilings`].
-///
-/// Short-circuits on a disabled guard before touching the sensor, exactly as
-/// [`probe_for_spawn`] does: a machine owner who turned the guard off pays
-/// nothing.
-pub(crate) fn thread_pressure() -> SpawnGate {
+/// **Logs nothing on its own** apart from what the two lane folds already log on
+/// a transition, so a polled route can call it freely; the shadowed-lane `warn!`
+/// belongs to the gate, not to a read.
+pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
     let local = crate::settings::get_session_guard_settings();
     if !local.enabled {
-        return SpawnGate::Proceed;
+        return None;
     }
-    thread_lane_verdict(&local)
+    // The reading carries free PHYSICAL alongside free commit — one
+    // `GlobalMemoryStatusEx` fills both, so the second figure costs nothing.
+    // Phase 1 of plan `2026-08-08-memory-floors-watch-commit-and-physical` is
+    // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
+    // commit figure and only the commit figure. Phase 2 is what gives the
+    // physical reading a floor of its own; do not add one here.
+    let (lane, free_commit_bytes, free_phys_bytes) =
+        crate::fleet::resource_sample::spawn_gate_reading();
+    let floors = effective_session_floors(&local, lane);
+    let memory = evaluate(lane, free_commit_bytes, &floors);
+    let threads = thread_lane_verdict(&local);
+    Some(LaneVerdicts {
+        memory_lane: lane,
+        free_commit_bytes,
+        free_phys_bytes,
+        warn_free_commit_bytes: floors.warn_free_commit_bytes,
+        critical_free_commit_bytes: floors.critical_free_commit_bytes,
+        memory,
+        threads,
+    })
 }
+
+/// The composed (heavier-lane) verdict of a [`LaneVerdicts`], without the
+/// shadowed-lane log [`probe_for_spawn`] writes. For a report, not a gate.
+pub(crate) fn composed_verdict(lanes: &LaneVerdicts) -> SpawnGate {
+    compose_lanes(lanes.memory.clone(), lanes.threads.verdict.clone()).0
+}
+
+/// The shadowed (lane, severity) [`probe_for_spawn`] last logged, so its line is
+/// written on a TRANSITION rather than on every call.
+static LAST_SHADOWED_LANE: Mutex<Option<(LaneMetric, &'static str)>> = Mutex::new(None);
 
 /// Live verdict: read the limits, take one reading per lane, evaluate both,
 /// report the heavier.
@@ -2410,23 +2465,10 @@ pub(crate) fn thread_pressure() -> SpawnGate {
 /// The fleet terms are folded in AFTER the readings, because the lane to look
 /// the memory floors up under comes from the reading itself.
 pub(crate) fn probe_for_spawn() -> SpawnGate {
-    let local = crate::settings::get_session_guard_settings();
-    if !local.enabled {
+    let Some(lanes) = lane_verdicts() else {
         return SpawnGate::Proceed;
-    }
-    // The reading now carries free PHYSICAL alongside free commit — one
-    // `GlobalMemoryStatusEx` fills both, so the second figure costs nothing.
-    // Phase 1 of plan `2026-08-08-memory-floors-watch-commit-and-physical` is
-    // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
-    // commit figure and only the commit figure. Phase 2 is what gives the
-    // physical reading a floor of its own; do not add one here.
-    let (lane, free_commit_bytes, _free_phys_bytes) =
-        crate::fleet::resource_sample::spawn_gate_reading();
-    let floors = effective_session_floors(&local, lane);
-    let memory = evaluate(lane, free_commit_bytes, &floors);
-    let threads = thread_lane_verdict(&local);
-
-    let (reported, shadowed) = compose_lanes(memory, threads);
+    };
+    let (reported, shadowed) = compose_lanes(lanes.memory, lanes.threads.verdict);
     // The lane that tripped but lost the report. Logged so the operator's log
     // says both, even though the toast or the refusal can only say one. The
     // severity word comes from the shadowed verdict itself, not from the
@@ -2435,7 +2477,27 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
     // operator stop trusting the line. Read through `tripped()` so a `Proceed`
     // is a `None` rather than a panic arm: this runs immediately before a PTY
     // opens, and nothing on that path may be able to unwind.
-    if let Some((severity, obs)) = shadowed.as_ref().and_then(SpawnGate::tripped) {
+    //
+    // EDGE-TRIGGERED, like the graded trip line (`note_graded_trip`): the
+    // unattended pre-check now calls this once per pending continuation per
+    // poll, so a level-triggered line would write N copies per poll under a
+    // backlog with both lanes tripped. It is written when the shadowed
+    // (lane, severity) pair CHANGES, and not again until it does.
+    let shadow_key = shadowed
+        .as_ref()
+        .and_then(SpawnGate::tripped)
+        .map(|(severity, obs)| (obs.metric, severity));
+    let shadow_changed = {
+        let mut last = LAST_SHADOWED_LANE.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *last != shadow_key;
+        *last = shadow_key;
+        changed
+    };
+    if let Some((severity, obs)) = shadowed
+        .as_ref()
+        .and_then(SpawnGate::tripped)
+        .filter(|_| shadow_changed)
+    {
         warn!(
             lane = %obs.lane,
             metric = obs.metric.wire_name(),
