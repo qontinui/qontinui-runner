@@ -807,6 +807,11 @@ impl ExplorationTask {
     /// Waits for the executor's response so a failed transition is reported as a
     /// failure. The previous fire-and-forget `execute_transition` send had no Python
     /// handler at all, so every transition read as passed while doing nothing.
+    ///
+    /// Precondition: the transition runs on the UI Bridge runtime the executor
+    /// has LOADED (`load_state_machine`), which this task does not load itself.
+    /// With nothing loaded every transition fails ("No state machine loaded");
+    /// with a different machine loaded its ids do not match and fail too.
     async fn execute_transition(&self, transition_id: &str) -> Result<(), String> {
         let params = serde_json::json!({
             "transition_id": transition_id
