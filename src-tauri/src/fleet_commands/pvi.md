@@ -249,7 +249,7 @@ When the argument resolves to a prompt **file**, check both signals:
 
 1. **A resolution stamp in the prompt itself** — a `> **RESOLVED …**` or
    `> **SHIPPED …**` block under the H1 (convention:
-   `qontinui-dev-notes/prompts/README.md`). If present, the prompt says it is
+   the `prompts/README.md` beside your prompt files, where one exists). If present, the prompt says it is
    done; trust it and go to the disposition below.
 2. **A same-stem plan** — `<plans-dir>/<same basename>.md`. That match is
    **definitive**: it is the prompt's own resolution, not prior art. Read its
@@ -310,6 +310,9 @@ Invoke via the Skill tool: skill "create-plan", args "<the resolved
 $ARGUMENTS prompt text or path, verbatim>".
 
 Let it do its own research and write the plan file.
+Its Step 2b (read the fleet policy fresh, apply it, record `## Policy applied`
+in the plan) is mandatory and is not to be skipped or abbreviated for size; a plan
+returned without that section is not done.
 
 COMMIT THE PLAN YOURSELF, BEFORE YOU REPLY — and commit it in a worktree
 you allocate, never in the checkout you started in. You do not have a
@@ -321,8 +324,8 @@ worktree; get one first:
 Handle an `isolation.mode` of `wait` / `shared_branch` as that script
 documents, and only on HTTP 409 `repo_not_registered` or an unreachable
 coord fall back to `git -C <repo> worktree add -b <branch>
-<workspace-root>/<repo>-wt-<slug> origin/main` — saying in your reply that
-the worktree is undeclared.
+<runner-workspace-root>/<repo>-wt-<slug> origin/main` — saying in your reply that
+the worktree is undeclared. (`<runner-workspace-root>` is the runner's resolved workspace root: `data.resolved.workspace_root` from `GET http://127.0.0.1:9876/settings/paths`; when that is null or the runner does not answer, the parent directory of the repo's primary checkout (`dirname "$(dirname "$(git -C <repo> rev-parse --path-format=absolute --git-common-dir)")"`).)
 
 Do not return an uncommitted plan and leave the commit to me.
 `/create-plan` §5 already requires write -> commit -> push at creation,
@@ -429,14 +432,14 @@ only one of them means "rescue":
   PR check below.
 
 > **Why this is a checked fact and not advice.** Measured 2026-09-13 on
-> merytshost: three plan documents authored 2026-09-03 — 32 KB, 47 KB and 32 KB,
+> one development machine: three plan documents authored 2026-09-03 — 32 KB, 47 KB and 32 KB,
 > fully phased — existed on **no git ref at all**. In each case the branch AND
 > the worktree had been created *for that plan*, so the authoring session got as
 > far as naming its work and then never ran the commit; no PR was ever opened.
 > They survived only because a dossier sweep walked worktree state. Each was the
 > `/pvi` output of a *different* dossier, so one missed commit was silently
 > holding up three unrelated remediations. `dossier:stranded-plan-pr`
-> occurrences 7-9; recovered as `qontinui-dev-notes#1127`. The doctrine was
+> occurrences 7-9; recovered through a single plans-repository PR. The doctrine was
 > already written in `/create-plan` §5 and in this step — what was missing was
 > anything that **verified** it, which is why the instruction moved into the
 > subagent's reply contract. Committing is necessary, not sufficient: the plan
@@ -528,6 +531,7 @@ Combine, briefly (under 100 words plus whatever `/vet-imp` itself reports):
 - **Thin orchestrator only.** Never re-implement `/create-plan`, `/vet-plan`,
   or `/implement-plan` logic inline — call the skills, let each own its
   behavior and coord wiring.
+- **Policy is read before the plan is written.** `/create-plan` Step 2b owns it; this command's job is to refuse a plan that arrives without a `## Policy applied` section. The subagent has already returned and committed, so resume it with `SendMessage` (or spawn a fresh one) to add the section and push a follow-up commit on the same branch, and only then go to Step 3.
 - **Foreground the plan-writing agent.** Step 3 depends on its result; there
   is no independent work to overlap it with, so spawn it synchronously.
 - **One session, no stop between stages** — same as `/vet-imp` — except for
