@@ -441,6 +441,7 @@ export const ARG_FILL: Record<string, string | number> = {
   b: 2,
   target: "next",
   preset: "six-pack",
+  mode: "tmux",
   state: "idle",
   type: "progress",
   tag: "gmail",
