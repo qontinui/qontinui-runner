@@ -65,6 +65,7 @@ export function ZoneLabel({
   onTogglePrompts,
   promptsVisible,
   reviewSlot,
+  position,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -87,6 +88,12 @@ export function ZoneLabel({
   promptsVisible?: boolean;
   /** The review toggle + unread badge (`SessionReviewToggle`), beside the prompts toggle. */
   reviewSlot?: ReactNode;
+  /**
+   * tmux work mode: this session's 1-based place among the live sessions and
+   * their count, shown as `k / n` beside the name. Omitted in grid mode, where
+   * the zone itself is the position.
+   */
+  position?: { index: number; count: number };
 }) {
   const [showSelector, setShowSelector] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -154,7 +161,19 @@ export function ZoneLabel({
         }`}
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
-      <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{displayTitle}</span>
+      {/* `title` keeps the full name reachable when the header truncates it. */}
+      <span className="text-[10px] text-[#a9b1d6] truncate font-medium" title={displayTitle}>
+        {displayTitle}
+      </span>
+      {position && (
+        <span
+          className="text-[9px] text-[#565f89] font-mono shrink-0"
+          title={`${displayTitle} — session ${position.index} of ${position.count}`}
+          data-tmux-position={`${position.index}/${position.count}`}
+        >
+          {position.index} / {position.count}
+        </span>
+      )}
 
       {/* Honesty label (Phase 5): interactive PTY shells are non-durable — a
           runner restart ends them. Mirrors the compact-card marker so the
