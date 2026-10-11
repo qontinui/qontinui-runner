@@ -155,6 +155,43 @@ const noop = () => {};
 let container: HTMLDivElement;
 let root: Root;
 
+/** A grid layout preset of `columns` × 2 zones, as `useZoneLayout` serves it. */
+function gridLayout(columns: number) {
+  const zones = [];
+  for (let row = 1; row <= 2; row++) {
+    for (let col = 1; col <= columns; col++) zones.push({ col: String(col), row: String(row) });
+  }
+  return { id: `grid-${columns}x2`, name: "Grid", columns, rows: 2, zones };
+}
+
+/** Render the page's grid in grid work mode with `assignments` zoned. */
+function renderGridPage(
+  tabs: TerminalTab[],
+  layout: ReturnType<typeof gridLayout>,
+  assignments: Record<number, string>,
+) {
+  page.tabs = tabs;
+  page.zoneLayout = {
+    layout,
+    layoutId: layout.id,
+    assignments,
+    focusedZone: 0,
+    maximizedZone: null,
+    isMultiZone: true,
+    assignTabToZone: noop,
+    setFocusedZone: noop,
+    setMaximizedZone: noop,
+    revealRequest: null,
+    consumeReveal: noop,
+    workMode: "grid",
+    shownTabId: null,
+  };
+  const onZoneClick = () => {};
+  act(() => {
+    root.render(createElement(ZoneGrid, { onZoneClick, onZoneDoubleClick: noop, onExit: noop }));
+  });
+}
+
 /** Render the page's grid in tmux work mode with `shown` on screen. */
 function renderTmuxPage(tabs: TerminalTab[], shown: string) {
   page.tabs = tabs;
@@ -219,5 +256,67 @@ describe("ZoneGrid in tmux work mode", () => {
     expect([...rec.mounts].sort()).toEqual(["a", "b", "c"]);
     expect(rec.unmounts).toEqual([]);
     expect(rec.instances.get("b")).toBe(instanceOfB);
+  });
+});
+
+describe("ZoneGrid across grid ⇄ tmux switches", () => {
+  /** Every pane's instance, keyed by terminal id, as minted by its one mount. */
+  function snapshotInstances(): Map<string, object> {
+    return new Map(rec.instances);
+  }
+
+  function expectNoRemount(ids: string[], before: Map<string, object>) {
+    expect([...rec.mounts].sort()).toEqual([...ids].sort());
+    expect(rec.unmounts).toEqual([]);
+    for (const id of ids) expect(rec.instances.get(id)).toBe(before.get(id));
+  }
+
+  it("keeps every zoned terminal mounted on entering tmux and on leaving it", () => {
+    const tabs = [pty("a"), pty("b"), pty("c")];
+    // Three sessions zoned in a 2 × 2 grid, one zone empty.
+    renderGridPage(tabs, gridLayout(2), { 0: "a", 1: "b", 2: "c" });
+    expect([...rec.mounts].sort()).toEqual(["a", "b", "c"]);
+    expect(visiblePanes().sort()).toEqual(["a", "b", "c"]);
+    const before = snapshotInstances();
+
+    // Enter tmux on b (what `enterTmuxMode` commits: `single`, zone 0 = shown).
+    renderTmuxPage(tabs, "b");
+    expect(visiblePanes()).toEqual(["b"]);
+    expectNoRemount(["a", "b", "c"], before);
+
+    // A swap inside tmux, then back to the grid the operator left.
+    renderTmuxPage(tabs, "c");
+    renderGridPage(tabs, gridLayout(2), { 0: "a", 1: "b", 2: "c" });
+    expect(visiblePanes().sort()).toEqual(["a", "b", "c"]);
+    expectNoRemount(["a", "b", "c"], before);
+  });
+
+  it("keeps an unzoned grid tab mounted when tmux parks it, and when it is shown", () => {
+    const tabs = [pty("a"), pty("b"), pty("c")];
+    // A 1 × 2 grid holds two sessions; c has no zone and stays parked.
+    const twoZones = { ...gridLayout(1), zones: gridLayout(1).zones.slice(0, 2) };
+    renderGridPage(tabs, twoZones, { 0: "a", 1: "b" });
+    expect([...rec.mounts].sort()).toEqual(["a", "b", "c"]);
+    expect(rec.visible.get("c")).toBe(false);
+    const before = snapshotInstances();
+
+    renderTmuxPage(tabs, "a");
+    renderTmuxPage(tabs, "c");
+    expect(visiblePanes()).toEqual(["c"]);
+    renderGridPage(tabs, twoZones, { 0: "a", 1: "b" });
+    expect(visiblePanes().sort()).toEqual(["a", "b"]);
+    expectNoRemount(["a", "b", "c"], before);
+  });
+
+  it("renders one root element whose work-mode marker follows the mode", () => {
+    const tabs = [pty("a"), pty("b")];
+    renderGridPage(tabs, gridLayout(2), { 0: "a", 1: "b" });
+    const gridRoot = container.firstElementChild;
+    expect(gridRoot?.getAttribute("data-terminal-work-mode")).toBe("grid");
+
+    renderTmuxPage(tabs, "a");
+    // The same DOM node: React kept the root, so it kept everything under it.
+    expect(container.firstElementChild).toBe(gridRoot);
+    expect(gridRoot?.getAttribute("data-terminal-work-mode")).toBe("tmux");
   });
 });

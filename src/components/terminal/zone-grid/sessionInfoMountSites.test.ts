@@ -17,12 +17,14 @@
  *   2. single / maximized    `ZoneGrid.tsx`                 → mounts
  *   3. solo session strip    `zone-grid/ZoneCell.tsx`       → mounts
  *   4. compact zone card     `zone-grid/CompactZoneCard.tsx`→ mounts (this fix)
- *   5. off-grid parking      `zone-grid/HiddenTerminal.tsx` → deliberately NOT
+ *   5. parked cell           `zone-grid/ZoneCell.tsx`       → deliberately NOT
+ *      (an unzoned grid tab, or an off-screen tmux tab: `isParked`)
  *
- * (5) is `<div className="hidden">`: a trigger there would be invisible, not
- * keyboard-reachable, and — having no zone — every hidden tab would register
- * the SAME `terminal-session-info-trigger--1` id. Its reachable home is the
- * zone control panel's Unassigned list, which is separate work.
+ * (5) is a `display: none` cell: a trigger there would be invisible, not
+ * keyboard-reachable, and — every parked cell being zone 0 — would register
+ * the SAME `terminal-session-info-trigger-0` id as zone 0's real one. Its
+ * reachable homes are the zone control panel's Unassigned list and the session
+ * manager.
  */
 
 import { readFileSync } from "node:fs";
@@ -36,7 +38,6 @@ const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.met
 
 const COMPACT = read("./CompactZoneCard.tsx");
 const ZONE_LABEL = read("./ZoneLabel.tsx");
-const HIDDEN = read("./HiddenTerminal.tsx");
 const ZONE_GRID = read("../ZoneGrid.tsx");
 const ZONE_CELL = read("./ZoneCell.tsx");
 
@@ -58,12 +59,17 @@ describe("SessionInfoDropdown mount sites", () => {
     expect(ZONE_CELL).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
   });
 
-  it("does NOT mount inside the off-grid hidden parking slot", () => {
+  it("does NOT mount inside a parked cell", () => {
     // A `display: none` subtree is neither visible nor keyboard-reachable, and
-    // an unassigned tab has no zone index to key the element ids off. If this
-    // ever changes, the id scheme has to grow a non-zone discriminator first.
-    expect(HIDDEN).not.toContain("SessionInfoDropdown");
-    expect(HIDDEN).toContain('className="hidden"');
+    // a parked tab has no zone index of its own to key the element ids off. If
+    // this ever changes, the id scheme has to grow a non-zone discriminator
+    // first. Both mount sites in the cell are gated off for a parked cell.
+    expect(ZONE_CELL).toContain(
+      'const isParked = classification === "offscreen" || classification === "hidden";',
+    );
+    expect(ZONE_CELL).toContain("const showLabels = showLabelsProp && !isParked;");
+    expect(ZONE_CELL).toMatch(/const soloSessionInfo =\s*!isParked &&/);
+    expect(ZONE_CELL).toContain('${isParked ? "hidden" : ""}');
   });
 });
 

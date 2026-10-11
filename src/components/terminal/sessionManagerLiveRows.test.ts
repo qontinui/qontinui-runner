@@ -9,16 +9,20 @@
  * from — every gated button and menu item reads one of its fields.
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
   buildTabRows,
+  isRowOffScreen,
   isRowOnScreen,
   mergeLiveRows,
+  sessionCardStatus,
   tabLiveStatus,
   type LiveRowTab,
 } from "./sessionManagerLiveRows";
-import { sessionCardActions, sessionCardTooltip } from "./SessionCard";
+import { sessionCardActions, sessionCardStatusInfo, sessionCardTooltip } from "./SessionCard";
 import type { TranscriptSessionRow } from "./useSessionManager";
 import type { SessionState } from "./useZoneLayout";
 
@@ -74,7 +78,6 @@ describe("buildTabRows", () => {
       ],
       representedTabIds: new Set(),
       sessionStates: none,
-      staleTabs: noStale,
     });
     expect(rows).toEqual([
       {
@@ -116,7 +119,6 @@ describe("buildTabRows", () => {
       ],
       representedTabIds: new Set(),
       sessionStates: none,
-      staleTabs: noStale,
       registryNames: new Map([["s-1", "renamed by operator"]]),
     });
     expect(named.displayName).toBe("renamed by operator");
@@ -128,14 +130,33 @@ describe("buildTabRows", () => {
       tabs: [tab({ id: "a" }), tab({ id: "b" }), tab({ id: "c" }), tab({ id: "d" })],
       representedTabIds: new Set(),
       sessionStates: { a: "needs-input", b: "error", c: "completed" },
-      staleTabs: new Set(["d"]),
     });
     expect(rows.map((r) => [r.sessionId, r.liveStatus])).toEqual([
       ["a", "needs-input"],
       ["b", "error"],
       ["c", "completed"],
-      ["d", "frozen"],
+      ["d", "active-in-zone"],
     ]);
+  });
+
+  it("never reads an idle plain shell as stuck, however long it has been silent", () => {
+    // The live check: a never-typed-in, off-screen shell tab showed `frozen`
+    // and "Session appears stuck — may need resume". Silence is a shell's idle
+    // state, and a tab row has nothing to resume.
+    const staleShell = tab({ id: "t-shell" });
+    const [row] = mergeLiveRows([], {
+      tabs: [staleShell],
+      sessionStates: { "t-shell": "idle" },
+    });
+    expect(row.source).toBe("tab");
+    expect(row.liveStatus).toBe("active-in-zone");
+    expect(row.likelyFrozen).toBe(false);
+  });
+
+  it("keeps the stuck heuristic for a transcript row joined to a silent tab", () => {
+    // A Claude conversation that has written messages and then went silent
+    // mid-run is what the staleness arm is for — unchanged by tab rows.
+    expect(tabLiveStatus("t-claude", { "t-claude": "idle" }, new Set(["t-claude"]))).toBe("frozen");
   });
 
   it("lists a remote session tab, labelled with its device", () => {
@@ -155,7 +176,6 @@ describe("buildTabRows", () => {
       ],
       representedTabIds: new Set(),
       sessionStates: none,
-      staleTabs: noStale,
     });
     expect(row.source).toBe("tab");
     expect(row.zoneTabId).toBe("t-remote");
@@ -173,7 +193,6 @@ describe("buildTabRows", () => {
       ],
       representedTabIds: new Set(["t-claude"]),
       sessionStates: none,
-      staleTabs: noStale,
     });
     expect(rows.map((r) => r.sessionId)).toEqual(["t-shell"]);
   });
@@ -188,7 +207,6 @@ describe("mergeLiveRows", () => {
         tab({ id: "t-shell" }),
       ],
       sessionStates: none,
-      staleTabs: noStale,
     });
     expect(rows.map((r) => [r.source, r.zoneTabId])).toEqual([
       ["transcript", "t-claude"],
@@ -201,7 +219,6 @@ describe("mergeLiveRows", () => {
     const rows = mergeLiveRows([], {
       tabs: [tab({ id: "t-new", claudeSessionId: "s-new", spawnName: "new session" })],
       sessionStates: none,
-      staleTabs: noStale,
     });
     expect(rows.map((r) => [r.source, r.sessionId, r.displayName])).toEqual([
       ["tab", "t-new", "new session"],
@@ -223,7 +240,6 @@ describe("SessionCard actions by row source", () => {
       tabs: [tab({ id: "t-shell" })],
       representedTabIds: new Set(),
       sessionStates: { "t-shell": "needs-input" },
-      staleTabs: noStale,
     });
     expect(sessionCardActions(row)).toEqual({
       resume: false,
@@ -262,7 +278,6 @@ describe("SessionCard actions by row source", () => {
       tabs: [tab({ id: "t-shell", spawnName: "build shell" })],
       representedTabIds: new Set(),
       sessionStates: none,
-      staleTabs: noStale,
     });
     expect(sessionCardTooltip(row)).toBe("Terminal t-shell\nbuild shell");
   });
@@ -277,5 +292,53 @@ describe("isRowOnScreen", () => {
 
   it("marks nothing in grid mode (no shown tab)", () => {
     expect(isRowOnScreen({ zoneTabId: "t-1" }, null)).toBe(false);
+  });
+});
+
+describe("off-screen wording in tmux mode", () => {
+  it("marks every row of this window but the shown one as off screen, in tmux only", () => {
+    const shown = transcriptRow({ zoneTabId: "t-a" });
+    const parked = transcriptRow({ zoneTabId: "t-b" });
+    const noTab = transcriptRow({ zoneTabId: null, liveStatus: "dormant" });
+    expect(isRowOffScreen(shown, "tmux", "t-a")).toBe(false);
+    expect(isRowOffScreen(parked, "tmux", "t-a")).toBe(true);
+    // A session not open in this window is not "off screen" — it is not here.
+    expect(isRowOffScreen(noTab, "tmux", "t-a")).toBe(false);
+    // tmux with nothing shown yet: every row of this window is off screen.
+    expect(isRowOffScreen(shown, "tmux", null)).toBe(true);
+    // Grid mode never says off screen.
+    expect(isRowOffScreen(parked, "grid", null)).toBe(false);
+  });
+
+  it("an off-screen running session reads 'Active, off screen', never 'in zone'", () => {
+    const parked = transcriptRow({ zoneTabId: "t-b" });
+    expect(sessionCardStatus("active-in-zone", true)).toBe("active-off-screen");
+    expect(sessionCardStatusInfo(parked, true)).toMatchObject({
+      status: "active-off-screen",
+      label: "Active, off screen",
+    });
+  });
+
+  it("keeps the grid wording, and every state chip, unchanged", () => {
+    expect(sessionCardStatusInfo(transcriptRow(), false)).toMatchObject({
+      status: "active-in-zone",
+      label: "Active in zone",
+    });
+    // A chip that describes the session, not its place, stays as it is.
+    for (const status of ["needs-input", "error", "completed", "frozen"] as const) {
+      expect(sessionCardStatus(status, true)).toBe(status);
+    }
+  });
+
+  it("the card renders the shown status as its data-session-status", () => {
+    const source = readFileSync(resolve(__dirname, "./SessionCard.tsx"), "utf8");
+    expect(source).toContain("const statusInfo = sessionCardStatusInfo(session, isOffScreen);");
+    expect(source).toContain("data-session-status={cardStatus}");
+    const panel = readFileSync(resolve(__dirname, "./SessionManagerPanel.tsx"), "utf8");
+    expect(panel).toContain("isOffScreen={isRowOffScreen(session, workMode, onScreenTabId)}");
+    const page = readFileSync(resolve(__dirname, "./TerminalPage.tsx"), "utf8");
+    expect(page).toMatch(
+      /onScreenTabId=\{zoneLayout\.shownTabId\}\s*workMode=\{zoneLayout\.workMode\}/,
+    );
   });
 });

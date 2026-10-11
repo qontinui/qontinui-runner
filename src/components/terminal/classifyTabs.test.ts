@@ -128,7 +128,7 @@ describe("classifyTabs — tmux work mode", () => {
     assertExactlyOneOrZeroOwner(result, ["a", "b", "plan", "worker"]);
   });
 
-  it("classifies nothing hidden — the HiddenTerminal parking owns no tab in tmux", () => {
+  it("classifies nothing hidden — grid's unzoned parking owns no tab in tmux", () => {
     const result = classifyTabs(mixed, { 0: "b" }, false, new Set(), "tmux");
     expect([...result.values()].filter((c) => c === "hidden")).toEqual([]);
   });
