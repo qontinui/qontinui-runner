@@ -5418,6 +5418,14 @@ async fn refresher_loop(
             }
         }
 
+        // Dark posture → ask web whether an operator authorized a redeem. A
+        // landed redeem re-runs the pass on the fresh credential.
+        let wrong_tier = matches!(decision, Decision::IdleWrongTier);
+        let (web_base, _web_base_arm) = resolve_pair_base(&settings_snapshot);
+        if crate::mcp::pending_redeem::on_refresher_pass(&web_base, wrong_tier).await {
+            continue;
+        }
+
         match decision {
             Decision::IdleWrongTier => {
                 // Phase 1b: publish the credential-dark signal so coord's
@@ -10379,9 +10387,11 @@ mod tenant_slot_refresh_tests {
     fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
         for (file, item) in [
             ("src/commands/auth.rs", "async fn finalize_signed_in("),
+            // Both pair-code redeem doors (the interactive command and the
+            // refresher's operator-authorized redeem) run this shared core.
             (
                 "src/commands/web_integration.rs",
-                "pub async fn redeem_pair_code(",
+                "pub(crate) async fn complete_pairing_after_redeem(",
             ),
         ] {
             // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run

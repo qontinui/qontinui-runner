@@ -625,6 +625,116 @@ struct StoredTokens {
     /// themselves.
     #[serde(default)]
     interactive_signed_out: bool,
+    /// The newest device JWT this store has held that web's pending-redeem
+    /// door accepts for THIS device ([`pending_redeem_anchor_exp`]), kept ONLY as the
+    /// bearer for web's `GET /api/v1/devices/{device_id}/pending-redeem`
+    /// (`mcp::pending_redeem`; plan
+    /// `2026-09-26-authenticate-and-perpetually-renew-a-specific-runner-from-qontinui-web`).
+    ///
+    /// Why a slot of its own: the refresher's automatic exit CLEARS a dead
+    /// per-tenant slot (`Cleared { .. }`), a default logout clears
+    /// `access_token`, and the paired-user reconcile clears dropped tenants —
+    /// so exactly the stranded (`unrefreshable`) device the poll exists for
+    /// would otherwise hold no token to prove which device it is. Maintained
+    /// in ONE place, [`SecureStorage::save_tokens`] (see
+    /// [`refresh_redeem_anchor`]), so every writer — present and future —
+    /// keeps it without knowing it exists: a newer device JWT supersedes it, a
+    /// clear leaves it. Emptied only by the full sign-out
+    /// ([`SecureStorage::clear_tokens`], an explicit "forget this device") and
+    /// re-seeded after a successful redeem
+    /// ([`SecureStorage::reset_redeem_anchor`]). It is a bearer credential
+    /// like the slots it copies; never log it. `#[serde(default)]` keeps
+    /// older `.enc` files readable.
+    #[serde(default)]
+    redeem_anchor_jwt: Option<String>,
+}
+
+/// `exp` of `token` iff it is a token web's pending-redeem door accepts as
+/// proof of THIS device (`device_id`), decoded without verification; `None`
+/// for anything else. Web verifies the signature and expiry; this mirrors the
+/// rest of its rule (qontinui-web `devices.py`, the pending-redeem anchor) so
+/// the store never keeps, and the poll never presents, a token web must refuse:
+///
+/// * `sub_type == "device"` exactly;
+/// * `mint_provenance` absent or `"paired"`;
+/// * `device_id` claim parses as a UUID equal to `device_id`;
+/// * `sub == "device:<that uuid>"` and `user_id` parses as a UUID — the shape
+///   coord's `issue_device` mints (a push token has neither).
+///
+/// The ONE helper both the anchor slot ([`refresh_redeem_anchor`]) and
+/// `mcp::pending_redeem::select_anchor` use.
+pub fn pending_redeem_anchor_exp(token: &str, device_id: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let want = uuid::Uuid::parse_str(device_id.trim()).ok()?;
+    let mut parts = token.trim().splitn(3, '.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let str_claim = |k: &str| claims.get(k).and_then(|v| v.as_str());
+    let uuid_claim = |k: &str| str_claim(k).and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+    let provenance_ok = match claims.get("mint_provenance") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(v) => v.as_str() == Some("paired"),
+    };
+    let ok = str_claim("sub_type") == Some("device")
+        && provenance_ok
+        && uuid_claim("device_id") == Some(want)
+        && str_claim("sub") == Some(format!("device:{want}").as_str())
+        && uuid_claim("user_id").is_some();
+    if !ok {
+        return None;
+    }
+    claims.get("exp").and_then(|v| v.as_i64())
+}
+
+/// Set `redeem_anchor_jwt` on a serialized [`StoredTokens`] to the newest
+/// token among the current anchor, `access_token` and every per-tenant slot
+/// that [`pending_redeem_anchor_exp`] accepts for `this_device`. A slot that
+/// was just cleared is simply not a candidate, so a still-valid anchor
+/// survives it; a newer token replaces it; an anchor for another device is
+/// dropped. With `this_device` unresolved nothing is changed.
+fn refresh_redeem_anchor(value: &mut serde_json::Value, this_device: Option<&str>) {
+    let Some(device_id) = this_device else {
+        return;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    for key in ["redeem_anchor_jwt", "access_token"] {
+        if let Some(t) = obj.get(key).and_then(|v| v.as_str()) {
+            candidates.push(t.to_string());
+        }
+    }
+    if let Some(slots) = obj.get("tenant_device_jwts").and_then(|v| v.as_object()) {
+        candidates.extend(
+            slots
+                .values()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string),
+        );
+    }
+    let newest = candidates
+        .into_iter()
+        .filter_map(|t| pending_redeem_anchor_exp(&t, device_id).map(|exp| (exp, t)))
+        .max_by_key(|(exp, _)| *exp)
+        .map(|(_, t)| t);
+    match newest {
+        Some(t) => {
+            obj.insert(
+                "redeem_anchor_jwt".to_string(),
+                serde_json::Value::String(t),
+            );
+        }
+        None => {
+            obj.insert("redeem_anchor_jwt".to_string(), serde_json::Value::Null);
+        }
+    }
 }
 
 /// Write posture for a read-modify-write over a possibly-unreadable store.
@@ -874,7 +984,14 @@ impl SecureStorage {
     /// not a substitute for the file mode against the local-reader threat this
     /// hardening exists for.
     fn save_tokens(&self, tokens: &StoredTokens) -> Result<()> {
-        let json = serde_json::to_vec(tokens).context("Failed to serialize tokens")?;
+        // Every write keeps the pending-redeem anchor current — see
+        // `StoredTokens::redeem_anchor_jwt`.
+        let mut value = serde_json::to_value(tokens).context("Failed to serialize tokens")?;
+        refresh_redeem_anchor(
+            &mut value,
+            crate::machine_identity::resolve_device_id().as_deref(),
+        );
+        let json = serde_json::to_vec(&value).context("Failed to serialize tokens")?;
 
         let encrypted = self.encrypt(&json)?;
 
@@ -1121,6 +1238,9 @@ impl SecureStorage {
         // already reports signed-out, but keep the flag consistent so a
         // partially-failed wipe can't leave the UI showing signed-in.
         tokens.interactive_signed_out = true;
+        // A full sign-out forgets the device: the pending-redeem anchor goes
+        // too (every slot it could be re-seeded from is already empty).
+        tokens.redeem_anchor_jwt = None;
         cleared_tenants
     }
 
@@ -1767,6 +1887,28 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// The pending-redeem anchor (`StoredTokens::redeem_anchor_jwt`), expired
+    /// or not. `Ok(None)` when none was ever kept.
+    pub fn get_redeem_anchor_jwt(&self) -> Result<Option<String>> {
+        Ok(self.load_tokens()?.redeem_anchor_jwt)
+    }
+
+    /// Drop the pending-redeem anchor after it has been spent on a successful
+    /// redeem. The save re-seeds it from the device JWTs the store holds NOW
+    /// (the one the redeem just persisted), so the spent token is gone and the
+    /// next dark episode still has an anchor.
+    ///
+    /// A mutator like every other: one [`Self::locked_rmw`], so a concurrent
+    /// locked writer (the CLI, an instance runner, a reconcile) cannot land
+    /// between this load and save and lose its slot. May wait up to
+    /// [`STORE_LOCK_TIMEOUT`] for the lock — callers on an async runtime run
+    /// it on the blocking pool.
+    pub fn reset_redeem_anchor(&self) -> Result<()> {
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.redeem_anchor_jwt = None;
+        })
+    }
+
     /// Deletes the storage file entirely.
     ///
     /// The reset affordance behind the "your credential store is corrupt" banner
@@ -1861,6 +2003,121 @@ mod tests {
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
         SecureStorage::with_path(storage_path).unwrap()
+    }
+
+    /// A JWT-shaped DEVICE token (signature unchecked locally).
+    fn anchor_test_jwt(device_id: &str, exp: i64, sub_type: &str) -> String {
+        use base64::Engine as _;
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let claims = serde_json::json!({
+            "sub": format!("device:{device_id}"),
+            "sub_type": sub_type,
+            "device_id": device_id,
+            "user_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "mint_provenance": "paired",
+            "exp": exp,
+        });
+        format!(
+            "{}.{}.sig",
+            enc(br#"{"alg":"RS256"}"#),
+            enc(claims.to_string().as_bytes())
+        )
+    }
+
+    /// The pending-redeem anchor survives every clear the refresher, a default
+    /// logout and the reconcile perform; a newer device JWT supersedes it;
+    /// non-device tokens never become it; a full sign-out drops it; and
+    /// `reset_redeem_anchor` re-seeds it from what the store holds now.
+    #[test]
+    fn test_redeem_anchor_survives_clears_and_tracks_the_newest_device_jwt() {
+        let storage = create_test_storage("test_redeem_anchor");
+        let did = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        crate::machine_identity::set_test_device_id(Some(did));
+        let tenant = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
+        let old = anchor_test_jwt(did, 1_000, "device");
+        let newer = anchor_test_jwt(did, 2_000, "device");
+        let newest = anchor_test_jwt(did, 3_000, "device");
+
+        assert_eq!(storage.get_redeem_anchor_jwt().unwrap(), None);
+
+        // Seeded by an ordinary slot write.
+        storage.store_tenant_device_jwt(&tenant, &old).unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(old.as_str())
+        );
+
+        // A newer token in ANOTHER slot supersedes it.
+        storage.store_tokens(&newer, "").unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+
+        // The refresher's `Cleared` path and a default logout clear the slots;
+        // the anchor survives both.
+        storage.clear_tenant_device_jwt(&tenant).unwrap();
+        storage.clear_interactive_session().unwrap();
+        assert!(storage.get_access_token().is_err());
+        assert!(storage.get_tenant_device_jwt(&tenant).unwrap().is_none());
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+
+        // An agent token, ANOTHER device's token, or an older device token
+        // never displaces it.
+        storage
+            .store_tenant_device_jwt(&tenant, &anchor_test_jwt(did, 9_999, "agent"))
+            .unwrap();
+        storage
+            .store_tenant_device_jwt(
+                &tenant,
+                &anchor_test_jwt("dddddddd-dddd-4ddd-8ddd-dddddddddddd", 9_999, "device"),
+            )
+            .unwrap();
+        storage.store_tokens(&old, "").unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+
+        // After a redeem stored `newest`, reset drops the spent anchor and
+        // re-seeds from what is held now.
+        storage.store_tokens(&newest, "").unwrap();
+        storage.clear_tokens().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap(),
+            None,
+            "full sign-out drops it"
+        );
+        storage.store_tokens(&old, "").unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(old.as_str())
+        );
+        storage.clear_interactive_session().unwrap();
+        storage.reset_redeem_anchor().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap(),
+            None,
+            "reset with nothing held leaves no anchor"
+        );
+        storage.store_tokens(&newest, "").unwrap();
+        storage.reset_redeem_anchor().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newest.as_str()),
+            "reset re-seeds from the credential the redeem stored"
+        );
+
+        // With this device's id unresolved, a write leaves the anchor alone.
+        crate::machine_identity::set_test_device_id(None);
+        storage.clear_interactive_session().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newest.as_str())
+        );
     }
 
     #[test]
@@ -2318,6 +2575,33 @@ mod tests {
         b.join().unwrap();
         let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
         assert_eq!(slots.len() as u128, 2 * N, "a concurrent writer lost slots");
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// `reset_redeem_anchor` is a LOCKED mutator: while another handle holds
+    /// the store lock it waits, and it completes once the holder releases.
+    #[test]
+    fn test_reset_redeem_anchor_waits_for_the_store_lock() {
+        let storage = create_test_storage("reset_redeem_anchor_locked");
+        storage.store_tokens("seed", "").unwrap();
+        let guard = storage.lock_store().unwrap();
+        let path = storage.storage_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let other = SecureStorage::with_path(path).unwrap();
+            tx.send(other.reset_redeem_anchor().is_ok()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "reset_redeem_anchor saved while another handle held the store lock"
+        );
+        drop(guard);
+        assert!(
+            rx.recv_timeout(STORE_LOCK_TIMEOUT).unwrap(),
+            "reset_redeem_anchor failed once the lock was released"
+        );
+        worker.join().unwrap();
         let _ = fs::remove_file(&storage.storage_path);
     }
 
