@@ -82,8 +82,8 @@ impl RepoOwners {
 /// artifact.
 pub const CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// HTTP budget for `GET /coord/canonical-repos` — strictly below
-/// [`CWD_TENANT_BUDGET`] minus the git probe's share.
+/// HTTP budget for `GET /coord/canonical-repos` (the credential-scope path's
+/// read; the cwd resolver reads `GET /coord/repos/tenants` instead).
 const CANONICAL_REPOS_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 
 // ===========================================================================
@@ -293,6 +293,159 @@ fn parse_canonical_repos(body: &serde_json::Value) -> Result<CanonicalRepos, Str
 }
 
 // ===========================================================================
+// coord read: GET /coord/repos/tenants (the cwd resolver's source)
+// ===========================================================================
+
+/// HTTP budget for `GET /coord/repos/tenants` — strictly below
+/// [`CWD_TENANT_BUDGET`] minus the git probe's share.
+const REPO_TENANTS_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The `source` the cwd resolver records on a [`CwdTenant::Resolved`] answer:
+/// the table coord's tenants-for-repo door reads ownership from (it serves the
+/// same string as its own `source` field).
+pub const REPO_TENANTS_SOURCE: &str = "coord.tenant_repos";
+
+/// What coord's `GET /coord/repos/tenants` said about one repo (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 3's door, read here by Phase 4).
+///
+/// The door answers from `coord.tenant_repos` INTERSECTED with the calling
+/// device's `coord.tenant_devices` bindings, so `None` means "no tenant THIS
+/// DEVICE is bound to owns the repo" — a repo owned only by a foreign tenant
+/// reads `None` by design, and its id never reaches this process. "Could not
+/// look" is never one of these: coord answers that with a non-2xx, which
+/// [`fetch_repo_tenants`] returns as `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoTenantsAnswer {
+    /// The repo coord answered for — its NORMALIZED (lowercase `owner/name`)
+    /// spelling of what was asked.
+    pub repo: String,
+    pub status: RepoTenantsStatus,
+    /// Every owning tenant coord served, in its order. Length agrees with
+    /// `status` ([`parse_repo_tenants`] refuses a body where it does not).
+    pub tenants: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoTenantsStatus {
+    /// Exactly one bound tenant owns the repo.
+    Resolved,
+    /// Coord looked; no tenant this device is bound to owns the repo.
+    None,
+    /// Several bound tenants own the repo.
+    Several,
+}
+
+/// Project a `GET /coord/repos/tenants` 200 body into a [`RepoTenantsAnswer`].
+/// Split out from the transport so the shape contract is unit-testable.
+///
+/// Every shape this does not fully understand is an `Err`, never an empty
+/// answer: an unknown `status`, a missing `tenants` array, a `tenant_id` that
+/// does not parse, or a tenant count that contradicts the `status` (a
+/// `resolved` with two tenants is not something to pick from).
+pub fn parse_repo_tenants(body: &serde_json::Value) -> Result<RepoTenantsAnswer, String> {
+    let repo = body
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "repo-tenants body carries no `repo` string".to_string())?
+        .to_string();
+    let status = match body.get("status").and_then(|v| v.as_str()) {
+        Some("resolved") => RepoTenantsStatus::Resolved,
+        Some("none") => RepoTenantsStatus::None,
+        Some("several") => RepoTenantsStatus::Several,
+        Some(other) => return Err(format!("repo-tenants body has an unknown status `{other}`")),
+        None => return Err("repo-tenants body carries no `status` string".to_string()),
+    };
+    let rows = body
+        .get("tenants")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "repo-tenants body carries no `tenants` array".to_string())?;
+    let mut tenants = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw = row
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("repo-tenants row has no `tenant_id` string: {row}"))?;
+        let t = Uuid::parse_str(raw.trim())
+            .map_err(|_| format!("repo-tenants row has an unparseable tenant_id `{raw}`"))?;
+        if !tenants.contains(&t) {
+            tenants.push(t);
+        }
+    }
+    let consistent = match status {
+        RepoTenantsStatus::Resolved => tenants.len() == 1,
+        RepoTenantsStatus::None => tenants.is_empty(),
+        RepoTenantsStatus::Several => tenants.len() >= 2,
+    };
+    if !consistent {
+        return Err(format!(
+            "repo-tenants body is inconsistent: status {status:?} with {} tenant(s)",
+            tenants.len()
+        ));
+    }
+    Ok(RepoTenantsAnswer {
+        repo,
+        status,
+        tenants,
+    })
+}
+
+/// The `Err` text for a non-2xx from `GET /coord/repos/tenants`. Every such
+/// answer is UNKNOWN — coord's own contract is that it never answers "could
+/// not look" (`503`) or "will not say" (`403`) as `none` — and the typed
+/// `error` code coord sends is carried so the reason names itself.
+///
+/// A `404` is a coord that predates the door. The door has been on every
+/// serving instance since coord `35bca23b6` deployed, so the `canonical_repos`
+/// fallback the plan allowed for this case is deleted (delete-over-deprecate,
+/// no permanent dual path); a runner pointed at an older coord answers
+/// UNKNOWN, which is true.
+fn repo_tenants_refusal(status: u16, body: &serde_json::Value) -> String {
+    let code = body.get("error").and_then(|v| v.as_str());
+    match (status, code) {
+        (404, None) => "GET /coord/repos/tenants returned 404 — this coord predates the \
+                        tenants-for-repo door"
+            .to_string(),
+        (_, Some(code)) => format!("GET /coord/repos/tenants returned {status} ({code})"),
+        (_, None) => format!("GET /coord/repos/tenants returned {status}"),
+    }
+}
+
+async fn fetch_repo_tenants(slug: String) -> Result<RepoTenantsAnswer, String> {
+    let (base, _coord_base_source) = crate::profiles::coord_base_with_source();
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/coord/repos/tenants");
+
+    let client = reqwest::Client::builder()
+        // Strictly below CWD_TENANT_BUDGET, so a slow coord surfaces as this
+        // read's own error (named) rather than the resolver's generic timeout.
+        .timeout(REPO_TENANTS_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+
+    // coord-tenant-scope(device): the door is scoped BY the device — it answers `coord.tenant_repos ∩ the caller device's coord.tenant_devices bindings` and refuses a principal that does not prove a device (`repo_tenants_read.rs` "Who can ask"). The device credential is therefore the one the answer is defined over, not a default standing in for an unknown tenant; this read is also what DETERMINES a cwd's tenant, so scoping it on one would be circular.
+    let resp = crate::auth::attach_device_auth(client.get(&url).query(&[("repo", slug.as_str())]))
+        .send()
+        .await
+        .map_err(|e| format!("GET /coord/repos/tenants: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // The typed refusal body is best-effort: an unreadable one still
+        // leaves the status, which is already an UNKNOWN.
+        let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
+        return Err(repo_tenants_refusal(status.as_u16(), &body));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse repo-tenants body: {e}"))?;
+
+    parse_repo_tenants(&body)
+}
+
+// ===========================================================================
 // caches
 // ===========================================================================
 
@@ -387,15 +540,21 @@ static CANONICAL_REPOS: once_cell::sync::Lazy<CanonicalRepoCache> =
 /// as stable as a fact gets, so a TTL'd answer is honest; `None` (not a git
 /// checkout, or `git` failed) is cached for the same reason coord's negative
 /// answers are — it is the steady state for any non-repo directory.
-struct DirCache<V> {
+///
+/// Generic over the key so the same TTL'd, failure-aware cache also holds the
+/// per-repo `GET /coord/repos/tenants` answers ([`REPO_TENANTS`]).
+struct KeyCache<K, V> {
     ttl: Duration,
-    entries: RwLock<HashMap<PathBuf, (Instant, V)>>,
+    entries: RwLock<HashMap<K, (Instant, V)>>,
 }
+
+/// The directory-keyed instance of [`KeyCache`].
+type DirCache<V> = KeyCache<PathBuf, V>;
 
 /// The slug cache is the `Option<String>` instance of [`DirCache`].
 type RepoSlugCache = DirCache<Option<String>>;
 
-impl<V: Clone> DirCache<V> {
+impl<K: std::hash::Hash + Eq, V: Clone> KeyCache<K, V> {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -406,20 +565,22 @@ impl<V: Clone> DirCache<V> {
     /// Answer for `dir` from the cache, else through `detect`, storing the
     /// fresh answer only when `cacheable` says so (a transient failure is not
     /// remembered — the next caller asks again).
-    async fn lookup<F, Fut>(
+    async fn lookup<Q, F, Fut>(
         &self,
-        dir: &Path,
+        key: &Q,
         now: Instant,
         detect: F,
         cacheable: impl FnOnce(&V) -> bool,
     ) -> V
     where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ToOwned<Owned = K> + ?Sized,
         F: FnOnce() -> Fut,
         Fut: Future<Output = V>,
     {
         {
             let entries = self.entries.read().await;
-            if let Some((at, v)) = entries.get(dir) {
+            if let Some((at, v)) = entries.get(key) {
                 if now.saturating_duration_since(*at) < self.ttl {
                     return v.clone();
                 }
@@ -432,7 +593,7 @@ impl<V: Clone> DirCache<V> {
             // never asked about again (every spawn's cwd) do not accumulate.
             let ttl = self.ttl;
             entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
-            entries.insert(dir.to_path_buf(), (now, fresh.clone()));
+            entries.insert(key.to_owned(), (now, fresh.clone()));
         }
         fresh
     }
@@ -458,6 +619,29 @@ static REPO_PROBES: once_cell::sync::Lazy<DirCache<RepoProbe>> =
 
 static REPO_SLUGS: once_cell::sync::Lazy<RepoSlugCache> =
     once_cell::sync::Lazy::new(|| RepoSlugCache::new(CACHE_TTL));
+
+/// TTL'd `repo slug → GET /coord/repos/tenants answer` cache for the cwd
+/// resolver: a burst of spawns into one checkout (~130 were observed during the
+/// 2026-08-30 wedge) costs one coord read per repo per [`CACHE_TTL`], not one
+/// per spawn. Only an ANSWER is kept — an `Err` (coord unreachable, a 503, a
+/// 403) is UNKNOWN and is asked again by the next caller, the same rule
+/// [`REPO_PROBES`] applies to a failed `git` probe; each such retry is bounded
+/// by [`REPO_TENANTS_HTTP_TIMEOUT`].
+static REPO_TENANTS: once_cell::sync::Lazy<KeyCache<String, Result<RepoTenantsAnswer, String>>> =
+    once_cell::sync::Lazy::new(|| KeyCache::new(CACHE_TTL));
+
+/// The tenants-for-repo answer for `slug`, through [`REPO_TENANTS`].
+pub async fn repo_tenants_for_slug(slug: &str) -> Result<RepoTenantsAnswer, String> {
+    let owned = slug.to_string();
+    REPO_TENANTS
+        .lookup(
+            slug,
+            Instant::now(),
+            || fetch_repo_tenants(owned),
+            |r| r.is_ok(),
+        )
+        .await
+}
 
 /// Read the canonical-repo map, refreshing through coord when the cache is
 /// cold. `Err` is reserved for a genuine coord failure so callers can tell
@@ -615,11 +799,16 @@ pub async fn tenant_scope_for_path(path: &Path) -> TenantScope {
 /// Phase 2).
 ///
 /// Distinct from [`TenantScope`] on purpose. `TenantScope` answers "which
-/// credential may this write present", so it is `Owned` only for a tenant this
-/// device holds a binding for. This answers "whose project is this", so a repo
-/// owned by a tenant the device is NOT bound to is still [`CwdTenant::Resolved`]
-/// — an answer from any other tenant is another project's data either way,
-/// and saying so is the point.
+/// credential may this write present" (and adds the usable-binding gate on top
+/// of ownership). This answers "whose project is this", from coord's
+/// tenants-for-repo door (`GET /coord/repos/tenants`, plan Phase 4) — the
+/// authoritative ownership read, scoped by coord to the tenants THIS DEVICE is
+/// paired to. A repo owned only by a tenant the device is not paired to
+/// therefore reads [`CwdTenant::RepoUnregistered`] ("no tenant of yours owns
+/// it"), and the foreign tenant's id never reaches the runner: a device learns
+/// nothing about tenants it is not paired to. Any answer such a session gets
+/// still comes from one of the device's own tenants, which the verdict then
+/// reports as unverified rather than agreeing.
 ///
 /// **"Empty" and "could not look" never share an arm.** [`Self::NoRepo`] and
 /// [`Self::RepoUnregistered`] are coord / git ANSWERING that there is nothing
@@ -639,7 +828,7 @@ pub enum CwdTenant {
         tenant_id: Uuid,
         /// The `owner/name` slug that was looked up.
         repo: String,
-        /// Where the ownership fact came from (`canonical_repos` today).
+        /// Where the ownership fact came from ([`REPO_TENANTS_SOURCE`]).
         source: String,
         /// RFC 3339 time this resolution was made.
         observed_at: String,
@@ -647,11 +836,13 @@ pub enum CwdTenant {
     /// The directory is not inside a git checkout: there is no repo to expect
     /// anything of.
     NoRepo,
-    /// A checkout whose repo has no owning tenant in coord's registry — absent
-    /// from it, registered without an owner, or not a GitHub remote coord could
-    /// ever have registered. Coord ANSWERED; the answer is "nobody".
+    /// A checkout whose repo no tenant this device is paired to owns — coord's
+    /// tenants-for-repo door answered `none` (unregistered, registered without
+    /// an owner, or owned only by a tenant this device is not paired to), or
+    /// the remote is not GitHub, which coord could never have registered.
+    /// Coord ANSWERED; the answer is "nobody of yours".
     RepoUnregistered { repo: String },
-    /// The repo is registered to more than one tenant.
+    /// The repo is owned by more than one tenant this device is paired to.
     Several { repo: String, tenant_ids: Vec<Uuid> },
     /// Nothing could be established. UNKNOWN, never "no tenant".
     Unknown {
@@ -706,7 +897,7 @@ impl CwdTenant {
 }
 
 /// Overall budget for one [`cwd_tenant_for_path`]: the `git` probe plus the
-/// (cached) coord read. It runs once per nonce mint and is awaited by at most
+/// (cached) tenants-for-repo read. It runs once per nonce mint and is awaited by at most
 /// the session's first coord call, so it must be short; past it the answer is
 /// [`CwdTenant::Unknown`], which is true.
 pub const CWD_TENANT_BUDGET: Duration = Duration::from_secs(10);
@@ -762,11 +953,15 @@ fn display_remote(url: &str) -> String {
     }
 }
 
-/// Project one repo probe and one canonical-repo lookup into a [`CwdTenant`].
-/// Pure, so every arm is a unit test.
+/// Project one repo probe and one tenants-for-repo answer into a
+/// [`CwdTenant`]. Pure, so every arm is a unit test.
+///
+/// `answer` is the `GET /coord/repos/tenants` read for the probe's slug; it is
+/// consulted only for [`RepoProbe::Slug`] (every other probe arm answers
+/// without coord).
 pub fn classify_cwd_tenant(
     probe: &RepoProbe,
-    repos: Result<&CanonicalRepos, &str>,
+    answer: Result<&RepoTenantsAnswer, &str>,
     observed_at: &str,
 ) -> CwdTenant {
     let slug = match probe {
@@ -779,34 +974,42 @@ pub fn classify_cwd_tenant(
         }
         RepoProbe::Slug(slug) => slug,
     };
-    let repos = match repos {
-        Ok(r) => r,
-        // Coord did not answer: UNKNOWN, never "unregistered".
+    let answer = match answer {
+        Ok(a) => a,
+        // Coord did not answer (unreachable, a 403/503, a 404 from a coord that
+        // predates the door, an unparseable body): UNKNOWN, never
+        // "unregistered".
         Err(e) => {
-            return CwdTenant::unknown_transient(format!("coord repo registry unreadable: {e}"))
+            return CwdTenant::unknown_transient(format!("coord tenants-for-repo unreadable: {e}"))
         }
     };
-    let Some(owners) = repos.get(slug) else {
-        return CwdTenant::RepoUnregistered { repo: slug.clone() };
-    };
-    if !owners.malformed.is_empty() {
+    // Coord echoes its normalized spelling of what was asked. An answer for a
+    // DIFFERENT repo establishes nothing about this one.
+    if !answer.repo.eq_ignore_ascii_case(slug) {
         return CwdTenant::unknown_transient(format!(
-            "coord served an unparseable tenant id for {slug}: {}",
-            owners.malformed.join(", ")
+            "coord tenants-for-repo answered for {} when asked about {slug}",
+            answer.repo
         ));
     }
-    match owners.tenants.as_slice() {
-        [] => CwdTenant::RepoUnregistered { repo: slug.clone() },
-        [t] => CwdTenant::Resolved {
+    match (answer.status, answer.tenants.as_slice()) {
+        (RepoTenantsStatus::Resolved, [t]) => CwdTenant::Resolved {
             tenant_id: *t,
             repo: slug.clone(),
-            source: "canonical_repos".to_string(),
+            source: REPO_TENANTS_SOURCE.to_string(),
             observed_at: observed_at.to_string(),
         },
-        several => CwdTenant::Several {
+        (RepoTenantsStatus::None, []) => CwdTenant::RepoUnregistered { repo: slug.clone() },
+        (RepoTenantsStatus::Several, several) if several.len() >= 2 => CwdTenant::Several {
             repo: slug.clone(),
             tenant_ids: several.to_vec(),
         },
+        // `parse_repo_tenants` refuses these shapes; a hand-built answer that
+        // carries one is still not something to pick from.
+        (status, tenants) => CwdTenant::unknown_transient(format!(
+            "coord tenants-for-repo answer is inconsistent for {slug}: status {status:?} with {} \
+             tenant(s)",
+            tenants.len()
+        )),
     }
 }
 
@@ -815,15 +1018,19 @@ pub fn classify_cwd_tenant(
 /// runs on the blocking pool), and never throwing: every failure is an
 /// [`CwdTenant::Unknown`] naming itself.
 pub async fn cwd_tenant_for_path(path: &Path) -> CwdTenant {
-    cwd_tenant_with(path, CWD_TENANT_BUDGET, canonical_repos).await
+    cwd_tenant_with(path, CWD_TENANT_BUDGET, |slug| async move {
+        repo_tenants_for_slug(&slug).await
+    })
+    .await
 }
 
 /// [`cwd_tenant_for_path`] with the budget and the coord read injected, so the
-/// timeout and the coord-failure arm are testable without a network.
+/// timeout and the coord-failure arm are testable without a network. `fetch`
+/// receives the probed slug.
 async fn cwd_tenant_with<F, Fut>(path: &Path, budget: Duration, fetch: F) -> CwdTenant
 where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<CanonicalRepos, String>>,
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<RepoTenantsAnswer, String>>,
 {
     let resolve = async {
         // A session's workdir is a DIRECTORY. One that does not exist says
@@ -845,7 +1052,7 @@ where
         }
         let probe = REPO_PROBES
             .lookup(
-                &dir,
+                dir.as_path(),
                 Instant::now(),
                 || async {
                     let probe_dir = dir.clone();
@@ -864,11 +1071,15 @@ where
         let observed_at = chrono::Utc::now().to_rfc3339();
         match &probe {
             // Only a slug needs coord at all.
-            RepoProbe::Slug(_) => {
-                let repos = fetch().await;
-                classify_cwd_tenant(&probe, repos.as_ref().map_err(|e| e.as_str()), &observed_at)
+            RepoProbe::Slug(slug) => {
+                let answer = fetch(slug.clone()).await;
+                classify_cwd_tenant(
+                    &probe,
+                    answer.as_ref().map_err(|e| e.as_str()),
+                    &observed_at,
+                )
             }
-            _ => classify_cwd_tenant(&probe, Ok(&CanonicalRepos::new()), &observed_at),
+            _ => classify_cwd_tenant(&probe, Err("not consulted"), &observed_at),
         }
     };
     match tokio::time::timeout(budget, resolve).await {
@@ -884,10 +1095,10 @@ where
 /// picker, which may be handed a slug instead of a directory.
 pub async fn cwd_tenant_for_slug(slug: &str) -> CwdTenant {
     let observed_at = chrono::Utc::now().to_rfc3339();
-    let repos = canonical_repos().await;
+    let answer = repo_tenants_for_slug(slug).await;
     classify_cwd_tenant(
         &RepoProbe::Slug(slug.to_string()),
-        repos.as_ref().map_err(|e| e.as_str()),
+        answer.as_ref().map_err(|e| e.as_str()),
         &observed_at,
     )
 }
@@ -989,17 +1200,17 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(m["a/b"].malformed, vec!["7".to_string()]);
-        assert!(matches!(
-            classify_cwd_tenant(&RepoProbe::Slug("a/b".into()), Ok(&m), "t0"),
-            CwdTenant::Unknown { .. }
-        ));
+        assert_eq!(
+            super::scope_from_lookup(Ok(&m), "a/b", &|_| true),
+            TenantScope::Unresolved
+        );
     }
 
     #[test]
     fn an_scp_remote_never_shows_what_precedes_the_at() {
         let t = classify_cwd_tenant(
             &RepoProbe::NotGithub("me:s3cret@gitlab.example:acme/x.git".into()),
-            Ok(&CanonicalRepos::new()),
+            Err("not consulted"),
             "t0",
         );
         match t {
@@ -1391,26 +1602,140 @@ mod tests {
         RepoProbe::Slug(s.to_string())
     }
 
+    /// A `GET /coord/repos/tenants` 200 body exactly as coord's `render_body`
+    /// builds it (`repo_tenants_read.rs`).
+    fn repo_tenants_body(repo: &str, status: &str, ids: &[&str]) -> serde_json::Value {
+        let tenants: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|t| serde_json::json!({ "tenant_id": t, "tenant_slug": "acme", "role": "owner" }))
+            .collect();
+        serde_json::json!({
+            "repo": repo,
+            "status": status,
+            "tenants": tenants,
+            "scope": "device_bindings",
+            "source": "coord.tenant_repos",
+            "observed_at": "2026-10-11T10:00:00+00:00",
+        })
+    }
+
+    fn answer(repo: &str, status: &str, ids: &[&str]) -> RepoTenantsAnswer {
+        parse_repo_tenants(&repo_tenants_body(repo, status, ids)).unwrap()
+    }
+
     #[test]
-    fn a_single_owner_resolves_even_for_a_tenant_this_device_is_not_bound_to() {
-        // The expectation is an observation, not a credential: no binding gate.
-        let m = map(&[("acme/pizzeria", Some(T1))]);
+    fn repo_tenants_body_parses_for_each_status() {
+        let one = answer("acme/pizzeria", "resolved", &[T1]);
+        assert_eq!(one.status, RepoTenantsStatus::Resolved);
+        assert_eq!(one.tenants, vec![Uuid::parse_str(T1).unwrap()]);
+        let none = answer("acme/pizzeria", "none", &[]);
+        assert_eq!(none.status, RepoTenantsStatus::None);
+        assert!(none.tenants.is_empty());
+        let several = answer("acme/shared", "several", &[T1, T2]);
+        assert_eq!(several.status, RepoTenantsStatus::Several);
         assert_eq!(
-            classify_cwd_tenant(&slug("acme/pizzeria"), Ok(&m), "t0"),
+            several.tenants,
+            vec![Uuid::parse_str(T1).unwrap(), Uuid::parse_str(T2).unwrap()]
+        );
+        // A null slug and role (coord could not read them) are not a refusal.
+        let nulls = serde_json::json!({
+            "repo": "a/b", "status": "resolved",
+            "tenants": [{ "tenant_id": T1, "tenant_slug": null, "role": null }],
+        });
+        assert!(parse_repo_tenants(&nulls).is_ok());
+    }
+
+    /// A 2xx in a shape we do not understand established nothing: never an
+    /// empty answer that would read on as "no tenant owns this".
+    #[test]
+    fn a_misshapen_repo_tenants_body_is_an_error_not_none() {
+        let ok = repo_tenants_body("a/b", "resolved", &[T1]);
+        let mut cases = Vec::new();
+        for key in ["repo", "status", "tenants"] {
+            let mut b = ok.clone();
+            b.as_object_mut().unwrap().remove(key);
+            cases.push((format!("missing {key}"), b));
+        }
+        cases.push((
+            "unknown status".into(),
+            repo_tenants_body("a/b", "maybe", &[T1]),
+        ));
+        cases.push((
+            "unparseable tenant id".into(),
+            repo_tenants_body("a/b", "resolved", &["nope"]),
+        ));
+        cases.push((
+            "resolved with two tenants".into(),
+            repo_tenants_body("a/b", "resolved", &[T1, T2]),
+        ));
+        cases.push((
+            "none with a tenant".into(),
+            repo_tenants_body("a/b", "none", &[T1]),
+        ));
+        cases.push((
+            "several with one tenant".into(),
+            repo_tenants_body("a/b", "several", &[T1]),
+        ));
+        cases.push((
+            "several that is one tenant twice".into(),
+            repo_tenants_body("a/b", "several", &[T1, T1]),
+        ));
+        for (what, body) in cases {
+            assert!(
+                parse_repo_tenants(&body).is_err(),
+                "{what} must be an error"
+            );
+        }
+    }
+
+    /// Every non-2xx is UNKNOWN with its typed code — and a 404 names the
+    /// predating coord rather than reading as "no tenant".
+    #[test]
+    fn a_refused_repo_tenants_read_names_its_code() {
+        let e = repo_tenants_refusal(
+            503,
+            &serde_json::json!({ "error": "tenant_repos_unavailable" }),
+        );
+        assert!(
+            e.contains("503") && e.contains("tenant_repos_unavailable"),
+            "{e}"
+        );
+        let e = repo_tenants_refusal(
+            403,
+            &serde_json::json!({ "error": "unproven_device_principal" }),
+        );
+        assert!(e.contains("unproven_device_principal"), "{e}");
+        let e = repo_tenants_refusal(404, &serde_json::Value::Null);
+        assert!(e.contains("predates"), "{e}");
+        let e = repo_tenants_refusal(500, &serde_json::Value::Null);
+        assert!(e.contains("500"), "{e}");
+    }
+
+    #[test]
+    fn a_resolved_answer_classifies_as_resolved_from_tenant_repos() {
+        let a = answer("acme/pizzeria", "resolved", &[T1]);
+        assert_eq!(
+            classify_cwd_tenant(&slug("acme/pizzeria"), Ok(&a), "t0"),
             CwdTenant::Resolved {
                 tenant_id: Uuid::parse_str(T1).unwrap(),
                 repo: "acme/pizzeria".to_string(),
-                source: "canonical_repos".to_string(),
+                source: REPO_TENANTS_SOURCE.to_string(),
                 observed_at: "t0".to_string(),
             }
         );
+        // coord echoes its lowercase normalization; the asked spelling is kept.
+        let a = answer("acme/pizzeria", "resolved", &[T1]);
+        assert!(matches!(
+            classify_cwd_tenant(&slug("Acme/Pizzeria"), Ok(&a), "t0"),
+            CwdTenant::Resolved { repo, .. } if repo == "Acme/Pizzeria"
+        ));
     }
 
     #[test]
     fn several_owners_classify_as_several_with_every_id() {
-        let m = map(&[("acme/shared", Some(T1)), ("acme/shared", Some(T2))]);
+        let a = answer("acme/shared", "several", &[T1, T2]);
         assert_eq!(
-            classify_cwd_tenant(&slug("acme/shared"), Ok(&m), "t0"),
+            classify_cwd_tenant(&slug("acme/shared"), Ok(&a), "t0"),
             CwdTenant::Several {
                 repo: "acme/shared".to_string(),
                 tenant_ids: vec![Uuid::parse_str(T1).unwrap(), Uuid::parse_str(T2).unwrap()],
@@ -1418,52 +1743,70 @@ mod tests {
         );
     }
 
+    /// `none` covers unregistered, unowned and foreign-owned alike: coord
+    /// answered "no tenant of yours".
     #[test]
-    fn absent_and_unowned_repos_are_unregistered() {
-        let m = map(&[("acme/unscoped", None)]);
-        for s in ["acme/unscoped", "acme/absent"] {
-            assert_eq!(
-                classify_cwd_tenant(&slug(s), Ok(&m), "t0"),
-                CwdTenant::RepoUnregistered {
-                    repo: s.to_string()
-                }
-            );
-        }
+    fn a_none_answer_is_unregistered() {
+        let a = answer("acme/absent", "none", &[]);
+        assert_eq!(
+            classify_cwd_tenant(&slug("acme/absent"), Ok(&a), "t0"),
+            CwdTenant::RepoUnregistered {
+                repo: "acme/absent".to_string()
+            }
+        );
     }
 
     /// THE acceptance arm: coord unreachable is UNKNOWN, never
     /// "unregistered" — the two used to render identically.
     #[test]
     fn a_coord_failure_is_unknown_not_unregistered() {
-        let t = classify_cwd_tenant(
-            &slug("acme/pizzeria"),
-            Err("GET /coord/canonical-repos: connection refused"),
-            "t0",
-        );
-        match t {
-            CwdTenant::Unknown { reason, .. } => assert!(reason.contains("connection refused")),
-            other => panic!("coord unreachable must be Unknown, got {other:?}"),
+        for err in [
+            "GET /coord/repos/tenants: connection refused",
+            "GET /coord/repos/tenants returned 503 (tenant_repos_unavailable)",
+            "GET /coord/repos/tenants returned 404 — this coord predates the tenants-for-repo door",
+        ] {
+            match classify_cwd_tenant(&slug("acme/pizzeria"), Err(err), "t0") {
+                CwdTenant::Unknown { reason, transient } => {
+                    assert!(reason.contains(err), "{reason}");
+                    assert!(transient, "a coord failure may clear by itself");
+                }
+                other => panic!("coord failure must be Unknown, got {other:?}"),
+            }
         }
     }
 
+    /// An answer for a different repo establishes nothing about this one, and
+    /// an answer whose count contradicts its status is not picked from.
     #[test]
-    fn an_unparseable_owner_is_unknown_not_a_pick_among_the_rest() {
-        let m = map(&[("acme/bad", Some(T1)), ("acme/bad", Some("nope"))]);
+    fn a_mismatched_or_inconsistent_answer_is_unknown() {
+        let other = answer("acme/other", "resolved", &[T1]);
         assert!(matches!(
-            classify_cwd_tenant(&slug("acme/bad"), Ok(&m), "t0"),
+            classify_cwd_tenant(&slug("acme/pizzeria"), Ok(&other), "t0"),
+            CwdTenant::Unknown { .. }
+        ));
+        let hand_built = RepoTenantsAnswer {
+            repo: "acme/pizzeria".into(),
+            status: RepoTenantsStatus::Resolved,
+            tenants: vec![Uuid::parse_str(T1).unwrap(), Uuid::parse_str(T2).unwrap()],
+        };
+        assert!(matches!(
+            classify_cwd_tenant(&slug("acme/pizzeria"), Ok(&hand_built), "t0"),
             CwdTenant::Unknown { .. }
         ));
     }
 
     #[test]
     fn git_failure_is_unknown_and_no_checkout_is_no_repo() {
-        let m = CanonicalRepos::new();
         assert_eq!(
-            classify_cwd_tenant(&RepoProbe::NotACheckout, Ok(&m), "t0"),
+            classify_cwd_tenant(&RepoProbe::NotACheckout, Err("not consulted"), "t0"),
             CwdTenant::NoRepo
         );
         assert!(matches!(
-            classify_cwd_tenant(&RepoProbe::Failed("timed out".into()), Ok(&m), "t0"),
+            classify_cwd_tenant(
+                &RepoProbe::Failed("timed out".into()),
+                Err("not consulted"),
+                "t0"
+            ),
             CwdTenant::Unknown { .. }
         ));
     }
@@ -1474,7 +1817,7 @@ mod tests {
     fn a_non_github_remote_is_unregistered_and_redacted() {
         let t = classify_cwd_tenant(
             &RepoProbe::NotGithub("https://user:s3cret@gitlab.com/acme/x.git".into()),
-            Ok(&CanonicalRepos::new()),
+            Err("not consulted"),
             "t0",
         );
         match t {
@@ -1513,8 +1856,8 @@ mod tests {
     #[tokio::test]
     async fn the_resolver_reports_coord_unreachable_as_unknown() {
         let Some(d) = github_checkout() else { return };
-        let t = cwd_tenant_with(d.path(), Duration::from_secs(10), || async {
-            Err("GET /coord/canonical-repos: connection refused".to_string())
+        let t = cwd_tenant_with(d.path(), Duration::from_secs(10), |_| async {
+            Err("GET /coord/repos/tenants: connection refused".to_string())
         })
         .await;
         assert!(
@@ -1523,20 +1866,31 @@ mod tests {
         );
 
         // And the same checkout with coord answering resolves.
-        let t = cwd_tenant_with(d.path(), Duration::from_secs(10), || async {
-            Ok(map(&[("acme/pizzeria", Some(T1))]))
+        // The resolver asks coord about the probed slug.
+        let t = cwd_tenant_with(d.path(), Duration::from_secs(10), |slug| async move {
+            assert_eq!(slug, "acme/pizzeria");
+            Ok(answer("acme/pizzeria", "resolved", &[T1]))
         })
         .await;
-        assert!(matches!(t, CwdTenant::Resolved { .. }), "{t:?}");
+        assert!(
+            matches!(&t, CwdTenant::Resolved { source, .. } if source == REPO_TENANTS_SOURCE),
+            "{t:?}"
+        );
+        // A `none` from the door is unregistered, end to end.
+        let t = cwd_tenant_with(d.path(), Duration::from_secs(10), |_| async {
+            Ok(answer("acme/pizzeria", "none", &[]))
+        })
+        .await;
+        assert!(matches!(t, CwdTenant::RepoUnregistered { .. }), "{t:?}");
     }
 
     #[tokio::test]
     async fn the_resolver_is_bounded() {
         let Some(d) = github_checkout() else { return };
         // A stalled coord read must end as Unknown inside the budget.
-        let t = cwd_tenant_with(d.path(), Duration::from_millis(1500), || async {
+        let t = cwd_tenant_with(d.path(), Duration::from_millis(1500), |_| async {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok(CanonicalRepos::new())
+            Ok(answer("acme/pizzeria", "none", &[]))
         })
         .await;
         assert!(
@@ -1551,7 +1905,7 @@ mod tests {
     async fn a_nonexistent_workdir_is_unknown_not_its_parent() {
         let Some(d) = github_checkout() else { return };
         let gone = d.path().join("deleted-subdir");
-        let t = cwd_tenant_with(&gone, Duration::from_secs(5), || async {
+        let t = cwd_tenant_with(&gone, Duration::from_secs(5), |_| async {
             Err("must not be asked".to_string())
         })
         .await;
@@ -1564,7 +1918,7 @@ mod tests {
 
     #[test]
     fn the_coord_read_times_out_inside_the_resolver_budget() {
-        assert!(CANONICAL_REPOS_HTTP_TIMEOUT + CWD_REMOTE_PROBE_BUDGET < CWD_TENANT_BUDGET);
+        assert!(REPO_TENANTS_HTTP_TIMEOUT + CWD_REMOTE_PROBE_BUDGET < CWD_TENANT_BUDGET);
     }
 
     /// A cold burst of concurrent reads costs ONE coord fetch.
@@ -1630,6 +1984,58 @@ mod tests {
         );
     }
 
+    /// The per-repo tenants cache keeps an answer for its TTL (one coord read
+    /// per repo for a burst of spawns) but never an `Err`: a coord failure is
+    /// UNKNOWN and the next caller asks again.
+    #[tokio::test]
+    async fn the_repo_tenants_cache_keeps_answers_never_failures() {
+        let cache: KeyCache<String, Result<RepoTenantsAnswer, String>> =
+            KeyCache::new(Duration::from_secs(60));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let now = Instant::now();
+        let ok = |r: &Result<RepoTenantsAnswer, String>| r.is_ok();
+        let fetch = |out: Result<RepoTenantsAnswer, String>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { out }
+        };
+        let got = cache
+            .lookup("acme/x", now, || fetch(Err("503".into())), ok)
+            .await;
+        assert!(got.is_err());
+        let got = cache
+            .lookup(
+                "acme/x",
+                now,
+                || fetch(Ok(answer("acme/x", "resolved", &[T1]))),
+                ok,
+            )
+            .await;
+        assert!(got.is_ok(), "the failure was not cached");
+        let got = cache
+            .lookup(
+                "acme/x",
+                now + Duration::from_secs(59),
+                || fetch(Err("x".into())),
+                ok,
+            )
+            .await;
+        assert!(got.is_ok(), "the answer was cached for the TTL");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = cache
+            .lookup(
+                "acme/x",
+                now + Duration::from_secs(60),
+                || fetch(Err("x".into())),
+                ok,
+            )
+            .await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "past the TTL coord is asked again"
+        );
+    }
+
     #[test]
     fn display_remote_keeps_path_ats_and_drops_query_strings() {
         assert_eq!(
@@ -1666,7 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn a_directory_outside_any_checkout_is_no_repo() {
         let d = tempfile::tempdir().unwrap();
-        let t = cwd_tenant_with(d.path(), Duration::from_secs(5), || async {
+        let t = cwd_tenant_with(d.path(), Duration::from_secs(5), |_| async {
             Err("must not be asked".to_string())
         })
         .await;
