@@ -1,0 +1,60 @@
+name: benchmark-ipc selftest
+
+# Pins scripts/benchmark-ipc.py's refusal to reach the primary runner implicitly
+# (scripts/tests/test_benchmark_ipc.py).
+#
+# WHY IT EXISTS. benchmark-ipc.py fires several hundred requests at a runner's
+# HTTP API. It used to default --runner-url to the PRIMARY runner on :9876,
+# which hosts the operator's live sessions — exactly the instance served policy
+# production-and-cost runner-lifecycle forbids disturbing. It now refuses to run
+# without an explicit --runner-url, and warns when that URL names :9876, the way
+# scripts/perf-harness.mjs refuses PRIMARY_RUNNER_PORT. Every existing Python
+# test in this repo is run by a step that names its file, and nothing discovers
+# new ones, so without this workflow the refusal's test would never run in CI.
+# Plan 2026-10-11-terminal-page-performance-kpis-across-setups, Phase 6.
+#
+# Hermetic: standard library only — no runner, no network, no httpx — so it runs
+# on `push` to main as well and has a baseline coord can read.
+#
+# NOT a merge gate, like ci-timeout-marker-selftest.yml: it is deliberately
+# absent from the repo ruleset's required contexts. It IS inside
+# ci-integrity.yml's scope (`.github/workflows/**`), so the PR that adds or edits
+# this file needs `ci:gate-change=declared`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/benchmark-ipc.py"
+      - "scripts/tests/test_benchmark_ipc.py"
+      - ".github/workflows/benchmark-ipc-selftest.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/benchmark-ipc.py"
+      - "scripts/tests/test_benchmark_ipc.py"
+      - ".github/workflows/benchmark-ipc-selftest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Copied verbatim from ci.yml — see ci-timeout-marker-selftest.yml's header for
+# why the group is one expression keyed this way (first-attempt PR runs
+# supersede per PR; every other run is its own group).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  selftest:
+    name: benchmark-ipc selftest
+    runs-on: ubuntu-latest
+    # A checkout plus five sub-second unittest cases.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Test benchmark-ipc's primary-runner refusal (no runner, no network)
+        shell: bash
+        run: python3 -m unittest -v scripts/tests/test_benchmark_ipc.py
