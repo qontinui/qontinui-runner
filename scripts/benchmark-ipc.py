@@ -6,27 +6,90 @@ Measures the round-trip latency of IPC communication between Rust and Python
 by calling various endpoints through the runner's HTTP API.
 
 Usage:
-    python benchmark-ipc.py [--iterations N] [--runner-url URL]
+    python benchmark-ipc.py --runner-url URL [--iterations N] [--warmup N]
+
+Which runner:
+    There is no default target. The old default was the primary runner on
+    port 9876, the runner hosting the operator's live sessions, and a
+    benchmark there loads those sessions while measuring a busy runner. So
+    the script refuses to reach port 9876 implicitly, the way
+    scripts/perf-harness.mjs refuses PRIMARY_RUNNER_PORT. Benchmark a temp
+    runner: spawn one through the dev supervisor
+    (POST http://127.0.0.1:9875/runners/spawn-test, ports 9877-9899) and pass
+    its URL. To benchmark the primary on purpose, name it explicitly:
+    --runner-url http://127.0.0.1:9876.
 
 Requirements:
-    - Runner must be running on the specified URL (default: http://localhost:9876)
-    - httpx must be installed: pip install httpx
+    - The runner at --runner-url must be running.
+    - httpx must be installed: pip install httpx (only needed once a target
+      has been accepted; the refusal itself needs nothing beyond Python).
 
 Results:
     Prints statistics including min, max, mean, median, p95, p99 latencies.
+
+Exit status:
+    0 on a completed run, 1 when the runner cannot be reached or httpx is
+    missing, 2 when the target is refused or is not an http(s) URL.
 """
+
+from __future__ import annotations
 
 import argparse
 import statistics
 import sys
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-try:
+if TYPE_CHECKING:
     import httpx
-except ImportError:
-    print("Error: httpx is required. Install with: pip install httpx")
-    sys.exit(1)
+
+#: The primary runner's port. The script never targets it implicitly.
+PRIMARY_RUNNER_PORT = 9876
+
+#: Exit status for a refused or unusable target.
+EXIT_TARGET_REFUSED = 2
+
+
+class TargetRefused(Exception):
+    """The benchmark target was refused before any request was sent."""
+
+
+def resolve_target(runner_url: str | None) -> str:
+    """Return the runner base URL to benchmark, or raise ``TargetRefused``.
+
+    ``runner_url`` is the operator's ``--runner-url``, or ``None`` when it was
+    not passed. Omitting it would reach the old default, the primary runner,
+    so that is refused. An explicit URL is accepted, port 9876 included: the
+    operator named the port, which is the override.
+    """
+    if runner_url is None:
+        raise TargetRefused(
+            f"refusing to default to port {PRIMARY_RUNNER_PORT}: that is the primary "
+            "runner, which hosts live sessions, and a benchmark there both loads "
+            "them and measures a busy runner. Benchmark a temp runner instead: "
+            "spawn one through the dev supervisor "
+            "(POST http://127.0.0.1:9875/runners/spawn-test) and pass its URL, "
+            "e.g. --runner-url http://127.0.0.1:9877. To benchmark the primary on "
+            f"purpose, pass it explicitly: --runner-url http://127.0.0.1:{PRIMARY_RUNNER_PORT}"
+        )
+    parts = urlsplit(runner_url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise TargetRefused(
+            f"--runner-url {runner_url!r} is not an http(s) URL with a host, "
+            "e.g. http://127.0.0.1:9877"
+        )
+    try:
+        parts.port
+    except ValueError as e:
+        raise TargetRefused(f"--runner-url {runner_url!r} has an invalid port: {e}") from e
+    return runner_url
+
+
+def targets_primary(runner_url: str) -> bool:
+    """True when an accepted ``runner_url`` names the primary runner's port."""
+    return urlsplit(runner_url).port == PRIMARY_RUNNER_PORT
 
 
 @dataclass
@@ -196,7 +259,7 @@ def benchmark_executor_status(client: httpx.Client, iterations: int) -> Benchmar
     )
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Benchmark IPC latency between Rust and Python"
     )
@@ -211,8 +274,13 @@ def main():
         "--runner-url",
         "-u",
         type=str,
-        default="http://localhost:9876",
-        help="Runner HTTP API URL (default: http://localhost:9876)",
+        default=None,
+        help=(
+            "Runner HTTP API URL to benchmark, e.g. a temp runner at "
+            "http://127.0.0.1:9877. Required: there is no default, and port "
+            f"{PRIMARY_RUNNER_PORT} (the primary runner) is reached only when "
+            "named here explicitly."
+        ),
     )
     parser.add_argument(
         "--warmup",
@@ -221,18 +289,26 @@ def main():
         default=10,
         help="Number of warmup iterations (default: 10)",
     )
+    return parser
 
-    args = parser.parse_args()
 
-    print(f"IPC Latency Benchmark")
-    print(f"=====================")
-    print(f"Runner URL: {args.runner_url}")
-    print(f"Iterations: {args.iterations}")
-    print(f"Warmup: {args.warmup}")
+def run_benchmarks(runner_url: str, iterations: int, warmup: int) -> int:
+    """Run every benchmark against ``runner_url`` and print the report."""
+    try:
+        import httpx
+    except ImportError:
+        print("Error: httpx is required. Install with: pip install httpx")
+        return 1
+
+    print("IPC Latency Benchmark")
+    print("=====================")
+    print(f"Runner URL: {runner_url}")
+    print(f"Iterations: {iterations}")
+    print(f"Warmup: {warmup}")
 
     # Create client with keep-alive
     with httpx.Client(
-        base_url=args.runner_url,
+        base_url=runner_url,
         timeout=30.0,
         limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
     ) as client:
@@ -241,17 +317,17 @@ def main():
             response = client.get("/health")
             if response.status_code != 200:
                 print(f"\nError: Runner health check failed: {response.status_code}")
-                sys.exit(1)
+                return 1
         except httpx.ConnectError:
-            print(f"\nError: Cannot connect to runner at {args.runner_url}")
+            print(f"\nError: Cannot connect to runner at {runner_url}")
             print("Make sure the runner is running.")
-            sys.exit(1)
+            return 1
 
         print("\nRunner connected successfully.")
 
         # Warmup
-        print(f"\nWarming up ({args.warmup} iterations)...")
-        for _ in range(args.warmup):
+        print(f"\nWarming up ({warmup} iterations)...")
+        for _ in range(warmup):
             client.get("/health")
             client.get("/status")
         print("Warmup complete.")
@@ -263,19 +339,19 @@ def main():
 
         # 1. Health check (Rust only - baseline)
         print("  - Health check (baseline)...")
-        results.append(benchmark_health_check(client, args.iterations))
+        results.append(benchmark_health_check(client, iterations))
 
         # 2. Status (Rust + Python IPC)
         print("  - Status (IPC)...")
-        results.append(benchmark_status(client, args.iterations))
+        results.append(benchmark_status(client, iterations))
 
         # 3. Models list (Rust + Python IPC)
         print("  - Models list (IPC)...")
-        results.append(benchmark_models_list(client, args.iterations))
+        results.append(benchmark_models_list(client, iterations))
 
         # 4. Executor status (Rust + Python IPC)
         print("  - Executor status (IPC)...")
-        results.append(benchmark_executor_status(client, args.iterations))
+        results.append(benchmark_executor_status(client, iterations))
 
         # Print results
         print("\n" + "=" * 60)
@@ -304,13 +380,31 @@ def main():
             print("TARGET ASSESSMENT")
             print("=" * 60)
             target_met = all(r.median_ms < 10 for r in results[1:])
-            print(f"  Target: IPC latency < 10ms for simple operations")
+            print("  Target: IPC latency < 10ms for simple operations")
             print(f"  Status: {'PASS' if target_met else 'NEEDS INVESTIGATION'}")
 
             for result in results[1:]:
                 status = "PASS" if result.median_ms < 10 else "SLOW"
                 print(f"    {result.operation}: {result.median_ms:.3f} ms [{status}]")
 
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        runner_url = resolve_target(args.runner_url)
+    except TargetRefused as e:
+        print(f"benchmark-ipc: {e}", file=sys.stderr)
+        return EXIT_TARGET_REFUSED
+    if targets_primary(runner_url):
+        print(
+            f"benchmark-ipc: benchmarking the PRIMARY runner on port {PRIMARY_RUNNER_PORT} "
+            "because --runner-url named it explicitly.",
+            file=sys.stderr,
+        )
+    return run_benchmarks(runner_url, args.iterations, args.warmup)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
