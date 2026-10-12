@@ -5502,7 +5502,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
     // Each binding's expectation (plan 2026-09-20-a-sessions-tenant-follows-
     // its-repo… Phase 2), built BEFORE the registry lock: the caller-named half
     // reads the workspace declaration files. The cwd half is restored VERBATIM
-    // — the spawn-time expectation, never re-resolved (F2) — and an entry
+    // — the spawn-time expectation, never re-resolved (F2) — for every variant
+    // EXCEPT `Unknown`, which restores pending and is re-resolved (it describes
+    // the credential / coord build that measured it, not the repo); an entry
     // persisted without one says so rather than guessing.
     let persisted: Vec<_> = persisted
         .into_iter()
