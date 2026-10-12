@@ -1029,7 +1029,7 @@ fn one_late_frame_does_not_make_the_probe_behind() {
 }
 
 #[test]
-fn below_twenty_frames_one_outlier_is_tolerated_and_two_are_not() {
+fn from_ten_to_twenty_frames_one_outlier_is_tolerated_and_below_ten_there_is_no_verdict() {
     let mut lags = vec![4u64; 9];
     lags.push(300);
     let h = health_of(&lags);
@@ -1039,10 +1039,10 @@ fn below_twenty_frames_one_outlier_is_tolerated_and_two_are_not() {
     let h = health_of(&lags);
     assert_eq!(h.behind, Some(true), "{h:?}");
     assert_eq!(h.lag_ms_judged, Some(200.0));
-    // A lone frame is judged as it is.
-    let h = health_of(&[80]);
-    assert_eq!(
-        (h.lag_statistic, h.behind),
-        (Some("only_frame"), Some(true))
-    );
+    // Below ten frames with a known lag there is no verdict at all: one
+    // outlier in two would be half the frames late.
+    for lags in [&[4u64, 300][..], &[80], &[4; 9]] {
+        let h = health_of(lags);
+        assert_eq!((h.lag_statistic, h.behind), (None, None), "{lags:?}: {h:?}");
+    }
 }

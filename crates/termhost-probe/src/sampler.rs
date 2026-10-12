@@ -24,6 +24,14 @@
 //! is a generator, with the session its slot file names, because a generator
 //! killed without writing its `exit` record must end its session's marker
 //! schedule — otherwise its overdue markers read as a host hang.
+//!
+//! A read that fails is an exit only when the process is GONE: the reader
+//! says so, or a fresh process-table read for that pid finds it absent (or
+//! a different process under the pid). A process still in the table whose
+//! read fails is an unreadable member and withholds the group's numbers. On
+//! Linux that includes a ZOMBIE host member — exited but not yet reaped by
+//! its parent: it stays in `/proc` while its memory reads fail, so it reads
+//! as unreadable, not exited, until its parent reaps it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -882,6 +890,82 @@ mod tests {
         let mut after = table();
         after.remove(&101);
         assert!(s.sample_table(&after, 500_000_000).exited.is_empty());
+    }
+
+    /// A reader that answers `gone` with "don't know" — like the Windows
+    /// and Linux readers — so the sampler's own process-table re-read
+    /// decides, and whose reads of `failing` pids fail.
+    struct TableDecides {
+        failing: Vec<u32>,
+    }
+
+    impl ProcessReader for TableDecides {
+        fn cpu_ns(&mut self, pid: u32) -> Option<u64> {
+            (!self.failing.contains(&pid)).then_some(0)
+        }
+        fn memory(&mut self, pid: u32) -> Option<crate::platform::ProcMem> {
+            (!self.failing.contains(&pid)).then_some(crate::platform::ProcMem {
+                catalog_bytes: 1_048_576,
+                rss_bytes: 1_048_576,
+            })
+        }
+        fn gpu(&mut self) -> GpuReading {
+            GpuReading::Unsupported("test".into())
+        }
+    }
+
+    #[test]
+    fn without_the_readers_word_the_process_table_decides_gone_or_unreadable() {
+        // This test process is alive, under its real start time; the other
+        // pid exists nowhere. Both reads fail.
+        let me = std::process::id();
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let start = sys
+            .process(sysinfo::Pid::from_u32(me))
+            .expect("this process")
+            .start_time();
+        let absent = u32::MAX - 11;
+        let mut t = BTreeMap::new();
+        t.insert(
+            absent,
+            ProcInfo {
+                start_time: 7,
+                ..p(Some(me), "gone.exe", &[])
+            },
+        );
+        let run = |failing: Vec<u32>| {
+            let mut s = Sampler::new(
+                SamplerConfig {
+                    host_pids: vec![me, absent],
+                    ..SamplerConfig::default()
+                },
+                Box::new(TableDecides { failing }),
+            );
+            let mut table = t.clone();
+            table.insert(
+                me,
+                ProcInfo {
+                    start_time: start,
+                    ..p(None, "probe", &[])
+                },
+            );
+            s.sample_table(&table, 0)
+        };
+        // A pid absent from a fresh table: exited, and the group is whole.
+        let rec = run(vec![absent]);
+        let host = &rec.groups[GROUP_HOST];
+        assert_eq!(host.note, None, "{host:?}");
+        assert_eq!(host.pids, vec![me]);
+        assert_eq!(
+            rec.exited.iter().map(|e| e.pid).collect::<Vec<_>>(),
+            vec![absent]
+        );
+        // A pid still present whose read fails: unreadable, not exited.
+        let rec = run(vec![me]);
+        let host = &rec.groups[GROUP_HOST];
+        assert_eq!(host.note, Some(NOTE_UNREADABLE), "{host:?}");
+        assert!(rec.exited.is_empty(), "{:?}", rec.exited);
     }
 
     #[test]

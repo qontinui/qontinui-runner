@@ -250,6 +250,9 @@ pub struct Model {
     finished: bool,
 }
 
+/// Below this many frames with a known lag, `behind` gives no verdict.
+pub const LAG_VERDICT_MIN_FRAMES: usize = 10;
+
 /// From this many frames with a known lag, `behind` judges their p95.
 pub const LAG_P95_MIN_FRAMES: usize = 20;
 
@@ -730,12 +733,12 @@ impl Model {
         scans.sort_unstable();
         // Judged on a statistic one late frame cannot decide: a scheduler
         // hiccup or one slow staging copy is not a probe that fell behind.
-        // p95 from 20 frames (it tolerates one late frame in 20); below that
-        // the second-largest lag (one outlier tolerated); a lone frame is
-        // judged as it is.
+        // p95 from 20 frames (it tolerates one late frame in 20); from 10,
+        // the second-largest lag (one outlier in 10 or more). Below 10 frames
+        // with a known lag no verdict is given: tolerating one outlier there
+        // would excuse a large share of late frames (half of them at 2).
         let (judged, statistic) = match lags.len() {
-            0 => (None, None),
-            1 => (lags.last().map(|&l| l as f64 / 1e6), Some("only_frame")),
+            n if n < LAG_VERDICT_MIN_FRAMES => (None, None),
             n if n < LAG_P95_MIN_FRAMES => (Some(lags[n - 2] as f64 / 1e6), Some("second_largest")),
             _ => (pct_ms(&lags, 95), Some("p95")),
         };
@@ -751,8 +754,8 @@ impl Model {
             lag_ms_judged: judged,
             lag_ms_max: lags.last().map(|&l| l as f64 / 1e6),
             lag_bound_ms: bound_ms,
-            // Judged only over frames whose lag is known; with none, whether
-            // the probe kept up was never established.
+            // Judged only over frames whose lag is known; with too few of
+            // them, whether the probe kept up was never established.
             behind: judged.map(|j| j > bound_ms),
         }
     }
@@ -778,7 +781,8 @@ impl Model {
         let lag_unknown = probe.frames > 0 && probe.behind.is_none();
         let lag_unknown_detail = || {
             format!(
-                "no primary frame's presentation time was known ({} frames), so the probe cannot show it kept up with them",
+                "only {} of {} primary frames had a known presentation time (a verdict needs {LAG_VERDICT_MIN_FRAMES}), so the probe cannot show it kept up with them",
+                probe.frames - probe.frames_lag_unknown,
                 probe.frames
             )
         };
