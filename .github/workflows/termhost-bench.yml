@@ -946,14 +946,19 @@ jobs:
           N: ${{ steps.params.outputs.n }}
           ARMS: ${{ steps.params.outputs.arms }}
           GATE_N: ${{ steps.params.outputs.gate_n }}
+          BASELINE: ${{ steps.params.outputs.baseline }}
         run: |
           set -euo pipefail
           results="$RUNNER_TEMP/tb-out/results.json"
           [ -f "$results" ] || { echo "::error::the run wrote no results file"; exit 1; }
+          # An A/B run gates on both builds being PROVEN at the gate N (D12).
+          ab=()
+          if [ "$BASELINE" != none ]; then ab=(--ab-baseline "$BASELINE"); fi
           node scripts/termhost-bench/cli.mjs report "$results" --format json \
             --setups runner --arms "$ARMS" --require-rows-n "$N" \
             --require-measured cpu_pct,memory_mb,producer_stall_pct --at-n "$GATE_N" \
-            --require-measured-if-operative capture.wgc:output_latency_ms
+            --require-measured-if-operative capture.wgc:output_latency_ms \
+            "${ab[@]}"
 
       - name: Upload the runner's results (redacted)
         if: ${{ !cancelled() && steps.run.outcome != 'skipped' }}

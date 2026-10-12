@@ -57,6 +57,7 @@ import { createRequire } from "node:module";
 import { basename, dirname, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { WaitAborted } from "../../lib/runner-clients.mjs";
 import { descendantsOf, listProcesses, terminatePid } from "../proc.mjs";
 import { ptyHostCensus, ptyHostImpl } from "../ptyhost.mjs";
 import { readGeneratorLog } from "../sessions.mjs";
@@ -363,7 +364,8 @@ export class HarnessClient {
     this.fetch = fetch;
   }
 
-  async call(cmd, args = {}, { timeoutMs = 30000 } = {}) {
+  /** `signal`: the run's abort, for launch-time calls only (teardown's calls must still run after it). */
+  async call(cmd, args = {}, { timeoutMs = 30000, signal = null } = {}) {
     const req = protocol.buildRpc(cmd, args, this.nonce);
     let res;
     try {
@@ -371,9 +373,10 @@ export class HarnessClient {
         method: "POST",
         headers: req.headers,
         body: req.body,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
+      if (signal?.aborted) throw new WaitAborted(`the harness extension's ${cmd}`);
       throw new HarnessCallError(`${cmd}: the harness endpoint did not answer (${e?.message ?? e})`);
     }
     const text = await res.text();
@@ -440,6 +443,7 @@ export class VscodeAdapter {
     this.childExit = null;
     this.pid = null;
     this.startKey = null;
+    this.abortSignal = null;
     this.client = null;
     this.hello = null;
     this.shellLaunch = null;
@@ -540,9 +544,11 @@ export class VscodeAdapter {
         log: this.log,
         exists: this.exists,
         verified: this.cacheVerified ?? null,
+        signal: this.abortSignal,
         ...(this.hashFn ? { hash: this.hashFn } : {}),
       });
     } catch (e) {
+      if (e instanceof WaitAborted) throw e;
       throw new AdapterRefusal("harness_error", e instanceof ArchiveIntegrityError ? `refusing the VS Code archive: ${e.message}` : e.message);
     }
     const appDir = await ensureUnpacked({
@@ -562,10 +568,15 @@ export class VscodeAdapter {
   }
 
   /**
-   * @param {{runDir: string, unitDir: string, genDir: string, genRunId: string, env?: {env?: object}}} ctx
+   * `ctx.signal` is the run's abort: every launch-time wait (the archive download,
+   * the control file, the hello and prepare calls) ends at it with `WaitAborted`,
+   * and the run then tears down as usual.
+   *
+   * @param {{runDir: string, unitDir: string, genDir: string, genRunId: string, env?: {env?: object}, signal?: AbortSignal}} ctx
    */
   async launch(ctx) {
     this.ctx = ctx;
+    this.abortSignal = ctx.signal ?? null;
     const facts = (await this.check()).mechanisms;
     for (const id of ["setup.vscode", "setup.vscode_extension", "setup.vscode_shell"]) {
       if (facts[id]?.state !== "OPERATIVE") throw new AdapterRefusal("harness_error", `${id}: ${facts[id]?.reason ?? "no verdict"}`);
@@ -627,13 +638,13 @@ export class VscodeAdapter {
     this.log(`vscode: pid ${this.pid} (${this.app.launchMode}) from ${this.app.exe}`);
     const control = await this.waitForControl(p.control);
     this.client = new HarnessClient({ port: control.port, nonce, fetch: this.controlFetch });
-    this.hello = await this.client.call("hello", {}, { timeoutMs: 30000 });
+    this.hello = await this.client.call("hello", {}, { timeoutMs: 30000, signal: this.abortSignal });
     if (this.hello?.protocol !== protocol.PROTOCOL) throw new AdapterRefusal("harness_error", `the extension speaks ${this.hello?.protocol}, not ${protocol.PROTOCOL}`);
     this.proveExclusive();
     if (this.app.launchMode === "portable_pinned" && this.hello.vscode?.version !== this.pin.version) {
       throw new AdapterRefusal("harness_error", `the instance reports VS Code ${this.hello.vscode?.version}, not the pinned ${this.pin.version}`);
     }
-    const prep = await this.client.call("prepare", {}, { timeoutMs: 60000 });
+    const prep = await this.client.call("prepare", {}, { timeoutMs: 60000, signal: this.abortSignal });
     for (const f of prep.failed ?? []) this.notes.push(`prepare: ${f.id} failed: ${f.error}`);
     return { ok: true };
   }
@@ -643,6 +654,7 @@ export class VscodeAdapter {
     const deadline = Date.now() + this.launchTimeoutMs;
     let last = null;
     for (;;) {
+      if (this.abortSignal?.aborted) throw new WaitAborted(`the VS Code harness extension's control file (pid ${this.pid})`);
       if (this.childExit) {
         const e = this.childExit;
         if (e.code === 0 && e.afterMs < 15000) {
@@ -874,38 +886,65 @@ export class VscodeAdapter {
     return Boolean(this.childExit);
   }
 
+  /**
+   * The process tree this run PROVED it started, root first, or why none is. The
+   * root is claimed only when its start key was read while our child was alive,
+   * the process holding the PID now has that same start key, and our child has
+   * not exited (an exited child's PID may already belong to a stranger — Windows
+   * reuses PIDs quickly). Descendants must chain back to the root with each
+   * parent started first (parent links outlive their parents on Windows).
+   * Teardown and `emergencyStop` both act only on this.
+   *
+   * @param {string} who  the caller, for the notes
+   * @returns {{owned: {pid: number, startKey: string, name: string}[], unprovable: string | null}}
+   */
+  provenTree(who) {
+    if (!Number.isInteger(this.pid)) return { owned: [], unprovable: null };
+    let unprovable = null;
+    if (this.startKey === null || this.startKey === undefined) unprovable = "its start key was never recorded";
+    else if (this.childExit !== null) unprovable = `our child exited (${JSON.stringify(this.childExit)}) before ${who}`;
+    if (unprovable) {
+      this.notes.push(`${who}: VS Code pid ${this.pid} cannot be proven this run's (${unprovable}); nothing is signalled`);
+      return { owned: [], unprovable };
+    }
+    try {
+      const table = this.list();
+      const root = table.get(this.pid);
+      if (root && root.startKey === this.startKey) {
+        const desc = descendantsOf(table, this.pid).filter((p) => isDescendantOf(table, p.pid, this.pid));
+        return { owned: [root, ...desc].map((p) => ({ pid: p.pid, startKey: p.startKey, name: p.name })), unprovable: null };
+      }
+      this.notes.push(`${who}: pid ${this.pid} no longer holds the process this run started; nothing is signalled`);
+    } catch (e) {
+      this.notes.push(`${who}: process table unreadable: ${e.message}`);
+    }
+    return { owned: [], unprovable: null };
+  }
+
+  /**
+   * A second signal's last act (no teardown follows): SIGKILL the process tree this
+   * run proved it started (`provenTree`, the same rule as teardown), children first,
+   * each PID re-checked against its start key at the signal. No graceful quit: the
+   * run is exiting within seconds. Returns what was done, or null when nothing is
+   * provably ours.
+   */
+  async emergencyStop() {
+    const { owned } = this.provenTree("emergency stop");
+    if (owned.length === 0) return null;
+    const table = this.list();
+    let signalled = 0;
+    for (const o of [...owned].reverse()) {
+      const r = terminatePid(o.pid, { signal: "SIGKILL", table, expect: (p) => p.startKey === o.startKey, ...(this.kill ? { kill: this.kill } : {}) });
+      if (r.outcome === "signalled") signalled += 1;
+    }
+    return `signalled VS Code pid ${this.pid} (${signalled} of ${owned.length} process(es))`;
+  }
+
   async teardown() {
     const closed = [];
     const survivors = [];
     const incidents = [];
-    let owned = [];
-    // The root is claimed only when this run PROVED it: its start key was read
-    // while our child was alive, the process holding the PID now has that same
-    // start key, and our child has not exited (an exited child's PID may already
-    // belong to a stranger — Windows reuses PIDs quickly).
-    let unprovable = null;
-    if (Number.isInteger(this.pid)) {
-      if (this.startKey === null || this.startKey === undefined) unprovable = "its start key was never recorded";
-      else if (this.childExit !== null) unprovable = `our child exited (${JSON.stringify(this.childExit)}) before teardown`;
-      if (unprovable) {
-        this.notes.push(`teardown: VS Code pid ${this.pid} cannot be proven this run's (${unprovable}); nothing is signalled`);
-      } else {
-        try {
-          const table = this.list();
-          const root = table.get(this.pid);
-          if (root && root.startKey === this.startKey) {
-            // Parent links outlive their parents on Windows: every descendant must
-            // chain back to the root with each parent started first.
-            const desc = descendantsOf(table, this.pid).filter((p) => isDescendantOf(table, p.pid, this.pid));
-            owned = [root, ...desc].map((p) => ({ pid: p.pid, startKey: p.startKey, name: p.name }));
-          } else {
-            this.notes.push(`teardown: pid ${this.pid} no longer holds the process this run started; nothing is signalled`);
-          }
-        } catch (e) {
-          this.notes.push(`teardown: process table unreadable: ${e.message}`);
-        }
-      }
-    }
+    const { owned, unprovable } = this.provenTree("teardown");
     if (this.client) {
       try {
         const r = await this.client.call("close", { all: true }, { timeoutMs: 30000 });

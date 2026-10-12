@@ -25,6 +25,7 @@ import { AdapterRefusal } from "../adapters/index.mjs";
 import {
   ARGV_JSON,
   HARNESS_EXTENSION_DIR,
+  HarnessClient,
   HOST_ID_KEY,
   SCROLLBACK_LINES,
   VscodeAdapter,
@@ -58,6 +59,7 @@ import {
 } from "../adapters/vscode-install.mjs";
 import { ptyHostCensus, ptyHostFromCensus, ptyHostImpl } from "../ptyhost.mjs";
 import { generatorArgv } from "../rundir.mjs";
+import { WaitAborted } from "../../lib/runner-clients.mjs";
 import { createFakeVscode } from "./helpers/fake-vscode.mjs";
 
 const require = createRequire(import.meta.url);
@@ -787,4 +789,57 @@ test("pane sizes come from the latest resize each session reported; a creation-t
   stdout.emit("resize");
   assert.deepEqual(logged, [resizeRecord({ cols: 100, rows: 40 }, 5n)]);
   assert.deepEqual(logged[0], { type: "resize", t_ns: "5", cols: 100, rows: 40 });
+});
+
+test("every launch-time wait ends at the run's abort, not at its timeout (Phase 3 review round 2)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "tb-vsc-abort-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const t0 = Date.now();
+  // A fetch that answers only when its signal aborts.
+  const hanging = (url, init) =>
+    new Promise((_, reject) => {
+      if (init.signal.aborted) return reject(init.signal.reason);
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    });
+
+  // The archive download: no fallback URL is tried after the abort, no partial file is left.
+  const fetched = [];
+  const ac1 = new AbortController();
+  setTimeout(() => ac1.abort(), 30);
+  const dlDir = join(dir, "dl");
+  await assert.rejects(
+    downloadVerified({ urls: ["https://a/1", "https://a/2"], dest: join(dlDir, "a.zip"), expected: "0".repeat(64), fetch: (u, i) => (fetched.push(u), hanging(u, i)), timeoutMs: 600_000, signal: ac1.signal }),
+    WaitAborted,
+  );
+  assert.deepEqual(fetched, ["https://a/1"]);
+  assert.deepEqual(readdirSync(dlDir), [], "the partial download is removed");
+
+  // A control-endpoint call.
+  const ac2 = new AbortController();
+  setTimeout(() => ac2.abort(), 30);
+  await assert.rejects(new HarnessClient({ port: 1, nonce: "a".repeat(64), fetch: hanging }).call("prepare", {}, { timeoutMs: 600_000, signal: ac2.signal }), WaitAborted);
+
+  // The control-file wait, with VS Code still running.
+  const unitDir = join(dir, "units", "u0");
+  mkdirSync(join(unitDir, "gen"), { recursive: true });
+  const app = join(dir, "app");
+  mkdirSync(app);
+  writeFileSync(join(app, "code"), "x");
+  const ac3 = new AbortController();
+  setTimeout(() => ac3.abort(), 30);
+  const a = new VscodeAdapter({
+    platform: "linux",
+    appPath: app,
+    cacheDir: dir,
+    shell: "/bin/bash",
+    sandbox: () => ({ state: "OPERATIVE", reason: "fake", noSandbox: false }),
+    exists: (p) => p === "/bin/bash" || existsSync(p),
+    spawnFn: () => Object.assign(new EventEmitter(), { pid: 600 }),
+    list: () => new Map([[600, { pid: 600, ppid: 1, name: "code", argv: null, cmdline: "code", startKey: "5000" }]]),
+    kill: () => {},
+    sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 10))),
+    launchTimeoutMs: 5000, // bounded: a missed abort fails as a timeout refusal, never hangs the suite
+  });
+  await assert.rejects(a.launch({ runDir: dir, unitDir, genDir: join(unitDir, "gen"), genRunId: "r-u0", env: { env: {} }, signal: ac3.signal }), WaitAborted);
+  assert.ok(Date.now() - t0 < 10_000, `every wait ended at the abort (${Date.now() - t0} ms)`);
 });

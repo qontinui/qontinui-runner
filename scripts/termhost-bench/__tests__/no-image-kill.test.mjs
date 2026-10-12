@@ -374,3 +374,40 @@ test("a tree walk needs the root's start key: without one nothing of the tree is
   const r3 = await terminateTree(null, { list: () => new Map(), kill: () => assert.fail("nothing to signal"), sleepFn: async () => {}, graceMs: 0 });
   assert.deepEqual(r3, { signalled: [], survivors: [] });
 });
+
+test("VS Code's emergency stop kills only the proven tree, children first, and claims nothing it cannot prove (Phase 3 review round 2)", async () => {
+  const { EventEmitter } = await import("node:events");
+  const P = (pid, ppid, name, startKey) => ({ pid, ppid, name, argv: null, cmdline: name, startKey: String(startKey) });
+  // 800 is ours; 801 descends from it; 802 claims 800 as parent but started
+  // before it (a stale parent link), so it is not ours.
+  const table = new Map([[800, P(800, 1, "Code.exe", 100)], [801, P(801, 800, "Code.exe", 101)], [802, P(802, 800, "pwsh.exe", 50)]]);
+  const make = () => {
+    const signalled = [];
+    const a = new VscodeAdapter({ platform: "win32", list: () => new Map(table), kill: (pid, sig) => signalled.push([pid, sig]), sleep: async () => {} });
+    a.child = new EventEmitter();
+    a.pid = 800;
+    a.startKey = "100";
+    return { a, signalled };
+  };
+  const ok = make();
+  assert.match(await ok.a.emergencyStop(), /signalled VS Code pid 800 \(2 of 2/);
+  assert.deepEqual(ok.signalled, [[801, "SIGKILL"], [800, "SIGKILL"]]);
+
+  const exited = make();
+  exited.a.childExit = { code: 0, signal: null, afterMs: 5 };
+  assert.equal(await exited.a.emergencyStop(), null);
+  assert.deepEqual(exited.signalled, [], "an exited child's PID is never adopted");
+
+  const unread = make();
+  unread.a.startKey = null;
+  assert.equal(await unread.a.emergencyStop(), null);
+  assert.deepEqual(unread.signalled, []);
+
+  const reused = make();
+  reused.a.startKey = "99"; // the PID now holds another process
+  assert.equal(await reused.a.emergencyStop(), null);
+  assert.deepEqual(reused.signalled, []);
+
+  const never = new VscodeAdapter({ platform: "win32", list: () => new Map(table), kill: () => assert.fail("nothing launched"), sleep: async () => {} });
+  assert.equal(await never.emergencyStop(), null, "nothing launched: nothing to stop");
+});
