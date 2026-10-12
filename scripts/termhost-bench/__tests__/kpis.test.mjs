@@ -9,6 +9,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { KPI_IDS } from "../kpi-catalog.mjs";
 import {
@@ -22,6 +25,7 @@ import {
   indexProbeSegment,
   injectAbortReason,
   parseJsonl,
+  LAG_VERDICT_MIN_FRAMES,
   probeHealthGate,
   seqAtOrAfter,
 } from "../kpis.mjs";
@@ -606,4 +610,13 @@ test("a probe with too few known lags for a verdict: harness_error naming the co
   const b = probeHealthGate(few({ behind: true, lag_statistic: null, lag_ms_judged: 250, frames_over_bound: 12 }));
   assert.equal(b.detail, "the probe fell behind its capture source (frame lag 250 ms judged, bound 100 ms, 12 frame(s) over it), so first appearances may be late");
   assert.match(probeHealthGate(few({ behind: true, lag_statistic: "second_largest", lag_ms_judged: 250 })).detail, /judged as the second_largest,/);
+});
+
+test("LAG_VERDICT_MIN_FRAMES is the probe's own constant, read from its source (review round 7)", () => {
+  // The probe owns the floor (crates/termhost-probe/src/model/mod.rs); kpis.mjs
+  // restates it in the text it writes, so the two must never drift apart.
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "crates", "termhost-probe", "src", "model", "mod.rs"), "utf8");
+  const found = [...src.matchAll(/^pub const LAG_VERDICT_MIN_FRAMES: usize = (\d+);\r?$/gm)];
+  assert.equal(found.length, 1, "exactly one definition of the probe's constant");
+  assert.equal(LAG_VERDICT_MIN_FRAMES, Number(found[0][1]));
 });
