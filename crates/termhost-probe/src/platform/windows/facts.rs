@@ -49,7 +49,7 @@ pub fn gather(node: &str) -> Facts {
     let input_facts = InputFacts {
         supported: Ok(()),
         listener: listener.as_ref().map(|m| m.describe.clone()).map_err(Clone::clone),
-        injector: Ok("SendInput (KEYEVENTF_UNICODE) with a per-run dwExtraInfo tag, which Raw Input reports back".into()),
+        injector: Ok("SendInput (virtual keys) with a per-run dwExtraInfo tag; Raw Input hearing those tagged keys is proven by `selftest`, not here".into()),
     };
     drop(listener);
 
