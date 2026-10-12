@@ -60,13 +60,12 @@ fn report(o: &SelftestOutcome) -> String {
 /// The gates a working desktop must pass — one per phase, so a selftest that
 /// silently skipped a phase cannot pass this test. (`selftest_window` and
 /// `input_listener` are recorded only when they fail, so they are not here.)
-const KEY_CHECKS: [&str; 12] = [
+const KEY_CHECKS: [&str; 11] = [
     "clock_aligned",
     "process_sampler",
     "selftest_window_foreground",
     "capture_visible.wgc",
-    "output_latency.wgc.d0",
-    "output_latency.wgc.d50",
+    "output_latency_slope.wgc",
     "hang_detected",
     "input_round_trip",
     "untagged_injection_aborts",
@@ -104,13 +103,20 @@ fn must_fail(faults: Faults, gate: &str) {
 #[test]
 fn fails_when_capture_lags_the_paint() {
     // Every frame stamped 40 ms late: more than one 16.7 ms refresh interval.
-    must_fail(
-        Faults {
-            capture_lag_ms: 40,
-            ..Faults::default()
-        },
-        "output_latency.wgc.d0",
-    );
+    // DDA's absolute check catches it (WGC's absolute check is reported, not
+    // gated, and a lag shared by both sources leaves their offset alone).
+    let mut host = FakeHost::new(Faults {
+        capture_lag_ms: 40,
+        ..Faults::default()
+    });
+    host.dda = true;
+    let o = run(&mut host, &quick(), &mut Sink::discard());
+    let c = find(&o, "output_latency.dda.d0");
+    assert!(c.gated && c.passed == Some(false), "{}", report(&o));
+    let w = find(&o, "output_latency.wgc.d0");
+    assert!(!w.gated && w.passed == Some(false), "{}", report(&o));
+    assert!(w.detail.contains("one machine class"), "{}", w.detail);
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
 }
 
 #[test]
@@ -306,28 +312,43 @@ fn one_late_frame_does_not_fail_the_kept_up_check() {
     );
 }
 
-#[test]
-fn wgc_is_allowed_its_capture_render_stage_and_dda_is_not() {
-    // WGC stamps the compositor's render of the capture frame, one stage
-    // after the presentation DDA stamps: its latency check allows two
-    // refresh intervals, DDA's one. Both are reported in the check's data.
-    let mut host = FakeHost::new(Faults::default());
+fn with_dda(faults: Faults) -> SelftestOutcome {
+    let mut host = FakeHost::new(faults);
     host.dda = true;
-    let o = run(&mut host, &quick(), &mut Sink::discard());
-    let tol = |name: &str| {
-        let c = find(&o, name);
-        (c.data["stages"].as_u64(), c.data["tolerance_ms"].as_f64())
-    };
-    let (wgc_stages, wgc_ms) = tol("output_latency.wgc.d0");
-    let (dda_stages, dda_ms) = tol("output_latency.dda.d0");
-    assert_eq!((wgc_stages, dda_stages), (Some(2), Some(1)));
-    assert!((wgc_ms.expect("wgc") - 33.333).abs() < 0.01, "{wgc_ms:?}");
-    assert!((dda_ms.expect("dda") - 16.667).abs() < 0.01, "{dda_ms:?}");
-    assert!(
-        find(&o, "output_latency.wgc.d0")
-            .detail
-            .contains("2 refresh interval(s)"),
-        "{}",
-        report(&o)
-    );
+    run(&mut host, &quick(), &mut Sink::discard())
+}
+
+#[test]
+fn wgc_is_held_to_dda_by_its_render_offset() {
+    // WGC and DDA see the same frames: within the offset, gated, passing.
+    let o = with_dda(Faults::default());
+    for d in [0, 50] {
+        let c = find(&o, &format!("wgc_render_offset.d{d}"));
+        assert!(c.gated && c.passed == Some(true), "{}", report(&o));
+    }
+    assert!(!find(&o, "output_latency.wgc.d0").gated, "{}", report(&o));
+    assert_eq!(o.exit_code, 0, "{}\n{}", o.summary, report(&o));
+    // WGC gains a frame (20 ms) on DDA: the offset check fails, gated.
+    let o = with_dda(Faults {
+        wgc_extra_ms: 20,
+        ..Faults::default()
+    });
+    let c = find(&o, "wgc_render_offset.d0");
+    assert!(c.gated && c.passed == Some(false), "{}", report(&o));
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
+}
+
+#[test]
+fn without_dda_wgc_is_held_to_its_own_slope() {
+    // From the eighth frame on (into the 50 ms phase) WGC frames are 30 ms
+    // later: median(d) - d moves by 30 ms across the delays.
+    let o = run_with(Faults {
+        wgc_extra_from_frame: 8,
+        wgc_extra_ms: 30,
+        ..Faults::default()
+    });
+    let c = find(&o, "output_latency_slope.wgc");
+    assert!(c.gated, "{}", report(&o));
+    assert_eq!(c.passed, Some(false), "{}", report(&o));
+    assert_eq!(o.exit_code, 1, "{}", o.summary);
 }

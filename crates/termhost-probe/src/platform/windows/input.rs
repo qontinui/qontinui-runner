@@ -44,6 +44,7 @@ use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
     DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, HDESK, UOI_NAME,
 };
+use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, GetKeyboardLayout, MapVirtualKeyExW, SendInput, VkKeyScanExW,
@@ -54,11 +55,13 @@ use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     PostThreadMessageW, RegisterClassExW, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_QUIT,
     WNDCLASSEXW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 
 use super::{hwnd, window};
@@ -393,10 +396,13 @@ fn keyboard_block(held: &[&str], caps: bool) -> Option<String> {
     (!why.is_empty()).then(|| why.join(", "))
 }
 
-/// The keyboard's modifier state now, as `keyboard_block` judges it. Read
-/// with GetAsyncKeyState, so a modifier another program left logically down
-/// counts too — the real-input listener would never see that one.
-fn keyboard_state() -> Option<String> {
+/// The keyboard's modifier state now, as `keyboard_block` judges it. The
+/// modifiers are read with GetAsyncKeyState, so a modifier another program
+/// left logically down counts too — the real-input listener would never see
+/// that one. CapsLock's TOGGLE has no asynchronous read: GetKeyState answers
+/// from the calling thread's input state, which on a background thread can
+/// be stale, so it is read while attached to the target's input thread.
+fn keyboard_state(target_thread: u32) -> Option<String> {
     const MODIFIERS: [(VIRTUAL_KEY, &str); 5] = [
         (VK_SHIFT, "Shift"),
         (VK_CONTROL, "Ctrl"),
@@ -410,16 +416,54 @@ fn keyboard_state() -> Option<String> {
         .filter(|(vk, _)| unsafe { GetAsyncKeyState(i32::from(vk.0)) } as u16 & 0x8000 != 0)
         .map(|(_, name)| *name)
         .collect();
-    // SAFETY: a read of the toggle state.
-    let caps = unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0;
-    keyboard_block(&held, caps)
+    keyboard_block(&held, caps_lock_on(target_thread))
 }
 
-/// The keyboard layout of the thread that owns `target`.
+/// CapsLock's toggle as the target's input thread sees it.
+fn caps_lock_on(target_thread: u32) -> bool {
+    // SAFETY: attaching this thread's input state to the target's for one
+    // GetKeyState read, then detaching; a failed attach reads our own state.
+    unsafe {
+        let me = GetCurrentThreadId();
+        let attached = target_thread != 0
+            && target_thread != me
+            && AttachThreadInput(me, target_thread, true).as_bool();
+        let caps = GetKeyState(i32::from(VK_CAPITAL.0)) & 1 != 0;
+        if attached {
+            let _ = AttachThreadInput(me, target_thread, false);
+        }
+        caps
+    }
+}
+
+/// The thread that receives the target's keys: the thread of the window
+/// with the keyboard focus in the target's GUI thread when there is one — a
+/// WebView2 or XAML child can run on another thread, with another layout —
+/// else the thread that owns the top-level window.
+fn target_thread(target: WindowHandle) -> u32 {
+    // SAFETY: GetWindowThreadProcessId accepts any window handle; the info
+    // struct carries its size.
+    unsafe {
+        let owner = GetWindowThreadProcessId(hwnd(target), None);
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if owner != 0 && GetGUIThreadInfo(owner, &mut info).is_ok() && !info.hwndFocus.is_invalid()
+        {
+            let focus = GetWindowThreadProcessId(info.hwndFocus, None);
+            if focus != 0 {
+                return focus;
+            }
+        }
+        owner
+    }
+}
+
+/// The keyboard layout of the thread that receives the target's keys.
 fn target_layout(target: WindowHandle) -> HKL {
-    // SAFETY: GetWindowThreadProcessId accepts any window handle, and
-    // GetKeyboardLayout any thread id.
-    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(hwnd(target), None)) }
+    // SAFETY: GetKeyboardLayout accepts any thread id.
+    unsafe { GetKeyboardLayout(target_thread(target)) }
 }
 
 /// Whether `ch` is typed by its plain virtual key on layout `hkl`.
@@ -431,13 +475,12 @@ fn typeable_on(ch: char, hkl: HKL) -> bool {
     layout_types_unshifted(unsafe { VkKeyScanExW(ch as u16, hkl) }, vk)
 }
 
-/// The key-down and key-up events that type `ch`, tagged with `extra`.
-fn key_events(ch: char, extra: usize) -> Option<[INPUT; 2]> {
+/// The key-down and key-up events that type `ch` on layout `hkl` (the
+/// target's: its scan code), tagged with `extra`.
+fn key_events(ch: char, extra: usize, hkl: HKL) -> Option<[INPUT; 2]> {
     let vk = virtual_key(ch)?;
-    // SAFETY: a pure table lookup in the caller's keyboard layout.
-    let scan =
-        unsafe { MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC, Some(GetKeyboardLayout(0))) }
-            as u16;
+    // SAFETY: a pure table lookup in the given keyboard layout.
+    let scan = unsafe { MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC, Some(hkl)) } as u16;
     let event = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -468,7 +511,7 @@ impl KeyInjector for Injector {
             }
             Err(why) => return Err(InjectBlock::DesktopUnavailable(why)),
         }
-        if let Some(why) = keyboard_state() {
+        if let Some(why) = keyboard_state(target_thread(WindowHandle(self.target))) {
             return Err(InjectBlock::KeyboardState(why));
         }
         if window::is_foreground(hwnd(WindowHandle(self.target))) {
@@ -498,13 +541,14 @@ impl KeyInjector for Injector {
 
     fn send_char(&mut self, ch: char, tagged: bool) -> Result<(), String> {
         // Again before every key: the target's layout can change mid-arm.
-        if !typeable_on(ch, target_layout(WindowHandle(self.target))) {
+        let hkl = target_layout(WindowHandle(self.target));
+        if !typeable_on(ch, hkl) {
             return Err(format!(
                 "{ch:?} is not typed by its plain key on the target's keyboard layout (it needs a modifier there, or has no key); nothing was sent"
             ));
         }
         let extra = if tagged { self.tagging.tag as usize } else { 0 };
-        let Some(inputs) = key_events(ch, extra) else {
+        let Some(inputs) = key_events(ch, extra, hkl) else {
             return Err(format!(
                 "{ch:?} has no virtual key here (lowercase letters and digits only)"
             ));
@@ -555,7 +599,9 @@ mod tests {
         assert!(!layout_types_unshifted(0x0131, 0x31));
         // A Cyrillic layout has no key for 'a': -1.
         assert!(!layout_types_unshifted(-1, 0x41));
-        // Another key types the character (QWERTZ: 'z' is on VK_Y): refused.
+        // VkKeyScanExW names a different virtual key than ours for the
+        // character: refused. (Layouts move keys, not VKs — on German QWERTZ
+        // VK_Z still types 'z' — so this arm is a guard, not a known layout.)
         assert!(!layout_types_unshifted(0x0059, 0x5A));
         // AltGr (Ctrl+Alt, shift state 0x06): refused.
         assert!(!layout_types_unshifted(0x0641, 0x41));
@@ -577,18 +623,21 @@ mod tests {
     #[test]
     fn keys_are_virtual_keys_raw_input_reports_not_unicode_packets() {
         let tag = 0x3e2a_5220usize;
-        let [down, up] = key_events('a', tag).expect("a letter");
+        let [down, up] = key_events('a', tag, unsafe { GetKeyboardLayout(0) }).expect("a letter");
         // SAFETY: reading the keyboard variant just built.
         let (d, u) = unsafe { (down.Anonymous.ki, up.Anonymous.ki) };
         assert_eq!(d.wVk, VIRTUAL_KEY(0x41), "VK_A, not a VK_PACKET carrier");
         assert_eq!(d.dwFlags, Default::default(), "no KEYEVENTF_UNICODE");
         assert_eq!(u.dwFlags, KEYEVENTF_KEYUP);
         assert_eq!((d.dwExtraInfo, u.dwExtraInfo), (tag, tag));
-        let seven = key_events('7', 0).expect("a digit");
+        let seven = key_events('7', 0, unsafe { GetKeyboardLayout(0) }).expect("a digit");
         // SAFETY: as above.
         assert_eq!(unsafe { seven[0].Anonymous.ki.wVk }, VIRTUAL_KEY(0x37));
         for ch in ['A', 'é', ' ', '~'] {
-            assert!(key_events(ch, tag).is_none(), "{ch:?}");
+            assert!(
+                key_events(ch, tag, unsafe { GetKeyboardLayout(0) }).is_none(),
+                "{ch:?}"
+            );
         }
     }
 

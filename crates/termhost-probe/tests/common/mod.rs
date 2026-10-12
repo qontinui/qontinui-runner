@@ -50,6 +50,10 @@ pub struct Faults {
     /// ONE frame (the fifth) reaches the probe this long after it was
     /// presented — a scheduler hiccup, not a probe that fell behind.
     pub one_late_frame_ms: u64,
+    /// WGC frames from this delivery on are stamped `wgc_extra_ms` later
+    /// (a capture path that gained a stage, or gains latency mid-run).
+    pub wgc_extra_from_frame: u64,
+    pub wgc_extra_ms: u64,
     /// Every frame reaches the probe this long after it was presented (the
     /// probe is behind its source).
     pub probe_backlog_ms: u64,
@@ -180,8 +184,15 @@ impl CaptureSource for FakeCapture {
                     };
                     let presented_ns = (!faults.presentation_unknown)
                         .then(|| now_ns().saturating_sub(late * 1_000_000));
+                    let extra = if self.id == SourceId::Wgc
+                        && self.delivered > faults.wgc_extra_from_frame
+                    {
+                        faults.wgc_extra_ms
+                    } else {
+                        0
+                    };
                     f(RawFrame {
-                        t_ns: present_at + faults.capture_lag_ms * 1_000_000,
+                        t_ns: present_at + (faults.capture_lag_ms + extra) * 1_000_000,
                         presented_ns,
                         view,
                         origin: (0, 0),
